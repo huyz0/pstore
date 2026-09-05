@@ -102,6 +102,19 @@ pub struct Engine<S> {
     committed: Mutex<Epoch>,
 }
 
+/// Waits before retrying a lost commit.
+///
+/// ⚠️ Jittered, and that is not decoration. Without it optimistic concurrency
+/// **livelocks**: every loser retries immediately, collides with the same peers, and
+/// loses again. It surfaced as a *flaky* test rather than a failing one, which is the
+/// more expensive way to find out. The jitter comes from the lane rather than a random
+/// source so a failing schedule still replays.
+async fn backoff(lane: LaneId, attempt: u32) {
+    let base = 1u64 << attempt.min(6);
+    let jitter = (lane.0 % 8) + 1;
+    tokio::time::sleep(std::time::Duration::from_micros(base * jitter)).await;
+}
+
 impl<S: BlobStore> Engine<S> {
     /// A writer on one lane of one tenant.
     pub fn new(store: Arc<S>, tenant: TenantId, lane: LaneId) -> Self {
@@ -345,13 +358,127 @@ impl<S: BlobStore> Engine<S> {
                 Err(EngineError::Lost | EngineError::Contended)
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
-                    // ⚠️ Backoff, and jittered. Without it, optimistic concurrency
-                    // LIVELOCKS: every loser retries immediately, collides with the same
-                    // peers, and loses again. It showed up as a flaky test rather than a
-                    // failing one, which is the more expensive way to find out.
-                    let base = 1u64 << attempt.min(6);
-                    let jitter = (self.lane.0 % 8) + 1;
-                    tokio::time::sleep(std::time::Duration::from_micros(base * jitter)).await;
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// The published manifest, so a test can assert on what is *referenced* rather than
+    /// inferring it from what a scan happens to return.
+    #[doc(hidden)]
+    pub async fn head_for_test(&self) -> Head {
+        head::read(&*self.store, self.tenant)
+            .await
+            .map(|at| at.head)
+            .unwrap_or_default()
+    }
+
+    /// The key a compactor writes its merged output to.
+    ///
+    /// ⚠️ **Carries the compactor's lane**, so two nodes compacting the same inputs write
+    /// to two different objects. Deriving the key from the inputs instead would be
+    /// tempting — the losers would cost nothing — but it makes the second compactor
+    /// overwrite a live object unconditionally, which is Invariant I1 gone. The
+    /// create-if-absent that would fix it is exactly the precondition MinIO was *measured*
+    /// ignoring, so the fix would be silently absent on a backend we support. A wasted
+    /// object that GC reaps is the cheaper mistake.
+    fn compacted_key(&self, epoch: Epoch, index: &str) -> Key {
+        Key::new(format!(
+            "{:04x}/tnt/{}/idx/{index}/seg/L1/{:020}-{:016x}.seg",
+            self.tenant.0 as u16, self.tenant.0, epoch.0, self.lane.0
+        ))
+    }
+
+    /// Merges an index's segments into one, and publishes it by CAS.
+    ///
+    /// **Optimistic, not coordinated.** Any node may compact any index at any time; there
+    /// is no lock, no lease and no claim, because there is nothing to protect. Several
+    /// nodes may do the same merge concurrently: they read the same inputs, write their
+    /// own outputs, and race to publish. Exactly one CAS lands. The losers discard, and
+    /// their objects are unreferenced from the moment they lose, so GC reaps them without
+    /// needing to know a compaction ever happened.
+    ///
+    /// Returns `None` when there was nothing to do — fewer than two segments, or another
+    /// compactor got there first.
+    ///
+    /// `RA = n Rpar + 1 W + 1 commit`, for any *n*.
+    pub async fn compact(&self, index: &str) -> Result<Option<Epoch>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        let inputs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
+        if inputs.len() < 2 {
+            return Ok(None);
+        }
+        let keys: Vec<Key> = inputs.iter().map(|r| Key::new(r.key.clone())).collect();
+
+        // Opened and scanned together, like every other multi-segment read: n inputs are
+        // n parallel fetches, not n round trips.
+        let opened =
+            futures_util::future::try_join_all(keys.iter().map(|k| Segment::open(&*self.store, k)))
+                .await?;
+        let scanned = futures_util::future::try_join_all(
+            opened
+                .iter()
+                .zip(&keys)
+                .map(|(seg, k)| seg.scan(&*self.store, k, None)),
+        )
+        .await?;
+        // In input order, so the merged segment reads back in the order the inputs would
+        // have. A merge that reorders is a merge that changes the answer.
+        let rows: Vec<Document> = scanned.into_iter().flatten().collect();
+
+        let out_key = self.compacted_key(at.head.epoch.next(), index);
+        let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
+        for d in &rows {
+            w.push(d.clone());
+        }
+        // The single W. Written BEFORE the commit and never rewritten on a retry: a
+        // rebase changes which HEAD we condition on, not what we merged.
+        self.store.put(&out_key, w.finish()).await?;
+        let out = SegmentRef {
+            key: out_key.as_str().to_owned(),
+            rows: rows.len() as u32,
+        };
+
+        let mut at = at;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let current: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
+            // ⚠️ The discard condition. If any input is no longer named by HEAD, another
+            // compactor published this merge and ours is stale — republishing it would
+            // resurrect rows that a later fold may already have superseded. Losing is the
+            // normal outcome of optimistic work, so it is not an error.
+            if !inputs
+                .iter()
+                .all(|i| current.iter().any(|c| c.key == i.key))
+            {
+                return Ok(None);
+            }
+
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+            // Segments added since we read: kept, in place, after the merged one. Dropping
+            // them would silently discard every row folded while we were merging.
+            let mut kept: Vec<SegmentRef> = vec![out.clone()];
+            kept.extend(
+                current
+                    .iter()
+                    .filter(|c| !inputs.iter().any(|i| i.key == c.key))
+                    .cloned(),
+            );
+            next.indexes.insert(index.to_owned(), kept);
+
+            match head::commit(&*self.store, self.tenant, &at, &next).await {
+                Ok(epoch) => return Ok(Some(epoch)),
+                Err(e @ (EngineError::Lost | EngineError::Contended))
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    if matches!(e, EngineError::Lost) {
+                        at = head::read(&*self.store, self.tenant).await?;
+                    }
+                    backoff(self.lane, attempt).await;
                 }
                 Err(e) => return Err(e),
             }

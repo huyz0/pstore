@@ -7,5 +7,6 @@ pub mod broken;
 pub mod conformance;
 pub mod depth;
 pub mod flaky;
+pub mod gated;
 pub mod sim;
 pub mod sweep;
