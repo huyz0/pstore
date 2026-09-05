@@ -38,6 +38,16 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(out.into_iter().map(|(_, b)| b).collect())
     }
 
+    /// The last `n` bytes, without knowing the object's length.
+    ///
+    /// `Range: bytes=-N`, supported by S3, GCS and Azure alike. **This is what makes
+    /// Pattern 6 work**: a self-describing footer can be read from the key alone, with no
+    /// prior `head` — and `head` is billed as a read, so requiring one would double the
+    /// cost of every cold open and put a HEAD on the hot path the design forbids.
+    ///
+    /// Returns fewer than `n` bytes only when the object is shorter than `n`.
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError>;
+
     /// The current CAS tag, or `None` if the object is absent.
     ///
     /// The rebase step of the commit protocol: read the state an attempt will be

@@ -1,0 +1,164 @@
+//! The immutable segment.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │ DATA BLOCKS   independently addressable by byte range        │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │ INDEX SECTION block directory, zone maps, doc-id map         │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │ FOOTER        fixed size, at a known offset from the END     │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! One `Range: -N` suffix GET fetches the footer and, for a small segment, the whole index
+//! section with it — so a cold open is **two** round trips at worst and **one** in the
+//! common case. Nothing about a segment is discovered by listing, and nothing needs a side
+//! table: the key is enough.
+
+mod codec;
+mod reader;
+mod writer;
+
+pub use reader::Segment;
+pub use writer::SegmentWriter;
+
+use std::collections::BTreeMap;
+
+/// Bytes fetched by the opening suffix read.
+///
+/// Larger than the footer on purpose: most indexes are small, and their entire index
+/// section arrives with the footer, saving the second round trip. Too large and every open
+/// over-reads; 8 KiB is roughly the index section of a few-hundred-row segment.
+pub const SUFFIX_FETCH: u64 = 8 * 1024;
+
+/// Bytes of fixed-size footer at the very end of a segment.
+pub(crate) const FOOTER_LEN: usize = 8 + 2 + 8 + 4 + 4 + 8 + 8;
+
+pub(crate) const MAGIC: &[u8; 8] = b"PSTORESG";
+pub(crate) const VERSION: u16 = 1;
+
+/// An attribute value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Value {
+    /// Signed integer. The type zone maps prune on.
+    Int(i64),
+    /// UTF-8 string.
+    Str(String),
+}
+
+/// A row: an id, a vector, and typed attributes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Document {
+    /// Unique within its index. Determines the shard, and never changes.
+    pub id: String,
+    /// Dense vector. All vectors in a segment share a dimension.
+    pub vector: Vec<f32>,
+    /// Filterable attributes.
+    pub attrs: BTreeMap<String, Value>,
+}
+
+impl Document {
+    /// A document with no attributes.
+    #[must_use]
+    pub fn new(id: impl Into<String>, vector: Vec<f32>) -> Self {
+        Self {
+            id: id.into(),
+            vector,
+            attrs: BTreeMap::new(),
+        }
+    }
+}
+
+/// A predicate over one attribute.
+///
+/// Deliberately small: M1 needs enough to demonstrate that **zone maps prune blocks**, and
+/// a richer expression language would add surface without testing that property harder.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Filter {
+    /// Attribute equals a value.
+    Eq(String, Value),
+    /// Integer attribute strictly greater than.
+    Gt(String, i64),
+    /// Integer attribute strictly less than.
+    Lt(String, i64),
+}
+
+impl Filter {
+    /// The attribute this filter reads.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        match self {
+            Self::Eq(c, _) | Self::Gt(c, _) | Self::Lt(c, _) => c,
+        }
+    }
+
+    /// Whether one row satisfies it.
+    #[must_use]
+    pub fn matches(&self, doc: &Document) -> bool {
+        match self {
+            Self::Eq(c, v) => doc.attrs.get(c) == Some(v),
+            Self::Gt(c, n) => matches!(doc.attrs.get(c), Some(Value::Int(v)) if v > n),
+            Self::Lt(c, n) => matches!(doc.attrs.get(c), Some(Value::Int(v)) if v < n),
+        }
+    }
+
+    /// Whether a block whose integer column spans `min..=max` **could** contain a match.
+    ///
+    /// ⚠️ Must never answer `false` for a block that could match: a wrong `false` silently
+    /// drops rows, which reads as a recall bug rather than an error. Answering `true` for a
+    /// block that cannot match is merely wasted work.
+    #[must_use]
+    pub fn could_match(&self, min: i64, max: i64) -> bool {
+        match self {
+            Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
+            // A string equality has no ordering to prune on, so every block could match.
+            Self::Eq(_, Value::Str(_)) => true,
+            Self::Gt(_, n) => max > *n,
+            Self::Lt(_, n) => min < *n,
+        }
+    }
+}
+
+/// Why a segment could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FormatError {
+    /// The bytes ran out mid-field.
+    #[error("segment truncated")]
+    Truncated,
+    /// Something was structurally wrong.
+    #[error("segment corrupt: {0}")]
+    Corrupt(&'static str),
+    /// Written by a version this build does not understand.
+    #[error("unsupported segment version {0}")]
+    UnsupportedVersion(u16),
+    /// The index section did not match its recorded checksum.
+    #[error("segment checksum mismatch")]
+    ChecksumMismatch,
+    /// A query's dimension did not match the segment's.
+    #[error("dimension mismatch: segment has {expected}, query has {got}")]
+    DimensionMismatch {
+        /// The segment's dimension.
+        expected: usize,
+        /// The query's.
+        got: usize,
+    },
+    /// The blob store could not serve it.
+    #[error("blob error: {0}")]
+    Blob(String),
+}
+
+impl From<pstore_blob::BlobError> for FormatError {
+    fn from(e: pstore_blob::BlobError) -> Self {
+        Self::Blob(e.to_string())
+    }
+}
+
+/// Where one block lives, and what it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BlockMeta {
+    pub offset: u64,
+    pub len: u32,
+    pub rows: u32,
+    /// Per integer column, the block's `(min, max)`. **The pruning input.**
+    pub zones: BTreeMap<String, (i64, i64)>,
+}

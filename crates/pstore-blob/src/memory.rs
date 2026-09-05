@@ -122,6 +122,12 @@ impl crate::BlobStore for MemoryStore {
         Ok(body.slice(range.start as usize..range.end as usize))
     }
 
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        let body = self.get(key).await?;
+        let start = (body.len() as u64).saturating_sub(n) as usize;
+        Ok(body.slice(start..))
+    }
+
     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
         self.lock()
             .objects

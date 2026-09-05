@@ -122,6 +122,21 @@ impl crate::BlobStore for ObjectStoreBackend {
         Ok(got)
     }
 
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        // `GetRange::Suffix` is `Range: bytes=-N` on the wire. No `head` first.
+        let opts = object_store::GetOptions {
+            range: Some(object_store::GetRange::Suffix(n)),
+            ..Default::default()
+        };
+        self.inner
+            .get_opts(&Self::path(key), opts)
+            .await
+            .map_err(Self::map_err)?
+            .bytes()
+            .await
+            .map_err(Self::map_err)
+    }
+
     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
         self.inner
             .head(&Self::path(key))

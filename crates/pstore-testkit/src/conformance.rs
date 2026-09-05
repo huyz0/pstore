@@ -203,6 +203,40 @@ async fn probe_coalesced_read<S: BlobStore>(s: &S, run: u64) -> Support {
     Support::Supported
 }
 
+/// `Range: bytes=-N`. The primitive a self-describing footer is read with.
+///
+/// Without it a reader must `head` first, which is billed as a read and doubles the cost
+/// of every cold open. A backend that answers a suffix range with the WHOLE object would
+/// pass a functional test and cost a segment's bandwidth per open, so the length is
+/// checked, not just the content.
+async fn probe_suffix_read<S: BlobStore>(s: &S, run: u64) -> Support {
+    let key = k(run, "suffix");
+    if s.put(&key, Bytes::from_static(b"0123456789"))
+        .await
+        .is_err()
+    {
+        return Support::Unsupported;
+    }
+    match s.get_suffix(&key, 4).await {
+        Ok(b) if &b[..] == b"6789" => {}
+        Ok(b) => {
+            return Support::Divergent(format!(
+                "a 4-byte suffix returned {} bytes: {:?}",
+                b.len(),
+                String::from_utf8_lossy(&b)
+            ));
+        }
+        Err(e) => return Support::Divergent(format!("suffix read failed: {e}")),
+    }
+    // Asking for more than exists must return the object, not fail: a small segment is
+    // shorter than the fixed suffix fetch, and that is the common case.
+    match s.get_suffix(&key, 1000).await {
+        Ok(b) if b.len() == 10 => Support::Supported,
+        Ok(b) => Support::Divergent(format!("an oversized suffix returned {} bytes", b.len())),
+        Err(e) => Support::Divergent(format!("an oversized suffix failed: {e}")),
+    }
+}
+
 async fn probe_missing_key<S: BlobStore>(s: &S, run: u64) -> Support {
     // A 404 is a NORMAL answer, not an error: it is what bounds the WAL lane during
     // forward probing. A backend that hangs or 500s here breaks tail discovery.
@@ -246,6 +280,10 @@ pub async fn run<S: BlobStore>(s: &S, run_id: u64) -> Report {
         Probe {
             name: "ranged_read",
             outcome: probe_ranged_read(s, run_id).await,
+        },
+        Probe {
+            name: "suffix_read",
+            outcome: probe_suffix_read(s, run_id).await,
         },
         Probe {
             name: "range_past_end_is_an_error",

@@ -94,7 +94,7 @@ async fn a_report_names_what_diverged() {
     let d = r.divergences();
     assert_eq!(d.len(), 1, "expected exactly one divergence, got {d:?}");
     assert!(!r.backend.is_empty());
-    assert_eq!(r.probes.len(), 8);
+    assert_eq!(r.probes.len(), 9);
 }
 
 #[tokio::test]
