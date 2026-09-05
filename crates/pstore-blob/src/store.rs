@@ -23,21 +23,19 @@ pub trait BlobStore: Send + Sync + 'static {
     /// accidentally implement the naive one-request-per-range version.
     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
         let gap = self.capabilities().coalesce_gap;
-        let mut out: Vec<Bytes> = vec![Bytes::new(); ranges.len()];
+        let mut out: Vec<(usize, Bytes)> = Vec::with_capacity(ranges.len());
         for fetch in crate::coalesce(ranges, gap) {
             let base = fetch.span.start;
             let buf = self.get_range(key, fetch.span.clone()).await?;
-            for i in fetch.serves {
-                let Some(r) = ranges.get(i) else { continue };
+            for (i, r) in fetch.serves {
                 let (lo, hi) = ((r.start - base) as usize, (r.end - base) as usize);
-                let slot = out
-                    .get_mut(i)
-                    .ok_or_else(|| BlobError::Other("range index out of bounds".to_owned()))?;
-                // Slice, not copy: `Bytes` is refcounted, so the merged buffer is shared.
-                *slot = buf.slice(lo..hi);
+                // Slice, not copy: `Bytes` is refcounted, so the merged buffer is shared
+                // by every range it serves.
+                out.push((i, buf.slice(lo..hi)));
             }
         }
-        Ok(out)
+        out.sort_by_key(|(i, _)| *i);
+        Ok(out.into_iter().map(|(_, b)| b).collect())
     }
 
     /// Object size without the body. Reserved for GC and repair — **never the hot path**,

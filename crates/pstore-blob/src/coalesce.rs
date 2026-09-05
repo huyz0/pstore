@@ -13,8 +13,10 @@ use std::ops::Range;
 pub struct Fetch {
     /// The byte span to request from the backend.
     pub span: Range<u64>,
-    /// Indices into the caller's slice, so results can be returned in the order asked.
-    pub serves: Vec<usize>,
+    /// Each served range with its index in the caller's slice, so results come back in
+    /// the order asked and the reader never has to look up `ranges[i]` again — which is
+    /// how the "index out of bounds" branch that could never fire gets deleted.
+    pub serves: Vec<(usize, Range<u64>)>,
 }
 
 /// Plans the fetches for `ranges`, merging any two whose gap is below `gap`.
@@ -36,11 +38,11 @@ pub fn coalesce(ranges: &[Range<u64>], gap: u64) -> Vec<Fetch> {
             // which is a gap of zero rather than an underflow.
             Some(f) if r.start.saturating_sub(f.span.end) < gap => {
                 f.span.end = f.span.end.max(r.end);
-                f.serves.push(i);
+                f.serves.push((i, r.clone()));
             }
             _ => out.push(Fetch {
                 span: r.clone(),
-                serves: vec![i],
+                serves: vec![(i, r.clone())],
             }),
         }
     }
@@ -50,6 +52,7 @@ pub fn coalesce(ranges: &[Range<u64>], gap: u64) -> Vec<Fetch> {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::single_range_in_vec_init,
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
@@ -73,7 +76,11 @@ mod tests {
         // 0..100 then 10..20: `start - end` would underflow on unsigned arithmetic.
         let plan = coalesce(&[0..100, 10..20], 4);
         assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].span, 0..100, "the span must not shrink");
+        assert_eq!(
+            plan.first().map(|f| f.span.clone()),
+            Some(0..100),
+            "the span must not shrink"
+        );
     }
 
     #[test]

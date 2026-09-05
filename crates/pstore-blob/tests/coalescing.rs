@@ -26,7 +26,7 @@ async fn coalescing_merges_ranges_closer_than_the_gap() {
     // Three ranges separated by 4-byte gaps, threshold 16: one request.
     let plan = coalesce(&[0..10, 14..20, 24..30], 16);
     assert_eq!(plan.len(), 1, "expected one merged fetch, got {plan:?}");
-    assert_eq!(plan[0].span, 0..30);
+    assert_eq!(plan.first().map(|f| f.span.clone()), Some(0..30));
 }
 
 #[tokio::test]
