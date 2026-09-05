@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace >= with < in Engine<S>::fold
+@@ -182,17 +182,17 @@
+         let flushed = *self
+             .seq
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+ 
+         for attempt in 0..MAX_COMMIT_ATTEMPTS {
+             let at = head::read(&*self.store, self.tenant).await?;
+             let from = at.head.watermarks.get(&self.lane.0).copied().unwrap_or(0);
+-            if from >= flushed.0 {
++            if from < /* ~ changed by cargo-mutants ~ */ flushed.0 {
+                 // Nothing of ours is unfolded. Another committer may have moved the epoch
+                 // on, which is not our concern.
+                 return Ok(at.head.epoch);
+             }
+ 
+             // Every unfolded bundle in this lane, fetched together: the sequence numbers
+             // are dense and derived, so there is nothing to discover and nothing to list.
+             let keys: Vec<Key> = (from..flushed.0).map(|n| self.lane_key(Seq(n))).collect();

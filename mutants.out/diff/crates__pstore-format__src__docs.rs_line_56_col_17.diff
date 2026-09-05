@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/docs.rs
++++ delete match arm 0 in decode_docs
+@@ -48,17 +48,17 @@
+         for _ in 0..dims {
+             vector.push(d.f32()?);
+         }
+         let an = d.u32()? as usize;
+         let mut attrs = BTreeMap::new();
+         for _ in 0..an {
+             let k = d.string()?;
+             let v = match d.u8()? {
+-                0 => Value::Int(d.i64()?),
++                 /* ~ changed by cargo-mutants ~ */
+                 1 => Value::Str(d.string()?),
+                 _ => return Err(FormatError::Corrupt("unknown value tag")),
+             };
+             attrs.insert(k, v);
+         }
+         out.push(Document { id, vector, attrs });
+     }
+     Ok(out)

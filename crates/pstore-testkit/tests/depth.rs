@@ -78,3 +78,25 @@ async fn get_ranges_fans_out_rather_than_looping() {
     );
     assert_eq!(s.depth(), 1, "but they must cost ONE round trip");
 }
+
+#[tokio::test]
+async fn the_depth_decorator_forwards_the_whole_contract() {
+    // A decorator that drops or mangles a method is invisible until something above it
+    // depends on that method -- and this one wraps every measurement we take, so a
+    // mistake here would corrupt the numbers rather than fail loudly.
+    let s = DepthCounting::new(MemoryStore::new());
+    let r = pstore_testkit::conformance::run(&s, 500).await;
+    assert!(r.conforms(), "divergences: {:?}", r.divergences());
+    assert!(s.requests() > 0);
+    assert_eq!(s.capabilities().backend, "memory(Monotonic)");
+}
+
+#[tokio::test]
+async fn reset_clears_both_counters() {
+    let s = DepthCounting::new(MemoryStore::new());
+    s.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    assert!(s.requests() > 0 && s.depth() > 0);
+    s.reset();
+    assert_eq!(s.requests(), 0);
+    assert_eq!(s.depth(), 0);
+}

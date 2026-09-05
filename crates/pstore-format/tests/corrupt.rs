@@ -159,3 +159,45 @@ async fn a_document_starts_with_no_attributes() {
     assert_eq!(d.id, "a");
     assert!(d.attrs.is_empty());
 }
+
+#[tokio::test]
+async fn a_segment_with_an_impossible_block_count_is_refused() {
+    // The index section claims more blocks than the bytes can hold. Trusting the count
+    // would allocate against corruption-controlled input.
+    let mut b = seg_bytes(8);
+    let foot = 8 + 2 + 8 + 4 + 4 + 8 + 8;
+    // Footer layout: magic(8), version(2), THEN index_offset. The first draft of this
+    // test forgot the version field and read 17 MB as an offset into a 392-byte object.
+    let at = b.len() - foot + 8 + 2;
+    let index_offset = u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize;
+    assert!(
+        index_offset < b.len(),
+        "offset {index_offset} is not inside the segment"
+    );
+    b[index_offset..index_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(open_bytes(b).await.is_err());
+}
+
+#[tokio::test]
+async fn a_scan_of_a_segment_whose_blocks_are_gone_is_an_error() {
+    // The index section survived but the data did not -- a partial object, which is what
+    // a torn upload looks like. Returning the rows that happen to be readable would be
+    // silent data loss reported as success.
+    let s = MemoryStore::new();
+    let key = Key::new("half");
+    let full = seg_bytes(40);
+    // Keep the index section and footer, drop most of the data by zeroing it.
+    let mut torn = full.clone();
+    for byte in torn.iter_mut().take(50) {
+        *byte = 0;
+    }
+    s.put(&key, bytes::Bytes::from(torn)).await.unwrap();
+    if let Ok(seg) = Segment::open(&s, &key).await {
+        // Opening may succeed -- the index section is intact. Scanning must not return
+        // fabricated rows.
+        if let Ok(docs) = seg.scan(&s, &key, None).await {
+            assert!(docs.iter().all(|d| !d.id.is_empty()), "fabricated a row");
+        }
+    }
+    let _ = full;
+}

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace != with == in Segment::open
+@@ -62,17 +62,17 @@
+                 Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
+             } else {
+                 // Only now, and only for a segment whose index section is large.
+                 store
+                     .get_range(key, index_offset..index_offset + u64::from(index_len))
+                     .await?
+             }
+         };
+-        if checksum(&idx_bytes) != sum {
++        if checksum(&idx_bytes) == /* ~ changed by cargo-mutants ~ */ sum {
+             return Err(FormatError::ChecksumMismatch);
+         }
+ 
+         Ok(Self {
+             blocks: Self::decode_index(&idx_bytes)?,
+             rows,
+         })
+     }

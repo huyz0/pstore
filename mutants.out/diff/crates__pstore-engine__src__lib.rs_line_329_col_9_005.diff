@@ -1,0 +1,36 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::search -> Result<Vec<(String, f32)>, EngineError> with Ok(vec![("xyzzy".into(), 1.0)])
+@@ -321,32 +321,17 @@
+     /// Exact k-nearest neighbours across everything the index contains.
+     pub async fn search(
+         &self,
+         index: &str,
+         query: &[f32],
+         k: usize,
+         filter: Option<&Filter>,
+     ) -> Result<Vec<(String, f32)>, EngineError> {
+-        let docs = self.scan(index, filter).await?;
+-        let mut scored: Vec<(String, f32)> = docs
+-            .into_iter()
+-            .map(|d| {
+-                let dist = d
+-                    .vector
+-                    .iter()
+-                    .zip(query)
+-                    .map(|(a, b)| (a - b) * (a - b))
+-                    .sum::<f32>();
+-                (d.id, dist)
+-            })
+-            .collect();
+-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-        scored.truncate(k);
+-        Ok(scored)
++        Ok(vec![("xyzzy".into(), 1.0)]) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Sets how far this lane has been flushed, so a successor can replay a predecessor's
+     /// bundles.
+     ///
+     /// ⚠️ A stand-in. In production a successor discovers the tail by forward-probing the
+     /// lane and reading the per-shard lane bitmap — neither of which exists until M2 — so
+     /// M1 injects the watermark rather than pretending discovery is solved.

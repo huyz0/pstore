@@ -1,0 +1,25 @@
+--- crates/pstore-format/src/codec.rs
++++ replace Dec<'a>::u16 -> Result<u16, FormatError> with Ok(1)
+@@ -64,21 +64,17 @@
+         self.pos = end;
+         Ok(out)
+     }
+ 
+     pub(crate) fn u8(&mut self) -> Result<u8, FormatError> {
+         self.take(1)?.first().copied().ok_or(FormatError::Truncated)
+     }
+     pub(crate) fn u16(&mut self) -> Result<u16, FormatError> {
+-        Ok(u16::from_le_bytes(
+-            self.take(2)?
+-                .try_into()
+-                .map_err(|_| FormatError::Truncated)?,
+-        ))
++        Ok(1) /* ~ changed by cargo-mutants ~ */
+     }
+     pub(crate) fn u32(&mut self) -> Result<u32, FormatError> {
+         Ok(u32::from_le_bytes(
+             self.take(4)?
+                 .try_into()
+                 .map_err(|_| FormatError::Truncated)?,
+         ))
+     }

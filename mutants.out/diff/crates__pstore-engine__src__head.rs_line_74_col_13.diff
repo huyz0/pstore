@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/head.rs
++++ delete field epoch from struct Self expression in Head::decode
+@@ -66,17 +66,17 @@
+         }
+         out
+     }
+ 
+     /// Decodes HEAD, refusing anything malformed.
+     pub fn decode(buf: &[u8]) -> Result<Self, EngineError> {
+         let mut c = Cur { b: buf, i: 0 };
+         let mut h = Self {
+-            epoch: Epoch(c.u64()?),
++             /* ~ changed by cargo-mutants ~ */
+             nonce: c.u64()?,
+             ..Self::default()
+         };
+         for _ in 0..c.u32()? {
+             let name = c.string()?;
+             let n = c.u32()?;
+             let mut segs = Vec::with_capacity(n as usize);
+             for _ in 0..n {

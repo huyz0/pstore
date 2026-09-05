@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::fold
+@@ -249,17 +249,17 @@
+                     self.mem().durable.clear();
+                     *self
+                         .committed
+                         .lock()
+                         .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+                     return Ok(epoch);
+                 }
+                 Err(EngineError::Lost | EngineError::Contended)
+-                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
++                    if true /* ~ changed by cargo-mutants ~ */ =>
+                 {
+                     // ⚠️ Backoff, and jittered. Without it, optimistic concurrency
+                     // LIVELOCKS: every loser retries immediately, collides with the same
+                     // peers, and loses again. It showed up here as a flaky test rather
+                     // than a failing one, which is the more expensive way to find out.
+                     // The jitter is derived from the lane so two writers never wake
+                     // together, and needs no clock or randomness to be reproducible.
+                     let base = 1u64 << attempt.min(6);

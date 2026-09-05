@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 5.4693755379999995,
+          "duration": 6.018261185,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -23,7 +23,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.401404213,
+          "duration": 0.351660479,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -77,7 +77,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.206837397,
+          "duration": 0.201056964,
           "process_status": {
             "Failure": 101
           },
@@ -132,7 +132,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.204691574,
+          "duration": 0.203135727,
           "process_status": {
             "Failure": 101
           },
@@ -187,7 +187,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151330855,
+          "duration": 0.150944793,
           "process_status": {
             "Failure": 101
           },
@@ -242,7 +242,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.554845389,
+          "duration": 0.552626672,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -255,7 +255,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050655439,
+          "duration": 0.050653382,
           "process_status": {
             "Failure": 101
           },
@@ -309,7 +309,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451628695,
+          "duration": 0.451563778,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -322,7 +322,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05062493,
+          "duration": 0.050613951,
           "process_status": {
             "Failure": 101
           },
@@ -376,7 +376,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501458039,
+          "duration": 0.505551212,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -389,7 +389,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050631398,
+          "duration": 0.050583413,
           "process_status": {
             "Failure": 101
           },
@@ -443,7 +443,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502938028,
+          "duration": 0.502044542,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -456,7 +456,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050866262,
+          "duration": 0.050871506,
           "process_status": {
             "Failure": 101
           },
@@ -510,7 +510,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201411859,
+          "duration": 0.15117623,
           "process_status": {
             "Failure": 101
           },
@@ -565,7 +565,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.15095967,
+          "duration": 0.150906509,
           "process_status": {
             "Failure": 101
           },
@@ -620,7 +620,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151054827,
+          "duration": 0.15087021,
           "process_status": {
             "Failure": 101
           },
@@ -675,7 +675,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150824135,
+          "duration": 0.150803158,
           "process_status": {
             "Failure": 101
           },
@@ -730,7 +730,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502195389,
+          "duration": 0.502479809,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -743,7 +743,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050796126,
+          "duration": 0.051058566,
           "process_status": {
             "Failure": 101
           },
@@ -797,7 +797,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451575871,
+          "duration": 0.451590135,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -810,7 +810,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050836307,
+          "duration": 0.050806837,
           "process_status": {
             "Failure": 101
           },
@@ -864,7 +864,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.404325475,
+          "duration": 0.401504962,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -877,7 +877,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050626632,
+          "duration": 0.050599966,
           "process_status": {
             "Failure": 101
           },
@@ -931,7 +931,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.402423678,
+          "duration": 0.401355051,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -944,7 +944,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05066224,
+          "duration": 0.050640377,
           "process_status": {
             "Failure": 101
           },
@@ -998,7 +998,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 5.475601416,
+          "duration": 5.3701333479999995,
           "process_status": {
             "Failure": 101
           },
@@ -1053,7 +1053,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351251176,
+          "duration": 0.351236475,
           "process_status": {
             "Failure": 101
           },
@@ -1108,7 +1108,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401730458,
+          "duration": 0.401432374,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1121,7 +1121,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050680944,
+          "duration": 0.050721858,
           "process_status": {
             "Failure": 101
           },
@@ -1175,7 +1175,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.50164799,
+          "duration": 0.451569377,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1188,7 +1188,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051199759,
+          "duration": 0.051228835,
           "process_status": {
             "Failure": 101
           },
@@ -1242,7 +1242,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.254894324,
+          "duration": 1.104583163,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1255,75 +1255,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050615782,
+          "duration": 0.050887572,
           "process_status": {
             "Failure": 101
           },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/accounting.rs:123:9: replace <impl crate::BlobStore for TenantView<S>>::get_tag -> Option<pstore_types::CasTag> with None",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/accounting.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for TenantView<S>>::get_tag",
-            "return_type": "-> Option<pstore_types::CasTag>",
-            "span": {
-              "start": {
-                "line": 122,
-                "column": 5
-              },
-              "end": {
-                "line": 125,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 123,
-              "column": 9
-            },
-            "end": {
-              "line": 124,
-              "column": 38
-            }
-          },
-          "replacement": "None",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__pstore-blob__src__accounting.rs_line_123_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__accounting.rs_line_123_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.655166146,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.150873631,
-          "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -1374,7 +1309,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150898853,
+          "duration": 0.100640609,
           "process_status": {
             "Failure": 101
           },
@@ -1382,6 +1317,71 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/accounting.rs:123:9: replace <impl crate::BlobStore for TenantView<S>>::get_tag -> Option<pstore_types::CasTag> with None",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/accounting.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for TenantView<S>>::get_tag",
+            "return_type": "-> Option<pstore_types::CasTag>",
+            "span": {
+              "start": {
+                "line": 122,
+                "column": 5
+              },
+              "end": {
+                "line": 125,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 123,
+              "column": 9
+            },
+            "end": {
+              "line": 124,
+              "column": 38
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__pstore-blob__src__accounting.rs_line_123_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__accounting.rs_line_123_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.556317205,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.150809803,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -1429,7 +1429,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.557622377,
+          "duration": 0.510144341,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1442,7 +1442,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101227048,
+          "duration": 0.050646776,
           "process_status": {
             "Failure": 101
           },
@@ -1496,7 +1496,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.605582987,
+          "duration": 0.501619255,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1509,7 +1509,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050662469,
+          "duration": 0.050590598,
           "process_status": {
             "Failure": 101
           },
@@ -1563,7 +1563,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151133527,
+          "duration": 0.150884997,
           "process_status": {
             "Failure": 101
           },
@@ -1618,7 +1618,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151099062,
+          "duration": 0.15074164,
           "process_status": {
             "Failure": 101
           },
@@ -1626,71 +1626,6 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/accounting.rs:148:9: replace <impl crate::BlobStore for TenantView<S>>::delete_batch -> Result<(), BlobError> with Ok(())",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/accounting.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for TenantView<S>>::delete_batch",
-            "return_type": "-> Result<(), BlobError>",
-            "span": {
-              "start": {
-                "line": 147,
-                "column": 5
-              },
-              "end": {
-                "line": 150,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 148,
-              "column": 9
-            },
-            "end": {
-              "line": 149,
-              "column": 44
-            }
-          },
-          "replacement": "Ok(())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__pstore-blob__src__accounting.rs_line_148_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__accounting.rs_line_148_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.452388276,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.151241423,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -1738,7 +1673,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501860812,
+          "duration": 0.502669034,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1751,10 +1686,75 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050672398,
+          "duration": 0.050617426,
           "process_status": {
             "Failure": 101
           },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/accounting.rs:148:9: replace <impl crate::BlobStore for TenantView<S>>::delete_batch -> Result<(), BlobError> with Ok(())",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/accounting.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for TenantView<S>>::delete_batch",
+            "return_type": "-> Result<(), BlobError>",
+            "span": {
+              "start": {
+                "line": 147,
+                "column": 5
+              },
+              "end": {
+                "line": 150,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 148,
+              "column": 9
+            },
+            "end": {
+              "line": 149,
+              "column": 44
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__pstore-blob__src__accounting.rs_line_148_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__accounting.rs_line_148_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.505035679,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.150919759,
+          "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -1805,7 +1805,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100642387,
+          "duration": 0.100666377,
           "process_status": {
             "Failure": 101
           },
@@ -1860,7 +1860,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150890652,
+          "duration": 0.150914299,
           "process_status": {
             "Failure": 101
           },
@@ -1915,7 +1915,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502240644,
+          "duration": 0.501610165,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1928,7 +1928,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051114671,
+          "duration": 0.050646515,
           "process_status": {
             "Failure": 101
           },
@@ -1982,7 +1982,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501782545,
+          "duration": 0.501573722,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1995,7 +1995,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050760897,
+          "duration": 0.050658068,
           "process_status": {
             "Failure": 101
           },
@@ -2049,7 +2049,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.554034463,
+          "duration": 0.552218498,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2062,7 +2062,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050676248,
+          "duration": 0.051092029,
           "process_status": {
             "Failure": 101
           },
@@ -2116,7 +2116,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502059206,
+          "duration": 0.50469383,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2129,7 +2129,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050605298,
+          "duration": 0.050597896,
           "process_status": {
             "Failure": 101
           },
@@ -2183,7 +2183,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454154945,
+          "duration": 0.401948668,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2196,7 +2196,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051016057,
+          "duration": 0.051053566,
           "process_status": {
             "Failure": 101
           },
@@ -2250,7 +2250,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501630111,
+          "duration": 0.505647469,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2263,7 +2263,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050738182,
+          "duration": 0.050707896,
           "process_status": {
             "Failure": 101
           },
@@ -2317,7 +2317,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452010661,
+          "duration": 0.451729899,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2330,7 +2330,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050798454,
+          "duration": 0.051112533,
           "process_status": {
             "Failure": 101
           },
@@ -2384,7 +2384,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.50248103,
+          "duration": 0.452948308,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2397,7 +2397,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051002736,
+          "duration": 0.05072379,
           "process_status": {
             "Failure": 101
           },
@@ -2451,7 +2451,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452287703,
+          "duration": 0.452404642,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2464,7 +2464,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050666314,
+          "duration": 0.051044429,
           "process_status": {
             "Failure": 101
           },
@@ -2518,7 +2518,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451638663,
+          "duration": 0.451772293,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2531,7 +2531,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101259909,
+          "duration": 0.100754985,
           "process_status": {
             "Failure": 101
           },
@@ -2585,7 +2585,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451743388,
+          "duration": 0.451551416,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2598,7 +2598,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100746776,
+          "duration": 0.100839738,
           "process_status": {
             "Failure": 101
           },
@@ -2652,7 +2652,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401482036,
+          "duration": 0.401501033,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2665,7 +2665,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100730739,
+          "duration": 0.100759892,
           "process_status": {
             "Failure": 101
           },
@@ -2719,7 +2719,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451640829,
+          "duration": 0.403680136,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2732,7 +2732,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100708971,
+          "duration": 0.100813583,
           "process_status": {
             "Failure": 101
           },
@@ -2786,7 +2786,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.504275963,
+          "duration": 0.505318038,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2799,7 +2799,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101675367,
+          "duration": 0.101520243,
           "process_status": {
             "Failure": 101
           },
@@ -2853,7 +2853,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451882538,
+          "duration": 0.451635814,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2866,7 +2866,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150987688,
+          "duration": 0.150975516,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2918,7 +2918,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.504044583,
+          "duration": 0.45188425,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2931,7 +2931,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100769313,
+          "duration": 0.100779187,
           "process_status": {
             "Failure": 101
           },
@@ -2985,7 +2985,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502657132,
+          "duration": 0.501983091,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2998,7 +2998,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100751213,
+          "duration": 0.10098374,
           "process_status": {
             "Failure": 101
           },
@@ -3052,7 +3052,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452472783,
+          "duration": 0.451916569,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3065,7 +3065,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101316835,
+          "duration": 0.100854983,
           "process_status": {
             "Failure": 101
           },
@@ -3119,7 +3119,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501764966,
+          "duration": 0.454692224,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3132,7 +3132,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151257253,
+          "duration": 0.151027327,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3184,7 +3184,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45240154,
+          "duration": 0.451700735,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3197,7 +3197,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100851711,
+          "duration": 0.100758748,
           "process_status": {
             "Failure": 101
           },
@@ -3251,7 +3251,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.301554615,
+          "duration": 0.302552281,
           "process_status": {
             "Failure": 101
           },
@@ -3306,7 +3306,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401520765,
+          "duration": 0.401856063,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3319,7 +3319,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100738584,
+          "duration": 0.100746669,
           "process_status": {
             "Failure": 101
           },
@@ -3373,7 +3373,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100810216,
+          "duration": 0.100729613,
           "process_status": {
             "Failure": 101
           },
@@ -3381,73 +3381,6 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/congestion.rs:123:9: replace <impl crate::BlobStore for Congested<S>>::get -> Result<Bytes, BlobError> with Ok(Default::default())",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/congestion.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for Congested<S>>::get",
-            "return_type": "-> Result<Bytes, BlobError>",
-            "span": {
-              "start": {
-                "line": 122,
-                "column": 5
-              },
-              "end": {
-                "line": 124,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 123,
-              "column": 9
-            },
-            "end": {
-              "line": 123,
-              "column": 54
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_123_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_123_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.451378438,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.050571496,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -3495,7 +3428,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501763295,
+          "duration": 0.451450454,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3508,7 +3441,139 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151222462,
+          "duration": 0.154542139,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/congestion.rs:123:9: replace <impl crate::BlobStore for Congested<S>>::get -> Result<Bytes, BlobError> with Ok(Default::default())",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/congestion.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for Congested<S>>::get",
+            "return_type": "-> Result<Bytes, BlobError>",
+            "span": {
+              "start": {
+                "line": 122,
+                "column": 5
+              },
+              "end": {
+                "line": 124,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 123,
+              "column": 9
+            },
+            "end": {
+              "line": 123,
+              "column": 54
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_123_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_123_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.453646676,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.050728808,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/congestion.rs:132:9: replace <impl crate::BlobStore for Congested<S>>::get_tag -> Option<pstore_types::CasTag> with None",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/congestion.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for Congested<S>>::get_tag",
+            "return_type": "-> Option<pstore_types::CasTag>",
+            "span": {
+              "start": {
+                "line": 131,
+                "column": 5
+              },
+              "end": {
+                "line": 133,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 132,
+              "column": 9
+            },
+            "end": {
+              "line": 132,
+              "column": 38
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_132_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_132_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.501928554,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.150836489,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3560,7 +3625,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.503097166,
+          "duration": 0.553745553,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3573,72 +3638,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150791536,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/congestion.rs:132:9: replace <impl crate::BlobStore for Congested<S>>::get_tag -> Option<pstore_types::CasTag> with None",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/congestion.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for Congested<S>>::get_tag",
-            "return_type": "-> Option<pstore_types::CasTag>",
-            "span": {
-              "start": {
-                "line": 131,
-                "column": 5
-              },
-              "end": {
-                "line": 133,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 132,
-              "column": 9
-            },
-            "end": {
-              "line": 132,
-              "column": 38
-            }
-          },
-          "replacement": "None",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_132_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_132_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.552080511,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.150917454,
+          "duration": 0.150744972,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3690,7 +3690,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150793771,
+          "duration": 0.151196969,
           "process_status": {
             "Failure": 101
           },
@@ -3745,7 +3745,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451516232,
+          "duration": 0.50208299,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3758,7 +3758,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151708981,
+          "duration": 0.151244991,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3810,7 +3810,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.50141129,
+          "duration": 0.454606457,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3823,7 +3823,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150856766,
+          "duration": 0.150905496,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3875,7 +3875,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150888637,
+          "duration": 0.150794678,
           "process_status": {
             "Failure": 101
           },
@@ -3930,7 +3930,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150818902,
+          "duration": 0.150917556,
           "process_status": {
             "Failure": 101
           },
@@ -3985,7 +3985,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451388266,
+          "duration": 0.451876997,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3998,7 +3998,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151030473,
+          "duration": 0.151340178,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/congestion.rs:161:9: replace <impl crate::BlobStore for Congested<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/congestion.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for Congested<S>>::list_unrestricted",
+            "return_type": "-> Result<Vec<Key>, BlobError>",
+            "span": {
+              "start": {
+                "line": 160,
+                "column": 5
+              },
+              "end": {
+                "line": 163,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 161,
+              "column": 9
+            },
+            "end": {
+              "line": 162,
+              "column": 19
+            }
+          },
+          "replacement": "Ok(vec![])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_161_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_161_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.50228802,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.150850586,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4050,7 +4115,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150775729,
+          "duration": 0.150738288,
           "process_status": {
             "Failure": 101
           },
@@ -4058,71 +4123,6 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/congestion.rs:161:9: replace <impl crate::BlobStore for Congested<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/congestion.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for Congested<S>>::list_unrestricted",
-            "return_type": "-> Result<Vec<Key>, BlobError>",
-            "span": {
-              "start": {
-                "line": 160,
-                "column": 5
-              },
-              "end": {
-                "line": 163,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 161,
-              "column": 9
-            },
-            "end": {
-              "line": 162,
-              "column": 19
-            }
-          },
-          "replacement": "Ok(vec![])",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__pstore-blob__src__congestion.rs_line_161_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__congestion.rs_line_161_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.502370121,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.150786035,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -4170,7 +4170,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502053615,
+          "duration": 0.501814135,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4183,7 +4183,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151241565,
+          "duration": 0.15101324,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4235,7 +4235,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.553288133,
+          "duration": 0.55175138,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4248,74 +4248,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100639628,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with 1.0",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/faulty.rs",
-          "function": {
-            "function_name": "Inner::next_f64",
-            "return_type": "-> f64",
-            "span": {
-              "start": {
-                "line": 52,
-                "column": 5
-              },
-              "end": {
-                "line": 60,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 53,
-              "column": 9
-            },
-            "end": {
-              "line": 59,
-              "column": 51
-            }
-          },
-          "replacement": "1.0",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_53_col_9_001.log",
-      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_53_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.505394196,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.0505417,
+          "duration": 0.10084009,
           "process_status": {
             "Failure": 101
           },
@@ -4369,7 +4302,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452837976,
+          "duration": 0.451321868,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4382,7 +4315,74 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100920222,
+          "duration": 0.100665913,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with 1.0",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/faulty.rs",
+          "function": {
+            "function_name": "Inner::next_f64",
+            "return_type": "-> f64",
+            "span": {
+              "start": {
+                "line": 52,
+                "column": 5
+              },
+              "end": {
+                "line": 60,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 53,
+              "column": 9
+            },
+            "end": {
+              "line": 59,
+              "column": 51
+            }
+          },
+          "replacement": "1.0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_53_col_9_001.log",
+      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_53_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.554198673,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.050755573,
           "process_status": {
             "Failure": 101
           },
@@ -4436,7 +4436,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.554037164,
+          "duration": 0.506183985,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4449,7 +4449,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151019594,
+          "duration": 0.151251166,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4501,7 +4501,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.55155322,
+          "duration": 0.502631811,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4514,7 +4514,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150916789,
+          "duration": 0.15069544,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4566,7 +4566,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.46035679,
+          "duration": 0.451406488,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4579,7 +4579,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150851866,
+          "duration": 0.150920969,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4631,7 +4631,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501642904,
+          "duration": 0.451413978,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4644,7 +4644,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150779033,
+          "duration": 0.150691526,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4696,7 +4696,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451934419,
+          "duration": 0.451406984,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4709,7 +4709,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151304693,
+          "duration": 0.15090156,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4761,7 +4761,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451515441,
+          "duration": 0.451554128,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4774,72 +4774,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150726748,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/faulty.rs:57:11: replace ^= with |= in Inner::next_f64",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/faulty.rs",
-          "function": {
-            "function_name": "Inner::next_f64",
-            "return_type": "-> f64",
-            "span": {
-              "start": {
-                "line": 52,
-                "column": 5
-              },
-              "end": {
-                "line": 60,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 57,
-              "column": 11
-            },
-            "end": {
-              "line": 57,
-              "column": 13
-            }
-          },
-          "replacement": "|=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_57_col_11.log",
-      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_57_col_11.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.454832505,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.150917427,
+          "duration": 0.150815066,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4891,7 +4826,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454159537,
+          "duration": 0.451434666,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4904,10 +4839,75 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100697208,
+          "duration": 0.100666508,
           "process_status": {
             "Failure": 101
           },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/faulty.rs:57:11: replace ^= with |= in Inner::next_f64",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/faulty.rs",
+          "function": {
+            "function_name": "Inner::next_f64",
+            "return_type": "-> f64",
+            "span": {
+              "start": {
+                "line": 52,
+                "column": 5
+              },
+              "end": {
+                "line": 60,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 57,
+              "column": 11
+            },
+            "end": {
+              "line": 57,
+              "column": 13
+            }
+          },
+          "replacement": "|=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_57_col_11.log",
+      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_57_col_11.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.451939724,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.150808268,
+          "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -4958,7 +4958,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.507584762,
+          "duration": 0.466100155,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4971,7 +4971,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050559414,
+          "duration": 0.050656564,
           "process_status": {
             "Failure": 101
           },
@@ -5025,7 +5025,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501691707,
+          "duration": 0.454644558,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5038,7 +5038,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150873433,
+          "duration": 0.150792055,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5090,7 +5090,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451985356,
+          "duration": 0.451322938,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5103,7 +5103,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10131316,
+          "duration": 0.0509285,
           "process_status": {
             "Failure": 101
           },
@@ -5157,7 +5157,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501802488,
+          "duration": 0.45176823,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5170,7 +5170,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050667216,
+          "duration": 0.050608003,
           "process_status": {
             "Failure": 101
           },
@@ -5224,7 +5224,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452096564,
+          "duration": 0.452056439,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5237,74 +5237,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101497538,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/faulty.rs:85:9: replace Faulty<S>::set_faults with ()",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/faulty.rs",
-          "function": {
-            "function_name": "Faulty<S>::set_faults",
-            "return_type": "",
-            "span": {
-              "start": {
-                "line": 83,
-                "column": 5
-              },
-              "end": {
-                "line": 86,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 85,
-              "column": 9
-            },
-            "end": {
-              "line": 85,
-              "column": 37
-            }
-          },
-          "replacement": "()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_85_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_85_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.50576273,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.100763485,
+          "duration": 0.051123841,
           "process_status": {
             "Failure": 101
           },
@@ -5358,7 +5291,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150791992,
+          "duration": 0.150865587,
           "process_status": {
             "Failure": 101
           },
@@ -5366,6 +5299,73 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/faulty.rs:85:9: replace Faulty<S>::set_faults with ()",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/faulty.rs",
+          "function": {
+            "function_name": "Faulty<S>::set_faults",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 83,
+                "column": 5
+              },
+              "end": {
+                "line": 86,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 85,
+              "column": 9
+            },
+            "end": {
+              "line": 85,
+              "column": 37
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_85_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_85_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.502827119,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.100774835,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -5413,7 +5413,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150891737,
+          "duration": 0.151312556,
           "process_status": {
             "Failure": 101
           },
@@ -5468,7 +5468,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150873117,
+          "duration": 0.150773504,
           "process_status": {
             "Failure": 101
           },
@@ -5523,7 +5523,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151102685,
+          "duration": 0.150903424,
           "process_status": {
             "Failure": 101
           },
@@ -5578,7 +5578,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501501366,
+          "duration": 0.451752559,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5591,7 +5591,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.102435956,
+          "duration": 0.100833984,
           "process_status": {
             "Failure": 101
           },
@@ -5645,7 +5645,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501536937,
+          "duration": 0.502832181,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5658,7 +5658,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050645648,
+          "duration": 0.050654191,
           "process_status": {
             "Failure": 101
           },
@@ -5712,7 +5712,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452762959,
+          "duration": 0.401436787,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5725,7 +5725,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100997445,
+          "duration": 0.100895045,
           "process_status": {
             "Failure": 101
           },
@@ -5779,7 +5779,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451898713,
+          "duration": 0.451444168,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5792,7 +5792,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050642303,
+          "duration": 0.050672703,
           "process_status": {
             "Failure": 101
           },
@@ -5846,7 +5846,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451365372,
+          "duration": 0.405039431,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5859,7 +5859,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101026452,
+          "duration": 0.102627086,
           "process_status": {
             "Failure": 101
           },
@@ -5913,7 +5913,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502383432,
+          "duration": 0.45213737,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5926,7 +5926,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10066376,
+          "duration": 0.100771855,
           "process_status": {
             "Failure": 101
           },
@@ -5980,7 +5980,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150986292,
+          "duration": 0.151027587,
           "process_status": {
             "Failure": 101
           },
@@ -6035,7 +6035,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451403018,
+          "duration": 0.451802831,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6048,7 +6048,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050759509,
+          "duration": 0.050954705,
           "process_status": {
             "Failure": 101
           },
@@ -6102,7 +6102,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501815349,
+          "duration": 0.451725091,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6115,7 +6115,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101170676,
+          "duration": 0.101293057,
           "process_status": {
             "Failure": 101
           },
@@ -6169,7 +6169,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501841762,
+          "duration": 0.501729277,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6182,7 +6182,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050721872,
+          "duration": 0.050695844,
           "process_status": {
             "Failure": 101
           },
@@ -6236,7 +6236,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.455616351,
+          "duration": 0.45330716,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6249,7 +6249,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101848532,
+          "duration": 0.100752309,
           "process_status": {
             "Failure": 101
           },
@@ -6303,7 +6303,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451604024,
+          "duration": 0.454153024,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6316,7 +6316,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150887888,
+          "duration": 0.150986224,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6368,7 +6368,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401512637,
+          "duration": 0.401502038,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6381,7 +6381,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10071318,
+          "duration": 0.100719994,
           "process_status": {
             "Failure": 101
           },
@@ -6435,7 +6435,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.40153919,
+          "duration": 0.401451422,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6448,7 +6448,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101205905,
+          "duration": 0.100800884,
           "process_status": {
             "Failure": 101
           },
@@ -6502,7 +6502,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454710708,
+          "duration": 0.402483573,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6515,7 +6515,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150945421,
+          "duration": 0.150920591,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6567,7 +6567,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401435323,
+          "duration": 0.452824885,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6580,7 +6580,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100693838,
+          "duration": 0.100957507,
           "process_status": {
             "Failure": 101
           },
@@ -6634,7 +6634,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401794558,
+          "duration": 0.401720722,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6647,7 +6647,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101227415,
+          "duration": 0.101488953,
           "process_status": {
             "Failure": 101
           },
@@ -6701,7 +6701,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150897297,
+          "duration": 0.200896928,
           "process_status": {
             "Failure": 101
           },
@@ -6756,7 +6756,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501510404,
+          "duration": 0.452990109,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6769,7 +6769,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150778337,
+          "duration": 0.150945169,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6821,7 +6821,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.402651225,
+          "duration": 0.401339631,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6834,7 +6834,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151272791,
+          "duration": 0.151035199,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6886,7 +6886,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501493782,
+          "duration": 0.504008348,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6899,7 +6899,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100860228,
+          "duration": 0.100763411,
           "process_status": {
             "Failure": 101
           },
@@ -6953,7 +6953,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.402217987,
+          "duration": 0.40154211,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6966,7 +6966,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.15094939,
+          "duration": 0.201509798,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7018,7 +7018,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452061895,
+          "duration": 0.451866977,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7031,7 +7031,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100759547,
+          "duration": 0.101174609,
           "process_status": {
             "Failure": 101
           },
@@ -7085,7 +7085,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401493505,
+          "duration": 0.502018655,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7098,7 +7098,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.201086034,
+          "duration": 0.201592442,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7150,7 +7150,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454303069,
+          "duration": 0.553244253,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7163,7 +7163,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150819736,
+          "duration": 0.151018474,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7215,7 +7215,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.40137791,
+          "duration": 0.402642443,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7228,7 +7228,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101131037,
+          "duration": 0.101267933,
           "process_status": {
             "Failure": 101
           },
@@ -7282,7 +7282,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45161534,
+          "duration": 0.45259066,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7295,7 +7295,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150970426,
+          "duration": 0.15092184,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7347,7 +7347,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.404151906,
+          "duration": 0.45184725,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7360,7 +7360,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150983899,
+          "duration": 0.151217483,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7412,7 +7412,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.40198361,
+          "duration": 0.451621681,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7425,7 +7425,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150895384,
+          "duration": 0.151017536,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7477,7 +7477,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201522286,
+          "duration": 0.201224221,
           "process_status": {
             "Failure": 101
           },
@@ -7532,7 +7532,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452992912,
+          "duration": 0.451697501,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7545,7 +7545,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100710102,
+          "duration": 0.100818985,
           "process_status": {
             "Failure": 101
           },
@@ -7599,7 +7599,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452676249,
+          "duration": 0.452034294,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7612,7 +7612,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101531665,
+          "duration": 0.101013487,
           "process_status": {
             "Failure": 101
           },
@@ -7666,7 +7666,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502665029,
+          "duration": 0.505251335,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7679,7 +7679,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100925492,
+          "duration": 0.100734044,
           "process_status": {
             "Failure": 101
           },
@@ -7733,7 +7733,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45201424,
+          "duration": 0.451392089,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7746,7 +7746,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151346913,
+          "duration": 0.201413897,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7798,7 +7798,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451305807,
+          "duration": 0.554524262,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7811,7 +7811,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100623637,
+          "duration": 0.100855098,
           "process_status": {
             "Failure": 101
           },
@@ -7865,7 +7865,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.4515025,
+          "duration": 0.452673796,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7878,7 +7878,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101376367,
+          "duration": 0.101051158,
           "process_status": {
             "Failure": 101
           },
@@ -7932,7 +7932,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452842161,
+          "duration": 0.505704793,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7945,7 +7945,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150827276,
+          "duration": 0.150862369,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7997,7 +7997,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451421356,
+          "duration": 0.451719291,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8010,74 +8010,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101167888,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/faulty.rs:133:27: replace + with * in Faulty<S>::cas_fault",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/faulty.rs",
-          "function": {
-            "function_name": "Faulty<S>::cas_fault",
-            "return_type": "-> Option<CasError>",
-            "span": {
-              "start": {
-                "line": 128,
-                "column": 5
-              },
-              "end": {
-                "line": 137,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 133,
-              "column": 27
-            },
-            "end": {
-              "line": 133,
-              "column": 28
-            }
-          },
-          "replacement": "*",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_133_col_27_001.log",
-      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_133_col_27_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.451362061,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.10071441,
+          "duration": 0.100841275,
           "process_status": {
             "Failure": 101
           },
@@ -8131,7 +8064,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150698179,
+          "duration": 0.20134399,
           "process_status": {
             "Failure": 101
           },
@@ -8139,6 +8072,73 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/faulty.rs:133:27: replace + with * in Faulty<S>::cas_fault",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/faulty.rs",
+          "function": {
+            "function_name": "Faulty<S>::cas_fault",
+            "return_type": "-> Option<CasError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 137,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 133,
+              "column": 27
+            },
+            "end": {
+              "line": 133,
+              "column": 28
+            }
+          },
+          "replacement": "*",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_133_col_27_001.log",
+      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_133_col_27_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.50292225,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.101024577,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -8186,7 +8186,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502176365,
+          "duration": 0.502287433,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8199,7 +8199,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051031817,
+          "duration": 0.101062964,
           "process_status": {
             "Failure": 101
           },
@@ -8253,7 +8253,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502717615,
+          "duration": 0.552450724,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8266,7 +8266,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150797233,
+          "duration": 0.150899779,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8318,7 +8318,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150825228,
+          "duration": 0.200962218,
           "process_status": {
             "Failure": 101
           },
@@ -8373,7 +8373,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.453150782,
+          "duration": 0.452392953,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8386,7 +8386,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150868187,
+          "duration": 0.150848931,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8438,7 +8438,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451687895,
+          "duration": 0.451587222,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8451,7 +8451,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150943643,
+          "duration": 0.15103189,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8503,62 +8503,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.152406643,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/faulty.rs:187:9: replace <impl crate::BlobStore for Faulty<S>>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/faulty.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for Faulty<S>>::put_conditional",
-            "return_type": "-> Result<PutOutcome, CasError>",
-            "span": {
-              "start": {
-                "line": 178,
-                "column": 5
-              },
-              "end": {
-                "line": 191,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 187,
-              "column": 9
-            },
-            "end": {
-              "line": 190,
-              "column": 10
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_187_col_9.log",
-      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_187_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.150790789,
+          "duration": 0.100755282,
           "process_status": {
             "Failure": 101
           },
@@ -8613,7 +8558,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.455943861,
+          "duration": 0.451537581,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8626,11 +8571,66 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150772264,
+          "duration": 0.150991363,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/faulty.rs:187:9: replace <impl crate::BlobStore for Faulty<S>>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/faulty.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for Faulty<S>>::put_conditional",
+            "return_type": "-> Result<PutOutcome, CasError>",
+            "span": {
+              "start": {
+                "line": 178,
+                "column": 5
+              },
+              "end": {
+                "line": 191,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 187,
+              "column": 9
+            },
+            "end": {
+              "line": 190,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__pstore-blob__src__faulty.rs_line_187_col_9.log",
+      "diff_path": "diff/crates__pstore-blob__src__faulty.rs_line_187_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.100758533,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -8678,7 +8678,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502072653,
+          "duration": 0.501687485,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8691,7 +8691,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150910156,
+          "duration": 0.150919518,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8743,7 +8743,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502954458,
+          "duration": 0.503853904,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8756,7 +8756,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.15072105,
+          "duration": 0.150835774,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8808,7 +8808,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150862812,
+          "duration": 0.151020727,
           "process_status": {
             "Failure": 101
           },
@@ -8863,7 +8863,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.607709523,
+          "duration": 0.551935265,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8876,7 +8876,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050942687,
+          "duration": 0.052676837,
           "process_status": {
             "Failure": 101
           },
@@ -8930,7 +8930,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.551699196,
+          "duration": 0.552571861,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8943,7 +8943,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.15081724,
+          "duration": 0.151026912,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8995,62 +8995,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201050319,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/memory.rs:75:9: replace MemoryStore::lock -> std::sync::MutexGuard<'_, State> with MutexGuard::from_iter([Default::default()])",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/memory.rs",
-          "function": {
-            "function_name": "MemoryStore::lock",
-            "return_type": "-> std::sync::MutexGuard<'_, State>",
-            "span": {
-              "start": {
-                "line": 72,
-                "column": 5
-              },
-              "end": {
-                "line": 78,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 75,
-              "column": 9
-            },
-            "end": {
-              "line": 77,
-              "column": 64
-            }
-          },
-          "replacement": "MutexGuard::from_iter([Default::default()])",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__pstore-blob__src__memory.rs_line_75_col_9_001.log",
-      "diff_path": "diff/crates__pstore-blob__src__memory.rs_line_75_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.151160848,
+          "duration": 0.201383044,
           "process_status": {
             "Failure": 101
           },
@@ -9105,7 +9050,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.50148685,
+          "duration": 0.502177297,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9118,13 +9063,68 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05064602,
+          "duration": 0.050703294,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/memory.rs:75:9: replace MemoryStore::lock -> std::sync::MutexGuard<'_, State> with MutexGuard::from_iter([Default::default()])",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/memory.rs",
+          "function": {
+            "function_name": "MemoryStore::lock",
+            "return_type": "-> std::sync::MutexGuard<'_, State>",
+            "span": {
+              "start": {
+                "line": 72,
+                "column": 5
+              },
+              "end": {
+                "line": 78,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 75,
+              "column": 9
+            },
+            "end": {
+              "line": 77,
+              "column": 64
+            }
+          },
+          "replacement": "MutexGuard::from_iter([Default::default()])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__pstore-blob__src__memory.rs_line_75_col_9_001.log",
+      "diff_path": "diff/crates__pstore-blob__src__memory.rs_line_75_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.151378871,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
             "--verbose",
             "--package=pstore-blob@0.1.0",
             "--all-features"
@@ -9172,7 +9172,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150763011,
+          "duration": 0.150768964,
           "process_status": {
             "Failure": 101
           },
@@ -9227,7 +9227,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150671678,
+          "duration": 0.150849135,
           "process_status": {
             "Failure": 101
           },
@@ -9282,7 +9282,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150809169,
+          "duration": 0.151070642,
           "process_status": {
             "Failure": 101
           },
@@ -9337,7 +9337,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401245183,
+          "duration": 0.45255884,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9350,7 +9350,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.151287384,
+          "duration": 0.151087032,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9402,7 +9402,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150876445,
+          "duration": 0.100658531,
           "process_status": {
             "Failure": 101
           },
@@ -9457,7 +9457,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451645214,
+          "duration": 0.452376274,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9470,7 +9470,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150773535,
+          "duration": 0.150761622,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9522,7 +9522,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501435241,
+          "duration": 0.502518179,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9535,7 +9535,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050740724,
+          "duration": 0.050681072,
           "process_status": {
             "Failure": 101
           },
@@ -9589,7 +9589,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.552403526,
+          "duration": 0.55275787,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9602,7 +9602,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050668048,
+          "duration": 0.05063177,
           "process_status": {
             "Failure": 101
           },
@@ -9656,7 +9656,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.50197633,
+          "duration": 0.501895755,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9669,7 +9669,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101255452,
+          "duration": 0.101189079,
           "process_status": {
             "Failure": 101
           },
@@ -9723,7 +9723,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.504182588,
+          "duration": 0.501555643,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9736,7 +9736,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050649689,
+          "duration": 0.050610046,
           "process_status": {
             "Failure": 101
           },
@@ -9790,7 +9790,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454850096,
+          "duration": 0.451893785,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9803,7 +9803,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051014394,
+          "duration": 0.05092239,
           "process_status": {
             "Failure": 101
           },
@@ -9857,7 +9857,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501602897,
+          "duration": 0.501460287,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9870,7 +9870,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050655075,
+          "duration": 0.050644282,
           "process_status": {
             "Failure": 101
           },
@@ -9924,7 +9924,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.453991835,
+          "duration": 0.451467445,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9937,7 +9937,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10160863,
+          "duration": 0.101186744,
           "process_status": {
             "Failure": 101
           },
@@ -9991,7 +9991,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501671875,
+          "duration": 0.5044494,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10004,7 +10004,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050658243,
+          "duration": 0.050630535,
           "process_status": {
             "Failure": 101
           },
@@ -10058,7 +10058,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45144658,
+          "duration": 0.456088401,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10071,7 +10071,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101079714,
+          "duration": 0.10146854,
           "process_status": {
             "Failure": 101
           },
@@ -10125,7 +10125,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501975361,
+          "duration": 0.501564045,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10138,7 +10138,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100719711,
+          "duration": 0.100721471,
           "process_status": {
             "Failure": 101
           },
@@ -10192,7 +10192,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151143531,
+          "duration": 0.150785757,
           "process_status": {
             "Failure": 101
           },
@@ -10247,7 +10247,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.505594756,
+          "duration": 0.501625585,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10260,7 +10260,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100728088,
+          "duration": 0.100716467,
           "process_status": {
             "Failure": 101
           },
@@ -10314,7 +10314,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.503140479,
+          "duration": 0.552110834,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10327,7 +10327,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10086626,
+          "duration": 0.100674145,
           "process_status": {
             "Failure": 101
           },
@@ -10381,7 +10381,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151337542,
+          "duration": 0.150805773,
           "process_status": {
             "Failure": 101
           },
@@ -10436,7 +10436,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.15064638,
+          "duration": 0.151674455,
           "process_status": {
             "Failure": 101
           },
@@ -10491,7 +10491,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502260565,
+          "duration": 0.501647534,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10504,7 +10504,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050786739,
+          "duration": 0.050995276,
           "process_status": {
             "Failure": 101
           },
@@ -10558,7 +10558,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.55501595,
+          "duration": 0.551993666,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10571,7 +10571,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050583454,
+          "duration": 0.050684304,
           "process_status": {
             "Failure": 101
           },
@@ -10625,7 +10625,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.551452677,
+          "duration": 0.502217557,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10638,7 +10638,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050611015,
+          "duration": 0.101605821,
           "process_status": {
             "Failure": 101
           },
@@ -10692,7 +10692,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.505241839,
+          "duration": 0.506321967,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10705,7 +10705,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100648192,
+          "duration": 0.100692968,
           "process_status": {
             "Failure": 101
           },
@@ -10759,7 +10759,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.503018663,
+          "duration": 0.452710694,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10772,7 +10772,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050656958,
+          "duration": 0.100779347,
           "process_status": {
             "Failure": 101
           },
@@ -10826,7 +10826,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501742948,
+          "duration": 0.501512497,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10839,7 +10839,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100771796,
+          "duration": 0.100790293,
           "process_status": {
             "Failure": 101
           },
@@ -10893,7 +10893,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150900733,
+          "duration": 0.15089168,
           "process_status": {
             "Failure": 101
           },
@@ -10948,7 +10948,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201234148,
+          "duration": 0.201163313,
           "process_status": {
             "Failure": 101
           },
@@ -11003,7 +11003,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.502390078,
+          "duration": 0.501518452,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11016,7 +11016,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100775421,
+          "duration": 0.10070709,
           "process_status": {
             "Failure": 101
           },
@@ -11070,7 +11070,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401179977,
+          "duration": 0.451500817,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11083,7 +11083,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.201327172,
+          "duration": 0.15112628,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11135,7 +11135,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.552566169,
+          "duration": 0.554124094,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11148,7 +11148,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.150821747,
+          "duration": 0.150780491,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11200,7 +11200,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201543531,
+          "duration": 0.201055277,
           "process_status": {
             "Failure": 101
           },
@@ -11255,7 +11255,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401405258,
+          "duration": 0.401308345,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11268,7 +11268,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100763336,
+          "duration": 0.100682352,
           "process_status": {
             "Failure": 101
           },
@@ -11322,7 +11322,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451619257,
+          "duration": 0.401438893,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11335,7 +11335,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05189786,
+          "duration": 0.050936237,
           "process_status": {
             "Failure": 101
           },
@@ -11389,7 +11389,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151482231,
+          "duration": 0.151161723,
           "process_status": {
             "Failure": 101
           },
@@ -11444,7 +11444,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.551947996,
+          "duration": 0.551715022,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11457,7 +11457,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10072028,
+          "duration": 0.10075014,
           "process_status": {
             "Failure": 101
           },
@@ -11511,7 +11511,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.555566036,
+          "duration": 0.501826578,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11524,7 +11524,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.103480578,
+          "duration": 0.101143798,
           "process_status": {
             "Failure": 101
           },
@@ -11578,7 +11578,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.602493523,
+          "duration": 0.602030737,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11591,7 +11591,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100628181,
+          "duration": 0.100798257,
           "process_status": {
             "Failure": 101
           },
@@ -11645,7 +11645,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.555168655,
+          "duration": 0.552062935,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11658,7 +11658,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101127486,
+          "duration": 0.10073836,
           "process_status": {
             "Failure": 101
           },
@@ -11712,7 +11712,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150851267,
+          "duration": 0.201573962,
           "process_status": {
             "Failure": 101
           },
@@ -11767,7 +11767,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.602635182,
+          "duration": 0.552748396,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11780,74 +11780,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100676724,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-blob/src/object_store_backend.rs:135:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(1)",
-          "package": "pstore-blob",
-          "file": "crates/pstore-blob/src/object_store_backend.rs",
-          "function": {
-            "function_name": "<impl crate::BlobStore for ObjectStoreBackend>::head",
-            "return_type": "-> Result<u64, BlobError>",
-            "span": {
-              "start": {
-                "line": 134,
-                "column": 5
-              },
-              "end": {
-                "line": 140,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 135,
-              "column": 9
-            },
-            "end": {
-              "line": 139,
-              "column": 36
-            }
-          },
-          "replacement": "Ok(1)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-blob__src__object_store_backend.rs_line_135_col_9_001.log",
-      "diff_path": "diff/crates__pstore-blob__src__object_store_backend.rs_line_135_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.552970636,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-blob@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.10066639,
+          "duration": 0.100717708,
           "process_status": {
             "Failure": 101
           },
@@ -11901,7 +11834,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.602811953,
+          "duration": 0.551881338,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -11914,7 +11847,74 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100692817,
+          "duration": 0.100772001,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-blob/src/object_store_backend.rs:135:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(1)",
+          "package": "pstore-blob",
+          "file": "crates/pstore-blob/src/object_store_backend.rs",
+          "function": {
+            "function_name": "<impl crate::BlobStore for ObjectStoreBackend>::head",
+            "return_type": "-> Result<u64, BlobError>",
+            "span": {
+              "start": {
+                "line": 134,
+                "column": 5
+              },
+              "end": {
+                "line": 140,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 135,
+              "column": 9
+            },
+            "end": {
+              "line": 139,
+              "column": 36
+            }
+          },
+          "replacement": "Ok(1)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-blob__src__object_store_backend.rs_line_135_col_9_001.log",
+      "diff_path": "diff/crates__pstore-blob__src__object_store_backend.rs_line_135_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.551821205,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-blob@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.100830668,
           "process_status": {
             "Failure": 101
           },
@@ -11968,7 +11968,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150719438,
+          "duration": 0.150812183,
           "process_status": {
             "Failure": 101
           },
@@ -12023,7 +12023,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.151204764,
+          "duration": 0.150809776,
           "process_status": {
             "Failure": 101
           },
@@ -12078,7 +12078,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.604238388,
+          "duration": 0.551726313,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12091,7 +12091,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100934525,
+          "duration": 0.1010671,
           "process_status": {
             "Failure": 101
           },
@@ -12145,7 +12145,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.602754972,
+          "duration": 0.606209378,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12158,7 +12158,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100712128,
+          "duration": 0.100745211,
           "process_status": {
             "Failure": 101
           },
@@ -12212,7 +12212,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150979171,
+          "duration": 0.151010793,
           "process_status": {
             "Failure": 101
           },
@@ -12267,7 +12267,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150778789,
+          "duration": 0.150882564,
           "process_status": {
             "Failure": 101
           },
@@ -12322,7 +12322,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.552418175,
+          "duration": 0.502871561,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12335,7 +12335,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.101334709,
+          "duration": 0.05083652,
           "process_status": {
             "Failure": 101
           },
@@ -12389,7 +12389,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.7054337,
+          "duration": 0.752288579,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12402,7 +12402,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050672111,
+          "duration": 0.100908868,
           "process_status": {
             "Failure": 101
           },
@@ -12456,7 +12456,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.603327718,
+          "duration": 0.754636747,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12469,7 +12469,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10155582,
+          "duration": 0.051037901,
           "process_status": {
             "Failure": 101
           },
@@ -12523,7 +12523,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.654374328,
+          "duration": 0.752551535,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12536,7 +12536,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05077434,
+          "duration": 0.101101285,
           "process_status": {
             "Failure": 101
           },
@@ -12590,7 +12590,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.652941972,
+          "duration": 0.906340653,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12603,7 +12603,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050630656,
+          "duration": 0.103094867,
           "process_status": {
             "Failure": 101
           },
@@ -12657,7 +12657,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.507088384,
+          "duration": 0.708632328,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12670,7 +12670,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050489669,
+          "duration": 0.101211331,
           "process_status": {
             "Failure": 101
           },
@@ -12724,7 +12724,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.452042056,
+          "duration": 0.610890445,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12737,7 +12737,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.10127204,
+          "duration": 0.050930176,
           "process_status": {
             "Failure": 101
           },
@@ -12791,7 +12791,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.652723459,
+          "duration": 0.702767562,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12804,7 +12804,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050622418,
+          "duration": 0.050849494,
           "process_status": {
             "Failure": 101
           },
@@ -12858,7 +12858,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.603272663,
+          "duration": 0.703586547,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12871,7 +12871,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050834528,
+          "duration": 0.101273288,
           "process_status": {
             "Failure": 101
           },
@@ -12925,7 +12925,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.501505194,
+          "duration": 0.5537816,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -12938,7 +12938,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100920462,
+          "duration": 0.100999129,
           "process_status": {
             "Failure": 101
           },
@@ -12992,7 +12992,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.454653555,
+          "duration": 0.502629277,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13005,7 +13005,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050945432,
+          "duration": 0.051180361,
           "process_status": {
             "Failure": 101
           },
@@ -13059,7 +13059,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45188419,
+          "duration": 0.504706723,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13072,7 +13072,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050623248,
+          "duration": 0.05069252,
           "process_status": {
             "Failure": 101
           },
@@ -13126,7 +13126,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.358239936,
+          "duration": 3.357474676,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13139,74 +13139,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050701445,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-testkit@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-testkit/src/conformance.rs:36:9: replace Report::conforms -> bool with false",
-          "package": "pstore-testkit",
-          "file": "crates/pstore-testkit/src/conformance.rs",
-          "function": {
-            "function_name": "Report::conforms",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 33,
-                "column": 5
-              },
-              "end": {
-                "line": 37,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 36,
-              "column": 9
-            },
-            "end": {
-              "line": 36,
-              "column": 68
-            }
-          },
-          "replacement": "false",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_36_col_9_001.log",
-      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_36_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 3.357651797,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-testkit@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.050693156,
+          "duration": 0.051154381,
           "process_status": {
             "Failure": 101
           },
@@ -13260,7 +13193,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.200979363,
+          "duration": 0.25382071,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13273,7 +13206,74 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050603652,
+          "duration": 0.050595996,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-testkit@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-testkit/src/conformance.rs:36:9: replace Report::conforms -> bool with false",
+          "package": "pstore-testkit",
+          "file": "crates/pstore-testkit/src/conformance.rs",
+          "function": {
+            "function_name": "Report::conforms",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 33,
+                "column": 5
+              },
+              "end": {
+                "line": 37,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 36,
+              "column": 9
+            },
+            "end": {
+              "line": 36,
+              "column": 68
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_36_col_9_001.log",
+      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_36_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 3.457836034,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-testkit@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.050608953,
           "process_status": {
             "Failure": 101
           },
@@ -13327,129 +13327,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.150916837,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-testkit@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-testkit/src/conformance.rs:42:9: replace Report::divergences -> Vec<&Probe> with vec![]",
-          "package": "pstore-testkit",
-          "file": "crates/pstore-testkit/src/conformance.rs",
-          "function": {
-            "function_name": "Report::divergences",
-            "return_type": "-> Vec<&Probe>",
-            "span": {
-              "start": {
-                "line": 39,
-                "column": 5
-              },
-              "end": {
-                "line": 46,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 42,
-              "column": 9
-            },
-            "end": {
-              "line": 45,
-              "column": 23
-            }
-          },
-          "replacement": "vec![]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_42_col_9.log",
-      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_42_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.401528849,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-testkit@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.051056366,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=pstore-testkit@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-testkit/src/conformance.rs:52:5: replace k -> Key with Default::default()",
-          "package": "pstore-testkit",
-          "file": "crates/pstore-testkit/src/conformance.rs",
-          "function": {
-            "function_name": "k",
-            "return_type": "-> Key",
-            "span": {
-              "start": {
-                "line": 49,
-                "column": 1
-              },
-              "end": {
-                "line": 53,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 52,
-              "column": 5
-            },
-            "end": {
-              "line": 52,
-              "column": 47
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_52_col_5.log",
-      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_52_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.100744756,
+          "duration": 0.100828627,
           "process_status": {
             "Failure": 101
           },
@@ -13504,7 +13382,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251110337,
+          "duration": 0.30107208,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13517,13 +13395,135 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050566042,
+          "duration": 0.050600573,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
+            "--verbose",
+            "--package=pstore-testkit@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-testkit/src/conformance.rs:42:9: replace Report::divergences -> Vec<&Probe> with vec![]",
+          "package": "pstore-testkit",
+          "file": "crates/pstore-testkit/src/conformance.rs",
+          "function": {
+            "function_name": "Report::divergences",
+            "return_type": "-> Vec<&Probe>",
+            "span": {
+              "start": {
+                "line": 39,
+                "column": 5
+              },
+              "end": {
+                "line": 46,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 42,
+              "column": 9
+            },
+            "end": {
+              "line": 45,
+              "column": 23
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_42_col_9.log",
+      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_42_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.451420317,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-testkit@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.050604131,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-testkit@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-testkit/src/conformance.rs:52:5: replace k -> Key with Default::default()",
+          "package": "pstore-testkit",
+          "file": "crates/pstore-testkit/src/conformance.rs",
+          "function": {
+            "function_name": "k",
+            "return_type": "-> Key",
+            "span": {
+              "start": {
+                "line": 49,
+                "column": 1
+              },
+              "end": {
+                "line": 53,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 52,
+              "column": 5
+            },
+            "end": {
+              "line": 52,
+              "column": 47
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__pstore-testkit__src__conformance.rs_line_52_col_5.log",
+      "diff_path": "diff/crates__pstore-testkit__src__conformance.rs_line_52_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.050614147,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
             "--verbose",
             "--package=pstore-testkit@0.1.0",
             "--all-features"
@@ -13571,7 +13571,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100718899,
+          "duration": 0.100729897,
           "process_status": {
             "Failure": 101
           },
@@ -13626,7 +13626,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.1007713,
+          "duration": 0.100731606,
           "process_status": {
             "Failure": 101
           },
@@ -13681,7 +13681,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100741479,
+          "duration": 0.100686468,
           "process_status": {
             "Failure": 101
           },
@@ -13736,7 +13736,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100798501,
+          "duration": 0.150989931,
           "process_status": {
             "Failure": 101
           },
@@ -13791,7 +13791,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.35114965,
+          "duration": 0.351265684,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13804,7 +13804,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050979534,
+          "duration": 0.050738705,
           "process_status": {
             "Failure": 101
           },
@@ -13858,7 +13858,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351373746,
+          "duration": 0.351212819,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13871,7 +13871,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050693675,
+          "duration": 0.050661912,
           "process_status": {
             "Failure": 101
           },
@@ -13925,7 +13925,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451730533,
+          "duration": 0.451458585,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13938,7 +13938,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251133124,
+          "duration": 0.251142356,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -13990,7 +13990,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100845637,
+          "duration": 0.101152932,
           "process_status": {
             "Failure": 101
           },
@@ -14045,7 +14045,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.101282395,
+          "duration": 0.100710427,
           "process_status": {
             "Failure": 101
           },
@@ -14100,7 +14100,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351290654,
+          "duration": 0.351486831,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14113,7 +14113,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050774365,
+          "duration": 0.050647781,
           "process_status": {
             "Failure": 101
           },
@@ -14167,7 +14167,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351476718,
+          "duration": 0.35122081,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14180,7 +14180,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050957062,
+          "duration": 0.050617861,
           "process_status": {
             "Failure": 101
           },
@@ -14234,7 +14234,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351514603,
+          "duration": 0.401282268,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14247,7 +14247,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050686377,
+          "duration": 0.050668658,
           "process_status": {
             "Failure": 101
           },
@@ -14301,7 +14301,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351428341,
+          "duration": 0.351145361,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14314,7 +14314,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050742972,
+          "duration": 0.050669803,
           "process_status": {
             "Failure": 101
           },
@@ -14368,7 +14368,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351615081,
+          "duration": 0.351206386,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14381,7 +14381,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251108182,
+          "duration": 0.250933653,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14433,7 +14433,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351076563,
+          "duration": 0.351092496,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14446,7 +14446,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05064025,
+          "duration": 0.050664018,
           "process_status": {
             "Failure": 101
           },
@@ -14500,7 +14500,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.10109838,
+          "duration": 0.100810518,
           "process_status": {
             "Failure": 101
           },
@@ -14555,7 +14555,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100766541,
+          "duration": 0.100746673,
           "process_status": {
             "Failure": 101
           },
@@ -14610,7 +14610,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100794805,
+          "duration": 0.100768575,
           "process_status": {
             "Failure": 101
           },
@@ -14665,7 +14665,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.35101257,
+          "duration": 0.351067,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14678,7 +14678,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.05061203,
+          "duration": 0.050753408,
           "process_status": {
             "Failure": 101
           },
@@ -14732,7 +14732,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401249999,
+          "duration": 0.401653458,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14745,7 +14745,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.25107409,
+          "duration": 0.251278032,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14797,7 +14797,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451671943,
+          "duration": 0.401258277,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14810,7 +14810,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251911253,
+          "duration": 0.251300456,
           "process_status": {
             "Failure": 101
           },
@@ -14864,7 +14864,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251279614,
+          "duration": 0.251259868,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14877,7 +14877,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251051184,
+          "duration": 0.251482164,
           "process_status": {
             "Failure": 101
           },
@@ -14931,7 +14931,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.401273602,
+          "duration": 0.401537002,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -14944,7 +14944,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251069968,
+          "duration": 0.25105045,
           "process_status": {
             "Failure": 101
           },
@@ -14998,7 +14998,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351635617,
+          "duration": 0.351878322,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15011,7 +15011,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.25107383,
+          "duration": 0.251722271,
           "process_status": {
             "Failure": 101
           },
@@ -15059,13 +15059,13 @@
           "genre": "BinaryOperator"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__pstore-testkit__src__sweep.rs_line_43_col_30.log",
       "diff_path": "diff/crates__pstore-testkit__src__sweep.rs_line_43_col_30.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351394406,
+          "duration": 0.351432665,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15078,8 +15078,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251043861,
-          "process_status": "Success",
+          "duration": 0.251448365,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -15124,13 +15126,13 @@
           "genre": "BinaryOperator"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__pstore-testkit__src__sweep.rs_line_43_col_30_001.log",
       "diff_path": "diff/crates__pstore-testkit__src__sweep.rs_line_43_col_30_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.252210914,
+          "duration": 0.201433305,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15143,8 +15145,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251078816,
-          "process_status": "Success",
+          "duration": 0.250943089,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -15189,13 +15193,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__pstore-testkit__src__sweep.rs_line_49_col_9.log",
       "diff_path": "diff/crates__pstore-testkit__src__sweep.rs_line_49_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351370552,
+          "duration": 0.301365242,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15208,8 +15212,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251590736,
-          "process_status": "Success",
+          "duration": 0.250894306,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -15260,7 +15266,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351326788,
+          "duration": 0.301087366,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15273,7 +15279,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251025694,
+          "duration": 0.251387839,
           "process_status": {
             "Failure": 101
           },
@@ -15327,7 +15333,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251217344,
+          "duration": 0.200896985,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15340,7 +15346,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.25141819,
+          "duration": 0.251047253,
           "process_status": {
             "Failure": 101
           },
@@ -15394,7 +15400,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351481856,
+          "duration": 0.351728076,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15407,7 +15413,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251168292,
+          "duration": 0.2512435,
           "process_status": {
             "Failure": 101
           },
@@ -15455,13 +15461,13 @@
           "genre": "BinaryOperator"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__pstore-testkit__src__sweep.rs_line_52_col_29.log",
       "diff_path": "diff/crates__pstore-testkit__src__sweep.rs_line_52_col_29.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351211925,
+          "duration": 0.3514127,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15474,8 +15480,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251196032,
-          "process_status": "Success",
+          "duration": 0.251704869,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -15526,7 +15534,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100713431,
+          "duration": 0.100889066,
           "process_status": {
             "Failure": 101
           },
@@ -15575,13 +15583,13 @@
           "genre": "BinaryOperator"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__pstore-testkit__src__sweep.rs_line_52_col_29_001.log",
       "diff_path": "diff/crates__pstore-testkit__src__sweep.rs_line_52_col_29_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.201584939,
+          "duration": 0.201241189,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15594,8 +15602,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.250983976,
-          "process_status": "Success",
+          "duration": 0.250995816,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -15646,7 +15656,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.301142742,
+          "duration": 0.301065826,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15659,7 +15669,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.250962037,
+          "duration": 0.251002082,
           "process_status": {
             "Failure": 101
           },
@@ -15713,7 +15723,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.300994881,
+          "duration": 0.301181566,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15726,7 +15736,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251232694,
+          "duration": 0.251184994,
           "process_status": {
             "Failure": 101
           },
@@ -15780,7 +15790,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.301155859,
+          "duration": 0.30108672,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15793,7 +15803,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251639653,
+          "duration": 0.251338963,
           "process_status": {
             "Failure": 101
           },
@@ -15847,7 +15857,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.301554713,
+          "duration": 0.301387564,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15860,7 +15870,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251129426,
+          "duration": 0.252426891,
           "process_status": {
             "Failure": 101
           },
@@ -15914,7 +15924,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.30109374,
+          "duration": 0.301153556,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15927,7 +15937,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251052419,
+          "duration": 0.251045459,
           "process_status": {
             "Failure": 101
           },
@@ -15981,7 +15991,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.301041549,
+          "duration": 0.3011559,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -15994,7 +16004,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251022302,
+          "duration": 0.251475673,
           "process_status": {
             "Failure": 101
           },
@@ -16048,7 +16058,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251292184,
+          "duration": 0.251012623,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16061,7 +16071,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251300081,
+          "duration": 0.250975725,
           "process_status": {
             "Failure": 101
           },
@@ -16115,7 +16125,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251137766,
+          "duration": 0.251027925,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16128,7 +16138,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251065172,
+          "duration": 0.251325371,
           "process_status": {
             "Failure": 101
           },
@@ -16182,7 +16192,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251081353,
+          "duration": 0.250903727,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16195,7 +16205,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251269639,
+          "duration": 0.250980332,
           "process_status": {
             "Failure": 101
           },
@@ -16249,7 +16259,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.25130207,
+          "duration": 0.251018273,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16262,7 +16272,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251044203,
+          "duration": 0.251528292,
           "process_status": {
             "Failure": 101
           },
@@ -16316,7 +16326,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.100979975,
+          "duration": 0.100865917,
           "process_status": {
             "Failure": 101
           },
@@ -16371,7 +16381,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.251045406,
+          "duration": 0.250882769,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16384,7 +16394,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251302581,
+          "duration": 0.251113101,
           "process_status": {
             "Failure": 101
           },
@@ -16438,7 +16448,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351727654,
+          "duration": 0.352002989,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16451,7 +16461,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251452573,
+          "duration": 0.251185207,
           "process_status": {
             "Failure": 101
           },
@@ -16505,7 +16515,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.050934004,
+          "duration": 0.101314317,
           "process_status": {
             "Failure": 101
           },
@@ -16560,7 +16570,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.351622762,
+          "duration": 0.351191916,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16573,7 +16583,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.251193785,
+          "duration": 0.251885508,
           "process_status": {
             "Failure": 101
           },
@@ -16627,7 +16637,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.050655758,
+          "duration": 0.1017119,
           "process_status": {
             "Failure": 101
           },
@@ -16635,73 +16645,6 @@
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=pstore-types@0.1.0",
-            "--all-features"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/pstore-types/src/lib.rs:102:9: replace CasTag::as_str -> &str with \"xyzzy\"",
-          "package": "pstore-types",
-          "file": "crates/pstore-types/src/lib.rs",
-          "function": {
-            "function_name": "CasTag::as_str",
-            "return_type": "-> &str",
-            "span": {
-              "start": {
-                "line": 99,
-                "column": 5
-              },
-              "end": {
-                "line": 103,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 102,
-              "column": 9
-            },
-            "end": {
-              "line": 102,
-              "column": 16
-            }
-          },
-          "replacement": "\"xyzzy\"",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__pstore-types__src__lib.rs_line_102_col_9_001.log",
-      "diff_path": "diff/crates__pstore-types__src__lib.rs_line_102_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.100660804,
-          "process_status": "Success",
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=pstore-types@0.1.0",
-            "--all-features"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.050668902,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=pstore-types@0.1.0",
             "--all-features"
@@ -16749,7 +16692,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.15089733,
+          "duration": 0.100681331,
           "process_status": "Success",
           "argv": [
             "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
@@ -16762,7 +16705,74 @@
         },
         {
           "phase": "Test",
-          "duration": 0.050762786,
+          "duration": 0.050887263,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=pstore-types@0.1.0",
+            "--all-features"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/pstore-types/src/lib.rs:102:9: replace CasTag::as_str -> &str with \"xyzzy\"",
+          "package": "pstore-types",
+          "file": "crates/pstore-types/src/lib.rs",
+          "function": {
+            "function_name": "CasTag::as_str",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 99,
+                "column": 5
+              },
+              "end": {
+                "line": 103,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 102,
+              "column": 9
+            },
+            "end": {
+              "line": 102,
+              "column": 16
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__pstore-types__src__lib.rs_line_102_col_9_001.log",
+      "diff_path": "diff/crates__pstore-types__src__lib.rs_line_102_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.150850076,
+          "process_status": "Success",
+          "argv": [
+            "/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=pstore-types@0.1.0",
+            "--all-features"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.050698138,
           "process_status": {
             "Failure": 101
           },
@@ -16778,12 +16788,12 @@
     }
   ],
   "total_mutants": 263,
-  "missed": 51,
-  "caught": 147,
+  "missed": 46,
+  "caught": 152,
   "timeout": 0,
   "unviable": 65,
   "success": 0,
-  "start_time": "2026-09-05T10:40:37.41927867Z",
-  "end_time": "2026-09-05T10:41:50.680202676Z",
+  "start_time": "2026-09-05T10:42:20.721425453Z",
+  "end_time": "2026-09-05T10:43:34.651515186Z",
   "cargo_mutants_version": "27.1.0"
 }

@@ -33,8 +33,8 @@ crates/pstore-blob/src/congestion.rs:83:29: replace + with - in Congested<S>::on
 crates/pstore-blob/src/congestion.rs:83:29: replace + with * in Congested<S>::on_success
 crates/pstore-blob/src/congestion.rs:123:9: replace <impl crate::BlobStore for Congested<S>>::get -> Result<Bytes, BlobError> with Ok(Default::default())
 crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with 0.0
-crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with 1.0
 crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with -1.0
+crates/pstore-blob/src/faulty.rs:53:9: replace Inner::next_f64 -> f64 with 1.0
 crates/pstore-blob/src/faulty.rs:57:11: replace ^= with &= in Inner::next_f64
 crates/pstore-blob/src/faulty.rs:59:28: replace / with % in Inner::next_f64
 crates/pstore-blob/src/faulty.rs:59:28: replace / with * in Inner::next_f64
@@ -94,8 +94,8 @@ crates/pstore-blob/src/object_store_backend.rs:97:9: replace <impl crate::BlobSt
 crates/pstore-blob/src/object_store_backend.rs:107:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
 crates/pstore-blob/src/object_store_backend.rs:119:29: replace != with == in <impl crate::BlobStore for ObjectStoreBackend>::get_range
 crates/pstore-blob/src/object_store_backend.rs:126:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_tag -> Option<CasTag> with None
-crates/pstore-blob/src/object_store_backend.rs:135:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(1)
 crates/pstore-blob/src/object_store_backend.rs:135:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-blob/src/object_store_backend.rs:135:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(1)
 crates/pstore-blob/src/object_store_backend.rs:178:9: replace <impl crate::BlobStore for ObjectStoreBackend>::delete_batch -> Result<(), BlobError> with Ok(())
 crates/pstore-blob/src/object_store_backend.rs:191:9: replace <impl crate::BlobStore for ObjectStoreBackend>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
 crates/pstore-blob/src/object_store_backend.rs:220:34: replace || with && in map_cas_err
@@ -111,10 +111,10 @@ crates/pstore-blob/src/types.rs:27:9: replace <impl fmt::Display for Key>::fmt -
 crates/pstore-blob/src/types.rs:67:9: replace CasError::should_rebase -> bool with true
 crates/pstore-blob/src/types.rs:67:9: replace CasError::should_rebase -> bool with false
 crates/pstore-testkit/src/conformance.rs:36:9: replace Report::conforms -> bool with true
-crates/pstore-testkit/src/conformance.rs:36:9: replace Report::conforms -> bool with false
 crates/pstore-testkit/src/conformance.rs:36:46: replace == with != in Report::conforms
-crates/pstore-testkit/src/conformance.rs:42:9: replace Report::divergences -> Vec<&Probe> with vec![]
+crates/pstore-testkit/src/conformance.rs:36:9: replace Report::conforms -> bool with false
 crates/pstore-testkit/src/conformance.rs:44:35: replace != with == in Report::divergences
+crates/pstore-testkit/src/conformance.rs:42:9: replace Report::divergences -> Vec<&Probe> with vec![]
 crates/pstore-testkit/src/conformance.rs:127:9: replace || with && in probe_aba_resistance
 crates/pstore-testkit/src/conformance.rs:154:18: replace match guard &b[..] == b"234" with false in probe_ranged_read
 crates/pstore-testkit/src/conformance.rs:154:25: replace == with != in probe_ranged_read
@@ -127,9 +127,14 @@ crates/pstore-testkit/src/sweep.rs:40:9: replace Point::attempts_per_commit -> f
 crates/pstore-testkit/src/sweep.rs:40:9: replace Point::attempts_per_commit -> f64 with -1.0
 crates/pstore-testkit/src/sweep.rs:40:9: replace Point::attempts_per_commit -> f64 with 1.0
 crates/pstore-testkit/src/sweep.rs:40:25: replace == with != in Point::attempts_per_commit
+crates/pstore-testkit/src/sweep.rs:43:30: replace / with % in Point::attempts_per_commit
+crates/pstore-testkit/src/sweep.rs:43:30: replace / with * in Point::attempts_per_commit
+crates/pstore-testkit/src/sweep.rs:49:9: replace Point::success_rate -> f64 with 0.0
 crates/pstore-testkit/src/sweep.rs:49:9: replace Point::success_rate -> f64 with 1.0
 crates/pstore-testkit/src/sweep.rs:49:9: replace Point::success_rate -> f64 with -1.0
 crates/pstore-testkit/src/sweep.rs:49:26: replace == with != in Point::success_rate
+crates/pstore-testkit/src/sweep.rs:52:29: replace / with % in Point::success_rate
+crates/pstore-testkit/src/sweep.rs:52:29: replace / with * in Point::success_rate
 crates/pstore-testkit/src/sweep.rs:88:30: replace += with -= in contention_point
 crates/pstore-testkit/src/sweep.rs:88:30: replace += with *= in contention_point
 crates/pstore-testkit/src/sweep.rs:92:53: replace += with -= in contention_point
@@ -143,5 +148,5 @@ crates/pstore-testkit/src/sweep.rs:113:27: replace * with / in contention_point
 crates/pstore-testkit/src/sweep.rs:124:5: replace contention_sweep -> Vec<Point> with vec![]
 crates/pstore-testkit/src/sweep.rs:136:5: replace render -> String with String::new()
 crates/pstore-testkit/src/sweep.rs:136:5: replace render -> String with "xyzzy".into()
-crates/pstore-types/src/lib.rs:102:9: replace CasTag::as_str -> &str with "xyzzy"
 crates/pstore-types/src/lib.rs:102:9: replace CasTag::as_str -> &str with ""
+crates/pstore-types/src/lib.rs:102:9: replace CasTag::as_str -> &str with "xyzzy"

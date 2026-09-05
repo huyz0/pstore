@@ -1,0 +1,106 @@
+
+*** crates/pstore-format/src/docs.rs:41:5: replace decode_docs -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+
+*** mutation diff:
+--- crates/pstore-format/src/docs.rs
++++ replace decode_docs -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+@@ -33,33 +33,10 @@
+             }
+         }
+     }
+     e.0
+ }
+ 
+ /// Decodes a run written by [`encode_docs`], refusing anything malformed.
+ pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+-    let mut d = Dec::new(buf);
+-    let n = d.u32()? as usize;
+-    let mut out = Vec::with_capacity(n.min(1 << 20));
+-    for _ in 0..n {
+-        let id = d.string()?;
+-        let dims = d.u32()? as usize;
+-        let mut vector = Vec::with_capacity(dims.min(1 << 16));
+-        for _ in 0..dims {
+-            vector.push(d.f32()?);
+-        }
+-        let an = d.u32()? as usize;
+-        let mut attrs = BTreeMap::new();
+-        for _ in 0..an {
+-            let k = d.string()?;
+-            let v = match d.u8()? {
+-                0 => Value::Int(d.i64()?),
+-                1 => Value::Str(d.string()?),
+-                _ => return Err(FormatError::Corrupt("unknown value tag")),
+-            };
+-            attrs.insert(k, v);
+-        }
+-        out.push(Document { id, vector, attrs });
+-    }
+-    Ok(out)
++    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+ }
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=pstore-format@0.1.0 --all-features
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh pin-project-lite v0.2.17
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh slab v0.4.12
+       Fresh futures-core v0.3.34
+       Fresh futures-task v0.3.34
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-IkU50c.tmp/crates/pstore-types)
+       Fresh futures-util v0.3.34
+       Fresh tokio v1.53.1
+       Fresh thiserror v2.0.20
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-IkU50c.tmp/crates/pstore-blob)
+       Dirty pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-IkU50c.tmp/crates/pstore-format): the file `crates/pstore-format/src/docs.rs` has changed (1788607315.488438881s, 436905767ns after last build at 1788607315.051533114s)
+   Compiling pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-IkU50c.tmp/crates/pstore-format)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=821cada9fb09dc73 -C extra-filename=-6c8cb96cbdbdb465 --out-dir /tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_blob-b6cf016c092a0ac2.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=57d28a0e0e46fc90 -C extra-filename=-1275d00aeb99a72a --out-dir /tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_blob-b6cf016c092a0ac2.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta`
+warning: unused import: `Dec`
+ --> crates/pstore-format/src/docs.rs:6:20
+  |
+6 | use crate::codec::{Dec, Enc};
+  |                    ^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::BTreeMap`
+ --> crates/pstore-format/src/docs.rs:8:5
+  |
+8 | use std::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `Document: Default` is not satisfied
+  --> crates/pstore-format/src/docs.rs:41:13
+   |
+41 |     Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+   |             ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Document`
+   |
+help: consider annotating `Document` with `#[derive(Default)]`
+  --> crates/pstore-format/src/lib.rs:53:1
+   |
+53 + #[derive(Default)]
+54 | pub struct Document {
+   |
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `pstore-format` (lib test) generated 2 warnings (2 duplicates)
+error: could not compile `pstore-format` (lib test) due to 1 previous error; 2 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=821cada9fb09dc73 -C extra-filename=-6c8cb96cbdbdb465 --out-dir /tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_blob-b6cf016c092a0ac2.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+warning: `pstore-format` (lib) generated 2 warnings
+error: could not compile `pstore-format` (lib) due to 1 previous error; 2 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=57d28a0e0e46fc90 -C extra-filename=-1275d00aeb99a72a --out-dir /tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_blob-b6cf016c092a0ac2.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-IkU50c.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta` (exit status: 1)
+
+*** result: Failure(101)

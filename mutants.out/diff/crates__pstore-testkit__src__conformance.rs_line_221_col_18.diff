@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace match guard &b[..] == b"6789" with true in probe_suffix_read
+@@ -213,17 +213,17 @@
+     let key = k(run, "suffix");
+     if s.put(&key, Bytes::from_static(b"0123456789"))
+         .await
+         .is_err()
+     {
+         return Support::Unsupported;
+     }
+     match s.get_suffix(&key, 4).await {
+-        Ok(b) if &b[..] == b"6789" => {}
++        Ok(b) if true /* ~ changed by cargo-mutants ~ */ => {}
+         Ok(b) => {
+             return Support::Divergent(format!(
+                 "a 4-byte suffix returned {} bytes: {:?}",
+                 b.len(),
+                 String::from_utf8_lossy(&b)
+             ));
+         }
+         Err(e) => return Support::Divergent(format!("suffix read failed: {e}")),

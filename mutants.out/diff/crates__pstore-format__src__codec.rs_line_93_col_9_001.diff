@@ -1,0 +1,25 @@
+--- crates/pstore-format/src/codec.rs
++++ replace Dec<'a>::i64 -> Result<i64, FormatError> with Ok(1)
+@@ -85,21 +85,17 @@
+     pub(crate) fn u64(&mut self) -> Result<u64, FormatError> {
+         Ok(u64::from_le_bytes(
+             self.take(8)?
+                 .try_into()
+                 .map_err(|_| FormatError::Truncated)?,
+         ))
+     }
+     pub(crate) fn i64(&mut self) -> Result<i64, FormatError> {
+-        Ok(i64::from_le_bytes(
+-            self.take(8)?
+-                .try_into()
+-                .map_err(|_| FormatError::Truncated)?,
+-        ))
++        Ok(1) /* ~ changed by cargo-mutants ~ */
+     }
+     pub(crate) fn f32(&mut self) -> Result<f32, FormatError> {
+         Ok(f32::from_le_bytes(
+             self.take(4)?
+                 .try_into()
+                 .map_err(|_| FormatError::Truncated)?,
+         ))
+     }

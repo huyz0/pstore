@@ -1,0 +1,32 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::blocks_to_read -> Vec<usize> with vec![]
+@@ -112,28 +112,17 @@
+     }
+ 
+     /// Which blocks a filter cannot rule out.
+     ///
+     /// A block is kept unless its zone map proves no row in it can match. **Erring toward
+     /// keeping is mandatory**: a wrongly dropped block silently loses rows.
+     #[must_use]
+     pub fn blocks_to_read(&self, filter: Option<&Filter>) -> Vec<usize> {
+-        (0..self.blocks.len())
+-            .filter(|i| match (filter, self.blocks.get(*i)) {
+-                (None, _) => true,
+-                (Some(f), Some(b)) => match b.zones.get(f.column()) {
+-                    Some((lo, hi)) => f.could_match(*lo, *hi),
+-                    // No zone map for that column -- it may be a string, or absent from
+-                    // this block. Cannot prune, so must read.
+-                    None => true,
+-                },
+-                (Some(_), None) => false,
+-            })
+-            .collect()
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Reads the rows a filter selects.
+     ///
+     /// The blocks that survive pruning are fetched in **one coalesced round**, so scanning
+     /// costs one round trip regardless of how many blocks match.
+     pub async fn scan<S: BlobStore>(
+         &self,

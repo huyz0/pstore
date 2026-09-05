@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace << with >> in Engine<S>::fold
+@@ -257,17 +257,17 @@
+                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                 {
+                     // ⚠️ Backoff, and jittered. Without it, optimistic concurrency
+                     // LIVELOCKS: every loser retries immediately, collides with the same
+                     // peers, and loses again. It showed up here as a flaky test rather
+                     // than a failing one, which is the more expensive way to find out.
+                     // The jitter is derived from the lane so two writers never wake
+                     // together, and needs no clock or randomness to be reproducible.
+-                    let base = 1u64 << attempt.min(6);
++                    let base = 1u64 >> /* ~ changed by cargo-mutants ~ */ attempt.min(6);
+                     let jitter = (self.lane.0 % 8) + 1;
+                     tokio::time::sleep(std::time::Duration::from_micros(base * jitter)).await;
+                 }
+                 Err(e) => return Err(e),
+             }
+         }
+         Err(EngineError::Lost)
+     }

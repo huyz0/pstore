@@ -113,3 +113,72 @@ async fn conformance_costs_a_bounded_number_of_requests() {
         "conformance must never LIST"
     );
 }
+
+#[tokio::test]
+async fn the_suite_detects_each_defect_a_real_backend_actually_has() {
+    use pstore_testkit::broken::{Broken, Defect};
+
+    // Until something is deliberately divergent, the suite's DETECTION is untested: it
+    // could report Supported unconditionally and every other test would still pass.
+    let cases = [
+        (Defect::IgnoresCreateIfAbsent, "create_if_absent"),
+        (Defect::ShortReadsPastTheEnd, "range_past_end_is_an_error"),
+        (Defect::SuffixReturnsEverything, "suffix_read"),
+        (Defect::IgnoresDeletes, "batch_delete"),
+    ];
+    for (i, (defect, probe)) in cases.into_iter().enumerate() {
+        let s = Broken::new(defect);
+        let r = conformance::run(&s, 900 + i as u64).await;
+        assert!(!r.conforms(), "{defect:?} was reported as conforming");
+        let p = r.probes.iter().find(|p| p.name == probe).unwrap();
+        assert!(
+            matches!(p.outcome, Support::Divergent(_)),
+            "{defect:?} should have shown up on {probe}, got {:?}",
+            p.outcome
+        );
+        // And exactly one probe should fail: a defect that trips several means the probes
+        // are not independent, and the report would not say what is actually wrong.
+        assert_eq!(
+            r.divergences().len(),
+            1,
+            "{defect:?} tripped {:?}",
+            r.divergences()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_broken_backend_still_declares_itself_healthy() {
+    use pstore_testkit::broken::{Broken, Defect};
+    // The gap the whole module exists to demonstrate.
+    let s = Broken::new(Defect::IgnoresCreateIfAbsent);
+    assert_eq!(s.capabilities().create_if_absent, Support::Supported);
+    let r = conformance::run(&s, 950).await;
+    assert!(matches!(r.observed.create_if_absent, Support::Divergent(_)));
+}
+
+#[tokio::test]
+async fn a_broken_backend_forwards_everything_it_does_not_break() {
+    use pstore_blob::Key;
+    use pstore_testkit::broken::{Broken, Defect};
+    // One defect means ONE defect. A stand-in that quietly broke a second method would
+    // make the "exactly one divergence" assertion above meaningless.
+    let s = Broken::new(Defect::IgnoresDeletes);
+    let k = Key::new("a/b");
+    s.put(&k, bytes::Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+    assert_eq!(&s.get(&k).await.unwrap()[..], b"0123456789");
+    assert_eq!(&s.get_range(&k, 2..5).await.unwrap()[..], b"234");
+    assert_eq!(&s.get_suffix(&k, 3).await.unwrap()[..], b"789");
+    assert_eq!(s.head(&k).await.unwrap(), 10);
+    assert!(s.get_tag(&k).await.is_some());
+    assert_eq!(s.get_with_tag(&k).await.unwrap().0.len(), 10);
+    assert_eq!(s.list_unrestricted(&Key::new("a")).await.unwrap().len(), 1);
+    // ...and the one it does break.
+    s.delete_batch(std::slice::from_ref(&k)).await.unwrap();
+    assert!(
+        s.get(&k).await.is_ok(),
+        "the defect is that deletes do nothing"
+    );
+}

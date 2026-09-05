@@ -1,0 +1,38 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::decode_block -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+@@ -204,34 +204,11 @@
+         // deterministically instead of making the sort's behaviour undefined. Ties break
+         // on id so the result is reproducible, which is what lets a reference test exist.
+         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+         scored.truncate(k);
+         Ok(scored)
+     }
+ 
+     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+-        let mut d = Dec::new(buf);
+-        let n = d.u32()? as usize;
+-        let mut out = Vec::with_capacity(n.min(1 << 20));
+-        for _ in 0..n {
+-            let id = d.string()?;
+-            let dims = d.u32()? as usize;
+-            let mut vector = Vec::with_capacity(dims.min(1 << 16));
+-            for _ in 0..dims {
+-                vector.push(d.f32()?);
+-            }
+-            let an = d.u32()? as usize;
+-            let mut attrs = BTreeMap::new();
+-            for _ in 0..an {
+-                let k = d.string()?;
+-                let v = match d.u8()? {
+-                    0 => Value::Int(d.i64()?),
+-                    1 => Value::Str(d.string()?),
+-                    _ => return Err(FormatError::Corrupt("unknown value tag")),
+-                };
+-                attrs.insert(k, v);
+-            }
+-            out.push(Document { id, vector, attrs });
+-        }
+-        Ok(out)
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ }

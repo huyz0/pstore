@@ -1,0 +1,24 @@
+--- crates/pstore-engine/src/head.rs
++++ replace Cur<'_>::take -> Result<&[u8], EngineError> with Ok(Vec::leak(vec![1]))
+@@ -108,20 +108,17 @@
+ 
+ struct Cur<'a> {
+     b: &'a [u8],
+     i: usize,
+ }
+ 
+ impl Cur<'_> {
+     fn take(&mut self, n: usize) -> Result<&[u8], EngineError> {
+-        let end = self.i.checked_add(n).ok_or(EngineError::CorruptHead)?;
+-        let out = self.b.get(self.i..end).ok_or(EngineError::CorruptHead)?;
+-        self.i = end;
+-        Ok(out)
++        Ok(Vec::leak(vec![1])) /* ~ changed by cargo-mutants ~ */
+     }
+     fn u32(&mut self) -> Result<u32, EngineError> {
+         Ok(u32::from_le_bytes(
+             self.take(4)?
+                 .try_into()
+                 .map_err(|_| EngineError::CorruptHead)?,
+         ))
+     }

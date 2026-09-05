@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/broken.rs
++++ replace <impl BlobStore for Broken>::delete_batch -> Result<(), BlobError> with Ok(())
+@@ -107,18 +107,15 @@
+                 .put(key, body)
+                 .await
+                 .map_err(|e| CasError::Io(e.to_string()));
+         }
+         self.inner.put_conditional(key, body, pre).await
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+-        if self.defect == Defect::IgnoresDeletes {
+-            return Ok(());
+-        }
+-        self.inner.delete_batch(keys).await
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         self.inner.list_unrestricted(prefix).await
+     }
+ }

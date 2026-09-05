@@ -18,4 +18,4 @@
          Ok(body.slice(range.start as usize..range.end as usize))
      }
  
-     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {

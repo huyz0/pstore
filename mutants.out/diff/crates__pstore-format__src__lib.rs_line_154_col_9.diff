@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/lib.rs
++++ replace <impl From<pstore_blob::BlobError> for FormatError>::from -> Self with Default::default()
+@@ -146,17 +146,17 @@
+     },
+     /// The blob store could not serve it.
+     #[error("blob error: {0}")]
+     Blob(String),
+ }
+ 
+ impl From<pstore_blob::BlobError> for FormatError {
+     fn from(e: pstore_blob::BlobError) -> Self {
+-        Self::Blob(e.to_string())
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Where one block lives, and what it holds.
+ #[derive(Debug, Clone, PartialEq)]
+ pub(crate) struct BlockMeta {
+     pub offset: u64,
+     pub len: u32,

@@ -1,0 +1,44 @@
+--- crates/pstore-blob/src/store.rs
++++ replace BlobStore::get_ranges -> Result<Vec<Bytes>, BlobError> with Ok(vec![Default::default()])
+@@ -18,40 +18,17 @@
+     /// One byte range.
+     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, BlobError>;
+ 
+     /// Several byte ranges at once, **coalescing nearby ones into a single request**.
+     ///
+     /// The workhorse of the read path. Provided rather than required, so no backend can
+     /// accidentally implement the naive one-request-per-range version.
+     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
+-        let gap = self.capabilities().coalesce_gap;
+-        let plan = crate::coalesce(ranges, gap);
+-        // ⚠️ Issued together, not in a loop. Coalescing merges what is NEARBY; ranges far
+-        // apart legitimately stay separate fetches, and awaiting each before issuing the
+-        // next would make a wide scan cost one round trip per block -- 1.2 s for forty
+-        // blocks at 30 ms a hop, and invisible to every functional test because the
+-        // answer is identical. Width is free; depth is not.
+-        let fetched = futures_util::future::try_join_all(
+-            plan.iter().map(|f| self.get_range(key, f.span.clone())),
+-        )
+-        .await?;
+-
+-        let mut out: Vec<(usize, Bytes)> = Vec::with_capacity(ranges.len());
+-        for (fetch, buf) in plan.into_iter().zip(fetched) {
+-            let base = fetch.span.start;
+-            for (i, r) in fetch.serves {
+-                let (lo, hi) = ((r.start - base) as usize, (r.end - base) as usize);
+-                // Slice, not copy: `Bytes` is refcounted, so the merged buffer is shared
+-                // by every range it serves.
+-                out.push((i, buf.slice(lo..hi)));
+-            }
+-        }
+-        out.sort_by_key(|(i, _)| *i);
+-        Ok(out.into_iter().map(|(_, b)| b).collect())
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The last `n` bytes, without knowing the object's length.
+     ///
+     /// `Range: bytes=-N`, supported by S3, GCS and Azure alike. **This is what makes
+     /// Pattern 6 work**: a self-describing footer can be read from the key alone, with no
+     /// prior `head` — and `head` is billed as a read, so requiring one would double the
+     /// cost of every cold open and put a HEAD on the hot path the design forbids.

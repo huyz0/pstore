@@ -3,8 +3,8 @@ crates/pstore-blob/src/accounting.rs:148:9: replace <impl crate::BlobStore for T
 crates/pstore-blob/src/congestion.rs:72:37: replace / with % in Congested<S>::on_slow_down
 crates/pstore-blob/src/congestion.rs:78:67: replace + with * in Congested<S>::on_success
 crates/pstore-blob/src/congestion.rs:106:35: replace << with >> in Congested<S>::with_retry
-crates/pstore-blob/src/congestion.rs:127:9: replace <impl crate::BlobStore for Congested<S>>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
 crates/pstore-blob/src/congestion.rs:132:9: replace <impl crate::BlobStore for Congested<S>>::get_tag -> Option<pstore_types::CasTag> with None
+crates/pstore-blob/src/congestion.rs:127:9: replace <impl crate::BlobStore for Congested<S>>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
 crates/pstore-blob/src/congestion.rs:136:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(0)
 crates/pstore-blob/src/congestion.rs:136:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(1)
 crates/pstore-blob/src/congestion.rs:157:9: replace <impl crate::BlobStore for Congested<S>>::delete_batch -> Result<(), BlobError> with Ok(())
@@ -44,8 +44,3 @@ crates/pstore-blob/src/object_store_backend.rs:49:32: replace * with / in Object
 crates/pstore-testkit/src/conformance.rs:154:18: replace match guard &b[..] == b"234" with true in probe_ranged_read
 crates/pstore-testkit/src/conformance.rs:191:24: replace match guard b.len() == want_len with true in probe_coalesced_read
 crates/pstore-testkit/src/conformance.rs:270:30: replace == with != in run
-crates/pstore-testkit/src/sweep.rs:43:30: replace / with % in Point::attempts_per_commit
-crates/pstore-testkit/src/sweep.rs:43:30: replace / with * in Point::attempts_per_commit
-crates/pstore-testkit/src/sweep.rs:49:9: replace Point::success_rate -> f64 with 0.0
-crates/pstore-testkit/src/sweep.rs:52:29: replace / with % in Point::success_rate
-crates/pstore-testkit/src/sweep.rs:52:29: replace / with * in Point::success_rate

@@ -174,3 +174,52 @@ async fn capabilities_pass_through_every_decorator() {
     let s = Congested::new(Faulty::new(MemoryStore::new(), 1, Faults::none()), 4);
     assert_eq!(s.capabilities().backend, "memory(Monotonic)");
 }
+
+#[tokio::test]
+async fn the_report_is_per_probe_not_all_or_nothing() {
+    // A backend that fails SOME operations must produce a report naming which -- that is
+    // the difference between "this backend is unusable" and "this backend cannot be
+    // trusted with durable writes but can serve reads", which is a decision we actually
+    // have to make per backend.
+    use pstore_blob::Support;
+    let s = Faulty::new(
+        MemoryStore::new(),
+        11,
+        Faults {
+            cas_contended: 1.0,
+            ..Faults::none()
+        },
+    );
+    let r = conformance::run(&s, 200).await;
+    assert!(!r.conforms());
+    // Reads are untouched, so their probes must still pass.
+    for name in ["ranged_read", "suffix_read", "missing_key_is_an_error"] {
+        let p = r.probes.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(p.outcome, Support::Supported, "{name} should be unaffected");
+    }
+    assert!(
+        r.divergences().len() < r.probes.len(),
+        "not everything should fail"
+    );
+}
+
+#[tokio::test]
+async fn a_partially_broken_backend_reports_the_reads_it_can_still_serve() {
+    // Writes fail, reads do not. The profile has to say so rather than collapsing to one
+    // verdict.
+    use pstore_blob::Support;
+    let s = Faulty::new(
+        MemoryStore::new(),
+        13,
+        Faults {
+            write_error: 1.0,
+            ..Faults::none()
+        },
+    );
+    let r = conformance::run(&s, 201).await;
+    assert!(!r.conforms());
+    assert!(
+        r.probes.iter().any(|p| p.outcome == Support::Unsupported),
+        "a probe whose setup write failed cannot reach the property it tests"
+    );
+}

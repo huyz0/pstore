@@ -1,0 +1,24 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace <impl crate::BlobStore for Faulty<S>>::delete_batch -> Result<(), BlobError> with Ok(())
+@@ -200,20 +200,17 @@
+         // assertion would be against a fiction.
+         match self.cas_fault() {
+             Some(e) => Err(e),
+             None => self.inner.put_conditional(key, body, pre).await,
+         }
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+-        match self.write_fault() {
+-            Some(e) => Err(e),
+-            None => self.inner.delete_batch(keys).await,
+-        }
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         match self.read_fault() {
+             Some(e) => Err(e),
+             None => self.inner.list_unrestricted(prefix).await,
+         }
+     }

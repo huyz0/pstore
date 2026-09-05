@@ -1,0 +1,22 @@
+--- crates/pstore-engine/src/head.rs
++++ replace put_str with ()
+@@ -97,18 +97,17 @@
+     /// Whether this lane's sequence has already been folded into a committed epoch.
+     #[must_use]
+     pub fn is_folded(&self, lane: LaneId, seq: Seq) -> bool {
+         self.watermarks.get(&lane.0).is_some_and(|w| *w > seq.0)
+     }
+ }
+ 
+ fn put_str(out: &mut Vec<u8>, s: &str) {
+-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+-    out.extend_from_slice(s.as_bytes());
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ struct Cur<'a> {
+     b: &'a [u8],
+     i: usize,
+ }
+ 
+ impl Cur<'_> {

@@ -1,0 +1,24 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::replay_for_test with ()
+@@ -347,20 +347,17 @@
+     /// Sets how far this lane has been flushed, so a successor can replay a predecessor's
+     /// bundles.
+     ///
+     /// ⚠️ A stand-in. In production a successor discovers the tail by forward-probing the
+     /// lane and reading the per-shard lane bitmap — neither of which exists until M2 — so
+     /// M1 injects the watermark rather than pretending discovery is solved.
+     #[doc(hidden)]
+     pub fn replay_for_test(&self, flushed: Seq) {
+-        *self
+-            .seq
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner) = flushed;
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Attempts a commit against a **deliberately stale** view of HEAD.
+     ///
+     /// Exists so the fencing property can be asserted: a caller holding a superseded tag
+     /// must be refused. Not part of the engine's real API.
+     #[doc(hidden)]
+     pub async fn commit_stale_for_test(&self) -> Result<Epoch, EngineError> {

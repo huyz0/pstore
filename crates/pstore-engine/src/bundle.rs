@@ -89,15 +89,22 @@ pub(crate) fn read_index(buf: &[u8]) -> Result<BTreeMap<String, Entry>, EngineEr
             .and_then(|b| b.try_into().ok())
             .ok_or(EngineError::CorruptBundle)?,
     ) as usize;
+    // ⚠️ Checked: a tampered offset of u64::MAX overflowed the addition and PANICKED
+    // rather than returning an error -- a crash vector reachable from a malformed object,
+    // which is the one input a storage layer must assume is hostile.
+    let end = index_offset
+        .checked_add(index_len)
+        .ok_or(EngineError::CorruptBundle)?;
     let idx = buf
-        .get(index_offset..index_offset + index_len)
+        .get(index_offset..end)
         .ok_or(EngineError::CorruptBundle)?;
 
     let mut out = BTreeMap::new();
     let mut i = 0usize;
     let take = |i: &mut usize, n: usize| -> Result<&[u8], EngineError> {
-        let s = idx.get(*i..*i + n).ok_or(EngineError::CorruptBundle)?;
-        *i += n;
+        let end = i.checked_add(n).ok_or(EngineError::CorruptBundle)?;
+        let s = idx.get(*i..end).ok_or(EngineError::CorruptBundle)?;
+        *i = end;
         Ok(s)
     };
     let count = u32::from_le_bytes(
@@ -135,8 +142,10 @@ pub(crate) fn read_index(buf: &[u8]) -> Result<BTreeMap<String, Entry>, EngineEr
 
 /// One index's documents, decoded from its slice of a bundle.
 pub(crate) fn read_entry(buf: &[u8], e: &Entry) -> Result<Vec<Document>, EngineError> {
-    let run = buf
-        .get(e.offset as usize..e.offset as usize + e.len as usize)
+    let start = e.offset as usize;
+    let end = start
+        .checked_add(e.len as usize)
         .ok_or(EngineError::CorruptBundle)?;
+    let run = buf.get(start..end).ok_or(EngineError::CorruptBundle)?;
     Ok(decode_docs(run)?)
 }
