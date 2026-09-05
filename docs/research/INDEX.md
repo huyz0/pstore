@@ -1,0 +1,139 @@
+# pstore Research Index
+
+Master index of all research. **Read this first; it is the map.**
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q31`) are
+defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
+
+**Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
+filters) in Rust. Unit of tenancy is an **index**. Blob store is the *only* durable tier,
+for data *and* metadata. Target: 10,000 nodes, millions of indexes, minimal blob-API spend.
+
+---
+
+**Status: research phase complete.** 28 documents, 31 research questions answered, 83 open
+questions logged. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
+substrate before writing an engine.
+
+## The five load-bearing conclusions
+
+If you read nothing else:
+
+1. **A PUT costs 12.5 GETs; LIST is priced like a PUT and returns ≤1000 keys.** Therefore:
+   batch writes ruthlessly, read freely, and never LIST.
+   → [`02-object-storage/cost-and-latency.md`](02-object-storage/cost-and-latency.md)
+2. **~30 ms per round trip + a 100 ms budget = ~3 sequential fetches.** This single fact
+   disqualifies graph ANN indexes (HNSW/DiskANN) from the cold path and selects a clustered
+   (IVF/SPANN/SPFresh) index.
+   → [`06-indexing/vector-index-survey.md`](06-indexing/vector-index-survey.md)
+3. **Every major cloud now has compare-and-swap on a blob** (S3 since Aug/Nov 2024). A
+   masterless system with no external metadata store became possible only recently — this is
+   the design's whole premise.
+   → [`03-metadata-consistency/manifest-and-cas.md`](03-metadata-consistency/manifest-and-cas.md)
+4. **CAS on a single key tops out at ~5 writes/s.** So bulk data writes must never touch the
+   CAS path: each writer owns a *lane*, and CAS is reserved for structural commits.
+   → [`05-storage-engine/write-path-and-wal.md`](05-storage-engine/write-path-and-wal.md)
+5. **Stateless nodes ⇒ no rebalancing ⇒ elasticity in seconds.** This is what makes 10,000
+   nodes tractable; cache affinity is an optimization, never a correctness requirement.
+   → [`04-cluster/routing-and-placement.md`](04-cluster/routing-and-placement.md)
+
+---
+
+## 00 — Plan
+| Doc | Answers | Status |
+|---|---|---|
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 31 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **83 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+
+## 01 — Prior art
+| Doc | Answers | One-line finding |
+|---|---|---|
+| [turbopuffer.md](01-prior-art/turbopuffer.md) | Q1 | Object-storage LSM + SPFresh + group-commit WAL; ceiling is ~1 WAL entry/s/namespace and a broker that is a hidden master. |
+| [object-storage-native-systems.md](01-prior-art/object-storage-native-systems.md) | Q2 | Everyone who built ZDA pre-2024 needed an external metadata store. That constraint expired. |
+| [vector-search-landscape.md](01-prior-art/vector-search-landscape.md) | Q3 | Three tiers; clustered indexes independently win *filtered* search, which is the market's weakest spot. |
+
+## 02 — The substrate: blob stores
+| Doc | Answers | One-line finding |
+|---|---|---|
+| [api-semantics.md](02-object-storage/api-semantics.md) | Q4 | Portable primitive set = ranged GET + atomic PUT + CAS. Not portable: append, leases, multi-range GET. |
+| [cost-and-latency.md](02-object-storage/cost-and-latency.md) | Q5 | 12.5:1 write:read price; ~30 ms RTT; $70/TB-mo vs $1,600–3,600 for RAM-resident. |
+| [request-efficiency-patterns.md](02-object-storage/request-efficiency-patterns.md) | Q6 | Ten reusable patterns + banned anti-patterns. The project's design language. |
+| [rust-object-store-crates.md](02-object-storage/rust-object-store-crates.md) | Q7 | `object_store` (Arrow) wrapped in our own `BlobStore` trait for accounting + congestion control. |
+
+## 03 — Metadata without a master
+| Doc | Answers | Status |
+|---|---|---|
+| [manifest-and-cas.md](03-metadata-consistency/manifest-and-cas.md) | Q8 | One CAS'd HEAD per index = a linearizable register. **Fencing is free** — the storage layer rejects stale writers, so no locks are needed for correctness. |
+| [catalog-without-master.md](03-metadata-consistency/catalog-without-master.md) | Q9 | Keys are derived from the index id, so the hot path needs no catalog at all. Enumeration = one parallel round over fixed-width buckets. |
+| [consistency-model.md](03-metadata-consistency/consistency-model.md) | Q10 | Snapshot isolation + three client-chosen read modes. Freshness is a parameter, never a mystery. |
+
+## 04 — Cluster: 10,000 nodes, no master
+| Doc | Answers | Status |
+|---|---|---|
+| [membership.md](04-cluster/membership.md) | Q11 | SWIM+Lifeguard gossip (proven at 10K+), seeded by one GET from the blob store. Membership is an optimization; a wrong view costs cache hits, never correctness. |
+| [routing-and-placement.md](04-cluster/routing-and-placement.md) | Q12 | **Rendezvous hashing is O(N) and disqualified above ~100 nodes.** Use Local Rendezvous Hashing (O(C)) + bounded-load skipping. |
+| [ownership-and-leases.md](04-cluster/ownership-and-leases.md) | Q13 | Optimistic work + CAS-on-publish. Duplicate work is an economics problem, not a correctness one. `needed_work(manifest)` is a pure function — no scheduler, no queue, no recovery. |
+| [load-and-hotspots.md](04-cluster/load-and-hotspots.md) | Q14 | Size skew → shards; rate skew → **dynamic replication factor, free because nodes own nothing**; cold start → singleflight + centroid-first cache fill. |
+
+## 05 — Storage engine
+| Doc | Answers | Status |
+|---|---|---|
+| [write-path-and-wal.md](05-storage-engine/write-path-and-wal.md) | Q15 | **The central mechanism.** Per-writer lanes + group commit ⇒ 1 PUT per batch, 0 CAS, no contention at any writer count. Tail found by probing + an 8 KiB lane bitmap. |
+| [file-format-and-layout.md](05-storage-engine/file-format-and-layout.md) | Q16 | Self-describing segment; one `Range: -N` suffix GET bootstraps it. No sidecars. Parquet rejected (random access); Lance is a real alternative. |
+| [compaction.md](05-storage-engine/compaction.md) | Q17 | On blob storage, space amp is cheap and **read amp is expensive** (30 ms/hop) — so bias leveled, bound segments per query to ~10. Compaction costs <$0.001 in requests; CPU is the constraint. |
+| [mutations-and-mvcc.md](05-storage-engine/mutations-and-mvcc.md) | Q18 | Immutable ⇒ MVCC, time travel, and **branching for one PUT** all fall out for free. Deletes via roaring delete vectors. |
+
+## 06 — Indexing
+| Doc | Answers | Status |
+|---|---|---|
+| [vector-index-survey.md](06-indexing/vector-index-survey.md) | Q19 | HNSW and DiskANN need data-dependent hop chains ⇒ dead on 30 ms storage. SPANN/SPFresh needs a **fixed 2**. Small indexes use exact scan — and most indexes are small. |
+| [quantization.md](06-indexing/quantization.md) | Q20 | **RaBitQ over PQ**: no per-tenant training (decisive at millions of tenants) and a real error bound (PQ has none and fails badly on some data). 1-bit = 96 GB per 1B vectors. |
+| [full-text-search.md](06-indexing/full-text-search.md) | Q21 | Inverted indexes already are ranged-read structures. Tantivy behind a custom `Directory`. Block-max metadata must live in the *cached* index section — a skipped block is a skipped network fetch. |
+| [filtering.md](06-indexing/filtering.md) | Q22 | Graph indexes collapse under selective filters (islands/dead ends). Clustered indexes compose with pre-filtering. **Our round-trip choice hands us the better filtering architecture for free.** |
+| [incremental-maintenance.md](06-indexing/incremental-maintenance.md) | Q23 | LIRE/SPFresh touches only boundary vectors: 1% of DRAM, <10% of cores vs. global rebuild. Adapting it to immutable objects is **the design's biggest open risk (OQ-51)**. |
+
+## 07 — Caching
+| Doc | Answers | Status |
+|---|---|---|
+| [cache-hierarchy.md](07-caching/cache-hierarchy.md) | Q24 | Class-aware admission, not one big LRU: centroids and index sections must never be evicted by bulk traffic. `foyer` for the hybrid RAM+NVMe tier. **Immutable ids ⇒ cache entries never need invalidation.** |
+| [affinity-and-coldstart.md](07-caching/affinity-and-coldstart.md) | Q25 | Cold is 30–60× warm, so minimize the *number* of cold queries. NVMe cache must survive process restarts, or a rolling deploy flushes 10,000 caches. |
+
+## 08 — Query engine
+| Doc | Answers | Status |
+|---|---|---|
+| [query-path.md](08-query-engine/query-path.md) | Q26 | Three round trips, with RT-A speculatively fetching everything knowable before touching data. Plan selection is free and **cache-aware**. |
+| [hybrid-and-ranking.md](08-query-engine/hybrid-and-ranking.md) | Q27 | RRF by default (robust to score drift). **Cross-shard BM25 needs two-pass IDF** — easy to ship wrong, hard to notice. No inference in v1. |
+
+## 09 — Rust stack
+| Doc | Answers | Status |
+|---|---|---|
+| [crate-survey.md](09-rust-stack/crate-survey.md) | Q28 | `object_store`, `arrow-rs`, `simsimd`, `roaring`, `tantivy`, `foyer`. **The deterministic simulator is built before the distributed features, not after.** One binary, all roles. |
+| [runtime-and-io.md](09-rust-stack/runtime-and-io.md) | Q29 | Tokio (work-stealing suits our wildly skewed work) + a separate rayon pool for SIMD. io_uring's win doesn't apply to 30 ms HTTPS. Round-trip depth is a **tested invariant**. |
+
+## 10 — Benchmarks & cost
+| Doc | Answers | Status |
+|---|---|---|
+| [evaluation-methodology.md](10-benchmarks-cost/evaluation-methodology.md) | Q30 | Never report latency without cache state. QPS and recall are one number, not two. Recall and round-trip depth are CI gates. |
+| [cost-model.md](10-benchmarks-cost/cost-model.md) | Q31 | At 100M docs: storage $8/mo, writes $1/mo, queries $780/mo, **compute $8,760/mo (92%)**. This is a compute-efficiency business. Idle tenants are free. |
+
+## 11 — Design synthesis
+| Doc | Answers | Status |
+|---|---|---|
+| **[architecture.md](11-design/architecture.md)** | D32 | **Start here for the design.** The five constraints, the diagram, the write/read paths, and how we beat turbopuffer. |
+| [key-layout.md](11-design/key-layout.md) | D33 | Every key derivable; **seven kinds of mutable object in the entire system**. Storage-class routing by prefix. |
+| [api-design.md](11-design/api-design.md) | D34 | Every tradeoff (consistency, recall, completeness) is a client parameter. Responses report freshness and cost. |
+| [roadmap.md](11-design/roadmap.md) | D35 | Built in descending order of "if this is wrong, the architecture is wrong." M0 measures CAS before anything else. |
+
+---
+
+## Glossary of pstore terms
+
+| Term | Meaning |
+|---|---|
+| **Index** | The unit of tenancy and isolation. (turbopuffer calls this a namespace.) |
+| **Shard** | A horizontal partition of one index, by hash of document id. |
+| **Lane** | A per-writer append-only WAL stream. Lanes remove CAS from the write path. |
+| **Epoch** | Monotonic counter incremented on structural change; part of every key. |
+| **Manifest** | The CAS'd blob naming the committed state of an index at an epoch. |
+| **RA** | Request amplification: blob requests per logical op, split W / Rseq / Rpar / List. |
+| **Segment** | An immutable data object (data blocks + index blocks + footer). |
+| **Footer** | Self-describing trailer at a known suffix offset; one `Range: -N` GET bootstraps a segment. |
