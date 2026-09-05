@@ -46,6 +46,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-testkit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pstore-blob",
+ "pstore-types",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-types"
 version = "0.1.0"
 

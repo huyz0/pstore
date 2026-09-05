@@ -10,6 +10,7 @@ members = [
     # Layer 0 - types only, no logic, no dependencies
     "crates/pstore-types",
     "crates/pstore-blob",
+    "crates/pstore-testkit",
     # Layer 1 - substrate
     # "crates/pstore-blob",      # nothing above may touch object_store directly
     # "crates/pstore-kernel",    # the ONLY crate permitted unsafe

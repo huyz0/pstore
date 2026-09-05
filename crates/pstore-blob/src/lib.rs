@@ -8,12 +8,16 @@
 
 mod accounting;
 mod coalesce;
+mod congestion;
+mod faulty;
 mod memory;
 mod store;
 mod types;
 
 pub use accounting::{Accounted, OpClass, TenantView};
 pub use coalesce::{Fetch, coalesce};
+pub use congestion::Congested;
+pub use faulty::{Faults, Faulty};
 pub use memory::{MemoryStore, TagStyle};
 pub use store::BlobStore;
 pub use types::{BlobError, Capabilities, CasError, Key, Precondition, PutOutcome, Support};

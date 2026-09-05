@@ -1,0 +1,5 @@
+//! Conformance probes and sensitivity sweeps.
+//!
+//! Never shipped: a `dev-dependencies` crate. See `docs/milestones/M0a/SPEC.md`.
+
+pub mod conformance;
