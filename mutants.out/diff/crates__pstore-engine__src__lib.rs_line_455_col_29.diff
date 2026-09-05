@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ delete ! in Engine<S>::gc
+@@ -447,17 +447,17 @@
+                 .collect();
+             let doomed: Vec<Key> = due
+                 .iter()
+                 .filter_map(|e| at.head.graveyard.get(e))
+                 .flatten()
+                 // ⚠️ Checked against what HEAD names *now*, not against what it named when
+                 // the key was buried. Cheap, and the one thing standing between a bug
+                 // anywhere in the commit path and deleting live data.
+-                .filter(|k| !live.contains(k.as_str()))
++                .filter(|k|  /* ~ changed by cargo-mutants ~ */live.contains(k.as_str()))
+                 .map(|k| Key::new(k.clone()))
+                 .collect();
+ 
+             // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
+             // Pruning first and then failing to delete loses the only record that these
+             // objects exist, and they leak with nothing left to find them by. Deleting
+             // first and then failing to prune costs a repeated delete on the next pass,
+             // which is idempotent.

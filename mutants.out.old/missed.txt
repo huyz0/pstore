@@ -9,8 +9,8 @@ crates/pstore-blob/src/congestion.rs:136:9: replace <impl crate::BlobStore for C
 crates/pstore-blob/src/congestion.rs:140:9: replace <impl crate::BlobStore for Congested<S>>::get_tag -> Option<pstore_types::CasTag> with None
 crates/pstore-blob/src/congestion.rs:144:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(0)
 crates/pstore-blob/src/congestion.rs:144:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(1)
-crates/pstore-blob/src/congestion.rs:165:9: replace <impl crate::BlobStore for Congested<S>>::delete_batch -> Result<(), BlobError> with Ok(())
 crates/pstore-blob/src/congestion.rs:169:9: replace <impl crate::BlobStore for Congested<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-blob/src/congestion.rs:165:9: replace <impl crate::BlobStore for Congested<S>>::delete_batch -> Result<(), BlobError> with Ok(())
 crates/pstore-blob/src/faulty.rs:38:9: replace Faults::none -> Self with Default::default()
 crates/pstore-blob/src/faulty.rs:55:16: replace ^ with | in Inner::next_f64
 crates/pstore-blob/src/faulty.rs:55:16: replace ^ with & in Inner::next_f64
@@ -26,8 +26,8 @@ crates/pstore-blob/src/faulty.rs:118:9: replace Faulty<S>::write_fault -> Option
 crates/pstore-blob/src/faulty.rs:119:39: replace || with && in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:119:44: replace < with == in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:119:44: replace < with <= in Faulty<S>::write_fault
-crates/pstore-blob/src/faulty.rs:122:14: replace < with == in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:122:14: replace < with <= in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:122:14: replace < with == in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:122:28: replace + with - in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:122:28: replace + with * in Faulty<S>::write_fault
 crates/pstore-blob/src/faulty.rs:130:14: replace < with <= in Faulty<S>::cas_fault
@@ -43,29 +43,77 @@ crates/pstore-blob/src/memory.rs:66:34: replace * with + in MemoryStore::with_ta
 crates/pstore-blob/src/memory.rs:91:23: replace ^= with |= in MemoryStore::next_tag
 crates/pstore-blob/src/memory.rs:91:23: replace ^= with &= in MemoryStore::next_tag
 crates/pstore-blob/src/memory.rs:135:9: replace <impl crate::BlobStore for MemoryStore>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:43:9: replace ObjectStoreBackend::unprobed -> Capabilities with Default::default()
+crates/pstore-blob/src/object_store_backend.rs:58:9: replace ObjectStoreBackend::map_err -> BlobError with Default::default()
 crates/pstore-blob/src/object_store_backend.rs:49:32: replace * with + in ObjectStoreBackend::unprobed
 crates/pstore-blob/src/object_store_backend.rs:49:32: replace * with / in ObjectStoreBackend::unprobed
-crates/pstore-engine/src/lib.rs:220:75: replace ^ with | in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:220:75: replace ^ with & in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:257:24: replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:257:32: replace < with <= in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:257:54: replace - with + in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:257:54: replace - with / in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:265:37: replace << with >> in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:266:52: replace + with - in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:266:52: replace + with * in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:266:47: replace % with / in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:266:47: replace % with + in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:267:78: replace * with + in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:267:78: replace * with / in Engine<S>::fold
-crates/pstore-engine/src/lib.rs:372:13: delete field epoch from struct Head expression in Engine<S>::commit_stale_for_test
+crates/pstore-blob/src/object_store_backend.rs:65:43: replace || with && in ObjectStoreBackend::map_err
+crates/pstore-blob/src/object_store_backend.rs:75:9: replace ObjectStoreBackend::put_opts -> PutOptions with Default::default()
+crates/pstore-blob/src/object_store_backend.rs:93:9: replace <impl crate::BlobStore for ObjectStoreBackend>::capabilities -> &Capabilities with Box::leak(Box::new(Default::default()))
+crates/pstore-blob/src/object_store_backend.rs:54:9: replace ObjectStoreBackend::path -> Path with Default::default()
+crates/pstore-blob/src/object_store_backend.rs:97:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:107:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:119:29: replace != with == in <impl crate::BlobStore for ObjectStoreBackend>::get_range
+crates/pstore-blob/src/object_store_backend.rs:128:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_with_tag -> Result<(Bytes, CasTag), BlobError> with Ok((Default::default(), Default::default()))
+crates/pstore-blob/src/object_store_backend.rs:139:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:140:13: delete field range from struct object_store::GetOptions expression in <impl crate::BlobStore for ObjectStoreBackend>::get_suffix
+crates/pstore-blob/src/object_store_backend.rs:153:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_tag -> Option<CasTag> with None
+crates/pstore-blob/src/object_store_backend.rs:153:9: replace <impl crate::BlobStore for ObjectStoreBackend>::get_tag -> Option<CasTag> with Some(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:162:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-blob/src/object_store_backend.rs:162:9: replace <impl crate::BlobStore for ObjectStoreBackend>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-blob/src/object_store_backend.rs:170:9: replace <impl crate::BlobStore for ObjectStoreBackend>::put -> Result<PutOutcome, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:188:9: replace <impl crate::BlobStore for ObjectStoreBackend>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+crates/pstore-blob/src/object_store_backend.rs:205:9: replace <impl crate::BlobStore for ObjectStoreBackend>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-blob/src/object_store_backend.rs:218:9: replace <impl crate::BlobStore for ObjectStoreBackend>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-blob/src/object_store_backend.rs:218:9: replace <impl crate::BlobStore for ObjectStoreBackend>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![Default::default()])
+crates/pstore-blob/src/object_store_backend.rs:241:5: replace map_cas_err -> CasError with Default::default()
+crates/pstore-blob/src/object_store_backend.rs:247:34: replace || with && in map_cas_err
+crates/pstore-engine/src/lib.rs:113:21: replace << with >> in backoff
+crates/pstore-engine/src/lib.rs:113:5: replace backoff with ()
+crates/pstore-engine/src/lib.rs:114:26: replace % with / in backoff
+crates/pstore-engine/src/lib.rs:114:31: replace + with * in backoff
+crates/pstore-engine/src/lib.rs:114:26: replace % with + in backoff
+crates/pstore-engine/src/lib.rs:115:62: replace * with + in backoff
+crates/pstore-engine/src/lib.rs:115:62: replace * with / in backoff
+crates/pstore-engine/src/lib.rs:319:75: replace ^ with & in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:319:75: replace ^ with | in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:344:26: replace > with >= in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:366:24: replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:366:32: replace < with <= in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:366:54: replace - with + in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:366:54: replace - with / in Engine<S>::fold
+crates/pstore-engine/src/lib.rs:431:75: replace ^ with | in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:431:75: replace ^ with & in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:24: replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with false in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:24: replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:32: replace < with == in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:32: replace < with > in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:32: replace < with <= in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:54: replace - with + in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:438:54: replace - with / in Engine<S>::gc
+crates/pstore-engine/src/lib.rs:463:71: replace ^ with | in Engine<S>::commit_head_for_test
+crates/pstore-engine/src/lib.rs:463:71: replace ^ with & in Engine<S>::commit_head_for_test
+crates/pstore-engine/src/lib.rs:460:9: replace Engine<S>::commit_head_for_test -> Result<Epoch, EngineError> with Ok(Default::default())
+crates/pstore-engine/src/lib.rs:510:25: replace < with <= in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:560:75: replace ^ with & in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:560:75: replace ^ with | in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:580:24: replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:580:54: replace - with + in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:580:32: replace < with <= in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:580:54: replace - with / in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:676:13: delete field epoch from struct Head expression in Engine<S>::commit_stale_for_test
+crates/pstore-engine/src/lanes.rs:45:54: replace > with == in decode
+crates/pstore-engine/src/lanes.rs:45:50: replace / with % in decode
+crates/pstore-engine/src/lanes.rs:45:54: replace > with >= in decode
 crates/pstore-format/src/lib.rs:34:33: replace * with +
 crates/pstore-format/src/docs.rs:13:5: replace encode_docs -> Vec<u8> with vec![]
 crates/pstore-format/src/docs.rs:13:5: replace encode_docs -> Vec<u8> with vec![0]
 crates/pstore-format/src/docs.rs:13:5: replace encode_docs -> Vec<u8> with vec![1]
-crates/pstore-format/src/docs.rs:41:5: replace decode_docs -> Result<Vec<Document>, FormatError> with Ok(vec![])
-crates/pstore-format/src/docs.rs:56:17: delete match arm 0 in decode_docs
-crates/pstore-format/src/docs.rs:57:17: delete match arm 1 in decode_docs
+crates/pstore-testkit/src/audit.rs:59:9: replace Auditing<S>::keys_written -> usize with 1
+crates/pstore-testkit/src/audit.rs:96:9: replace <impl BlobStore for Auditing<S>>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/audit.rs:96:9: replace <impl BlobStore for Auditing<S>>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/audit.rs:92:9: replace <impl BlobStore for Auditing<S>>::get_tag -> Option<CasTag> with None
+crates/pstore-testkit/src/audit.rs:140:9: replace <impl BlobStore for Auditing<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
 crates/pstore-testkit/src/conformance.rs:154:18: replace match guard &b[..] == b"234" with true in probe_ranged_read
 crates/pstore-testkit/src/conformance.rs:191:24: replace match guard b.len() == want_len with true in probe_coalesced_read
 crates/pstore-testkit/src/conformance.rs:234:18: replace match guard b.len() == 10 with true in probe_suffix_read
@@ -73,3 +121,61 @@ crates/pstore-testkit/src/depth.rs:120:9: replace <impl pstore_blob::BlobStore f
 crates/pstore-testkit/src/depth.rs:125:9: replace <impl pstore_blob::BlobStore for DepthCounting<S>>::head -> Result<u64, BlobError> with Ok(0)
 crates/pstore-testkit/src/depth.rs:125:9: replace <impl pstore_blob::BlobStore for DepthCounting<S>>::head -> Result<u64, BlobError> with Ok(1)
 crates/pstore-testkit/src/depth.rs:150:9: replace <impl pstore_blob::BlobStore for DepthCounting<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-testkit/src/flaky.rs:81:9: replace Flaky::failures -> u64 with 0
+crates/pstore-testkit/src/flaky.rs:81:9: replace Flaky::failures -> u64 with 1
+crates/pstore-testkit/src/flaky.rs:87:9: replace Flaky::refuse -> bool with true
+crates/pstore-testkit/src/flaky.rs:87:9: replace Flaky::refuse -> bool with false
+crates/pstore-testkit/src/flaky.rs:92:22: replace == with != in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:99:16: replace ^ with | in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:99:16: replace ^ with & in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:100:16: replace ^ with | in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:100:16: replace ^ with & in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:99:21: replace >> with << in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:100:21: replace >> with << in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:101:23: replace ^ with & in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:101:36: replace >> with << in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:101:23: replace ^ with | in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:101:28: replace >> with << in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:102:17: replace < with == in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:102:17: replace < with > in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:102:17: replace < with <= in Flaky::refuse
+crates/pstore-testkit/src/flaky.rs:113:13: delete field reads_fail from struct Self expression in Flaky::refusing_reads
+crates/pstore-testkit/src/flaky.rs:122:13: delete field always_contended from struct Self expression in Flaky::always_contended
+crates/pstore-testkit/src/flaky.rs:128:9: replace Flaky::read_gate -> Result<(), BlobError> with Ok(())
+crates/pstore-testkit/src/flaky.rs:142:9: replace <impl BlobStore for Flaky>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/flaky.rs:146:9: replace <impl BlobStore for Flaky>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/flaky.rs:150:9: replace <impl BlobStore for Flaky>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/flaky.rs:158:9: replace <impl BlobStore for Flaky>::get_tag -> Option<CasTag> with None
+crates/pstore-testkit/src/flaky.rs:164:9: replace <impl BlobStore for Flaky>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/flaky.rs:164:9: replace <impl BlobStore for Flaky>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/flaky.rs:197:9: replace <impl BlobStore for Flaky>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-testkit/src/flaky.rs:200:9: replace <impl BlobStore for Flaky>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-testkit/src/gated.rs:43:9: replace Gated::arm with ()
+crates/pstore-testkit/src/gated.rs:53:9: replace <impl BlobStore for Gated>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/gated.rs:56:9: replace <impl BlobStore for Gated>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/gated.rs:59:9: replace <impl BlobStore for Gated>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/gated.rs:65:9: replace <impl BlobStore for Gated>::get_tag -> Option<CasTag> with None
+crates/pstore-testkit/src/gated.rs:68:9: replace <impl BlobStore for Gated>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/gated.rs:68:9: replace <impl BlobStore for Gated>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/gated.rs:83:46: replace && with || in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:83:93: replace < with == in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:83:93: replace < with > in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:83:93: replace < with <= in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:91:9: replace <impl BlobStore for Gated>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-testkit/src/gated.rs:94:9: replace <impl BlobStore for Gated>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-testkit/src/sim.rs:33:9: replace Sim::seed -> u64 with 0
+crates/pstore-testkit/src/sim.rs:33:9: replace Sim::seed -> u64 with 1
+crates/pstore-testkit/src/sim.rs:40:9: replace Sim::steps -> u64 with 0
+crates/pstore-testkit/src/sim.rs:40:9: replace Sim::steps -> u64 with 1
+crates/pstore-testkit/src/sim.rs:46:20: replace += with *= in Sim::next
+crates/pstore-testkit/src/sim.rs:49:16: replace ^ with & in Sim::next
+crates/pstore-testkit/src/sim.rs:49:16: replace ^ with | in Sim::next
+crates/pstore-testkit/src/sim.rs:49:21: replace >> with << in Sim::next
+crates/pstore-testkit/src/sim.rs:50:16: replace ^ with | in Sim::next
+crates/pstore-testkit/src/sim.rs:50:16: replace ^ with & in Sim::next
+crates/pstore-testkit/src/sim.rs:50:21: replace >> with << in Sim::next
+crates/pstore-testkit/src/sim.rs:51:11: replace ^ with | in Sim::next
+crates/pstore-testkit/src/sim.rs:51:16: replace >> with << in Sim::next
+crates/pstore-testkit/src/sim.rs:67:62: replace < with <= in Sim::chance
+crates/pstore-testkit/src/sim.rs:73:35: replace + with - in Sim::shuffle
+crates/pstore-testkit/src/sim.rs:73:35: replace + with * in Sim::shuffle

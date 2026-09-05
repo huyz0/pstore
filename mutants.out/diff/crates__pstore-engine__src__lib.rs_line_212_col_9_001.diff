@@ -1,0 +1,26 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::pending_for_test -> Vec<String> with vec![String::new()]
+@@ -204,22 +204,17 @@
+ 
+     /// The ids currently buffered and not yet acknowledged.
+     ///
+     /// Exposed so a recovery test can state precisely which rows a `flush` acknowledges.
+     /// Guessing that from the outside would make the test's own bookkeeping the thing
+     /// under test.
+     #[doc(hidden)]
+     pub async fn pending_for_test(&self) -> Vec<String> {
+-        self.mem()
+-            .pending
+-            .values()
+-            .flatten()
+-            .map(|d| d.id.clone())
+-            .collect()
++        vec![String::new()] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Writes everything buffered as **one bundle object**, whatever it covers.
+     ///
+     /// `RA = 1 W` for the batch, and for every index in it.
+     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
+         let _lane = self.flushing.lock().await;
+         let pending = {

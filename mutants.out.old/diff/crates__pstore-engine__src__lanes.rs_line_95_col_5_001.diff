@@ -1,0 +1,25 @@
+--- crates/pstore-engine/src/lanes.rs
++++ replace live -> Result<Vec<LaneId>, EngineError> with Ok(vec![Default::default()])
+@@ -87,21 +87,17 @@
+             Err(CasError::Io(e)) => return Err(EngineError::Blob(e)),
+         }
+     }
+     Err(EngineError::Lost)
+ }
+ 
+ /// Every lane a writer has ever registered for this tenant. **One read, no LIST.**
+ pub async fn live<S: BlobStore>(store: &S, tenant: TenantId) -> Result<Vec<LaneId>, EngineError> {
+-    match store.get(&key(tenant)).await {
+-        Ok(bytes) => Ok(decode(&bytes)?.into_iter().collect()),
+-        Err(pstore_blob::BlobError::NotFound(_)) => Ok(Vec::new()),
+-        Err(e) => Err(e.into()),
+-    }
++    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// How far a lane has been written, discovered by **probing forward** from `from`.
+ ///
+ /// Returns the first sequence number that does not exist, which is the count of bundles
+ /// written. Probes in each window go out together, so cost is reads rather than round
+ /// trips, and a 404 is a normal answer — it is what bounds the lane.
+ pub async fn tail<S: BlobStore>(

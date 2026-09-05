@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/gated.rs
++++ replace <impl BlobStore for Gated>::head -> Result<u64, BlobError> with Ok(0)
+@@ -60,17 +60,17 @@
+     }
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+         self.inner.get_with_tag(key).await
+     }
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+         self.inner.get_tag(key).await
+     }
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+-        self.inner.head(key).await
++        Ok(0) /* ~ changed by cargo-mutants ~ */
+     }
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+         self.inner.put(key, body).await
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,

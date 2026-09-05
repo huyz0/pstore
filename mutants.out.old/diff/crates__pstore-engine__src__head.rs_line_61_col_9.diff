@@ -1,0 +1,46 @@
+--- crates/pstore-engine/src/head.rs
++++ replace Head::encode -> Vec<u8> with vec![]
+@@ -53,42 +53,17 @@
+     #[must_use]
+     pub fn key(tenant: pstore_types::TenantId) -> Key {
+         Key::new(format!("{:04x}/tnt/{}/HEAD", tenant.0 as u16, tenant.0))
+     }
+ 
+     /// Encodes HEAD.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        let mut out = Vec::new();
+-        out.extend_from_slice(&self.epoch.0.to_le_bytes());
+-        out.extend_from_slice(&self.nonce.to_le_bytes());
+-        out.extend_from_slice(&(self.indexes.len() as u32).to_le_bytes());
+-        for (name, segs) in &self.indexes {
+-            put_str(&mut out, name);
+-            out.extend_from_slice(&(segs.len() as u32).to_le_bytes());
+-            for s in segs {
+-                put_str(&mut out, &s.key);
+-                out.extend_from_slice(&s.rows.to_le_bytes());
+-            }
+-        }
+-        out.extend_from_slice(&(self.watermarks.len() as u32).to_le_bytes());
+-        for (lane, seq) in &self.watermarks {
+-            out.extend_from_slice(&lane.to_le_bytes());
+-            out.extend_from_slice(&seq.to_le_bytes());
+-        }
+-        out.extend_from_slice(&(self.graveyard.len() as u32).to_le_bytes());
+-        for (epoch, keys) in &self.graveyard {
+-            out.extend_from_slice(&epoch.to_le_bytes());
+-            out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+-            for k in keys {
+-                put_str(&mut out, k);
+-            }
+-        }
+-        out
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Decodes HEAD, refusing anything malformed.
+     pub fn decode(buf: &[u8]) -> Result<Self, EngineError> {
+         let mut c = Cur { b: buf, i: 0 };
+         let mut h = Self {
+             epoch: Epoch(c.u64()?),
+             nonce: c.u64()?,

@@ -38,9 +38,9 @@
 +        Ok(vec![]) /* ~ changed by cargo-mutants ~ */
      }
  
+     /// ⚠️ Delegates rather than duplicating. This was a second decoder for the same wire
+     /// format, byte-identical to `decode_docs` — which means every future change to the
+     /// document encoding had to be made twice, and the day one of them was missed the
+     /// reader and the writer would disagree with no compiler to say so.
      fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
-         let mut d = Dec::new(buf);
-         let n = d.u32()? as usize;
-         let mut out = Vec::with_capacity(n.min(1 << 20));
-         for _ in 0..n {
-             let id = d.string()?;
+         crate::decode_docs(buf)

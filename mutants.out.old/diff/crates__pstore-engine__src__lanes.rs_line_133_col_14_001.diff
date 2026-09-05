@@ -1,0 +1,19 @@
+--- crates/pstore-engine/src/lanes.rs
++++ replace += with *= in tail
+@@ -125,15 +125,15 @@
+                 // ⚠️ Stops at the FIRST gap rather than counting what exists. A lane is
+                 // dense by construction, so a hole means the object is missing rather than
+                 // never written — and skipping past it would silently drop everything
+                 // before the next present key.
+                 Err(pstore_blob::BlobError::NotFound(_)) => break,
+                 Err(e) => return Err(e.into()),
+             }
+         }
+-        base += found;
++        base *= /* ~ changed by cargo-mutants ~ */ found;
+         if found < window {
+             return Ok(base);
+         }
+         window = (window * 2).min(MAX_PROBE_WINDOW);
+     }
+ }

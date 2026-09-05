@@ -16,7 +16,9 @@
 use pstore_blob::{
     Accounted, BlobStore, Congested, Faults, Faulty, MemoryStore, Support, TagStyle,
 };
-use pstore_testkit::conformance;
+use pstore_testkit::{
+    audit::Auditing, conformance, depth::DepthCounting, flaky::Flaky, gated::Gated,
+};
 use pstore_types::TenantId;
 
 #[tokio::test]
@@ -47,6 +49,26 @@ async fn every_decorator_conforms() {
     // Stacked, in the order production would use them.
     let stack = Congested::new(Faulty::new(MemoryStore::new(), 9, Faults::none()), 8);
     assert!(conformance::run(&stack, 5).await.conforms());
+
+    // The measuring decorators. `DepthCounting` in particular reimplements the whole
+    // trait to time each call, so every method is a hand-written forward.
+    let depth = DepthCounting::new(MemoryStore::new());
+    assert!(conformance::run(&depth, 7).await.conforms());
+
+    // The auditing store refuses an unconditional overwrite of an existing key, and the
+    // suite never does one -- so a CONFORMING caller cannot tell it is there. That is its
+    // contract: invisible until Invariant I1 is actually broken.
+    let audit = Auditing::new(MemoryStore::new());
+    assert!(conformance::run(&audit, 8).await.conforms());
+
+    // The fault injectors, configured to inject nothing. A "no faults" setting that still
+    // perturbs the store would make every test built on it quietly non-deterministic.
+    assert!(conformance::run(&Flaky::new(99, 0.0), 9).await.conforms());
+    assert!(conformance::run(&Flaky::refusing(&[]), 10).await.conforms());
+
+    // Unarmed means "not yet racing". A gate that blocked before it was armed would
+    // deadlock the setup phase of every test that uses it.
+    assert!(conformance::run(&Gated::new(2), 11).await.conforms());
 }
 
 #[tokio::test]

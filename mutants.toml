@@ -1,0 +1,11 @@
+# ⚠️ Run the WHOLE workspace's tests against every mutant, not just the mutated
+# package's own.
+#
+# The default is per-package, and it silently understates the score in a workspace laid
+# out like this one: `pstore-blob` defines the store decorators, but the conformance suite
+# that interrogates them lives in `pstore-testkit`, so by default a mutant in a decorator
+# was never shown the one test that catches it. It was reported MISSED while a test that
+# fails on it sat two directories away.
+#
+# Costs wall-clock. Buys a score that means what it says.
+test_workspace = true

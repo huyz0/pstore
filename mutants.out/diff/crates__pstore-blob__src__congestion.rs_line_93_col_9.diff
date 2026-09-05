@@ -1,6 +1,6 @@
 --- crates/pstore-blob/src/congestion.rs
 +++ replace Congested<S>::with_retry -> Result<T, BlobError> with Ok(Default::default())
-@@ -85,36 +85,17 @@
+@@ -85,33 +85,17 @@
      }
  
      /// Runs `op`, backing off and retrying while it answers `SlowDown`.
@@ -20,10 +20,7 @@
 -                Err(BlobError::SlowDown) => {
 -                    self.on_slow_down();
 -                    last = BlobError::SlowDown;
--                    // Exponential, and jittered by the attempt index so a fleet that all
--                    // tripped together does not all come back together.
--                    let ms = 1u64 << attempt;
--                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+-                    tokio::time::sleep(retry_delay(attempt)).await;
 -                }
 -                Err(e) => return Err(e),
 -            }
@@ -33,8 +30,8 @@
      }
  }
  
- #[async_trait::async_trait]
- impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
-     fn capabilities(&self) -> &Capabilities {
-         self.inner.capabilities()
-     }
+ /// How long to wait before retrying a throttled request.
+ ///
+ /// ⚠️ Split out from the retry loop so it can be checked. Inside the loop its only
+ /// observable was elapsed time, and mutation testing inverted the shift — turning
+ /// exponential backoff into an immediately-collapsing one — without a single test

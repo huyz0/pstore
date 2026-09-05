@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace * with / in Engine<S>::search
+@@ -684,17 +684,17 @@
+         let docs = self.scan(index, filter).await?;
+         let mut scored: Vec<(String, f32)> = docs
+             .into_iter()
+             .map(|d| {
+                 let dist = d
+                     .vector
+                     .iter()
+                     .zip(query)
+-                    .map(|(a, b)| (a - b) * (a - b))
++                    .map(|(a, b)| (a - b) / /* ~ changed by cargo-mutants ~ */ (a - b))
+                     .sum::<f32>();
+                 (d.id, dist)
+             })
+             .collect();
+         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+         scored.truncate(k);
+         Ok(scored)
+     }

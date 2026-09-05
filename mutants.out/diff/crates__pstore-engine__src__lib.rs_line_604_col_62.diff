@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace == with != in Engine<S>::compact
+@@ -596,17 +596,17 @@
+             next.epoch = next.epoch.next();
+             next.nonce = nonce_for(next.epoch, self.lane);
+             // Segments added since we read: kept, in place, after the merged one. Dropping
+             // them would silently discard every row folded while we were merging.
+             let mut kept: Vec<SegmentRef> = vec![out.clone()];
+             kept.extend(
+                 current
+                     .iter()
+-                    .filter(|c| !inputs.iter().any(|i| i.key == c.key))
++                    .filter(|c| !inputs.iter().any(|i| i.key != /* ~ changed by cargo-mutants ~ */ c.key))
+                     .cloned(),
+             );
+             next.indexes.insert(index.to_owned(), kept);
+             // Same rule for the segments this merge replaced.
+             next.graveyard
+                 .entry(next.epoch.0)
+                 .or_default()
+                 .extend(inputs.iter().map(|i| i.key.clone()));

@@ -1,0 +1,52 @@
+--- crates/pstore-engine/src/head.rs
++++ replace Head::decode -> Result<Self, EngineError> with Ok(Default::default())
+@@ -83,48 +83,17 @@
+                 put_str(&mut out, k);
+             }
+         }
+         out
+     }
+ 
+     /// Decodes HEAD, refusing anything malformed.
+     pub fn decode(buf: &[u8]) -> Result<Self, EngineError> {
+-        let mut c = Cur { b: buf, i: 0 };
+-        let mut h = Self {
+-            epoch: Epoch(c.u64()?),
+-            nonce: c.u64()?,
+-            ..Self::default()
+-        };
+-        for _ in 0..c.u32()? {
+-            let name = c.string()?;
+-            let n = c.u32()?;
+-            let mut segs = Vec::with_capacity(n as usize);
+-            for _ in 0..n {
+-                segs.push(SegmentRef {
+-                    key: c.string()?,
+-                    rows: c.u32()?,
+-                });
+-            }
+-            h.indexes.insert(name, segs);
+-        }
+-        for _ in 0..c.u32()? {
+-            let lane = c.u64()?;
+-            h.watermarks.insert(lane, c.u64()?);
+-        }
+-        for _ in 0..c.u32()? {
+-            let epoch = c.u64()?;
+-            let n = c.u32()?;
+-            let mut keys = Vec::with_capacity(n as usize);
+-            for _ in 0..n {
+-                keys.push(c.string()?);
+-            }
+-            h.graveyard.insert(epoch, keys);
+-        }
+-        Ok(h)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Whether this lane's sequence has already been folded into a committed epoch.
+     #[must_use]
+     pub fn is_folded(&self, lane: LaneId, seq: Seq) -> bool {
+         self.watermarks.get(&lane.0).is_some_and(|w| *w > seq.0)
+     }
+ }

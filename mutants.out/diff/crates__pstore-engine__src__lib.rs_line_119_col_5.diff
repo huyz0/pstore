@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace nonce_for -> u64 with 0
+@@ -111,17 +111,17 @@
+ /// two commits byte-different even when everything else about them matches.
+ ///
+ /// XOR, not OR or AND: both of those lose information, so distinct `(epoch, lane)` pairs
+ /// collapse onto the same nonce and the guard silently stops guarding. Mutation testing
+ /// found `|` and `&` indistinguishable from `^` to every test in the workspace, which is
+ /// why `nonces_never_collide_across_epochs_and_lanes` exists.
+ #[must_use]
+ pub fn nonce_for(epoch: Epoch, lane: LaneId) -> u64 {
+-    epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ lane.0
++    0 /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// How long a writer waits before retrying a lost commit.
+ ///
+ /// ⚠️ Jittered, and that is not decoration. Without it optimistic concurrency
+ /// **livelocks**: every loser retries immediately, collides with the same peers, and
+ /// loses again. It surfaced as a *flaky* test rather than a failing one, which is the
+ /// more expensive way to find out. The jitter comes from the lane rather than a random
