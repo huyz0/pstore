@@ -100,3 +100,8 @@ jobs:
       # in the project this was distilled from, a silently-broken counter meant the
       # cap never fired and one task reached eleven rounds.
       - run: ./scripts/selftest-review.sh
+      # OQ-167: every acceptance criterion has an evidence line, and every test it
+      # names resolves. Spec drift is the one problem no SDD framework solves; this
+      # is the only part of it a predicate can catch.
+      - run: ./scripts/check-verified.py
+      - run: ./scripts/selftest-check-verified.sh

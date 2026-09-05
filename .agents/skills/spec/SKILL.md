@@ -72,6 +72,11 @@ Three rules that make it worth having:
 Enumeration is the mechanism. Nothing can check the evidence is *true*; forcing a line per
 criterion is what catches the quiet omission of criterion 6.
 
+→ `scripts/check-verified.py` enforces the mechanical half: every criterion has a line,
+every named test resolves, and a line that names no test must say `NOT-RUN` or
+`OBSERVED-NOT`. It **cannot** check that the evidence is true, and it cannot see
+macro-generated tests — name the enclosing `#[test]` fn, or abstain with a reason.
+
 ## Only the current milestone
 
 Decompose in detail only what is next. Tasks written three milestones ahead are wrong by

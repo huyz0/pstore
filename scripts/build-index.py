@@ -73,6 +73,22 @@ txt = re.sub(r"The plan: \d+ questions", f"The plan: {c['questions']} questions"
 txt = re.sub(r"\*\*\d+ open questions, risk-ranked\.\*\*", f"**{c['open']} open questions, risk-ranked.**", txt)
 stale |= apply(i, txt)
 
+# ⚠️ The Gates table in AGENTS.md is hand-written prose -- exactly the list that goes
+# stale, and it already had: it named build-index.sh for months after the rename to .py.
+# We cannot generate the descriptions, but we CAN assert that the set of scripts CI runs
+# and the set the table claims are the same set. Rung 3 beating rung 7.
+ci = (ROOT / ".github/workflows/ci.yml").read_text()
+ci_scripts = {m for m in re.findall(r"\./(scripts/[\w.-]+)", ci) if "selftest-" not in m}
+gates_tbl = re.search(r"<!-- index:gates:start -->(.*?)<!-- index:gates:end -->",
+                      (ROOT / "AGENTS.md").read_text(), re.S).group(1)
+tbl_scripts = set(re.findall(r"`(scripts/[\w.-]+)", gates_tbl))
+for m in sorted(ci_scripts - tbl_scripts):
+    stale = True
+    print(f"STALE AGENTS.md Gates: CI runs {m}, the table does not list it", file=sys.stderr)
+for e in sorted(tbl_scripts - ci_scripts):
+    stale = True
+    print(f"STALE AGENTS.md Gates: the table lists {e}, CI does not run it", file=sys.stderr)
+
 if CHECK and stale:
     print("FAIL run scripts/build-index.py to refresh", file=sys.stderr)
     sys.exit(1)

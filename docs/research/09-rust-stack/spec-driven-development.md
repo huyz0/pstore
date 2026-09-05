@@ -176,8 +176,16 @@ a spec that turns out wrong is amended rather than worked around. **None of thes
 gate**, and per [`gate-design`](../../../.agents/skills/gate-design/SKILL.md) that makes
 them preferences until something checks them.
 
-A plausible rung-3 gate exists: assert every test name in `VERIFIED.md` resolves to a
-real test. Recorded as OQ-167.
+One rung-3 gate now exists: **`scripts/check-verified.py`** (OQ-167, closed). It
+asserts every acceptance criterion has an evidence line, that every test named resolves
+to a real test in the tree, and that a line naming no test says `NOT-RUN` or
+`OBSERVED-NOT`. Nine selftest cases, four of which check the *false-refusal* path,
+because a gate that rejects legitimate input gets switched off and then enforces nothing.
+
+⚠️ It closes only the mechanical half. It **cannot** check that the evidence is true —
+that remains the "never claim a gate ran without running it" rule, which no script can
+enforce. It also cannot see macro-generated tests, so a proptest-generated name will not
+resolve; name the enclosing `#[test]` fn or abstain with a reason.
 
 ## 8. Open questions raised
 

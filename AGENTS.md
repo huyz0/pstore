@@ -81,7 +81,8 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `cargo mutants` | D-111 — the gate that makes coverage mean something |
 | `cargo deny check` | licences, advisories, and the `object_store` ban outside `pstore-blob` |
 | `scripts/check-links.sh` | every relative markdown link resolves |
-| `scripts/build-index.sh --check` | the generated regions in `AGENTS.md` are current |
+| `scripts/build-index.py --check` | the generated regions in `AGENTS.md` are current, and the Gates table matches what CI runs |
+| `scripts/check-verified.py` | every acceptance criterion has an evidence line, and every test it names resolves (OQ-167) |
 <!-- index:gates:end -->
 
 **Named by skills but absent today:** `scripts/review.sh` runs, but the reviewer
