@@ -1,0 +1,25 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace Accounted<S>::count -> u64 with 0
+@@ -57,21 +57,17 @@
+             counters: Arc::clone(&self.counters),
+             tenant,
+         }
+     }
+ 
+     /// Requests of `class` billed to `tenant`.
+     #[must_use]
+     pub fn count(&self, tenant: TenantId, class: OpClass) -> u64 {
+-        self.lock()
+-            .per_tenant
+-            .get(&(tenant, class))
+-            .copied()
+-            .unwrap_or(0)
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Requests of `class` across every tenant.
+     #[must_use]
+     pub fn total(&self, class: OpClass) -> u64 {
+         self.lock().totals.get(&class).copied().unwrap_or(0)
+     }
+ 

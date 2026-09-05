@@ -11,7 +11,7 @@ run() { printf '%-42s' "$1"; shift; if "$@" >/tmp/pstore-gate.log 2>&1; then ech
 
 run "cargo fmt --check"            cargo fmt --all --check
 run "cargo clippy -D warnings"     cargo clippy --all-targets --all-features -- -D warnings
-run "cargo test"                   cargo test --workspace --quiet
+run "cargo test"                   cargo test --workspace --all-features --quiet
 run "scripts/check-links.sh"       ./scripts/check-links.sh
 run "scripts/build-index.py --check" ./scripts/build-index.py --check
 run "scripts/check-verified.py"    ./scripts/check-verified.py

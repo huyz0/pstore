@@ -1,0 +1,18 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace <impl crate::BlobStore for Faulty<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+@@ -193,14 +193,11 @@
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         match self.write_fault() {
+             Some(e) => Err(e),
+             None => self.inner.delete_batch(keys).await,
+         }
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+-        match self.read_fault() {
+-            Some(e) => Err(e),
+-            None => self.inner.list_unrestricted(prefix).await,
+-        }
++        Ok(vec![]) /* ~ changed by cargo-mutants ~ */
+     }
+ }

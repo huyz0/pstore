@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/sweep.rs
++++ replace += with -= in contention_point
+@@ -98,17 +98,17 @@
+             (attempts, lost)
+         }));
+     }
+ 
+     let (mut attempts, mut lost) = (0u64, 0u64);
+     for t in tasks {
+         if let Ok((a, l)) = t.await {
+             attempts += a;
+-            lost += l;
++            lost -= /* ~ changed by cargo-mutants ~ */ l;
+         }
+     }
+     Point {
+         writers,
+         commits_each,
+         attempts,
+         commits: (writers * commits_each) as u64,
+         lost,

@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace < with <= in Faulty<S>::write_fault
+@@ -111,17 +111,17 @@
+         if r < f.slow_down + f.read_error {
+             return Some(BlobError::Other("injected read fault".to_owned()));
+         }
+         None
+     }
+ 
+     fn write_fault(&self) -> Option<BlobError> {
+         let (f, r, ops) = self.roll();
+-        if ops <= f.slow_down_first_n || r < f.slow_down {
++        if ops <= f.slow_down_first_n || r <= /* ~ changed by cargo-mutants ~ */ f.slow_down {
+             return Some(BlobError::SlowDown);
+         }
+         if r < f.slow_down + f.write_error {
+             return Some(BlobError::Other("injected write fault".to_owned()));
+         }
+         None
+     }
+ 

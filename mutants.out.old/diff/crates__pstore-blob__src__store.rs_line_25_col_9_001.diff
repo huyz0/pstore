@@ -1,0 +1,34 @@
+--- crates/pstore-blob/src/store.rs
++++ replace BlobStore::get_ranges -> Result<Vec<Bytes>, BlobError> with Ok(vec![Default::default()])
+@@ -17,30 +17,17 @@
+     /// One byte range.
+     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, BlobError>;
+ 
+     /// Several byte ranges at once, **coalescing nearby ones into a single request**.
+     ///
+     /// The workhorse of the read path. Provided rather than required, so no backend can
+     /// accidentally implement the naive one-request-per-range version.
+     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
+-        let gap = self.capabilities().coalesce_gap;
+-        let mut out: Vec<(usize, Bytes)> = Vec::with_capacity(ranges.len());
+-        for fetch in crate::coalesce(ranges, gap) {
+-            let base = fetch.span.start;
+-            let buf = self.get_range(key, fetch.span.clone()).await?;
+-            for (i, r) in fetch.serves {
+-                let (lo, hi) = ((r.start - base) as usize, (r.end - base) as usize);
+-                // Slice, not copy: `Bytes` is refcounted, so the merged buffer is shared
+-                // by every range it serves.
+-                out.push((i, buf.slice(lo..hi)));
+-            }
+-        }
+-        out.sort_by_key(|(i, _)| *i);
+-        Ok(out.into_iter().map(|(_, b)| b).collect())
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The current CAS tag, or `None` if the object is absent.
+     ///
+     /// The rebase step of the commit protocol: read the state an attempt will be
+     /// conditioned on. Provided in terms of `head`-like access so every backend has it.
+     async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag>;
+ 

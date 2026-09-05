@@ -1,0 +1,107 @@
+
+*** crates/pstore-blob/src/congestion.rs:140:9: replace <impl crate::BlobStore for Congested<S>>::put -> Result<PutOutcome, BlobError> with Ok(Default::default())
+
+*** mutation diff:
+--- crates/pstore-blob/src/congestion.rs
++++ replace <impl crate::BlobStore for Congested<S>>::put -> Result<PutOutcome, BlobError> with Ok(Default::default())
+@@ -132,17 +132,17 @@
+         self.inner.get_tag(key).await
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         self.with_retry(|| self.inner.head(key)).await
+     }
+ 
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+-        self.with_retry(|| self.inner.put(key, body.clone())).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=pstore-blob@0.1.0 --all-features
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh stable_deref_trait v1.2.1
+       Fresh writeable v0.6.4
+       Fresh litemap v0.8.3
+       Fresh smallvec v1.16.0
+       Fresh utf8_iter v1.0.4
+       Fresh autocfg v1.5.1
+       Fresh scopeguard v1.2.0
+       Fresh percent-encoding v2.3.2
+       Fresh pin-project-lite v0.2.17
+       Fresh cfg-if v1.0.4
+       Fresh either v1.18.0
+       Fresh slab v0.4.12
+       Fresh bytes v1.12.1
+       Fresh itoa v1.0.18
+       Fresh quote v1.0.47
+       Fresh lock_api v0.4.14
+       Fresh form_urlencoded v1.2.2
+       Fresh futures-task v0.3.34
+       Fresh futures-core v0.3.34
+       Fresh futures-sink v0.3.34
+       Fresh iana-time-zone v0.1.65
+       Fresh http v1.5.0
+       Fresh itertools v0.15.0
+       Fresh humantime v2.4.0
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-types)
+       Fresh syn v3.0.5
+       Fresh syn v2.0.119
+       Fresh icu_properties_data v2.3.0
+       Fresh icu_normalizer_data v2.3.0
+       Fresh libc v0.2.189
+       Fresh synstructure v0.13.2
+       Fresh zerovec-derive v0.11.6
+       Fresh displaydoc v0.2.7
+       Fresh thiserror-impl v2.0.20
+       Fresh num-traits v0.2.19
+       Fresh futures-macro v0.3.34
+       Fresh parking_lot_core v0.9.12
+       Fresh async-trait v0.1.92
+       Fresh tokio-macros v2.7.2
+       Fresh zerofrom-derive v0.1.7
+       Fresh yoke-derive v0.8.2
+       Fresh chrono v0.4.45
+       Fresh futures-util v0.3.34
+       Fresh thiserror v2.0.20
+       Fresh parking_lot v0.12.5
+       Fresh tokio v1.53.1
+       Fresh zerofrom v0.1.8
+       Fresh yoke v0.8.3
+       Fresh zerovec v0.11.8
+       Fresh zerotrie v0.2.5
+       Fresh tinystr v0.8.4
+       Fresh potential_utf v0.1.6
+       Fresh icu_locale_core v2.3.0
+       Fresh icu_collections v2.3.0
+       Fresh icu_provider v2.3.1
+       Fresh icu_normalizer v2.3.0
+       Fresh icu_properties v2.3.0
+       Fresh idna_adapter v1.2.2
+       Fresh idna v1.1.0
+       Fresh url v2.5.8
+       Fresh object_store v0.14.1
+       Dirty pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-blob): the file `crates/pstore-blob/src/congestion.rs` has changed (1788604860.038228054s, 1s after last build at 1788604859.461744646s)
+   Compiling pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-blob)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_blob --edition=2024 crates/pstore-blob/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --cfg 'feature="object_store"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=b615e1a99aa61aeb -C extra-filename=-ea7ab0f4ca431f83 --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libasync_trait-14b400283fac8cea.so --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern object_store=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libobject_store-b201e14610e40912.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libthiserror-5a6de54893a1cf1a.rmeta --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-8f73ed7cb87faa2b.rmeta`
+error[E0277]: the trait bound `PutOutcome: Default` is not satisfied
+   --> crates/pstore-blob/src/congestion.rs:140:12
+    |
+140 |         Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+    |            ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `PutOutcome`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `pstore-blob` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_blob --edition=2024 crates/pstore-blob/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --cfg 'feature="object_store"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=b615e1a99aa61aeb -C extra-filename=-ea7ab0f4ca431f83 --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libasync_trait-14b400283fac8cea.so --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern object_store=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libobject_store-b201e14610e40912.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libthiserror-5a6de54893a1cf1a.rmeta --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-8f73ed7cb87faa2b.rmeta` (exit status: 1)
+
+*** result: Failure(101)

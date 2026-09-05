@@ -157,6 +157,10 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         }
     }
 
+    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+        self.inner.get_tag(key).await
+    }
+
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
         match self.read_fault() {
             Some(e) => Err(e),

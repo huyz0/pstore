@@ -1,0 +1,39 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace probe_create_if_absent -> Support with Default::default()
+@@ -48,35 +48,17 @@
+ 
+ fn k(run: u64, s: &str) -> Key {
+     // Namespaced per run so a suite can be pointed at a shared bucket without two runs
+     // colliding -- which is how this will be used against a real cloud in M0b.
+     Key::new(format!("conformance/{run}/{s}"))
+ }
+ 
+ async fn probe_create_if_absent<S: BlobStore>(s: &S, run: u64) -> Support {
+-    let key = k(run, "cia");
+-    if s.put_conditional(&key, Bytes::from_static(b"1"), Precondition::NotExists)
+-        .await
+-        .is_err()
+-    {
+-        return Support::Unsupported;
+-    }
+-    match s
+-        .put_conditional(&key, Bytes::from_static(b"2"), Precondition::NotExists)
+-        .await
+-    {
+-        Err(CasError::Lost) => Support::Supported,
+-        // The MinIO case: the second create SUCCEEDS, so two writers both believe they
+-        // created the object. Silent, and fatal to every create-once key in the design.
+-        Ok(_) => Support::Divergent(
+-            "second create-if-absent succeeded; the wildcard precondition is ignored".to_owned(),
+-        ),
+-        Err(e) => Support::Divergent(format!("unexpected error: {e}")),
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ async fn probe_cas<S: BlobStore>(s: &S, run: u64) -> Support {
+     let key = k(run, "cas");
+     let Ok(first) = s
+         .put_conditional(&key, Bytes::from_static(b"1"), Precondition::NotExists)
+         .await
+     else {

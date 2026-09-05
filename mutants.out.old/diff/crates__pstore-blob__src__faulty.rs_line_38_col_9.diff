@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace Faults::none -> Self with Default::default()
+@@ -30,17 +30,17 @@
+     pub slow_down_first_n: u32,
+ }
+ 
+ impl Faults {
+     /// A perfectly behaved backend. The decorator must be transparent at this setting,
+     /// or every test that uses it is testing the decorator instead of the subject.
+     #[must_use]
+     pub fn none() -> Self {
+-        Self::default()
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[derive(Debug)]
+ struct Inner {
+     /// SplitMix64. Written out rather than pulled in so that determinism is visible in
+     /// the source and cannot drift with a dependency's version.
+     seed: u64,

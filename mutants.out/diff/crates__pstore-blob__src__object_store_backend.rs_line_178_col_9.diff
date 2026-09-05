@@ -1,0 +1,27 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace <impl crate::BlobStore for ObjectStoreBackend>::delete_batch -> Result<(), BlobError> with Ok(())
+@@ -170,23 +170,17 @@
+         }
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         // One request per key. ⚠️ S3 offers DeleteObjects for 1000 at a time and this
+         // does not use it, so GC costs 1000x what it should. Recorded rather than fixed:
+         // it needs `delete_stream`, which needs the futures machinery, and M0a's job here
+         // is to learn whether the trait fits — not to optimise an unverified adapter.
+-        for key in keys {
+-            self.inner
+-                .delete(&Self::path(key))
+-                .await
+-                .map_err(Self::map_err)?;
+-        }
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         // `list_with_delimiter` rather than the streaming `list`, so the adapter needs no
+         // futures dependency. Listing is banned on every hot path anyway, so the
+         // non-streaming form is the right shape for the three sanctioned uses.
+         let r = self
+             .inner

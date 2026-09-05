@@ -1,0 +1,24 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace probe_missing_key -> Support with Default::default()
+@@ -201,20 +201,17 @@
+         }
+     }
+     Support::Supported
+ }
+ 
+ async fn probe_missing_key<S: BlobStore>(s: &S, run: u64) -> Support {
+     // A 404 is a NORMAL answer, not an error: it is what bounds the WAL lane during
+     // forward probing. A backend that hangs or 500s here breaks tail discovery.
+-    match s.get(&k(run, "definitely-absent")).await {
+-        Err(_) => Support::Supported,
+-        Ok(_) => Support::Divergent("a missing key returned a body".to_owned()),
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ async fn probe_batch_delete<S: BlobStore>(s: &S, run: u64) -> Support {
+     let keys = [k(run, "d1"), k(run, "d2")];
+     for key in &keys {
+         if s.put(key, Bytes::from_static(b"x")).await.is_err() {
+             return Support::Unsupported;
+         }

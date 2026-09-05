@@ -1,0 +1,24 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace <impl crate::BlobStore for Faulty<S>>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -179,20 +179,17 @@
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+         // ⚠️ The fault is decided BEFORE the backend is touched. Failing after mutating
+         // would make the store diverge from what the caller was told, and every later
+         // assertion would be against a fiction.
+-        match self.cas_fault() {
+-            Some(e) => Err(e),
+-            None => self.inner.put_conditional(key, body, pre).await,
+-        }
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         match self.write_fault() {
+             Some(e) => Err(e),
+             None => self.inner.delete_batch(keys).await,
+         }
+     }

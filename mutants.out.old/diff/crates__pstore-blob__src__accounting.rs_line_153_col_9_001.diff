@@ -1,0 +1,16 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace <impl crate::BlobStore for TenantView<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![Default::default()])
+@@ -145,12 +145,11 @@
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         self.bill(OpClass::Delete);
+         self.inner.delete_batch(keys).await
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+-        self.bill(OpClass::List);
+-        self.inner.list_unrestricted(prefix).await
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ }

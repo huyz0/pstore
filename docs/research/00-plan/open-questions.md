@@ -178,7 +178,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-159` where exactly is the generics/`dyn` boundary — monomorphizing `BlobStore` through the engine could hurt compile times on a capped box ·
 `OQ-160` should `pstore-types` exist, or do newtypes belong with their owning layer? (junk-drawer risk) ·
 `OQ-165` at what change size does a spec stop paying for itself? milestone granularity may be too coarse ·
-~~`OQ-167`~~ **closed** — `scripts/check-verified.py`, 9 selftest cases. Catches missing evidence, drifted test names, unevidenced claims and ghost criteria; accepts `NOT-RUN`/`OBSERVED-NOT` and in-progress milestones. Cannot see macro-generated tests, and cannot check the evidence is *true* ·
+~~`OQ-167`~~ **closed** — `scripts/check-verified.py`, 9 selftest cases. Catches missing evidence, drifted test names, unevidenced claims and ghost criteria; accepts `NOT-RUN`/`OBSERVED-NOT` and in-progress milestones. Cannot see macro-generated tests, cannot check the evidence is *true*, and cannot see PARTIAL drift — one resolving name rescues a drifted sibling, because refusing every backticked snake_case word would refuse the methods and probes ledgers legitimately mention ·
 `OQ-168` does `NOT-RUN` stay honest, or decay into a rubber stamp? nothing enforces it ·
 ~~`OQ-161`~~ **closed** — layer 0+1 measured at ~1,400 tokens (the earlier ~4,800 was measured in the wrong repo); the five conclusions now live only in `INDEX.md`, with their imperative form in `AGENTS.md` § Never ·
 `OQ-162` the review packet runs the gates itself; cache verdicts by tree-sha if a gate gets slow ·

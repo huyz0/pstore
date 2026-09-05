@@ -1,0 +1,46 @@
+crates/pstore-blob/src/accounting.rs:123:9: replace <impl crate::BlobStore for TenantView<S>>::get_tag -> Option<pstore_types::CasTag> with None
+crates/pstore-blob/src/accounting.rs:148:9: replace <impl crate::BlobStore for TenantView<S>>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-blob/src/congestion.rs:72:37: replace / with % in Congested<S>::on_slow_down
+crates/pstore-blob/src/congestion.rs:78:67: replace + with * in Congested<S>::on_success
+crates/pstore-blob/src/congestion.rs:106:35: replace << with >> in Congested<S>::with_retry
+crates/pstore-blob/src/congestion.rs:132:9: replace <impl crate::BlobStore for Congested<S>>::get_tag -> Option<pstore_types::CasTag> with None
+crates/pstore-blob/src/congestion.rs:127:9: replace <impl crate::BlobStore for Congested<S>>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/congestion.rs:136:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-blob/src/congestion.rs:136:9: replace <impl crate::BlobStore for Congested<S>>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-blob/src/congestion.rs:157:9: replace <impl crate::BlobStore for Congested<S>>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-blob/src/congestion.rs:161:9: replace <impl crate::BlobStore for Congested<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-blob/src/faulty.rs:38:9: replace Faults::none -> Self with Default::default()
+crates/pstore-blob/src/faulty.rs:55:16: replace ^ with | in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:55:16: replace ^ with & in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:55:21: replace >> with << in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:56:16: replace ^ with | in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:56:16: replace ^ with & in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:56:21: replace >> with << in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:57:11: replace ^= with |= in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:57:16: replace >> with << in Inner::next_f64
+crates/pstore-blob/src/faulty.rs:108:14: replace < with <= in Faulty<S>::read_fault
+crates/pstore-blob/src/faulty.rs:111:14: replace < with <= in Faulty<S>::read_fault
+crates/pstore-blob/src/faulty.rs:118:9: replace Faulty<S>::write_fault -> Option<BlobError> with None
+crates/pstore-blob/src/faulty.rs:119:39: replace || with && in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:119:44: replace < with == in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:119:44: replace < with <= in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:122:14: replace < with == in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:122:14: replace < with <= in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:122:28: replace + with - in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:122:28: replace + with * in Faulty<S>::write_fault
+crates/pstore-blob/src/faulty.rs:130:14: replace < with <= in Faulty<S>::cas_fault
+crates/pstore-blob/src/faulty.rs:133:14: replace < with <= in Faulty<S>::cas_fault
+crates/pstore-blob/src/faulty.rs:154:9: replace <impl crate::BlobStore for Faulty<S>>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-blob/src/faulty.rs:161:9: replace <impl crate::BlobStore for Faulty<S>>::get_tag -> Option<pstore_types::CasTag> with None
+crates/pstore-blob/src/faulty.rs:165:9: replace <impl crate::BlobStore for Faulty<S>>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-blob/src/faulty.rs:165:9: replace <impl crate::BlobStore for Faulty<S>>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-blob/src/faulty.rs:194:9: replace <impl crate::BlobStore for Faulty<S>>::delete_batch -> Result<(), BlobError> with Ok(())
+crates/pstore-blob/src/faulty.rs:201:9: replace <impl crate::BlobStore for Faulty<S>>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+crates/pstore-blob/src/memory.rs:66:34: replace * with + in MemoryStore::with_tag_style
+crates/pstore-blob/src/memory.rs:91:23: replace ^= with |= in MemoryStore::next_tag
+crates/pstore-blob/src/memory.rs:91:23: replace ^= with &= in MemoryStore::next_tag
+crates/pstore-blob/src/object_store_backend.rs:49:32: replace * with + in ObjectStoreBackend::unprobed
+crates/pstore-blob/src/object_store_backend.rs:49:32: replace * with / in ObjectStoreBackend::unprobed
+crates/pstore-testkit/src/conformance.rs:154:18: replace match guard &b[..] == b"234" with true in probe_ranged_read
+crates/pstore-testkit/src/conformance.rs:191:24: replace match guard b.len() == want_len with true in probe_coalesced_read
+crates/pstore-testkit/src/conformance.rs:270:30: replace == with != in run

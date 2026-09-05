@@ -38,6 +38,12 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(out.into_iter().map(|(_, b)| b).collect())
     }
 
+    /// The current CAS tag, or `None` if the object is absent.
+    ///
+    /// The rebase step of the commit protocol: read the state an attempt will be
+    /// conditioned on. Provided in terms of `head`-like access so every backend has it.
+    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag>;
+
     /// Object size without the body. Reserved for GC and repair — **never the hot path**,
     /// where the manifest already proves what exists.
     async fn head(&self, key: &Key) -> Result<u64, BlobError>;

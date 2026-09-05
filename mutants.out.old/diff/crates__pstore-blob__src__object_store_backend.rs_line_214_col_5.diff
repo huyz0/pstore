@@ -1,0 +1,33 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace map_cas_err -> CasError with Default::default()
+@@ -206,29 +206,17 @@
+ /// S3 under concurrent conditional writes, which is precisely what we cannot produce.
+ ///
+ /// ⚠️ **A finding for M0b.** `object_store` has typed variants for 412
+ /// (`AlreadyExists`, `Precondition`) but folds S3's `409 ConditionalRequestConflict` into
+ /// a generic error, so it is recovered by matching the message. A string match on a
+ /// third-party error is fragile, and confirming it against a real throttle is an M0b
+ /// exit item rather than something to assume.
+ pub(crate) fn map_cas_err(e: &object_store::Error) -> CasError {
+-    match e {
+-        object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. } => {
+-            CasError::Lost
+-        }
+-        other => {
+-            let s = other.to_string();
+-            if s.contains("409") || s.contains("ConditionalRequestConflict") {
+-                CasError::Contended
+-            } else {
+-                CasError::Io(s)
+-            }
+-        }
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ #[allow(
+     clippy::unwrap_used,
+     reason = "assertions in tests are the reporting mechanism"
+ )]
+ mod tests {

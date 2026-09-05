@@ -1,0 +1,29 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace <impl crate::BlobStore for ObjectStoreBackend>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![Default::default()])
+@@ -183,25 +183,17 @@
+         }
+         Ok(())
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         // `list_with_delimiter` rather than the streaming `list`, so the adapter needs no
+         // futures dependency. Listing is banned on every hot path anyway, so the
+         // non-streaming form is the right shape for the three sanctioned uses.
+-        let r = self
+-            .inner
+-            .list_with_delimiter(Some(&Self::path(prefix)))
+-            .await
+-            .map_err(Self::map_err)?;
+-        Ok(r.objects
+-            .into_iter()
+-            .map(|m| Key::new(m.location.to_string()))
+-            .collect())
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Maps an `object_store` error onto the 412/409 split the retry policy rests on.
+ ///
+ /// Free-standing so it can be tested directly: the 409 path is reachable only from a real
+ /// S3 under concurrent conditional writes, which is precisely what we cannot produce.
+ ///

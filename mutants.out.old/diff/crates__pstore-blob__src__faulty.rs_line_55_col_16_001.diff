@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace ^ with & in Inner::next_f64
+@@ -47,17 +47,17 @@
+     faults: Faults,
+     ops: u32,
+ }
+ 
+ impl Inner {
+     fn next_f64(&mut self) -> f64 {
+         self.seed = self.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+         let mut z = self.seed;
+-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z & /* ~ changed by cargo-mutants ~ */ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+         z ^= z >> 31;
+         // 53 bits of mantissa: the same value on every platform.
+         ((z >> 11) as f64) / ((1u64 << 53) as f64)
+     }
+ }
+ 
+ /// Wraps a backend and injects faults from a seed.

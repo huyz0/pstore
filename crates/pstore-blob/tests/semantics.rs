@@ -183,3 +183,44 @@ async fn capabilities_name_the_backend_and_its_tag_style() {
     );
     assert!(MemoryStore::default().capabilities().delete_is_free);
 }
+
+#[tokio::test]
+async fn an_empty_range_is_legal_and_returns_nothing() {
+    // Found by mutation testing: `start > end` mutated to `>=` rejects a zero-length
+    // range, and nothing noticed because `coalesce` drops empty ranges before they reach
+    // the store. A direct read must still accept one.
+    let s = MemoryStore::new();
+    s.put(&k("e"), Bytes::from_static(b"0123")).await.unwrap();
+    assert!(s.get_range(&k("e"), 2..2).await.unwrap().is_empty());
+    assert!(s.get_range(&k("e"), 0..0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_full_length_range_is_legal() {
+    // The other side of the same mutation: `end > len` as `>=` would reject reading the
+    // whole object by range.
+    let s = MemoryStore::new();
+    s.put(&k("f"), Bytes::from_static(b"0123")).await.unwrap();
+    assert_eq!(&s.get_range(&k("f"), 0..4).await.unwrap()[..], b"0123");
+}
+
+#[tokio::test]
+async fn get_tag_reports_the_current_tag_and_none_when_absent() {
+    // The rebase step of the commit protocol. Returning None always would make every
+    // commit loop give up, and returning a stale tag would break fencing.
+    let s = MemoryStore::new();
+    assert!(s.get_tag(&k("t")).await.is_none());
+    let first = s.put(&k("t"), Bytes::from_static(b"1")).await.unwrap();
+    assert_eq!(s.get_tag(&k("t")).await.as_ref(), Some(&first.tag));
+    let second = s.put(&k("t"), Bytes::from_static(b"2")).await.unwrap();
+    assert_eq!(s.get_tag(&k("t")).await.as_ref(), Some(&second.tag));
+    assert_ne!(first.tag, second.tag);
+}
+
+#[tokio::test]
+async fn a_key_displays_as_the_path_it_will_be_fetched_from() {
+    // Keys appear in error messages and logs; a Display that dropped the path would make
+    // every "no such key" report unactionable.
+    assert_eq!(k("h/idx/1/HEAD").to_string(), "h/idx/1/HEAD");
+    assert_eq!(k("h/idx/1/HEAD").as_str(), "h/idx/1/HEAD");
+}

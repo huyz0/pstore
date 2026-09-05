@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace || with && in ObjectStoreBackend::map_err
+@@ -57,17 +57,17 @@
+     fn map_err(e: object_store::Error) -> BlobError {
+         match e {
+             object_store::Error::NotFound { .. } => BlobError::NotFound(e.to_string()),
+             other => {
+                 // `object_store` surfaces 503 SlowDown only in the message, which is
+                 // itself a finding: the signal our congestion controller needs is not a
+                 // typed variant. Recorded for M0b to confirm against a real throttle.
+                 let s = other.to_string();
+-                if s.contains("SlowDown") || s.contains("503") {
++                if s.contains("SlowDown") && /* ~ changed by cargo-mutants ~ */ s.contains("503") {
+                     BlobError::SlowDown
+                 } else {
+                     BlobError::Other(s)
+                 }
+             }
+         }
+     }
+ 

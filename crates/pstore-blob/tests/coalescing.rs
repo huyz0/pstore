@@ -5,6 +5,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::single_range_in_vec_init,
     reason = "assertions in tests are the reporting mechanism"
 )]
 
@@ -96,4 +97,28 @@ async fn ranges_out_of_order_are_returned_in_the_order_asked() {
     assert_eq!(&out[0][..], &[200, 201, 202, 203]);
     assert_eq!(&out[1][..], &[0, 1, 2, 3]);
     assert_eq!(&out[2][..], &[100, 101, 102, 103]);
+}
+
+#[tokio::test]
+async fn slices_are_offset_from_the_fetch_start_not_the_object_start() {
+    // Found by mutation testing: every earlier case had a merged fetch starting at 0, so
+    // `start - base` and `start + base` were indistinguishable and the offset arithmetic
+    // was never actually exercised. Here the fetch starts at 100.
+    let s = MemoryStore::new();
+    s.put(&k("o"), Bytes::from((0..=255u8).collect::<Vec<_>>()))
+        .await
+        .unwrap();
+    let got = s.get_ranges(&k("o"), &[100..104, 110..114]).await.unwrap();
+    assert_eq!(&got[0][..], &[100, 101, 102, 103]);
+    assert_eq!(&got[1][..], &[110, 111, 112, 113]);
+}
+
+#[tokio::test]
+async fn a_single_far_range_is_offset_correctly() {
+    let s = MemoryStore::new();
+    s.put(&k("o"), Bytes::from((0..=255u8).collect::<Vec<_>>()))
+        .await
+        .unwrap();
+    let got = s.get_ranges(&k("o"), &[200..205]).await.unwrap();
+    assert_eq!(&got[0][..], &[200, 201, 202, 203, 204]);
 }

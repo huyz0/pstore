@@ -35,6 +35,14 @@ fixture observed-not pass "1. \`$REAL\`. \`cargo test\`.
 fixture continuation-lines pass "1. \`$REAL\`. \`cargo test\`.
    Mutation verified killed (saturating add removed).
 2. \`$REAL\`. \`cargo test\`."
+# The documented blind spot, pinned: one good name rescues a drifted sibling.
+fixture partial-drift-is-a-known-blind-spot pass "1. \`$REAL\`. \`cargo test\`.
+2. \`$REAL\` and \`a_test_renamed_last_week\`. \`cargo test\`."
+# Legitimate prose: a method name in backticks must not be read as a test claim.
+fixture prose-identifiers-are-not-test-claims pass "1. \`$REAL\` -- covers \`should_rebase\`.
+2. \`$REAL\`. \`cargo test\`."
+fixture evidence-is-a-command pass "1. \`$REAL\`. \`cargo test\`.
+2. \`./scripts/gates.sh\` -- all eight green, and \`cargo llvm-cov\` reports 95.4%."
 fixture in-progress-no-ledger pass __none__
 
 # --- must FAIL ---

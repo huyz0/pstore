@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace || with && in probe_aba_resistance
+@@ -119,17 +119,17 @@
+     let key = k(run, "aba");
+     let Ok(v1) = s
+         .put_conditional(&key, Bytes::from_static(b"v1"), Precondition::NotExists)
+         .await
+     else {
+         return Support::Unsupported;
+     };
+     if s.put(&key, Bytes::from_static(b"v2")).await.is_err()
+-        || s.put(&key, Bytes::from_static(b"v1")).await.is_err()
++        && /* ~ changed by cargo-mutants ~ */ s.put(&key, Bytes::from_static(b"v1")).await.is_err()
+     {
+         return Support::Unsupported;
+     }
+     match s
+         .put_conditional(&key, Bytes::from_static(b"v3"), Precondition::Match(v1.tag))
+         .await
+     {
+         Err(CasError::Lost) => Support::Supported,

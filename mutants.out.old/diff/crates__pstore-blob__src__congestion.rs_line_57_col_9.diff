@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/congestion.rs
++++ replace Congested<S>::limit -> u32 with 0
+@@ -49,17 +49,17 @@
+                 attempts: AtomicU64::new(0),
+             }),
+         }
+     }
+ 
+     /// The current concurrency limit.
+     #[must_use]
+     pub fn limit(&self) -> u32 {
+-        self.state.limit.load(Ordering::Relaxed)
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Total attempts made, including retries. The number that would grow without bound
+     /// if the retry policy were wrong.
+     #[must_use]
+     pub fn attempts(&self) -> u64 {
+         self.state.attempts.load(Ordering::Relaxed)
+     }

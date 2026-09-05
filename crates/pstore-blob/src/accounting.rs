@@ -119,6 +119,11 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         self.inner.get_range(key, range).await
     }
 
+    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+        self.bill(OpClass::Read);
+        self.inner.get_tag(key).await
+    }
+
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
         self.bill(OpClass::Read);
         self.inner.head(key).await

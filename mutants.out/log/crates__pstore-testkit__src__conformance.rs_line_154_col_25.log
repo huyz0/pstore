@@ -1,0 +1,119 @@
+
+*** crates/pstore-testkit/src/conformance.rs:154:25: replace == with != in probe_ranged_read
+
+*** mutation diff:
+--- crates/pstore-testkit/src/conformance.rs
++++ replace == with != in probe_ranged_read
+@@ -146,17 +146,17 @@
+     let key = k(run, "range");
+     if s.put(&key, Bytes::from_static(b"0123456789"))
+         .await
+         .is_err()
+     {
+         return Support::Unsupported;
+     }
+     match s.get_range(&key, 2..5).await {
+-        Ok(b) if &b[..] == b"234" => Support::Supported,
++        Ok(b) if &b[..] != /* ~ changed by cargo-mutants ~ */ b"234" => Support::Supported,
+         Ok(b) => Support::Divergent(format!("range 2..5 returned {} bytes", b.len())),
+         Err(e) => Support::Divergent(format!("ranged read failed: {e}")),
+     }
+ }
+ 
+ async fn probe_range_past_end<S: BlobStore>(s: &S, run: u64) -> Support {
+     let key = k(run, "past");
+     if s.put(&key, Bytes::from_static(b"0123")).await.is_err() {
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=pstore-testkit@0.1.0 --all-features
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh pin-project-lite v0.2.17
+       Fresh bytes v1.12.1
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-types)
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh tokio-macros v2.7.2
+       Fresh thiserror-impl v2.0.20
+       Fresh async-trait v0.1.92
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-blob)
+       Dirty pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-testkit): the file `crates/pstore-testkit/src/conformance.rs` has changed (1788605005.129392469s, 1s after last build at 1788605004.742202770s)
+   Compiling pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-testkit)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=ffe68468f979daaf -C extra-filename=-46a9c552ac5cdb53 --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=b4ba8a674e58c4ad -C extra-filename=-cc29758db0dc5d2b --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rmeta`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name conformance --edition=2024 crates/pstore-testkit/tests/conformance.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6e06f544d61dafed -C extra-filename=-2a974b4f3faf1e84 --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_testkit-cc29758db0dc5d2b.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name hostile --edition=2024 crates/pstore-testkit/tests/hostile.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=86391afd943e694b -C extra-filename=-00b0f49d83b8f422 --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_testkit-cc29758db0dc5d2b.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name sweep --edition=2024 crates/pstore-testkit/tests/sweep.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=44898c6415067104 -C extra-filename=-698f636d1d2f8201 --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_testkit-cc29758db0dc5d2b.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name contention --edition=2024 crates/pstore-testkit/examples/contention.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=5b91cfd51c5a2958 -C extra-filename=-bfe6e6403db38066 --out-dir /tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/examples -C incremental=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_testkit-cc29758db0dc5d2b.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+  Executable `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/pstore_testkit-46a9c552ac5cdb53`
+  Executable `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/conformance-2a974b4f3faf1e84`
+  Executable `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/hostile-00b0f49d83b8f422`
+  Executable `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/sweep-698f636d1d2f8201`
+
+*** result: Success
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=pstore-testkit@0.1.0 --all-features
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh tokio-macros v2.7.2
+       Fresh thiserror-impl v2.0.20
+       Fresh pin-project-lite v0.2.17
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-types)
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-blob)
+       Fresh pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-1GLcYs.tmp/crates/pstore-testkit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/pstore_testkit-46a9c552ac5cdb53`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-1GLcYs.tmp/target/debug/deps/conformance-2a974b4f3faf1e84`
+
+running 5 tests
+test a_report_names_what_diverged ... FAILED
+test conformance_costs_a_bounded_number_of_requests ... ok
+test the_memory_store_conforms ... FAILED
+test the_suite_detects_a_backend_that_is_not_fenced ... ok
+test every_decorator_conforms ... FAILED
+
+failures:
+
+---- a_report_names_what_diverged stdout ----
+
+thread 'a_report_names_what_diverged' panicked at crates/pstore-testkit/tests/conformance.rs:95:5:
+assertion `left == right` failed: expected exactly one divergence, got [Probe { name: "aba_resistance", outcome: Divergent("a stale tag was accepted after the content returned to its first value: tags are content-derived, so the ABA hazard is live") }, Probe { name: "ranged_read", outcome: Divergent("range 2..5 returned 3 bytes") }]
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- the_memory_store_conforms stdout ----
+
+thread 'the_memory_store_conforms' panicked at crates/pstore-testkit/tests/conformance.rs:25:5:
+divergences: [Probe { name: "ranged_read", outcome: Divergent("range 2..5 returned 3 bytes") }]
+
+---- every_decorator_conforms stdout ----
+
+thread 'every_decorator_conforms' panicked at crates/pstore-testkit/tests/conformance.rs:35:5:
+assertion failed: conformance::run(&acc.as_tenant(TenantId(1)), 2).await.conforms()
+
+
+failures:
+    a_report_names_what_diverged
+    every_decorator_conforms
+    the_memory_store_conforms
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p pstore-testkit --test conformance`
+
+*** result: Failure(101)

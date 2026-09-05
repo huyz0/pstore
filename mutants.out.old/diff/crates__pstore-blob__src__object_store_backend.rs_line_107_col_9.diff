@@ -1,0 +1,36 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace <impl crate::BlobStore for ObjectStoreBackend>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -99,32 +99,17 @@
+             .await
+             .map_err(Self::map_err)?
+             .bytes()
+             .await
+             .map_err(Self::map_err)
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+-        let want = range.end.saturating_sub(range.start);
+-        let got = self
+-            .inner
+-            .get_range(&Self::path(key), range.clone())
+-            .await
+-            .map_err(Self::map_err)?;
+-        // ⚠️ FOUND BY THE CONFORMANCE SUITE, not by reading the docs. HTTP `Range` is
+-        // permitted to answer a range that overruns the object with `206 Partial
+-        // Content` and the bytes that exist -- a SHORT READ, not an error -- and
+-        // `object_store` passes that through. Our trait promises the requested bytes or
+-        // an error, because a silent truncation here surfaces several layers away as a
+-        // recall bug: a posting list that ends early scores as a missing document.
+-        if got.len() as u64 != want {
+-            return Err(BlobError::RangeOutOfBounds(range, got.len() as u64));
+-        }
+-        Ok(got)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+         self.inner
+             .head(&Self::path(key))
+             .await
+             .ok()
+             .and_then(|m| m.e_tag)

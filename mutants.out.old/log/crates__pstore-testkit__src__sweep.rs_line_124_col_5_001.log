@@ -1,0 +1,75 @@
+
+*** crates/pstore-testkit/src/sweep.rs:124:5: replace contention_sweep -> Vec<Point> with vec![Default::default()]
+
+*** mutation diff:
+--- crates/pstore-testkit/src/sweep.rs
++++ replace contention_sweep -> Vec<Point> with vec![Default::default()]
+@@ -116,23 +116,17 @@
+ }
+ 
+ /// Sweeps contention across `levels`, returning one [`Point`] each.
+ pub async fn contention_sweep<S: BlobStore>(
+     store: Arc<S>,
+     levels: &[usize],
+     commits_each: usize,
+ ) -> Vec<Point> {
+-    let mut out = Vec::with_capacity(levels.len());
+-    for (i, w) in levels.iter().enumerate() {
+-        // A fresh key per level, so one level's final state cannot bias the next.
+-        let key = Key::new(format!("sweep/contention/{i}"));
+-        out.push(contention_point(Arc::clone(&store), key, *w, commits_each).await);
+-    }
+-    out
++    vec![Default::default()] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Renders a sweep as a table, with the caveat attached rather than left to a reader.
+ #[must_use]
+ pub fn render(points: &[Point]) -> String {
+     let mut s = String::from(
+         "writers  commits  attempts  lost  attempts/commit  success\n\
+          -------  -------  --------  ----  ---------------  -------\n",
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=pstore-testkit@0.1.0 --all-features
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh pin-project-lite v0.2.17
+       Fresh bytes v1.12.1
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-types)
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh async-trait v0.1.92
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-blob)
+       Dirty pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-testkit): the file `crates/pstore-testkit/src/sweep.rs` has changed (1788604909.628432614s, 484051851ns after last build at 1788604909.144380763s)
+   Compiling pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-BjRf6M.tmp/crates/pstore-testkit)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=ffe68468f979daaf -C extra-filename=-46a9c552ac5cdb53 --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=b4ba8a674e58c4ad -C extra-filename=-cc29758db0dc5d2b --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rmeta`
+error[E0277]: the trait bound `Point: Default` is not satisfied
+   --> crates/pstore-testkit/src/sweep.rs:124:10
+    |
+124 |     vec![Default::default()] /* ~ changed by cargo-mutants ~ */
+    |          ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Point`
+    |
+help: consider annotating `Point` with `#[derive(Default)]`
+    |
+ 19 + #[derive(Default)]
+ 20 | pub struct Point {
+    |
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `pstore-testkit` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=b4ba8a674e58c4ad -C extra-filename=-cc29758db0dc5d2b --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rmeta` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `pstore-testkit` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=ffe68468f979daaf -C extra-filename=-46a9c552ac5cdb53 --out-dir /tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_blob-855ef7d8a80cd4f4.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-BjRf6M.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib` (exit status: 1)
+
+*** result: Failure(101)

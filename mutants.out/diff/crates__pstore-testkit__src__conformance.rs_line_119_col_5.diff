@@ -1,0 +1,44 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace probe_aba_resistance -> Support with Default::default()
+@@ -111,40 +111,17 @@
+ /// Whether a tag ever repeats for content the object held before.
+ ///
+ /// Distinct from `compare_and_swap`, and the difference is exactly S3 versus GCS. Basic
+ /// fencing can pass while this fails: writing v1 -> v2 -> v1 returns a content-derived
+ /// ETag EQUAL to the first, so a writer that read v1 and paused has its CAS accepted
+ /// against a world that changed and changed back. A backend failing this needs the
+ /// monotonic epoch and nonce our manifest carries; one passing it does not.
+ async fn probe_aba_resistance<S: BlobStore>(s: &S, run: u64) -> Support {
+-    let key = k(run, "aba");
+-    let Ok(v1) = s
+-        .put_conditional(&key, Bytes::from_static(b"v1"), Precondition::NotExists)
+-        .await
+-    else {
+-        return Support::Unsupported;
+-    };
+-    if s.put(&key, Bytes::from_static(b"v2")).await.is_err()
+-        || s.put(&key, Bytes::from_static(b"v1")).await.is_err()
+-    {
+-        return Support::Unsupported;
+-    }
+-    match s
+-        .put_conditional(&key, Bytes::from_static(b"v3"), Precondition::Match(v1.tag))
+-        .await
+-    {
+-        Err(CasError::Lost) => Support::Supported,
+-        Ok(_) => Support::Divergent(
+-            "a stale tag was accepted after the content returned to its first value: tags \
+-             are content-derived, so the ABA hazard is live"
+-                .to_owned(),
+-        ),
+-        Err(e) => Support::Divergent(format!("unexpected error: {e}")),
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ async fn probe_ranged_read<S: BlobStore>(s: &S, run: u64) -> Support {
+     let key = k(run, "range");
+     if s.put(&key, Bytes::from_static(b"0123456789"))
+         .await
+         .is_err()
+     {

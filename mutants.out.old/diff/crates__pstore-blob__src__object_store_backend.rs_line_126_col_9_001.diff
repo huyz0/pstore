@@ -1,0 +1,26 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace <impl crate::BlobStore for ObjectStoreBackend>::get_tag -> Option<CasTag> with Some(Default::default())
+@@ -118,22 +118,17 @@
+         // recall bug: a posting list that ends early scores as a missing document.
+         if got.len() as u64 != want {
+             return Err(BlobError::RangeOutOfBounds(range, got.len() as u64));
+         }
+         Ok(got)
+     }
+ 
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+-        self.inner
+-            .head(&Self::path(key))
+-            .await
+-            .ok()
+-            .and_then(|m| m.e_tag)
+-            .map(CasTag::new)
++        Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         self.inner
+             .head(&Self::path(key))
+             .await
+             .map(|m| m.size)
+             .map_err(Self::map_err)

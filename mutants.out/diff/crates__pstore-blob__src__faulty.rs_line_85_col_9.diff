@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace Faulty<S>::set_faults with ()
+@@ -77,17 +77,17 @@
+                 faults,
+                 ops: 0,
+             })),
+         }
+     }
+ 
+     /// Changes the injection rates, so a test can make a transient fault stop.
+     pub fn set_faults(&self, faults: Faults) {
+-        self.lock().faults = faults;
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+         self.state
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+     }
+ 
