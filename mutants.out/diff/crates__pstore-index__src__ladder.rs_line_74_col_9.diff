@@ -1,0 +1,22 @@
+--- crates/pstore-index/src/ladder.rs
++++ replace Ladder::rung1 -> Vec<(usize, f32)> with vec![]
+@@ -66,18 +66,17 @@
+     }
+ 
+     /// Re-scores rung 0's survivors at int8 precision.
+     pub fn rung1<F: FnMut(usize) -> f32>(
+         &self,
+         candidates: &[(usize, f32)],
+         mut score: F,
+     ) -> Vec<(usize, f32)> {
+-        let rescored = candidates.iter().map(|(i, _)| (*i, score(*i))).collect();
+-        self.top(rescored, self.keep(Rung::Int8))
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Re-scores rung 1's survivors exactly.
+     pub fn rung2<F: FnMut(usize) -> f32>(
+         &self,
+         candidates: &[(usize, f32)],
+         mut score: F,
+     ) -> Vec<(usize, f32)> {

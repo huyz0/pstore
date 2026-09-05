@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace * with + in Quantizer::rotate
+@@ -234,17 +234,17 @@
+     /// Pads, flips signs, and applies the Walsh–Hadamard transform.
+     ///
+     /// Orthogonal up to the `1/sqrt(padded)` scaling applied at the end, so inner products
+     /// are preserved — which is what lets the estimate be compared against the original
+     /// vectors' inner product at all.
+     fn rotate(&self, v: &[f32]) -> Vec<f32> {
+         let mut a = vec![0.0f32; self.padded];
+         for ((slot, x), flip) in a.iter_mut().zip(v).zip(&self.flips) {
+-            *slot = x * flip;
++            *slot = x + /* ~ changed by cargo-mutants ~ */ flip;
+         }
+         let mut h = 1;
+         while h < self.padded {
+             for chunk in a.chunks_mut(h * 2) {
+                 let (lo, hi) = chunk.split_at_mut(h);
+                 for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
+                     let (u, w) = (*x, *y);
+                     *x = u + w;

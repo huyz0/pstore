@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/audit.rs
++++ replace <impl BlobStore for Auditing<S>>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -115,18 +115,17 @@
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+         // Legitimate by construction: the write names the version it replaces, so a writer
+         // holding a stale view is refused by the store rather than by our vigilance.
+-        self.lock().written.insert(key.as_str().to_owned());
+-        self.inner.put_conditional(key, body, pre).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         // A reaped key may legitimately be written again later — GC is what makes a key
+         // free — so forget it rather than treating the next write as a mutation.
+         {
+             let mut s = self.lock();
+             for k in keys {

@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace Clustering::lists -> &[Vec<usize>] with Vec::leak(vec![vec![1]])
+@@ -106,17 +106,17 @@
+     #[must_use]
+     pub fn centroids(&self) -> &[Vec<f32>] {
+         &self.centroids
+     }
+ 
+     /// The rows in each posting list, ascending.
+     #[must_use]
+     pub fn lists(&self) -> &[Vec<usize>] {
+-        &self.lists
++        Vec::leak(vec![vec![1]]) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Total squared distance from each vector to the centroid it was assigned.
+     ///
+     /// The k-means objective, and the only way to tell a *balanced* assignment from a
+     /// *good* balanced assignment: both satisfy the capacity bound, and one of them puts
+     /// vectors in lists they have no business being in.
+     #[must_use]

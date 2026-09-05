@@ -1,0 +1,122 @@
+--- crates/pstore-format/src/writer.rs
++++ replace SegmentWriter::finish -> Bytes with Default::default()
+@@ -149,118 +149,11 @@
+             }
+         }
+         idx
+     }
+ 
+     /// Seals the last block and emits the segment.
+     #[must_use]
+     pub fn finish(mut self) -> Bytes {
+-        let docs = std::mem::take(&mut self.docs);
+-        // ⚠️ Grow the block size until the index fits the budget, rather than trusting the
+-        // caller's request. Doubling terminates: at one block the index is a handful of
+-        // bytes, and every doubling at least halves the block count.
+-        let idx = loop {
+-            self.blocks.clear();
+-            self.body = Enc::default();
+-            self.rows = 0;
+-            for chunk in docs.chunks(self.rows_per_block) {
+-                self.seal(chunk);
+-            }
+-            let idx = self.encode_index();
+-            if idx.len() <= self.index_budget || self.blocks.len() <= 1 {
+-                break idx;
+-            }
+-            self.rows_per_block = self.rows_per_block.saturating_mul(2);
+-        };
+-
+-        // Vectors leave the data blocks entirely and become their own section: row-major,
+-        // fixed width, so row `i` is a computable byte range and a reader can fetch one row
+-        // or none without touching the rest.
+-        let dim = docs.first().map_or(0, |d| d.vector.len());
+-        let vectors: Vec<u8> = if dim == 0 {
+-            Vec::new()
+-        } else {
+-            let mut v = Vec::with_capacity(docs.len() * dim * 4);
+-            for d in &docs {
+-                // A ragged vector would silently shift every later row. Padding is the
+-                // conservative choice: a wrong-length vector is a caller bug, and truncating
+-                // the section would corrupt rows that are fine.
+-                for j in 0..dim {
+-                    v.extend_from_slice(&d.vector.get(j).copied().unwrap_or(0.0).to_le_bytes());
+-                }
+-            }
+-            v
+-        };
+-
+-        let mut out = self.body;
+-        let mut dir: Vec<(Section, u64, u64)> = Vec::new();
+-        if !vectors.is_empty() {
+-            dir.push((Section::Vectors, out.len() as u64, vectors.len() as u64));
+-            out.raw(&vectors);
+-        }
+-        let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
+-        for (section, bytes) in &self.extra {
+-            if bytes.is_empty() {
+-                continue;
+-            }
+-            dir.push((*section, out.len() as u64, bytes.len() as u64));
+-            out.raw(bytes);
+-        }
+-        for (id, bytes) in &self.raw_extra {
+-            if bytes.is_empty() {
+-                continue;
+-            }
+-            raw_dir.push((*id, out.len() as u64, bytes.len() as u64));
+-            out.raw(bytes);
+-        }
+-
+-        // The meta region: directory first, then the block index, checksummed together and
+-        // addressed by the footer as one span. One suffix read brings back the footer and,
+-        // for any segment the writer produced, this whole region.
+-        let meta_offset = out.len() as u64;
+-        dir.push((
+-            Section::Blocks,
+-            0, // patched below, once the directory's own length is known
+-            idx.len() as u64,
+-        ));
+-        let mut meta = Enc::default();
+-        meta.u32((dir.len() + raw_dir.len()) as u32);
+-        for (section, offset, len) in &dir {
+-            meta.u16(*section as u16);
+-            meta.u64(*offset);
+-            meta.u64(*len);
+-        }
+-        for (id, offset, len) in &raw_dir {
+-            meta.u16(*id);
+-            meta.u64(*offset);
+-            meta.u64(*len);
+-        }
+-        let blocks_at = meta_offset + meta.len() as u64;
+-        // Patch the Blocks entry now that the directory's size is known. Encoding it twice
+-        // would be simpler and would silently break the moment the directory's size depended
+-        // on the value being patched.
+-        let entry = 4 + (dir.len() - 1) * (2 + 8 + 8) + 2;
+-        if let Some(slot) = meta.0.get_mut(entry..entry + 8) {
+-            slot.copy_from_slice(&blocks_at.to_le_bytes());
+-        }
+-        meta.raw(&idx.0);
+-
+-        let meta_len = meta.len() as u32;
+-        let sum = checksum(&meta.0);
+-        out.raw(&meta.0);
+-
+-        // The footer is last and fixed-width, so `Range: -N` finds it without knowing the
+-        // object's length -- which is what makes an open possible from the key alone.
+-        out.raw(MAGIC);
+-        out.u16(VERSION);
+-        out.u64(meta_offset);
+-        out.u32(meta_len);
+-        out.u32(self.rows);
+-        out.u64(sum);
+-        out.raw(MAGIC);
+-        debug_assert_eq!(
+-            out.len() as u64 - meta_offset - u64::from(meta_len),
+-            FOOTER_LEN as u64
+-        );
+-        Bytes::from(out.0)
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }

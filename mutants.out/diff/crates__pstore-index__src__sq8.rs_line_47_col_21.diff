@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace > with == in encode
+@@ -39,17 +39,17 @@
+     let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+     // A constant vector has no range; a zero step reconstructs it exactly, and dividing by
+     // it is the only thing that could go wrong, so it is handled here rather than guarded
+     // at every use.
+     let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
+     let codes = v
+         .iter()
+         .map(|x| {
+-            if step > 0.0 {
++            if step == /* ~ changed by cargo-mutants ~ */ 0.0 {
+                 // ⚠️ `round`, not truncate. Truncation shifts every coordinate down by
+                 // about half a step, so the reconstructed vector is displaced by a constant
+                 // offset in every dimension at once rather than scattered around the
+                 // original. Against a zero-mean query that mostly cancels in the inner
+                 // product, which is why no accuracy test catches it -- only the
+                 // reconstruction bound does.
+                 (((x - lo) / step).round()).clamp(0.0, 255.0) as u8
+             } else {

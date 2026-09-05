@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace *= with += in Quantizer::rotate
+@@ -250,17 +250,17 @@
+                     *x = u + w;
+                     *y = u - w;
+                 }
+             }
+             h *= 2;
+         }
+         let scale = 1.0 / (self.padded as f32).sqrt();
+         for x in a.iter_mut() {
+-            *x *= scale;
++            *x += /* ~ changed by cargo-mutants ~ */ scale;
+         }
+         a
+     }
+ 
+     /// Encodes a vector as its residual from `centroid`.
+     ///
+     /// See the module docs: quantizing the raw vector instead costs most of the recall,
+     /// because everything in one posting list is similar and the shared component is all

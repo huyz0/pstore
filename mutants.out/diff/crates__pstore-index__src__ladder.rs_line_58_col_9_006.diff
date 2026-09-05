@@ -1,0 +1,23 @@
+--- crates/pstore-index/src/ladder.rs
++++ replace Ladder::top -> Vec<(usize, f32)> with vec![(1, -1.0)]
+@@ -50,19 +50,17 @@
+             Rung::Int8 => self.k * 2,
+             Rung::Exact => self.k,
+         }
+     }
+ 
+     fn top(&self, mut scored: Vec<(usize, f32)>, keep: usize) -> Vec<(usize, f32)> {
+         // Descending by score; ties broken by id so a result set is reproducible, which is
+         // what lets a recall number be compared across runs at all.
+-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+-        scored.truncate(keep);
+-        scored
++        vec![(1, -1.0)] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Scores every candidate at 1-bit precision and keeps the oversampled top.
+     pub fn rung0<I: IntoIterator<Item = (usize, f32)>>(&self, scored: I) -> Vec<(usize, f32)> {
+         self.top(scored.into_iter().collect(), self.keep(Rung::OneBit))
+     }
+ 
+     /// Re-scores rung 0's survivors at int8 precision.

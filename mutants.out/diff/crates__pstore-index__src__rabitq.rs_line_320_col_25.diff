@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace / with % in Quantizer::raw
+@@ -312,17 +312,17 @@
+             // which is what makes `encode` and `encode_residual` agree for a zero centroid.
+             residual_norm: 1.0,
+             dim: self.dim,
+         })
+     }
+ 
+     /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
+     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+-        let scale = 1.0 / (self.padded as f32).sqrt();
++        let scale = 1.0 % /* ~ changed by cargo-mutants ~ */ (self.padded as f32).sqrt();
+         let mut acc = 0.0f32;
+         for (i, q) in rotated_query.iter().enumerate() {
+             let bit = code
+                 .bits
+                 .get(i / 8)
+                 .is_some_and(|b| b & (1 << (i % 8)) != 0);
+             acc += if bit { *q } else { -*q };
+         }

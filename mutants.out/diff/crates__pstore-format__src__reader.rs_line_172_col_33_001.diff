@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace / with * in Segment::vectors
+@@ -164,17 +164,17 @@
+         key: &Key,
+     ) -> Result<Vec<Vec<f32>>, FormatError> {
+         let Some(raw) = self.fetch_section(store, key, Section::Vectors).await? else {
+             return Ok(Vec::new());
+         };
+         if self.rows == 0 {
+             return Ok(Vec::new());
+         }
+-        let per_row = raw.len() / self.rows as usize;
++        let per_row = raw.len() * /* ~ changed by cargo-mutants ~ */ self.rows as usize;
+         Ok(raw
+             .chunks_exact(per_row.max(1))
+             .map(|row| {
+                 row.chunks_exact(4)
+                     .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                     .collect()
+             })
+             .collect())

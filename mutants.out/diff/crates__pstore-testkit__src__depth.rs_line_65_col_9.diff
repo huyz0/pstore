@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace DepthCounting<S>::reset with ()
+@@ -57,18 +57,17 @@
+     /// Total requests, however issued. Depth's denominator, and the cost figure.
+     #[must_use]
+     pub fn requests(&self) -> usize {
+         self.c.requests.load(Ordering::SeqCst)
+     }
+ 
+     /// Clears both counters, so a test can measure one operation rather than a session.
+     pub fn reset(&self) {
+-        self.c.depth.store(0, Ordering::SeqCst);
+-        self.c.requests.store(0, Ordering::SeqCst);
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn begin(&self) -> Guard {
+         self.c.requests.fetch_add(1, Ordering::SeqCst);
+         // `fetch_add` returns the PREVIOUS value: zero means nothing was in flight, so
+         // this request could not have been issued concurrently with another.
+         if self.c.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+             self.c.depth.fetch_add(1, Ordering::SeqCst);

@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace / with % in capacity
+@@ -207,17 +207,17 @@
+         // ⚠️ Replication happens AFTER empty lists are dropped, so a boundary vector is
+         // never replicated into a list that is about to disappear.
+         augment(corpus, &centroids, &mut lists, params);
+         Self { centroids, lists }
+     }
+ }
+ 
+ fn capacity(n: usize, k: usize, balance: f32) -> usize {
+-    let mean = n as f32 / k as f32;
++    let mean = n as f32 % /* ~ changed by cargo-mutants ~ */ k as f32;
+     // ⚠️ Rounded DOWN against the bound, so the cap is inside it rather than on it. A cap
+     // computed as exactly `balance * mean` and then rounded up produces lists one element
+     // over the bound the tests assert, which reads as an off-by-one in the test rather than
+     // in the cap.
+     ((mean * balance).floor() as usize).max(1)
+ }
+ 
+ /// Squared L2. The root is monotonic in the same order and costs an operation per vector on

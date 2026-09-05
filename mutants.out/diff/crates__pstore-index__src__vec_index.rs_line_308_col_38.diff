@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace * with + in VecIndex::search
+@@ -300,17 +300,17 @@
+         let mut ranges = Vec::with_capacity(probes.len() * 2);
+         let mut rows = Vec::with_capacity(probes.len());
+         for li in &probes {
+             let Some((first, len)) = centroids.spans.get(*li).copied() else {
+                 continue;
+             };
+             let (first, len) = (first as u64, len as u64);
+             ranges.push(
+-                rabitq.start + first * code_len as u64
++                rabitq.start + first + /* ~ changed by cargo-mutants ~ */ code_len as u64
+                     ..rabitq.start + (first + len) * code_len as u64,
+             );
+             rows.push((*li, first, len));
+         }
+         let want_sq8 = q.rerank != Rerank::None;
+         if want_sq8 {
+             let per = sq8::record_len(self.dim) as u64;
+             for (_, first, len) in &rows {

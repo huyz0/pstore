@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace == with != in Segment::open
+@@ -86,17 +86,17 @@
+             let len = d.u64()?;
+             let span = offset..offset.saturating_add(len);
+             // ⚠️ Recorded by RAW id, including ids this version has never heard of. There
+             // is deliberately no "is this known?" check: `section()` is looked up by a
+             // `Section`, so an unknown id is unreachable and storing it costs one map entry.
+             // A check would be equivalent code that no test could distinguish — and
+             // refusing would make every future section a breaking change for every deployed
+             // reader at once, which segments being immutable makes permanent.
+-            if id == Section::Blocks as u16 {
++            if id != /* ~ changed by cargo-mutants ~ */ Section::Blocks as u16 {
+                 blocks_span = Some(span.clone());
+             }
+             sections.insert(id, span);
+         }
+         let blocks_span = blocks_span.ok_or(FormatError::Corrupt("no block section"))?;
+         // The block index sits inside the region already fetched, at a known offset.
+         let lo = (blocks_span.start - meta_offset) as usize;
+         let hi = lo

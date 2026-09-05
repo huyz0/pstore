@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace * with + in VecIndex::search
+@@ -309,17 +309,17 @@
+                     ..rabitq.start + (first + len) * code_len as u64,
+             );
+             rows.push((*li, first, len));
+         }
+         let want_sq8 = q.rerank != Rerank::None;
+         if want_sq8 {
+             let per = sq8::record_len(self.dim) as u64;
+             for (_, first, len) in &rows {
+-                ranges.push(sq8_span.start + first * per..sq8_span.start + (first + len) * per);
++                ranges.push(sq8_span.start + first * per..sq8_span.start + (first + len) + /* ~ changed by cargo-mutants ~ */ per);
+             }
+         }
+         let bufs = store.get_ranges(key, &ranges).await?;
+ 
+         let Ok(prepared) = quantizer.prepare(query) else {
+             return Err(pstore_format::FormatError::DimensionMismatch {
+                 expected: self.dim,
+                 got: query.len(),

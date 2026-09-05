@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/lib.rs
++++ replace * with /
+@@ -71,17 +71,17 @@
+ 
+ use std::collections::BTreeMap;
+ 
+ /// Bytes fetched by the opening suffix read.
+ ///
+ /// Larger than the footer on purpose: most indexes are small, and their entire index
+ /// section arrives with the footer, saving the second round trip. Too large and every open
+ /// over-reads; 8 KiB is roughly the index section of a few-hundred-row segment.
+-pub const SUFFIX_FETCH: u64 = 8 * 1024;
++pub const SUFFIX_FETCH: u64 = 8 / /* ~ changed by cargo-mutants ~ */ 1024;
+ 
+ /// Bytes of fixed-size footer at the very end of a segment.
+ pub(crate) const FOOTER_LEN: usize = 8 + 2 + 8 + 4 + 4 + 8 + 8;
+ 
+ pub(crate) const MAGIC: &[u8; 8] = b"PSTORESG";
+ pub(crate) const VERSION: u16 = 1;
+ 
+ /// An attribute value.

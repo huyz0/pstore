@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace record_len -> usize with 0
+@@ -71,17 +71,17 @@
+         .iter()
+         .map(|b| c.offset + f32::from(*b) * c.step)
+         .collect()
+ }
+ 
+ /// Bytes one row occupies on the wire: the codes, then the offset and step.
+ #[must_use]
+ pub fn record_len(dim: usize) -> usize {
+-    dim + 8
++    0 /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Appends a code's wire form: codes, then `offset` and `step`.
+ ///
+ /// ⚠️ The scale travels **with** the codes, and it has to. The quantization is per vector —
+ /// a global scale would be fitted state, which is per-tenant training under another name —
+ /// so two rows' codes are on different scales and comparing them raw is comparing
+ /// different units. Measured: reading the codes without their scale made `rerank: fast`

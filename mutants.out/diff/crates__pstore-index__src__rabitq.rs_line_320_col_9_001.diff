@@ -1,0 +1,30 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace Quantizer::raw -> f32 with 1.0
+@@ -312,26 +312,17 @@
+             // which is what makes `encode` and `encode_residual` agree for a zero centroid.
+             residual_norm: 1.0,
+             dim: self.dim,
+         })
+     }
+ 
+     /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
+     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+-        let scale = 1.0 / (self.padded as f32).sqrt();
+-        let mut acc = 0.0f32;
+-        for (i, q) in rotated_query.iter().enumerate() {
+-            let bit = code
+-                .bits
+-                .get(i / 8)
+-                .is_some_and(|b| b & (1 << (i % 8)) != 0);
+-            acc += if bit { *q } else { -*q };
+-        }
+-        acc * scale
++        1.0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Rotates a query once, for scoring against many codes.
+     ///
+     /// ⚠️ The asymmetry D-11 buys accuracy from: the query is transformed **once per
+     /// query**, not once per vector, so work spent on it is amortised across every code in
+     /// every probed posting list. Rotating inside `estimate` would put an `O(D log D)`
+     /// transform on the inner loop of a scan over thousands of vectors.

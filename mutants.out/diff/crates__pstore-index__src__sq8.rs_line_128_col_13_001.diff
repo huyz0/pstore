@@ -1,0 +1,16 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace += with *= in estimate
+@@ -120,12 +120,12 @@
+ /// Expanded rather than reconstructing first: `<o,q> ≈ offset·Σq + step·Σ(c·q)`, which is
+ /// one pass and no allocation on a path that runs once per candidate.
+ #[must_use]
+ pub fn estimate(c: &Code, query: &[f32]) -> f32 {
+     let mut sum_q = 0.0f32;
+     let mut acc = 0.0f32;
+     for (b, q) in c.codes.iter().zip(query) {
+         sum_q += *q;
+-        acc += f32::from(*b) * *q;
++        acc *= /* ~ changed by cargo-mutants ~ */ f32::from(*b) * *q;
+     }
+     c.offset * sum_q + c.step * acc
+ }

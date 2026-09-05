@@ -1,0 +1,37 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace estimate_raw -> f32 with 0.0
+@@ -91,33 +91,17 @@
+     out.extend_from_slice(&c.codes);
+     out.extend_from_slice(&c.offset.to_le_bytes());
+     out.extend_from_slice(&c.step.to_le_bytes());
+ }
+ 
+ /// Estimates `<o, q>` from one row's wire form.
+ #[must_use]
+ pub fn estimate_raw(record: &[u8], query: &[f32]) -> f32 {
+-    let Some(split) = record.len().checked_sub(8) else {
+-        return f32::NEG_INFINITY;
+-    };
+-    let (codes, tail) = record.split_at(split);
+-    let f = |at: usize| {
+-        tail.get(at..at + 4)
+-            .and_then(|b| b.try_into().ok())
+-            .map_or(0.0, f32::from_le_bytes)
+-    };
+-    let (offset, step) = (f(0), f(4));
+-    let mut sum_q = 0.0f32;
+-    let mut acc = 0.0f32;
+-    for (b, q) in codes.iter().zip(query) {
+-        sum_q += *q;
+-        acc += f32::from(*b) * *q;
+-    }
+-    offset * sum_q + step * acc
++    0.0 /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Estimates `<o, q>` from `o`'s code.
+ ///
+ /// Expanded rather than reconstructing first: `<o,q> ≈ offset·Σq + step·Σ(c·q)`, which is
+ /// one pass and no allocation on a path that runs once per candidate.
+ #[must_use]
+ pub fn estimate(c: &Code, query: &[f32]) -> f32 {

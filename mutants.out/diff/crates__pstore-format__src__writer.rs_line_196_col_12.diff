@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ delete ! in SegmentWriter::finish
+@@ -188,17 +188,17 @@
+                     v.extend_from_slice(&d.vector.get(j).copied().unwrap_or(0.0).to_le_bytes());
+                 }
+             }
+             v
+         };
+ 
+         let mut out = self.body;
+         let mut dir: Vec<(Section, u64, u64)> = Vec::new();
+-        if !vectors.is_empty() {
++        if  /* ~ changed by cargo-mutants ~ */vectors.is_empty() {
+             dir.push((Section::Vectors, out.len() as u64, vectors.len() as u64));
+             out.raw(&vectors);
+         }
+         let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
+         for (section, bytes) in &self.extra {
+             if bytes.is_empty() {
+                 continue;
+             }

@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace / with % in Quantizer::encode_residual
+@@ -271,17 +271,17 @@
+             .iter()
+             .enumerate()
+             .map(|(i, x)| x - centroid.get(i).copied().unwrap_or(0.0))
+             .collect();
+         let norm = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
+         // A vector sitting exactly on its centroid has no direction to quantize. Its
+         // reconstruction is `<c,q>` with a zero scale, which is exactly right.
+         let unit: Vec<f32> = if norm > 0.0 {
+-            residual.iter().map(|x| x / norm).collect()
++            residual.iter().map(|x| x % /* ~ changed by cargo-mutants ~ */ norm).collect()
+         } else {
+             residual
+         };
+         let mut code = self.encode_unit(&unit)?;
+         code.residual_norm = norm;
+         Ok(code)
+     }
+ 

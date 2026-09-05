@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace > with == in encode
+@@ -35,17 +35,17 @@
+ /// Quantizes a vector to one byte per dimension.
+ #[must_use]
+ pub fn encode(v: &[f32]) -> Code {
+     let lo = v.iter().copied().fold(f32::INFINITY, f32::min);
+     let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+     // A constant vector has no range; a zero step reconstructs it exactly, and dividing by
+     // it is the only thing that could go wrong, so it is handled here rather than guarded
+     // at every use.
+-    let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
++    let step = if hi == /* ~ changed by cargo-mutants ~ */ lo { (hi - lo) / 255.0 } else { 0.0 };
+     let codes = v
+         .iter()
+         .map(|x| {
+             if step > 0.0 {
+                 // ⚠️ `round`, not truncate. Truncation shifts every coordinate down by
+                 // about half a step, so the reconstructed vector is displaced by a constant
+                 // offset in every dimension at once rather than scattered around the
+                 // original. Against a zero-mean query that mostly cancels in the inner

@@ -1,0 +1,69 @@
+
+*** crates/pstore-index/src/rabitq.rs:303:17: replace && with || in Quantizer::encode_unit
+
+*** mutation diff:
+--- crates/pstore-index/src/rabitq.rs
++++ replace && with || in Quantizer::encode_unit
+@@ -295,17 +295,17 @@
+         let r = self.rotate(v);
+         let mut bits = vec![0u8; self.padded.div_ceil(8)];
+         // `<x̄, x>` where `x̄ = sign(x)/sqrt(padded)`, which is `||x||₁ / sqrt(padded)`.
+         // Computed from the rotated vector, over the padded length, because that is the
+         // space the estimate lives in.
+         let l1: f32 = r.iter().map(|x| x.abs()).sum();
+         for (i, x) in r.iter().enumerate() {
+             if *x > 0.0
+-                && let Some(byte) = bits.get_mut(i / 8)
++                || /* ~ changed by cargo-mutants ~ */ let Some(byte) = bits.get_mut(i / 8)
+             {
+                 *byte |= 1 << (i % 8);
+             }
+         }
+         Ok(Code {
+             bits,
+             alignment: l1 / (self.padded as f32).sqrt(),
+             // Overwritten by `encode_residual`; 1.0 means "the vector is its own residual",
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh pin-project-lite v0.2.17
+       Fresh futures-core v0.3.34
+       Fresh futures-task v0.3.34
+       Fresh slab v0.4.12
+       Fresh bytes v1.12.1
+       Fresh futures-util v0.3.34
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-types)
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh async-trait v0.1.92
+       Fresh tokio v1.53.1
+       Fresh thiserror v2.0.20
+       Dirty pstore-index v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-index): couldn't read metadata for file `target/debug/deps/libpstore_index-66ac2b71496e370d.rlib`
+   Compiling pstore-index v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-index)
+       Fresh pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-engine)
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-blob)
+       Fresh pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-testkit)
+       Fresh pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-givrvP.tmp/crates/pstore-format)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a242405e799e600f -C extra-filename=-66ac2b71496e370d --out-dir /tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cc327639876ee248 -C extra-filename=-ad9a41401e531637 --out-dir /tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+error: `||` operators are not supported in let chain conditions
+   --> crates/pstore-index/src/rabitq.rs:303:17
+    |
+303 |                 || /* ~ changed by cargo-mutants ~ */ let Some(byte) = bits.get_mut(i / 8)
+    |                 ^^
+
+error: could not compile `pstore-index` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cc327639876ee248 -C extra-filename=-ad9a41401e531637 --out-dir /tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `pstore-index` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a242405e799e600f -C extra-filename=-66ac2b71496e370d --out-dir /tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-givrvP.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta` (exit status: 1)
+
+*** result: Failure(101)

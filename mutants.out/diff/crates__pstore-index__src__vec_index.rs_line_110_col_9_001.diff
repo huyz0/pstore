@@ -1,0 +1,45 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace Centroids::decode -> Option<Self> with Some(Default::default())
+@@ -102,41 +102,17 @@
+     }
+ 
+     /// Decodes a table, returning `None` for anything malformed.
+     ///
+     /// A short or ragged table would otherwise produce centroids of the wrong dimension and
+     /// spans pointing at the wrong rows — a wrong answer rather than an error.
+     #[must_use]
+     pub fn decode(raw: &[u8]) -> Option<Self> {
+-        let n = u32::from_le_bytes(raw.get(0..4)?.try_into().ok()?) as usize;
+-        let dim = u32::from_le_bytes(raw.get(4..8)?.try_into().ok()?) as usize;
+-        let mut at: usize = 8;
+-        let mut vectors = Vec::with_capacity(n);
+-        for _ in 0..n {
+-            let end = at.checked_add(dim * 4)?;
+-            let v = raw
+-                .get(at..end)?
+-                .chunks_exact(4)
+-                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+-                .collect();
+-            vectors.push(v);
+-            at = end;
+-        }
+-        let mut spans = Vec::with_capacity(n);
+-        for _ in 0..n {
+-            let end = at.checked_add(8)?;
+-            let s = raw.get(at..end)?;
+-            spans.push((
+-                u32::from_le_bytes(s.get(0..4)?.try_into().ok()?),
+-                u32::from_le_bytes(s.get(4..8)?.try_into().ok()?),
+-            ));
+-            at = end;
+-        }
+-        Some(Self { vectors, spans })
++        Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// A built index: the segment bytes, and the centroid table if one was worth building.
+ #[derive(Debug)]
+ pub struct Built {
+     /// The segment object.
+     pub segment: bytes::Bytes,

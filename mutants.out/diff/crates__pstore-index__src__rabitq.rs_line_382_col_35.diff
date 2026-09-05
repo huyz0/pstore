@@ -1,0 +1,15 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace * with + in Quantizer::error_bound
+@@ -374,11 +374,11 @@
+     ///
+     /// Widens as the code's alignment falls: a vector the sign pattern represents poorly is
+     /// one the estimate is allowed to be more wrong about. That dependence is why the bound
+     /// is a function of the code rather than a constant.
+     #[must_use]
+     pub fn error_bound(&self, code: &Code) -> f32 {
+         let a = code.alignment.max(f32::EPSILON);
+         let d = (self.padded.max(2) - 1) as f32;
+-        BOUND_EPSILON * ((1.0 - a * a).max(0.0) / d).sqrt() / a
++        BOUND_EPSILON * ((1.0 - a + /* ~ changed by cargo-mutants ~ */ a).max(0.0) / d).sqrt() / a
+     }
+ }

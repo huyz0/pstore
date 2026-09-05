@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace += with -= in Quantizer::raw
+@@ -319,17 +319,17 @@
+     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+         let scale = 1.0 / (self.padded as f32).sqrt();
+         let mut acc = 0.0f32;
+         for (i, q) in rotated_query.iter().enumerate() {
+             let bit = code
+                 .bits
+                 .get(i / 8)
+                 .is_some_and(|b| b & (1 << (i % 8)) != 0);
+-            acc += if bit { *q } else { -*q };
++            acc -= /* ~ changed by cargo-mutants ~ */ if bit { *q } else { -*q };
+         }
+         acc * scale
+     }
+ 
+     /// Rotates a query once, for scoring against many codes.
+     ///
+     /// ⚠️ The asymmetry D-11 buys accuracy from: the query is transformed **once per
+     /// query**, not once per vector, so work spent on it is amortised across every code in

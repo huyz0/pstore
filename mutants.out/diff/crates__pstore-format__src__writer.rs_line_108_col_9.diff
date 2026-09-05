@@ -1,0 +1,46 @@
+--- crates/pstore-format/src/writer.rs
++++ replace SegmentWriter::seal with ()
+@@ -100,42 +100,17 @@
+     ///
+     /// Buffered rather than sealed on the spot: the block size cannot be chosen until the
+     /// row count is known, and choosing it eagerly is what made the index section unbounded.
+     pub fn push(&mut self, doc: Document) {
+         self.docs.push(doc);
+     }
+ 
+     fn seal(&mut self, rows: &[Document]) {
+-        if rows.is_empty() {
+-            return;
+-        }
+-        let offset = self.body.len() as u64;
+-        let mut zones: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+-        for d in rows {
+-            for (k, v) in &d.attrs {
+-                if let Value::Int(n) = v {
+-                    // Zone maps are built here, from the rows as they are written -- never
+-                    // from a later pass that could disagree with the bytes.
+-                    let e = zones.entry(k.clone()).or_insert((*n, *n));
+-                    e.0 = e.0.min(*n);
+-                    e.1 = e.1.max(*n);
+-                }
+-            }
+-        }
+-        let blk = crate::encode_rows(rows);
+-        let len = blk.len() as u32;
+-        self.body.raw(&blk);
+-        self.blocks.push(BlockMeta {
+-            offset,
+-            len,
+-            rows: rows.len() as u32,
+-            zones,
+-        });
+-        self.rows += rows.len() as u32;
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Encodes the index section for the blocks sealed so far.
+     fn encode_index(&self) -> Enc {
+         let mut idx = Enc::default();
+         idx.u32(self.blocks.len() as u32);
+         for b in &self.blocks {
+             idx.u64(b.offset);

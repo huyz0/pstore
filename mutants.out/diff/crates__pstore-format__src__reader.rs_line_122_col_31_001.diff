@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace + with * in Segment::data_end
+@@ -114,17 +114,17 @@
+     /// The byte offset just past the last data block.
+     ///
+     /// Data blocks are addressed by the index rather than by the directory, so nothing else
+     /// can tell whether a section overlaps them.
+     #[must_use]
+     pub fn data_end(&self) -> u64 {
+         self.blocks
+             .iter()
+-            .map(|b| b.offset + u64::from(b.len))
++            .map(|b| b.offset * /* ~ changed by cargo-mutants ~ */ u64::from(b.len))
+             .max()
+             .unwrap_or(0)
+     }
+ 
+     /// Where a section lives, or `None` if this segment does not carry it.
+     #[must_use]
+     pub fn section(&self, section: Section) -> Option<std::ops::Range<u64>> {
+         self.sections.get(&(section as u16)).cloned()

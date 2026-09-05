@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace - with + in probe_coalesced_read
+@@ -181,17 +181,17 @@
+     let wanted = [0..4u64, 8..12, 250..256];
+     let Ok(got) = s.get_ranges(&key, &wanted).await else {
+         return Support::Divergent("get_ranges failed".to_owned());
+     };
+     if got.len() != 3 {
+         return Support::Divergent(format!("expected 3 slices, got {}", got.len()));
+     }
+     for (i, r) in wanted.iter().enumerate() {
+-        let want_len = (r.end - r.start) as usize;
++        let want_len = (r.end + /* ~ changed by cargo-mutants ~ */ r.start) as usize;
+         match got.get(i) {
+             Some(b) if b.len() == want_len => {}
+             // Returning the merged buffer rather than each range's slice is the mutation
+             // this catches, and a length-only check at the top level would miss it.
+             Some(b) => {
+                 return Support::Divergent(format!(
+                     "slice {i} was {} bytes, wanted {want_len}",
+                     b.len()

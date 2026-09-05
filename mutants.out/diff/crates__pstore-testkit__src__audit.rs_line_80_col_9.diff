@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/audit.rs
++++ replace <impl BlobStore for Auditing<S>>::get_range -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -72,17 +72,17 @@
+         self.inner.capabilities()
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+         self.inner.get(key).await
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+-        self.inner.get_range(key, range).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+         self.inner.get_suffix(key, n).await
+     }
+ 
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+         self.inner.get_with_tag(key).await

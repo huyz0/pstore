@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace Quantizer::estimate_unnormalized_for_test -> f32 with -1.0
+@@ -362,17 +362,17 @@
+     pub fn estimate(&self, code: &Code, query: &[f32]) -> Result<f32, QuantError> {
+         Ok(self.estimate_prepared(code, &self.prepare(query)?))
+     }
+ 
+     /// The same estimate **without** the normalisation, so a test can show the bound is
+     /// tight enough to reject it.
+     #[doc(hidden)]
+     pub fn estimate_unnormalized_for_test(&self, code: &Code, query: &Query) -> f32 {
+-        self.raw(code, &query.0)
++        -1.0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The error bound for this code, at [`BOUND_EPSILON`].
+     ///
+     /// Widens as the code's alignment falls: a vector the sign pattern represents poorly is
+     /// one the estimate is allowed to be more wrong about. That dependence is why the bound
+     /// is a function of the code rather than a constant.
+     #[must_use]

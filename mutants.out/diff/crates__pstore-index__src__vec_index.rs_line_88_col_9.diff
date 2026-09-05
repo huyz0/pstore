@@ -1,0 +1,34 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace Centroids::encode -> Vec<u8> with vec![]
+@@ -80,30 +80,17 @@
+     /// `(first_row, len)` per posting list, into the segment's row order.
+     pub spans: Vec<(u32, u32)>,
+ }
+ 
+ impl Centroids {
+     /// Encodes the table.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        let dim = self.vectors.first().map_or(0, Vec::len);
+-        let mut out = Vec::with_capacity(8 + self.vectors.len() * (dim * 4 + 8));
+-        out.extend_from_slice(&(self.vectors.len() as u32).to_le_bytes());
+-        out.extend_from_slice(&(dim as u32).to_le_bytes());
+-        for v in &self.vectors {
+-            for x in v {
+-                out.extend_from_slice(&x.to_le_bytes());
+-            }
+-        }
+-        for (first, len) in &self.spans {
+-            out.extend_from_slice(&first.to_le_bytes());
+-            out.extend_from_slice(&len.to_le_bytes());
+-        }
+-        out
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Decodes a table, returning `None` for anything malformed.
+     ///
+     /// A short or ragged table would otherwise produce centroids of the wrong dimension and
+     /// spans pointing at the wrong rows — a wrong answer rather than an error.
+     #[must_use]
+     pub fn decode(raw: &[u8]) -> Option<Self> {

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace - with + in Segment::search
+@@ -334,17 +334,17 @@
+                     expected: d.vector.len(),
+                     got: query.len(),
+                 });
+             }
+             let dist: f32 = d
+                 .vector
+                 .iter()
+                 .zip(query)
+-                .map(|(a, b)| (a - b) * (a - b))
++                .map(|(a, b)| (a - b) * (a + /* ~ changed by cargo-mutants ~ */ b))
+                 .sum();
+             scored.push((d.id, dist));
+         }
+         // `total_cmp` rather than `partial_cmp`: a NaN from a malformed vector must order
+         // deterministically instead of making the sort's behaviour undefined. Ties break
+         // on id so the result is reproducible, which is what lets a reference test exist.
+         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+         scored.truncate(k);

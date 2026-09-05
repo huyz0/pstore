@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::row_count -> usize with 1
+@@ -200,17 +200,17 @@
+             });
+         }
+         Ok(blocks)
+     }
+ 
+     /// Rows in the segment.
+     #[must_use]
+     pub fn row_count(&self) -> usize {
+-        self.rows as usize
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Blocks in the segment.
+     #[must_use]
+     pub fn block_count(&self) -> usize {
+         self.blocks.len()
+     }
+ 

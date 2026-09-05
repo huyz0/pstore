@@ -1,0 +1,22 @@
+--- crates/pstore-format/src/writer.rs
++++ replace SegmentWriter::with_section -> Self with Default::default()
+@@ -74,18 +74,17 @@
+     }
+ 
+     /// Attaches a fixed-width section, one equal-length record per row.
+     ///
+     /// The reader derives the record width by dividing by the row count, so a caller that
+     /// supplies a ragged payload gets rows that read as garbage — hence the debug assert.
+     #[must_use]
+     pub fn with_section(mut self, section: Section, bytes: Vec<u8>) -> Self {
+-        self.extra.push((section, bytes));
+-        self
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Attaches a section under a **raw** id, including one this version does not know.
+     ///
+     /// Exists to build a segment "from the future", which is the only way to check that a
+     /// reader skips what it does not recognise. Forward compatibility that cannot be tested
+     /// is a promise, and segments are immutable, so old readers meet new segments for
+     /// years.

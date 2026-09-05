@@ -1,0 +1,24 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ replace Flaky::always_contended -> Self with Default::default()
+@@ -129,20 +129,17 @@
+             never_missing: true,
+             ..Self::refusing(&[])
+         }
+     }
+ 
+     /// A store whose conditional writes are always `Contended`.
+     #[must_use]
+     pub fn always_contended() -> Self {
+-        Self {
+-            always_contended: true,
+-            ..Self::refusing(&[])
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn read_gate(&self) -> Result<(), BlobError> {
+         if self.reads_fail {
+             self.failures.fetch_add(1, Ordering::Relaxed);
+             return Err(BlobError::Other("injected read failure".to_owned()));
+         }
+         Ok(())

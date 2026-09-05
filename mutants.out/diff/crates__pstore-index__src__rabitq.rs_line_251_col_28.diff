@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace - with + in Quantizer::rotate
+@@ -243,17 +243,17 @@
+         }
+         let mut h = 1;
+         while h < self.padded {
+             for chunk in a.chunks_mut(h * 2) {
+                 let (lo, hi) = chunk.split_at_mut(h);
+                 for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
+                     let (u, w) = (*x, *y);
+                     *x = u + w;
+-                    *y = u - w;
++                    *y = u + /* ~ changed by cargo-mutants ~ */ w;
+                 }
+             }
+             h *= 2;
+         }
+         let scale = 1.0 / (self.padded as f32).sqrt();
+         for x in a.iter_mut() {
+             *x *= scale;
+         }

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/lib.rs
++++ replace > with < in Filter::could_match
+@@ -155,17 +155,17 @@
+     /// drops rows, which reads as a recall bug rather than an error. Answering `true` for a
+     /// block that cannot match is merely wasted work.
+     #[must_use]
+     pub fn could_match(&self, min: i64, max: i64) -> bool {
+         match self {
+             Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
+             // A string equality has no ordering to prune on, so every block could match.
+             Self::Eq(_, Value::Str(_)) => true,
+-            Self::Gt(_, n) => max > *n,
++            Self::Gt(_, n) => max < /* ~ changed by cargo-mutants ~ */ *n,
+             Self::Lt(_, n) => min < *n,
+         }
+     }
+ }
+ 
+ /// Why a segment could not be read.
+ #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+ pub enum FormatError {

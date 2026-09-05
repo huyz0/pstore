@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace / with % in Quantizer::raw
+@@ -317,17 +317,17 @@
+ 
+     /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
+     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+         let scale = 1.0 / (self.padded as f32).sqrt();
+         let mut acc = 0.0f32;
+         for (i, q) in rotated_query.iter().enumerate() {
+             let bit = code
+                 .bits
+-                .get(i / 8)
++                .get(i % /* ~ changed by cargo-mutants ~ */ 8)
+                 .is_some_and(|b| b & (1 << (i % 8)) != 0);
+             acc += if bit { *q } else { -*q };
+         }
+         acc * scale
+     }
+ 
+     /// Rotates a query once, for scoring against many codes.
+     ///

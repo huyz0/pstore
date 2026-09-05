@@ -1,0 +1,24 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::compacted_key -> Key with Default::default()
+@@ -523,20 +523,17 @@
+     /// ⚠️ **Carries the compactor's lane**, so two nodes compacting the same inputs write
+     /// to two different objects. Deriving the key from the inputs instead would be
+     /// tempting — the losers would cost nothing — but it makes the second compactor
+     /// overwrite a live object unconditionally, which is Invariant I1 gone. The
+     /// create-if-absent that would fix it is exactly the precondition MinIO was *measured*
+     /// ignoring, so the fix would be silently absent on a backend we support. A wasted
+     /// object that GC reaps is the cheaper mistake.
+     fn compacted_key(&self, epoch: Epoch, index: &str) -> Key {
+-        Key::new(format!(
+-            "{:04x}/tnt/{}/idx/{index}/seg/L1/{:020}-{:016x}.seg",
+-            self.tenant.0 as u16, self.tenant.0, epoch.0, self.lane.0
+-        ))
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Merges an index's segments into one, and publishes it by CAS.
+     ///
+     /// **Optimistic, not coordinated.** Any node may compact any index at any time; there
+     /// is no lock, no lease and no claim, because there is nothing to protect. Several
+     /// nodes may do the same merge concurrently: they read the same inputs, write their
+     /// own outputs, and race to publish. Exactly one CAS lands. The losers discard, and

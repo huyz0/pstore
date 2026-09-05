@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace + with * in Segment::scan
+@@ -248,17 +248,17 @@
+     ) -> Result<Vec<Document>, FormatError> {
+         let wanted = self.blocks_to_read(filter);
+         if wanted.is_empty() {
+             return Ok(Vec::new());
+         }
+         let ranges: Vec<_> = wanted
+             .iter()
+             .filter_map(|i| self.blocks.get(*i))
+-            .map(|b| b.offset..b.offset + u64::from(b.len))
++            .map(|b| b.offset..b.offset * /* ~ changed by cargo-mutants ~ */ u64::from(b.len))
+             .collect();
+         // Row indices, so a decoded row can find its own vector. Blocks are contiguous and
+         // in order, so the base is the sum of the rows before this block.
+         let mut base: Vec<usize> = Vec::with_capacity(self.blocks.len());
+         let mut running = 0usize;
+         for b in &self.blocks {
+             base.push(running);
+             running += b.rows as usize;

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace > with < in Segment::scan
+@@ -266,17 +266,17 @@
+ 
+         // ⚠️ Only the vector rows belonging to the blocks being read, not the whole
+         // section. Fetching all of it would undo zone-map pruning in bytes while leaving it
+         // intact in block count -- the plan would still say "one block" and the wire would
+         // still carry the entire segment's vectors.
+         let per_row = self.vector_row_len();
+         let mut all: Vec<std::ops::Range<u64>> = ranges;
+         let block_count = all.len();
+-        if let (Some(vec_span), true) = (self.section(Section::Vectors), per_row > 0) {
++        if let (Some(vec_span), true) = (self.section(Section::Vectors), per_row < /* ~ changed by cargo-mutants ~ */ 0) {
+             for i in &wanted {
+                 let (Some(start), Some(b)) = (base.get(*i), self.blocks.get(*i)) else {
+                     continue;
+                 };
+                 let lo = vec_span.start + (*start * per_row) as u64;
+                 all.push(lo..lo + (b.rows as usize * per_row) as u64);
+             }
+         }

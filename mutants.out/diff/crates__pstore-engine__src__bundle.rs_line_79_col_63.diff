@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/bundle.rs
++++ replace - with + in read_index
+@@ -71,17 +71,17 @@
+ /// The bundle's directory: which indexes it carries and where.
+ pub(crate) fn read_index(buf: &[u8]) -> Result<BTreeMap<String, Entry>, EngineError> {
+     let foot_len = 8 + 8 + 4 + 8;
+     let at = buf
+         .len()
+         .checked_sub(foot_len)
+         .ok_or(EngineError::CorruptBundle)?;
+     let foot = buf.get(at..).ok_or(EngineError::CorruptBundle)?;
+-    if foot.get(..8) != Some(&MAGIC[..]) || foot.get(foot_len - 8..) != Some(&MAGIC[..]) {
++    if foot.get(..8) != Some(&MAGIC[..]) || foot.get(foot_len + /* ~ changed by cargo-mutants ~ */ 8..) != Some(&MAGIC[..]) {
+         return Err(EngineError::CorruptBundle);
+     }
+     let index_offset = u64::from_le_bytes(
+         foot.get(8..16)
+             .and_then(|b| b.try_into().ok())
+             .ok_or(EngineError::CorruptBundle)?,
+     ) as usize;
+     let index_len = u32::from_le_bytes(

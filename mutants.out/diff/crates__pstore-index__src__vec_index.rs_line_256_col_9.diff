@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace VecIndex::is_clustered -> bool with true
+@@ -248,17 +248,17 @@
+             centroids: cen.ok().and_then(|b| Centroids::decode(b.as_ref())),
+             dim,
+         })
+     }
+ 
+     /// Whether this index has a clustered structure, or is scanned exactly.
+     #[must_use]
+     pub fn is_clustered(&self) -> bool {
+-        self.centroids.is_some()
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The opened segment.
+     #[must_use]
+     pub fn segment(&self) -> &Segment {
+         &self.segment
+     }
+ 

@@ -1,0 +1,31 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace Clustering::unconstrained_cost -> f64 with 0.0
+@@ -133,27 +133,17 @@
+     }
+ 
+     /// The same objective if every vector went to its nearest centroid, ignoring capacity.
+     ///
+     /// A lower bound the balanced assignment cannot beat, so the ratio between them is what
+     /// balance actually costs.
+     #[must_use]
+     pub fn unconstrained_cost(&self, corpus: &[Vec<f32>]) -> f64 {
+-        corpus
+-            .iter()
+-            .map(|v| {
+-                f64::from(
+-                    self.centroids
+-                        .iter()
+-                        .map(|c| dist2(v, c))
+-                        .fold(f32::INFINITY, f32::min),
+-                )
+-            })
+-            .sum()
++        0.0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// A clustering from parts, for a reader that has centroids but not assignments.
+     ///
+     /// A searcher holds the centroid table and reads posting lists by byte range; it never
+     /// materialises the row lists, so requiring them would force it to fetch what it is
+     /// specifically avoiding.
+     #[must_use]

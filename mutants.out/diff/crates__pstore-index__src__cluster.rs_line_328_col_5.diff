@@ -1,0 +1,45 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace assign -> Vec<Vec<usize>> with vec![]
+@@ -320,41 +320,10 @@
+         // A row replicated into a list it was also assigned to would be scored twice and
+         // could occupy two slots in a top-k.
+         list.dedup();
+     }
+ }
+ 
+ /// Assigns every row to its nearest centroid that still has room.
+ fn assign(corpus: &[Vec<f32>], centroids: &[Vec<f32>], cap: usize) -> Vec<Vec<usize>> {
+-    let mut lists: Vec<Vec<usize>> = vec![Vec::new(); centroids.len()];
+-    for (row, v) in corpus.iter().enumerate() {
+-        let mut prefs: Vec<(usize, f32)> = centroids
+-            .iter()
+-            .enumerate()
+-            .map(|(c, cen)| (c, dist2(v, cen)))
+-            .collect();
+-        // Ties by centroid index, so the order is total and two runs over the same corpus
+-        // agree exactly. Recall is compared across runs; a clustering that varies makes
+-        // every comparison noise.
+-        prefs.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-
+-        // Nearest centroid with room. Every vector lands somewhere: the fallback is the
+-        // least-full list, so a corpus can never lose a row to a full-everywhere state --
+-        // and a lost row is unreachable at any probe width, visible only as a recall
+-        // ceiling.
+-        let target = prefs
+-            .iter()
+-            .find(|(c, _)| lists.get(*c).is_some_and(|l| l.len() < cap))
+-            .map(|(c, _)| *c)
+-            .unwrap_or_else(|| {
+-                lists
+-                    .iter()
+-                    .enumerate()
+-                    .min_by_key(|(i, l)| (l.len(), *i))
+-                    .map_or(0, |(i, _)| i)
+-            });
+-        if let Some(list) = lists.get_mut(target) {
+-            list.push(row);
+-        }
+-    }
+-    lists
++    vec![] /* ~ changed by cargo-mutants ~ */
+ }

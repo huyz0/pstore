@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace == with != in run
+@@ -327,17 +327,17 @@
+         Probe {
+             name: "batch_delete",
+             outcome: probe_batch_delete(s, run_id).await,
+         },
+     ];
+     let find = |n: &str| {
+         probes
+             .iter()
+-            .find(|p| p.name == n)
++            .find(|p| p.name != /* ~ changed by cargo-mutants ~ */ n)
+             .map_or(Support::Unsupported, |p| p.outcome.clone())
+     };
+     let declared = s.capabilities();
+     Report {
+         backend: declared.backend.clone(),
+         observed: Capabilities {
+             backend: declared.backend.clone(),
+             // ⚠️ Taken from the PROBE, not from what the backend claims. That difference

@@ -1,0 +1,59 @@
+
+*** crates/pstore-engine/src/lib.rs:74:9: replace <impl From<pstore_format::FormatError> for EngineError>::from -> Self with Default::default()
+
+*** mutation diff:
+--- crates/pstore-engine/src/lib.rs
++++ replace <impl From<pstore_format::FormatError> for EngineError>::from -> Self with Default::default()
+@@ -66,17 +66,17 @@
+ impl From<pstore_blob::BlobError> for EngineError {
+     fn from(e: pstore_blob::BlobError) -> Self {
+         Self::Blob(e.to_string())
+     }
+ }
+ 
+ impl From<pstore_format::FormatError> for EngineError {
+     fn from(e: pstore_format::FormatError) -> Self {
+-        Self::Format(e.to_string())
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Rows written but not yet folded, held in memory and served by queries.
+ ///
+ /// This is the freshness layer: **visibility does not wait on the fold**, so the flush
+ /// interval never enters the time-to-searchable budget.
+ #[derive(Debug, Default)]
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh pin-project-lite v0.2.17
+       Fresh tokio-macros v2.7.2
+       Fresh thiserror-impl v2.0.20
+       Fresh slab v0.4.12
+       Fresh futures-task v0.3.34
+       Fresh futures-core v0.3.34
+       Fresh futures-util v0.3.34
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Dirty pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-engine): couldn't read metadata for file `target/debug/deps/libpstore_engine-2eb216b63a1c00b2.rlib`
+   Compiling pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-engine)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_engine --edition=2024 crates/pstore-engine/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=05499d15a4a24ae3 -C extra-filename=-2eb216b63a1c00b2 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta --extern tokio=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rmeta`
+error[E0277]: the trait bound `EngineError: Default` is not satisfied
+  --> crates/pstore-engine/src/lib.rs:74:9
+   |
+74 |         Default::default() /* ~ changed by cargo-mutants ~ */
+   |         ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `EngineError`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `pstore-engine` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_engine --edition=2024 crates/pstore-engine/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=05499d15a4a24ae3 -C extra-filename=-2eb216b63a1c00b2 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta --extern tokio=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rmeta` (exit status: 1)
+
+*** result: Failure(101)

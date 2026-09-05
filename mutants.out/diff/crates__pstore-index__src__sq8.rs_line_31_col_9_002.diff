@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/sq8.rs
++++ replace Code::step -> f32 with -1.0
+@@ -23,17 +23,17 @@
+     #[must_use]
+     pub fn codes(&self) -> &[u8] {
+         &self.codes
+     }
+ 
+     /// The reconstruction step: no coordinate is further than this from its original.
+     #[must_use]
+     pub fn step(&self) -> f32 {
+-        self.step
++        -1.0 /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Quantizes a vector to one byte per dimension.
+ #[must_use]
+ pub fn encode(v: &[f32]) -> Code {
+     let lo = v.iter().copied().fold(f32::INFINITY, f32::min);
+     let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);

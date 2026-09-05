@@ -1,0 +1,50 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace probe_coalesced_read -> Support with Default::default()
+@@ -166,46 +166,17 @@
+         Err(_) => Support::Supported,
+         // A short read here truncates a posting list and surfaces as a recall bug several
+         // layers away from its cause.
+         Ok(b) => Support::Divergent(format!("a range past the end returned {} bytes", b.len())),
+     }
+ }
+ 
+ async fn probe_coalesced_read<S: BlobStore>(s: &S, run: u64) -> Support {
+-    let key = k(run, "coalesce");
+-    if s.put(&key, Bytes::from((0..=255u8).collect::<Vec<_>>()))
+-        .await
+-        .is_err()
+-    {
+-        return Support::Unsupported;
+-    }
+-    let wanted = [0..4u64, 8..12, 250..256];
+-    let Ok(got) = s.get_ranges(&key, &wanted).await else {
+-        return Support::Divergent("get_ranges failed".to_owned());
+-    };
+-    if got.len() != 3 {
+-        return Support::Divergent(format!("expected 3 slices, got {}", got.len()));
+-    }
+-    for (i, r) in wanted.iter().enumerate() {
+-        let want_len = (r.end - r.start) as usize;
+-        match got.get(i) {
+-            Some(b) if b.len() == want_len => {}
+-            // Returning the merged buffer rather than each range's slice is the mutation
+-            // this catches, and a length-only check at the top level would miss it.
+-            Some(b) => {
+-                return Support::Divergent(format!(
+-                    "slice {i} was {} bytes, wanted {want_len}",
+-                    b.len()
+-                ));
+-            }
+-            None => return Support::Divergent(format!("slice {i} missing")),
+-        }
+-    }
+-    Support::Supported
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// `Range: bytes=-N`. The primitive a self-describing footer is read with.
+ ///
+ /// Without it a reader must `head` first, which is billed as a read and doubles the cost
+ /// of every cold open. A backend that answers a suffix range with the WHOLE object would
+ /// pass a functional test and cost a segment's bandwidth per open, so the length is
+ /// checked, not just the content.

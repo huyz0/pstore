@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/sweep.rs
++++ replace += with *= in contention_point
+@@ -84,17 +84,17 @@
+                     // The window every optimistic protocol has: another writer can land
+                     // between the read and the CAS. Yielding widens it deterministically
+                     // enough to be measurable on a store with no network.
+                     tokio::task::yield_now().await;
+                     attempts += 1;
+                     let body = Bytes::from(format!("w{w}c{c}"));
+                     match s.put_conditional(&k, body, Precondition::Match(tag)).await {
+                         Ok(_) => break,
+-                        Err(CasError::Lost) => lost += 1,
++                        Err(CasError::Lost) => lost *= /* ~ changed by cargo-mutants ~ */ 1,
+                         Err(CasError::Contended) => {}
+                         Err(CasError::Io(_)) => break,
+                     }
+                 }
+             }
+             (attempts, lost)
+         }));
+     }

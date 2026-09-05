@@ -1,0 +1,29 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace VecIndex::open -> Result<Self, pstore_format::FormatError> with Ok(Default::default())
+@@ -234,25 +234,17 @@
+         store: &S,
+         segment: &Key,
+         centroids: &Key,
+         dim: usize,
+     ) -> Result<Self, pstore_format::FormatError> {
+         // ⚠️ `join`, not two awaits. Both keys are derived, neither depends on the other's
+         // contents, and awaiting the footer first would make every cold open two hops for
+         // no reason a caller could see.
+-        let (seg, cen) =
+-            futures_util::future::join(Segment::open(store, segment), store.get(centroids)).await;
+-        Ok(Self {
+-            segment: seg?,
+-            // A missing centroid object is not an error: it is how an index below the
+-            // threshold says "scan me exactly" (D-10).
+-            centroids: cen.ok().and_then(|b| Centroids::decode(b.as_ref())),
+-            dim,
+-        })
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Whether this index has a clustered structure, or is scanned exactly.
+     #[must_use]
+     pub fn is_clustered(&self) -> bool {
+         self.centroids.is_some()
+     }
+ 

@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace * with / in VecIndex::search
+@@ -364,17 +364,17 @@
+                     rows.iter()
+                         .enumerate()
+                         .find(|(_, (_, first, len))| {
+                             row >= *first as usize && row < (*first + *len) as usize
+                         })
+                         .and_then(|(n, (_, first, _))| {
+                             let buf = bufs.get(rows.len() + n)?;
+                             let i = row - *first as usize;
+-                            let raw = buf.get(i * per..(i + 1) * per)?;
++                            let raw = buf.get(i * per..(i + 1) / /* ~ changed by cargo-mutants ~ */ per)?;
+                             Some(sq8::estimate_raw(raw, query))
+                         })
+                         .unwrap_or(f32::NEG_INFINITY)
+                 });
+                 refined.into_iter().take(q.k).collect()
+             }
+             Rerank::Exact => {
+                 // The fourth round trip, and only here: which float32 rows to read cannot

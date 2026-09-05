@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/ladder.rs
++++ replace * with + in Ladder::keep
+@@ -42,17 +42,17 @@
+     /// Strictly narrowing, because a rung that hands on as many as it received is a rescan
+     /// at higher cost rather than a rerank.
+     #[must_use]
+     pub fn keep(&self, rung: Rung) -> usize {
+         match rung {
+             Rung::OneBit => self.k * self.oversample,
+             // A fixed 2x, so the last rung's fetch is small enough to be worth its round
+             // trip: at k=10 that is 20 vectors, tens of kilobytes.
+-            Rung::Int8 => self.k * 2,
++            Rung::Int8 => self.k + /* ~ changed by cargo-mutants ~ */ 2,
+             Rung::Exact => self.k,
+         }
+     }
+ 
+     fn top(&self, mut scored: Vec<(usize, f32)>, keep: usize) -> Vec<(usize, f32)> {
+         // Descending by score; ties broken by id so a result set is reproducible, which is
+         // what lets a recall number be compared across runs at all.
+         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

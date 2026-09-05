@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lanes.rs
++++ replace key -> Key with Default::default()
+@@ -39,17 +39,17 @@
+ ///
+ /// Generous: with the window doubling to [`MAX_PROBE_WINDOW`] this covers far more
+ /// bundles than a lane accumulates between folds. It exists to bound the loop, not to
+ /// limit a lane.
+ const MAX_PROBE_ROUNDS: u32 = 64;
+ 
+ /// The registry's key, derived from the tenant like every other key here.
+ pub fn key(tenant: TenantId) -> Key {
+-    Key::new(format!("{:04x}/tnt/{}/lanes", tenant.0 as u16, tenant.0))
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn decode(buf: &[u8]) -> Result<BTreeSet<LaneId>, EngineError> {
+     if !buf.len().is_multiple_of(8) || buf.len() / 8 > MAX_LANES {
+         return Err(EngineError::CorruptHead);
+     }
+     Ok(buf
+         .chunks_exact(8)

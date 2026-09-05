@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ delete ! in Clustering::build
+@@ -190,17 +190,17 @@
+                     *slot = sum / list.len() as f32;
+                 }
+             }
+         }
+ 
+         // An empty list costs a centroid, a directory entry, and a probe that can never
+         // return anything.
+         let keep: Vec<usize> = (0..k)
+-            .filter(|i| lists.get(*i).is_some_and(|l| !l.is_empty()))
++            .filter(|i| lists.get(*i).is_some_and(|l|  /* ~ changed by cargo-mutants ~ */l.is_empty()))
+             .collect();
+         let centroids: Vec<Vec<f32>> = keep
+             .iter()
+             .filter_map(|i| centroids.get(*i).cloned())
+             .collect();
+         let mut lists: Vec<Vec<usize>> =
+             keep.iter().filter_map(|i| lists.get(*i).cloned()).collect();
+ 

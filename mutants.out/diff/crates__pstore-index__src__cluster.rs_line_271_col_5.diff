@@ -1,0 +1,73 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace augment with ()
+@@ -263,69 +263,17 @@
+ /// centroids belongs, as far as any query is concerned, to both: a query near the boundary
+ /// probes one list and the answer is in the other. Assignment has to pick one; replication
+ /// undoes the arbitrariness for the vectors where it matters, and only for those.
+ ///
+ /// Bounded twice — by `replicas` and by `boundary` — because the degenerate version
+ /// replicates everything into everything and calls the resulting exhaustive scan a
+ /// clustered index.
+ fn augment(corpus: &[Vec<f32>], centroids: &[Vec<f32>], lists: &mut [Vec<usize>], params: Params) {
+-    if params.replicas == 0 || params.boundary <= 0.0 || centroids.len() < 2 {
+-        return;
+-    }
+-    // Pass one: every replica the boundary rule would admit, with its distance, so pass two
+-    // can prefer the closest when a list runs out of room.
+-    let mut extra: Vec<Vec<(usize, f32)>> = vec![Vec::new(); lists.len()];
+-    for (row, v) in corpus.iter().enumerate() {
+-        let mut d: Vec<(usize, f32)> = centroids
+-            .iter()
+-            .enumerate()
+-            .map(|(c, cen)| (c, dist2(v, cen)))
+-            .collect();
+-        d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-        let Some((_, nearest)) = d.first().copied() else {
+-            continue;
+-        };
+-        // Compared in true distance, not squared: `boundary` is a fraction of a distance,
+-        // and applying it to a squared value would make the threshold quietly
+-        // dimension-dependent.
+-        let limit = nearest.sqrt() * (1.0 + params.boundary);
+-        for (c, dd) in d.iter().skip(1).take(params.replicas) {
+-            if dd.sqrt() <= limit
+-                && let Some(slot) = extra.get_mut(*c)
+-            {
+-                slot.push((row, *dd));
+-            }
+-        }
+-    }
+-
+-    // ⚠️ Pass two enforces the SAME balance bound on the augmented lists. Replication that
+-    // ignores the cap undoes it entirely: measured on 10:1 skewed data, unbounded
+-    // replication took the largest list to 6.0x the mean, which is exactly the cost the cap
+-    // exists to prevent — and a probe reads the augmented list, not the assigned one.
+-    //
+-    // The cap is computed against the mean *after* replication, so augmentation is allowed
+-    // to grow every list proportionally; what it may not do is grow one of them.
+-    let admitted: usize = extra.iter().map(Vec::len).sum();
+-    let total = corpus.len().saturating_add(admitted);
+-    let cap = capacity(total, lists.len().max(1), params.balance);
+-    for (list, mut add) in lists.iter_mut().zip(extra) {
+-        // Closest first, so a list that fills keeps the replicas that mattered most.
+-        add.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-        for (row, _) in add {
+-            if list.len() >= cap {
+-                break;
+-            }
+-            list.push(row);
+-        }
+-        list.sort_unstable();
+-        // A row replicated into a list it was also assigned to would be scored twice and
+-        // could occupy two slots in a top-k.
+-        list.dedup();
+-    }
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Assigns every row to its nearest centroid that still has room.
+ fn assign(corpus: &[Vec<f32>], centroids: &[Vec<f32>], cap: usize) -> Vec<Vec<usize>> {
+     let mut lists: Vec<Vec<usize>> = vec![Vec::new(); centroids.len()];
+     for (row, v) in corpus.iter().enumerate() {
+         let mut prefs: Vec<(usize, f32)> = centroids
+             .iter()

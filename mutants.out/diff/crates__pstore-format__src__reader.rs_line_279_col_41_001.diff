@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace + with * in Segment::scan
+@@ -271,17 +271,17 @@
+         let per_row = self.vector_row_len();
+         let mut all: Vec<std::ops::Range<u64>> = ranges;
+         let block_count = all.len();
+         if let (Some(vec_span), true) = (self.section(Section::Vectors), per_row > 0) {
+             for i in &wanted {
+                 let (Some(start), Some(b)) = (base.get(*i), self.blocks.get(*i)) else {
+                     continue;
+                 };
+-                let lo = vec_span.start + (*start * per_row) as u64;
++                let lo = vec_span.start * /* ~ changed by cargo-mutants ~ */ (*start * per_row) as u64;
+                 all.push(lo..lo + (b.rows as usize * per_row) as u64);
+             }
+         }
+         // ⚠️ One call, so blocks and vector rows go out TOGETHER. They are different
+         // sections of the same object, both spans are known before either is issued, and
+         // awaiting one before the other would make every scan a two-hop read for no reason
+         // a caller could see. Width is free; depth is not.
+         let bufs = store.get_ranges(key, &all).await?;

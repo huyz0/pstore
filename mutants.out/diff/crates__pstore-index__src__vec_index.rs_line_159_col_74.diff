@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace || with && in build
+@@ -151,17 +151,17 @@
+ /// ⚠️ **One switch, at one place.** Below the threshold no centroid object is written at
+ /// all — not an empty one — so "is this index clustered?" is answered by whether the object
+ /// exists, and there is no second code path that could disagree with the first.
+ #[must_use]
+ pub fn build(docs: &[Document], params: Params) -> Built {
+     let dim = docs.first().map_or(0, |d| d.vector.len());
+     let quantizer = Quantizer::new(dim.max(1));
+ 
+-    let (order, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
++    let (order, centroids) = if docs.len() < params.exact_scan_threshold && /* ~ changed by cargo-mutants ~ */ dim == 0 {
+         ((0..docs.len()).collect::<Vec<_>>(), None)
+     } else {
+         let corpus: Vec<Vec<f32>> = docs.iter().map(|d| d.vector.clone()).collect();
+         let c = Clustering::build(&corpus, params);
+         // ⚠️ Rows are written in LIST order, so a posting list is one contiguous byte range
+         // and a probe is one ranged read rather than a scatter of thousands.
+         let mut order = Vec::with_capacity(docs.len());
+         let mut spans = Vec::with_capacity(c.lists().len());

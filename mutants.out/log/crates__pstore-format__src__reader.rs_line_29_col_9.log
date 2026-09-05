@@ -1,0 +1,171 @@
+
+*** crates/pstore-format/src/reader.rs:29:9: replace Segment::open -> Result<Self, FormatError> with Ok(Default::default())
+
+*** mutation diff:
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::open -> Result<Self, FormatError> with Ok(Default::default())
+@@ -21,99 +21,17 @@
+     /// Opens a segment knowing only its key.
+     ///
+     /// **At most two sequential reads.** One suffix range fetches the footer and, if the
+     /// segment is small, its whole index section; only a segment whose index section did
+     /// not fit needs the second.
+     pub async fn open<S: BlobStore>(store: &S, key: &Key) -> Result<Self, FormatError> {
+         // One suffix read. No `head` first: it is billed as a read, so requiring one
+         // would double every cold open -- found by the request counter, not by inspection.
+-        let tail = store.get_suffix(key, SUFFIX_FETCH).await?;
+-
+-        let foot_at = tail
+-            .len()
+-            .checked_sub(FOOTER_LEN)
+-            .ok_or(FormatError::Truncated)?;
+-        let foot = tail.get(foot_at..).ok_or(FormatError::Truncated)?;
+-        let mut d = Dec::new(foot);
+-        if d.raw(8)? != MAGIC {
+-            return Err(FormatError::Corrupt("bad magic"));
+-        }
+-        let version = d.u16()?;
+-        if version != VERSION {
+-            return Err(FormatError::UnsupportedVersion(version));
+-        }
+-        let meta_offset = d.u64()?;
+-        let meta_len = d.u32()?;
+-        let rows = d.u32()?;
+-        let sum = d.u64()?;
+-        // The trailing magic is what distinguishes a real footer from bytes that happen to
+-        // decode: a tampered length field almost never leaves both copies intact.
+-        if d.raw(8)? != MAGIC {
+-            return Err(FormatError::Corrupt("bad trailing magic"));
+-        }
+-
+-        // Where in the object the bytes we hold begin. Derived from the footer's own
+-        // offsets rather than from a separately-fetched length.
+-        let seg_len = meta_offset + u64::from(meta_len) + FOOTER_LEN as u64;
+-        let tail_start = seg_len.saturating_sub(tail.len() as u64);
+-        let idx_bytes = {
+-            if meta_offset >= tail_start {
+-                let lo = (meta_offset - tail_start) as usize;
+-                let hi = lo
+-                    .checked_add(meta_len as usize)
+-                    .ok_or(FormatError::Truncated)?;
+-                Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
+-            } else {
+-                // Only now, and only for a segment whose meta region is large.
+-                store
+-                    .get_range(key, meta_offset..meta_offset + u64::from(meta_len))
+-                    .await?
+-            }
+-        };
+-        if checksum(&idx_bytes) != sum {
+-            return Err(FormatError::ChecksumMismatch);
+-        }
+-
+-        // The meta region is the directory followed by the block index. Parsing the
+-        // directory tells us where the block index is; everything else in it is a byte
+-        // range a later fetch may or may not use.
+-        let mut d = Dec::new(&idx_bytes);
+-        let entries = d.u32()? as usize;
+-        let mut sections = BTreeMap::new();
+-        let mut blocks_span: Option<std::ops::Range<u64>> = None;
+-        for _ in 0..entries {
+-            let id = d.u16()?;
+-            let offset = d.u64()?;
+-            let len = d.u64()?;
+-            let span = offset..offset.saturating_add(len);
+-            // ⚠️ Recorded by RAW id, including ids this version has never heard of. There
+-            // is deliberately no "is this known?" check: `section()` is looked up by a
+-            // `Section`, so an unknown id is unreachable and storing it costs one map entry.
+-            // A check would be equivalent code that no test could distinguish — and
+-            // refusing would make every future section a breaking change for every deployed
+-            // reader at once, which segments being immutable makes permanent.
+-            if id == Section::Blocks as u16 {
+-                blocks_span = Some(span.clone());
+-            }
+-            sections.insert(id, span);
+-        }
+-        let blocks_span = blocks_span.ok_or(FormatError::Corrupt("no block section"))?;
+-        // The block index sits inside the region already fetched, at a known offset.
+-        let lo = (blocks_span.start - meta_offset) as usize;
+-        let hi = lo
+-            .checked_add((blocks_span.end - blocks_span.start) as usize)
+-            .ok_or(FormatError::Truncated)?;
+-        let blocks = idx_bytes.get(lo..hi).ok_or(FormatError::Truncated)?;
+-
+-        Ok(Self {
+-            blocks: Self::decode_index(blocks)?,
+-            rows,
+-            sections,
+-        })
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The byte offset just past the last data block.
+     ///
+     /// Data blocks are addressed by the index rather than by the directory, so nothing else
+     /// can tell whether a section overlaps them.
+     #[must_use]
+     pub fn data_end(&self) -> u64 {
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh pin-project-lite v0.2.17
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh slab v0.4.12
+       Fresh futures-task v0.3.34
+       Fresh futures-core v0.3.34
+       Fresh futures-util v0.3.34
+       Fresh tokio v1.53.1
+       Fresh thiserror v2.0.20
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Dirty pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-format): couldn't read metadata for file `target/debug/deps/libpstore_format-b47669c15c655435.rlib`
+   Compiling pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-format)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=01612be049a97498 -C extra-filename=-b47669c15c655435 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta`
+warning: unused import: `checksum`
+ --> crates/pstore-format/src/reader.rs:3:25
+  |
+3 | use crate::codec::{Dec, checksum};
+  |                         ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `FOOTER_LEN`, `MAGIC`, `SUFFIX_FETCH`, and `VERSION`
+ --> crates/pstore-format/src/reader.rs:5:26
+  |
+5 |     BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, Section, VERSION,
+  |                          ^^^^^^^^^^                       ^^^^^  ^^^^^^^^^^^^           ^^^^^^^
+
+error[E0277]: the trait bound `Segment: Default` is not satisfied
+  --> crates/pstore-format/src/reader.rs:29:12
+   |
+29 |         Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+   |            ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Segment`
+   |
+help: consider annotating `Segment` with `#[derive(Default)]`
+   |
+13 + #[derive(Default)]
+14 | pub struct Segment {
+   |
+
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-blob)
+       Fresh pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-testkit)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a754d8b7b402e13f -C extra-filename=-222b2d320583739b --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+For more information about this error, try `rustc --explain E0277`.
+warning: `pstore-format` (lib) generated 2 warnings
+error: could not compile `pstore-format` (lib) due to 1 previous error; 2 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=01612be049a97498 -C extra-filename=-b47669c15c655435 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+warning: `pstore-format` (lib test) generated 2 warnings (2 duplicates)
+error: could not compile `pstore-format` (lib test) due to 1 previous error; 2 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a754d8b7b402e13f -C extra-filename=-222b2d320583739b --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib` (exit status: 1)
+
+*** result: Failure(101)

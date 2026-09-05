@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ replace += with *= in SegmentWriter::seal
+@@ -125,17 +125,17 @@
+         let len = blk.len() as u32;
+         self.body.raw(&blk);
+         self.blocks.push(BlockMeta {
+             offset,
+             len,
+             rows: rows.len() as u32,
+             zones,
+         });
+-        self.rows += rows.len() as u32;
++        self.rows *= /* ~ changed by cargo-mutants ~ */ rows.len() as u32;
+     }
+ 
+     /// Encodes the index section for the blocks sealed so far.
+     fn encode_index(&self) -> Enc {
+         let mut idx = Enc::default();
+         idx.u32(self.blocks.len() as u32);
+         for b in &self.blocks {
+             idx.u64(b.offset);

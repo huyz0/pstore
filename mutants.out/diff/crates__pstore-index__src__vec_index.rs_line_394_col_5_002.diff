@@ -1,0 +1,14 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace dot -> f32 with -1.0
+@@ -386,10 +386,10 @@
+                         .map_or(f32::NEG_INFINITY, |v| dot(v, query))
+                 })
+             }
+         })
+     }
+ }
+ 
+ fn dot(a: &[f32], b: &[f32]) -> f32 {
+-    a.iter().zip(b).map(|(x, y)| x * y).sum()
++    -1.0 /* ~ changed by cargo-mutants ~ */
+ }

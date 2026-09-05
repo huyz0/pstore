@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace + with - in Segment::open
+@@ -60,17 +60,17 @@
+                 let lo = (meta_offset - tail_start) as usize;
+                 let hi = lo
+                     .checked_add(meta_len as usize)
+                     .ok_or(FormatError::Truncated)?;
+                 Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
+             } else {
+                 // Only now, and only for a segment whose meta region is large.
+                 store
+-                    .get_range(key, meta_offset..meta_offset + u64::from(meta_len))
++                    .get_range(key, meta_offset..meta_offset - /* ~ changed by cargo-mutants ~ */ u64::from(meta_len))
+                     .await?
+             }
+         };
+         if checksum(&idx_bytes) != sum {
+             return Err(FormatError::ChecksumMismatch);
+         }
+ 
+         // The meta region is the directory followed by the block index. Parsing the

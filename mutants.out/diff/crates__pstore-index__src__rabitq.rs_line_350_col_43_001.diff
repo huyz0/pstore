@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace * with / in Quantizer::estimate_residual
+@@ -342,17 +342,17 @@
+ 
+     /// Estimates `<o, q>` where the code is a residual from a centroid.
+     ///
+     /// `centroid_dot` is `<c, q>`, computed **once per probed posting list** rather than
+     /// once per candidate — there are thousands of candidates behind each centroid, and
+     /// that ratio is the whole reason this is cheap.
+     #[must_use]
+     pub fn estimate_residual(&self, code: &Code, query: &Query, centroid_dot: f32) -> f32 {
+-        centroid_dot + code.residual_norm * self.estimate_prepared(code, query)
++        centroid_dot + code.residual_norm / /* ~ changed by cargo-mutants ~ */ self.estimate_prepared(code, query)
+     }
+ 
+     /// Estimates `<o, q>` from `o`'s code and a prepared query.
+     #[must_use]
+     pub fn estimate_prepared(&self, code: &Code, query: &Query) -> f32 {
+         // ⚠️ The division is the whole construction. `<x̄, q>` is biased low by exactly the
+         // factor `<x̄, x>`, which the encoder measured; dividing removes it.
+         self.raw(code, &query.0) / code.alignment

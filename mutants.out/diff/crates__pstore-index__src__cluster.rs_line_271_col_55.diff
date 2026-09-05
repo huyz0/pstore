@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace || with && in augment
+@@ -263,17 +263,17 @@
+ /// centroids belongs, as far as any query is concerned, to both: a query near the boundary
+ /// probes one list and the answer is in the other. Assignment has to pick one; replication
+ /// undoes the arbitrariness for the vectors where it matters, and only for those.
+ ///
+ /// Bounded twice — by `replicas` and by `boundary` — because the degenerate version
+ /// replicates everything into everything and calls the resulting exhaustive scan a
+ /// clustered index.
+ fn augment(corpus: &[Vec<f32>], centroids: &[Vec<f32>], lists: &mut [Vec<usize>], params: Params) {
+-    if params.replicas == 0 || params.boundary <= 0.0 || centroids.len() < 2 {
++    if params.replicas == 0 || params.boundary <= 0.0 && /* ~ changed by cargo-mutants ~ */ centroids.len() < 2 {
+         return;
+     }
+     // Pass one: every replica the boundary rule would admit, with its distance, so pass two
+     // can prefer the closest when a list runs out of room.
+     let mut extra: Vec<Vec<(usize, f32)>> = vec![Vec::new(); lists.len()];
+     for (row, v) in corpus.iter().enumerate() {
+         let mut d: Vec<(usize, f32)> = centroids
+             .iter()

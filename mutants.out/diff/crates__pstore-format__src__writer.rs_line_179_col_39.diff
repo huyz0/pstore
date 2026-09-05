@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ replace == with != in SegmentWriter::finish
+@@ -171,17 +171,17 @@
+             }
+             self.rows_per_block = self.rows_per_block.saturating_mul(2);
+         };
+ 
+         // Vectors leave the data blocks entirely and become their own section: row-major,
+         // fixed width, so row `i` is a computable byte range and a reader can fetch one row
+         // or none without touching the rest.
+         let dim = docs.first().map_or(0, |d| d.vector.len());
+-        let vectors: Vec<u8> = if dim == 0 {
++        let vectors: Vec<u8> = if dim != /* ~ changed by cargo-mutants ~ */ 0 {
+             Vec::new()
+         } else {
+             let mut v = Vec::with_capacity(docs.len() * dim * 4);
+             for d in &docs {
+                 // A ragged vector would silently shift every later row. Padding is the
+                 // conservative choice: a wrong-length vector is a caller bug, and truncating
+                 // the section would corrupt rows that are fine.
+                 for j in 0..dim {

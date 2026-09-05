@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/ladder.rs
++++ replace * with / in Ladder::keep
+@@ -39,17 +39,17 @@
+ 
+     /// How many candidates `rung` keeps.
+     ///
+     /// Strictly narrowing, because a rung that hands on as many as it received is a rescan
+     /// at higher cost rather than a rerank.
+     #[must_use]
+     pub fn keep(&self, rung: Rung) -> usize {
+         match rung {
+-            Rung::OneBit => self.k * self.oversample,
++            Rung::OneBit => self.k / /* ~ changed by cargo-mutants ~ */ self.oversample,
+             // A fixed 2x, so the last rung's fetch is small enough to be worth its round
+             // trip: at k=10 that is 20 vectors, tens of kilobytes.
+             Rung::Int8 => self.k * 2,
+             Rung::Exact => self.k,
+         }
+     }
+ 
+     fn top(&self, mut scored: Vec<(usize, f32)>, keep: usize) -> Vec<(usize, f32)> {

@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ replace <impl BlobStore for Flaky>::get_tag -> Option<CasTag> with None
+@@ -166,17 +166,17 @@
+         self.read_gate()?;
+         self.inner.get_suffix(key, n).await
+     }
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+         self.read_gate()?;
+         self.inner.get_with_tag(key).await
+     }
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+-        self.inner.get_tag(key).await
++        None /* ~ changed by cargo-mutants ~ */
+     }
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         // ⚠️ Gated too. `head` is how the WAL tail is probed, so leaving it working while
+         // every other read fails models a backend that does not exist and hides the
+         // engine's most important "is this a gap or an outage?" decision.
+         self.read_gate()?;
+         if self.never_missing {
+             return Ok(1);

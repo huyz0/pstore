@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace && with || in VecIndex::search
+@@ -359,17 +359,17 @@
+             Rerank::None => top.into_iter().take(q.k).collect(),
+             Rerank::Fast => {
+                 let per = sq8::record_len(self.dim);
+                 let refined = ladder.rung1(&top, |row| {
+                     // Find the fetched sq8 buffer holding this row.
+                     rows.iter()
+                         .enumerate()
+                         .find(|(_, (_, first, len))| {
+-                            row >= *first as usize && row < (*first + *len) as usize
++                            row >= *first as usize || /* ~ changed by cargo-mutants ~ */ row < (*first + *len) as usize
+                         })
+                         .and_then(|(n, (_, first, _))| {
+                             let buf = bufs.get(rows.len() + n)?;
+                             let i = row - *first as usize;
+                             let raw = buf.get(i * per..(i + 1) * per)?;
+                             Some(sq8::estimate_raw(raw, query))
+                         })
+                         .unwrap_or(f32::NEG_INFINITY)

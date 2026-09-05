@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/sim.rs
++++ replace Sim::seed -> u64 with 0
+@@ -25,17 +25,17 @@
+             seed,
+             steps: 0,
+         }
+     }
+ 
+     /// The seed, to print with a failure so it can be replayed.
+     #[must_use]
+     pub fn seed(&self) -> u64 {
+-        self.seed
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Decisions taken so far. Two runs of the same scenario must agree on this, or
+     /// something is reading the clock.
+     #[must_use]
+     pub fn steps(&self) -> u64 {
+         self.steps
+     }

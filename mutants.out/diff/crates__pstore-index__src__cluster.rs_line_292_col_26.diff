@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace <= with > in augment
+@@ -284,17 +284,17 @@
+         let Some((_, nearest)) = d.first().copied() else {
+             continue;
+         };
+         // Compared in true distance, not squared: `boundary` is a fraction of a distance,
+         // and applying it to a squared value would make the threshold quietly
+         // dimension-dependent.
+         let limit = nearest.sqrt() * (1.0 + params.boundary);
+         for (c, dd) in d.iter().skip(1).take(params.replicas) {
+-            if dd.sqrt() <= limit
++            if dd.sqrt() > /* ~ changed by cargo-mutants ~ */ limit
+                 && let Some(slot) = extra.get_mut(*c)
+             {
+                 slot.push((row, *dd));
+             }
+         }
+     }
+ 
+     // ⚠️ Pass two enforces the SAME balance bound on the augmented lists. Replication that

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ replace <= with > in SegmentWriter::finish
+@@ -161,17 +161,17 @@
+         let idx = loop {
+             self.blocks.clear();
+             self.body = Enc::default();
+             self.rows = 0;
+             for chunk in docs.chunks(self.rows_per_block) {
+                 self.seal(chunk);
+             }
+             let idx = self.encode_index();
+-            if idx.len() <= self.index_budget || self.blocks.len() <= 1 {
++            if idx.len() <= self.index_budget || self.blocks.len() > /* ~ changed by cargo-mutants ~ */ 1 {
+                 break idx;
+             }
+             self.rows_per_block = self.rows_per_block.saturating_mul(2);
+         };
+ 
+         // Vectors leave the data blocks entirely and become their own section: row-major,
+         // fixed width, so row `i` is a computable byte range and a reader can fetch one row
+         // or none without touching the rest.

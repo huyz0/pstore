@@ -1,0 +1,22 @@
+--- crates/pstore-format/src/writer.rs
++++ replace SegmentWriter::with_index_budget -> Self with Default::default()
+@@ -64,18 +64,17 @@
+     /// A writer allowed only `budget` bytes of index section.
+     ///
+     /// The default is the whole suffix read minus the footer. It is a knob because a
+     /// segment that carries more footer-addressed sections — M3 adds centroids — has less
+     /// room for the block index, and because a reader's two-read path cannot be tested
+     /// against a writer that makes it unreachable.
+     #[must_use]
+     pub fn with_index_budget(mut self, budget: usize) -> Self {
+-        self.index_budget = budget;
+-        self
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Attaches a fixed-width section, one equal-length record per row.
+     ///
+     /// The reader derives the record width by dividing by the row count, so a caller that
+     /// supplies a ragged payload gets rows that read as garbage — hence the debug assert.
+     #[must_use]
+     pub fn with_section(mut self, section: Section, bytes: Vec<u8>) -> Self {

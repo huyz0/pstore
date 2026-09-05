@@ -1,0 +1,42 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace Quantizer::encode_unit -> Result<Code, QuantError> with Ok(Default::default())
+@@ -286,38 +286,17 @@
+     }
+ 
+     /// Encodes a **unit** vector, with no centroid.
+     pub fn encode(&self, v: &[f32]) -> Result<Code, QuantError> {
+         self.encode_unit(v)
+     }
+ 
+     fn encode_unit(&self, v: &[f32]) -> Result<Code, QuantError> {
+-        self.check(v)?;
+-        let r = self.rotate(v);
+-        let mut bits = vec![0u8; self.padded.div_ceil(8)];
+-        // `<x̄, x>` where `x̄ = sign(x)/sqrt(padded)`, which is `||x||₁ / sqrt(padded)`.
+-        // Computed from the rotated vector, over the padded length, because that is the
+-        // space the estimate lives in.
+-        let l1: f32 = r.iter().map(|x| x.abs()).sum();
+-        for (i, x) in r.iter().enumerate() {
+-            if *x > 0.0
+-                && let Some(byte) = bits.get_mut(i / 8)
+-            {
+-                *byte |= 1 << (i % 8);
+-            }
+-        }
+-        Ok(Code {
+-            bits,
+-            alignment: l1 / (self.padded as f32).sqrt(),
+-            // Overwritten by `encode_residual`; 1.0 means "the vector is its own residual",
+-            // which is what makes `encode` and `encode_residual` agree for a zero centroid.
+-            residual_norm: 1.0,
+-            dim: self.dim,
+-        })
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
+     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+         let scale = 1.0 / (self.padded as f32).sqrt();
+         let mut acc = 0.0f32;
+         for (i, q) in rotated_query.iter().enumerate() {
+             let bit = code

@@ -1,0 +1,21 @@
+--- crates/pstore-types/src/lib.rs
++++ replace Seq::next -> Self with Default::default()
+@@ -62,17 +62,17 @@
+ 
+ impl Seq {
+     /// The first position in a lane.
+     pub const ZERO: Self = Self(0);
+ 
+     /// The next position. Saturating, for the same reason as [`Epoch::next`].
+     #[must_use]
+     pub const fn next(self) -> Self {
+-        Self(self.0.saturating_add(1))
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// An immutable segment. Globally unique and never reused, which is why cache entries
+ /// keyed by it never need invalidation.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct SegmentId(pub u128);
+ 

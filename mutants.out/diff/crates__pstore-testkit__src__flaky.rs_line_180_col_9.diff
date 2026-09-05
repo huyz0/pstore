@@ -1,0 +1,25 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ replace <impl BlobStore for Flaky>::head -> Result<u64, BlobError> with Ok(0)
+@@ -172,21 +172,17 @@
+     }
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+         self.inner.get_tag(key).await
+     }
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         // ⚠️ Gated too. `head` is how the WAL tail is probed, so leaving it working while
+         // every other read fails models a backend that does not exist and hides the
+         // engine's most important "is this a gap or an outage?" decision.
+-        self.read_gate()?;
+-        if self.never_missing {
+-            return Ok(1);
+-        }
+-        self.inner.head(key).await
++        Ok(0) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+         if self.refuse() {
+             // ⚠️ Refused BEFORE writing. A failure that half-lands is a different
+             // scenario, and pretending one is the other would let a real torn-write bug
+             // hide behind a passing test for this one.
+             return Err(BlobError::Other("injected write failure".to_owned()));

@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/vec_index.rs
++++ replace && with || in build
+@@ -182,17 +182,17 @@
+     let mut rabitq = Vec::new();
+     let mut eights = Vec::new();
+     // The centroid a row is coded against: its own list's, or the origin when unclustered.
+     let mut home: Vec<usize> = vec![usize::MAX; docs.len()];
+     if let Some(c) = &centroids {
+         for (li, (first, len)) in c.spans.iter().enumerate() {
+             for slot in *first..*first + *len {
+                 if let Some(row) = order.get(slot as usize)
+-                    && let Some(slot) = home.get_mut(*row)
++                    || /* ~ changed by cargo-mutants ~ */ let Some(slot) = home.get_mut(*row)
+                 {
+                     *slot = li;
+                 }
+             }
+         }
+     }
+     let zero = vec![0.0f32; dim];
+     for row in &order {

@@ -1,0 +1,76 @@
+
+*** crates/pstore-index/src/cluster.rs:161:9: replace Clustering::from_parts -> Self with Default::default()
+
+*** mutation diff:
+--- crates/pstore-index/src/cluster.rs
++++ replace Clustering::from_parts -> Self with Default::default()
+@@ -153,17 +153,17 @@
+ 
+     /// A clustering from parts, for a reader that has centroids but not assignments.
+     ///
+     /// A searcher holds the centroid table and reads posting lists by byte range; it never
+     /// materialises the row lists, so requiring them would force it to fetch what it is
+     /// specifically avoiding.
+     #[must_use]
+     pub fn from_parts(centroids: Vec<Vec<f32>>, lists: Vec<Vec<usize>>) -> Self {
+-        Self { centroids, lists }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Clusters a corpus.
+     #[must_use]
+     pub fn build(corpus: &[Vec<f32>], params: Params) -> Self {
+         if corpus.is_empty() {
+             return Self {
+                 centroids: Vec::new(),
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh pin-project-lite v0.2.17
+       Fresh futures-core v0.3.34
+       Fresh slab v0.4.12
+       Fresh futures-task v0.3.34
+       Fresh bytes v1.12.1
+       Fresh futures-util v0.3.34
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-types)
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh async-trait v0.1.92
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+       Dirty pstore-index v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-index): the file `crates/pstore-index/src/cluster.rs` has changed (1788644808.464189664s, 4s after last build at 1788644804.075925803s)
+   Compiling pstore-index v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-index)
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-blob)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a242405e799e600f -C extra-filename=-66ac2b71496e370d --out-dir /tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta`
+       Fresh pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-format)
+       Fresh pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-testkit)
+       Fresh pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-FkDeYx.tmp/crates/pstore-engine)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cc327639876ee248 -C extra-filename=-ad9a41401e531637 --out-dir /tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+error[E0277]: the trait bound `Clustering: Default` is not satisfied
+   --> crates/pstore-index/src/cluster.rs:161:9
+    |
+161 |         Default::default() /* ~ changed by cargo-mutants ~ */
+    |         ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Clustering`
+    |
+help: consider annotating `Clustering` with `#[derive(Default)]`
+    |
+ 99 + #[derive(Default)]
+100 | pub struct Clustering {
+    |
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `pstore-index` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a242405e799e600f -C extra-filename=-66ac2b71496e370d --out-dir /tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_format=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rmeta` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `pstore-index` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_index --edition=2024 crates/pstore-index/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cc327639876ee248 -C extra-filename=-ad9a41401e531637 --out-dir /tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_format-b47669c15c655435.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-FkDeYx.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib` (exit status: 1)
+
+*** result: Failure(101)

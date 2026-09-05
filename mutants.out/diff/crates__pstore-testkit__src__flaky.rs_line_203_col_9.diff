@@ -1,0 +1,30 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ replace <impl BlobStore for Flaky>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -195,26 +195,17 @@
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+-        if self.always_contended {
+-            self.failures.fetch_add(1, Ordering::Relaxed);
+-            return Err(CasError::Contended);
+-        }
+-        if self.refuse() {
+-            return Err(CasError::Io(
+-                "injected conditional write failure".to_owned(),
+-            ));
+-        }
+-        self.inner.put_conditional(key, body, pre).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         self.inner.delete_batch(keys).await
+     }
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         self.inner.list_unrestricted(prefix).await
+     }

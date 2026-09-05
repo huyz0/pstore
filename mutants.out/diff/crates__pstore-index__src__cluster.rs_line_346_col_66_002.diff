@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace < with <= in assign
+@@ -338,17 +338,17 @@
+         prefs.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+ 
+         // Nearest centroid with room. Every vector lands somewhere: the fallback is the
+         // least-full list, so a corpus can never lose a row to a full-everywhere state --
+         // and a lost row is unreachable at any probe width, visible only as a recall
+         // ceiling.
+         let target = prefs
+             .iter()
+-            .find(|(c, _)| lists.get(*c).is_some_and(|l| l.len() < cap))
++            .find(|(c, _)| lists.get(*c).is_some_and(|l| l.len() <= /* ~ changed by cargo-mutants ~ */ cap))
+             .map(|(c, _)| *c)
+             .unwrap_or_else(|| {
+                 lists
+                     .iter()
+                     .enumerate()
+                     .min_by_key(|(i, l)| (l.len(), *i))
+                     .map_or(0, |(i, _)| i)
+             });

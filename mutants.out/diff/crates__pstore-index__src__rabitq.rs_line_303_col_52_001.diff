@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace / with * in Quantizer::encode_unit
+@@ -295,17 +295,17 @@
+         let r = self.rotate(v);
+         let mut bits = vec![0u8; self.padded.div_ceil(8)];
+         // `<x̄, x>` where `x̄ = sign(x)/sqrt(padded)`, which is `||x||₁ / sqrt(padded)`.
+         // Computed from the rotated vector, over the padded length, because that is the
+         // space the estimate lives in.
+         let l1: f32 = r.iter().map(|x| x.abs()).sum();
+         for (i, x) in r.iter().enumerate() {
+             if *x > 0.0
+-                && let Some(byte) = bits.get_mut(i / 8)
++                && let Some(byte) = bits.get_mut(i * /* ~ changed by cargo-mutants ~ */ 8)
+             {
+                 *byte |= 1 << (i % 8);
+             }
+         }
+         Ok(Code {
+             bits,
+             alignment: l1 / (self.padded as f32).sqrt(),
+             // Overwritten by `encode_residual`; 1.0 means "the vector is its own residual",

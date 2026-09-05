@@ -1,0 +1,44 @@
+--- crates/pstore-index/src/search.rs
++++ replace probe_pruned -> Vec<usize> with vec![1]
+@@ -32,40 +32,17 @@
+ ///
+ /// ⚠️ Query-aware pruning: a query sitting **on** a centroid has one obviously-right list
+ /// and the rest are noise, while a query equidistant between several genuinely needs them
+ /// all. Probing a fixed `p` either over-fetches for the easy query or under-fetches for the
+ /// hard one. `slack` is how much further than the nearest centroid a list may be and still
+ /// be worth its bytes.
+ #[must_use]
+ pub fn probe_pruned(clustering: &Clustering, query: &[f32], p: usize, slack: f32) -> Vec<usize> {
+-    let chosen = probe(clustering, query, p);
+-    let Some(nearest) = chosen
+-        .first()
+-        .and_then(|i| clustering.centroids().get(*i))
+-        .map(|c| dist2(query, c).sqrt())
+-    else {
+-        return chosen;
+-    };
+-    // True distance, not squared: `slack` is a fraction of a distance, and applying it to a
+-    // squared value makes the threshold quietly dimension-dependent.
+-    let limit = nearest * (1.0 + slack);
+-    let kept: Vec<usize> = chosen
+-        .iter()
+-        .copied()
+-        .filter(|i| {
+-            clustering
+-                .centroids()
+-                .get(*i)
+-                .is_some_and(|c| dist2(query, c).sqrt() <= limit)
+-        })
+-        .collect();
+-    // Never empty: pruning that can return nothing turns a hard query into no answer at
+-    // all, which is a worse failure than fetching a list that did not help.
+-    if kept.is_empty() { chosen } else { kept }
++    vec![1] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Every row reachable through `lists`, deduplicated.
+ ///
+ /// Boundary replication means a row can appear in several probed lists; scoring it twice
+ /// would let one vector occupy two slots of a top-k.
+ #[must_use]
+ pub fn candidates(clustering: &Clustering, lists: &[usize]) -> Vec<usize> {

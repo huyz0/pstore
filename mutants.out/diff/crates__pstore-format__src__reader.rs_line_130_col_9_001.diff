@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::section -> Option<std::ops::Range<u64>> with Some(Range::new())
+@@ -122,17 +122,17 @@
+             .map(|b| b.offset + u64::from(b.len))
+             .max()
+             .unwrap_or(0)
+     }
+ 
+     /// Where a section lives, or `None` if this segment does not carry it.
+     #[must_use]
+     pub fn section(&self, section: Section) -> Option<std::ops::Range<u64>> {
+-        self.sections.get(&(section as u16)).cloned()
++        Some(Range::new()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Fetches a whole section.
+     ///
+     /// One ranged read. The caller decides *which* section, which is how a rung-0 scan
+     /// avoids the full-precision bytes entirely rather than fetching and discarding them.
+     pub async fn fetch_section<S: BlobStore>(
+         &self,

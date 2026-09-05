@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/search.rs
++++ replace <= with > in probe_pruned
+@@ -50,17 +50,17 @@
+     let limit = nearest * (1.0 + slack);
+     let kept: Vec<usize> = chosen
+         .iter()
+         .copied()
+         .filter(|i| {
+             clustering
+                 .centroids()
+                 .get(*i)
+-                .is_some_and(|c| dist2(query, c).sqrt() <= limit)
++                .is_some_and(|c| dist2(query, c).sqrt() > /* ~ changed by cargo-mutants ~ */ limit)
+         })
+         .collect();
+     // Never empty: pruning that can return nothing turns a hard query into no answer at
+     // all, which is a worse failure than fetching a list that did not help.
+     if kept.is_empty() { chosen } else { kept }
+ }
+ 
+ /// Every row reachable through `lists`, deduplicated.

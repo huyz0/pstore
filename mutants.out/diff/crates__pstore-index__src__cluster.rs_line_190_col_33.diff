@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace / with % in Clustering::build
+@@ -182,17 +182,17 @@
+             // that drifts from its members makes probe selection pick the wrong lists, and
+             // recall falls for a reason nothing in the search path can explain.
+             for (c, list) in centroids.iter_mut().zip(&lists) {
+                 if list.is_empty() {
+                     continue;
+                 }
+                 for (d, slot) in c.iter_mut().enumerate() {
+                     let sum: f32 = list.iter().filter_map(|r| corpus.get(*r)?.get(d)).sum();
+-                    *slot = sum / list.len() as f32;
++                    *slot = sum % /* ~ changed by cargo-mutants ~ */ list.len() as f32;
+                 }
+             }
+         }
+ 
+         // An empty list costs a centroid, a directory entry, and a probe that can never
+         // return anything.
+         let keep: Vec<usize> = (0..k)
+             .filter(|i| lists.get(*i).is_some_and(|l| !l.is_empty()))

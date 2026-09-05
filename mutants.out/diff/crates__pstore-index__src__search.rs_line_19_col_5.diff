@@ -1,0 +1,30 @@
+--- crates/pstore-index/src/search.rs
++++ replace probe -> Vec<usize> with vec![]
+@@ -11,26 +11,17 @@
+ 
+ /// Which lists a query should read.
+ ///
+ /// `p` is free in **depth** and costs **bytes**: 64 lists is the same one round trip as 8,
+ /// and eight times the transfer. That asymmetry is the lever a memory-resident index does
+ /// not have, and it is why `p` is the recall knob rather than a graph traversal depth.
+ #[must_use]
+ pub fn probe(clustering: &Clustering, query: &[f32], p: usize) -> Vec<usize> {
+-    let mut d: Vec<(usize, f32)> = clustering
+-        .centroids()
+-        .iter()
+-        .enumerate()
+-        .map(|(i, c)| (i, dist2(query, c)))
+-        .collect();
+-    // Ties by index so a probe set is reproducible; recall is compared across runs.
+-    d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-    d.truncate(p.max(1));
+-    d.into_iter().map(|(i, _)| i).collect()
++    vec![] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Which lists a query should read, dropping those too far to contribute.
+ ///
+ /// ⚠️ Query-aware pruning: a query sitting **on** a centroid has one obviously-right list
+ /// and the rest are noise, while a query equidistant between several genuinely needs them
+ /// all. Probing a fixed `p` either over-fetches for the easy query or under-fetches for the
+ /// hard one. `slack` is how much further than the nearest centroid a list may be and still

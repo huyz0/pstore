@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/rabitq.rs
++++ replace != with == in Quantizer::read_code
+@@ -196,17 +196,17 @@
+ 
+     /// Reads a code back from [`Code::write_to`]'s form.
+     ///
+     /// Returns `None` for a wrong-length record rather than decoding a shifted one: a
+     /// fixed-width section read at the wrong stride yields plausible bits and silently wrong
+     /// answers, which is the failure this shape exists to make impossible.
+     #[must_use]
+     pub fn read_code(&self, raw: &[u8]) -> Option<Code> {
+-        if raw.len() != self.code_len() {
++        if raw.len() == /* ~ changed by cargo-mutants ~ */ self.code_len() {
+             return None;
+         }
+         let split = self.padded.div_ceil(8);
+         let (bits, tail) = raw.split_at_checked(split)?;
+         Some(Code {
+             bits: bits.to_vec(),
+             alignment: f32::from_le_bytes(tail.get(..4)?.try_into().ok()?),
+             residual_norm: f32::from_le_bytes(tail.get(4..8)?.try_into().ok()?),

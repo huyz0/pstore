@@ -1,0 +1,21 @@
+--- crates/pstore-index/src/cluster.rs
++++ replace >= with < in augment
+@@ -306,17 +306,17 @@
+     // to grow every list proportionally; what it may not do is grow one of them.
+     let admitted: usize = extra.iter().map(Vec::len).sum();
+     let total = corpus.len().saturating_add(admitted);
+     let cap = capacity(total, lists.len().max(1), params.balance);
+     for (list, mut add) in lists.iter_mut().zip(extra) {
+         // Closest first, so a list that fills keeps the replicas that mattered most.
+         add.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+         for (row, _) in add {
+-            if list.len() >= cap {
++            if list.len() < /* ~ changed by cargo-mutants ~ */ cap {
+                 break;
+             }
+             list.push(row);
+         }
+         list.sort_unstable();
+         // A row replicated into a list it was also assigned to would be scored twice and
+         // could occupy two slots in a top-k.
+         list.dedup();

@@ -1,0 +1,14 @@
+--- crates/pstore-index/src/search.rs
++++ replace * with + in dist2
+@@ -76,10 +76,10 @@
+         .copied()
+         .collect();
+     out.sort_unstable();
+     out.dedup();
+     out
+ }
+ 
+ fn dist2(a: &[f32], b: &[f32]) -> f32 {
+-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
++    a.iter().zip(b).map(|(x, y)| (x - y) + /* ~ changed by cargo-mutants ~ */ (x - y)).sum()
+ }

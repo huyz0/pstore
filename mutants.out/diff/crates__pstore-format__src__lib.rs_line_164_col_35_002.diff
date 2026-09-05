@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/lib.rs
++++ replace < with <= in Filter::could_match
+@@ -156,17 +156,17 @@
+     /// block that cannot match is merely wasted work.
+     #[must_use]
+     pub fn could_match(&self, min: i64, max: i64) -> bool {
+         match self {
+             Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
+             // A string equality has no ordering to prune on, so every block could match.
+             Self::Eq(_, Value::Str(_)) => true,
+             Self::Gt(_, n) => max > *n,
+-            Self::Lt(_, n) => min < *n,
++            Self::Lt(_, n) => min <= /* ~ changed by cargo-mutants ~ */ *n,
+         }
+     }
+ }
+ 
+ /// Why a segment could not be read.
+ #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+ pub enum FormatError {
+     /// The bytes ran out mid-field.

@@ -1,0 +1,25 @@
+--- crates/pstore-engine/src/head.rs
++++ replace Cur<'_>::u32 -> Result<u32, EngineError> with Ok(0)
+@@ -142,21 +142,17 @@
+ impl Cur<'_> {
+     fn take(&mut self, n: usize) -> Result<&[u8], EngineError> {
+         let end = self.i.checked_add(n).ok_or(EngineError::CorruptHead)?;
+         let out = self.b.get(self.i..end).ok_or(EngineError::CorruptHead)?;
+         self.i = end;
+         Ok(out)
+     }
+     fn u32(&mut self) -> Result<u32, EngineError> {
+-        Ok(u32::from_le_bytes(
+-            self.take(4)?
+-                .try_into()
+-                .map_err(|_| EngineError::CorruptHead)?,
+-        ))
++        Ok(0) /* ~ changed by cargo-mutants ~ */
+     }
+     fn u64(&mut self) -> Result<u64, EngineError> {
+         Ok(u64::from_le_bytes(
+             self.take(8)?
+                 .try_into()
+                 .map_err(|_| EngineError::CorruptHead)?,
+         ))
+     }

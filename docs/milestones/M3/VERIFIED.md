@@ -98,7 +98,18 @@ milestone does not show".
     the cap never binds and the ratio was exactly 1.0000. It now uses grouped arrival.
 13. `./scripts/coverage.sh --fail-under-regions 95` → **95.03% region**, 96.95% line on
     shipped crates, exit 0. `cargo llvm-cov --workspace --fail-under-lines 95` → passes.
-    `cargo mutants --workspace` — figure in the notes below. `./scripts/gates.sh` → green.
+    `cargo mutants --workspace` → 1,249 mutants, 920 caught, 159 missed, 0 timeouts:
+    **85.3% workspace, 86.3% on shipped crates.** `./scripts/gates.sh` → green.
+
+    ⚠️ **159 mutants survive and are not claimed to be covered.** The largest groups are
+    `object_store_backend.rs` (25), which needs a live cloud backend and is M0a.13;
+    `rabitq.rs` (22) and `sq8.rs` (10), mostly arithmetic inside estimators whose output is
+    consumed by a *ranking*, so a small perturbation changes no order and no test can see
+    it; and PRNG mixing constants in the fault injectors and simulator, where a mutated
+    mixer is still a mixer and the property under test is determinism.
+
+    ⚠️ Timeouts count as **not caught** in these figures. There were none this run, after
+    M2 replaced two barriers that could hang with ones that fail.
 
 ## Corrections this milestone made to the corpus
 

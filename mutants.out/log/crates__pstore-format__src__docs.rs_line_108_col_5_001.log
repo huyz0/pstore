@@ -1,0 +1,71 @@
+
+*** crates/pstore-format/src/docs.rs:108:5: replace decode_rows -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+
+*** mutation diff:
+--- crates/pstore-format/src/docs.rs
++++ replace decode_rows -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+@@ -100,22 +100,10 @@
+         encode_attrs(&mut e, &d.attrs);
+     }
+     e.0
+ }
+ 
+ /// Decodes segment-block rows. Vectors come back empty and are filled from the
+ /// [`crate::Section::Vectors`] section by the caller that wants them.
+ pub fn decode_rows(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+-    let mut d = Dec::new(buf);
+-    let n = d.u32()? as usize;
+-    let mut out = Vec::with_capacity(n.min(1 << 20));
+-    for _ in 0..n {
+-        let id = d.string()?;
+-        let attrs = decode_attrs(&mut d)?;
+-        out.push(Document {
+-            id,
+-            vector: Vec::new(),
+-            attrs,
+-        });
+-    }
+-    Ok(out)
++    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+ }
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh pin-project-lite v0.2.17
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh futures-core v0.3.34
+       Fresh futures-task v0.3.34
+       Fresh slab v0.4.12
+       Fresh futures-util v0.3.34
+       Fresh tokio v1.53.1
+       Fresh thiserror v2.0.20
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Dirty pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-format): the file `crates/pstore-format/src/docs.rs` has changed (1788644618.744330007s, 4s after last build at 1788644614.044046119s)
+   Compiling pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-yddpDt.tmp/crates/pstore-format)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=01612be049a97498 -C extra-filename=-b47669c15c655435 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta`
+error[E0277]: the trait bound `Document: Default` is not satisfied
+   --> crates/pstore-format/src/docs.rs:108:13
+    |
+108 |     Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+    |             ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Document`
+    |
+help: consider annotating `Document` with `#[derive(Default)]`
+   --> crates/pstore-format/src/lib.rs:98:1
+    |
+ 98 + #[derive(Default)]
+ 99 | pub struct Document {
+    |
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `pstore-format` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_format --edition=2024 crates/pstore-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=01612be049a97498 -C extra-filename=-b47669c15c655435 --out-dir /tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern futures_util=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern thiserror=/tmp/cargo-mutants-pstore-yddpDt.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rmeta` (exit status: 1)
+
+*** result: Failure(101)
