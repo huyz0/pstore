@@ -98,10 +98,16 @@ Gate: `scripts/check-verified.py`.
     real defects, not slow tests** — see the note under "What this milestone does not
     show".
 
-    ⚠️ Region coverage is reported on **shipped crates**, excluding `pstore-testkit`,
-    which is the harness rather than the product. Including it gives 94.81% region. This
-    is the M1.12 question and it is still open; the number is stated both ways rather than
-    only in the form that passes.
+    ⚠️ Region coverage is reported on **shipped crates** (95.40%); including the test
+    harness gives 94.79%. Both are stated rather than only the form that passes.
+
+    ✅ **M1.12 is answered, and it was not a judgement call.** A crate that no other crate
+    depends on outside `[dev-dependencies]` does not ship — a predicate over files in the
+    tree, so rung 3 of the gate-design ladder says an agent must not be asked to check it.
+    `scripts/coverage.sh` derives the exclusion from `cargo metadata`, which means a future
+    test-only crate is excluded automatically instead of being argued about, and a crate
+    that starts shipping is included the moment something depends on it at runtime.
+    `scripts/coverage.sh --all` prints the unfiltered number.
 
     ⚠️ **68 mutants survive on shipped crates and are not claimed to be covered.** Twenty-
     five of them are in `object_store_backend.rs`, the real S3/GCS/Azure adapter, which

@@ -54,6 +54,11 @@ jobs:
       # Workspace floor is 95% (D-110). Per-crate targets are higher for the
       # correctness core and are checked in the nightly job.
       - run: cargo llvm-cov --all-features --workspace --fail-under-lines 95 --lcov --output-path lcov.info
+      # The REGION floor, on the crates that ship. `pstore-testkit` is dev-only, so it is
+      # excluded -- derived from the dependency graph rather than named here, so a future
+      # test-only crate is excluded automatically and a crate that starts shipping is
+      # included the moment something depends on it at runtime.
+      - run: ./scripts/coverage.sh --fail-under-regions 95
 
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
   # Only the second one makes 95% mean something (D-111). Changed files per PR;

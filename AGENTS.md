@@ -78,6 +78,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `cargo clippy --all-targets -- -D warnings` | the workspace lint set, including `unsafe_code = "forbid"` |
 | `cargo test` / `cargo nextest run` | tests |
 | `cargo llvm-cov --fail-under-lines 95` | engineering-standards D-110 |
+| `scripts/coverage.sh --fail-under-regions 95` | the **region** floor on the crates that ship; the test-only set is derived from the dependency graph, not named |
 | `cargo mutants` | D-111 — the gate that makes coverage mean something |
 | `cargo deny check` | licences, advisories, and the `object_store` ban outside `pstore-blob` |
 | `scripts/check-links.sh` | every relative markdown link resolves |
