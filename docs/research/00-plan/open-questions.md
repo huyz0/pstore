@@ -222,3 +222,24 @@ rather than loudly.
 
 ⚠️ `provisional`. The scenarios model a writer that stops and a store that refuses. They
 do not reproduce a kernel, a socket, or a machine losing power mid-`PUT`.
+
+
+## C-3 — rung 0 alone does not suffice (M3)
+
+Recorded in full on
+[`06-indexing/quantization.md`](../06-indexing/quantization.md); repeated here because it
+changes a number the cost model uses.
+
+D-11's rerank ladder assumed rung 0 — 1-bit codes — typically answers at 90–95% recall@10.
+Measured at 384 dimensions on 20,000 clustered synthetic vectors, **it answers at 0.30**,
+and no probe width or oversample moves it, because with `rerank: none` the answer *is* rung
+0's top-k. Everything in one posting list is similar by construction, so a 1-bit code is
+being asked to rank differences far smaller than its own error.
+
+**int8 rerank reaches 0.981 in the same three round trips**, because the `sq8` byte ranges
+for the probed lists are known at the same moment as the `rabitq` ranges — same object, same
+round. So the ≤3 budget holds, but **the bytes per query are the int8 tier's, not the 1-bit
+tier's**: ~4× more than the storage-math table's rung-0 figure. Anything downstream that
+sized bandwidth from 1-bit codes alone should be re-derived.
+
+⚠️ `provisional`: WSL2, synthetic corpus, 20,000 vectors.

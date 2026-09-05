@@ -500,6 +500,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "pstore-blob",
+ "pstore-engine",
  "pstore-format",
  "pstore-testkit",
  "pstore-types",

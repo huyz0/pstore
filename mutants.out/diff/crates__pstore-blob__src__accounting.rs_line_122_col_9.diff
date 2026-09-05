@@ -1,0 +1,27 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace Accounted<S>::bytes_in -> u64 with 0
+@@ -114,23 +114,17 @@
+     /// Bytes read from `key` that fall inside `span`.
+     ///
+     /// The section assertion: given a section's byte range from the footer, this is how
+     /// many bytes of it a query actually moved. Overlap, not containment — a coalesced
+     /// fetch spanning two sections is billed to both, which is the honest answer because
+     /// the bytes really did cross the wire.
+     #[must_use]
+     pub fn bytes_in(&self, key: &Key, span: std::ops::Range<u64>) -> u64 {
+-        self.lock()
+-            .ranges
+-            .iter()
+-            .flatten()
+-            .filter(|(k, _)| k == key)
+-            .map(|(_, r)| r.end.min(span.end).saturating_sub(r.start.max(span.start)))
+-            .sum()
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Requests of `class` across every tenant.
+     #[must_use]
+     pub fn total(&self, class: OpClass) -> u64 {
+         self.lock().totals.get(&class).copied().unwrap_or(0)
+     }
+ 

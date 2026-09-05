@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace == with != in Accounted<S>::bytes_in
+@@ -118,17 +118,17 @@
+     /// fetch spanning two sections is billed to both, which is the honest answer because
+     /// the bytes really did cross the wire.
+     #[must_use]
+     pub fn bytes_in(&self, key: &Key, span: std::ops::Range<u64>) -> u64 {
+         self.lock()
+             .ranges
+             .iter()
+             .flatten()
+-            .filter(|(k, _)| k == key)
++            .filter(|(k, _)| k != /* ~ changed by cargo-mutants ~ */ key)
+             .map(|(_, r)| r.end.min(span.end).saturating_sub(r.start.max(span.start)))
+             .sum()
+     }
+ 
+     /// Requests of `class` across every tenant.
+     #[must_use]
+     pub fn total(&self, class: OpClass) -> u64 {
+         self.lock().totals.get(&class).copied().unwrap_or(0)

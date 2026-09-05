@@ -1,0 +1,33 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace <impl crate::BlobStore for TenantView<S>>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -217,29 +217,17 @@
+         if let Ok((b, _)) = &out {
+             self.bill_bytes(OpClass::Read, b.len() as u64);
+             self.note_range(key, 0..b.len() as u64);
+         }
+         out
+     }
+ 
+     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+-        self.bill(OpClass::Read);
+-        let out = self.inner.get_suffix(key, n).await;
+-        if let Ok(b) = &out {
+-            let len = b.len() as u64;
+-            self.bill_bytes(OpClass::Read, len);
+-            // ⚠️ Resolved to the absolute range it actually moved. A suffix is the one
+-            // read whose span is not known until it returns, and the footer is ALWAYS read
+-            // as a suffix -- so leaving it unresolved would make the one section every
+-            // query touches the one section nothing can attribute.
+-            let end = self.inner.head(key).await.unwrap_or(len);
+-            self.note_range(key, end.saturating_sub(len)..end);
+-        }
+-        out
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+         self.bill(OpClass::Read);
+         self.inner.get_tag(key).await
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

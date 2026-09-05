@@ -1,0 +1,27 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace <impl crate::BlobStore for TenantView<S>>::get_with_tag -> Result<(Bytes, pstore_types::CasTag), BlobError> with Ok((Default::default(), Default::default()))
+@@ -207,23 +207,17 @@
+         if let Ok(b) = &out {
+             self.bill_bytes(OpClass::Read, b.len() as u64);
+             self.note_range(key, range);
+         }
+         out
+     }
+ 
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, pstore_types::CasTag), BlobError> {
+-        self.bill(OpClass::Read);
+-        let out = self.inner.get_with_tag(key).await;
+-        if let Ok((b, _)) = &out {
+-            self.bill_bytes(OpClass::Read, b.len() as u64);
+-            self.note_range(key, 0..b.len() as u64);
+-        }
+-        out
++        Ok((Default::default(), Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+         self.bill(OpClass::Read);
+         let out = self.inner.get_suffix(key, n).await;
+         if let Ok(b) = &out {
+             let len = b.len() as u64;
+             self.bill_bytes(OpClass::Read, len);

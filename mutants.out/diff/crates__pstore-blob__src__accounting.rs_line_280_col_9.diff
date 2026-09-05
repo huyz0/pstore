@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace <impl crate::BlobStore for TenantView<S>>::delete_batch -> Result<(), BlobError> with Ok(())
+@@ -272,17 +272,16 @@
+         let out = self.inner.put_conditional(key, body, pre).await;
+         if out.is_ok() {
+             self.bill_bytes(OpClass::Write, n);
+         }
+         out
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+-        self.bill(OpClass::Delete);
+-        self.inner.delete_batch(keys).await
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+         self.bill(OpClass::List);
+         self.inner.list_unrestricted(prefix).await
+     }
+ }

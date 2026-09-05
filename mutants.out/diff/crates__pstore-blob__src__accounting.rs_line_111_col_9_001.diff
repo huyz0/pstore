@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace Accounted<S>::ranges -> Vec<(Key, std::ops::Range<u64>)> with vec![(Default::default(), Range::new())]
+@@ -103,17 +103,17 @@
+     /// for assertions rather than for production accounting.
+     pub fn record_ranges(&self) {
+         self.lock().ranges.get_or_insert_with(Vec::new).clear();
+     }
+ 
+     /// The ranges recorded since [`Self::record_ranges`], in request order.
+     #[must_use]
+     pub fn ranges(&self) -> Vec<(Key, std::ops::Range<u64>)> {
+-        self.lock().ranges.clone().unwrap_or_default()
++        vec![(Default::default(), Range::new())] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Bytes read from `key` that fall inside `span`.
+     ///
+     /// The section assertion: given a section's byte range from the footer, this is how
+     /// many bytes of it a query actually moved. Overlap, not containment — a coalesced
+     /// fetch spanning two sections is billed to both, which is the honest answer because
+     /// the bytes really did cross the wire.

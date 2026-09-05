@@ -416,3 +416,63 @@ async fn the_rerank_knob_buys_recall_and_not_only_bytes() {
     );
     assert!(hits[2] >= 45, "exact rerank found only {} of 50", hits[2]);
 }
+
+#[tokio::test]
+async fn a_cold_query_from_head_costs_three_round_trips() {
+    // ⚠️ Criterion 6, composed. The layer that joins the engine to the index is
+    // `pstore-query` (layer 4) and does not exist yet, so this test does the joining --
+    // legitimately, because `pstore-index` is layer 3 and may depend DOWNWARD on
+    // `pstore-engine`. What it measures is the real sequence a client experiences:
+    //
+    //   1. read HEAD, which names the segment
+    //   2. the segment footer and the centroid object, together -- different objects, both
+    //      keys derived, so width rather than depth
+    //   3. the probed posting lists, rabitq and sq8 ranges in one call
+    //
+    // Three. `rerank: fast` is inside them; only `exact` adds a fourth, and it says so.
+    let s = Arc::new(DepthCounting::new(MemoryStore::new()));
+    let t = TenantId(77);
+    let docs = corpus(TEST_THRESHOLD + 400, 12, 21);
+    let built = vec_index::build(&docs, params());
+    s.put(&Key::new(SEG), built.segment.clone()).await.unwrap();
+    s.put(
+        &Key::new(CEN),
+        bytes::Bytes::from(built.centroids.as_ref().unwrap().encode()),
+    )
+    .await
+    .unwrap();
+
+    // A HEAD naming that segment, committed the way a fold would.
+    let engine = pstore_engine::Engine::new(Arc::clone(&s), t, pstore_types::LaneId(0));
+    engine
+        .commit_head_for_test(|h| {
+            h.indexes.insert(
+                "idx".to_owned(),
+                vec![pstore_engine::SegmentRef {
+                    key: SEG.to_owned(),
+                    rows: docs.len() as u32,
+                }],
+            );
+        })
+        .await
+        .unwrap();
+
+    // Cold: nothing cached, starting from the tenant id alone.
+    s.reset();
+    let head = engine.head_for_test().await;
+    let seg_key = Key::new(head.indexes["idx"][0].key.clone());
+    let idx = VecIndex::open(&*s, &seg_key, &Key::new(CEN), DIM)
+        .await
+        .unwrap();
+    let hits = idx
+        .search(&*s, &seg_key, &docs[9].vector, Query::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10);
+    assert_eq!(
+        s.depth(),
+        3,
+        "a cold query from HEAD took {} sequential round trips",
+        s.depth()
+    );
+}

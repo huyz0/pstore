@@ -101,6 +101,17 @@ disproven.
 
 **Exit:** 90–95% recall@10 at ≤3 round trips cold, measured, on 100M vectors.
 
+> ✅ **Delivered, except the scale.** See
+> [`docs/milestones/M3/VERIFIED.md`](../../milestones/M3/VERIFIED.md). Recall and depth are
+> met — **recall@10 = 0.981 at 3 round trips cold** — at **20,000 × 384d**, not 100M.
+> 100M × 768d is ~300 GB against WSL2 with no cloud account, and brute-force ground truth
+> alone would exceed the gate's time budget by orders of magnitude. **The scale is NOT-RUN
+> and blocked on M0b**, not on effort; it is carried to the milestone with real storage.
+>
+> ⚠️ **[C-3](../00-plan/open-questions.md) corrects D-11.** Rung 0 alone measures 0.30
+> recall@10, not the 90–95% `quantization.md` claims. int8 rerank reaches 0.981 in the same
+> three round trips, so the default rerank mode is `fast` and the budget still closes.
+
 ### M3.5 — LIRE spike (run in parallel from M1, 2 weeks of effort)
 **Out of order deliberately.** Prototype LIRE-style split/merge/reassign batched into an
 immutable segment rewrite, and measure partition quality against a global rebuild (OQ-51).

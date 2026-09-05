@@ -1,0 +1,25 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace Accounted<S>::as_tenant -> TenantView<S> with TenantView::from(Default::default())
+@@ -61,21 +61,17 @@
+             inner: Arc::new(inner),
+             counters: Arc::new(Mutex::new(Counters::default())),
+         }
+     }
+ 
+     /// A handle that attributes everything it does to one tenant.
+     #[must_use]
+     pub fn as_tenant(&self, tenant: TenantId) -> TenantView<S> {
+-        TenantView {
+-            inner: Arc::clone(&self.inner),
+-            counters: Arc::clone(&self.counters),
+-            tenant,
+-        }
++        TenantView::from(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Requests of `class` billed to `tenant`.
+     #[must_use]
+     pub fn count(&self, tenant: TenantId, class: OpClass) -> u64 {
+         self.lock()
+             .per_tenant
+             .get(&(tenant, class))
