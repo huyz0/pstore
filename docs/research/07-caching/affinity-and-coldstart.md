@@ -37,7 +37,10 @@ turbopuffer's published figures for 1M documents:
 | **Stampede** | Bursty | Singleflight + admission control (`04-cluster/load-and-hotspots.md`). |
 
 > **D-23.** The NVMe cache must be **durable across process restarts** and validated by
-> segment id (immutable ⇒ always valid). A rolling deploy of 10,000 nodes must not produce
+> segment id (immutable ⇒ always valid). **This is mandatory, not an optimization**: the
+> endurance budget puts a full cache refill at ~10 hours per node, so a deploy that flushes
+> caches costs 10 hours of degraded hit rate fleet-wide
+> ([`disk-space-management.md`](disk-space-management.md) §2). A rolling deploy of 10,000 nodes must not produce
 > 10,000 cold caches. Design the on-disk cache format for fast reopen (index the cache
 > directory in a small persistent file; do not scan it).
 
@@ -82,8 +85,10 @@ Metrics that must exist from day one:
 
 ## Open questions raised
 
-- OQ-57: Is shadow warming worth its blob-request cost during a large scale-out? Model:
-  `nodes_added × indexes_moved × metadata_bytes`.
+- ~~OQ-57~~ **ANSWERED** — see [`disk-space-management.md`](disk-space-management.md) §2.
+  Yes for metadata, never for bulk. Cache fill is capped by device endurance at ~67 MB/s, so
+  filling a 2.4 TB cache takes ~10 hours; but classes 1–4 are 0.1–1% of bytes (2.4–24 GB =
+  36 s to 6 min) and unblock every query. **D-44:** warm classes 1–4 only.
 - OQ-58: How long does the NVMe cache remain useful after a placement change (i.e. should a
   node retain an index's cache after losing placement, in case it comes back)? Leaning yes,
   with decay.

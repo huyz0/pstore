@@ -47,7 +47,13 @@ memory-only). It is used by Percas, a distributed persistent cache service for N
 > top. Fall back to `moka`/`quick-cache` for pure in-memory sub-caches (e.g. the manifest
 > cache) where the hybrid machinery is overhead.
 
-Requirements we must verify against `foyer` (OQ-54):
+**OQ-54 is now closed favourably** — foyer provides admission/reinsertion filters, S3-FIFO
+and LRU-with-priority-pool eviction, restart recovery, reserved-space configuration, and
+crucially **device throttling (IOPS and throughput limits per direction)**, which is the
+enforcement point for the endurance budget. Details and what remains ours to build:
+[`disk-space-management.md`](disk-space-management.md) §7.
+
+Requirements originally raised (now largely answered):
 - Per-class quotas / multiple isolated instances.
 - Pinning (classes 2–3 must be un-evictable while an index is active).
 - Zero-copy `Bytes` handoff so a cached block goes to the SIMD scanner without a memcpy.
@@ -67,12 +73,21 @@ Eviction is purely a capacity decision.
 
 ## Sizing
 
-For a node with 128 GB RAM / 4 TB NVMe:
+For a node with 128 GB RAM / 3.75 TB NVMe:
 - RAM: ~16 GB for classes 1–5 (thousands of active indexes' metadata), ~16 GB page-cache-ish
   for hot class 6, rest for query execution and OS.
-- NVMe: ~3.5 TB for classes 6–8.
+- NVMe: **~2.4 TB (64% of the device)** for classes 6–8.
 
-3.5 TB of NVMe holds the 1-bit scan tier for **~36 billion 768-dim vectors** — on one node.
+> **⚠️ Corrected — see [`disk-space-management.md`](disk-space-management.md) §2.** An earlier
+> version allocated ~3.5 TB of a 4 TB device to cache. **Cache capacity is not device
+> capacity.** Flash device-level write amplification rises from ~1.3 at 50% utilization to
+> **~3.5 at 100%**, and DLWA of 2 wears the drive twice as fast; Meta runs CacheLib with 50%
+> host over-provisioning for exactly this reason. Budget ~64% for cache, a hard reserve for
+> OS/logs/scratch, and leave the rest unallocated as over-provisioning. Separately, cache fill
+> must be **rate-limited by device endurance (~67 MB/s sustained)**, not by network — which
+> means a cold node takes ~10 hours to fill and bulk pre-warming is off the table.
+
+2.4 TB of NVMe holds the 1-bit scan tier for **~25 billion 768-dim vectors** — on one node.
 That is the number that makes the economics work: a modest fleet can hold the entire scan
 tier of an enormous corpus warm.
 

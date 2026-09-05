@@ -16,6 +16,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | ~~OQ-84~~ | ~~What fraction of indexes are trickle writers?~~ | **ANSWERED:** 1M tenants × up to 50 indexes (~50M), **10% of tenants active per second**. Confirms bundling is essential and forces two further structural changes. | → [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) |
 | **OQ-92** | How many of a tenant's ~50 indexes does a typical write burst touch? | Sets active-indexes/s `A` between 100k and 5M — a 50× swing in what the write-cohort design is worth. **The most valuable remaining number.** | Instrument a pilot tenant, or ask design partners. |
 | **OQ-93** | Fleet write throughput in bytes/s. | Sets `W* = bytes/s × T / B` directly; without it the cohort ring cannot be sized. | Estimate from expected docs/s × doc size; confirm in M1. |
+| **OQ-98** | Actual endurance (DWPD/TBW) of AWS/GCP/Azure instance-store NVMe — **none of them publish it**. | The whole cache-fill rate budget (~67 MB/s) rests on a 2-DWPD assumption. If it is 1 DWPD the budget halves and warming takes 20 h; drives failing at month 8 is the failure mode. | Track SMART `percentage_used` drift on a real fleet for 2–4 weeks; or ask the vendor. |
 | **OQ-85** | The three-way optimum between memtable memory budget, fold rate, and recovery-scan window. | Fold rate is the dominant per-index PUT cost after bundling; memtable size bounds both query cost and how lazy folding can be. | Model analytically, then measure in M1/M2. |
 | **OQ-91** | Prove that `HEAD.lane_watermarks` + forward probing of placement nodes' bundle lanes finds **every** un-folded record under placement change, fallback writes, and node death. | If recovery can miss records, cross-index bundling is unsafe and the whole cost argument collapses. | Deterministic simulation target for M2. |
 
@@ -36,7 +37,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-43 | Tantivy-over-`Directory` request amplification for a realistic multi-term query | `06/full-text-search` |
 | OQ-46 | Selectivity thresholds for filter plan switching (YFCC + synthetic correlated) | `06/filtering` |
 | OQ-50 | Recall lost to segment fragmentation (probing `p` lists across 10 segments vs 1) | `06/incremental-maintenance` |
-| OQ-54 | Does `foyer` support per-class quotas, pinning, zero-copy handoff? | `07/cache-hierarchy` |
+| ~~OQ-54~~ | **CLOSED favourably** — foyer has admission/reinsertion filters, S3-FIFO + LRU-with-priority-pool, restart recovery, reserved space, and device IOPS/throughput throttling (the endurance enforcement point). Ours to build: class→region mapping, per-tenant accounting, watermarks. | `07/disk-space-management` §7 |
 | OQ-64 | Ranking error from per-shard IDF vs. global DF maintenance | `08/hybrid-and-ranking` |
 | OQ-66 | Rust SWIM implementation with Lifeguard — `chitchat` (Quickwit) vs `foca` | `09/crate-survey` |
 | OQ-72 | Realistic multi-tenant index-size/query-rate distribution for synthetic benchmarks | `10/evaluation-methodology` |
@@ -46,6 +47,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-94 | Size threshold for tenant-grouped vs index-grouped placement, and for inlining — probably one number; verify | `10/tenancy-scale-model` |
 | OQ-95 | Does `W`-node write concentration collide with S3 per-prefix limits, especially on cohort-lane reads during recovery? | `10/tenancy-scale-model` |
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
+| OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
+| OQ-100 | Does class→region segregation reach the ~1.03 DLWA the FDP paper reports, without FDP hardware? | `07/disk-space-management` |
+| OQ-103 | Behaviour when the cache device fails outright mid-flight — must be identical to bypass mode, and the node must not die. Verify. | `07/disk-space-management` |
 
 ## Tier 3 — tuning and refinement
 
@@ -87,8 +91,8 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-52` drift thresholds for re-clustering ·
 `OQ-53` centroid hierarchy crossover ·
 `OQ-55` RAM:NVMe ratio and instance selection ·
-`OQ-56` class-aware admission vs S3-FIFO/W-TinyLFU ·
-`OQ-57` shadow-warming cost/benefit ·
+`OQ-56` class-aware admission vs S3-FIFO/W-TinyLFU (see also OQ-101) ·
+~~`OQ-57`~~ **closed** — warm classes 1–4 only; bulk warming exceeds the endurance budget ·
 `OQ-58` cache retention after placement loss ·
 `OQ-59` balance cost of AZ-aware LRH ·
 `OQ-60` speculative RT-A fetch waste ·
@@ -113,7 +117,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-83` streaming query responses ·
 `OQ-88` bundle record ordering: sorted by `(index_id, shard)` vs clustered by read affinity ·
 `OQ-89` shared L0 segments across indexes — worth the GC/branching complexity, or does inlining small indexes already capture it? ·
-`OQ-96` prefix entropy width at 1M tenants, 4 vs 5 chars (refines OQ-78)
+`OQ-96` prefix entropy width at 1M tenants, 4 vs 5 chars (refines OQ-78) ·
+`OQ-101` S3-FIFO vs W-TinyLFU vs our class-aware policy on real traces (refines OQ-56) ·
+`OQ-102` dedicated cache partition for very large tenants, vs a quota
 
 ## Strategic risks (not answerable by experiment)
 

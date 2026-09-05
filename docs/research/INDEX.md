@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q33`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q34`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 30 documents, 33 research questions answered, 97 open
+**Status: research phase complete.** 31 documents, 34 research questions answered, 103 open
 questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
@@ -47,8 +47,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 33 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **97 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 34 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **103 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -102,6 +102,7 @@ If you read nothing else:
 | Doc | Answers | Status |
 |---|---|---|
 | [cache-hierarchy.md](07-caching/cache-hierarchy.md) | Q24 | Class-aware admission, not one big LRU: centroids and index sections must never be evicted by bulk traffic. `foyer` for the hybrid RAM+NVMe tier. **Immutable ids ⇒ cache entries never need invalidation.** |
+| **[disk-space-management.md](07-caching/disk-space-management.md)** | Q34 | **Endurance binds before capacity.** Flash DLWA goes 1.3→3.5 from 50%→100% utilization, so cache max is ~64% of the device and fill is capped at ~67 MB/s — a cold node takes ~10 h. A full disk must degrade to bypass mode, never fail. Closes OQ-54 and OQ-57. |
 | [affinity-and-coldstart.md](07-caching/affinity-and-coldstart.md) | Q25 | Cold is 30–60× warm, so minimize the *number* of cold queries. NVMe cache must survive process restarts, or a rolling deploy flushes 10,000 caches. |
 
 ## 08 — Query engine
