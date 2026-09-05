@@ -168,6 +168,10 @@ async fn an_armed_gate_releases_its_writers_together() {
     for t in tasks {
         assert!(t.await.unwrap());
     }
+    assert!(
+        s.raced(),
+        "the barrier gave up instead of releasing together"
+    );
 }
 
 #[tokio::test]

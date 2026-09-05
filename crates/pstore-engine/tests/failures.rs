@@ -161,3 +161,18 @@ async fn an_unknown_attribute_tag_is_refused() {
     buf.push(200); // a value tag from the future
     assert!(pstore_format::decode_docs(&buf).is_err());
 }
+
+#[tokio::test]
+async fn a_lane_that_never_ends_is_refused_rather_than_probed_forever() {
+    // ⚠️ Probing terminates on a 404, which is an answer the STORE has to give. A backend
+    // that keeps answering -- hostile, buggy, or serving a corrupted lane -- would spin
+    // here forever, on a path a query waits on. Found as a hung test under mutation
+    // testing rather than a failing one, which is the expensive way to find out.
+    let err = lanes::tail(&Flaky::never_missing(), TenantId(9), LaneId(0), 0)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("probe bound"),
+        "an endless lane surfaced as {err}"
+    );
+}

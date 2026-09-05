@@ -146,6 +146,10 @@ async fn concurrent_compactors_produce_one_winner() {
             winners += 1;
         }
     }
+    // ⚠️ Asserted BEFORE the winner count. "Exactly one winner" is equally satisfied by
+    // twelve compactors racing and by one compactor running alone, so without this the
+    // headline assertion can pass having tested nothing.
+    assert!(store.raced(), "the compactors never met at the barrier");
     assert_eq!(
         winners, 1,
         "{winners} compactors committed; exactly one may win and the rest must discard"
@@ -258,6 +262,10 @@ async fn a_fold_landing_mid_compaction_is_not_swallowed_by_it() {
     let (c, f) = tokio::join!(compactor.compact("idx"), folder.fold());
     c.unwrap();
     f.unwrap();
+    assert!(
+        store.raced(),
+        "the fold and the compaction never overlapped"
+    );
 
     let reader = Engine::new(Arc::clone(&store), t, LaneId(99));
     let ids: Vec<String> = reader

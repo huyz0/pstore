@@ -35,6 +35,12 @@ const MAX_PROBE_WINDOW: u64 = 256;
 
 /// Ceiling on lanes per tenant, so a corrupt object cannot make a reader allocate wildly.
 const MAX_LANES: usize = 4096;
+/// How many probe rounds before a lane is declared unreadable.
+///
+/// Generous: with the window doubling to [`MAX_PROBE_WINDOW`] this covers far more
+/// bundles than a lane accumulates between folds. It exists to bound the loop, not to
+/// limit a lane.
+const MAX_PROBE_ROUNDS: u32 = 64;
 
 /// The registry's key, derived from the tenant like every other key here.
 pub fn key(tenant: TenantId) -> Key {
@@ -112,7 +118,13 @@ pub async fn tail<S: BlobStore>(
 ) -> Result<u64, EngineError> {
     let mut base = from;
     let mut window = FIRST_PROBE_WINDOW;
-    loop {
+    // ⚠️ Bounded, not `loop`. The termination condition is "the store answered 404", which
+    // means a store that never does — hostile, buggy, or serving a lane genuinely longer
+    // than any tenant could write — spins here forever, on a path a query waits on. An
+    // unbounded loop whose exit depends on a remote answer is a liveness bug however
+    // correct the logic is; mutation testing surfaced it as a hung test rather than a
+    // failing one, which is the expensive way to find out.
+    for _ in 0..MAX_PROBE_ROUNDS {
         let keys: Vec<Key> = (base..base + window)
             .map(|n| crate::bundle_key(tenant, lane, pstore_types::Seq(n)))
             .collect();
@@ -136,4 +148,5 @@ pub async fn tail<S: BlobStore>(
         }
         window = (window * 2).min(MAX_PROBE_WINDOW);
     }
+    Err(EngineError::LaneTooLong(lane))
 }

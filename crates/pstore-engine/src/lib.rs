@@ -55,6 +55,12 @@ pub enum EngineError {
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
+    /// A lane's tail could not be found within the probe bound.
+    ///
+    /// Not "the lane is too long" in practice — it means the store kept answering, which
+    /// is a backend fault or a corrupted lane rather than a large one.
+    #[error("lane {0:?} did not terminate within the probe bound")]
+    LaneTooLong(pstore_types::LaneId),
 }
 
 impl From<pstore_blob::BlobError> for EngineError {

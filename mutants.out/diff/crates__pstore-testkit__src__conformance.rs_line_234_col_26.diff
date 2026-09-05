@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace == with != in probe_suffix_read
+@@ -226,17 +226,17 @@
+                 String::from_utf8_lossy(&b)
+             ));
+         }
+         Err(e) => return Support::Divergent(format!("suffix read failed: {e}")),
+     }
+     // Asking for more than exists must return the object, not fail: a small segment is
+     // shorter than the fixed suffix fetch, and that is the common case.
+     match s.get_suffix(&key, 1000).await {
+-        Ok(b) if b.len() == 10 => Support::Supported,
++        Ok(b) if b.len() != /* ~ changed by cargo-mutants ~ */ 10 => Support::Supported,
+         Ok(b) => Support::Divergent(format!("an oversized suffix returned {} bytes", b.len())),
+         Err(e) => Support::Divergent(format!("an oversized suffix failed: {e}")),
+     }
+ }
+ 
+ /// `get_tag` — the rebase step of the commit protocol.
+ ///
+ /// Every decorator forwards it and nothing else probed it, so a decorator that answered

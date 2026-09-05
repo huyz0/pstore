@@ -28,6 +28,11 @@ pub struct Flaky {
     at: Vec<u64>,
     /// Every read fails. Models a backend that is down rather than busy.
     reads_fail: bool,
+    /// `head` never reports a missing key.
+    ///
+    /// The one answer forward probing depends on. A backend that never gives it — hostile,
+    /// buggy, or serving a corrupted lane — turns tail discovery into a loop with no exit.
+    never_missing: bool,
     /// Every conditional write comes back `Contended`.
     ///
     /// Distinct from `Lost`, and the difference is the whole retry protocol: `Lost` means
@@ -51,6 +56,7 @@ impl Flaky {
             rate: (clamped * f64::from(u32::MAX)) as u64,
             at: Vec::new(),
             reads_fail: false,
+            never_missing: false,
             always_contended: false,
             seen: AtomicU64::new(0),
             failures: Arc::new(AtomicU64::new(0)),
@@ -69,6 +75,7 @@ impl Flaky {
             rate: 0,
             at: at.to_vec(),
             reads_fail: false,
+            never_missing: false,
             always_contended: false,
             seen: AtomicU64::new(0),
             failures: Arc::new(AtomicU64::new(0)),
@@ -111,6 +118,15 @@ impl Flaky {
     pub fn refusing_reads() -> Self {
         Self {
             reads_fail: true,
+            ..Self::refusing(&[])
+        }
+    }
+
+    /// A store whose `head` always finds the key, so a forward probe never terminates.
+    #[must_use]
+    pub fn never_missing() -> Self {
+        Self {
+            never_missing: true,
             ..Self::refusing(&[])
         }
     }
@@ -162,6 +178,9 @@ impl BlobStore for Flaky {
         // every other read fails models a backend that does not exist and hides the
         // engine's most important "is this a gap or an outage?" decision.
         self.read_gate()?;
+        if self.never_missing {
+            return Ok(1);
+        }
         self.inner.head(key).await
     }
 

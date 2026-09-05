@@ -22,7 +22,14 @@ pub struct Gated {
     arrived: AtomicUsize,
     n: usize,
     armed: std::sync::atomic::AtomicBool,
+    broke: std::sync::atomic::AtomicBool,
 }
+
+/// How long a writer waits at the barrier before giving up on its peers.
+///
+/// Long enough that a loaded machine still races; short enough that a scenario whose
+/// racers never arrive fails rather than stalls.
+const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Gated {
     /// A store whose first `n` conditional writes are released simultaneously.
@@ -34,6 +41,7 @@ impl Gated {
             arrived: AtomicUsize::new(0),
             n,
             armed: std::sync::atomic::AtomicBool::new(false),
+            broke: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -41,6 +49,15 @@ impl Gated {
     /// against the barrier would release it before the racers ever arrive.
     pub fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether any writer gave up waiting for peers that never came.
+    ///
+    /// A test asserting on a race must check this: without it, "one winner" is equally
+    /// satisfied by twelve compactors racing and by one compactor running alone.
+    #[must_use]
+    pub fn raced(&self) -> bool {
+        !self.broke.load(Ordering::SeqCst)
     }
 }
 
@@ -82,7 +99,17 @@ impl BlobStore for Gated {
         // test rather than fail it, which is the harder failure to read.
         if self.armed.load(Ordering::SeqCst) && self.arrived.fetch_add(1, Ordering::SeqCst) < self.n
         {
-            self.barrier.wait().await;
+            // ⚠️ Bounded. A plain `wait()` turns "the expected racers never arrived" into a
+            // hang, and a hang is the worst way for a test to fail: no message, no line
+            // number, and under mutation testing it is scored as inconclusive rather than
+            // as the behaviour change it actually is. Timing out and recording it lets the
+            // test's own assertion do the reporting.
+            if tokio::time::timeout(BARRIER_TIMEOUT, self.barrier.wait())
+                .await
+                .is_err()
+            {
+                self.broke.store(true, Ordering::SeqCst);
+            }
         }
         self.inner.put_conditional(key, body, pre).await
     }

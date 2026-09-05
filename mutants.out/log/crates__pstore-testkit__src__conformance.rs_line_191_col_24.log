@@ -1,0 +1,593 @@
+
+*** crates/pstore-testkit/src/conformance.rs:191:24: replace match guard b.len() == want_len with true in probe_coalesced_read
+
+*** mutation diff:
+--- crates/pstore-testkit/src/conformance.rs
++++ replace match guard b.len() == want_len with true in probe_coalesced_read
+@@ -183,17 +183,17 @@
+         return Support::Divergent("get_ranges failed".to_owned());
+     };
+     if got.len() != 3 {
+         return Support::Divergent(format!("expected 3 slices, got {}", got.len()));
+     }
+     for (i, r) in wanted.iter().enumerate() {
+         let want_len = (r.end - r.start) as usize;
+         match got.get(i) {
+-            Some(b) if b.len() == want_len => {}
++            Some(b) if true /* ~ changed by cargo-mutants ~ */ => {}
+             // Returning the merged buffer rather than each range's slice is the mutation
+             // this catches, and a length-only check at the top level would miss it.
+             Some(b) => {
+                 return Support::Divergent(format!(
+                     "slice {i} was {} bytes, wanted {want_len}",
+                     b.len()
+                 ));
+             }
+
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh pin-project-lite v0.2.17
+       Fresh thiserror-impl v2.0.20
+       Fresh tokio-macros v2.7.2
+       Fresh futures-task v0.3.34
+       Fresh futures-core v0.3.34
+       Fresh slab v0.4.12
+       Fresh futures-util v0.3.34
+       Fresh tokio v1.53.1
+       Fresh thiserror v2.0.20
+       Fresh async-trait v0.1.92
+       Fresh bytes v1.12.1
+       Dirty pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-testkit): the file `crates/pstore-testkit/src/conformance.rs` has changed (1788614613.993138109s, 3s after last build at 1788614610.250603381s)
+   Compiling pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-testkit)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=7c6884569a017aab -C extra-filename=-c70127229fd98aeb --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rmeta --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rmeta --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rmeta --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rmeta`
+warning: unused variable: `b`
+   --> crates/pstore-testkit/src/conformance.rs:191:18
+    |
+191 |             Some(b) if true /* ~ changed by cargo-mutants ~ */ => {}
+    |                  ^ help: if this is intentional, prefix it with an underscore: `_b`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+       Fresh pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-format)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_testkit --edition=2024 crates/pstore-testkit/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=eb66d2a9afb7e29b -C extra-filename=-5d9681023401e166 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-types)
+warning: `pstore-testkit` (lib) generated 1 warning
+       Dirty pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-engine): the dependency pstore_testkit was rebuilt
+   Compiling pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-engine)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name oq91 --edition=2024 crates/pstore-engine/tests/oq91.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6cb15318f59096c2 -C extra-filename=-d4ce40b15d2ee193 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+       Dirty pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-blob): the dependency pstore_testkit was rebuilt
+   Compiling pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-blob)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_blob --edition=2024 crates/pstore-blob/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=f2f4f50824e7892c -C extra-filename=-beebd50e20890a1c --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name lanes --edition=2024 crates/pstore-engine/tests/lanes.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6910df478171efaa -C extra-filename=-4f73796799f37cd5 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name sim --edition=2024 crates/pstore-testkit/tests/sim.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=afd80c5028eaad17 -C extra-filename=-bbf2b604e1467e00 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name hostile --edition=2024 crates/pstore-testkit/tests/hostile.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=07621c81aaf6f68e -C extra-filename=-f0118fdf2cfac1af --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name end_to_end --edition=2024 crates/pstore-engine/tests/end_to_end.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4fd13578167e8dc5 -C extra-filename=-2bee7b37ede99944 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name injectors --edition=2024 crates/pstore-testkit/tests/injectors.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=316e1a785e8eb35e -C extra-filename=-a3592247aa5e2312 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name conformance --edition=2024 crates/pstore-testkit/tests/conformance.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=eb2bb0928bdd4aa7 -C extra-filename=-b77084fd195a7c41 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name coalescing --edition=2024 crates/pstore-blob/tests/coalescing.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=95fd0fb8bd343508 -C extra-filename=-07cd275959561fdd --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name linearizability --edition=2024 crates/pstore-engine/tests/linearizability.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4d254723bcc0811c -C extra-filename=-254bc0b1b39781af --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name semantics --edition=2024 crates/pstore-blob/tests/semantics.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=955ca3f9d7c7f70e -C extra-filename=-498f3631a70a0c40 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name bundle_errors --edition=2024 crates/pstore-engine/tests/bundle_errors.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=28754e23c98f5123 -C extra-filename=-f5f75d0122717507 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name cas --edition=2024 crates/pstore-blob/tests/cas.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=3fb4d681b59d484c -C extra-filename=-4a0e1648b7639c55 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_engine --edition=2024 crates/pstore-engine/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=1d717388a189498b -C extra-filename=-a10afff159302613 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name depth --edition=2024 crates/pstore-testkit/tests/depth.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=11bc16d940fe0dc0 -C extra-filename=-6790482b94222d43 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+warning: `pstore-testkit` (lib test) generated 1 warning (1 duplicate)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name arithmetic --edition=2024 crates/pstore-engine/tests/arithmetic.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=25b092164d3e93f7 -C extra-filename=-3a9b05330657663e --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name sweep --edition=2024 crates/pstore-testkit/tests/sweep.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cf23280c39ff24a2 -C extra-filename=-88387a89f9831276 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name contention --edition=2024 crates/pstore-testkit/examples/contention.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=331431c29c4c3574 -C extra-filename=-33eb8ddbfb165b09 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/examples -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name faults --edition=2024 crates/pstore-blob/tests/faults.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=ef654a0a1786a870 -C extra-filename=-6ff9c0975fba4475 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name engine --edition=2024 crates/pstore-engine/tests/engine.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9adddba898cfe624 -C extra-filename=-d3f6e35023412aa0 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name compaction --edition=2024 crates/pstore-engine/tests/compaction.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=60255f1194bf4db1 -C extra-filename=-fea23ca71d87002d --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name failures --edition=2024 crates/pstore-engine/tests/failures.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=da2153a1a301194a -C extra-filename=-395c7ad6521485a0 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name gc --edition=2024 crates/pstore-engine/tests/gc.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6a829d9c507f5849 -C extra-filename=-a51240571b343ea3 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name object_store_adapter --edition=2024 crates/pstore-blob/tests/object_store_adapter.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=96973d3c9d325fd5 -C extra-filename=-318667f311816eef --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name invariants --edition=2024 crates/pstore-engine/tests/invariants.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=f1ab011b492174b3 -C extra-filename=-7c58ff7140e0f97d --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name accounting --edition=2024 crates/pstore-blob/tests/accounting.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' -C metadata=023f0ddac3062718 -C extra-filename=-f4906d65a4a0bb28 --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name head --edition=2024 crates/pstore-engine/tests/head.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6744ca41f6952a23 -C extra-filename=-bae2d0c8b8f449bc --out-dir /tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.41s
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_blob-beebd50e20890a1c`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/accounting-f4906d65a4a0bb28`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/cas-4a0e1648b7639c55`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/coalescing-07cd275959561fdd`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/faults-6ff9c0975fba4475`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/object_store_adapter-318667f311816eef`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/semantics-498f3631a70a0c40`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_engine-a10afff159302613`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/arithmetic-3a9b05330657663e`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/bundle_errors-f5f75d0122717507`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/compaction-fea23ca71d87002d`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/end_to_end-2bee7b37ede99944`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/engine-d3f6e35023412aa0`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/failures-395c7ad6521485a0`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/gc-a51240571b343ea3`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/head-bae2d0c8b8f449bc`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/invariants-7c58ff7140e0f97d`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/lanes-4f73796799f37cd5`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/linearizability-254bc0b1b39781af`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/oq91-d4ce40b15d2ee193`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_format-bd498c68e6c46481`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/corrupt-1b001b89d0d01ece`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/search-df777557c562d446`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/segment-5c77b70ad5435831`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_testkit-5d9681023401e166`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/conformance-b77084fd195a7c41`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/depth-6790482b94222d43`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/hostile-f0118fdf2cfac1af`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/injectors-a3592247aa5e2312`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/sim-bbf2b604e1467e00`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/sweep-88387a89f9831276`
+  Executable `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
+
+*** result: Success
+
+*** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --verbose --workspace
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh pin-project-lite v0.2.17
+       Fresh futures-core v0.3.34
+       Fresh futures-task v0.3.34
+       Fresh slab v0.4.12
+       Fresh bytes v1.12.1
+       Fresh futures-util v0.3.34
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-types)
+       Fresh quote v1.0.47
+       Fresh syn v3.0.5
+       Fresh tokio-macros v2.7.2
+       Fresh thiserror-impl v2.0.20
+       Fresh async-trait v0.1.92
+       Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
+warning: unused variable: `b`
+   --> crates/pstore-testkit/src/conformance.rs:191:18
+    |
+191 |             Some(b) if true /* ~ changed by cargo-mutants ~ */ => {}
+    |                  ^ help: if this is intentional, prefix it with an underscore: `_b`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `pstore-testkit` (lib) generated 1 warning
+warning: `pstore-testkit` (lib test) generated 1 warning (1 duplicate)
+       Fresh pstore-testkit v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-testkit)
+       Fresh pstore-format v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-format)
+       Fresh pstore-engine v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-engine)
+       Fresh pstore-blob v0.1.0 (/tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-blob)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_blob-beebd50e20890a1c`
+
+running 4 tests
+test coalesce::tests::a_zero_gap_merges_only_touching_ranges ... ok
+test coalesce::tests::empty_input_plans_nothing ... ok
+test coalesce::tests::a_contained_range_does_not_underflow_the_gap ... ok
+test coalesce::tests::empty_ranges_are_dropped ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/accounting-f4906d65a4a0bb28`
+
+running 4 tests
+test a_failed_conditional_write_is_still_billed ... ok
+test accounting_counts_one_write_per_put ... ok
+test accounting_is_per_tenant ... ok
+test accounting_separates_read_write_and_list_classes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/cas-4a0e1648b7639c55`
+
+running 5 tests
+test cas_lost_and_contended_are_distinct ... ok
+test cas_rejects_stale_tag ... ok
+test create_if_absent_rejects_second_write ... ok
+test get_range_returns_the_requested_slice ... ok
+test delete_batch_removes_only_the_named_keys ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/coalescing-07cd275959561fdd`
+
+running 8 tests
+test a_single_far_range_is_offset_correctly ... ok
+test coalesced_reads_equal_separate_reads ... ok
+test coalescing_merges_ranges_closer_than_the_gap ... ok
+test coalescing_never_issues_more_requests_than_ranges ... ok
+test coalescing_actually_saves_requests ... ok
+test coalescing_respects_the_gap_threshold ... ok
+test slices_are_offset_from_the_fetch_start_not_the_object_start ... ok
+test ranges_out_of_order_are_returned_in_the_order_asked ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/faults-6ff9c0975fba4475`
+
+running 13 tests
+test an_injected_write_fault_does_not_reach_the_backend ... ok
+test a_zero_rate_injects_nothing ... ok
+test each_fault_kind_is_injected_independently ... ok
+test recovery_is_additive_and_slow ... ok
+test same_seed_reproduces_the_same_failures ... ok
+test the_retry_delay_is_exponential_and_capped ... ok
+test slow_down_first_n_covers_exactly_the_first_n_operations ... ok
+test a_fault_rate_of_one_injects_on_every_call_and_zero_on_none ... ok
+test injected_faults_land_at_roughly_the_rate_asked_for ... ok
+test a_slow_down_halves_the_limit_rather_than_merely_lowering_it ... ok
+test a_transient_slowdown_is_retried_and_succeeds ... ok
+test retries_are_bounded ... ok
+test slowdown_reduces_concurrency_then_recovers ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/object_store_adapter-318667f311816eef`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/semantics-498f3631a70a0c40`
+
+running 15 tests
+test a_key_displays_as_the_path_it_will_be_fetched_from ... ok
+test a_full_length_range_is_legal ... ok
+test a_range_past_the_end_is_an_error_not_a_short_read ... ok
+test capabilities_name_the_backend_and_its_tag_style ... ok
+test cas_against_a_deleted_object_is_refused ... ok
+test a_batch_delete_over_the_backend_limit_is_refused ... ok
+test cas_with_a_fabricated_tag_is_refused ... ok
+test content_hash_tags_exhibit_the_aba_hazard ... ok
+test an_empty_range_is_legal_and_returns_nothing ... ok
+test get_ranges_of_nothing_is_not_a_request ... ok
+test get_ranges_propagates_a_read_error ... ok
+test get_tag_reports_the_current_tag_and_none_when_absent ... ok
+test head_reports_size_without_the_body ... ok
+test monotonic_tags_are_immune_to_aba ... ok
+test list_is_prefix_filtered ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_engine-a10afff159302613`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/arithmetic-3a9b05330657663e`
+
+running 5 tests
+test backoff_is_capped ... ok
+test backoff_grows_with_the_attempt ... ok
+test lanes_do_not_back_off_in_lockstep ... ok
+test a_nonce_changes_when_only_the_epoch_does ... ok
+test nonces_never_collide_across_epochs_and_lanes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/bundle_errors-f5f75d0122717507`
+
+running 7 tests
+test a_truncated_document_run_is_refused_at_every_length ... ok
+test a_bundle_with_a_mangled_footer_fails_the_fold ... ok
+test a_bundle_with_an_impossible_index_offset_fails_the_fold ... ok
+test a_hole_in_a_lane_bounds_the_tail_rather_than_being_skipped ... ok
+test folding_nothing_is_a_no_op_not_an_error ... ok
+test documents_round_trip_through_the_shared_codec ... ok
+test an_unknown_value_tag_in_a_document_run_is_refused ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/compaction-fea23ca71d87002d`
+
+running 6 tests
+test a_short_index_is_not_worth_compacting ... ok
+test compaction_does_not_change_the_answer ... ok
+test compaction_collapses_the_segments_it_merged ... ok
+test a_fold_landing_mid_compaction_is_not_swallowed_by_it ... ok
+test a_losing_compactors_output_is_unreferenced ... ok
+test concurrent_compactors_produce_one_winner ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/end_to_end-2bee7b37ede99944`
+
+running 2 tests
+test the_whole_flow_stays_inside_its_request_budget ... ok
+test write_read_filter_and_search_one_index ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/engine-d3f6e35023412aa0`
+
+running 13 tests
+test a_fresh_engine_recovers_acknowledged_writes_from_the_wal ... ok
+test a_bundle_reader_gets_only_its_own_index ... ok
+test a_lane_registration_costs_one_cas_for_the_lane_not_one_per_batch ... ok
+test a_corrupt_bundle_fails_the_fold_rather_than_losing_rows ... ok
+test a_folded_write_is_still_visible_exactly_once ... ok
+test a_stale_committer_is_fenced ... ok
+test a_write_is_visible_before_it_is_folded ... ok
+test folding_twice_does_not_duplicate_rows ... ok
+test many_indexes_share_one_bundle ... ok
+test writes_after_a_fold_are_visible_alongside_folded_ones ... ok
+test search_and_filter_work_across_the_memtable_and_segments ... ok
+test a_write_batch_costs_exactly_one_put ... ok
+test concurrent_committers_lose_and_duplicate_nothing ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/failures-395c7ad6521485a0`
+
+running 8 tests
+test a_backend_that_cannot_evaluate_the_condition_is_retried_and_then_reported ... ok
+test a_corrupt_head_is_refused_not_guessed ... ok
+test a_corrupt_bundle_fails_the_fold ... ok
+test a_corrupt_lane_registry_is_refused_not_guessed ... ok
+test a_failed_head_read_is_an_error_not_an_empty_head ... ok
+test a_corrupt_segment_surfaces_as_a_format_error ... ok
+test a_failed_registry_read_is_an_error_not_an_empty_registry ... ok
+test an_unknown_attribute_tag_is_refused ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/gc-a51240571b343ea3`
+
+running 6 tests
+test gc_refuses_to_reap_a_key_head_still_names ... ok
+test gc_never_reaps_a_referenced_object ... ok
+test gc_with_nothing_due_is_free ... ok
+test gc_reaps_a_folded_bundle_once_it_is_beyond_the_window ... ok
+test a_dereferenced_object_survives_the_retention_window ... ok
+test gc_prunes_what_it_reaps_so_the_manifest_stays_bounded ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/head-bae2d0c8b8f449bc`
+
+running 6 tests
+test a_head_with_a_bad_string_length_is_refused ... ok
+test an_empty_head_round_trips ... ok
+test head_round_trips_exactly ... ok
+test the_head_key_is_derived_from_the_tenant_alone ... ok
+test the_watermark_says_what_has_been_folded ... ok
+test a_truncated_head_is_refused_at_every_length ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/invariants-7c58ff7140e0f97d`
+
+running 7 tests
+test a_fresh_read_costs_no_blob_requests_beyond_head ... ok
+test nothing_on_the_read_path_ever_lists ... ok
+test a_write_batch_is_one_round_trip_and_one_request ... ok
+test a_cold_search_has_a_sequential_depth_of_at_most_three ... ok
+test a_cold_filtered_read_has_a_sequential_depth_of_at_most_three ... ok
+test a_cold_read_has_a_sequential_depth_of_at_most_three ... ok
+test depth_does_not_grow_with_the_number_of_segments ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/lanes-4f73796799f37cd5`
+
+running 6 tests
+test a_lane_bitmap_records_a_lane_in_one_cas ... ok
+test a_successor_finds_the_tail_by_probing_not_listing ... ok
+test a_lane_registers_once_and_is_discoverable ... ok
+test concurrent_lane_registrations_all_survive ... ok
+test probing_resumes_from_a_watermark_rather_than_from_zero ... ok
+test a_probe_window_grows_so_a_long_lane_costs_few_round_trips ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/linearizability-254bc0b1b39781af`
+
+running 4 tests
+test a_writer_paused_past_many_commits_cannot_corrupt ... ok
+test one_hundred_writers_produce_a_dense_epoch_sequence ... ok
+test a_cas_storm_still_converges ... ok
+test every_acknowledged_document_survives_contention ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/oq91-d4ce40b15d2ee193`
+
+running 3 tests
+test a_refused_flush_does_not_punch_a_hole_in_the_lane ... ok
+test recovery_after_a_fallback_write_to_another_lane ... ok
+test recovery_finds_every_unfolded_record_across_seeds ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_format-bd498c68e6c46481`
+
+running 4 tests
+test codec::tests::every_primitive_refuses_a_short_buffer_rather_than_panicking ... ok
+test codec::tests::a_string_field_rejects_invalid_utf8 ... ok
+test codec::tests::every_primitive_round_trips ... ok
+test codec::tests::the_checksum_changes_when_any_byte_does ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/corrupt-1b001b89d0d01ece`
+
+running 10 tests
+test a_document_starts_with_no_attributes ... ok
+test a_future_version_is_refused_rather_than_guessed_at ... ok
+test a_missing_segment_is_an_error_not_an_empty_one ... ok
+test a_scan_of_a_segment_whose_blocks_are_gone_is_an_error ... ok
+test a_segment_with_an_impossible_block_count_is_refused ... ok
+test a_tampered_index_section_is_caught_by_the_checksum ... ok
+test a_truncated_segment_is_an_error ... ok
+test filters_match_rows_by_type ... ok
+test an_unknown_value_tag_is_an_error ... ok
+test filters_prune_only_what_they_provably_can ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/search-df777557c562d446`
+
+running 8 tests
+test a_filter_on_an_unknown_column_matches_nothing_and_prunes_nothing ... ok
+test search_on_a_dimension_mismatch_is_an_error ... ok
+test a_string_filter_cannot_prune_but_still_filters ... ok
+test search_returns_k_results_when_k_exceeds_the_segment ... ok
+test search_respects_a_filter ... ok
+test zone_maps_skip_blocks_that_cannot_match ... ok
+test exact_search_matches_a_brute_force_reference ... ok
+test pruning_does_not_change_the_answer ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/segment-5c77b70ad5435831`
+
+running 7 tests
+test a_corrupt_footer_is_an_error_not_a_wrong_answer ... ok
+test a_segment_is_readable_from_its_key_alone ... ok
+test a_small_segment_opens_in_one_read ... ok
+test an_empty_segment_is_legal ... ok
+test a_segment_round_trips_through_the_blob_store ... ok
+test opening_a_cold_segment_costs_at_most_two_reads ... ok
+test a_segment_whose_index_section_overflows_the_suffix_takes_two_reads ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_testkit-5d9681023401e166`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/conformance-b77084fd195a7c41`
+
+running 8 tests
+test a_broken_backend_forwards_everything_it_does_not_break ... ok
+test conformance_costs_a_bounded_number_of_requests ... ok
+test a_broken_backend_still_declares_itself_healthy ... ok
+test a_report_names_what_diverged ... ok
+test the_memory_store_conforms ... ok
+test the_suite_detects_a_backend_that_is_not_fenced ... ok
+test the_suite_detects_each_defect_a_real_backend_actually_has ... ok
+test every_decorator_conforms ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/depth-6790482b94222d43`
+
+running 6 tests
+test a_failed_request_still_counts ... ok
+test a_loop_that_awaits_each_result_counts_every_iteration ... ok
+test concurrent_fan_out_counts_once ... ok
+test reset_clears_both_counters ... ok
+test the_depth_decorator_forwards_the_whole_contract ... ok
+test get_ranges_fans_out_rather_than_looping ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/hostile-f0118fdf2cfac1af`
+
+running 10 tests
+test a_cas_failure_is_never_retried_by_the_transport ... ok
+test capabilities_pass_through_every_decorator ... ok
+test a_non_slowdown_error_is_not_retried ... ok
+test a_partially_broken_backend_reports_the_reads_it_can_still_serve ... ok
+test the_report_is_per_probe_not_all_or_nothing ... ok
+test the_suite_survives_a_backend_that_fails_everything ... ok
+test the_suite_survives_a_backend_that_only_fails_writes ... ok
+test the_suite_survives_a_backend_that_only_fails_conditional_writes ... ok
+test every_method_retries_a_transient_slowdown ... ok
+test the_limit_never_reaches_zero ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/injectors-a3592247aa5e2312`
+
+running 10 tests
+test a_refused_write_never_reaches_the_store ... ok
+test an_injected_error_says_it_was_injected ... ok
+test an_unarmed_gate_does_not_block ... ok
+test refusing_reads_refuses_every_kind_of_read ... ok
+test always_contended_reports_contention_and_not_a_lost_race ... ok
+test refusing_refuses_exactly_the_named_writes ... ok
+test an_armed_gate_releases_its_writers_together ... ok
+test a_gate_does_not_hold_writers_after_its_quota ... ok
+test the_same_seed_refuses_the_same_writes ... ok
+test a_rate_is_honoured_at_both_extremes_and_in_between ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/sim-bbf2b604e1467e00`
+
+running 10 tests
+test a_seed_reproduces_the_same_schedule ... ok
+test chance_respects_its_probability ... ok
+test a_compare_and_swap_is_not_a_violation ... ok
+test different_seeds_diverge ... ok
+test choose_stays_in_range_and_shuffle_is_a_permutation ... ok
+test choose_covers_its_whole_range ... ok
+test the_auditing_store_rejects_an_unconditional_overwrite ... ok
+test a_reaped_key_may_be_written_again ... ok
+test shuffle_can_move_every_element_to_every_position ... ok
+test the_auditor_forwards_the_whole_contract ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/sweep-88387a89f9831276`
+
+running 4 tests
+test a_point_with_no_commits_is_infinite_not_a_divide_by_zero ... ok
+test the_rendered_table_carries_its_own_caveat ... ok
+test a_single_writer_never_contends ... ok
+test sweep_reports_a_curve_not_a_point ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
+
+running 7 tests
+test tests::cas_failure_distinguishes_lost_from_contended ... ok
+test tests::cas_tag_round_trips_without_interpretation ... ok
+test tests::cas_tags_compare_only_by_equality ... ok
+test tests::epoch_orders_and_advances ... ok
+test tests::epoch_saturates_rather_than_wrapping ... ok
+test tests::identifiers_are_distinct_types ... ok
+test tests::seq_orders_and_saturates ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pstore_blob
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_blob --test crates/pstore-blob/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-blob -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("object_store"))' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pstore_engine
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_engine --test crates/pstore-engine/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-engine -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_engine-57ca2718b28a8562.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pstore_format
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_format --test crates/pstore-format/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-format -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_format-915614e952a6fbe8.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pstore_testkit
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_testkit --test crates/pstore-testkit/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-testkit -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern async_trait=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libasync_trait-efaaae825ff87b5f.so --extern bytes=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_blob-a1c846e65fcdfc47.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_testkit-c70127229fd98aeb.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern tokio=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libtokio-c4794fa7272c7af3.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pstore_types
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_types --test crates/pstore-types/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-2KP5Jb.tmp/crates/pstore-types -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern pstore_types=/tmp/cargo-mutants-pstore-2KP5Jb.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+*** result: Success
