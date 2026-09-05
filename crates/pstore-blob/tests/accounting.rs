@@ -18,6 +18,10 @@ fn k(s: &str) -> Key {
     Key::new(s)
 }
 
+fn v_bytes(s: &Accounted<MemoryStore>, t: TenantId, class: OpClass) -> u64 {
+    s.bytes(t, class)
+}
+
 #[tokio::test]
 async fn accounting_counts_one_write_per_put() {
     let s = Accounted::new(MemoryStore::new());
@@ -89,4 +93,61 @@ async fn a_failed_conditional_write_is_still_billed() {
     // AWS charges for failed conditional requests too, so a CAS retry storm costs real
     // money. A counter that only counted successes would hide exactly that.
     assert_eq!(s.count(t, OpClass::Write), 2);
+}
+
+#[tokio::test]
+async fn bytes_are_counted_not_just_requests() {
+    // ⚠️ A request count cannot express the budget M3 is held to. "Probe 64 posting lists
+    // instead of 8" is ONE request either way and eight times the bytes -- that is the
+    // whole point of the round-trip architecture, and it means a recall number bought with
+    // unbounded bandwidth looks identical to an efficient one through a request counter.
+    // Recall and bytes are one number, not two.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(1);
+    let v = s.as_tenant(t);
+    v.put(&k("a"), Bytes::from(vec![7u8; 1000])).await.unwrap();
+    assert_eq!(v_bytes(&s, t, OpClass::Write), 1000);
+
+    v.get(&k("a")).await.unwrap();
+    assert_eq!(v_bytes(&s, t, OpClass::Read), 1000);
+
+    // A ranged read is billed for what it moved, not for the object it came from.
+    v.get_range(&k("a"), 0..64).await.unwrap();
+    assert_eq!(v_bytes(&s, t, OpClass::Read), 1064);
+
+    // A HEAD moves no body. Counting it as the object's size would make a metadata probe
+    // look like a full fetch and hide the difference the design turns on.
+    v.head(&k("a")).await.unwrap();
+    assert_eq!(v_bytes(&s, t, OpClass::Read), 1064);
+}
+
+#[tokio::test]
+async fn ranges_are_recorded_so_bytes_can_be_attributed_to_a_section() {
+    // The store cannot know what a byte range MEANS -- sections are the format's idea. So
+    // it records what was asked for, and the caller attributes it using the same footer
+    // the reader used. That keeps the accounting honest without teaching the blob layer
+    // about segments.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(2);
+    let v = s.as_tenant(t);
+    v.put(&k("seg"), Bytes::from(vec![0u8; 4096]))
+        .await
+        .unwrap();
+
+    s.record_ranges();
+    v.get_range(&k("seg"), 100..200).await.unwrap();
+    v.get_range(&k("seg"), 3000..3100).await.unwrap();
+    v.get_suffix(&k("seg"), 42).await.unwrap();
+
+    let log = s.ranges();
+    assert_eq!(log.len(), 3, "got {log:?}");
+    assert_eq!(log[0], (k("seg"), 100..200));
+    assert_eq!(log[1], (k("seg"), 3000..3100));
+    // A suffix read is resolved to the range it actually moved, or it cannot be attributed
+    // to a section at all -- and the footer is always read as a suffix.
+    assert_eq!(log[2], (k("seg"), 4054..4096));
+
+    // Bytes in a named span, which is what a section assertion needs.
+    assert_eq!(s.bytes_in(&k("seg"), 0..1000), 100);
+    assert_eq!(s.bytes_in(&k("seg"), 1000..4096), 142);
 }
