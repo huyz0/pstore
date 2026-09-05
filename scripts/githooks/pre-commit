@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Refuse a commit whose tree does not pass the gates.
+#
+# ⚠️ This exists because I committed on red three times in one session, each time the same
+# way: `./scripts/gates.sh > log; echo "exit=$?"; git commit ...`. Reading the exit status
+# into an echo consumes it, so the commit runs unconditionally -- and the first two times a
+# pipe into `tail` did the same thing. AGENTS.md already says "never commit a tree you know
+# is broken". The rule was known, stated, and broken anyway.
+#
+# Rung 3 of the gate-design ladder: the rule is a predicate over the tree, so nobody --
+# human or agent -- should be asked to remember it. An instruction that says "remember to
+# check" is the rung the ladder exists to climb down from.
+#
+# Install:  git config core.hooksPath scripts/githooks
+# Bypass:   git commit --no-verify   (deliberate, visible, and rare)
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+if [[ -n "${PSTORE_SKIP_GATES:-}" ]]; then
+    echo "pre-commit: skipped by PSTORE_SKIP_GATES" >&2
+    exit 0
+fi
+if ! ./scripts/gates.sh; then
+    echo >&2
+    echo "pre-commit: REFUSED -- gates are red. Fix them, or --no-verify deliberately." >&2
+    exit 1
+fi
