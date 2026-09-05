@@ -133,3 +133,42 @@ async fn the_auditor_forwards_the_whole_contract() {
     let r = pstore_testkit::conformance::run(&a, 700).await;
     assert!(r.conforms(), "divergences: {:?}", r.divergences());
 }
+#[test]
+fn choose_covers_its_whole_range() {
+    // ⚠️ A scheduler whose "choice" is biased explores far less than the seed count
+    // suggests, and every scenario built on it silently tests one interleaving many times
+    // instead of many once. Determinism tests cannot see this: a broken mixer is still
+    // perfectly deterministic.
+    let mut sim = Sim::new(7);
+    let mut hits = [0usize; 8];
+    for _ in 0..8_000 {
+        hits[sim.choose(8)] += 1;
+    }
+    for (i, n) in hits.iter().enumerate() {
+        assert!(
+            (700..=1300).contains(n),
+            "choose(8) returned {i} {n} times in 8000 draws; the mixer is skewed: {hits:?}"
+        );
+    }
+}
+
+#[test]
+fn shuffle_can_move_every_element_to_every_position() {
+    // A shuffle with an off-by-one in its index never places an element at one end, so a
+    // whole class of orderings is unreachable and the scenarios that need them never run.
+    let mut seen = [[false; 6]; 6];
+    for seed in 0..400u64 {
+        let mut sim = Sim::new(seed);
+        let mut items = [0usize, 1, 2, 3, 4, 5];
+        sim.shuffle(&mut items);
+        for (pos, v) in items.iter().enumerate() {
+            seen[*v][pos] = true;
+        }
+    }
+    for (v, positions) in seen.iter().enumerate() {
+        assert!(
+            positions.iter().all(|p| *p),
+            "value {v} never reached some position: {positions:?}"
+        );
+    }
+}

@@ -269,3 +269,137 @@ fn the_retry_delay_is_exponential_and_capped() {
     // Capped, so a pathological attempt count cannot wait for days.
     assert_eq!(pstore_blob::retry_delay(16), pstore_blob::retry_delay(99));
 }
+
+#[tokio::test]
+async fn a_fault_rate_of_one_injects_on_every_call_and_zero_on_none() {
+    // ⚠️ The boundaries of the injector's own probability comparisons. Every scenario in
+    // the workspace that says "no faults" or "always fails" depends on `r < rate` being
+    // exactly that: `<=` makes a rate of 0.0 fire whenever the draw is 0.0, and a test
+    // configured for a clean store would inject anyway, occasionally, for reasons no one
+    // could find. Mutation testing found nothing distinguished the two.
+    let clean = Faulty::new(MemoryStore::new(), 5, Faults::none());
+    clean.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    for _ in 0..500 {
+        clean.get(&k("a")).await.unwrap();
+        clean.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+        clean
+            .put_conditional(&k("b"), Bytes::from_static(b"y"), Precondition::NotExists)
+            .await
+            .ok();
+    }
+
+    let always_read = Faulty::new(
+        MemoryStore::new(),
+        5,
+        Faults {
+            read_error: 1.0,
+            ..Faults::none()
+        },
+    );
+    for _ in 0..200 {
+        assert!(always_read.get(&k("a")).await.is_err());
+    }
+
+    let always_write = Faulty::new(
+        MemoryStore::new(),
+        5,
+        Faults {
+            write_error: 1.0,
+            ..Faults::none()
+        },
+    );
+    for _ in 0..200 {
+        assert!(
+            always_write
+                .put(&k("a"), Bytes::from_static(b"x"))
+                .await
+                .is_err()
+        );
+    }
+
+    let always_lost = Faulty::new(
+        MemoryStore::new(),
+        5,
+        Faults {
+            cas_lost: 1.0,
+            ..Faults::none()
+        },
+    );
+    for _ in 0..200 {
+        assert!(matches!(
+            always_lost
+                .put_conditional(&k("a"), Bytes::from_static(b"x"), Precondition::NotExists)
+                .await,
+            Err(CasError::Lost)
+        ));
+    }
+
+    let always_contended = Faulty::new(
+        MemoryStore::new(),
+        5,
+        Faults {
+            cas_contended: 1.0,
+            ..Faults::none()
+        },
+    );
+    for _ in 0..200 {
+        assert!(matches!(
+            always_contended
+                .put_conditional(&k("a"), Bytes::from_static(b"x"), Precondition::NotExists)
+                .await,
+            Err(CasError::Contended)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn injected_faults_land_at_roughly_the_rate_asked_for() {
+    // A rate is a contract, not a hint. If the injector's mixer is broken the draws bunch
+    // up, a "20%" scenario injects 2% or 90%, and every conclusion drawn from it is about
+    // a different experiment than the one described.
+    let s = Faulty::new(
+        MemoryStore::new(),
+        42,
+        Faults {
+            read_error: 0.25,
+            ..Faults::none()
+        },
+    );
+    s.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    let n = 4000;
+    let failed = {
+        let mut c = 0;
+        for _ in 0..n {
+            if s.get(&k("a")).await.is_err() {
+                c += 1;
+            }
+        }
+        c
+    };
+    assert!(
+        (850..=1150).contains(&failed),
+        "asked for 25% of {n}, got {failed}"
+    );
+}
+
+#[tokio::test]
+async fn slow_down_first_n_covers_exactly_the_first_n_operations() {
+    // An off-by-one here changes "the first attempt fails" into "the first two do", which
+    // silently shifts every retry-count assertion built on it.
+    let s = Faulty::new(
+        MemoryStore::new(),
+        1,
+        Faults {
+            slow_down_first_n: 3,
+            ..Faults::none()
+        },
+    );
+    for i in 1..=3 {
+        assert!(
+            matches!(s.get(&k("a")).await, Err(BlobError::SlowDown)),
+            "operation {i} should have been throttled"
+        );
+    }
+    // The fourth is past the window, so it reaches the store and gets an honest 404.
+    assert!(matches!(s.get(&k("a")).await, Err(BlobError::NotFound(_))));
+}

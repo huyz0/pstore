@@ -37,7 +37,7 @@ async fn the_suite_survives_a_backend_that_fails_everything() {
     // It must report, not panic and not hang.
     let r = conformance::run(&broken(), 100).await;
     assert!(!r.conforms());
-    assert_eq!(r.probes.len(), 9);
+    assert_eq!(r.probes.len(), 10);
     assert!(
         r.probes.iter().any(|p| p.outcome == Support::Unsupported),
         "a backend that refuses every write is Unsupported, not merely Divergent"

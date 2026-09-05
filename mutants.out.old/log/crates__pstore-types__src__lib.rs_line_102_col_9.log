@@ -26,28 +26,28 @@
 
 
 *** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=pstore-types@0.1.0
-       Dirty pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-zLaeUx.tmp/crates/pstore-types): couldn't read metadata for file `target/debug/deps/libpstore_types-c19df0e60947a156.rlib`
-   Compiling pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-zLaeUx.tmp/crates/pstore-types)
-     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps`
-     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps`
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
-  Executable `/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
+       Dirty pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-kKE8d1.tmp/crates/pstore-types): couldn't read metadata for file `target/debug/deps/libpstore_types-c19df0e60947a156.rlib`
+   Compiling pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-kKE8d1.tmp/crates/pstore-types)
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+  Executable `/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
 
 *** result: Success
 
 *** /home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=pstore-types@0.1.0
-       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-zLaeUx.tmp/crates/pstore-types)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
-     Running `/tmp/cargo-mutants-pstore-zLaeUx.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
+       Fresh pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-kKE8d1.tmp/crates/pstore-types)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running `/tmp/cargo-mutants-pstore-kKE8d1.tmp/target/debug/deps/pstore_types-ac8d1ba0068fec8f`
 
 running 7 tests
-test tests::cas_tag_round_trips_without_interpretation ... FAILED
-test tests::cas_tags_compare_only_by_equality ... ok
 test tests::cas_failure_distinguishes_lost_from_contended ... ok
+test tests::cas_tags_compare_only_by_equality ... ok
+test tests::cas_tag_round_trips_without_interpretation ... FAILED
 test tests::epoch_orders_and_advances ... ok
 test tests::seq_orders_and_saturates ... ok
-test tests::identifiers_are_distinct_types ... ok
 test tests::epoch_saturates_rather_than_wrapping ... ok
+test tests::identifiers_are_distinct_types ... ok
 
 failures:
 
@@ -63,7 +63,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 failures:
     tests::cas_tag_round_trips_without_interpretation
 
-test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 error: test failed, to rerun pass `-p pstore-types --lib`
 

@@ -237,6 +237,29 @@ async fn probe_suffix_read<S: BlobStore>(s: &S, run: u64) -> Support {
     }
 }
 
+/// `get_tag` — the rebase step of the commit protocol.
+///
+/// Every decorator forwards it and nothing else probed it, so a decorator that answered
+/// `None` unconditionally passed the whole suite. A commit conditioned on `None` becomes a
+/// create-if-absent, which on an existing key fails forever: the tenant simply stops being
+/// able to commit.
+async fn probe_get_tag<S: BlobStore>(s: &S, run: u64) -> Support {
+    let key = k(run, "tag");
+    if s.get_tag(&key).await.is_some() {
+        return Support::Divergent("an absent key reported a tag".to_owned());
+    }
+    let Ok(put) = s.put(&key, Bytes::from_static(b"1")).await else {
+        return Support::Unsupported;
+    };
+    match s.get_tag(&key).await {
+        None => Support::Divergent("an existing key reported no tag".to_owned()),
+        Some(t) if t == put.tag => Support::Supported,
+        Some(_) => {
+            Support::Divergent("the tag did not match the one the write returned".to_owned())
+        }
+    }
+}
+
 async fn probe_missing_key<S: BlobStore>(s: &S, run: u64) -> Support {
     // A 404 is a NORMAL answer, not an error: it is what bounds the WAL lane during
     // forward probing. A backend that hangs or 500s here breaks tail discovery.
@@ -292,6 +315,10 @@ pub async fn run<S: BlobStore>(s: &S, run_id: u64) -> Report {
         Probe {
             name: "coalesced_read",
             outcome: probe_coalesced_read(s, run_id).await,
+        },
+        Probe {
+            name: "get_tag",
+            outcome: probe_get_tag(s, run_id).await,
         },
         Probe {
             name: "missing_key_is_an_error",
