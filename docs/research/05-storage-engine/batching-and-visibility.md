@@ -344,7 +344,7 @@ differentiator, and it falls out of routing we already do.
 
 | Hazard | Mitigation |
 |---|---|
-| **Loss window in `batched` mode** | Un-flushed writes survive R−1 node failures but not simultaneous loss of all R (e.g. an AZ). Document it precisely; `durable` mode remains available per request. |
+| **Loss window in `batched` mode** | Memtable replication is **AZ-local** (cross-AZ would cost ~$104k/month at 1 GB/s), so the documented loss window is **"one AZ, up to `T` seconds"**, not "one node". State this plainly in the API docs; `durable` remains one parameter away, and an opt-in `batched_az_redundant` tier is available. See [`../04-cluster/az-topology.md`](../04-cluster/az-topology.md) §5. |
 | **Memory pressure from many memtables** | Global buffer budget with per-tenant caps (Design rule 13); spill to local NVMe; force-fold under pressure. |
 | **Cross-tenant data in one object** | Per-index encryption keys applied per byte range; access control at the range, never the object. **Must be designed in, not added later.** |
 | **Bundle GC** | A bundle is referenced by many indexes; delete only when all are folded. Enforce with a TTL plus forced fold on approach to expiry. |

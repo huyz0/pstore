@@ -171,6 +171,8 @@ is warm and the ANN data is cold, exact scan may be both faster and more accurat
 | Rebalancing | none — nodes own nothing |
 | Failover | none — no ownership to fail over |
 | Split-brain resolution | none — both partitions serve correctly, at lower cache hit rate |
+| Cross-AZ replication | **none needed — S3 Standard already spans ≥3 AZs, and access is free.** An AZ loss degrades to a cold-start event, not a data event |
+| Per-tenant state propagation | committer unicasts to computed placements; never flooded |
 
 **Invariant I1:** *No node ever mutates an object another node might read, and every state
 transition is a CAS on a single key conditioned on the exact version the actor observed.*
@@ -213,6 +215,7 @@ transition is a CAS on a single key conditioned on the exact version the actor o
 | Warm latency doesn't reach 10 ms | OQ-75 | It's a compute problem; SIMD + zero-copy + Tokio/rayon split |
 | Cold-query ratio too high in practice | OQ-57 | Shadow warming, persistent NVMe cache, warm API |
 | Bundle recovery could miss un-folded records after node death or placement change | [OQ-91](../00-plan/open-questions.md) | Simulator proof in M2 — if this fails, cross-index bundling is unsafe and the cost argument collapses |
+| Inter-AZ or NAT misconfiguration silently multiplies cost 10–100× | [az-topology](../04-cluster/az-topology.md) | Startup assertion on the S3 route; alarm on any non-zero cross-AZ byte count |
 | Cross-tenant data sharing one object may be a compliance blocker | OQ-87 | Per-byte-range encryption; **validate with customers before building** |
 | `A` (active indexes/s) is unknown within 50× | [OQ-92](../00-plan/open-questions.md) | Sets how much the write-cohort design is worth; instrument a pilot tenant |
 | S3 Vectors commoditizes the category | — | Compete on hybrid + filtering + warm latency + BYOC, not on $/GB |

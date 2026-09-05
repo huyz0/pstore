@@ -62,9 +62,12 @@ past the token.
 2. **Jittered, demand-driven revalidation.** Only nodes actually serving an index poll it,
    at a rate derived from that index's observed query rate, with per-node jitter. A cold
    index is polled by nobody.
-3. **Piggybacked epoch hints.** A node that observes a new epoch gossips it (see
-   `04-cluster/membership.md`). Most nodes learn about a change without polling. Gossip is a
-   *hint* only — never trusted for correctness, only used to trigger a revalidation early.
+3. **Direct epoch notification.** The node that won the CAS computes `placements(tenant)` —
+   the same pure function used to route reads — and **unicasts** the hint to those R nodes.
+   Not gossip: flooding epochs to 10,000 nodes would cost ~$355k/month in cross-AZ transfer
+   versus ~$107 for targeted notification. The hint triggers an early revalidation; a node
+   **never serves state it learned from a peer**. See
+   [`../04-cluster/epoch-propagation.md`](../04-cluster/epoch-propagation.md).
 
 **Worst case cost:** an index served by *k* nodes at *q* QPS revalidates at most
 `min(k × poll_rate, ...)` reads/s — bounded, and each is a 304.

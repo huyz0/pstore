@@ -89,6 +89,16 @@ Mitigations for the scale-out cache dip:
   owner fetches from the blob store (not from the peer — peer-to-peer transfer would create
   the coupling we are trying to avoid).
 
+## Revision: one placement ring **per AZ**
+
+D-24 below prefers same-AZ placements. That is now stronger: each AZ runs its **own independent
+ring**, and a request is routed, forwarded, fanned out, and served entirely within the AZ it
+arrived in. Cross-AZ transfer at $0.02/GB round trip would otherwise dominate every other cost
+in the system — query fan-out alone is ~$166k/month at 10k QPS if it crosses AZs, versus
+~$14k/month for the entire blob-store bill. See [`az-topology.md`](az-topology.md).
+
+The cost is per-AZ cache duplication, which is free because capacity never binds.
+
 ## Revision: session tokens carry routing hints
 
 A client's session token names the nodes that were warm for its indexes

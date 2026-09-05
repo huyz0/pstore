@@ -71,10 +71,14 @@ Concretely:
   rate. When the partition heals, gossip merges. **There is no split-brain to resolve** —
   a direct dividend of Design rule 9.
 
-### Scaling gossip past 10K
-If a single flat mesh becomes the bottleneck, shard the mesh by **zone/rack**, with a small
-number of cross-zone relays, so per-node fanout stays constant. This is standard practice
-and can be deferred; 10K flat is within demonstrated limits.
+### Zone-sharded gossip is required, not optional
+Shard the mesh by **AZ**, with a small number of cross-AZ relays, so per-node fanout stays
+constant *and* cross-AZ chatter stays negligible. This was framed as a scaling option; per
+[`az-topology.md`](az-topology.md) it is a **cost requirement** — cross-AZ traffic is
+$0.02/GB round trip and any flat-mesh chatter is billed.
+
+Note also that per-tenant state (epoch changes) is **not** gossiped at all — the committer
+computes the placements and unicasts them. See [`epoch-propagation.md`](epoch-propagation.md).
 
 ## Node identity
 

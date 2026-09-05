@@ -58,6 +58,10 @@ Each is tracked to a document. `Q` = question, `D` = the doc that answers it.
 - **Q16** What is the on-disk (on-blob) layout? LSM levels vs. tiered vs. delta-on-base; file formats; column layout; how a single blob is structured for ranged reads. → `05-storage-engine/file-format-and-layout.md`
 - **Q17** Compaction: policy, who runs it, how it is scheduled without a master, and its blob-request cost. → `05-storage-engine/compaction.md`
 - **Q18** Deletes, updates, MVCC, tombstones, TTL, and index branching/copy-on-write. → `05-storage-engine/mutations-and-mvcc.md`
+- **Q41** How do we avoid inter-AZ transfer cost, and survive an AZ loss? →
+  `04-cluster/az-topology.md`
+- **Q40** How do we spread news of a new generation as best-effort, off the query critical
+  path? → `04-cluster/epoch-propagation.md`
 - **Q39** How do we support dense + sparse vectors now and full-text later without a data
   migration? → `06-indexing/modalities-and-sequencing.md`
 - **Q38** How does the API protocol deliver read-your-writes and warm routing? →

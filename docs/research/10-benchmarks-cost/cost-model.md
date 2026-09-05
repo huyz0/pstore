@@ -109,6 +109,23 @@ becomes the dominant per-index PUT cost, which is why it must be size-driven rat
 timed. Idle indexes cost zero.
 → [`../05-storage-engine/batching-and-visibility.md`](../05-storage-engine/batching-and-visibility.md)
 
+## The line item that dwarfs all of these if you get it wrong
+
+Every figure above assumes traffic stays inside an AZ and blob access uses an S3 gateway
+endpoint. Neither is automatic:
+
+| Mistake | Cost at moderate scale |
+|---|---|
+| Query fan-out crossing AZs (10k QPS) | **$165,888/month** |
+| Memtable replication across AZs (1 GB/s) | **$103,680/month** |
+| Flooded epoch gossip | **$355,208/month** |
+| Blob traffic via NAT gateway instead of a gateway endpoint (1 GB/s) | **$116,640/month** |
+| *All of them done right* | **$0** |
+
+Against a total blob-store bill of ~$14,000/month for 50M indexes, **networking
+misconfiguration is a 10–100× cost multiplier that produces no error message.**
+→ [`../04-cluster/az-topology.md`](../04-cluster/az-topology.md)
+
 ## The three conclusions
 
 1. **Compute dominates, not storage or requests.** Once batching and caching are right, the
