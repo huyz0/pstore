@@ -21,8 +21,16 @@ milestone that has real storage — not as a task, because it is blocked on M0b.
   `pstore-index-vec`**: the standing constraint is "modularized but not too many", and a
   quantizer with no index to serve is not independently useful. Split it when something
   else needs the codes; sparse impact scoring is the likely trigger.
-- Segment **sections** for `rabitq` (1-bit) and `sq8` (int8) codes, plus a **centroid**
-  section, all addressed from the footer.
+- Segment **sections** for `rabitq` (1-bit) and `sq8` (int8) codes, addressed from the
+  footer.
+- A **centroid object**, keyed deterministically from the manifest — *not* a section of the
+  segment. ⚠️ Corrected from this spec's second draft, which had centroids riding with the
+  footer-addressed index section. That only buys a round while the table fits one suffix
+  read: 63 int8 centroids at 384d is 24 KB against an 8 KiB budget already shared with the
+  block index, and `vector-index-survey.md` sizes the production table at ~768 MB. As its
+  own object it is fetched **in parallel with the segment footer** — width, not depth — and
+  it gets the separate cache class D-9 asks for, which a section inside a segment cannot
+  have.
 - **Byte accounting per section** in `pstore-blob`, alongside the existing request counter.
   Criteria 4 and 7 are unassertable without it: today nothing records how many bytes a
   query moved, or which section they came from.
@@ -58,7 +66,9 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 | Default oversample | **8×** | Mid-range of the corpus's 4–32. |
 | Posting list target | **4,000** vectors | `vector-index-survey.md` sizing; ≈192 KB of 1-bit codes at 384d. |
 | Recall floor | **recall@10 ≥ 0.90** | The low end of the roadmap's 90–95%. |
-| Byte ceiling | **≤8 MB fetched per query** at the defaults | Probing all 63 lists costs ~12 MB, so the ceiling binds against "probe everything". |
+| Default rerank mode | **`none`** | Pinned because the byte ceiling is meaningless without it. D-11: rung 0 alone typically reaches 90–95% recall@10. |
+| Byte ceiling | **≤8 MB fetched per query** at the defaults, i.e. at `rerank: none` | p=16 × 4,000 × 48 B ≈ 3.07 MB. Probing all 63 lists costs ~12.1 MB, so the ceiling binds against "probe everything" with real headroom. |
+| Augmentation margin | **≥5 points of recall@10 at `p` = 2** | Boundary augmentation only shows up at small `p`; a margin chosen after measuring is not a criterion. |
 | Balance bound | no list > **4× the mean** | On a dataset with 10:1 density skew. |
 | Bound confidence | **δ = 1e-3**, 384d, fixed seed | RaBitQ's bound is probabilistic; asserted on the empirical failure rate over ≥10,000 pairs, not per-pair. |
 
@@ -76,16 +86,20 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 5. **Recall@10 ≥ 0.90 *and* ≤8 MB fetched**, at the stated defaults, on the stated dataset,
    against exact brute force. **One criterion, not two** — recall bought with unbounded
    bytes is not recall (`evaluation-methodology.md`).
-6. **Depth, measured from `HEAD` and not from an already-open index:** `rerank: none` and
-   `rerank: fast` cost **≤3 sequential** blob rounds; `rerank: exact` costs **≤4**, and that
-   fourth round is what the client is buying. ⚠️ This is the one place the milestone spends
-   more than the three-round budget, and it does so only on explicit request.
+6. **Depth, measured from `HEAD`, on the gate dataset** — not on a small fixture, because
+   that is exactly how M1's own depth invariant came to hold only at fixture scale
+   (corrected in `docs/milestones/M1/VERIFIED.md`). `rerank: none` costs **≤3 sequential**
+   rounds; each rerank rung beyond 0 costs **exactly one more**, and a query uses at most
+   one. ⚠️ `rerank: fast` and `exact` therefore spend a fourth round, on explicit request
+   only. Reranking inside round 3 was considered and rejected: it means fetching `sq8` for
+   all p × 4,000 = 64,000 candidates — ~24.6 MB, three times the byte ceiling — where a
+   fourth round fetches it for the ~80 survivors, about 30 KB.
 7. **`p` is free in depth**: probing 64 lists costs the same sequential depth as 8, and more
    bytes — both asserted.
 8. **The rerank knob is real** (D-12): `none | fast | exact` give non-decreasing recall and
    non-decreasing bytes on the same query set.
-9. **Boundary augmentation earns its size**: at a deliberately small `p` (2), recall with
-   augmentation exceeds recall without it by a stated margin on the same index.
+9. **Boundary augmentation earns its size**: at `p` = 2, recall@10 with augmentation
+   exceeds recall without it by **≥5 points** on the same index.
 10. **Query-aware pruning earns its complexity**: an easy query (near a centroid) fetches
     strictly fewer bytes than a hard one (equidistant between centroids), same `p`.
 11. **D-10 holds and is the only switch**: below 25,000 vectors an index answers by brute
@@ -105,11 +119,11 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 | 3 | `int8_rerank_beats_one_bit_on_the_same_pairs` | a rerank rung that does not rerank |
 | 4 | `rerank_none_reads_no_sq8_or_float_bytes` | sections merged, so rung 0 pays for precision it discards |
 | 5 | `recall_at_ten_meets_the_floor_inside_the_byte_ceiling` | recall regression, and recall bought with unbounded bytes |
-| 6 | `a_cold_ann_query_from_head_costs_three_rounds` | a data-dependent chain creeping into search |
-| 6 | `exact_rerank_costs_exactly_one_more_round` | an unadvertised fourth round on the default path |
+| 6 | `a_cold_ann_query_from_head_costs_three_rounds_at_gate_scale` | a data-dependent chain in search, **and** a depth test that only holds on a small fixture |
+| 6 | `each_rerank_rung_costs_exactly_one_more_round` | an unadvertised extra round on the default path |
 | 7 | `probing_more_lists_costs_bytes_not_depth` | posting lists fetched in a loop |
 | 8 | `the_rerank_knob_trades_bytes_for_recall_monotonically` | a knob wired to nothing |
-| 9 | `augmentation_lifts_recall_at_a_small_probe_count` | augmentation written but never consulted |
+| 9 | `augmentation_lifts_recall_by_five_points_at_p_two` | augmentation written but never consulted |
 | 10 | `an_easy_query_fetches_less_than_a_hard_one` | pruning that prunes nothing |
 | 11 | `a_small_index_answers_exactly_and_builds_no_index` | building an ANN index nobody needs |
 | 11 | `the_threshold_is_the_only_thing_that_switches_paths` | a silent fallback hiding a broken ANN path |
@@ -118,18 +132,20 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 
 ## RA budget
 
-Measured **from `HEAD`**, because that is what a client experiences. M1 already spends
-≤2 rounds opening an index and a segment, so the query path has one round left; the
-centroid section rides with the footer-addressed index section (D-9), and rungs 0 and 1
-read different byte ranges of the **same** posting-list objects in the **same** round.
+Measured **from `HEAD`**, because that is what a client experiences, and **on the gate
+dataset**, because M1's ≤3 invariant held only at 500 rows and broke at 40,000. HEAD is one
+read (segment refs are inline in it, not behind a second manifest object), and a segment
+now opens in one read at any size — `SegmentWriter` bounds its index section by
+construction. That leaves exactly one round for the query, and the centroid object rides
+*beside* the footer fetch rather than inside it.
 
 | Operation | Budget |
 |---|---|
-| Cold, `rerank: none` or `fast` | HEAD+manifest, open+centroids, `p` lists = **3 depth** |
-| Cold, `rerank: exact` | + 1 Rpar for float32 = **4 depth**, client-requested only |
+| Cold, `rerank: none` | HEAD (1) ∥ {footer, centroids} (2) ∥ `p` lists (3) = **3 depth** |
+| Cold, `rerank: fast` or `exact` | + 1 Rpar over the ~80 survivors = **4 depth**, on request |
 | Warm (centroids and index section cached) | **1 depth** |
 | Small index (exact) | **1 Rpar** = 1 depth beyond open |
-| Build of *n* vectors | *n* Rpar in, **1 W** per segment, 0 LIST |
+| Build of *n* vectors | *n* Rpar in, **1 W** per segment + 1 W centroids, 0 LIST |
 
 ## Risks
 
@@ -157,7 +173,7 @@ read different byte ranges of the **same** posting-list objects in the **same** 
 | M3.4 | Segment sections: `rabitq`, `sq8`, `centroids`, footer-addressed |
 | M3.5 | Balanced clustering: centroid selection, assignment, balance bound |
 | M3.6 | Boundary augmentation |
-| M3.7 | Posting-list layout; centroids ride with the index section |
+| M3.7 | Posting-list layout; the centroid object and its parallel fetch |
 | M3.8 | ANN search: probe, `p` lists in parallel, rerank ladder, query-aware pruning |
 | M3.9 | The D-10 threshold as the single switch |
 | M3.10 | Recall harness and `scripts/recall.sh` as a gate |
