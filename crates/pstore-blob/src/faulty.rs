@@ -157,6 +157,13 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         }
     }
 
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, pstore_types::CasTag), BlobError> {
+        match self.read_fault() {
+            Some(e) => Err(e),
+            None => self.inner.get_with_tag(key).await,
+        }
+    }
+
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
         match self.read_fault() {
             Some(e) => Err(e),

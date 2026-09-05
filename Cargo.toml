@@ -11,6 +11,7 @@ members = [
     "crates/pstore-types",
     "crates/pstore-blob",
     "crates/pstore-format",
+    "crates/pstore-engine",
     "crates/pstore-testkit",
     # Layer 1 - substrate
     # "crates/pstore-blob",      # nothing above may touch object_store directly

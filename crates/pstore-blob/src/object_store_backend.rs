@@ -122,6 +122,18 @@ impl crate::BlobStore for ObjectStoreBackend {
         Ok(got)
     }
 
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+        // One GET: the response carries the ETag, so the pair is atomic by construction
+        // rather than by luck.
+        let r = self
+            .inner
+            .get(&Self::path(key))
+            .await
+            .map_err(Self::map_err)?;
+        let tag = CasTag::new(r.meta.e_tag.clone().unwrap_or_default());
+        Ok((r.bytes().await.map_err(Self::map_err)?, tag))
+    }
+
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
         // `GetRange::Suffix` is `Range: bytes=-N` on the wire. No `head` first.
         let opts = object_store::GetOptions {

@@ -32,7 +32,7 @@ pub struct ShardId(pub u16);
 /// Ordering is the whole point: a reader holding epoch *E* has a complete,
 /// self-consistent immutable view, and a stale writer's CAS fails because it names
 /// an epoch that is no longer current.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Epoch(pub u64);
 
 impl Epoch {
@@ -57,7 +57,7 @@ pub struct LaneId(pub u64);
 
 /// Position within a single [`LaneId`]. Dense and monotonic, so a reader can find the
 /// tail by probing forward rather than listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Seq(pub u64);
 
 impl Seq {

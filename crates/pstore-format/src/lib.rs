@@ -16,9 +16,11 @@
 //! table: the key is enough.
 
 mod codec;
+mod docs;
 mod reader;
 mod writer;
 
+pub use docs::{decode_docs, encode_docs};
 pub use reader::Segment;
 pub use writer::SegmentWriter;
 

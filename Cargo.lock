@@ -458,7 +458,22 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "object_store",
+ "pstore-testkit",
+ "pstore-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "pstore-engine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "pstore-blob",
+ "pstore-format",
  "pstore-testkit",
  "pstore-types",
  "thiserror",
@@ -481,7 +496,9 @@ dependencies = [
 name = "pstore-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "futures-util",
  "pstore-blob",
  "pstore-types",
  "tokio",

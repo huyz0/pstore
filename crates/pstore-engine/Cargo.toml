@@ -1,0 +1,25 @@
+[package]
+name        = "pstore-engine"
+version     = "0.1.0"
+description = "HEAD and the CAS commit protocol, WAL lanes carrying cross-index bundles, and the memtable that makes a write visible before it is folded."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pstore-blob   = { path = "../pstore-blob" }
+pstore-format = { path = "../pstore-format" }
+pstore-types  = { path = "../pstore-types" }
+bytes         = "1"
+thiserror     = "2"
+tokio         = { version = "1", features = ["sync", "rt", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+pstore-testkit = { path = "../pstore-testkit" }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures-util   = { version = "0.3", default-features = false, features = ["std", "alloc"] }

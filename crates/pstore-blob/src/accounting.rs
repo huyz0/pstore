@@ -119,6 +119,11 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         self.inner.get_range(key, range).await
     }
 
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, pstore_types::CasTag), BlobError> {
+        self.bill(OpClass::Read);
+        self.inner.get_with_tag(key).await
+    }
+
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
         self.bill(OpClass::Read);
         self.inner.get_suffix(key, n).await

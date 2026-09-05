@@ -122,6 +122,15 @@ impl crate::BlobStore for MemoryStore {
         Ok(body.slice(range.start as usize..range.end as usize))
     }
 
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+        // Under one lock, so the pair cannot straddle another writer's commit.
+        self.lock()
+            .objects
+            .get(key.as_str())
+            .map(|(b, t)| (b.clone(), t.clone()))
+            .ok_or_else(|| BlobError::NotFound(key.to_string()))
+    }
+
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
         let body = self.get(key).await?;
         let start = (body.len() as u64).saturating_sub(n) as usize;

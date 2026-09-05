@@ -3,6 +3,7 @@
 
 use crate::{BlobError, Capabilities, CasError, Key, Precondition, PutOutcome};
 use bytes::Bytes;
+use pstore_types::CasTag;
 use std::ops::Range;
 
 /// The only way pstore touches durable storage.
@@ -23,10 +24,20 @@ pub trait BlobStore: Send + Sync + 'static {
     /// accidentally implement the naive one-request-per-range version.
     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
         let gap = self.capabilities().coalesce_gap;
+        let plan = crate::coalesce(ranges, gap);
+        // ⚠️ Issued together, not in a loop. Coalescing merges what is NEARBY; ranges far
+        // apart legitimately stay separate fetches, and awaiting each before issuing the
+        // next would make a wide scan cost one round trip per block -- 1.2 s for forty
+        // blocks at 30 ms a hop, and invisible to every functional test because the
+        // answer is identical. Width is free; depth is not.
+        let fetched = futures_util::future::try_join_all(
+            plan.iter().map(|f| self.get_range(key, f.span.clone())),
+        )
+        .await?;
+
         let mut out: Vec<(usize, Bytes)> = Vec::with_capacity(ranges.len());
-        for fetch in crate::coalesce(ranges, gap) {
+        for (fetch, buf) in plan.into_iter().zip(fetched) {
             let base = fetch.span.start;
-            let buf = self.get_range(key, fetch.span.clone()).await?;
             for (i, r) in fetch.serves {
                 let (lo, hi) = ((r.start - base) as usize, (r.end - base) as usize);
                 // Slice, not copy: `Bytes` is refcounted, so the merged buffer is shared
@@ -47,6 +58,14 @@ pub trait BlobStore: Send + Sync + 'static {
     ///
     /// Returns fewer than `n` bytes only when the object is shorter than `n`.
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError>;
+
+    /// The object **and** the tag it had when read, in one operation.
+    ///
+    /// ⚠️ Not `get` followed by `get_tag`. Between two calls another writer can land, so
+    /// the caller would hold old bytes with a new tag — and its CAS would then succeed,
+    /// silently overwriting a commit it never saw. A lost update, and the reason this is
+    /// a required method rather than a convenience.
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError>;
 
     /// The current CAS tag, or `None` if the object is absent.
     ///
