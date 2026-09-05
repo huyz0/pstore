@@ -82,6 +82,17 @@ re-analysis.
 writers, plus the bundle-recovery proof. This is where the architecture is either proven or
 disproven.
 
+> ✅ **Delivered.** See [`docs/milestones/M2/VERIFIED.md`](../../milestones/M2/VERIFIED.md).
+> **The architecture is proven, and OQ-91 failed before it passed** — recovery lost two
+> acknowledged rows because a refused `PUT` still consumed a lane sequence number, turning
+> one transient failure into a permanent, silent truncation of the lane. Fixed, and the
+> obligation it revealed is recorded as
+> [C-2](../00-plan/open-questions.md#c-2--oq-91-recovery-requires-a-dense-lane).
+>
+> ⚠️ **Duplicate-work suppression is NOT delivered.** Compaction is shown to be *safe*
+> under concurrency, not *rare*; suppression depends on placement, which is M4. The line
+> above claims it and this milestone does not.
+
 ### M3 — Vector index (5–7 weeks)
 - `pstore-quant`: RaBitQ + int8 SQ + SIMD kernels (`simsimd`), rerank ladder.
 - `pstore-index-vec`: SPANN-family build — hierarchical balanced clustering, boundary
@@ -165,8 +176,14 @@ parallelism on M3/M5, which are largely independent of M2/M4.
    and more useful, because it says how much headroom we have.) **After M0b:** which side of
    that threshold is reality on? If a single key can't sustain
    even a few writes/second reliably, the partitioned-register plan needs rethinking.
-2. **After M2:** does the simulation find correctness bugs we cannot close? A masterless design
-   that needs a lock service is just a worse design with extra steps.
+2. ~~**After M2:** does the simulation find correctness bugs we cannot close? A masterless
+   design that needs a lock service is just a worse design with extra steps.~~
+   **ANSWERED: no.** The simulation found four real defects — a lane truncated by a
+   consumed-but-unwritten sequence number, a compaction that swallowed a concurrent fold,
+   an unbounded probe loop, and an untested GC guard — and every one was closed without
+   introducing a lock, a lease, or a leader. CAS on a blob remained sufficient throughout.
+   ⚠️ `provisional`: the harness models a writer that stops and a store that refuses. It
+   does not reproduce a kernel, a socket, or a machine losing power mid-`PUT`.
 3. **After M3.5:** does incremental clustering work on immutable storage? If not, the fallback
    is periodic full re-clustering during compaction — more expensive, still viable, but it
    changes the cost model.

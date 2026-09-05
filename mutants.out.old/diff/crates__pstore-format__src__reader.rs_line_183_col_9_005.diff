@@ -1,0 +1,46 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::search -> Result<Vec<(String, f32)>, FormatError> with Ok(vec![("xyzzy".into(), 1.0)])
+@@ -175,42 +175,17 @@
+     pub async fn search<S: BlobStore>(
+         &self,
+         store: &S,
+         key: &Key,
+         query: &[f32],
+         k: usize,
+         filter: Option<&Filter>,
+     ) -> Result<Vec<(String, f32)>, FormatError> {
+-        if k == 0 {
+-            return Ok(Vec::new());
+-        }
+-        let docs = self.scan(store, key, filter).await?;
+-        let mut scored = Vec::with_capacity(docs.len());
+-        for d in docs {
+-            if d.vector.len() != query.len() {
+-                return Err(FormatError::DimensionMismatch {
+-                    expected: d.vector.len(),
+-                    got: query.len(),
+-                });
+-            }
+-            let dist: f32 = d
+-                .vector
+-                .iter()
+-                .zip(query)
+-                .map(|(a, b)| (a - b) * (a - b))
+-                .sum();
+-            scored.push((d.id, dist));
+-        }
+-        // `total_cmp` rather than `partial_cmp`: a NaN from a malformed vector must order
+-        // deterministically instead of making the sort's behaviour undefined. Ties break
+-        // on id so the result is reproducible, which is what lets a reference test exist.
+-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+-        scored.truncate(k);
+-        Ok(scored)
++        Ok(vec![("xyzzy".into(), 1.0)]) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// ⚠️ Delegates rather than duplicating. This was a second decoder for the same wire
+     /// format, byte-identical to `decode_docs` — which means every future change to the
+     /// document encoding had to be made twice, and the day one of them was missed the
+     /// reader and the writer would disagree with no compiler to say so.
+     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+         crate::decode_docs(buf)

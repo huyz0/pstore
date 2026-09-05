@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/sim.rs
++++ replace Sim::chance -> bool with false
+@@ -59,17 +59,17 @@
+         if n == 0 {
+             return 0;
+         }
+         (self.next() % n as u64) as usize
+     }
+ 
+     /// True with probability `p`.
+     pub fn chance(&mut self, p: f64) -> bool {
+-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// A deterministic shuffle, for turning a set of pending actions into an order.
+     pub fn shuffle<T>(&mut self, items: &mut [T]) {
+         for i in (1..items.len()).rev() {
+             let j = self.choose(i + 1);
+             items.swap(i, j);
+         }

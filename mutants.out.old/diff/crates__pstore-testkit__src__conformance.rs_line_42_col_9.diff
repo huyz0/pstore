@@ -1,0 +1,24 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace Report::divergences -> Vec<&Probe> with vec![]
+@@ -34,20 +34,17 @@
+     #[must_use]
+     pub fn conforms(&self) -> bool {
+         self.probes.iter().all(|p| p.outcome == Support::Supported)
+     }
+ 
+     /// The probes that did not.
+     #[must_use]
+     pub fn divergences(&self) -> Vec<&Probe> {
+-        self.probes
+-            .iter()
+-            .filter(|p| p.outcome != Support::Supported)
+-            .collect()
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ fn k(run: u64, s: &str) -> Key {
+     // Namespaced per run so a suite can be pointed at a shared bucket without two runs
+     // colliding -- which is how this will be used against a real cloud in M0b.
+     Key::new(format!("conformance/{run}/{s}"))
+ }

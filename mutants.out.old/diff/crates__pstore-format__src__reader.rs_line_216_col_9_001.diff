@@ -1,0 +1,15 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::decode_block -> Result<Vec<Document>, FormatError> with Ok(vec![Default::default()])
+@@ -208,11 +208,11 @@
+         Ok(scored)
+     }
+ 
+     /// ⚠️ Delegates rather than duplicating. This was a second decoder for the same wire
+     /// format, byte-identical to `decode_docs` — which means every future change to the
+     /// document encoding had to be made twice, and the day one of them was missed the
+     /// reader and the writer would disagree with no compiler to say so.
+     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+-        crate::decode_docs(buf)
++        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+     }
+ }

@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace k -> Key with Default::default()
+@@ -44,17 +44,17 @@
+             .filter(|p| p.outcome != Support::Supported)
+             .collect()
+     }
+ }
+ 
+ fn k(run: u64, s: &str) -> Key {
+     // Namespaced per run so a suite can be pointed at a shared bucket without two runs
+     // colliding -- which is how this will be used against a real cloud in M0b.
+-    Key::new(format!("conformance/{run}/{s}"))
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ async fn probe_create_if_absent<S: BlobStore>(s: &S, run: u64) -> Support {
+     let key = k(run, "cia");
+     if s.put_conditional(&key, Bytes::from_static(b"1"), Precondition::NotExists)
+         .await
+         .is_err()
+     {

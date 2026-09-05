@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace <impl pstore_blob::BlobStore for DepthCounting<S>>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -92,18 +92,17 @@
+ 
+ #[async_trait::async_trait]
+ impl<S: pstore_blob::BlobStore> pstore_blob::BlobStore for DepthCounting<S> {
+     fn capabilities(&self) -> &Capabilities {
+         self.inner.capabilities()
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+-        let _g = self.begin_async().await;
+-        self.inner.get(key).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+         let _g = self.begin_async().await;
+         self.inner.get_range(key, range).await
+     }
+ 
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {

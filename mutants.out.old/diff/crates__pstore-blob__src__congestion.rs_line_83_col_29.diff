@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/congestion.rs
++++ replace + with - in Congested<S>::on_success
+@@ -75,17 +75,17 @@
+     /// Additive increase, and only every few successes, so one lucky request does not
+     /// undo a cut.
+     fn on_success(&self) {
+         let n = self.state.streak.fetch_add(1, Ordering::Relaxed) + 1;
+         if n.is_multiple_of(8) {
+             let cur = self.state.limit.load(Ordering::Relaxed);
+             self.state
+                 .limit
+-                .store((cur + 1).min(self.state.ceiling), Ordering::Relaxed);
++                .store((cur - /* ~ changed by cargo-mutants ~ */ 1).min(self.state.ceiling), Ordering::Relaxed);
+         }
+     }
+ 
+     /// Runs `op`, backing off and retrying while it answers `SlowDown`.
+     async fn with_retry<T, F, Fut>(&self, mut op: F) -> Result<T, BlobError>
+     where
+         F: FnMut() -> Fut,
+         Fut: std::future::Future<Output = Result<T, BlobError>>,

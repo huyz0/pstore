@@ -1,0 +1,26 @@
+--- crates/pstore-testkit/src/sim.rs
++++ replace Sim::next -> u64 with 1
+@@ -38,22 +38,17 @@
+     #[must_use]
+     pub fn steps(&self) -> u64 {
+         self.steps
+     }
+ 
+     /// SplitMix64, written out so determinism is visible in the source rather than
+     /// dependent on a crate's version.
+     fn next(&mut self) -> u64 {
+-        self.steps += 1;
+-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+-        let mut z = self.state;
+-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+-        z ^ (z >> 31)
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// One of `n`, uniformly.
+     ///
+     /// Returns 0 for `n == 0` rather than dividing by zero: an empty choice is a caller
+     /// bug, and panicking inside the scheduler would lose the seed that reproduces it.
+     pub fn choose(&mut self, n: usize) -> usize {
+         if n == 0 {

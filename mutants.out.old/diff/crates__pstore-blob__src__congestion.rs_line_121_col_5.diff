@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/congestion.rs
++++ replace retry_delay -> std::time::Duration with Default::default()
+@@ -113,17 +113,17 @@
+ /// How long to wait before retrying a throttled request.
+ ///
+ /// ⚠️ Split out from the retry loop so it can be checked. Inside the loop its only
+ /// observable was elapsed time, and mutation testing inverted the shift — turning
+ /// exponential backoff into an immediately-collapsing one — without a single test
+ /// noticing. A fleet that all tripped together must not all come back together.
+ #[must_use]
+ pub fn retry_delay(attempt: u32) -> std::time::Duration {
+-    std::time::Duration::from_millis(1u64 << attempt.min(16))
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[async_trait::async_trait]
+ impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
+     fn capabilities(&self) -> &Capabilities {
+         self.inner.capabilities()
+     }
+ 

@@ -1,25 +1,24 @@
 --- crates/pstore-testkit/src/flaky.rs
-+++ replace Flaky::read_gate -> Result<(), BlobError> with Ok(())
-@@ -120,21 +120,17 @@
-     pub fn always_contended() -> Self {
-         Self {
-             always_contended: true,
++++ replace Flaky::never_missing -> Self with Default::default()
+@@ -120,20 +120,17 @@
+             reads_fail: true,
              ..Self::refusing(&[])
          }
      }
  
-     fn read_gate(&self) -> Result<(), BlobError> {
--        if self.reads_fail {
--            self.failures.fetch_add(1, Ordering::Relaxed);
--            return Err(BlobError::Other("injected read failure".to_owned()));
+     /// A store whose `head` always finds the key, so a forward probe never terminates.
+     #[must_use]
+     pub fn never_missing() -> Self {
+-        Self {
+-            never_missing: true,
+-            ..Self::refusing(&[])
 -        }
--        Ok(())
-+        Ok(()) /* ~ changed by cargo-mutants ~ */
++        Default::default() /* ~ changed by cargo-mutants ~ */
      }
- }
  
- #[async_trait::async_trait]
- impl BlobStore for Flaky {
-     fn capabilities(&self) -> &Capabilities {
-         self.inner.capabilities()
-     }
+     /// A store whose conditional writes are always `Contended`.
+     #[must_use]
+     pub fn always_contended() -> Self {
+         Self {
+             always_contended: true,
+             ..Self::refusing(&[])

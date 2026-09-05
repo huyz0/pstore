@@ -1,0 +1,122 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::fold -> Result<Epoch, EngineError> with Ok(Default::default())
+@@ -307,118 +307,17 @@
+     /// behalf of the tenant*, so any node may do it and a successor can fold a dead
+     /// writer's lane without ever having spoken to it. The lanes come from the registry
+     /// and the tails from forward probing — nothing is listed, and nothing is injected.
+     ///
+     /// ⚠️ **Reads the bundles from the blob store, not from memory.** Folding the in-memory
+     /// copy would make the WAL write-only: the objects would be paid for and never read,
+     /// and a process that restarted could not recover a single acknowledged write.
+     pub async fn fold(&self) -> Result<Epoch, EngineError> {
+-        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+-            let at = head::read(&*self.store, self.tenant).await?;
+-            let live = lanes::live(&*self.store, self.tenant).await?;
+-
+-            // Each lane's unfolded span, discovered rather than remembered.
+-            let spans = futures_util::future::try_join_all(live.iter().map(|l| {
+-                let from = at.head.watermarks.get(&l.0).copied().unwrap_or(0);
+-                async move {
+-                    lanes::tail(&*self.store, self.tenant, *l, from)
+-                        .await
+-                        .map(|tail| (*l, from, tail))
+-                }
+-            }))
+-            .await?;
+-
+-            let keys: Vec<(LaneId, Key)> = spans
+-                .iter()
+-                .flat_map(|(lane, from, tail)| {
+-                    (*from..*tail).map(move |n| (*lane, bundle_key(self.tenant, *lane, Seq(n))))
+-                })
+-                .collect();
+-            if keys.is_empty() {
+-                return Ok(at.head.epoch);
+-            }
+-
+-            let bodies =
+-                futures_util::future::try_join_all(keys.iter().map(|(_, k)| self.store.get(k)))
+-                    .await?;
+-
+-            let mut by_index: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+-            for body in &bodies {
+-                for (name, entry) in bundle::read_index(body)? {
+-                    by_index
+-                        .entry(name)
+-                        .or_default()
+-                        .extend(bundle::read_entry(body, &entry)?);
+-                }
+-            }
+-            if by_index.is_empty() {
+-                return Ok(at.head.epoch);
+-            }
+-
+-            let mut next = at.head.clone();
+-            next.epoch = next.epoch.next();
+-            // The ABA guard: two HEADs differing only in content a content-derived tag is
+-            // computed from would otherwise share a tag. Derived from the epoch and lane,
+-            // so it is deterministic and needs no clock.
+-            next.nonce = nonce_for(next.epoch, self.lane);
+-
+-            // One segment per index. Folding every index into one object would make each
+-            // index's ref point at the whole thing, and a scan would return its
+-            // neighbours' rows.
+-            for (idx, docs) in &by_index {
+-                let seg_key = self.segment_key(next.epoch, idx);
+-                let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
+-                for d in docs {
+-                    w.push(d.clone());
+-                }
+-                self.store.put(&seg_key, w.finish()).await?;
+-                next.indexes
+-                    .entry(idx.clone())
+-                    .or_default()
+-                    .push(SegmentRef {
+-                        key: seg_key.as_str().to_owned(),
+-                        rows: docs.len() as u32,
+-                    });
+-            }
+-            // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
+-            // bundles this attempt did not read would drop them permanently — and nothing
+-            // downstream could tell, because the watermark is the only record of what is
+-            // outstanding.
+-            for (lane, _, tail) in &spans {
+-                if *tail > 0 {
+-                    next.watermarks.insert(lane.0, *tail);
+-                }
+-            }
+-            // The bundles just folded are now garbage: their rows live in a segment HEAD
+-            // names. Recorded here rather than deleted here, because a reader holding the
+-            // previous epoch may still be replaying them.
+-            next.graveyard
+-                .entry(next.epoch.0)
+-                .or_default()
+-                .extend(keys.iter().map(|(_, k)| k.as_str().to_owned()));
+-
+-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+-                Ok(epoch) => {
+-                    self.mem().durable.clear();
+-                    *self
+-                        .committed
+-                        .lock()
+-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+-                    return Ok(epoch);
+-                }
+-                Err(EngineError::Lost | EngineError::Contended)
+-                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+-                {
+-                    backoff(self.lane, attempt).await;
+-                }
+-                Err(e) => return Err(e),
+-            }
+-        }
+-        Err(EngineError::Lost)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Reaps objects dereferenced more than `retention` epochs ago.
+     ///
+     /// **Zero LIST.** GC works from the manifest's graveyard, which records each key at
+     /// the epoch it stopped being referenced. Enumerating the bucket would answer a
+     /// different question — what *exists*, rather than what is still reachable — and cost
+     /// a PUT per thousand keys to answer it wrongly.

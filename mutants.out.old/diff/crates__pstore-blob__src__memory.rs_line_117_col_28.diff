@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/memory.rs
++++ replace || with && in <impl crate::BlobStore for MemoryStore>::get_range
+@@ -109,17 +109,17 @@
+             .get(key.as_str())
+             .map(|(b, _)| b.clone())
+             .ok_or_else(|| BlobError::NotFound(key.to_string()))
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+         let body = self.get(key).await?;
+         let len = body.len() as u64;
+-        if range.end > len || range.start > range.end {
++        if range.end > len && /* ~ changed by cargo-mutants ~ */ range.start > range.end {
+             return Err(BlobError::RangeOutOfBounds(range, len));
+         }
+         // `slice` rather than indexing: this crate denies `indexing_slicing`, and the
+         // bounds are checked above where the error is meaningful.
+         Ok(body.slice(range.start as usize..range.end as usize))
+     }
+ 
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {

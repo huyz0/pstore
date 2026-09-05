@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace <impl pstore_blob::BlobStore for DepthCounting<S>>::put -> Result<PutOutcome, BlobError> with Ok(Default::default())
+@@ -122,18 +122,17 @@
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         let _g = self.begin_async().await;
+         self.inner.head(key).await
+     }
+ 
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+-        let _g = self.begin_async().await;
+-        self.inner.put(key, body).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {

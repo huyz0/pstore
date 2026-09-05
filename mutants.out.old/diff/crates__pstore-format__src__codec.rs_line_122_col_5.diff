@@ -1,0 +1,26 @@
+--- crates/pstore-format/src/codec.rs
++++ replace checksum -> u64 with 0
+@@ -114,22 +114,17 @@
+         self.take(n)
+     }
+ }
+ 
+ /// FNV-1a over the index section, so tampering is caught before it is served as data.
+ ///
+ /// Not cryptographic and not meant to be: it detects corruption, not an adversary.
+ pub(crate) fn checksum(bytes: &[u8]) -> u64 {
+-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+-    for b in bytes {
+-        h ^= u64::from(*b);
+-        h = h.wrapping_mul(0x1000_0000_01b3);
+-    }
+-    h
++    0 /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ #[allow(
+     clippy::unwrap_used,
+     reason = "assertions in tests are the reporting mechanism"
+ )]
+ mod tests {

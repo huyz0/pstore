@@ -1,0 +1,76 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::gc -> Result<usize, EngineError> with Ok(0)
+@@ -425,72 +425,17 @@
+     ///
+     /// `retention` is a number of epochs, not a duration. A reader that read HEAD at
+     /// epoch *e* may take arbitrarily long to finish scanning, so what protects it is not
+     /// elapsed time but the guarantee that nothing referenced at *e* is reaped until the
+     /// tenant has committed `retention` further epochs.
+     ///
+     /// Returns how many objects were reaped.
+     pub async fn gc(&self, retention: u64) -> Result<usize, EngineError> {
+-        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+-            let at = head::read(&*self.store, self.tenant).await?;
+-            // Everything dereferenced at an epoch this old is beyond the reach of any
+-            // reader the window promises to protect.
+-            let horizon = at.head.epoch.0.saturating_sub(retention);
+-            let due: Vec<u64> = at
+-                .head
+-                .graveyard
+-                .range(..=horizon)
+-                .map(|(e, _)| *e)
+-                .collect();
+-            if due.is_empty() {
+-                return Ok(0);
+-            }
+-            let live: std::collections::BTreeSet<&str> = at
+-                .head
+-                .indexes
+-                .values()
+-                .flatten()
+-                .map(|r| r.key.as_str())
+-                .collect();
+-            let doomed: Vec<Key> = due
+-                .iter()
+-                .filter_map(|e| at.head.graveyard.get(e))
+-                .flatten()
+-                // ⚠️ Checked against what HEAD names *now*, not against what it named when
+-                // the key was buried. Cheap, and the one thing standing between a bug
+-                // anywhere in the commit path and deleting live data.
+-                .filter(|k| !live.contains(k.as_str()))
+-                .map(|k| Key::new(k.clone()))
+-                .collect();
+-
+-            // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
+-            // Pruning first and then failing to delete loses the only record that these
+-            // objects exist, and they leak with nothing left to find them by. Deleting
+-            // first and then failing to prune costs a repeated delete on the next pass,
+-            // which is idempotent.
+-            self.store.delete_batch(&doomed).await?;
+-
+-            let mut next = at.head.clone();
+-            next.epoch = next.epoch.next();
+-            next.nonce = nonce_for(next.epoch, self.lane);
+-            for e in &due {
+-                next.graveyard.remove(e);
+-            }
+-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+-                Ok(_) => return Ok(doomed.len()),
+-                Err(EngineError::Lost | EngineError::Contended)
+-                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+-                {
+-                    backoff(self.lane, attempt).await;
+-                }
+-                Err(e) => return Err(e),
+-            }
+-        }
+-        Err(EngineError::Lost)
++        Ok(0) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Commits an arbitrary edit to HEAD.
+     ///
+     /// Exists for one reason: GC's live-reference guard refuses to reap a key HEAD still
+     /// names, and the commit protocol is supposed to make that state unreachable. A
+     /// defence that cannot be reached cannot be tested, and an untested defence is one
+     /// that quietly stops working — so a test is allowed to construct the state the

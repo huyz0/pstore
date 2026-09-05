@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/types.rs
++++ replace Key::as_str -> &str with "xyzzy"
+@@ -13,17 +13,17 @@
+     #[must_use]
+     pub fn new(s: impl Into<String>) -> Self {
+         Self(s.into())
+     }
+ 
+     /// The key as a string, for the backend.
+     #[must_use]
+     pub fn as_str(&self) -> &str {
+-        &self.0
++        "xyzzy" /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl fmt::Display for Key {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.write_str(&self.0)
+     }
+ }

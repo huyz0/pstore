@@ -1,0 +1,18 @@
+crates/pstore-engine/src/lib.rs:545:9: replace Engine<S>::compact -> Result<Option<Epoch>, EngineError> with Ok(Some(Default::default()))
+crates/pstore-engine/src/lib.rs:545:9: replace Engine<S>::compact -> Result<Option<Epoch>, EngineError> with Ok(None)
+crates/pstore-engine/src/lib.rs:547:25: replace < with > in Engine<S>::compact
+crates/pstore-engine/src/lib.rs:588:16: delete ! in Engine<S>::compact
+crates/pstore-engine/src/lanes.rs:113:5: replace tail -> Result<u64, EngineError> with Ok(1)
+crates/pstore-engine/src/lanes.rs:134:18: replace < with == in tail
+crates/pstore-engine/src/lanes.rs:134:18: replace < with > in tail
+crates/pstore-engine/src/lanes.rs:137:26: replace * with / in tail
+crates/pstore-testkit/src/depth.rs:125:9: replace <impl pstore_blob::BlobStore for DepthCounting<S>>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/depth.rs:125:9: replace <impl pstore_blob::BlobStore for DepthCounting<S>>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/flaky.rs:164:9: replace <impl BlobStore for Flaky>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/flaky.rs:164:9: replace <impl BlobStore for Flaky>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/gated.rs:59:9: replace <impl BlobStore for Gated>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+crates/pstore-testkit/src/gated.rs:68:9: replace <impl BlobStore for Gated>::head -> Result<u64, BlobError> with Ok(0)
+crates/pstore-testkit/src/gated.rs:68:9: replace <impl BlobStore for Gated>::head -> Result<u64, BlobError> with Ok(1)
+crates/pstore-testkit/src/gated.rs:83:46: replace && with || in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:83:93: replace < with == in <impl BlobStore for Gated>::put_conditional
+crates/pstore-testkit/src/gated.rs:83:93: replace < with <= in <impl BlobStore for Gated>::put_conditional

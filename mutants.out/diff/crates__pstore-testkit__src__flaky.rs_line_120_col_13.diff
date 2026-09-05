@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ delete field reads_fail from struct Self expression in Flaky::refusing_reads
+@@ -112,17 +112,17 @@
+         }
+         false
+     }
+ 
+     /// A store whose reads all fail.
+     #[must_use]
+     pub fn refusing_reads() -> Self {
+         Self {
+-            reads_fail: true,
++             /* ~ changed by cargo-mutants ~ */
+             ..Self::refusing(&[])
+         }
+     }
+ 
+     /// A store whose `head` always finds the key, so a forward probe never terminates.
+     #[must_use]
+     pub fn never_missing() -> Self {
+         Self {

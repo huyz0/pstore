@@ -1,0 +1,25 @@
+--- crates/pstore-blob/src/memory.rs
++++ replace <impl crate::BlobStore for MemoryStore>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -99,21 +99,17 @@
+ 
+ #[async_trait::async_trait]
+ impl crate::BlobStore for MemoryStore {
+     fn capabilities(&self) -> &Capabilities {
+         &self.caps
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+-        self.lock()
+-            .objects
+-            .get(key.as_str())
+-            .map(|(b, _)| b.clone())
+-            .ok_or_else(|| BlobError::NotFound(key.to_string()))
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+         let body = self.get(key).await?;
+         let len = body.len() as u64;
+         if range.end > len || range.start > range.end {
+             return Err(BlobError::RangeOutOfBounds(range, len));
+         }

@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/codec.rs
++++ replace Enc::i64 with ()
+@@ -20,17 +20,17 @@
+     }
+     pub(crate) fn u32(&mut self, v: u32) {
+         self.0.extend_from_slice(&v.to_le_bytes());
+     }
+     pub(crate) fn u64(&mut self, v: u64) {
+         self.0.extend_from_slice(&v.to_le_bytes());
+     }
+     pub(crate) fn i64(&mut self, v: i64) {
+-        self.0.extend_from_slice(&v.to_le_bytes());
++        () /* ~ changed by cargo-mutants ~ */
+     }
+     pub(crate) fn f32(&mut self, v: f32) {
+         self.0.extend_from_slice(&v.to_le_bytes());
+     }
+     pub(crate) fn bytes(&mut self, v: &[u8]) {
+         // Length-prefixed, so a decoder never has to guess where a field ends.
+         self.u32(v.len() as u32);
+         self.0.extend_from_slice(v);

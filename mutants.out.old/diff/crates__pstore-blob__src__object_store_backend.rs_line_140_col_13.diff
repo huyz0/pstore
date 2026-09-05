@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ delete field range from struct object_store::GetOptions expression in <impl crate::BlobStore for ObjectStoreBackend>::get_suffix
+@@ -132,17 +132,17 @@
+             .map_err(Self::map_err)?;
+         let tag = CasTag::new(r.meta.e_tag.clone().unwrap_or_default());
+         Ok((r.bytes().await.map_err(Self::map_err)?, tag))
+     }
+ 
+     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+         // `GetRange::Suffix` is `Range: bytes=-N` on the wire. No `head` first.
+         let opts = object_store::GetOptions {
+-            range: Some(object_store::GetRange::Suffix(n)),
++             /* ~ changed by cargo-mutants ~ */
+             ..Default::default()
+         };
+         self.inner
+             .get_opts(&Self::path(key), opts)
+             .await
+             .map_err(Self::map_err)?
+             .bytes()
+             .await

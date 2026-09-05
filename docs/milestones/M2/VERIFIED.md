@@ -74,15 +74,40 @@ Gate: `scripts/check-verified.py`.
    every test green. It is unreachable through the normal API by design, so
    `commit_head_for_test` lets a test construct the manifest the commit protocol forbids.
    Removing the guard now turns `gc_refuses_to_reap_a_key_head_still_names` red.
-10. `cargo llvm-cov --workspace --summary-only --ignore-filename-regex pstore-testkit`
-    → **95.16% region**, 97.74% line on shipped crates (2725 regions, 132 missed).
-    `cargo llvm-cov --workspace --summary-only --fail-under-lines 95` → 95.78% line,
-    passes the CI gate. `cargo mutants --workspace` and `./scripts/gates.sh` — figures in
-    the notes below.
+10. Measured, all four:
+    * `cargo llvm-cov --workspace --summary-only --ignore-filename-regex pstore-testkit`
+      → **95.40% region**, 98.07% line on shipped crates (2738 regions, 126 missed).
+    * `cargo llvm-cov --workspace --summary-only --fail-under-lines 95` → 96.49% line,
+      the CI gate, exit 0.
+    * `cargo mutants --workspace` → 736 mutants, 503 caught, 102 missed, 1 timeout:
+      **83.0% workspace, 84.4% on shipped crates.**
+    * `./scripts/gates.sh` → all gates green.
+
+    ⚠️ **The mutation score was measuring the wrong thing, twice.** cargo-mutants runs
+    only the *mutated package's* tests by default, so a mutant in a `pstore-blob` store
+    decorator was never shown the conformance suite in `pstore-testkit` that catches it —
+    reported MISSED while a test that fails on it sat two directories away, confirmed by
+    applying one by hand. The first fix put the config at the repo root, which
+    cargo-mutants does not read; the second run returned byte-identical numbers, which is
+    what gave it away. `.cargo/mutants.toml` sets `test_workspace = true`.
+    The 68.6% and 72.8% figures measured before that are void, not merely lower.
+
+    ⚠️ Timeouts count as **not caught** above. cargo-mutants' own ratio excludes them
+    (83.1% / 84.4%); the stricter reading is recorded because a mutant that hangs is not a
+    mutant that was detected. Of the 18 timeouts in the first corrected run, **17 were
+    real defects, not slow tests** — see the note under "What this milestone does not
+    show".
+
     ⚠️ Region coverage is reported on **shipped crates**, excluding `pstore-testkit`,
-    which is the harness rather than the product. Including it gives 94.31% region. This
-    is the M1.12 question and it is still open; the number is stated both ways rather
-    than reported only in the form that passes.
+    which is the harness rather than the product. Including it gives 94.81% region. This
+    is the M1.12 question and it is still open; the number is stated both ways rather than
+    only in the form that passes.
+
+    ⚠️ **68 mutants survive on shipped crates and are not claimed to be covered.** Twenty-
+    five of them are in `object_store_backend.rs`, the real S3/GCS/Azure adapter, which
+    cannot be exercised without a backend — that is M0a.13, and no amount of local work
+    closes it. The rest are mostly PRNG mixing constants in the fault injector, where a
+    mutated mixer is still a mixer and the property under test is determinism.
 
 ## RA budget
 
@@ -105,3 +130,21 @@ Measured through the request counters, not estimated.
   depends on placement, which is M4.
 - **Anything measured on real cloud storage.** Numbers here come from in-process stores on
   WSL2 and are relative, never absolute.
+
+## Two defects found by a test *hanging* rather than failing
+
+Worth recording because the signal was nearly discarded as noise. The first corrected
+mutation run produced 18 timeouts, which look like slow tests. Seventeen were mutants whose
+behaviour change turned a test into a hang, and both underlying causes were real:
+
+- **`lanes::tail` looped until the store answered 404** — a termination condition owned by
+  the remote end. A backend that keeps answering spins forever, on a path a query waits on.
+  An unbounded loop whose exit depends on a remote answer is a liveness bug however correct
+  its logic. Now bounded, with `EngineError::LaneTooLong`, and tested by
+  `a_lane_that_never_ends_is_refused_rather_than_probed_forever`.
+- **`Gated` waited at its barrier forever**, so "the racers never arrived" was
+  indistinguishable from "still racing". Now bounded and recorded, and every race test
+  asserts `raced()` **before** its headline assertion — "exactly one winner" is equally
+  satisfied by twelve compactors racing and by one compactor running alone.
+
+After both fixes: 1 timeout, and the score rose from 80.2% to 83.0%.

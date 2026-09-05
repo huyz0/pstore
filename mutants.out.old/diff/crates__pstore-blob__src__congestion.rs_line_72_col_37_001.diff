@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/congestion.rs
++++ replace / with * in Congested<S>::on_slow_down
+@@ -64,17 +64,17 @@
+         self.state.attempts.load(Ordering::Relaxed)
+     }
+ 
+     /// Multiplicative decrease, floored at one: the limit must never reach zero, or the
+     /// backend can never be probed again and the fall is permanent.
+     fn on_slow_down(&self) {
+         self.state.streak.store(0, Ordering::Relaxed);
+         let cur = self.state.limit.load(Ordering::Relaxed);
+-        self.state.limit.store((cur / 2).max(1), Ordering::Relaxed);
++        self.state.limit.store((cur * /* ~ changed by cargo-mutants ~ */ 2).max(1), Ordering::Relaxed);
+     }
+ 
+     /// Additive increase, and only every few successes, so one lucky request does not
+     /// undo a cut.
+     fn on_success(&self) {
+         let n = self.state.streak.fetch_add(1, Ordering::Relaxed) + 1;
+         if n.is_multiple_of(8) {
+             let cur = self.state.limit.load(Ordering::Relaxed);

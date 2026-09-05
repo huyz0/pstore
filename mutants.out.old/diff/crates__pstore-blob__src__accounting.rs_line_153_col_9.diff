@@ -1,0 +1,22 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace <impl crate::BlobStore for TenantView<S>>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -145,18 +145,17 @@
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+-        self.bill(OpClass::Write);
+-        self.inner.put_conditional(key, body, pre).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         self.bill(OpClass::Delete);
+         self.inner.delete_batch(keys).await
+     }
+ 
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {

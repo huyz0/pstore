@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace > with >= in Engine<S>::fold
+@@ -379,17 +379,17 @@
+                         rows: docs.len() as u32,
+                     });
+             }
+             // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
+             // bundles this attempt did not read would drop them permanently — and nothing
+             // downstream could tell, because the watermark is the only record of what is
+             // outstanding.
+             for (lane, _, tail) in &spans {
+-                if *tail > 0 {
++                if *tail >= /* ~ changed by cargo-mutants ~ */ 0 {
+                     next.watermarks.insert(lane.0, *tail);
+                 }
+             }
+             // The bundles just folded are now garbage: their rows live in a segment HEAD
+             // names. Recorded here rather than deleted here, because a reader holding the
+             // previous epoch may still be replaying them.
+             next.graveyard
+                 .entry(next.epoch.0)

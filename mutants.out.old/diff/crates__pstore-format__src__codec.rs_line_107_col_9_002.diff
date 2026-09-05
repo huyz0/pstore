@@ -1,0 +1,22 @@
+--- crates/pstore-format/src/codec.rs
++++ replace Dec<'a>::bytes -> Result<&'a[u8], FormatError> with Ok(Vec::leak(vec![1]))
+@@ -99,18 +99,17 @@
+     pub(crate) fn f32(&mut self) -> Result<f32, FormatError> {
+         Ok(f32::from_le_bytes(
+             self.take(4)?
+                 .try_into()
+                 .map_err(|_| FormatError::Truncated)?,
+         ))
+     }
+     pub(crate) fn bytes(&mut self) -> Result<&'a [u8], FormatError> {
+-        let n = self.u32()? as usize;
+-        self.take(n)
++        Ok(Vec::leak(vec![1])) /* ~ changed by cargo-mutants ~ */
+     }
+     pub(crate) fn string(&mut self) -> Result<String, FormatError> {
+         String::from_utf8(self.bytes()?.to_vec()).map_err(|_| FormatError::Corrupt("bad utf8"))
+     }
+     pub(crate) fn raw(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
+         self.take(n)
+     }
+ }

@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/gated.rs
++++ replace Gated::raced -> bool with false
+@@ -52,17 +52,17 @@
+     }
+ 
+     /// Whether any writer gave up waiting for peers that never came.
+     ///
+     /// A test asserting on a race must check this: without it, "one winner" is equally
+     /// satisfied by twelve compactors racing and by one compactor running alone.
+     #[must_use]
+     pub fn raced(&self) -> bool {
+-        !self.broke.load(Ordering::SeqCst)
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[async_trait::async_trait]
+ impl BlobStore for Gated {
+     fn capabilities(&self) -> &Capabilities {
+         self.inner.capabilities()
+     }

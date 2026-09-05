@@ -1,0 +1,33 @@
+--- crates/pstore-testkit/src/audit.rs
++++ replace <impl BlobStore for Auditing<S>>::put -> Result<PutOutcome, BlobError> with Ok(Default::default())
+@@ -92,29 +92,17 @@
+         self.inner.get_tag(key).await
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+         self.inner.head(key).await
+     }
+ 
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+-        {
+-            let mut s = self.lock();
+-            // ⚠️ The whole audit. An unconditional PUT over a key that exists overwrites
+-            // bytes a reader may be mid-fetch on, and does so without naming the version it
+-            // believed it was replacing — which is exactly what CAS exists to prevent.
+-            if !s.written.insert(key.as_str().to_owned()) {
+-                s.violations.push(Violation {
+-                    key: key.as_str().to_owned(),
+-                    what: "unconditional overwrite of an existing key",
+-                });
+-            }
+-        }
+-        self.inner.put(key, body).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {

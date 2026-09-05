@@ -1,0 +1,24 @@
+--- crates/pstore-format/src/writer.rs
++++ replace SegmentWriter::push with ()
+@@ -29,20 +29,17 @@
+             blocks: Vec::new(),
+             body: Enc::default(),
+             rows: 0,
+         }
+     }
+ 
+     /// Adds a document, sealing a block when it fills.
+     pub fn push(&mut self, doc: Document) {
+-        self.pending.push(doc);
+-        if self.pending.len() >= self.rows_per_block {
+-            self.seal();
+-        }
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn seal(&mut self) {
+         if self.pending.is_empty() {
+             return;
+         }
+         let offset = self.body.len() as u64;
+         let mut zones: BTreeMap<String, (i64, i64)> = BTreeMap::new();

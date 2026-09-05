@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/object_store_backend.rs
++++ replace <impl crate::BlobStore for ObjectStoreBackend>::capabilities -> &Capabilities with Box::leak(Box::new(Default::default()))
+@@ -85,17 +85,17 @@
+             extensions: object_store::Extensions::default(),
+         }
+     }
+ }
+ 
+ #[async_trait::async_trait]
+ impl crate::BlobStore for ObjectStoreBackend {
+     fn capabilities(&self) -> &Capabilities {
+-        &self.caps
++        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+         self.inner
+             .get(&Self::path(key))
+             .await
+             .map_err(Self::map_err)?
+             .bytes()
