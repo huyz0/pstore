@@ -3,6 +3,7 @@
 
 mod bundle;
 mod head;
+pub mod lanes;
 
 pub use bundle::Entry;
 pub use head::{Head, HeadAt, SegmentRef};
@@ -12,6 +13,16 @@ use pstore_format::{Document, Filter, Segment, SegmentWriter};
 use pstore_types::{Epoch, LaneId, Seq, TenantId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+/// The key one lane's bundle lives at. **Derived**, so a successor computes it rather than
+/// discovering it — which is what keeps recovery off the LIST path.
+#[must_use]
+pub fn bundle_key(tenant: TenantId, lane: LaneId, seq: Seq) -> Key {
+    Key::new(format!(
+        "{:04x}/wal/{}/{:016x}/{:016}.bundle",
+        tenant.0 as u16, tenant.0, lane.0, seq.0
+    ))
+}
 
 /// Rows per block in a folded segment. Small enough that zone maps prune usefully, large
 /// enough that a scan is not one request per handful of rows.
@@ -80,6 +91,14 @@ pub struct Engine<S> {
     /// Next sequence in this lane. Lanes are single-writer, so this needs no coordination
     /// with anyone — which is the entire point of lanes.
     seq: Mutex<Seq>,
+    /// Serialises this lane's flushes against each other.
+    ///
+    /// ⚠️ Not contention control — a lane is single-writer by definition. This *enforces*
+    /// that definition against the one caller who ignores it: two overlapping `flush`
+    /// calls on the same handle would each reserve a sequence and race to write them, and
+    /// a failure of the lower one would leave a gap the tail probe stops at. Cheap to
+    /// hold, because the thing it excludes should never happen.
+    flushing: tokio::sync::Mutex<()>,
     committed: Mutex<Epoch>,
 }
 
@@ -92,6 +111,7 @@ impl<S: BlobStore> Engine<S> {
             lane,
             mem: Mutex::new(Memtable::default()),
             seq: Mutex::new(Seq::ZERO),
+            flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
         }
     }
@@ -112,10 +132,7 @@ impl<S: BlobStore> Engine<S> {
     }
 
     fn lane_key(&self, seq: Seq) -> Key {
-        Key::new(format!(
-            "{:04x}/wal/{}/{:016x}/{:016}.bundle",
-            self.tenant.0 as u16, self.tenant.0, self.lane.0, seq.0
-        ))
+        bundle_key(self.tenant, self.lane, seq)
     }
 
     fn segment_key(&self, epoch: Epoch, index: &str) -> Key {
@@ -135,10 +152,26 @@ impl<S: BlobStore> Engine<S> {
         Ok(())
     }
 
+    /// The ids currently buffered and not yet acknowledged.
+    ///
+    /// Exposed so a recovery test can state precisely which rows a `flush` acknowledges.
+    /// Guessing that from the outside would make the test's own bookkeeping the thing
+    /// under test.
+    #[doc(hidden)]
+    pub async fn pending_for_test(&self) -> Vec<String> {
+        self.mem()
+            .pending
+            .values()
+            .flatten()
+            .map(|d| d.id.clone())
+            .collect()
+    }
+
     /// Writes everything buffered as **one bundle object**, whatever it covers.
     ///
     /// `RA = 1 W` for the batch, and for every index in it.
     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
+        let _lane = self.flushing.lock().await;
         let pending = {
             let mut m = self.mem();
             if m.pending.is_empty() {
@@ -146,19 +179,47 @@ impl<S: BlobStore> Engine<S> {
             }
             std::mem::take(&mut m.pending)
         };
-        let seq = {
+        let seq = *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Registered once, on the lane's first flush. A lane nobody can find is a lane
+        // whose writes cannot be recovered, and the registration is what makes a successor
+        // able to discover it without being told.
+        if seq == Seq::ZERO
+            && let Err(e) = lanes::register(&*self.store, self.tenant, self.lane).await
+        {
+            self.restore(pending);
+            return Err(e);
+        }
+        // The one PUT.
+        if let Err(e) = self
+            .store
+            .put(&self.lane_key(seq), bundle::encode(&pending).into())
+            .await
+        {
+            // ⚠️ **The sequence is not consumed, and this is load-bearing** (OQ-91).
+            //
+            // A lane is recovered by probing forward from the last watermark until a key
+            // is missing, so a lane must be DENSE: the first absent sequence is taken as
+            // the end. Burning a number on a failed write punches a permanent hole, and
+            // every bundle after it — all of them acknowledged, all of them durable —
+            // becomes invisible to every future reader. One refused PUT silently
+            // truncates the lane forever.
+            //
+            // Found by the OQ-91 scenario losing two acknowledged rows on seed 0, not by
+            // reading this code.
+            self.restore(pending);
+            return Err(e.into());
+        }
+        {
             let mut s = self
                 .seq
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cur = *s;
-            *s = s.next();
-            cur
-        };
-        // The one PUT.
-        self.store
-            .put(&self.lane_key(seq), bundle::encode(&pending).into())
-            .await?;
+            *s = seq.next();
+        }
         // Only now does it move from pending to durable: a write that failed to land must
         // not be reported as durable, and must stay visible so it is not lost.
         let mut m = self.mem();
@@ -168,36 +229,61 @@ impl<S: BlobStore> Engine<S> {
         Ok(Some(seq))
     }
 
-    /// Replays this lane's unfolded WAL bundles into segments and commits them.
+    /// Puts a failed flush's rows back in front of anything written since.
     ///
-    /// ⚠️ **Reads the bundles from the blob store, not from memory.** Folding the
-    /// in-memory copy would make the WAL write-only: the objects would be paid for and
-    /// never read, and a process that restarted could not recover a single acknowledged
-    /// write. The memtable exists to make a write *visible*; the bundle is what makes it
-    /// *durable*, and only one of those survives a crash.
-    ///
-    /// Retries a lost CAS by rebasing, which is the protocol: `Lost` means the world
-    /// moved, so the attempt is rebuilt against the world that exists now.
-    pub async fn fold(&self) -> Result<Epoch, EngineError> {
-        let flushed = *self
-            .seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Without this a refused flush would drop the rows it took, which is a silent loss of
+    /// data the caller was never told was durable — worse than the error it reports,
+    /// because the caller's retry would have no way to know what to retry.
+    fn restore(&self, pending: BTreeMap<String, Vec<Document>>) {
+        let mut m = self.mem();
+        for (idx, mut docs) in pending {
+            let slot = m.pending.entry(idx).or_default();
+            // Older rows first: they were written first, and a later write to the same id
+            // must stay later.
+            docs.append(slot);
+            *slot = docs;
+        }
+    }
 
+    /// Replays **every lane's** unfolded WAL bundles into segments and commits them.
+    ///
+    /// ⚠️ Tenant-scoped, not lane-scoped, and that is the point: folding is work done *on
+    /// behalf of the tenant*, so any node may do it and a successor can fold a dead
+    /// writer's lane without ever having spoken to it. The lanes come from the registry
+    /// and the tails from forward probing — nothing is listed, and nothing is injected.
+    ///
+    /// ⚠️ **Reads the bundles from the blob store, not from memory.** Folding the in-memory
+    /// copy would make the WAL write-only: the objects would be paid for and never read,
+    /// and a process that restarted could not recover a single acknowledged write.
+    pub async fn fold(&self) -> Result<Epoch, EngineError> {
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
-            let from = at.head.watermarks.get(&self.lane.0).copied().unwrap_or(0);
-            if from >= flushed.0 {
-                // Nothing of ours is unfolded. Another committer may have moved the epoch
-                // on, which is not our concern.
+            let live = lanes::live(&*self.store, self.tenant).await?;
+
+            // Each lane's unfolded span, discovered rather than remembered.
+            let spans = futures_util::future::try_join_all(live.iter().map(|l| {
+                let from = at.head.watermarks.get(&l.0).copied().unwrap_or(0);
+                async move {
+                    lanes::tail(&*self.store, self.tenant, *l, from)
+                        .await
+                        .map(|tail| (*l, from, tail))
+                }
+            }))
+            .await?;
+
+            let keys: Vec<(LaneId, Key)> = spans
+                .iter()
+                .flat_map(|(lane, from, tail)| {
+                    (*from..*tail).map(move |n| (*lane, bundle_key(self.tenant, *lane, Seq(n))))
+                })
+                .collect();
+            if keys.is_empty() {
                 return Ok(at.head.epoch);
             }
 
-            // Every unfolded bundle in this lane, fetched together: the sequence numbers
-            // are dense and derived, so there is nothing to discover and nothing to list.
-            let keys: Vec<Key> = (from..flushed.0).map(|n| self.lane_key(Seq(n))).collect();
             let bodies =
-                futures_util::future::try_join_all(keys.iter().map(|k| self.store.get(k))).await?;
+                futures_util::future::try_join_all(keys.iter().map(|(_, k)| self.store.get(k)))
+                    .await?;
 
             let mut by_index: BTreeMap<String, Vec<Document>> = BTreeMap::new();
             for body in &bodies {
@@ -228,9 +314,6 @@ impl<S: BlobStore> Engine<S> {
                 for d in docs {
                     w.push(d.clone());
                 }
-                // Keyed by the epoch being attempted, so a retry rewrites the same bytes
-                // at the same key. A loser leaves an orphan that GC reaps, because no HEAD
-                // references it.
                 self.store.put(&seg_key, w.finish()).await?;
                 next.indexes
                     .entry(idx.clone())
@@ -240,12 +323,18 @@ impl<S: BlobStore> Engine<S> {
                         rows: docs.len() as u32,
                     });
             }
-            next.watermarks.insert(self.lane.0, flushed.0);
+            // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
+            // bundles this attempt did not read would drop them permanently — and nothing
+            // downstream could tell, because the watermark is the only record of what is
+            // outstanding.
+            for (lane, _, tail) in &spans {
+                if *tail > 0 {
+                    next.watermarks.insert(lane.0, *tail);
+                }
+            }
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
-                    // Dropped only after the commit lands, so a lost race leaves the rows
-                    // visible from the memtable rather than briefly from nowhere.
                     self.mem().durable.clear();
                     *self
                         .committed
@@ -258,10 +347,8 @@ impl<S: BlobStore> Engine<S> {
                 {
                     // ⚠️ Backoff, and jittered. Without it, optimistic concurrency
                     // LIVELOCKS: every loser retries immediately, collides with the same
-                    // peers, and loses again. It showed up here as a flaky test rather
-                    // than a failing one, which is the more expensive way to find out.
-                    // The jitter is derived from the lane so two writers never wake
-                    // together, and needs no clock or randomness to be reproducible.
+                    // peers, and loses again. It showed up as a flaky test rather than a
+                    // failing one, which is the more expensive way to find out.
                     let base = 1u64 << attempt.min(6);
                     let jitter = (self.lane.0 % 8) + 1;
                     tokio::time::sleep(std::time::Duration::from_micros(base * jitter)).await;
@@ -342,20 +429,6 @@ impl<S: BlobStore> Engine<S> {
         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
         Ok(scored)
-    }
-
-    /// Sets how far this lane has been flushed, so a successor can replay a predecessor's
-    /// bundles.
-    ///
-    /// ⚠️ A stand-in. In production a successor discovers the tail by forward-probing the
-    /// lane and reading the per-shard lane bitmap — neither of which exists until M2 — so
-    /// M1 injects the watermark rather than pretending discovery is solved.
-    #[doc(hidden)]
-    pub fn replay_for_test(&self, flushed: Seq) {
-        *self
-            .seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = flushed;
     }
 
     /// Attempts a commit against a **deliberately stale** view of HEAD.

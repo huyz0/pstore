@@ -101,7 +101,16 @@ async fn the_whole_flow_stays_inside_its_request_budget() {
         .unwrap();
         s.reset();
         e.flush().await.unwrap();
-        assert_eq!(s.requests(), 1, "a batch cost {} PUTs", s.requests());
+        // RA(write batch) = 1 PUT, regardless of how many rows or indexes it carries.
+        // The lane's FIRST flush also registers the lane -- a read of the registry and a
+        // CAS to publish -- which is one-off per lane lifetime, not per batch. Stating it
+        // rather than resetting the counter after it keeps the cost visible.
+        assert_eq!(
+            s.requests(),
+            if batch == 0 { 3 } else { 1 },
+            "a batch cost {} requests",
+            s.requests()
+        );
         e.fold().await.unwrap();
     }
 

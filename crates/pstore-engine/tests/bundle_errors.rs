@@ -13,7 +13,7 @@
 use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_engine::Engine;
 use pstore_format::{Document, Value, decode_docs, encode_docs};
-use pstore_types::{LaneId, Seq, TenantId};
+use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
 
 fn doc(id: &str, n: i64) -> Document {
@@ -107,16 +107,35 @@ async fn a_bundle_with_an_impossible_index_offset_fails_the_fold() {
 }
 
 #[tokio::test]
-async fn a_missing_bundle_fails_the_fold_rather_than_skipping_it() {
-    // Silently skipping a gap in the lane loses every row in it while reporting success.
+async fn a_hole_in_a_lane_bounds_the_tail_rather_than_being_skipped() {
+    // Lanes are dense by construction, so a missing object is a HOLE, not an end. Counting
+    // past it would silently drop every bundle before the next present key while reporting
+    // success; stopping at it means the rows before the hole are still folded and the ones
+    // after are simply not yet visible.
+    use pstore_engine::lanes;
     let s = Arc::new(MemoryStore::new());
     let t = TenantId(42);
     let e = Engine::new(Arc::clone(&s), t, LaneId(1));
-    e.write("idx", vec![doc("a", 1)]).await.unwrap();
-    e.flush().await.unwrap();
-    // Claim a further flush that never happened: seq 1 does not exist.
-    e.replay_for_test(Seq(2));
-    assert!(e.fold().await.is_err());
+    for i in 0..4 {
+        e.write("idx", vec![doc(&format!("d{i}"), i)])
+            .await
+            .unwrap();
+        e.flush().await.unwrap();
+    }
+    // Remove the second bundle, as a torn upload or an over-eager reaper would.
+    s.delete_batch(&[lane_key(t, 1, 1)]).await.unwrap();
+    assert_eq!(
+        lanes::tail(&*s, t, LaneId(1), 0).await.unwrap(),
+        1,
+        "the tail is the hole"
+    );
+
+    e.fold().await.unwrap();
+    let got = e.scan("idx", None).await.unwrap();
+    assert!(
+        got.iter().any(|d| d.id == "d0"),
+        "rows before the hole must still be folded"
+    );
 }
 
 #[tokio::test]

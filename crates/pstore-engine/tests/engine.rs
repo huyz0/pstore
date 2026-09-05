@@ -30,6 +30,10 @@ async fn a_write_batch_costs_exactly_one_put() {
     let t = TenantId(1);
     let e = Engine::new(Arc::new(s.as_tenant(t)), t, pstore_types::LaneId(1));
 
+    // Register the lane first, so the loop measures the batch rather than the one-off.
+    e.write("warm", vec![doc("w", 0)]).await.unwrap();
+    e.flush().await.unwrap();
+
     for size in [1usize, 10, 1000] {
         let before = s.count(t, OpClass::Write);
         let docs: Vec<_> = (0..size).map(|i| doc(&format!("d{i}"), i as i64)).collect();
@@ -44,6 +48,34 @@ async fn a_write_batch_costs_exactly_one_put() {
 }
 
 #[tokio::test]
+async fn a_lane_registration_costs_one_cas_for_the_lane_not_one_per_batch() {
+    // The registration is real, so it is measured rather than waved away: two writes on
+    // the first flush, one on every flush after.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(30);
+    let e = Engine::new(Arc::new(s.as_tenant(t)), t, pstore_types::LaneId(1));
+    e.write("idx", vec![doc("a", 1)]).await.unwrap();
+    let before = s.count(t, OpClass::Write);
+    e.flush().await.unwrap();
+    assert_eq!(
+        s.count(t, OpClass::Write) - before,
+        2,
+        "bundle plus the registration CAS"
+    );
+
+    for _ in 0..5 {
+        e.write("idx", vec![doc("b", 2)]).await.unwrap();
+        let before = s.count(t, OpClass::Write);
+        e.flush().await.unwrap();
+        assert_eq!(
+            s.count(t, OpClass::Write) - before,
+            1,
+            "later flushes are one PUT"
+        );
+    }
+}
+
+#[tokio::test]
 async fn many_indexes_share_one_bundle() {
     // The finding that per-index flushing has a cost floor independent of data volume:
     // one bundle per index restores it. Fifty indexes, one window, one PUT.
@@ -52,6 +84,14 @@ async fn many_indexes_share_one_bundle() {
     let e = Engine::new(Arc::new(s.as_tenant(t)), t, pstore_types::LaneId(1));
     for i in 0..50 {
         e.write(&format!("idx{i}"), vec![doc("d0", i)])
+            .await
+            .unwrap();
+    }
+    // Flush once first so the lane is registered: registration is one CAS per lane
+    // lifetime, and this test is about the per-batch cost of fifty indexes.
+    e.flush().await.unwrap();
+    for i in 0..50 {
+        e.write(&format!("idx{i}"), vec![doc("d1", i)])
             .await
             .unwrap();
     }
@@ -175,7 +215,7 @@ async fn a_stale_committer_is_fenced() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_committers_produce_a_dense_epoch_sequence() {
+async fn concurrent_committers_lose_and_duplicate_nothing() {
     // Linearizability: every commit either applies or rebases, and the epochs it produces
     // are strictly increasing with no gaps and no repeats. A lost update shows up as a
     // gap; a double-apply shows up as a repeat.
@@ -203,19 +243,53 @@ async fn concurrent_committers_produce_a_dense_epoch_sequence() {
     }
     epochs.sort();
     assert_eq!(epochs.len(), 32);
+    // ⚠️ This assertion CHANGED in M2.4 and the reason matters. When `fold` was
+    // lane-scoped, each of the 32 folds necessarily produced a distinct epoch, and
+    // counting them was a cheap proxy for "no commit was lost". `fold` is now
+    // tenant-scoped: a writer folds every live lane's un-folded bundles, so a concurrent
+    // fold legitimately finds nothing left to do and returns the current epoch
+    // unchanged. That collapse is the FEATURE -- it is what lets a successor fold a dead
+    // writer's lane -- so demanding 32 distinct epochs would now be demanding wasted
+    // commits.
+    //
+    // The property the old assertion was protecting is asserted directly below, and more
+    // strongly: every acknowledged row is visible exactly once. A lost update loses a
+    // row; a double-apply duplicates one. Neither can hide behind an epoch count.
     let uniq: std::collections::BTreeSet<_> = epochs.iter().collect();
-    assert_eq!(
-        uniq.len(),
-        32,
-        "an epoch was used twice: a commit was lost or applied twice"
+    assert!(
+        uniq.len() > 1,
+        "no commit made progress at all: {} epochs",
+        uniq.len()
     );
-    for (i, e) in epochs.iter().enumerate() {
-        assert_eq!(*e, Epoch((i + 1) as u64), "epoch sequence has a gap at {i}");
+    // Epochs still advance by exactly one per COMMIT, with no gaps: a gap would mean a
+    // number was consumed without a manifest behind it, which is what a torn commit or a
+    // double increment looks like. What changed is only that a fold may return an epoch
+    // it did not create.
+    let mut ordered: Vec<u64> = uniq.iter().map(|e| e.0).collect();
+    ordered.sort_unstable();
+    for (i, e) in ordered.iter().enumerate() {
+        assert_eq!(*e, (i + 1) as u64, "epoch sequence has a gap at {i}");
     }
 
     // And every document survived: 8 writers x 4 commits.
-    let reader = Engine::new(Arc::clone(&s), t, pstore_types::LaneId(99));
-    assert_eq!(reader.scan("idx", None).await.unwrap().len(), 32);
+    let seen = Engine::new(Arc::clone(&s), t, pstore_types::LaneId(99))
+        .scan("idx", None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = seen.iter().map(|d| d.id.as_str()).collect();
+    let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        32,
+        "a commit was LOST: {} of 32 rows are visible",
+        distinct.len()
+    );
+    assert_eq!(
+        ids.len(),
+        32,
+        "a commit was applied TWICE: {} rows for 32 writes",
+        ids.len()
+    );
 }
 
 #[tokio::test]
@@ -262,8 +336,9 @@ async fn a_fresh_engine_recovers_acknowledged_writes_from_the_wal() {
         // No fold. The process is gone, and so is everything it held in memory.
     }
 
-    let successor = Engine::new(Arc::clone(&s), t, pstore_types::LaneId(1));
-    successor.replay_for_test(pstore_types::Seq(2));
+    // A different lane, holding nothing in memory and told nothing: it must discover the
+    // dead writer's lane from the registry and its tail by probing.
+    let successor = Engine::new(Arc::clone(&s), t, pstore_types::LaneId(2));
     successor.fold().await.unwrap();
 
     let idx: Vec<_> = successor.scan("idx", None).await.unwrap();

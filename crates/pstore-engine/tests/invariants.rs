@@ -106,6 +106,11 @@ async fn depth_does_not_grow_with_the_number_of_segments() {
 async fn a_write_batch_is_one_round_trip_and_one_request() {
     let s = Arc::new(DepthCounting::new(MemoryStore::new()));
     let e = Engine::new(Arc::clone(&s), TenantId(2), LaneId(1));
+    // Warm the lane first: registering it is one CAS per lane LIFETIME, so folding it
+    // into the per-batch invariant would misstate the steady-state cost this bounds.
+    e.write("idx", vec![doc("warm", 0)]).await.unwrap();
+    e.flush().await.unwrap();
+
     e.write("idx", (0..1000).map(|i| doc(&format!("d{i}"), i)).collect())
         .await
         .unwrap();
