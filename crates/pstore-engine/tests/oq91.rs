@@ -123,7 +123,7 @@ async fn scenario<S: BlobStore>(store: &Arc<S>, tenant: TenantId, seed: u64) -> 
 }
 
 #[tokio::test]
-async fn oq91_recovery_finds_every_acknowledged_record_across_seeds() {
+async fn recovery_finds_every_unfolded_record_across_seeds() {
     let mut total_acked = 0usize;
     let mut total_deaths = 0usize;
     let mut total_injected = 0u64;
@@ -217,5 +217,50 @@ async fn a_refused_flush_does_not_punch_a_hole_in_the_lane() {
     assert!(
         ids.contains("b") && ids.contains("c"),
         "rows after the refusal are invisible: the lane was truncated by a hole, got {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_after_a_fallback_write_to_another_lane() {
+    // The mutation this exists to catch is a successor that probes only ITS OWN lane. The
+    // seeded scenario above would find it eventually; this finds it immediately, and says
+    // what is wrong when it does.
+    let store = Arc::new(pstore_blob::MemoryStore::new());
+    let t = TenantId(11);
+
+    // A writer acknowledges a row on lane 0, then stops -- process gone, nothing folded.
+    let dead = Engine::new(Arc::clone(&store), t, LaneId(0));
+    dead.write("idx", vec![doc("before-fallback")])
+        .await
+        .unwrap();
+    dead.flush().await.unwrap();
+    drop(dead);
+
+    // The same logical writer resumes on a different lane, as it would after a restart
+    // that could not prove the old lane was free.
+    let fallback = Engine::new(Arc::clone(&store), t, LaneId(1));
+    fallback
+        .write("idx", vec![doc("after-fallback")])
+        .await
+        .unwrap();
+    fallback.flush().await.unwrap();
+
+    // A third node, which owns neither lane, folds on the tenant's behalf.
+    let third = Engine::new(Arc::clone(&store), t, LaneId(2));
+    third.fold().await.unwrap();
+    let ids: BTreeSet<String> = third
+        .scan("idx", None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|d| d.id.clone())
+        .collect();
+    assert!(
+        ids.contains("before-fallback"),
+        "the abandoned lane was not folded: a successor is only probing its own lane, got {ids:?}"
+    );
+    assert!(
+        ids.contains("after-fallback"),
+        "the fallback lane was not folded, got {ids:?}"
     );
 }
