@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q46`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q47`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 43 documents, 46 research questions answered, 160 open
+**Status: research phase complete.** 54 documents, 47 research questions answered, 164 open
 questions logged. Workspace scaffold live: `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`,
 `crates/pstore-types`. Dev scaffold in [`dev/`](../../dev/README.md). Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
@@ -51,8 +51,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 46 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **160 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 47 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **164 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -126,6 +126,7 @@ If you read nothing else:
 | **[dev-and-test-environment.md](09-rust-stack/dev-and-test-environment.md)** | Q44 | **No emulator implements our core CAS primitive faithfully** — MinIO rejects `If-None-Match: *`, Azurite and SeaweedFS have their own divergences. So: in-process fault-injecting store proves *correctness*, emulators test *plumbing*, real clouds test *economics*. Where we can't measure, parameterize and find the breaking point. WSL2 gets three nested resource ceilings. |
 | **[blob-store-fakes.md](09-rust-stack/blob-store-fakes.md)** | Q45 | **Build `pstore-fake-s3` on `s3s`** — ~12 ops with AWS's exact semantics + protocol fault injection, ~1–2 weeks. Unblocks OQ-6 (ABA under multipart ETags) and the 412-vs-409 distinction, testable nowhere else. The anti-circularity rule: the conformance suite is the contract, and real S3 must pass it identically. |
 | **[engineering-standards.md](09-rust-stack/engineering-standards.md)** | Q46 | 9 library + 2 test crates; a boundary must encode a compiler-enforced invariant. `unsafe_code = "forbid"` everywhere but `pstore-kernel`. **95% coverage is a floor, not an assurance argument** — paired with mutation-score gates, since our bugs live in interleavings. The architectural invariants (≤3 round trips, zero LIST, RA=1W) become named tests. |
+| **[agent-harness.md](09-rust-stack/agent-harness.md)** | Q47 | Distilled from a sibling repo that hit both pitfalls and left the post-mortems in its code. **Review loops don't self-terminate** — the marginal round is never empty, severity decays; one task there reached 11 rounds and 755k tokens. Budget must refuse the *round*, remedy is SPLIT, verify rounds get the delta. Four skills taken, nine deliberately left. |
 | [crate-survey.md](09-rust-stack/crate-survey.md) | Q28 | `object_store`, `arrow-rs`, `simsimd`, `roaring`, `tantivy`, `foyer`. **The deterministic simulator is built before the distributed features, not after.** One binary, all roles. |
 | **[memory-management.md](09-rust-stack/memory-management.md)** | Q35 | **Rust allocation failure aborts and is not catchable**, so limits live above the allocator. In-flight fetch bytes (fan-out × block × concurrency) are the OOM source: score-and-drop makes query memory O(k + resident), not O(scanned). Byte reservations, an emergency reserve for the flush path, `memory.high` + PSI, and a degradation ladder that ends in 429 rather than abort. |
 | **[cpu-management.md](09-rust-stack/cpu-management.md)** | Q36 | **QPS is not a unit of capacity** — warm scan is memory-bandwidth-bound, so QPS/node swings 75× (16→1,221) with scan size. Capacity is bytes-scanned/s. Guard against metastable collapse: hedging off under load, retry budgets, CoDel. **Set CPU requests, never CPU limits.** |

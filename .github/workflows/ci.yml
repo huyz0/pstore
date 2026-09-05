@@ -87,3 +87,16 @@ jobs:
           if [ -n "$offenders" ]; then echo "unsafe relaxed outside pstore-kernel:"; echo "$offenders"; exit 1; fi
       - run: cargo miri test -p pstore-kernel
         if: hashFiles('crates/pstore-kernel/Cargo.toml') != ''
+
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Rungs 3 and 5 of the gate-design ladder: predicates over files in the tree,
+      # so no agent is asked to check them.
+      - run: ./scripts/check-links.sh
+      - run: ./scripts/build-index.py --check
+      # The round counter is the mechanism that bounds review, so it is tested --
+      # in the project this was distilled from, a silently-broken counter meant the
+      # cap never fired and one task reached eleven rounds.
+      - run: ./scripts/selftest-review.sh
