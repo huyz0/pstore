@@ -27,6 +27,8 @@
 | FST / term dict | `fst` (BurntSushi) — also what tantivy uses | — | |
 | Metrics | `metrics` + Prometheus exporter, `tracing` | `opentelemetry` | Per-tenant blob-request accounting is mandatory (Design rule 13). |
 | Testing | `proptest`, `turmoil` (deterministic network sim), `madsim` | `loom` for concurrency | See below. |
+| Allocator | **`tikv-jemallocator`** + `background_thread` | `mimalloc`, system | Decay-timer purging suits idle-between-bursts workers; best stats surface. See [memory-management](memory-management.md) §8. |
+| Memory accounting | own `MemoryPool` (DataFusion-shaped) | `datafusion`'s directly | Ours must track fetch buffers, which DataFusion explicitly does not. |
 | Error handling | `thiserror` (lib), `anyhow` (bin) | — | |
 | Config | `figment` / `serde` | — | |
 

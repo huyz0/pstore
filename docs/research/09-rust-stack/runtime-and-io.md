@@ -60,13 +60,19 @@ More important than the runtime choice:
 
 ## Memory discipline
 
+> Full treatment in [`memory-management.md`](memory-management.md). The essentials below; the
+> load-bearing point is that **Rust allocation failure aborts and is not catchable**, so every
+> data-proportional allocation must be accounted above the allocator (Invariant I3).
+
 - **Zero-copy from cache to scanner.** `Bytes` all the way through: blob response → cache →
   decompressed block → SIMD kernel. Every copy of a 4 MB block at 10k QPS is real bandwidth.
 - **Arena/bump allocation per query** for intermediate results; drop the arena at the end
   rather than freeing millions of small objects.
 - **Alignment**: 64-byte-aligned quantized code buffers for AVX-512.
-- **`jemalloc` or `mimalloc`** — the default system allocator is a poor fit for this
-  allocation profile.
+- **`jemalloc` with `background_thread:true`** — not mimalloc: mimalloc reclaims on allocation
+  activity, which suits a busy uniform service, while ours has worker threads idle between
+  bursts across 50M mostly-idle indexes. jemalloc purges on decay timers and exposes the
+  `stats.allocated` vs `stats.resident` surface we need. (D-59)
 - Explicit memory budget per query with admission control; OOM at 10,000 nodes is a fleet
   event, not a node event.
 
@@ -89,6 +95,9 @@ Non-negotiable, from the first commit:
 - Cache hit rate per class.
 - CAS attempts, losses, and 409s per index.
 - Cold-query ratio per index.
+- **RSS vs `stats.allocated`** (fragmentation ratio), memory-pool reservations by consumer and
+  tenant, `memory.events.high`, and PSI memory `full avg60`. See
+  [`memory-management.md`](memory-management.md) §9.
 
 > **D-34.** Round-trip depth is a **tested invariant**, not a metric to look at later. A test
 > that runs a cold query against the fault-injecting blob store and asserts the sequential

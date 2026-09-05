@@ -6,7 +6,10 @@
 ## The budget
 
 Every user-facing query gets **≤3 sequential blob round trips**. Fan-out within a round is
-unlimited (bandwidth is free, latency is not). This is a hard constraint that every feature
+wide (bandwidth is free, latency is not) — but **bounded by a memory reservation, not
+unlimited**: see [`../09-rust-stack/memory-management.md`](../09-rust-stack/memory-management.md)
+§3. Where residency binds, shrink block size before narrowing width — trading memory for blob
+requests ($0.0004/1000) beats trading memory for round trips. This is a hard constraint that every feature
 must fit inside; features that need a 4th data-dependent hop must be redesigned or made
 opt-in.
 
@@ -40,6 +43,8 @@ enough metadata to issue RT-A's fetches speculatively.
 
 > **D-25.** The planner issues **speculative parallel fetches** in RT-A for everything the
 > query *might* need, accepting some waste. Bytes are free; hops are not. (Pattern 5.)
+> Speculation is charged against the query's memory reservation, so a plan that would
+> speculate beyond its budget speculates less rather than risking the process (D-55).
 
 ## Warm query
 

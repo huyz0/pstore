@@ -97,6 +97,13 @@ more**. Examples:
 The failure mode of this pattern is bandwidth saturation on the node, not cost. Cap it by
 NIC budget, not by dollars.
 
+> **⚠️ Corrected (M-1) — see [`../09-rust-stack/memory-management.md`](../09-rust-stack/memory-management.md)
+> §3.** The real cap is **memory**, not NIC. Fan-out × block size × query concurrency is the
+> dominant OOM source: 32 lists × 3 MB × 4 shards = 384 MB for a single query if fetched bytes
+> are accumulated. Fetch width is bounded by an **in-flight byte reservation**, and blocks are
+> decoded, scored, and dropped so peak is O(resident), not O(fetched). Bandwidth is free;
+> buffers are not.
+
 ## Pattern 6: Co-location / stapling (turn 2 objects into 1)
 
 If A is always read with B, they must be in the same object, adjacent, so one ranged GET

@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q34`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q35`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 31 documents, 34 research questions answered, 103 open
+**Status: research phase complete.** 32 documents, 35 research questions answered, 110 open
 questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
@@ -47,8 +47,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 34 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **103 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 35 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **110 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -115,6 +115,7 @@ If you read nothing else:
 | Doc | Answers | Status |
 |---|---|---|
 | [crate-survey.md](09-rust-stack/crate-survey.md) | Q28 | `object_store`, `arrow-rs`, `simsimd`, `roaring`, `tantivy`, `foyer`. **The deterministic simulator is built before the distributed features, not after.** One binary, all roles. |
+| **[memory-management.md](09-rust-stack/memory-management.md)** | Q35 | **Rust allocation failure aborts and is not catchable**, so limits live above the allocator. In-flight fetch bytes (fan-out × block × concurrency) are the OOM source: score-and-drop makes query memory O(k + resident), not O(scanned). Byte reservations, an emergency reserve for the flush path, `memory.high` + PSI, and a degradation ladder that ends in 429 rather than abort. |
 | [runtime-and-io.md](09-rust-stack/runtime-and-io.md) | Q29 | Tokio (work-stealing suits our wildly skewed work) + a separate rayon pool for SIMD. io_uring's win doesn't apply to 30 ms HTTPS. Round-trip depth is a **tested invariant**. |
 
 ## 10 — Benchmarks & cost

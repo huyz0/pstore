@@ -47,6 +47,8 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-94 | Size threshold for tenant-grouped vs index-grouped placement, and for inlining — probably one number; verify | `10/tenancy-scale-model` |
 | OQ-95 | Does `W`-node write concentration collide with S3 per-prefix limits, especially on cohort-lane reads during recovery? | `10/tenancy-scale-model` |
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
+| OQ-104 | Real per-query memory profile by plan type — 24 MB is derived, not measured, and it sets the pool size and admission model | `09/memory-management` |
+| OQ-107 | jemalloc tuning (`dirty_decay_ms`, `muzzy_decay_ms`, `retain`) against measured RSS, given the documented gap between settings and behaviour | `09/memory-management` |
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
 | OQ-100 | Does class→region segregation reach the ~1.03 DLWA the FDP paper reports, without FDP hardware? | `07/disk-space-management` |
 | OQ-103 | Behaviour when the cache device fails outright mid-flight — must be identical to bypass mode, and the node must not die. Verify. | `07/disk-space-management` |
@@ -119,7 +121,12 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-89` shared L0 segments across indexes — worth the GC/branching complexity, or does inlining small indexes already capture it? ·
 `OQ-96` prefix entropy width at 1M tenants, 4 vs 5 chars (refines OQ-78) ·
 `OQ-101` S3-FIFO vs W-TinyLFU vs our class-aware policy on real traces (refines OQ-56) ·
-`OQ-102` dedicated cache partition for very large tenants, vs a quota
+`OQ-102` dedicated cache partition for very large tenants, vs a quota ·
+`OQ-105` plan-time memory estimates vs mid-flight re-reservation ·
+`OQ-106` query-pool vs RAM-cache split (both buy latency, at different rates) ·
+`OQ-108` should query intermediates ever spill to disk, or is narrowing fetch width strictly better? ·
+`OQ-109` per-open-index resident state size, which drives the LRU bound ·
+`OQ-110` does `memory.high` throttling ever hurt more than shedding would?
 
 ## Strategic risks (not answerable by experiment)
 

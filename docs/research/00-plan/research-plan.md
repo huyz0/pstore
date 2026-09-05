@@ -58,6 +58,8 @@ Each is tracked to a document. `Q` = question, `D` = the doc that answers it.
 - **Q16** What is the on-disk (on-blob) layout? LSM levels vs. tiered vs. delta-on-base; file formats; column layout; how a single blob is structured for ranged reads. → `05-storage-engine/file-format-and-layout.md`
 - **Q17** Compaction: policy, who runs it, how it is scheduled without a master, and its blob-request cost. → `05-storage-engine/compaction.md`
 - **Q18** Deletes, updates, MVCC, tombstones, TTL, and index branching/copy-on-write. → `05-storage-engine/mutations-and-mvcc.md`
+- **Q35** How do we manage memory so the process degrades instead of being OOM-killed, given
+  that Rust allocation failure aborts uncatchably? → `09-rust-stack/memory-management.md`
 - **Q34** How do we manage local disk so a full cache degrades instead of taking a node down,
   and how large / how fast may the cache actually be? → `07-caching/disk-space-management.md`
 - **Q33** What does the real tenancy shape (1M tenants × up to 50 indexes, 10% active per
