@@ -52,6 +52,21 @@ impl MemoryStore {
         Self::with_tag_style(TagStyle::Monotonic)
     }
 
+    /// A backend whose coalescing gap is `gap` bytes.
+    ///
+    /// ⚠️ Exists because the default 64 KiB gap is larger than a small fixture's whole
+    /// object, so every ranged read merges into one and a test measuring "does asking for
+    /// more ranges move more bytes" measures the coalescer instead. At production sizing a
+    /// posting list is tens of kilobytes and the gap does not merge them; at test sizing it
+    /// does, and shrinking the gap is the honest way to keep the fixture small without
+    /// removing the effect under test.
+    #[must_use]
+    pub fn with_coalesce_gap(gap: u64) -> Self {
+        let mut s = Self::new();
+        s.caps.coalesce_gap = gap;
+        s
+    }
+
     /// A backend with the chosen tag semantics, for exercising the ABA hazard.
     #[must_use]
     pub fn with_tag_style(tag_style: TagStyle) -> Self {

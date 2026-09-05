@@ -56,6 +56,12 @@ pub struct Params {
     ///
     /// 0.0 replicates nothing; 1.0 replicates almost everything and doubles the index.
     pub boundary: f32,
+    /// Below this many rows, no index is built and the segment is scanned exactly (D-10).
+    ///
+    /// A parameter rather than a constant so a test can put the switch within reach of a
+    /// small fixture. The **default is the stated number**; a test that lowers it is
+    /// testing the switch, not moving it.
+    pub exact_scan_threshold: usize,
 }
 
 impl Default for Params {
@@ -83,6 +89,7 @@ impl Default for Params {
             // generously, cache stingily" argument.
             replicas: 1,
             boundary: 0.05,
+            exact_scan_threshold: crate::vec_index::EXACT_SCAN_THRESHOLD,
         }
     }
 }
@@ -142,6 +149,16 @@ impl Clustering {
                 )
             })
             .sum()
+    }
+
+    /// A clustering from parts, for a reader that has centroids but not assignments.
+    ///
+    /// A searcher holds the centroid table and reads posting lists by byte range; it never
+    /// materialises the row lists, so requiring them would force it to fetch what it is
+    /// specifically avoiding.
+    #[must_use]
+    pub fn from_parts(centroids: Vec<Vec<f32>>, lists: Vec<Vec<usize>>) -> Self {
+        Self { centroids, lists }
     }
 
     /// Clusters a corpus.

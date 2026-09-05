@@ -8,3 +8,4 @@ pub mod ladder;
 pub mod rabitq;
 pub mod search;
 pub mod sq8;
+pub mod vec_index;

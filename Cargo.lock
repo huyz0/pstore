@@ -498,6 +498,7 @@ name = "pstore-index"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "pstore-blob",
  "pstore-format",
  "pstore-testkit",

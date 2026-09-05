@@ -73,6 +73,48 @@ pub fn decode(c: &Code) -> Vec<f32> {
         .collect()
 }
 
+/// Bytes one row occupies on the wire: the codes, then the offset and step.
+#[must_use]
+pub fn record_len(dim: usize) -> usize {
+    dim + 8
+}
+
+/// Appends a code's wire form: codes, then `offset` and `step`.
+///
+/// ⚠️ The scale travels **with** the codes, and it has to. The quantization is per vector —
+/// a global scale would be fitted state, which is per-tenant training under another name —
+/// so two rows' codes are on different scales and comparing them raw is comparing
+/// different units. Measured: reading the codes without their scale made `rerank: fast`
+/// *worse* than no rerank at all (25 true neighbours against 26), while every depth and
+/// byte assertion still passed.
+pub fn write_to(c: &Code, out: &mut Vec<u8>) {
+    out.extend_from_slice(&c.codes);
+    out.extend_from_slice(&c.offset.to_le_bytes());
+    out.extend_from_slice(&c.step.to_le_bytes());
+}
+
+/// Estimates `<o, q>` from one row's wire form.
+#[must_use]
+pub fn estimate_raw(record: &[u8], query: &[f32]) -> f32 {
+    let Some(split) = record.len().checked_sub(8) else {
+        return f32::NEG_INFINITY;
+    };
+    let (codes, tail) = record.split_at(split);
+    let f = |at: usize| {
+        tail.get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0.0, f32::from_le_bytes)
+    };
+    let (offset, step) = (f(0), f(4));
+    let mut sum_q = 0.0f32;
+    let mut acc = 0.0f32;
+    for (b, q) in codes.iter().zip(query) {
+        sum_q += *q;
+        acc += f32::from(*b) * *q;
+    }
+    offset * sum_q + step * acc
+}
+
 /// Estimates `<o, q>` from `o`'s code.
 ///
 /// Expanded rather than reconstructing first: `<o,q> ≈ offset·Σq + step·Σ(c·q)`, which is

@@ -48,7 +48,7 @@ fn build(docs: &[Document]) -> bytes::Bytes {
     let mut eights = Vec::new();
     for d in docs {
         q.encode(&d.vector).unwrap().write_to(&mut rabitq);
-        eights.extend_from_slice(sq8::encode(&d.vector).codes());
+        sq8::write_to(&sq8::encode(&d.vector), &mut eights);
     }
     let mut w = SegmentWriter::new(64);
     for d in docs {
@@ -131,7 +131,9 @@ async fn the_code_sections_are_a_fraction_of_the_vectors() {
     // norm. Both are per-vector scalars the estimate cannot work without: the alignment
     // de-biases, and the norm restores the scale the residual was divided by.
     assert_eq!(rabitq, (N * 72) as u64);
-    assert_eq!(eights, (N * DIM) as u64);
+    // One byte a dimension, plus the per-vector offset and step the reader needs to put
+    // two rows' codes on the same scale.
+    assert_eq!(eights, (N * (DIM + 8)) as u64);
     // 21x, not the 24x the bit count alone suggests: eight bytes a vector of scalars buy
     // the error bound and the residual scale. Stated as the measured ratio rather than the
     // theoretical one, because the theoretical one is not what gets fetched.
@@ -140,5 +142,9 @@ async fn the_code_sections_are_a_fraction_of_the_vectors() {
         "1-bit compression is only {}x",
         vectors / rabitq
     );
-    assert!(vectors / eights == 4, "int8 must be exactly 4x smaller");
+    assert!(
+        vectors / eights == 3,
+        "int8 is {}x smaller; the scale costs eight bytes a row",
+        vectors / eights
+    );
 }
