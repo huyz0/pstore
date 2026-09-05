@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/broken.rs
++++ replace <impl BlobStore for Broken>::get -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -54,17 +54,17 @@
+ impl BlobStore for Broken {
+     fn capabilities(&self) -> &Capabilities {
+         // ⚠️ Still claims to be fine. That gap between declared and observed is the whole
+         // reason capabilities are probed rather than read.
+         self.inner.capabilities()
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+-        self.inner.get(key).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+         if self.defect == Defect::ShortReadsPastTheEnd {
+             let body = self.inner.get(key).await?;
+             let start = (range.start as usize).min(body.len());
+             let end = (range.end as usize).min(body.len());
+             return Ok(body.slice(start..end));

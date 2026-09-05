@@ -1,0 +1,28 @@
+--- crates/pstore-testkit/src/broken.rs
++++ replace <impl BlobStore for Broken>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -96,24 +96,17 @@
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+-        if self.defect == Defect::IgnoresCreateIfAbsent && pre == Precondition::NotExists {
+-            return self
+-                .inner
+-                .put(key, body)
+-                .await
+-                .map_err(|e| CasError::Io(e.to_string()));
+-        }
+-        self.inner.put_conditional(key, body, pre).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         if self.defect == Defect::IgnoresDeletes {
+             return Ok(());
+         }
+         self.inner.delete_batch(keys).await
+     }

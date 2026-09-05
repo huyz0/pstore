@@ -1,0 +1,51 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace probe_cas -> Support with Default::default()
+@@ -70,47 +70,17 @@
+         Ok(_) => Support::Divergent(
+             "second create-if-absent succeeded; the wildcard precondition is ignored".to_owned(),
+         ),
+         Err(e) => Support::Divergent(format!("unexpected error: {e}")),
+     }
+ }
+ 
+ async fn probe_cas<S: BlobStore>(s: &S, run: u64) -> Support {
+-    let key = k(run, "cas");
+-    let Ok(first) = s
+-        .put_conditional(&key, Bytes::from_static(b"1"), Precondition::NotExists)
+-        .await
+-    else {
+-        return Support::Unsupported;
+-    };
+-    if s.put_conditional(
+-        &key,
+-        Bytes::from_static(b"2"),
+-        Precondition::Match(first.tag.clone()),
+-    )
+-    .await
+-    .is_err()
+-    {
+-        return Support::Divergent("CAS on the observed tag was refused".to_owned());
+-    }
+-    match s
+-        .put_conditional(
+-            &key,
+-            Bytes::from_static(b"3"),
+-            Precondition::Match(first.tag),
+-        )
+-        .await
+-    {
+-        Err(CasError::Lost) => Support::Supported,
+-        // The fencing property. If a stale tag lands, a paused writer can overwrite a
+-        // world that moved on, and no amount of care above this layer recovers it.
+-        Ok(_) => Support::Divergent("a stale tag was accepted: writers are not fenced".to_owned()),
+-        Err(e) => Support::Divergent(format!("unexpected error: {e}")),
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Whether a tag ever repeats for content the object held before.
+ ///
+ /// Distinct from `compare_and_swap`, and the difference is exactly S3 versus GCS. Basic
+ /// fencing can pass while this fails: writing v1 -> v2 -> v1 returns a content-derived
+ /// ETag EQUAL to the first, so a writer that read v1 and paused has its CAS accepted
+ /// against a world that changed and changed back. A backend failing this needs the

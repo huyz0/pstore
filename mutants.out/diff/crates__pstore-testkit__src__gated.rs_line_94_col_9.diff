@@ -1,0 +1,15 @@
+--- crates/pstore-testkit/src/gated.rs
++++ replace <impl BlobStore for Gated>::list_unrestricted -> Result<Vec<Key>, BlobError> with Ok(vec![])
+@@ -86,11 +86,11 @@
+         }
+         self.inner.put_conditional(key, body, pre).await
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         self.inner.delete_batch(keys).await
+     }
+     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+-        self.inner.list_unrestricted(prefix).await
++        Ok(vec![]) /* ~ changed by cargo-mutants ~ */
+     }
+ }

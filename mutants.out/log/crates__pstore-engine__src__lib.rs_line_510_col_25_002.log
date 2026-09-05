@@ -225,3 +225,25 @@ running 4 tests
 test a_writer_paused_past_many_commits_cannot_corrupt ... ok
 test one_hundred_writers_produce_a_dense_epoch_sequence ... ok
 test a_cas_storm_still_converges ... ok
+test every_acknowledged_document_survives_contention ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
+
+     Running `/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/oq91-0041ee8d544e3276`
+
+running 3 tests
+test recovery_after_a_fallback_write_to_another_lane ... ok
+test a_refused_flush_does_not_punch_a_hole_in_the_lane ... ok
+test recovery_finds_every_unfolded_record_across_seeds ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+   Doc-tests pstore_engine
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2024 --crate-type lib --color auto --crate-name pstore_engine --test crates/pstore-engine/src/lib.rs --test-run-directory /tmp/cargo-mutants-pstore-NoaGgA.tmp/crates/pstore-engine -L dependency=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --extern bytes=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libbytes-31b8f712e3be84e8.rlib --extern futures_util=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libfutures_util-9467758a9490225b.rlib --extern pstore_blob=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libpstore_blob-b6cf016c092a0ac2.rlib --extern pstore_engine=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libpstore_engine-bda1651ff56837d3.rlib --extern pstore_format=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libpstore_format-1275d00aeb99a72a.rlib --extern pstore_testkit=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libpstore_testkit-c545806fa049828c.rlib --extern pstore_types=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libpstore_types-c19df0e60947a156.rlib --extern thiserror=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libthiserror-a555ba146edbfd98.rlib --extern tokio=/tmp/cargo-mutants-pstore-NoaGgA.tmp/target/debug/deps/libtokio-1c12c7fb7aae7e9d.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+*** result: Success

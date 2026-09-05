@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace != with == in Segment::open
+@@ -38,17 +38,17 @@
+             return Err(FormatError::UnsupportedVersion(version));
+         }
+         let index_offset = d.u64()?;
+         let index_len = d.u32()?;
+         let rows = d.u32()?;
+         let sum = d.u64()?;
+         // The trailing magic is what distinguishes a real footer from bytes that happen to
+         // decode: a tampered length field almost never leaves both copies intact.
+-        if d.raw(8)? != MAGIC {
++        if d.raw(8)? == /* ~ changed by cargo-mutants ~ */ MAGIC {
+             return Err(FormatError::Corrupt("bad trailing magic"));
+         }
+ 
+         // Where in the object the bytes we hold begin. Derived from the footer's own
+         // offsets rather than from a separately-fetched length.
+         let seg_len = index_offset + u64::from(index_len) + FOOTER_LEN as u64;
+         let tail_start = seg_len.saturating_sub(tail.len() as u64);
+         let idx_bytes = {

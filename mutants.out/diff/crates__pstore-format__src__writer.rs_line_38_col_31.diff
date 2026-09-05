@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ replace >= with < in SegmentWriter::push
+@@ -30,17 +30,17 @@
+             body: Enc::default(),
+             rows: 0,
+         }
+     }
+ 
+     /// Adds a document, sealing a block when it fills.
+     pub fn push(&mut self, doc: Document) {
+         self.pending.push(doc);
+-        if self.pending.len() >= self.rows_per_block {
++        if self.pending.len() < /* ~ changed by cargo-mutants ~ */ self.rows_per_block {
+             self.seal();
+         }
+     }
+ 
+     fn seal(&mut self) {
+         if self.pending.is_empty() {
+             return;
+         }

@@ -1,0 +1,19 @@
+--- crates/pstore-engine/src/bundle.rs
++++ replace read_entry -> Result<Vec<Document>, EngineError> with Ok(vec![])
+@@ -137,15 +137,10 @@
+         );
+         out.insert(name, Entry { offset, len, docs });
+     }
+     Ok(out)
+ }
+ 
+ /// One index's documents, decoded from its slice of a bundle.
+ pub(crate) fn read_entry(buf: &[u8], e: &Entry) -> Result<Vec<Document>, EngineError> {
+-    let start = e.offset as usize;
+-    let end = start
+-        .checked_add(e.len as usize)
+-        .ok_or(EngineError::CorruptBundle)?;
+-    let run = buf.get(start..end).ok_or(EngineError::CorruptBundle)?;
+-    Ok(decode_docs(run)?)
++    Ok(vec![]) /* ~ changed by cargo-mutants ~ */
+ }

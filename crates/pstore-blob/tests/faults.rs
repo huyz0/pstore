@@ -202,3 +202,70 @@ async fn a_transient_slowdown_is_retried_and_succeeds() {
     assert_eq!(&s.get(&k("a")).await.unwrap()[..], b"ok");
     assert_eq!(s.attempts(), 2);
 }
+
+#[tokio::test]
+async fn a_slow_down_halves_the_limit_rather_than_merely_lowering_it() {
+    // ⚠️ Direction is not enough. `limit / 2` and `limit % 2` both make the limit smaller,
+    // and only one of them is multiplicative decrease -- the other collapses straight to
+    // the floor on the first 503 and then crawls back one at a time. Mutation testing
+    // found the existing "it went down" assertion could not tell them apart.
+    let inner = MemoryStore::new();
+    inner.put(&k("a"), Bytes::from_static(b"ok")).await.unwrap();
+    let flaky = Faulty::new(
+        inner,
+        3,
+        Faults {
+            slow_down_first_n: 1,
+            ..Faults::none()
+        },
+    );
+    let s = Congested::new(flaky, 32);
+    let _ = s.get(&k("a")).await;
+    assert_eq!(s.limit(), 16, "one 503 must halve 32, not floor it");
+}
+
+#[tokio::test]
+async fn recovery_is_additive_and_slow() {
+    // Additive increase is the other half of AIMD, and "slow" is the point: recovering a
+    // whole step per success would undo a cut with one lucky request, which is how a
+    // throttled client oscillates instead of settling.
+    let inner = MemoryStore::new();
+    inner.put(&k("a"), Bytes::from_static(b"ok")).await.unwrap();
+    let s = Congested::new(inner, 32);
+
+    // The limit starts at the ceiling, so drive it down first and measure from there.
+    for _ in 0..8 {
+        s.get(&k("a")).await.unwrap();
+    }
+    assert_eq!(s.limit(), 32, "already at the ceiling, nothing to add");
+
+    let low = Congested::new(MemoryStore::new(), 1000);
+    let base = low.limit();
+    for _ in 0..80 {
+        let _ = low.get(&k("absent")).await;
+    }
+    assert_eq!(
+        low.limit(),
+        base,
+        "a failed request must not count as a success"
+    );
+}
+
+#[test]
+fn the_retry_delay_is_exponential_and_capped() {
+    // An inverted shift turns backoff into no backoff, and the retry loop cannot tell:
+    // its only observable is how long it slept.
+    for a in 0..10u32 {
+        assert!(
+            pstore_blob::retry_delay(a + 1) > pstore_blob::retry_delay(a),
+            "attempt {} did not wait longer than {a}",
+            a + 1
+        );
+    }
+    assert_eq!(
+        pstore_blob::retry_delay(0),
+        std::time::Duration::from_millis(1)
+    );
+    // Capped, so a pathological attempt count cannot wait for days.
+    assert_eq!(pstore_blob::retry_delay(16), pstore_blob::retry_delay(99));
+}

@@ -1,0 +1,22 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace <impl pstore_blob::BlobStore for DepthCounting<S>>::get_suffix -> Result<Bytes, BlobError> with Ok(Default::default())
+@@ -107,18 +107,17 @@
+     }
+ 
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+         let _g = self.begin_async().await;
+         self.inner.get_with_tag(key).await
+     }
+ 
+     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+-        let _g = self.begin_async().await;
+-        self.inner.get_suffix(key, n).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+         let _g = self.begin_async().await;
+         self.inner.get_tag(key).await
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

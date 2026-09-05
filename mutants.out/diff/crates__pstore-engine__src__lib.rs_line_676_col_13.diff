@@ -1,0 +1,18 @@
+--- crates/pstore-engine/src/lib.rs
++++ delete field epoch from struct Head expression in Engine<S>::commit_stale_for_test
+@@ -668,14 +668,14 @@
+     /// must be refused. Not part of the engine's real API.
+     #[doc(hidden)]
+     pub async fn commit_stale_for_test(&self) -> Result<Epoch, EngineError> {
+         let stale = HeadAt {
+             head: Head::default(),
+             tag: None,
+         };
+         let next = Head {
+-            epoch: Epoch(1),
++             /* ~ changed by cargo-mutants ~ */
+             ..Head::default()
+         };
+         head::commit(&*self.store, self.tenant, &stale, &next).await
+     }
+ }

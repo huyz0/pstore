@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/broken.rs
++++ replace <impl BlobStore for Broken>::capabilities -> &Capabilities with Box::leak(Box::new(Default::default()))
+@@ -50,17 +50,17 @@
+     }
+ }
+ 
+ #[async_trait::async_trait]
+ impl BlobStore for Broken {
+     fn capabilities(&self) -> &Capabilities {
+         // ⚠️ Still claims to be fine. That gap between declared and observed is the whole
+         // reason capabilities are probed rather than read.
+-        self.inner.capabilities()
++        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+         self.inner.get(key).await
+     }
+ 
+     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+         if self.defect == Defect::ShortReadsPastTheEnd {

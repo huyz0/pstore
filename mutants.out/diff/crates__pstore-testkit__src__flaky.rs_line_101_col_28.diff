@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/flaky.rs
++++ replace >> with << in Flaky::refuse
+@@ -93,17 +93,17 @@
+             return false;
+         }
+         let mut z = self
+             .state
+             .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+             .wrapping_add(0x9E37_79B9_7F4A_7C15);
+         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+-        let draw = (z ^ (z >> 31)) >> 32;
++        let draw = (z ^ (z << /* ~ changed by cargo-mutants ~ */ 31)) >> 32;
+         if draw < self.rate {
+             self.failures.fetch_add(1, Ordering::Relaxed);
+             return true;
+         }
+         false
+     }
+ 
+     /// A store whose reads all fail.

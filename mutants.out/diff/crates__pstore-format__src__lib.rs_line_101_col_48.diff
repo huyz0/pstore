@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/lib.rs
++++ replace == with != in Filter::matches
+@@ -93,17 +93,17 @@
+             Self::Eq(c, _) | Self::Gt(c, _) | Self::Lt(c, _) => c,
+         }
+     }
+ 
+     /// Whether one row satisfies it.
+     #[must_use]
+     pub fn matches(&self, doc: &Document) -> bool {
+         match self {
+-            Self::Eq(c, v) => doc.attrs.get(c) == Some(v),
++            Self::Eq(c, v) => doc.attrs.get(c) != /* ~ changed by cargo-mutants ~ */ Some(v),
+             Self::Gt(c, n) => matches!(doc.attrs.get(c), Some(Value::Int(v)) if v > n),
+             Self::Lt(c, n) => matches!(doc.attrs.get(c), Some(Value::Int(v)) if v < n),
+         }
+     }
+ 
+     /// Whether a block whose integer column spans `min..=max` **could** contain a match.
+     ///
+     /// ⚠️ Must never answer `false` for a block that could match: a wrong `false` silently

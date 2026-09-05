@@ -1,0 +1,23 @@
+--- crates/pstore-testkit/src/audit.rs
++++ replace Auditing<S>::lock -> std::sync::MutexGuard<'_, Seen> with MutexGuard::new()
+@@ -55,19 +55,17 @@
+     /// Distinct keys written. The denominator: an audit over no writes proves nothing, so
+     /// a test should assert this is non-trivial before trusting an empty violation list.
+     #[must_use]
+     pub fn keys_written(&self) -> usize {
+         self.lock().written.len()
+     }
+ 
+     fn lock(&self) -> std::sync::MutexGuard<'_, Seen> {
+-        self.seen
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner)
++        MutexGuard::new() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[async_trait::async_trait]
+ impl<S: BlobStore> BlobStore for Auditing<S> {
+     fn capabilities(&self) -> &Capabilities {
+         self.inner.capabilities()
+     }

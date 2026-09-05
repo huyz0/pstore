@@ -1,0 +1,23 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace DepthCounting<S>::begin_async -> Guard with Default::default()
+@@ -79,19 +79,17 @@
+     /// Registers the request, then yields.
+     ///
+     /// ⚠️ The yield is the point. Against a synchronous backend every future completes
+     /// the instant it is first polled, so `join_all` would run them one at a time and
+     /// genuine fan-out would be indistinguishable from a loop. Yielding lets every
+     /// concurrently-polled request register before any completes, which is what a backend
+     /// with a network in front of it does anyway.
+     async fn begin_async(&self) -> Guard {
+-        let g = self.begin();
+-        tokio::task::yield_now().await;
+-        g
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[async_trait::async_trait]
+ impl<S: pstore_blob::BlobStore> pstore_blob::BlobStore for DepthCounting<S> {
+     fn capabilities(&self) -> &Capabilities {
+         self.inner.capabilities()
+     }

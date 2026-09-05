@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace != with == in Segment::open
+@@ -25,17 +25,17 @@
+         let tail = store.get_suffix(key, SUFFIX_FETCH).await?;
+ 
+         let foot_at = tail
+             .len()
+             .checked_sub(FOOTER_LEN)
+             .ok_or(FormatError::Truncated)?;
+         let foot = tail.get(foot_at..).ok_or(FormatError::Truncated)?;
+         let mut d = Dec::new(foot);
+-        if d.raw(8)? != MAGIC {
++        if d.raw(8)? == /* ~ changed by cargo-mutants ~ */ MAGIC {
+             return Err(FormatError::Corrupt("bad magic"));
+         }
+         let version = d.u16()?;
+         if version != VERSION {
+             return Err(FormatError::UnsupportedVersion(version));
+         }
+         let index_offset = d.u64()?;
+         let index_len = d.u32()?;

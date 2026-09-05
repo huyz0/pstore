@@ -18,7 +18,7 @@ mod types;
 
 pub use accounting::{Accounted, OpClass, TenantView};
 pub use coalesce::{Fetch, coalesce};
-pub use congestion::Congested;
+pub use congestion::{Congested, retry_delay};
 pub use faulty::{Faults, Faulty};
 pub use memory::{MemoryStore, TagStyle};
 #[cfg(feature = "object_store")]

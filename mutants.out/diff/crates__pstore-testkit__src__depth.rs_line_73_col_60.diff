@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/depth.rs
++++ replace == with != in DepthCounting<S>::begin
+@@ -65,17 +65,17 @@
+         self.c.depth.store(0, Ordering::SeqCst);
+         self.c.requests.store(0, Ordering::SeqCst);
+     }
+ 
+     fn begin(&self) -> Guard {
+         self.c.requests.fetch_add(1, Ordering::SeqCst);
+         // `fetch_add` returns the PREVIOUS value: zero means nothing was in flight, so
+         // this request could not have been issued concurrently with another.
+-        if self.c.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
++        if self.c.in_flight.fetch_add(1, Ordering::SeqCst) != /* ~ changed by cargo-mutants ~ */ 0 {
+             self.c.depth.fetch_add(1, Ordering::SeqCst);
+         }
+         Guard(Arc::clone(&self.c))
+     }
+ 
+     /// Registers the request, then yields.
+     ///
+     /// ⚠️ The yield is the point. Against a synchronous backend every future completes

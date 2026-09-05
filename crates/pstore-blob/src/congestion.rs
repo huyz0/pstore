@@ -101,16 +101,24 @@ impl<S: crate::BlobStore> Congested<S> {
                 Err(BlobError::SlowDown) => {
                     self.on_slow_down();
                     last = BlobError::SlowDown;
-                    // Exponential, and jittered by the attempt index so a fleet that all
-                    // tripped together does not all come back together.
-                    let ms = 1u64 << attempt;
-                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    tokio::time::sleep(retry_delay(attempt)).await;
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(last)
     }
+}
+
+/// How long to wait before retrying a throttled request.
+///
+/// ⚠️ Split out from the retry loop so it can be checked. Inside the loop its only
+/// observable was elapsed time, and mutation testing inverted the shift — turning
+/// exponential backoff into an immediately-collapsing one — without a single test
+/// noticing. A fleet that all tripped together must not all come back together.
+#[must_use]
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(1u64 << attempt.min(16))
 }
 
 #[async_trait::async_trait]

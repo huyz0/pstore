@@ -102,17 +102,54 @@ pub struct Engine<S> {
     committed: Mutex<Epoch>,
 }
 
-/// Waits before retrying a lost commit.
+/// The ABA guard: a value that never repeats for two different commits.
+///
+/// ⚠️ **Load-bearing on any backend whose CAS tag is content-derived** — an S3 ETag on a
+/// single-part PUT is the MD5 of the body. Two HEADs that happen to encode identically
+/// would then carry identical tags, so a writer that read the first, paused, and woke
+/// after the world changed and changed back would have its CAS *accepted*. The nonce makes
+/// two commits byte-different even when everything else about them matches.
+///
+/// XOR, not OR or AND: both of those lose information, so distinct `(epoch, lane)` pairs
+/// collapse onto the same nonce and the guard silently stops guarding. Mutation testing
+/// found `|` and `&` indistinguishable from `^` to every test in the workspace, which is
+/// why `nonces_never_collide_across_epochs_and_lanes` exists.
+#[must_use]
+pub fn nonce_for(epoch: Epoch, lane: LaneId) -> u64 {
+    epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ lane.0
+}
+
+/// How long a writer waits before retrying a lost commit.
 ///
 /// ⚠️ Jittered, and that is not decoration. Without it optimistic concurrency
 /// **livelocks**: every loser retries immediately, collides with the same peers, and
 /// loses again. It surfaced as a *flaky* test rather than a failing one, which is the
 /// more expensive way to find out. The jitter comes from the lane rather than a random
 /// source so a failing schedule still replays.
+///
+/// ⚠️ Separated from the sleep on purpose. While this was one function its entire
+/// contents were invisible to every test — mutation testing replaced the whole body with
+/// nothing, inverted the shift, and swapped the arithmetic, and not one test noticed,
+/// because the only observable was elapsed microseconds. A pure function has a contract
+/// that can be stated and checked; a sleep does not.
+#[must_use]
+pub fn backoff_delay(lane: LaneId, attempt: u32) -> std::time::Duration {
+    // Doubling, capped: the cap stops a late retry waiting far longer than the operation
+    // it is retrying.
+    let base = 1u64 << attempt.min(BACKOFF_CAP_SHIFT);
+    // 1..=8, never 0: a jitter that can be zero leaves the lanes that draw it colliding
+    // in lockstep, which is the livelock this exists to prevent.
+    let jitter = (lane.0 % JITTER_SPREAD) + 1;
+    std::time::Duration::from_micros(base * jitter)
+}
+
+/// Where the doubling stops.
+const BACKOFF_CAP_SHIFT: u32 = 6;
+/// How many distinct delays a given attempt can produce.
+const JITTER_SPREAD: u64 = 8;
+
 async fn backoff(lane: LaneId, attempt: u32) {
-    let base = 1u64 << attempt.min(6);
-    let jitter = (lane.0 % 8) + 1;
-    tokio::time::sleep(std::time::Duration::from_micros(base * jitter)).await;
+    tokio::time::sleep(backoff_delay(lane, attempt)).await;
 }
 
 impl<S: BlobStore> Engine<S> {
@@ -316,7 +353,7 @@ impl<S: BlobStore> Engine<S> {
             // The ABA guard: two HEADs differing only in content a content-derived tag is
             // computed from would otherwise share a tag. Derived from the epoch and lane,
             // so it is deterministic and needs no clock.
-            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+            next.nonce = nonce_for(next.epoch, self.lane);
 
             // One segment per index. Folding every index into one object would make each
             // index's ref point at the whole thing, and a scan would return its
@@ -428,7 +465,7 @@ impl<S: BlobStore> Engine<S> {
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
-            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+            next.nonce = nonce_for(next.epoch, self.lane);
             for e in &due {
                 next.graveyard.remove(e);
             }
@@ -460,7 +497,7 @@ impl<S: BlobStore> Engine<S> {
         let at = head::read(&*self.store, self.tenant).await?;
         let mut next = at.head.clone();
         next.epoch = next.epoch.next();
-        next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+        next.nonce = nonce_for(next.epoch, self.lane);
         mutate(&mut next);
         head::commit(&*self.store, self.tenant, &at, &next).await
     }
@@ -557,7 +594,7 @@ impl<S: BlobStore> Engine<S> {
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
-            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+            next.nonce = nonce_for(next.epoch, self.lane);
             // Segments added since we read: kept, in place, after the merged one. Dropping
             // them would silently discard every row folded while we were merging.
             let mut kept: Vec<SegmentRef> = vec![out.clone()];

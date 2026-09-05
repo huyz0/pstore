@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/writer.rs
++++ replace += with -= in SegmentWriter::seal
+@@ -77,17 +77,17 @@
+         let len = blk.len() as u32;
+         self.body.raw(&blk.0);
+         self.blocks.push(BlockMeta {
+             offset,
+             len,
+             rows: self.pending.len() as u32,
+             zones,
+         });
+-        self.rows += self.pending.len() as u32;
++        self.rows -= /* ~ changed by cargo-mutants ~ */ self.pending.len() as u32;
+         self.pending.clear();
+     }
+ 
+     /// Seals the last block and emits the segment.
+     #[must_use]
+     pub fn finish(mut self) -> Bytes {
+         self.seal();
+ 

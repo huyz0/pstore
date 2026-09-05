@@ -1,0 +1,71 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::open -> Result<Self, FormatError> with Ok(Default::default())
+@@ -17,67 +17,17 @@
+     /// Opens a segment knowing only its key.
+     ///
+     /// **At most two sequential reads.** One suffix range fetches the footer and, if the
+     /// segment is small, its whole index section; only a segment whose index section did
+     /// not fit needs the second.
+     pub async fn open<S: BlobStore>(store: &S, key: &Key) -> Result<Self, FormatError> {
+         // One suffix read. No `head` first: it is billed as a read, so requiring one
+         // would double every cold open -- found by the request counter, not by inspection.
+-        let tail = store.get_suffix(key, SUFFIX_FETCH).await?;
+-
+-        let foot_at = tail
+-            .len()
+-            .checked_sub(FOOTER_LEN)
+-            .ok_or(FormatError::Truncated)?;
+-        let foot = tail.get(foot_at..).ok_or(FormatError::Truncated)?;
+-        let mut d = Dec::new(foot);
+-        if d.raw(8)? != MAGIC {
+-            return Err(FormatError::Corrupt("bad magic"));
+-        }
+-        let version = d.u16()?;
+-        if version != VERSION {
+-            return Err(FormatError::UnsupportedVersion(version));
+-        }
+-        let index_offset = d.u64()?;
+-        let index_len = d.u32()?;
+-        let rows = d.u32()?;
+-        let sum = d.u64()?;
+-        // The trailing magic is what distinguishes a real footer from bytes that happen to
+-        // decode: a tampered length field almost never leaves both copies intact.
+-        if d.raw(8)? != MAGIC {
+-            return Err(FormatError::Corrupt("bad trailing magic"));
+-        }
+-
+-        // Where in the object the bytes we hold begin. Derived from the footer's own
+-        // offsets rather than from a separately-fetched length.
+-        let seg_len = index_offset + u64::from(index_len) + FOOTER_LEN as u64;
+-        let tail_start = seg_len.saturating_sub(tail.len() as u64);
+-        let idx_bytes = {
+-            if index_offset >= tail_start {
+-                let lo = (index_offset - tail_start) as usize;
+-                let hi = lo
+-                    .checked_add(index_len as usize)
+-                    .ok_or(FormatError::Truncated)?;
+-                Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
+-            } else {
+-                // Only now, and only for a segment whose index section is large.
+-                store
+-                    .get_range(key, index_offset..index_offset + u64::from(index_len))
+-                    .await?
+-            }
+-        };
+-        if checksum(&idx_bytes) != sum {
+-            return Err(FormatError::ChecksumMismatch);
+-        }
+-
+-        Ok(Self {
+-            blocks: Self::decode_index(&idx_bytes)?,
+-            rows,
+-        })
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn decode_index(bytes: &[u8]) -> Result<Vec<BlockMeta>, FormatError> {
+         let mut d = Dec::new(bytes);
+         let n = d.u32()? as usize;
+         let mut blocks = Vec::with_capacity(n.min(1 << 20));
+         for _ in 0..n {
+             let (offset, len, rows) = (d.u64()?, d.u32()?, d.u32()?);

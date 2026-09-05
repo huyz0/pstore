@@ -1,0 +1,21 @@
+--- crates/pstore-testkit/src/conformance.rs
++++ replace Report::conforms -> bool with false
+@@ -28,17 +28,17 @@
+     /// The capability profile derived from the probes — **not** from `capabilities()`.
+     pub observed: Capabilities,
+ }
+ 
+ impl Report {
+     /// Whether every probe behaved as the specification requires.
+     #[must_use]
+     pub fn conforms(&self) -> bool {
+-        self.probes.iter().all(|p| p.outcome == Support::Supported)
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The probes that did not.
+     #[must_use]
+     pub fn divergences(&self) -> Vec<&Probe> {
+         self.probes
+             .iter()
+             .filter(|p| p.outcome != Support::Supported)

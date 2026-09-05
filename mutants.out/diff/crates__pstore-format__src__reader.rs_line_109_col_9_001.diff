@@ -1,0 +1,21 @@
+--- crates/pstore-format/src/reader.rs
++++ replace Segment::block_count -> usize with 1
+@@ -101,17 +101,17 @@
+     #[must_use]
+     pub fn row_count(&self) -> usize {
+         self.rows as usize
+     }
+ 
+     /// Blocks in the segment.
+     #[must_use]
+     pub fn block_count(&self) -> usize {
+-        self.blocks.len()
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Which blocks a filter cannot rule out.
+     ///
+     /// A block is kept unless its zone map proves no row in it can match. **Erring toward
+     /// keeping is mandatory**: a wrongly dropped block silently loses rows.
+     #[must_use]
+     pub fn blocks_to_read(&self, filter: Option<&Filter>) -> Vec<usize> {
