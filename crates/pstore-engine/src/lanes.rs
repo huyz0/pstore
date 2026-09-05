@@ -36,7 +36,8 @@ const MAX_PROBE_WINDOW: u64 = 256;
 /// Ceiling on lanes per tenant, so a corrupt object cannot make a reader allocate wildly.
 const MAX_LANES: usize = 4096;
 
-fn key(tenant: TenantId) -> Key {
+/// The registry's key, derived from the tenant like every other key here.
+pub fn key(tenant: TenantId) -> Key {
     Key::new(format!("{:04x}/tnt/{}/lanes", tenant.0 as u16, tenant.0))
 }
 

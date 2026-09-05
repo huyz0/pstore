@@ -1,9 +1,7 @@
 //! Opening and reading a segment.
 
 use crate::codec::{Dec, checksum};
-use crate::{
-    BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, VERSION, Value,
-};
+use crate::{BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, VERSION};
 use bytes::Bytes;
 use pstore_blob::{BlobStore, Key};
 use std::collections::BTreeMap;
@@ -117,17 +115,19 @@ impl Segment {
     /// keeping is mandatory**: a wrongly dropped block silently loses rows.
     #[must_use]
     pub fn blocks_to_read(&self, filter: Option<&Filter>) -> Vec<usize> {
-        (0..self.blocks.len())
-            .filter(|i| match (filter, self.blocks.get(*i)) {
-                (None, _) => true,
-                (Some(f), Some(b)) => match b.zones.get(f.column()) {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| match filter {
+                None => true,
+                Some(f) => match b.zones.get(f.column()) {
                     Some((lo, hi)) => f.could_match(*lo, *hi),
                     // No zone map for that column -- it may be a string, or absent from
                     // this block. Cannot prune, so must read.
                     None => true,
                 },
-                (Some(_), None) => false,
             })
+            .map(|(i, _)| i)
             .collect()
     }
 
@@ -208,30 +208,11 @@ impl Segment {
         Ok(scored)
     }
 
+    /// ⚠️ Delegates rather than duplicating. This was a second decoder for the same wire
+    /// format, byte-identical to `decode_docs` — which means every future change to the
+    /// document encoding had to be made twice, and the day one of them was missed the
+    /// reader and the writer would disagree with no compiler to say so.
     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
-        let mut d = Dec::new(buf);
-        let n = d.u32()? as usize;
-        let mut out = Vec::with_capacity(n.min(1 << 20));
-        for _ in 0..n {
-            let id = d.string()?;
-            let dims = d.u32()? as usize;
-            let mut vector = Vec::with_capacity(dims.min(1 << 16));
-            for _ in 0..dims {
-                vector.push(d.f32()?);
-            }
-            let an = d.u32()? as usize;
-            let mut attrs = BTreeMap::new();
-            for _ in 0..an {
-                let k = d.string()?;
-                let v = match d.u8()? {
-                    0 => Value::Int(d.i64()?),
-                    1 => Value::Str(d.string()?),
-                    _ => return Err(FormatError::Corrupt("unknown value tag")),
-                };
-                attrs.insert(k, v);
-            }
-            out.push(Document { id, vector, attrs });
-        }
-        Ok(out)
+        crate::decode_docs(buf)
     }
 }

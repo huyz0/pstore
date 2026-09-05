@@ -42,9 +42,9 @@
 +    Default::default() /* ~ changed by cargo-mutants ~ */
  }
  
- async fn probe_missing_key<S: BlobStore>(s: &S, run: u64) -> Support {
-     // A 404 is a NORMAL answer, not an error: it is what bounds the WAL lane during
-     // forward probing. A backend that hangs or 500s here breaks tail discovery.
-     match s.get(&k(run, "definitely-absent")).await {
-         Err(_) => Support::Supported,
-         Ok(_) => Support::Divergent("a missing key returned a body".to_owned()),
+ /// `Range: bytes=-N`. The primitive a self-describing footer is read with.
+ ///
+ /// Without it a reader must `head` first, which is billed as a read and doubles the cost
+ /// of every cold open. A backend that answers a suffix range with the WHOLE object would
+ /// pass a functional test and cost a segment's bandwidth per open, so the length is
+ /// checked, not just the content.

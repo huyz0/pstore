@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace < with > in Engine<S>::compact
+@@ -502,17 +502,17 @@
+     ///
+     /// Returns `None` when there was nothing to do — fewer than two segments, or another
+     /// compactor got there first.
+     ///
+     /// `RA = n Rpar + 1 W + 1 commit`, for any *n*.
+     pub async fn compact(&self, index: &str) -> Result<Option<Epoch>, EngineError> {
+         let at = head::read(&*self.store, self.tenant).await?;
+         let inputs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
+-        if inputs.len() < 2 {
++        if inputs.len() > /* ~ changed by cargo-mutants ~ */ 2 {
+             return Ok(None);
+         }
+         let keys: Vec<Key> = inputs.iter().map(|r| Key::new(r.key.clone())).collect();
+ 
+         // Opened and scanned together, like every other multi-segment read: n inputs are
+         // n parallel fetches, not n round trips.
+         let opened =
+             futures_util::future::try_join_all(keys.iter().map(|k| Segment::open(&*self.store, k)))

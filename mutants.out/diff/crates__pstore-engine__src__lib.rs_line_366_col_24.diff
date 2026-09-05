@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace match guard attempt < MAX_COMMIT_ATTEMPTS - 1 with true in Engine<S>::fold
+@@ -358,17 +358,17 @@
+                     self.mem().durable.clear();
+                     *self
+                         .committed
+                         .lock()
+                         .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+                     return Ok(epoch);
+                 }
+                 Err(EngineError::Lost | EngineError::Contended)
+-                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
++                    if true /* ~ changed by cargo-mutants ~ */ =>
+                 {
+                     backoff(self.lane, attempt).await;
+                 }
+                 Err(e) => return Err(e),
+             }
+         }
+         Err(EngineError::Lost)
+     }

@@ -19,7 +19,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | **OQ-111** | Measured **bytes-scanned per second** per node, from RAM and from NVMe separately (refines OQ-75). | QPS/node swings 75× with scan size, so the cost model's dominant input is currently meaningless without this. | Benchmark the SIMD scan loop on target instance types at several scan sizes. |
 | **OQ-98** | Actual endurance (DWPD/TBW) of AWS/GCP/Azure instance-store NVMe — **none of them publish it**. | The whole cache-fill rate budget (~67 MB/s) rests on a 2-DWPD assumption. If it is 1 DWPD the budget halves and warming takes 20 h; drives failing at month 8 is the failure mode. | Track SMART `percentage_used` drift on a real fleet for 2–4 weeks; or ask the vendor. |
 | **OQ-85** | The three-way optimum between memtable memory budget, fold rate, and recovery-scan window. | Fold rate is the dominant per-index PUT cost after bundling; memtable size bounds both query cost and how lazy folding can be. | Model analytically, then measure in M1/M2. |
-| **OQ-91** | Prove that `HEAD.lane_watermarks` + forward probing of placement nodes' bundle lanes finds **every** un-folded record under placement change, fallback writes, and node death. | If recovery can miss records, cross-index bundling is unsafe and the whole cost argument collapses. | Deterministic simulation target for M2. |
+| ~~**OQ-91**~~ | Prove that `HEAD.lane_watermarks` + forward probing of placement nodes' bundle lanes finds **every** un-folded record under placement change, fallback writes, and node death. | If recovery can miss records, cross-index bundling is unsafe and the whole cost argument collapses. | **ANSWERED in M2 — and it failed first.** See [C-2](#c-2-oq-91-recovery-requires-a-dense-lane) below. |
 
 ## Tier 2 — significant design impact
 
@@ -193,3 +193,32 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | **turbopuffer is well ahead** | They have production scale (1T docs, 25k QPS, 99.99% since launch) and marquee customers. Our differentiation must be architectural (multi-writer lanes, true masterlessness, 10K nodes), not incremental. |
 | **The masterless premise is unproven at scale** | Nobody has shipped a fully blob-resident metadata plane at fleet scale. That is simultaneously the risk and the reason to build it. M0 and M2 exist to answer this early and cheaply. |
 | **"No master" may be solving a problem customers don't have** | Worth stating plainly: a small hosted metadata service (WarpStream's model) works fine for most people. Our justification is operational simplicity, BYOC data sovereignty, and one-stateful-dependency uptime — which are *product* arguments, and should be validated with customers, not just engineers. |
+
+
+## C-2 — OQ-91: recovery requires a **dense** lane
+
+**Answered in M2** ([`docs/milestones/M2/VERIFIED.md`](../../milestones/M2/VERIFIED.md),
+criterion 6). Recovery does find every acknowledged record under writer death, succession
+and fallback writes to a different lane — **but only after a bug that the first run of the
+proof exposed.**
+
+The scenario (64 seeds, three writers, deaths and successions drawn from the seed, 15% of
+writes refused) lost two acknowledged rows on seed 0.
+
+**The cause.** Forward probing takes the first absent sequence as the end of the lane —
+correctly, because a lane is dense by construction. The write path did not honour that: a
+refused `PUT` still consumed the lane's sequence number. One transient failure therefore
+punched a permanent hole, and every bundle written after it — all acknowledged, all
+durable — became invisible to every future reader. No error was raised anywhere, because
+from the probe's point of view the lane had simply ended.
+
+**What this means for the design, beyond the fix.** The research treats "probe forward to
+the first 404" as a cheap way to avoid a LIST, and it is. What it does not say, and what
+this milestone establishes, is that the technique imposes an obligation on the *write*
+path: **a sequence number may only be consumed by a write that landed.** Any future
+mechanism that allocates lane sequences — a batching layer, a retry wrapper, a
+speculative pre-allocation — inherits that obligation, and violating it fails silently
+rather than loudly.
+
+⚠️ `provisional`. The scenarios model a writer that stops and a store that refuses. They
+do not reproduce a kernel, a socket, or a machine losing power mid-`PUT`.

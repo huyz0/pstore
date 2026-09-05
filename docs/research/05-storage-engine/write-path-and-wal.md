@@ -75,6 +75,15 @@ For a known lane at `seq = n`, issue **parallel GETs** for `n+1 … n+k`. The fi
 the tail. Cost: `k` cheap reads (Rpar, one round trip), 0 writes, 0 LISTs. `k` adapts to the
 observed write rate.
 
+> ⚠️ **C-2 (M2).** "The first 404 bounds the tail" is only sound if the lane is **dense**,
+> and that is an obligation on the *write* path, not a property of the probe: **a sequence
+> number may only be consumed by a write that landed.** M2 shipped a `flush` that consumed
+> the sequence before its `PUT` succeeded, so a single refused write punched a permanent
+> hole and every acknowledged bundle after it became invisible — silently, because from the
+> probe's side the lane had simply ended. Found by the OQ-91 scenario, not by review. Any
+> future layer that allocates lane sequences inherits the obligation. See
+> [`00-plan/open-questions.md` C-2](../00-plan/open-questions.md#c-2--oq-91-recovery-requires-a-dense-lane).
+
 ### (b) New lanes: the lane directory
 A writer that opens a *new* lane advertises it once:
 

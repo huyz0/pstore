@@ -1,0 +1,24 @@
+--- crates/pstore-blob/src/faulty.rs
++++ replace <impl crate::BlobStore for Faulty<S>>::head -> Result<u64, BlobError> with Ok(0)
+@@ -171,20 +171,17 @@
+         }
+     }
+ 
+     async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+         self.inner.get_tag(key).await
+     }
+ 
+     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+-        match self.read_fault() {
+-            Some(e) => Err(e),
+-            None => self.inner.head(key).await,
+-        }
++        Ok(0) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+         match self.write_fault() {
+             Some(e) => Err(e),
+             None => self.inner.put(key, body).await,
+         }
+     }

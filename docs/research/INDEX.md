@@ -90,7 +90,7 @@ If you read nothing else:
 ## 05 — Storage engine
 | Doc | Answers | Status |
 |---|---|---|
-| [write-path-and-wal.md](05-storage-engine/write-path-and-wal.md) | Q15 | **The central mechanism.** Per-writer lanes + group commit ⇒ 1 PUT per batch, 0 CAS, no contention at any writer count. Tail found by probing + an 8 KiB lane bitmap. *(Partly superseded by the row below.)* |
+| [write-path-and-wal.md](05-storage-engine/write-path-and-wal.md) | Q15 | **The central mechanism.** Per-writer lanes + group commit ⇒ 1 PUT per batch, 0 CAS, no contention at any writer count. Tail found by probing + an 8 KiB lane bitmap. *(Partly superseded by the row below.)* **⚠️ Two corrections from M2: the bitmap as specified cannot be read back (a set bit does not name the lane that set it), and forward probing requires the write path to keep the lane dense — C-2.** |
 | **[batching-and-visibility.md](05-storage-engine/batching-and-visibility.md)** | Q32 | **Per-index batching has a $216k–$13M/month floor at 1M indexes at any batch size.** Bundle across tenants (PUTs scale with nodes, not indexes) and serve freshness from a replicated memtable — ~1 ms visibility with hour-scale batching. Corrects the Express One Zone and multipart-cost claims elsewhere. |
 | [file-format-and-layout.md](05-storage-engine/file-format-and-layout.md) | Q16 | Self-describing segment; one `Range: -N` suffix GET bootstraps it. No sidecars. Parquet rejected (random access); Lance is a real alternative. |
 | [compaction.md](05-storage-engine/compaction.md) | Q17 | On blob storage, space amp is cheap and **read amp is expensive** (30 ms/hop) — so bias leveled, bound segments per query to ~10. Compaction costs <$0.001 in requests; CPU is the constraint. |

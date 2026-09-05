@@ -20,9 +20,9 @@
 +        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
      }
  
-     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+         // Under one lock, so the pair cannot straddle another writer's commit.
          self.lock()
              .objects
              .get(key.as_str())
-             .map(|(_, t)| t.clone())
-     }
+             .map(|(b, t)| (b.clone(), t.clone()))

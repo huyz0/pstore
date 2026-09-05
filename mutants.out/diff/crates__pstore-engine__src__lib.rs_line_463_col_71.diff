@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace ^ with | in Engine<S>::commit_head_for_test
+@@ -455,17 +455,17 @@
+     #[doc(hidden)]
+     pub async fn commit_head_for_test(
+         &self,
+         mutate: impl FnOnce(&mut Head),
+     ) -> Result<Epoch, EngineError> {
+         let at = head::read(&*self.store, self.tenant).await?;
+         let mut next = at.head.clone();
+         next.epoch = next.epoch.next();
+-        next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
++        next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) | /* ~ changed by cargo-mutants ~ */ self.lane.0;
+         mutate(&mut next);
+         head::commit(&*self.store, self.tenant, &at, &next).await
+     }
+ 
+     /// The published manifest, so a test can assert on what is *referenced* rather than
+     /// inferring it from what a scan happens to return.
+     #[doc(hidden)]
+     pub async fn head_for_test(&self) -> Head {

@@ -19,4 +19,4 @@
          self.inner.get_range(key, range).await
      }
  
-     async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, pstore_types::CasTag), BlobError> {

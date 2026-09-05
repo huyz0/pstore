@@ -26,6 +26,14 @@ pub struct Flaky {
     /// Ordinals of writes to refuse outright, for a scenario that needs a *specific*
     /// failure rather than a plausible distribution of them.
     at: Vec<u64>,
+    /// Every read fails. Models a backend that is down rather than busy.
+    reads_fail: bool,
+    /// Every conditional write comes back `Contended`.
+    ///
+    /// Distinct from `Lost`, and the difference is the whole retry protocol: `Lost` means
+    /// rebase because someone else won, `Contended` means the backend could not evaluate
+    /// the condition and the same attempt should be retried unchanged.
+    always_contended: bool,
     seen: AtomicU64,
     failures: Arc<AtomicU64>,
 }
@@ -42,6 +50,8 @@ impl Flaky {
             // than dependent on float formatting.
             rate: (clamped * f64::from(u32::MAX)) as u64,
             at: Vec::new(),
+            reads_fail: false,
+            always_contended: false,
             seen: AtomicU64::new(0),
             failures: Arc::new(AtomicU64::new(0)),
         }
@@ -58,6 +68,8 @@ impl Flaky {
             state: AtomicU64::new(0),
             rate: 0,
             at: at.to_vec(),
+            reads_fail: false,
+            always_contended: false,
             seen: AtomicU64::new(0),
             failures: Arc::new(AtomicU64::new(0)),
         }
@@ -93,6 +105,32 @@ impl Flaky {
         }
         false
     }
+
+    /// A store whose reads all fail.
+    #[must_use]
+    pub fn refusing_reads() -> Self {
+        Self {
+            reads_fail: true,
+            ..Self::refusing(&[])
+        }
+    }
+
+    /// A store whose conditional writes are always `Contended`.
+    #[must_use]
+    pub fn always_contended() -> Self {
+        Self {
+            always_contended: true,
+            ..Self::refusing(&[])
+        }
+    }
+
+    fn read_gate(&self) -> Result<(), BlobError> {
+        if self.reads_fail {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(BlobError::Other("injected read failure".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -101,21 +139,29 @@ impl BlobStore for Flaky {
         self.inner.capabilities()
     }
     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+        self.read_gate()?;
         self.inner.get(key).await
     }
     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+        self.read_gate()?;
         self.inner.get_range(key, range).await
     }
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        self.read_gate()?;
         self.inner.get_suffix(key, n).await
     }
     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+        self.read_gate()?;
         self.inner.get_with_tag(key).await
     }
     async fn get_tag(&self, key: &Key) -> Option<CasTag> {
         self.inner.get_tag(key).await
     }
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+        // ⚠️ Gated too. `head` is how the WAL tail is probed, so leaving it working while
+        // every other read fails models a backend that does not exist and hides the
+        // engine's most important "is this a gap or an outage?" decision.
+        self.read_gate()?;
         self.inner.head(key).await
     }
 
@@ -135,6 +181,10 @@ impl BlobStore for Flaky {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        if self.always_contended {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(CasError::Contended);
+        }
         if self.refuse() {
             return Err(CasError::Io(
                 "injected conditional write failure".to_owned(),

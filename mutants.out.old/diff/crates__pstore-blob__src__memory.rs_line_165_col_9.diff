@@ -1,0 +1,35 @@
+--- crates/pstore-blob/src/memory.rs
++++ replace <impl crate::BlobStore for MemoryStore>::put_conditional -> Result<PutOutcome, CasError> with Ok(Default::default())
+@@ -157,31 +157,17 @@
+     }
+ 
+     async fn put_conditional(
+         &self,
+         key: &Key,
+         body: Bytes,
+         pre: Precondition,
+     ) -> Result<PutOutcome, CasError> {
+-        let mut st = self.lock();
+-        let current = st.objects.get(key.as_str()).map(|(_, t)| t.clone());
+-        let ok = match (&pre, &current) {
+-            (Precondition::NotExists, None) => true,
+-            (Precondition::NotExists, Some(_)) => false,
+-            (Precondition::Match(want), Some(have)) => want == have,
+-            (Precondition::Match(_), None) => false,
+-        };
+-        if !ok {
+-            return Err(CasError::Lost);
+-        }
+-        let tag = self.next_tag(&mut st, &body);
+-        st.objects
+-            .insert(key.as_str().to_owned(), (body, tag.clone()));
+-        Ok(PutOutcome { tag })
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+         if keys.len() > self.caps.max_batch_delete {
+             return Err(BlobError::Other(format!(
+                 "batch of {} exceeds the backend's limit of {}",
+                 keys.len(),
+                 self.caps.max_batch_delete

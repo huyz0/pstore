@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace ^ with & in Engine<S>::fold
+@@ -311,17 +311,17 @@
+                 return Ok(at.head.epoch);
+             }
+ 
+             let mut next = at.head.clone();
+             next.epoch = next.epoch.next();
+             // The ABA guard: two HEADs differing only in content a content-derived tag is
+             // computed from would otherwise share a tag. Derived from the epoch and lane,
+             // so it is deterministic and needs no clock.
+-            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
++            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) & /* ~ changed by cargo-mutants ~ */ self.lane.0;
+ 
+             // One segment per index. Folding every index into one object would make each
+             // index's ref point at the whole thing, and a scan would return its
+             // neighbours' rows.
+             for (idx, docs) in &by_index {
+                 let seg_key = self.segment_key(next.epoch, idx);
+                 let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
+                 for d in docs {

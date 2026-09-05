@@ -1,0 +1,21 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace < with <= in Engine<S>::fold
+@@ -358,17 +358,17 @@
+                     self.mem().durable.clear();
+                     *self
+                         .committed
+                         .lock()
+                         .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+                     return Ok(epoch);
+                 }
+                 Err(EngineError::Lost | EngineError::Contended)
+-                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
++                    if attempt <= /* ~ changed by cargo-mutants ~ */ MAX_COMMIT_ATTEMPTS - 1 =>
+                 {
+                     backoff(self.lane, attempt).await;
+                 }
+                 Err(e) => return Err(e),
+             }
+         }
+         Err(EngineError::Lost)
+     }

@@ -1,0 +1,76 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::flush -> Result<Option<Seq>, EngineError> with Ok(None)
+@@ -179,72 +179,17 @@
+             .map(|d| d.id.clone())
+             .collect()
+     }
+ 
+     /// Writes everything buffered as **one bundle object**, whatever it covers.
+     ///
+     /// `RA = 1 W` for the batch, and for every index in it.
+     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
+-        let _lane = self.flushing.lock().await;
+-        let pending = {
+-            let mut m = self.mem();
+-            if m.pending.is_empty() {
+-                return Ok(None);
+-            }
+-            std::mem::take(&mut m.pending)
+-        };
+-        let seq = *self
+-            .seq
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+-
+-        // Registered once, on the lane's first flush. A lane nobody can find is a lane
+-        // whose writes cannot be recovered, and the registration is what makes a successor
+-        // able to discover it without being told.
+-        if seq == Seq::ZERO
+-            && let Err(e) = lanes::register(&*self.store, self.tenant, self.lane).await
+-        {
+-            self.restore(pending);
+-            return Err(e);
+-        }
+-        // The one PUT.
+-        if let Err(e) = self
+-            .store
+-            .put(&self.lane_key(seq), bundle::encode(&pending).into())
+-            .await
+-        {
+-            // ⚠️ **The sequence is not consumed, and this is load-bearing** (OQ-91).
+-            //
+-            // A lane is recovered by probing forward from the last watermark until a key
+-            // is missing, so a lane must be DENSE: the first absent sequence is taken as
+-            // the end. Burning a number on a failed write punches a permanent hole, and
+-            // every bundle after it — all of them acknowledged, all of them durable —
+-            // becomes invisible to every future reader. One refused PUT silently
+-            // truncates the lane forever.
+-            //
+-            // Found by the OQ-91 scenario losing two acknowledged rows on seed 0, not by
+-            // reading this code.
+-            self.restore(pending);
+-            return Err(e.into());
+-        }
+-        {
+-            let mut s = self
+-                .seq
+-                .lock()
+-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            *s = seq.next();
+-        }
+-        // Only now does it move from pending to durable: a write that failed to land must
+-        // not be reported as durable, and must stay visible so it is not lost.
+-        let mut m = self.mem();
+-        for (idx, docs) in pending {
+-            m.durable.entry(idx).or_default().extend(docs);
+-        }
+-        Ok(Some(seq))
++        Ok(None) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Puts a failed flush's rows back in front of anything written since.
+     ///
+     /// Without this a refused flush would drop the rows it took, which is a silent loss of
+     /// data the caller was never told was durable — worse than the error it reports,
+     /// because the caller's retry would have no way to know what to retry.
+     fn restore(&self, pending: BTreeMap<String, Vec<Document>>) {

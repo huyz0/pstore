@@ -1,0 +1,26 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::commit_head_for_test -> Result<Epoch, EngineError> with Ok(Default::default())
+@@ -452,22 +452,17 @@
+     /// defence that cannot be reached cannot be tested, and an untested defence is one
+     /// that quietly stops working — so a test is allowed to construct the state the
+     /// protocol forbids, and check that GC survives it.
+     #[doc(hidden)]
+     pub async fn commit_head_for_test(
+         &self,
+         mutate: impl FnOnce(&mut Head),
+     ) -> Result<Epoch, EngineError> {
+-        let at = head::read(&*self.store, self.tenant).await?;
+-        let mut next = at.head.clone();
+-        next.epoch = next.epoch.next();
+-        next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+-        mutate(&mut next);
+-        head::commit(&*self.store, self.tenant, &at, &next).await
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The published manifest, so a test can assert on what is *referenced* rather than
+     /// inferring it from what a scan happens to return.
+     #[doc(hidden)]
+     pub async fn head_for_test(&self) -> Head {
+         head::read(&*self.store, self.tenant)
+             .await

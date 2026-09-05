@@ -1,0 +1,24 @@
+--- crates/pstore-engine/src/lib.rs
++++ replace Engine<S>::segment_key -> Key with Default::default()
+@@ -144,20 +144,17 @@
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+     }
+ 
+     fn lane_key(&self, seq: Seq) -> Key {
+         bundle_key(self.tenant, self.lane, seq)
+     }
+ 
+     fn segment_key(&self, epoch: Epoch, index: &str) -> Key {
+-        Key::new(format!(
+-            "{:04x}/tnt/{}/idx/{index}/seg/L0/{:020}-{:016x}.seg",
+-            self.tenant.0 as u16, self.tenant.0, epoch.0, self.lane.0
+-        ))
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Buffers documents. **Visible immediately**; durable at the next [`Self::flush`].
+     pub async fn write(&self, index: &str, docs: Vec<Document>) -> Result<(), EngineError> {
+         self.mem()
+             .pending
+             .entry(index.to_owned())
+             .or_default()
