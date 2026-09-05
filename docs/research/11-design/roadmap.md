@@ -34,7 +34,9 @@ premise.
 ### M1 — Single-node storage engine (4–6 weeks)
 - `pstore-format`: segment encode/decode, footer, blocks, zone maps.
 - `pstore-manifest`: HEAD, epochs, commit protocol, delta chains.
-- `pstore-wal`: lanes, group commit, lane bitmap, tail probing.
+- `pstore-wal`: lanes, group commit, lane bitmap, tail probing, **cross-index bundles**
+  (footer index, sort by `(index_id, shard)`) and the **memtable/freshness layer** — these are
+  not a later optimization; a per-index write path would have to be rewritten (OQ-84/85).
 - `pstore-cache`: `foyer` + class-aware admission.
 - **Exact brute-force vector search only.** No ANN yet — it already serves the majority of
   real indexes (D-10).
@@ -49,9 +51,13 @@ premise.
   injected pauses, partitions, and CAS storms; **assert Invariant I1**.
 - Compaction as optimistic work + CAS-on-publish, with duplicate-work suppression.
 - GC with epoch retention.
+- **Bundle-recovery proof (OQ-91):** under node death, placement change, and fallback writes,
+  `HEAD.lane_watermarks` + forward probing of placement lanes must find *every* un-folded
+  record. If this cannot be shown, cross-index bundling is unsafe and the cost model collapses.
 
 **Exit:** linearizability of the epoch sequence under adversarial scheduling, at 100+ logical
-writers. This is where the architecture is either proven or disproven.
+writers, plus the bundle-recovery proof. This is where the architecture is either proven or
+disproven.
 
 ### M3 — Vector index (5–7 weeks)
 - `pstore-quant`: RaBitQ + int8 SQ + SIMD kernels (`simsimd`), rerank ladder.
@@ -117,6 +123,10 @@ parallelism on M3/M5, which are largely independent of M2/M4.
 
 ## The three questions that decide whether to continue
 
+0. **Before M1:** what is the real tenancy distribution (OQ-84)? If most indexes turn out to
+   be large and continuously written, cross-index bundling is over-engineering and the simpler
+   per-index path is fine. This is a customer-discovery question, not an engineering one, and
+   it is cheap to answer first.
 1. **After M0:** does CAS behave well enough under contention? If a single key can't sustain
    even a few writes/second reliably, the partitioned-register plan needs rethinking.
 2. **After M2:** does the simulation find correctness bugs we cannot close? A masterless design

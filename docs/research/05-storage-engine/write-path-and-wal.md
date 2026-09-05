@@ -1,7 +1,12 @@
 # The Write Path: Lanes, Group Commit, and Zero CAS
 
 **Answers:** Q15
-**Status:** Complete (v1)
+**Status:** Complete (v1) — **partially superseded by
+[`batching-and-visibility.md`](batching-and-visibility.md)**, which shows that per-index
+batching has a cost floor of $216k–$13M/month at 1M indexes regardless of batch size, and
+moves the WAL unit from per-`(index, shard)` to per-**node** cross-index bundles. Read that
+document with this one; §3's lane bitmap survives as the fallback-discovery mechanism, and
+§5's Express One Zone recommendation is corrected there (C-1).
 
 This is the design's biggest departure from turbopuffer and the thing that makes 10K nodes
 useful rather than decorative.
@@ -18,8 +23,16 @@ useful rather than decorative.
 ## 2. The core idea: lanes
 
 > **A lane is a single-writer, append-only sequence of immutable WAL objects, owned by one
-> node for one index-shard.** Multiple lanes exist concurrently. Ordering is established at
-> *read* time by merging lanes, not at write time by serializing writers.
+> node.** Multiple lanes exist concurrently. Ordering is established at *read* time by merging
+> lanes, not at write time by serializing writers.
+
+> **Revision (see [`batching-and-visibility.md`](batching-and-visibility.md) §4).** A lane
+> object is a **cross-index bundle** — one object carrying records for every index and shard
+> the node buffered in that window, sorted by `(index_id, shard)` with a footer index. The
+> per-`(index, shard)` keying shown below is retained only for the fallback path, where a
+> writer that cannot reach an index's placements writes a dedicated object and registers
+> itself in the lane bitmap. Bundling is what removes the per-index PUT floor; the lane
+> concept is otherwise unchanged.
 
 ```
 {h}/idx/{id}/s{shard}/wal/{lane_id}/{seq:016}.wal
@@ -127,10 +140,18 @@ storage cost is irrelevant at a 1-hour TTL.
 - WAL → Express/low-latency tier (where available).
 - Segments → Standard.
 - **Caveat:** Express is single-AZ. `durable` mode requires multi-AZ durability, so either
-  (a) dual-write WAL to Express (for latency) and Standard (for durability) — 2 PUTs, still
-  amortized over a big batch, or (b) offer Express-only WAL as a documented single-AZ
-  durability tier. **Recommendation: (a) by default**, since the second PUT is ~$0.005/1000
-  amortized over 10k docs = negligible, and it collapses the durability question.
+  (a) dual-write WAL to Express (for latency) and Standard (for durability), or (b) offer
+  Express-only WAL as a documented single-AZ durability tier.
+
+> **⚠️ Corrected — see [`batching-and-visibility.md`](batching-and-visibility.md) §8 (C-1).**
+> The original recommendation of (a)-by-default understated the cost. Multi-AZ durability on
+> Express needs ~3 copies (WarpStream writes to three Express buckets for quorum), and since
+> April 2025 Express bills **$0.0032/GB on all uploaded bytes**. For an 8 MiB bundle that is
+> **≈16× more expensive than a single Standard PUT**, dominated by per-GB transfer rather
+> than requests. **Express is a latency purchase, not a cost saving**, and it gets worse as
+> bundles grow. Default to Standard; offer Express as a priced opt-in for single-digit-ms
+> *durable* acks. Most workloads will not need it, because the freshness layer already
+> delivers ~1 ms *visibility*.
 
 ## 6. Backpressure
 

@@ -54,6 +54,10 @@ match our differentiation claims.
 - Write latency p50/p99 in each durability mode.
 - Time-to-searchable (write → visible in a strong-consistency query).
 - **PUTs per million documents** — the number that decides whether the economics work.
+- **PUTs per idle-ish index per month** — the tenancy floor. Measure with 100k+ trickle
+  indexes; a single-index benchmark cannot see this and it is where the naive design fails.
+- **Time-to-searchable** measured separately from write-ack latency, and **swept against the
+  flush interval** — the two must be independent, or the freshness layer is not working.
 
 ### Scale and elasticity
 - Cluster convergence time after adding/removing 1,000 nodes.

@@ -131,6 +131,12 @@ compacted index) have opposite cost profiles. Split them across storage classes:
 The WAL's 37.7:1 W:R ratio is fine because group commit already made W rare, and its GETs
 (tail-following by other nodes) are 13× cheaper than Standard.
 
+> **⚠️ Corrected — see [`../05-storage-engine/batching-and-visibility.md`](../05-storage-engine/batching-and-visibility.md)
+> §8 (C-1).** Express One Zone is single-AZ, so multi-AZ durability costs ~3 copies, and it
+> bills per-GB on all uploaded bytes. At bundle sizes it is ~16× *more* expensive than
+> Standard. Treat this pattern as a **latency** tool, priced accordingly — not a cost
+> reduction.
+
 ## Pattern 10: Amortized metadata (one CAS per many commits)
 
 A CAS PUT per write batch would double our write cost. Instead:
@@ -142,6 +148,33 @@ A CAS PUT per write batch would double our write cost. Instead:
 Tail probing: reader knows the last seen seq `n`; issues parallel GETs for `n+1..n+k`; the
 first 404 bounds the tail. Cost: `k` cheap reads, 0 writes, 0 lists. This is the trick that
 lets us have a durable log with no coordinator and no listing.
+
+## Pattern 11: Bundle across tenants (breaks the per-stream PUT floor)
+
+Group commit (Pattern 1) removes write amplification *within* one stream. It does nothing
+about the floor you pay for **having** a stream: a per-index timer at interval `T` costs
+`2,592,000/T` PUTs per index per month whether the index writes one document or a billion.
+At 1M indexes and `T = 60 s` that is **$216,000/month of pure liveness**.
+
+The fix is to make the flush unit the **node**, not the tenant: one object per window carrying
+records for every index the node buffered, sorted by `(index_id, shard)` with a footer index.
+PUT cost then scales with **node count and write volume**, not tenant count.
+
+Discovery is preserved by routing writes through the same placement function that routes
+reads, so a reader derives the small set of node lanes that could hold its data — still zero
+LIST. Full design, cost tables, and the visibility argument:
+[`../05-storage-engine/batching-and-visibility.md`](../05-storage-engine/batching-and-visibility.md).
+
+## Pattern 12: Serve freshness from memory, not from storage
+
+Bundling only stays latency-free if visibility does not wait for the PUT. Route writes to an
+index's read placements, hold them in an R-way in-memory-replicated memtable, and scan that
+memtable exactly at query time. Visibility then costs ~1 ms **regardless of the flush
+interval**, and the batching dial moves onto the durable-ack axis where clients can choose it.
+
+> **Corollary.** Any design in which the flush interval appears in the time-to-searchable
+> budget has conflated durability with visibility, and will be forced to choose between cost
+> and freshness. Separate them and the choice disappears.
 
 ---
 
@@ -155,6 +188,9 @@ lets us have a durable log with no coordinator and no listing.
 | HEAD-before-GET | Doubles read count for zero information the manifest lacks |
 | Read-modify-write of a large object | Bandwidth + lost-update hazard |
 | Per-node discovery by enumeration | O(fleet × dataset) |
+| **Per-index time-driven flush** | **$216k–$13M/month floor at 1M indexes, independent of data volume** |
+| Tuning the flush interval for search freshness | Conflates durability with visibility; use a memtable (Pattern 12) |
+| Multipart upload for ordinary batches | Every `UploadPart` is a PUT-class request; a single PUT covers up to 5 GiB |
 | Depending on Azure leases or append blobs | Not portable |
 | Parsing ETags as content hashes | Wrong under MPU/KMS |
 

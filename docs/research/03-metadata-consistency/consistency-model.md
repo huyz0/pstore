@@ -72,8 +72,14 @@ t4  indexer folds it into a segment      <- visible for all reads, faster
 t5  structural CAS commit publishes it   <- epoch advances
 ```
 
-- Between t2 and t5, data is **visible but unindexed**: strong-mode queries must scan the WAL
-  tail as well as the indexed segments. We cap the unindexed volume (turbopuffer caps at
+- **Visibility actually happens at t1, not t3** — see
+  [`../05-storage-engine/batching-and-visibility.md`](../05-storage-engine/batching-and-visibility.md)
+  §5. Writes are routed to the index's read placements and held in an R-way in-memory
+  memtable, so every node that can answer a query for the index has the record ~1 ms after
+  arrival, independent of when the PUT lands. The t2–t5 sequence below describes durability
+  and query *efficiency*, not freshness.
+- Between t2 and t5, data is **visible but unindexed**: strong-mode queries must scan the
+  memtable (and any un-folded WAL) as well as the indexed segments. We cap the unindexed volume (turbopuffer caps at
   128 MiB; we do the same, adaptively) and apply back-pressure beyond it.
 - `bounded` reads may serve from t4 or even t3 state.
 

@@ -10,7 +10,7 @@ for data *and* metadata. Target: 10,000 nodes, millions of indexes, minimal blob
 
 ---
 
-**Status: research phase complete.** 28 documents, 31 research questions answered, 83 open
+**Status: research phase complete.** 29 documents, 32 research questions answered, 91 open
 questions logged. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
 
@@ -29,9 +29,13 @@ If you read nothing else:
    masterless system with no external metadata store became possible only recently — this is
    the design's whole premise.
    → [`03-metadata-consistency/manifest-and-cas.md`](03-metadata-consistency/manifest-and-cas.md)
-4. **CAS on a single key tops out at ~5 writes/s.** So bulk data writes must never touch the
-   CAS path: each writer owns a *lane*, and CAS is reserved for structural commits.
-   → [`05-storage-engine/write-path-and-wal.md`](05-storage-engine/write-path-and-wal.md)
+4. **CAS on a single key tops out at ~5 writes/s, and per-*index* batching has a cost floor
+   independent of data volume** ($216k/month at 1M indexes even at a 60 s flush). So bulk
+   writes touch neither CAS nor a per-index object: each node writes one **cross-index bundle**
+   per window, and freshness is served from a replicated in-memory memtable so the batch window
+   never appears in the time-to-searchable budget.
+   → [`05-storage-engine/write-path-and-wal.md`](05-storage-engine/write-path-and-wal.md),
+   [`05-storage-engine/batching-and-visibility.md`](05-storage-engine/batching-and-visibility.md)
 5. **Stateless nodes ⇒ no rebalancing ⇒ elasticity in seconds.** This is what makes 10,000
    nodes tractable; cache affinity is an optimization, never a correctness requirement.
    → [`04-cluster/routing-and-placement.md`](04-cluster/routing-and-placement.md)
@@ -77,7 +81,8 @@ If you read nothing else:
 ## 05 — Storage engine
 | Doc | Answers | Status |
 |---|---|---|
-| [write-path-and-wal.md](05-storage-engine/write-path-and-wal.md) | Q15 | **The central mechanism.** Per-writer lanes + group commit ⇒ 1 PUT per batch, 0 CAS, no contention at any writer count. Tail found by probing + an 8 KiB lane bitmap. |
+| [write-path-and-wal.md](05-storage-engine/write-path-and-wal.md) | Q15 | **The central mechanism.** Per-writer lanes + group commit ⇒ 1 PUT per batch, 0 CAS, no contention at any writer count. Tail found by probing + an 8 KiB lane bitmap. *(Partly superseded by the row below.)* |
+| **[batching-and-visibility.md](05-storage-engine/batching-and-visibility.md)** | Q32 | **Per-index batching has a $216k–$13M/month floor at 1M indexes at any batch size.** Bundle across tenants (PUTs scale with nodes, not indexes) and serve freshness from a replicated memtable — ~1 ms visibility with hour-scale batching. Corrects the Express One Zone and multipart-cost claims elsewhere. |
 | [file-format-and-layout.md](05-storage-engine/file-format-and-layout.md) | Q16 | Self-describing segment; one `Range: -N` suffix GET bootstraps it. No sidecars. Parquet rejected (random access); Lance is a real alternative. |
 | [compaction.md](05-storage-engine/compaction.md) | Q17 | On blob storage, space amp is cheap and **read amp is expensive** (30 ms/hop) — so bias leveled, bound segments per query to ~10. Compaction costs <$0.001 in requests; CPU is the constraint. |
 | [mutations-and-mvcc.md](05-storage-engine/mutations-and-mvcc.md) | Q18 | Immutable ⇒ MVCC, time travel, and **branching for one PUT** all fall out for free. Deletes via roaring delete vectors. |

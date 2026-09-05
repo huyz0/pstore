@@ -85,6 +85,24 @@ deployment — this is a real knob, not a hand-wave.
 | Compute | $8,760 | **92%** |
 | **Total** | **~$9,550** | |
 
+## The tenancy term the single-index model hides
+
+The table above is for **one** index. It omits the cost of *having* many indexes, which is
+where the naive design dies: a per-index flush timer at interval `T` costs `2,592,000/T` PUTs
+per index per month **whether the index writes one document or a billion**.
+
+| Design | 1M indexes, 1 doc/min each (~16.7 MB/s total) |
+|---|---|
+| Per-index flush, `T` = 1 s | **$13.0M / month** |
+| Per-index flush, `T` = 60 s | **$216,000 / month** |
+| **Cross-index node bundles (8 MiB / 5 s)** | **$26 – $260 / month** |
+| \+ adaptive per-index folds (hourly) | + ~$3,600 / month |
+
+~1,000× on the WAL, with *better* visibility latency. After bundling, the **fold rate**
+becomes the dominant per-index PUT cost, which is why it must be size-driven rather than
+timed. Idle indexes cost zero.
+→ [`../05-storage-engine/batching-and-visibility.md`](../05-storage-engine/batching-and-visibility.md)
+
 ## The three conclusions
 
 1. **Compute dominates, not storage or requests.** Once batching and caching are right, the
@@ -95,9 +113,9 @@ deployment — this is a real knob, not a hand-wave.
    A million small idle indexes cost storage only. This is the property no Tier-1 system can
    match and it should drive pricing: charge for storage + queries, not for provisioned
    capacity.
-3. **Unbatched writes or an uncached read path are 1,000×–2,000× cost regressions.** These are
-   not optimizations; they are the difference between a business and a bankruptcy. Both must
-   be enforced by tests, not by discipline.
+3. **Unbatched writes, per-*index* flush timers, or an uncached read path are 1,000×–2,000×
+   cost regressions.** These are not optimizations; they are the difference between a business
+   and a bankruptcy. All three must be enforced by tests, not by discipline.
 
 ## Comparison at 100M docs / 330 GB
 

@@ -69,11 +69,19 @@ Merging `n` input segments of total size `S` into one output:
 - Reads: `S` bytes, `~S / block_size` GETs, but **coalesced into large sequential ranges** —
   a compactor should read whole segments with a small number of big ranged GETs, since it
   needs everything. Cost ≈ `S / 8 MiB` GETs.
-- Writes: 1 multipart upload ≈ `S / part_size` PUT-class ops. **This is the dominant cost.**
+- Writes: **1 PUT** if the output is ≤5 GiB (the single-`PutObject` limit); otherwise a
+  multipart upload costing `S / part_size` PUT-class requests plus initiate and complete,
+  since **every `UploadPart` is separately billable**.
 - Commit: 1 R + 2 W.
 
-For S = 4 GiB with 64 MiB parts: 512 GETs (~$0.0002) + 64 PUT-parts (~$0.0003) + commit.
-**Under a millidollar per compaction.** Compaction cost is dominated by CPU (decode, re-encode,
+For S = 4 GiB: 512 GETs (~$0.0002) + **1 PUT** (~$0.000005) + commit.
+**Well under a millidollar per compaction.**
+
+> **⚠️ Corrected (C-3, see [`batching-and-visibility.md`](batching-and-visibility.md) §13).**
+> An earlier version costed this output as 64 multipart parts. At 4 GiB it is under the 5 GiB
+> single-PUT limit and is **1 request, not 64** — so sizing segments just below 5 GiB is
+> meaningfully cheaper than chunking them. The conclusion is unchanged and strengthened:
+> compaction is CPU-bound, not request-bound. Compaction cost is dominated by CPU (decode, re-encode,
 re-cluster), not by blob requests. That is a useful conclusion: **we should compact more
 aggressively than a local-disk LSM would**, and the constraint is our own compute budget.
 

@@ -26,6 +26,7 @@ filtered search.
 | C2 | ~30 ms per round trip; ~100 ms budget | [cost-and-latency](../02-object-storage/cost-and-latency.md) | ≤3 sequential fetches ⇒ clustered index, not graph |
 | C3 | Blob CAS exists everywhere now (S3 since 2024) | [api-semantics](../02-object-storage/api-semantics.md) | A masterless metadata plane is finally possible |
 | C4 | CAS on one key ≈ 5 writes/s | [manifest-and-cas](../03-metadata-consistency/manifest-and-cas.md) | Lanes; partitioned registers; CAS only for structural change |
+| C4b | **Per-index flushing costs `2,592,000/T` PUTs/index/month whether the index writes 1 doc or 10⁹** | [batching-and-visibility](../05-storage-engine/batching-and-visibility.md) | Bundle across tenants; serve freshness from memory so `T` costs nothing in latency |
 | C5 | Stateless ⇒ no rebalancing ⇒ elasticity in seconds | [routing-and-placement](../04-cluster/routing-and-placement.md) | 10,000 nodes is tractable; placement is a hint |
 
 ## 3. System diagram
@@ -96,19 +97,27 @@ Every key is **derivable**. Nothing is ever discovered by LIST.
 ## 6. The write path
 
 ```
-client → any node → per-(index,shard) buffer → group commit (8–64 MiB or 50 ms)
-       → ONE PUT to {lane}/{seq}                          ← durable, ack
-       → (async) indexer folds lanes into a segment
+client → routed to the index's read placements
+       → in-memory memtable, replicated R-way intra-AZ (~0.5 ms)
+       → SEARCHABLE  ◀── every node that can answer a query for this index now has it
+       → (up to T later) ONE PUT of a CROSS-INDEX BUNDLE covering every index
+                          this node buffered                ← durable, ack
+       → (async) indexer folds bundles into per-index segments
        → (async) CAS HEAD to publish the new epoch
 ```
 
-- **RA(write batch) = 1 W. CAS operations per write = 0.**
-- N writers ⇒ N lanes ⇒ **no contention at any N**.
-- Readers find lanes via an 8 KiB bitmap + forward probing, never LIST.
-- Three durability modes: `durable` (blob PUT, ~50–250 ms), `batched` (peer-replicated,
-  ~1–5 ms, bounded loss), `async`.
+- **RA(write batch) = 1 W, shared across every index in the bundle. CAS per write = 0.**
+- PUT cost scales with **node count and write volume, not tenant count** — a per-index timer
+  would cost $216k–$13M/month at 1M indexes regardless of batch size.
+- **The flush interval `T` never appears in the time-to-searchable budget**, because visibility
+  is served from the replicated memtable. Batch for seconds, be searchable in ~1 ms.
+- Readers derive candidate bundle lanes from the same placement function used for reads; the
+  8 KiB per-shard lane bitmap remains the fallback. Never LIST.
+- Three durability modes: `durable` (blob PUT, ~250 ms–5 s, tunable), `batched`
+  (peer-replicated, ~1 ms, bounded loss), `async`.
 
-→ [write-path-and-wal](../05-storage-engine/write-path-and-wal.md)
+→ [write-path-and-wal](../05-storage-engine/write-path-and-wal.md) ·
+[**batching-and-visibility**](../05-storage-engine/batching-and-visibility.md)
 
 ## 7. The read path
 
@@ -167,6 +176,8 @@ transition is a CAS on a single key conditioned on the exact version the actor o
 | Dimension | turbopuffer | pstore |
 |---|---|---|
 | Per-index write rate | ~1 WAL entry/s, ~10k vectors/s | **lanes** ⇒ blob-rate-limited, target ≥1M vectors/s |
+| Cost floor per idle-ish index | one WAL entry/s ⇒ ~$13/mo/index if flushed on a timer | **cross-index bundles** ⇒ PUTs scale with nodes, not tenants |
+| Time-to-searchable | strong reads see writes; ~10 ms floor from checking object storage | **~1 ms** from a replicated memtable, decoupled from the flush interval |
 | Coordination | a stateless **broker** (a hidden master, with a failover window) | none |
 | Staleness in eventual mode | "up to about one hour" | **client-specified bound** |
 | Fleet scale | not stated | **10,000 nodes** (LRH + gossip) |
@@ -193,6 +204,8 @@ transition is a CAS on a single key conditioned on the exact version the actor o
 | Lane tail discovery costs more than expected | OQ-22 | Model probe-vs-pointer; the lane bitmap is the hedge |
 | Warm latency doesn't reach 10 ms | OQ-75 | It's a compute problem; SIMD + zero-copy + Tokio/rayon split |
 | Cold-query ratio too high in practice | OQ-57 | Shadow warming, persistent NVMe cache, warm API |
+| Bundle recovery could miss un-folded records after node death or placement change | [OQ-91](../00-plan/open-questions.md) | Simulator proof in M2 — if this fails, cross-index bundling is unsafe and the cost argument collapses |
+| Cross-tenant data sharing one object may be a compliance blocker | OQ-87 | Per-byte-range encryption; **validate with customers before building** |
 | S3 Vectors commoditizes the category | — | Compete on hybrid + filtering + warm latency + BYOC, not on $/GB |
 
 ## 13. Reading order for a newcomer

@@ -13,6 +13,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | **OQ-5** | Real CAS throughput and loss-rate curves per backend under 2 / 8 / 64 / 512 concurrent contenders. | The "~5 writes/s" figure is borrowed, not measured. Everything about commit rate and register partitioning depends on it. | M0 microbenchmark inside each cloud. |
 | **OQ-22** | Is forward-probing the lane tail with `k` parallel GETs cheaper than a per-lane tail-pointer object updated every M writes? | Determines read-path cost of the whole lane design. | Model both, then measure with realistic write-rate distributions. |
 | **OQ-75** | Real warm queries-per-second per node. Currently a guess (200/s). | The dominant term in the cost model (compute is 92% of cost). | Benchmark the scan path on target instance types. |
+| **OQ-84** | What fraction of indexes are trickle writers, and what is the real index-size distribution? | Sets the value of cross-index bundling and the inline-small-index threshold — i.e. whether we are optimizing the common case or a hypothetical one. | Customer discovery + any public SaaS tenant-distribution data; build the synthetic generator from it (OQ-72). |
+| **OQ-85** | The three-way optimum between memtable memory budget, fold rate, and recovery-scan window. | Fold rate is the dominant per-index PUT cost after bundling; memtable size bounds both query cost and how lazy folding can be. | Model analytically, then measure in M1/M2. |
+| **OQ-91** | Prove that `HEAD.lane_watermarks` + forward probing of placement nodes' bundle lanes finds **every** un-folded record under placement change, fallback writes, and node death. | If recovery can miss records, cross-index bundling is unsafe and the whole cost argument collapses. | Deterministic simulation target for M2. |
 
 ## Tier 2 — significant design impact
 
@@ -35,6 +38,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-64 | Ranking error from per-shard IDF vs. global DF maintenance | `08/hybrid-and-ranking` |
 | OQ-66 | Rust SWIM implementation with Lifeguard — `chitchat` (Quickwit) vs `foca` | `09/crate-survey` |
 | OQ-72 | Realistic multi-tenant index-size/query-rate distribution for synthetic benchmarks | `10/evaluation-methodology` |
+| OQ-86 | Optimal bundle size `B` — cuts PUTs but raises single-index read amplification and `durable` ack latency | `05/batching-and-visibility` |
+| OQ-87 | Is per-byte-range encryption sufficient isolation for cross-tenant bundles, or does compliance force per-tenant objects? **Ask customers before building.** | `05/batching-and-visibility` |
+| OQ-90 | Does R-way in-memory memtable replication raise intra-AZ network cost or tail latency at 10K nodes? | `05/batching-and-visibility` |
 
 ## Tier 3 — tuning and refinement
 
@@ -99,7 +105,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-80` per-shard HEAD threshold ·
 `OQ-81` Arrow Flight for bulk ingest ·
 `OQ-82` public epochs / time travel ·
-`OQ-83` streaming query responses
+`OQ-83` streaming query responses ·
+`OQ-88` bundle record ordering: sorted by `(index_id, shard)` vs clustered by read affinity ·
+`OQ-89` shared L0 segments across indexes — worth the GC/branching complexity, or does inlining small indexes already capture it?
 
 ## Strategic risks (not answerable by experiment)
 
