@@ -127,12 +127,16 @@ async fn the_code_sections_are_a_fraction_of_the_vectors() {
         len(Section::Sq8),
     );
     assert_eq!(vectors, (N * DIM * 4) as u64);
-    // 384 dims pad to 512 bits = 64 bytes, plus 4 for the alignment the estimate needs.
-    assert_eq!(rabitq, (N * 68) as u64);
+    // 384 dims pad to 512 bits = 64 bytes, plus 4 for the alignment and 4 for the residual
+    // norm. Both are per-vector scalars the estimate cannot work without: the alignment
+    // de-biases, and the norm restores the scale the residual was divided by.
+    assert_eq!(rabitq, (N * 72) as u64);
     assert_eq!(eights, (N * DIM) as u64);
-    // 22x, not 24x: the alignment costs four bytes a vector and buys the error bound.
+    // 21x, not the 24x the bit count alone suggests: eight bytes a vector of scalars buy
+    // the error bound and the residual scale. Stated as the measured ratio rather than the
+    // theoretical one, because the theoretical one is not what gets fetched.
     assert!(
-        vectors / rabitq >= 22,
+        vectors / rabitq >= 21,
         "1-bit compression is only {}x",
         vectors / rabitq
     );

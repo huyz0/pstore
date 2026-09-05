@@ -44,6 +44,18 @@ pub struct Params {
     /// the result depend on a tolerance, and the marginal iteration stops mattering long
     /// before it stops running.
     pub iterations: usize,
+    /// How many **extra** lists a boundary vector may be replicated into.
+    ///
+    /// A vector sitting between two centroids is found only if the query probes the list it
+    /// happens to have been assigned to. At a small `p` that is a coin flip, and it is
+    /// exactly where recall is lost — the true neighbours of a query near a boundary are on
+    /// the other side of it. Replication buys them back for index size.
+    pub replicas: usize,
+    /// How much further than its own centroid a vector may be from another and still be
+    /// replicated there, as a fraction.
+    ///
+    /// 0.0 replicates nothing; 1.0 replicates almost everything and doubles the index.
+    pub boundary: f32,
 }
 
 impl Default for Params {
@@ -52,6 +64,25 @@ impl Default for Params {
             target_list_size: 4_000,
             balance: 4.0,
             iterations: 12,
+            // ⚠️ Measured, not chosen. 4,000 x 128d clustered, 40 lists, k=10, `rerank:
+            // fast` (`cargo run --release -p pstore-index --example aug`):
+            //
+            //   replicas x boundary   index size   r@10 p=2   r@10 p=8
+            //     0 (none)                 1.00      0.844      0.978
+            //     1 x 0.05                 1.72      0.936      0.978
+            //     1 x 0.10                 1.82      0.961      0.978
+            //     2 x 0.10                 2.47      0.978      0.978
+            //
+            // Three things this settles. Augmentation buys nothing at p=8 -- a wide probe
+            // reaches the neighbouring list anyway, so it is purely a small-`p` mechanism.
+            // Its cost is steep and non-linear: a second replica nearly doubles the index
+            // for a further 1.7 points. And it is worth having anyway, because at equal
+            // recall it moves FEWER bytes per query -- p=2 over a 1.72x index reads ~344
+            // candidates where p=8 over a 1.0x index reads ~800. Storage is the cheap
+            // resource and query bytes are the scarce one, which is the whole "store
+            // generously, cache stingily" argument.
+            replicas: 1,
+            boundary: 0.05,
         }
     }
 }
@@ -149,13 +180,17 @@ impl Clustering {
         let keep: Vec<usize> = (0..k)
             .filter(|i| lists.get(*i).is_some_and(|l| !l.is_empty()))
             .collect();
-        Self {
-            centroids: keep
-                .iter()
-                .filter_map(|i| centroids.get(*i).cloned())
-                .collect(),
-            lists: keep.iter().filter_map(|i| lists.get(*i).cloned()).collect(),
-        }
+        let centroids: Vec<Vec<f32>> = keep
+            .iter()
+            .filter_map(|i| centroids.get(*i).cloned())
+            .collect();
+        let mut lists: Vec<Vec<usize>> =
+            keep.iter().filter_map(|i| lists.get(*i).cloned()).collect();
+
+        // ⚠️ Replication happens AFTER empty lists are dropped, so a boundary vector is
+        // never replicated into a list that is about to disappear.
+        augment(corpus, &centroids, &mut lists, params);
+        Self { centroids, lists }
     }
 }
 
@@ -203,6 +238,72 @@ fn seed_centroids(corpus: &[Vec<f32>], k: usize, dim: usize) -> Vec<Vec<f32>> {
         chosen.push(next);
     }
     chosen
+}
+
+/// Replicates boundary vectors into nearby lists.
+///
+/// ⚠️ **This is where recall at small `p` comes from.** A vector midway between two
+/// centroids belongs, as far as any query is concerned, to both: a query near the boundary
+/// probes one list and the answer is in the other. Assignment has to pick one; replication
+/// undoes the arbitrariness for the vectors where it matters, and only for those.
+///
+/// Bounded twice — by `replicas` and by `boundary` — because the degenerate version
+/// replicates everything into everything and calls the resulting exhaustive scan a
+/// clustered index.
+fn augment(corpus: &[Vec<f32>], centroids: &[Vec<f32>], lists: &mut [Vec<usize>], params: Params) {
+    if params.replicas == 0 || params.boundary <= 0.0 || centroids.len() < 2 {
+        return;
+    }
+    // Pass one: every replica the boundary rule would admit, with its distance, so pass two
+    // can prefer the closest when a list runs out of room.
+    let mut extra: Vec<Vec<(usize, f32)>> = vec![Vec::new(); lists.len()];
+    for (row, v) in corpus.iter().enumerate() {
+        let mut d: Vec<(usize, f32)> = centroids
+            .iter()
+            .enumerate()
+            .map(|(c, cen)| (c, dist2(v, cen)))
+            .collect();
+        d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let Some((_, nearest)) = d.first().copied() else {
+            continue;
+        };
+        // Compared in true distance, not squared: `boundary` is a fraction of a distance,
+        // and applying it to a squared value would make the threshold quietly
+        // dimension-dependent.
+        let limit = nearest.sqrt() * (1.0 + params.boundary);
+        for (c, dd) in d.iter().skip(1).take(params.replicas) {
+            if dd.sqrt() <= limit
+                && let Some(slot) = extra.get_mut(*c)
+            {
+                slot.push((row, *dd));
+            }
+        }
+    }
+
+    // ⚠️ Pass two enforces the SAME balance bound on the augmented lists. Replication that
+    // ignores the cap undoes it entirely: measured on 10:1 skewed data, unbounded
+    // replication took the largest list to 6.0x the mean, which is exactly the cost the cap
+    // exists to prevent — and a probe reads the augmented list, not the assigned one.
+    //
+    // The cap is computed against the mean *after* replication, so augmentation is allowed
+    // to grow every list proportionally; what it may not do is grow one of them.
+    let admitted: usize = extra.iter().map(Vec::len).sum();
+    let total = corpus.len().saturating_add(admitted);
+    let cap = capacity(total, lists.len().max(1), params.balance);
+    for (list, mut add) in lists.iter_mut().zip(extra) {
+        // Closest first, so a list that fills keeps the replicas that mattered most.
+        add.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        for (row, _) in add {
+            if list.len() >= cap {
+                break;
+            }
+            list.push(row);
+        }
+        list.sort_unstable();
+        // A row replicated into a list it was also assigned to would be scored twice and
+        // could occupy two slots in a top-k.
+        list.dedup();
+    }
 }
 
 /// Assigns every row to its nearest centroid that still has room.

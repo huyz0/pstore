@@ -65,7 +65,8 @@ Rung 2: exact rerank with float16/32 vectors          → 1 Rpar, only if reques
         → final top k
 ```
 
-- Rung 0 alone typically suffices at 90–95% recall@10 (turbopuffer's stated target).
+- ~~Rung 0 alone typically suffices at 90–95% recall@10 (turbopuffer's stated target).~~
+  ⚠️ **C-3 (M3): measured false.** See the banner below.
 - Rungs 1–2 are opt-in per query (`rerank: none | fast | exact`), letting a caller buy
   precision with latency.
 - Full-precision vectors live in a **separate segment section** so they are never fetched
@@ -74,6 +75,38 @@ Rung 2: exact rerank with float16/32 vectors          → 1 Rpar, only if reques
 > **D-12.** Expose the rerank ladder in the query API. Recall is a *client-selectable* knob,
 > like consistency. This is more honest than a fixed internal recall target and lets one
 > engine serve both "cheap RAG retrieval" and "exact nearest neighbour" workloads.
+
+## C-3 — rung 0 alone does **not** suffice, and the ladder's first two rungs share a round trip
+
+**Measured in M3** (`scripts/recall.sh`, 20,000 × 384d clustered synthetic, 100 posting
+lists, k=10, p=16, `provisional`: WSL2):
+
+| Rerank | recall@10 | Round trips |
+|---|---|---|
+| `none` — 1-bit only | **0.30** | 3 |
+| `fast` — int8 over the survivors | **0.981** | **3** |
+| `exact` — float32 over the survivors | 0.999 | 4 |
+
+The claim above was that rung 0 alone reaches 90–95%. It reaches **30%**. The reason is
+visible once stated: everything in one posting list is similar *by construction* — that is
+what put it there — so a 1-bit code, which is already a coarse description of a vector, is
+being asked to rank vectors that differ from each other by far less than its own error. It
+cannot, and no oversample fixes it, because with `rerank: none` the answer *is* rung 0's
+top-k and oversampling changes nothing. Recall was flat at 0.30 from p=8 to p=32.
+
+**Two things follow, and neither weakens the architecture.**
+
+1. **The default rerank mode is `fast`, not `none`.** D-12's knob survives; its cheapest
+   setting is simply not the one to default to.
+2. **Rungs 0 and 1 share a round trip.** The `sq8` byte ranges for the probed lists are
+   known at the same moment as the `rabitq` ranges — same object, same round — so int8
+   costs *bytes*, not depth. Only `exact` needs a fourth round, because float32 rows cannot
+   be chosen until rung 0 has ranked. **The ≤3 round-trip budget holds at 98% recall.**
+
+⚠️ Also measured, and worth stating because it is the other half of D-10: on a **uniform**
+corpus with no cluster structure, recall@10 is **0.538** at p=16 — clustering cannot help
+where there is nothing to cluster, and probing 32% of the corpus returns roughly 32% of the
+neighbours. An index whose data looks like this should scan exactly.
 
 ## Storage math (768 dims, 1B vectors)
 

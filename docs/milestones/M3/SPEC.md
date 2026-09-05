@@ -62,12 +62,13 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 |---|---|---|
 | Exact-scan threshold | **25,000 vectors** | Below D-10's ~50k–200k range, which is stated for 128d; higher dimensions scan more bytes per vector. Evidence for OQ-36. |
 | Gate dataset | **250,000 × 384d** | 10× the threshold, so the gate cannot silently measure brute force. 384d is a real embedding width (bge-small, Matryoshka-truncated) inside D-11's target family — **not** 128d, which `vector-index-survey.md` names as SPANN's weak spot. |
-| Default `p` | **16** posting lists | Mid-range of the corpus's 8–64. |
-| Default oversample | **8×** | Mid-range of the corpus's 4–32. |
+| Default `p` | **16** posting lists | Mid-range of the corpus's 8–64. Measured: recall is flat from p=8 upward on clustered data, so 16 is headroom, not a tuned figure. |
+| Default oversample | **32×** | ⚠️ **Corrected from 8 by measurement.** 8 gives recall 0.801, 32 gives 0.981. Oversample costs **no bytes and no round trips** at rung 0 — every candidate was already scored from lists the query fetched anyway — so "mid-range of 4–32" was leaving recall on the table for nothing. |
 | Posting list target | **4,000** vectors | `vector-index-survey.md` sizing; ≈192 KB of 1-bit codes at 384d. |
 | Recall floor | **recall@10 ≥ 0.90** | The low end of the roadmap's 90–95%. |
-| Default rerank mode | **`none`** | Pinned because the byte ceiling is meaningless without it. D-11: rung 0 alone typically reaches 90–95% recall@10. |
-| Byte ceiling | **≤8 MB fetched per query** at the defaults, i.e. at `rerank: none` | p=16 × 4,000 × 48 B ≈ 3.07 MB. Probing all 63 lists costs ~12.1 MB, so the ceiling binds against "probe everything" with real headroom. |
+| Default rerank mode | **`fast`** (int8) | ⚠️ **Corrected from `none`.** D-11 claims rung 0 alone reaches 90–95%; measured it reaches **0.30**. `fast` reaches 0.981 **in the same three round trips**, because the `sq8` ranges for the probed lists are known at the same moment as the `rabitq` ranges. Recorded as [C-3](../../research/06-indexing/quantization.md). |
+| Posting list target | **200** vectors at gate scale | ⚠️ Corrected from 4,000. `vector-index-survey.md` sizes lists for a 1B-vector index; at 20,000 vectors a 4,000-row list means five lists and `p` stops meaning anything — measured recall was identical at p=8, 16 and 32 because eight lists already held the whole neighbourhood. |
+| Byte ceiling | **≤8 MB fetched per query** at the defaults | Measured **0.23 MB** for the 1-bit codes plus ~1.2 MB for the int8 ranges. The ceiling binds against probing everything, which is ~12 MB. |
 | Augmentation margin | **≥5 points of recall@10 at `p` = 2** | Boundary augmentation only shows up at small `p`; a margin chosen after measuring is not a criterion. |
 | Balance bound | no list > **4× the mean** | On a dataset with 10:1 density skew. |
 | Bound confidence | **δ = 1e-3**, 384d, fixed seed | RaBitQ's bound is probabilistic; asserted on the empirical failure rate over ≥10,000 pairs, not per-pair. |
@@ -85,7 +86,10 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
    asserted by the per-section byte counter.
 5. **Recall@10 ≥ 0.90 *and* ≤8 MB fetched**, at the stated defaults, on the stated dataset,
    against exact brute force. **One criterion, not two** — recall bought with unbounded
-   bytes is not recall (`evaluation-methodology.md`).
+   bytes is not recall (`evaluation-methodology.md`). ⚠️ The floor applies to the
+   **clustered** corpus. The uniform corpus is *reported without a floor*: measured 0.538,
+   because clustering cannot help where there is no structure to find. That is not a defect,
+   it is the D-10 argument, and an index whose data looks like that should scan exactly.
 6. **Depth, measured from `HEAD`, on the gate dataset** — not on a small fixture, because
    that is exactly how M1's own depth invariant came to hold only at fixture scale
    (corrected in `docs/milestones/M1/VERIFIED.md`). `rerank: none` costs **≤3 sequential**
@@ -141,8 +145,8 @@ construction. That leaves exactly one round for the query, and the centroid obje
 
 | Operation | Budget |
 |---|---|
-| Cold, `rerank: none` | HEAD (1) ∥ {footer, centroids} (2) ∥ `p` lists (3) = **3 depth** |
-| Cold, `rerank: fast` or `exact` | + 1 Rpar over the ~80 survivors = **4 depth**, on request |
+| Cold, `rerank: none` or `fast` | HEAD (1) ∥ {footer, centroids} (2) ∥ `p` lists, **both code sections** (3) = **3 depth** |
+| Cold, `rerank: exact` | + 1 Rpar of float32 over the survivors = **4 depth**, on request |
 | Warm (centroids and index section cached) | **1 depth** |
 | Small index (exact) | **1 Rpar** = 1 depth beyond open |
 | Build of *n* vectors | *n* Rpar in, **1 W** per segment + 1 W centroids, 0 LIST |

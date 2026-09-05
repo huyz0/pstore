@@ -23,6 +23,23 @@
 //! which is why [`Quantizer::estimate_unnormalized_for_test`] exists to show what happens
 //! without it.
 //!
+//! ## ⚠️ Residuals, not raw vectors — and why recall collapses without them
+//!
+//! A code is built from `(o - c) / ||o - c||`, the **residual** from the posting list's
+//! centroid, with `||o - c||` stored alongside. `<o, q>` is then reconstructed as
+//! `<c, q> + ||o - c|| · <x, q>`, where `<c, q>` is computed once per probed list.
+//!
+//! Encoding the raw vector instead is not a small loss, it is the difference between
+//! working and not. Vectors in one posting list are similar *by construction* — that is
+//! what put them in the same list — so their inner products with a query differ in the
+//! third decimal place while the 1-bit estimator's error is two orders of magnitude larger.
+//! The codes rank them essentially at random. Measured: recall@10 of **0.365** at p=16, and
+//! still only **0.528** with every list probed, on a corpus where exhaustive rerank of the
+//! candidates should have given ~1.0. Subtracting the centroid removes the component every
+//! member shares and leaves the quantizer the part that actually distinguishes them.
+//!
+//! Found by the recall test, not by reading the paper.
+//!
 //! ## The rotation
 //!
 //! A Randomized Hadamard Transform: random sign flips, then a fast Walsh–Hadamard
@@ -92,6 +109,11 @@ pub struct Code {
     /// for a vector that happens to align with the rotated axes. Stored rather than
     /// assumed, because it varies per vector and it is what the bound is a function of.
     alignment: f32,
+    /// `||o - c||`, the distance from the centroid this code's residual was taken against.
+    ///
+    /// Without it the estimate is of the residual's direction only, and the reconstruction
+    /// `<c,q> + norm·<x,q>` has no scale.
+    residual_norm: f32,
     dim: usize,
 }
 
@@ -111,6 +133,12 @@ impl Code {
         self.alignment
     }
 
+    /// `||o - c||`.
+    #[must_use]
+    pub fn residual_norm(&self) -> f32 {
+        self.residual_norm
+    }
+
     /// Appends this code's wire form: sign bits, then the alignment.
     ///
     /// ⚠️ The alignment travels **with** the bits. It is measured per vector at encode time
@@ -121,6 +149,7 @@ impl Code {
     pub fn write_to(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.bits);
         out.extend_from_slice(&self.alignment.to_le_bytes());
+        out.extend_from_slice(&self.residual_norm.to_le_bytes());
     }
 }
 
@@ -162,7 +191,7 @@ impl Quantizer {
     /// Bytes one code occupies on the wire: sign bits plus the alignment.
     #[must_use]
     pub fn code_len(&self) -> usize {
-        self.padded.div_ceil(8) + 4
+        self.padded.div_ceil(8) + 8
     }
 
     /// Reads a code back from [`Code::write_to`]'s form.
@@ -180,6 +209,7 @@ impl Quantizer {
         Some(Code {
             bits: bits.to_vec(),
             alignment: f32::from_le_bytes(tail.get(..4)?.try_into().ok()?),
+            residual_norm: f32::from_le_bytes(tail.get(4..8)?.try_into().ok()?),
             dim: self.dim,
         })
     }
@@ -230,11 +260,37 @@ impl Quantizer {
         a
     }
 
-    /// Encodes a **unit** vector.
+    /// Encodes a vector as its residual from `centroid`.
     ///
-    /// The caller normalizes, because in use the vector is a residual from a centroid whose
-    /// norm the caller already has and must keep anyway.
+    /// See the module docs: quantizing the raw vector instead costs most of the recall,
+    /// because everything in one posting list is similar and the shared component is all
+    /// the 1-bit code can see.
+    pub fn encode_residual(&self, v: &[f32], centroid: &[f32]) -> Result<Code, QuantError> {
+        self.check(v)?;
+        let residual: Vec<f32> = v
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x - centroid.get(i).copied().unwrap_or(0.0))
+            .collect();
+        let norm = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // A vector sitting exactly on its centroid has no direction to quantize. Its
+        // reconstruction is `<c,q>` with a zero scale, which is exactly right.
+        let unit: Vec<f32> = if norm > 0.0 {
+            residual.iter().map(|x| x / norm).collect()
+        } else {
+            residual
+        };
+        let mut code = self.encode_unit(&unit)?;
+        code.residual_norm = norm;
+        Ok(code)
+    }
+
+    /// Encodes a **unit** vector, with no centroid.
     pub fn encode(&self, v: &[f32]) -> Result<Code, QuantError> {
+        self.encode_unit(v)
+    }
+
+    fn encode_unit(&self, v: &[f32]) -> Result<Code, QuantError> {
         self.check(v)?;
         let r = self.rotate(v);
         let mut bits = vec![0u8; self.padded.div_ceil(8)];
@@ -252,6 +308,9 @@ impl Quantizer {
         Ok(Code {
             bits,
             alignment: l1 / (self.padded as f32).sqrt(),
+            // Overwritten by `encode_residual`; 1.0 means "the vector is its own residual",
+            // which is what makes `encode` and `encode_residual` agree for a zero centroid.
+            residual_norm: 1.0,
             dim: self.dim,
         })
     }
@@ -279,6 +338,16 @@ impl Quantizer {
     pub fn prepare(&self, query: &[f32]) -> Result<Query, QuantError> {
         self.check(query)?;
         Ok(Query(self.rotate(query)))
+    }
+
+    /// Estimates `<o, q>` where the code is a residual from a centroid.
+    ///
+    /// `centroid_dot` is `<c, q>`, computed **once per probed posting list** rather than
+    /// once per candidate — there are thousands of candidates behind each centroid, and
+    /// that ratio is the whole reason this is cheap.
+    #[must_use]
+    pub fn estimate_residual(&self, code: &Code, query: &Query, centroid_dot: f32) -> f32 {
+        centroid_dot + code.residual_norm * self.estimate_prepared(code, query)
     }
 
     /// Estimates `<o, q>` from `o`'s code and a prepared query.

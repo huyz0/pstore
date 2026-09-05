@@ -126,7 +126,12 @@ fn clustering_stays_balanced_on_skewed_data() {
         },
     );
     let sizes: Vec<usize> = c.lists().iter().map(Vec::len).collect();
-    let mean = corpus.len() as f64 / sizes.len() as f64;
+    // ⚠️ The mean is over ENTRIES, not over the corpus. Boundary replication legitimately
+    // puts a vector in more than one list, so `corpus.len() / lists` understates the mean
+    // and the bound reads as broken when it is not. The bound that matters is on what a
+    // probe actually reads.
+    let entries: usize = sizes.iter().sum();
+    let mean = entries as f64 / sizes.len() as f64;
     let largest = *sizes.iter().max().unwrap();
     assert!(
         (largest as f64) <= mean * 4.0,

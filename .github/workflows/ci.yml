@@ -60,6 +60,17 @@ jobs:
       # included the moment something depends on it at runtime.
       - run: ./scripts/coverage.sh --fail-under-regions 95
 
+  # Recall is a gate, not a periodic study (D-35): a PR that silently drops recall@10 or
+  # adds a round trip must fail the build. Release mode and its own job, because a
+  # gate-scale corpus does not belong in the unit suite.
+  recall:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/recall.sh
+
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
   # Only the second one makes 95% mean something (D-111). Changed files per PR;
   # the full workspace run is nightly, because it is expensive.
