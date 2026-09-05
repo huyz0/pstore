@@ -106,6 +106,15 @@ Target **256 MiB – 4 GiB**. The bounds come from opposite directions:
   intolerable write amplification, and multipart upload of huge objects has its own tail
   latency.
 
+## Forward compatibility for modalities we haven't built
+
+The footer names which sections a segment contains, and readers skip what they do not find. A
+v1 dense-only segment simply has no `sparse_postings`, `positions`, or `term_dict` section —
+and because segments are immutable, old ones stay valid forever. **Reserve those section
+identifiers in v1** (D-74): reserving a name costs nothing, while a format version bump across
+50M indexes costs a year. See
+[`../06-indexing/modalities-and-sequencing.md`](../06-indexing/modalities-and-sequencing.md).
+
 ## Sidecar principle
 
 **There are no sidecars.** Everything about a segment lives inside the segment. A design that

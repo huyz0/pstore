@@ -81,6 +81,12 @@ frequencies, so the same posting-list machinery serves them.
 > from day one, so BM25 and learned-sparse share one code path. Retrofitting this later is
 > expensive.
 
+> **Sequencing (D-72–D-74).** Sparse vectors should ship **before** BM25: sparse search over
+> postings is *exact*, so it is a far smaller subsystem than BM25's tokenizers, analyzers, and
+> two-pass IDF — and it delivers a real hybrid story much sooner. Full prerequisites checklist
+> for deferring FTS safely:
+> [`modalities-and-sequencing.md`](modalities-and-sequencing.md) §6.
+
 ## Also needed
 
 - **Trigram index** for regex/glob (turbopuffer offers this) — a second inverted index over

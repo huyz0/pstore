@@ -89,6 +89,15 @@ Mitigations for the scale-out cache dip:
   owner fetches from the blob store (not from the peer — peer-to-peer transfer would create
   the coupling we are trying to avoid).
 
+## Revision: session tokens carry routing hints
+
+A client's session token names the nodes that were warm for its indexes
+([`../11-design/session-and-affinity-protocol.md`](../11-design/session-and-affinity-protocol.md)).
+Because writes are routed to an index's read placements to populate the memtable, those hinted
+nodes are also the ones holding the freshest data — so **one hop satisfies both consistency and
+cache warmth**. Hints are advisory (D-70): ignoring one costs a cache miss, never correctness,
+and the external LB still needs no affinity configuration.
+
 ## Revision: key placement on the tenant for small tenants
 
 `LRH(index_id)` scatters a tenant's ~50 indexes across ~50 node sets, which for a *small*

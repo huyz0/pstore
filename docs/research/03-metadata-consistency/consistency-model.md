@@ -23,7 +23,15 @@ a coordinator back into the design.
 The 10 ms floor turbopuffer describes for strong consistency is the cost of *checking the
 blob store*. We expose that cost as a choice.
 
-### `strong` (default)
+> **Revision — `session` is now the default.** See
+> [`../11-design/session-and-affinity-protocol.md`](../11-design/session-and-affinity-protocol.md).
+> `strong` costs a blob round trip on every query to guarantee visibility of *other clients'*
+> writes, which most callers do not need. A client-held session token gives read-your-writes and
+> monotonic reads at `bounded` cost (0 blob requests in the common case) **and** carries a
+> routing hint that lands the follow-up read on a warm node. Cosmos DB makes session its default
+> for the same reason. `strong` and `bounded` remain available.
+
+### `strong` (no longer the default)
 Read HEAD (conditional GET, usually a 304), then probe the lane tail. Sees every
 acknowledged write.
 - **Cost:** 1–2 Rseq. **Latency floor:** ~1 blob RTT (~10–30 ms).

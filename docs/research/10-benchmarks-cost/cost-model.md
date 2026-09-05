@@ -73,6 +73,12 @@ deployment — this is a real knob, not a hand-wave.
 ### Compute
 
 1,000 QPS at (say) 200 warm queries/sec/node ⇒ ~5–8 nodes with headroom.
+
+> **⚠️ "200 QPS/node" is not a property of the node.** Warm scan is memory-bandwidth-bound, so
+> capacity is **vectors scanned per second**, and QPS/node ranges from ~16 to ~1,221 depending
+> purely on scan size — a 75× swing. See
+> [`../09-rust-stack/cpu-management.md`](../09-rust-stack/cpu-management.md) §1. Quote node
+> counts against a stated scan size or not at all.
 `~6 × $2/hr × 730 = ~$8,760/month`.
 
 ### Totals

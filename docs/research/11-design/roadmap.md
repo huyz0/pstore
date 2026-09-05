@@ -84,9 +84,16 @@ strategy" — known *before* M3 hardens around it.
 **Exit:** 1,000 real nodes, 10,000 simulated; add/remove 50% of the fleet with zero data
 movement and a measured, bounded cache dip.
 
-### M5 — Full-text and hybrid (4–5 weeks)
+### M5a — Sparse vectors and hybrid (2 weeks)
+- Sparse/learned-sparse retrieval over the generic-impact posting lists built in M3.
+- RRF fusion; exercise the `prefetch[]` + `fusion` path.
+- **Before BM25 deliberately:** sparse search is *exact*, so it is a much smaller subsystem and
+  gives a real hybrid story for a fraction of the work
+  ([`../06-indexing/modalities-and-sequencing.md`](../06-indexing/modalities-and-sequencing.md) §7).
+
+### M5b — Full-text (4–5 weeks)
 - Tantivy behind a `BlobStore`-backed `Directory`; block-max metadata in the index section.
-- BM25, RRF fusion, two-pass IDF, trigram regex.
+- BM25, two-pass IDF, trigram regex.
 - MS MARCO quality evaluation; NDCG/MRR as CI gates.
 
 ### M6 — Multi-tenancy at scale (3–4 weeks)

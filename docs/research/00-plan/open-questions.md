@@ -16,6 +16,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | ~~OQ-84~~ | ~~What fraction of indexes are trickle writers?~~ | **ANSWERED:** 1M tenants × up to 50 indexes (~50M), **10% of tenants active per second**. Confirms bundling is essential and forces two further structural changes. | → [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) |
 | **OQ-92** | How many of a tenant's ~50 indexes does a typical write burst touch? | Sets active-indexes/s `A` between 100k and 5M — a 50× swing in what the write-cohort design is worth. **The most valuable remaining number.** | Instrument a pilot tenant, or ask design partners. |
 | **OQ-93** | Fleet write throughput in bytes/s. | Sets `W* = bytes/s × T / B` directly; without it the cohort ring cannot be sized. | Estimate from expected docs/s × doc size; confirm in M1. |
+| **OQ-111** | Measured **bytes-scanned per second** per node, from RAM and from NVMe separately (refines OQ-75). | QPS/node swings 75× with scan size, so the cost model's dominant input is currently meaningless without this. | Benchmark the SIMD scan loop on target instance types at several scan sizes. |
 | **OQ-98** | Actual endurance (DWPD/TBW) of AWS/GCP/Azure instance-store NVMe — **none of them publish it**. | The whole cache-fill rate budget (~67 MB/s) rests on a 2-DWPD assumption. If it is 1 DWPD the budget halves and warming takes 20 h; drives failing at month 8 is the failure mode. | Track SMART `percentage_used` drift on a real fleet for 2–4 weeks; or ask the vendor. |
 | **OQ-85** | The three-way optimum between memtable memory budget, fold rate, and recovery-scan window. | Fold rate is the dominant per-index PUT cost after bundling; memtable size bounds both query cost and how lazy folding can be. | Model analytically, then measure in M1/M2. |
 | **OQ-91** | Prove that `HEAD.lane_watermarks` + forward probing of placement nodes' bundle lanes finds **every** un-folded record under placement change, fallback writes, and node death. | If recovery can miss records, cross-index bundling is unsafe and the whole cost argument collapses. | Deterministic simulation target for M2. |
@@ -47,6 +48,10 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-94 | Size threshold for tenant-grouped vs index-grouped placement, and for inlining — probably one number; verify | `10/tenancy-scale-model` |
 | OQ-95 | Does `W`-node write concentration collide with S3 per-prefix limits, especially on cohort-lane reads during recovery? | `10/tenancy-scale-model` |
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
+| OQ-117 | Measured working-set fraction `f` on real query traces — everything about R rests on f ≈ 0.1, which is folklore not data | `07/storage-to-cache-ratio` |
+| OQ-116 | Adaptive concurrency + the blob-store congestion controller are two interacting limiters in one request path; can they oscillate? | `09/cpu-management` |
+| OQ-112 | Foreground/background core split: what floor does compaction need to keep segment counts bounded? | `09/cpu-management` |
+| OQ-127 | Should sparse postings share a term space with BM25, or use a parallel index? | `06/modalities-and-sequencing` |
 | OQ-104 | Real per-query memory profile by plan type — 24 MB is derived, not measured, and it sets the pool size and admission model | `09/memory-management` |
 | OQ-107 | jemalloc tuning (`dirty_decay_ms`, `muzzy_decay_ms`, `retain`) against measured RSS, given the documented gap between settings and behaviour | `09/memory-management` |
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
@@ -126,7 +131,21 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-106` query-pool vs RAM-cache split (both buy latency, at different rates) ·
 `OQ-108` should query intermediates ever spill to disk, or is narrowing fetch width strictly better? ·
 `OQ-109` per-open-index resident state size, which drives the LRU bound ·
-`OQ-110` does `memory.high` throttling ever hurt more than shedding would?
+`OQ-110` does `memory.high` throttling ever hurt more than shedding would? ·
+`OQ-113` does SMT help a bandwidth-bound scan, or should the pool be sized in physical cores? ·
+`OQ-114` scan chunk size: cancellation granularity vs per-chunk overhead ·
+`OQ-115` NUMA-aware buffers, or just prefer single-socket instances? ·
+`OQ-118` does caching the int8 rerank tier for hot tenants pay for itself? ·
+`OQ-119` fixed per-index cache overhead at 50M indexes ·
+`OQ-120` is there an R below which we should decline or reprice a workload? ·
+`OQ-121` tenant-level vs per-index epochs in the session token ·
+`OQ-122` `max_wait_ms` when a node is behind the token: wait, forward, or serve stale? ·
+`OQ-123` should routing hints be signed separately so a proxy can use them? ·
+`OQ-124` cross-region sessions — reserve token space now ·
+`OQ-125` does `session`-as-default surprise users expecting `strong`? ·
+`OQ-126` impact payload encoding (u8/f16/varint) and its effect on R ·
+`OQ-128` multi-vector storage layout: interleaved or separate section (refines OQ-65) ·
+`OQ-129` does accepting sparse vectors as input match how customers actually work?
 
 ## Strategic risks (not answerable by experiment)
 

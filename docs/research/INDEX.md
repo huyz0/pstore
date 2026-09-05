@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q35`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q39`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 32 documents, 35 research questions answered, 110 open
+**Status: research phase complete.** 36 documents, 39 research questions answered, 129 open
 questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
@@ -47,8 +47,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 35 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **110 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 39 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **129 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -95,6 +95,7 @@ If you read nothing else:
 | [vector-index-survey.md](06-indexing/vector-index-survey.md) | Q19 | HNSW and DiskANN need data-dependent hop chains ⇒ dead on 30 ms storage. SPANN/SPFresh needs a **fixed 2**. Small indexes use exact scan — and most indexes are small. |
 | [quantization.md](06-indexing/quantization.md) | Q20 | **RaBitQ over PQ**: no per-tenant training (decisive at millions of tenants) and a real error bound (PQ has none and fails badly on some data). 1-bit = 96 GB per 1B vectors. |
 | [full-text-search.md](06-indexing/full-text-search.md) | Q21 | Inverted indexes already are ranged-read structures. Tantivy behind a custom `Directory`. Block-max metadata must live in the *cached* index section — a skipped block is a skipped network fetch. |
+| **[modalities-and-sequencing.md](06-indexing/modalities-and-sequencing.md)** | Q39 | Dense, sparse, and BM25 are one structure: postings with a generic impact payload. Build the general data model (named plural vectors, optional sections, `prefetch[]`+`fusion`) in v1; ship one retriever at a time. **Sparse before BM25** — it's exact, so it's far cheaper. |
 | [filtering.md](06-indexing/filtering.md) | Q22 | Graph indexes collapse under selective filters (islands/dead ends). Clustered indexes compose with pre-filtering. **Our round-trip choice hands us the better filtering architecture for free.** |
 | [incremental-maintenance.md](06-indexing/incremental-maintenance.md) | Q23 | LIRE/SPFresh touches only boundary vectors: 1% of DRAM, <10% of cores vs. global rebuild. Adapting it to immutable objects is **the design's biggest open risk (OQ-51)**. |
 
@@ -103,6 +104,7 @@ If you read nothing else:
 |---|---|---|
 | [cache-hierarchy.md](07-caching/cache-hierarchy.md) | Q24 | Class-aware admission, not one big LRU: centroids and index sections must never be evicted by bulk traffic. `foyer` for the hybrid RAM+NVMe tier. **Immutable ids ⇒ cache entries never need invalidation.** |
 | **[disk-space-management.md](07-caching/disk-space-management.md)** | Q34 | **Endurance binds before capacity.** Flash DLWA goes 1.3→3.5 from 50%→100% utilization, so cache max is ~64% of the device and fill is capped at ~67 MB/s — a cold node takes ~10 h. A full disk must degrade to bypass mode, never fail. Closes OQ-54 and OQ-57. |
+| **[storage-to-cache-ratio.md](07-caching/storage-to-cache-ratio.md)** | Q37 | **R = managed bytes ÷ resident bytes** is the economic thesis as one number. 31.6× from quantization + tier separation, × 1/f from the clustered index ⇒ ~316:1. **Capacity never binds; QPS binds by 1–2 orders of magnitude.** Store generously, cache stingily. |
 | [affinity-and-coldstart.md](07-caching/affinity-and-coldstart.md) | Q25 | Cold is 30–60× warm, so minimize the *number* of cold queries. NVMe cache must survive process restarts, or a rolling deploy flushes 10,000 caches. |
 
 ## 08 — Query engine
@@ -116,6 +118,7 @@ If you read nothing else:
 |---|---|---|
 | [crate-survey.md](09-rust-stack/crate-survey.md) | Q28 | `object_store`, `arrow-rs`, `simsimd`, `roaring`, `tantivy`, `foyer`. **The deterministic simulator is built before the distributed features, not after.** One binary, all roles. |
 | **[memory-management.md](09-rust-stack/memory-management.md)** | Q35 | **Rust allocation failure aborts and is not catchable**, so limits live above the allocator. In-flight fetch bytes (fan-out × block × concurrency) are the OOM source: score-and-drop makes query memory O(k + resident), not O(scanned). Byte reservations, an emergency reserve for the flush path, `memory.high` + PSI, and a degradation ladder that ends in 429 rather than abort. |
+| **[cpu-management.md](09-rust-stack/cpu-management.md)** | Q36 | **QPS is not a unit of capacity** — warm scan is memory-bandwidth-bound, so QPS/node swings 75× (16→1,221) with scan size. Capacity is bytes-scanned/s. Guard against metastable collapse: hedging off under load, retry budgets, CoDel. **Set CPU requests, never CPU limits.** |
 | [runtime-and-io.md](09-rust-stack/runtime-and-io.md) | Q29 | Tokio (work-stealing suits our wildly skewed work) + a separate rayon pool for SIMD. io_uring's win doesn't apply to 30 ms HTTPS. Round-trip depth is a **tested invariant**. |
 
 ## 10 — Benchmarks & cost
@@ -130,6 +133,7 @@ If you read nothing else:
 |---|---|---|
 | **[architecture.md](11-design/architecture.md)** | D32 | **Start here for the design.** The five constraints, the diagram, the write/read paths, and how we beat turbopuffer. |
 | [key-layout.md](11-design/key-layout.md) | D33 | Every key derivable; **seven kinds of mutable object in the entire system**. Storage-class routing by prefix. |
+| **[session-and-affinity-protocol.md](11-design/session-and-affinity-protocol.md)** | Q38 | One opaque token solves read-your-writes *and* cold-cache routing, because the nodes holding fresh data are the nodes we'd route to for warmth. **`session` becomes the default consistency mode** (as in Cosmos DB): read-your-writes at ~1 ms and 0 blob requests. |
 | [api-design.md](11-design/api-design.md) | D34 | Every tradeoff (consistency, recall, completeness) is a client parameter. Responses report freshness and cost. |
 | [roadmap.md](11-design/roadmap.md) | D35 | Built in descending order of "if this is wrong, the architecture is wrong." M0 measures CAS before anything else. |
 

@@ -27,7 +27,7 @@ because *every* query needs it. Cache admission must be class-aware, not LRU-ove
 | **3. Centroid tables** | ~100 MB per 1B vectors (quantized) | Every vector query; unblocks everything downstream | **Pinned, prefetched first on cold start** |
 | **4. Term dictionaries / FSTs, block-max metadata** | small | Every FTS query; enables skipping *fetches* | RAM |
 | **5. Filter columns / zone maps** | moderate | Plan selection + filtering | RAM then NVMe |
-| **6. Quantized vector blocks (1-bit)** | 96 GB per 1B @768d | The scan tier | **NVMe**, this is the bulk |
+| **6. Quantized vector blocks (1-bit)** | 96 GB per 1B @768d | The scan tier | **NVMe** for the bulk; **hottest slice pinned in RAM** — a scan from NVMe is ~10× slower than from RAM ([cpu-management](../09-rust-stack/cpu-management.md) §1, D-61) |
 | **7. Posting-list blocks** | large | FTS scan | NVMe |
 | **8. Documents / stored fields** | largest | Only for the final top-k | NVMe, low priority |
 | **9. Full-precision vectors** | 1.5 TB per 1B @768d | Exact rerank only | **Do not cache by default** |
