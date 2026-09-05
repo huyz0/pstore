@@ -136,7 +136,18 @@ async fn a_segment_whose_index_section_overflows_the_suffix_takes_two_reads() {
     let t = TenantId(9);
     let v = s.as_tenant(t);
     let key = Key::new("seg/wide");
-    v.put(&key, write_docs(4000, 1)).await.unwrap();
+    // ⚠️ Built with the index budget lifted. The writer normally grows its block size
+    // until the index fits the suffix read, which is what keeps a cold open to one round
+    // trip -- so this branch of the READER cannot be reached by writing a normal segment
+    // any more. It still has to work: M3 adds a centroid section that will not fit, and a
+    // segment already on the store was written under a different budget. Opting out is
+    // therefore what a test of the two-read path must do, and saying so here is cheaper
+    // than someone later concluding the branch is dead.
+    let mut w = SegmentWriter::new(1).with_index_budget(usize::MAX);
+    for i in 0..4000 {
+        w.push(doc(&format!("d{i}"), &[i as f32, 1.0, 2.0], i as i64));
+    }
+    v.put(&key, w.finish()).await.unwrap();
 
     let before = s.count(t, OpClass::Read);
     let seg = Segment::open(&v, &key).await.unwrap();
@@ -146,7 +157,10 @@ async fn a_segment_whose_index_section_overflows_the_suffix_takes_two_reads() {
         "a large index section costs the second read, and only that"
     );
     assert_eq!(seg.row_count(), 4000);
-    assert_eq!(seg.block_count(), 4000);
+    assert!(
+        seg.block_count() > 1,
+        "the tiny budget did not produce many blocks"
+    );
 
     // And it must still be correct, not merely cheap.
     let all = seg.scan(&v, &key, None).await.unwrap();

@@ -56,6 +56,18 @@ Gate: `scripts/check-verified.py`.
    `cargo test -p pstore-engine`. The counter is itself tested
    (`a_loop_that_awaits_each_result_counts_every_iteration`, `concurrent_fan_out_counts_once`)
    because a naive request counter would pass while measuring the wrong thing.
+
+   ⚠️ **CORRECTED in M3.** This criterion was met only at fixture scale. The test used 500
+   rows, which is 8 blocks, whose index section fits the 8 KiB suffix read — so the segment
+   opened in **one** round and the invariant held for a reason the test never stated. At
+   40,000 rows the index section no longer fits, the open costs a second round, and a cold
+   scan measures **4**. The claim above was true of what ran and false of the system.
+   Fixed by bounding the index section by construction (`SegmentWriter` grows its block
+   size until the index fits the budget), and the invariant is now asserted directly by
+   `the_block_index_stays_inside_the_suffix_read_at_any_size` as well as by
+   `a_cold_read_of_a_large_segment_still_costs_three_rounds`, both in
+   `cargo test -p pstore-engine --test depth_at_scale`.
+
 10. `./scripts/gates.sh` — all eight green. **150 tests.**
     `cargo llvm-cov --workspace --all-features` → **96.10% lines** (the CI gate,
     `--fail-under-lines 95`, passes) and **94.19% regions**.

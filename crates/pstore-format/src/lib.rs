@@ -22,7 +22,21 @@ mod writer;
 
 pub use docs::{decode_docs, encode_docs};
 pub use reader::Segment;
-pub use writer::SegmentWriter;
+pub use writer::{INDEX_BUDGET, SegmentWriter};
+
+/// The index section's length, read from a segment's footer.
+///
+/// Exposed so the "the index fits the suffix read" invariant can be asserted **directly**
+/// rather than inferred from a round-trip count. Depth is the consequence; the fit is the
+/// cause, and it is what a future change to block sizing breaks first.
+#[must_use]
+pub fn index_section_len(segment: &[u8]) -> Option<usize> {
+    let foot = segment.len().checked_sub(FOOTER_LEN)?;
+    let f = segment.get(foot..)?;
+    // MAGIC(8) VERSION(2) index_offset(8) index_len(4)
+    let lo = f.get(18..22)?;
+    Some(u32::from_le_bytes(lo.try_into().ok()?) as usize)
+}
 
 use std::collections::BTreeMap;
 
