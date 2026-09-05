@@ -177,7 +177,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-158` `cargo-mutants` runtime on a workspace this size; per-crate scheduling needed? ·
 `OQ-159` where exactly is the generics/`dyn` boundary — monomorphizing `BlobStore` through the engine could hurt compile times on a capped box ·
 `OQ-160` should `pstore-types` exist, or do newtypes belong with their owning layer? (junk-drawer risk) ·
-`OQ-161` is a ~4,800-token layer 0+1 the right standing charge? `AGENTS.md` duplicates `INDEX.md`'s conclusions ·
+~~`OQ-161`~~ **closed** — layer 0+1 measured at ~1,400 tokens (the earlier ~4,800 was measured in the wrong repo); the five conclusions now live only in `INDEX.md`, with their imperative form in `AGENTS.md` § Never ·
 `OQ-162` the review packet runs the gates itself; cache verdicts by tree-sha if a gate gets slow ·
 `OQ-163` a long autonomous run needs a token budget, not just a per-task round budget ·
 `OQ-164` `build-index.py` counts meta-files as documents — honest, but is it the number a reader wants?

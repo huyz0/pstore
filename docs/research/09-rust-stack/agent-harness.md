@@ -77,8 +77,19 @@ a **~78× reduction per round**, ~150× per task.
    matters here is the corpus: 53 documents cannot be loaded, and `INDEX.md` giving each
    a one-line finding is usually the whole answer.
 
-Measured cost of our layer 0 + 1: **~4,800 tokens per session** (`AGENTS.md` plus four
-skill descriptions). That is the standing charge; everything else is on demand.
+Measured cost of our layer 0 + 1: **~1,400 tokens per session** — `AGENTS.md` (921
+words) plus four skill descriptions (136 words). That is the standing charge; everything
+else is on demand.
+
+> ⚠️ **Corrected.** The first version of this line said ~4,800 tokens. That figure was
+> measured with the shell still in the *source* repository, so it counted **their**
+> `AGENTS.md` (3,100 words) rather than ours. The error is recorded rather than quietly
+> replaced, because non-negotiable 1 is about numbers as much as gates, and a measured
+> figure taken in the wrong directory is exactly the failure it names. The trim that
+> followed (removing the five conclusions, which `INDEX.md` already states with sources)
+> was therefore worth **~90 tokens, not ~3,400**. It is still right — two copies of a
+> load-bearing claim drift, and the imperative form in § *Never* is more actionable than
+> the expository one — but the case for it is duplication, not cost.
 
 > ⚠️ **Layer 1 is the whole mechanism.** A skill's `description` is all an agent sees
 > before deciding to load it, so it must say **when to use this**, not what it is.

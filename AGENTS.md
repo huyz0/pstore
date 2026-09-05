@@ -9,42 +9,17 @@ index**. Detail lives in the linked files.
 
 ## Start here
 
-- [docs/research/INDEX.md](docs/research/INDEX.md) — the map. Read this before anything else.
-- [docs/research/11-design/architecture.md](docs/research/11-design/architecture.md) — the design, and the five constraints that generated it
-- [docs/research/11-design/roadmap.md](docs/research/11-design/roadmap.md) — milestones in execution order
-- [docs/research/00-plan/open-questions.md](docs/research/00-plan/open-questions.md) — what we do not know, risk-ranked
-- [docs/research/09-rust-stack/engineering-standards.md](docs/research/09-rust-stack/engineering-standards.md) — modularity, coverage, the invariant tests
-- [dev/README.md](dev/README.md) — containerized WSL2 dev environment
+- **[docs/research/INDEX.md](docs/research/INDEX.md) — the map.** Every document has a
+  one-line finding, the five load-bearing conclusions with sources, and the glossary.
+  Route through it; it is layer 3's table of contents, not a document to read.
+- [dev/README.md](dev/README.md) — containerized WSL2 dev environment. Not in the corpus.
 
-## The research corpus
-
-[docs/research/](docs/research/INDEX.md) is a corpus compiled **before any code
-existed**: the cost model, prior art read from source, and this project's own design.
-
-⚠️ **Never read it wholesale.** `INDEX.md` gives every document a one-line finding —
-that is usually enough. Use the [`research`](.agents/skills/research/SKILL.md) skill
-to navigate rather than to read.
+⚠️ **Never read the corpus wholesale.** Use the
+[`research`](.agents/skills/research/SKILL.md) skill to navigate rather than to read.
 
 ⚠️ Several documents carry **correction banners** (`C-1`, `M-1`, `⚠️ Corrected`) where a
-later finding overturned an earlier one. **When a section and a correction banner
-disagree, the banner wins.**
-
-## The five load-bearing conclusions
-
-Everything else follows from these. They are stated with sources in `INDEX.md`.
-
-1. **A PUT costs 12.5 GETs; LIST is PUT-priced for ≤1000 keys.** Batch writes, read
-   freely, never LIST.
-2. **~30 ms per round trip ÷ a 100 ms budget = ~3 sequential fetches.** This
-   disqualifies graph ANN indexes and selects SPANN.
-3. **Blob compare-and-swap exists on every cloud since 2024.** It is what makes a
-   masterless metadata plane possible, and CAS *is* the fencing mechanism — so no
-   locks or leases are needed for correctness.
-4. **CAS tops out near 5 writes/s per key, and per-index flushing has a cost floor
-   independent of data volume.** Bulk writes use contention-free lanes in cross-tenant
-   bundles; the tenant is the CAS unit.
-5. **Nodes own nothing**, so scaling needs no rebalancing, S3 is our free cross-AZ
-   replication, and an AZ loss is a cold-start event rather than a data event.
+later finding overturned an earlier one. **When a section and a banner disagree, the
+banner wins.**
 
 ## Skills
 
@@ -108,10 +83,21 @@ is worse than no skill.
 
 ## Never
 
+These are the five load-bearing conclusions in the only form layer 0 needs. The
+reasoning, with numbers and sources, is in `INDEX.md`.
+
 - Never read the research corpus wholesale. Route through `INDEX.md`.
+- Never **LIST** on a read, write, or startup path. A LIST is priced like a PUT and
+  returns ≤1000 keys; keys are derived, not discovered.
+- Never add a blob request that scales with **records, documents, indexes, or elapsed
+  time per index**. Requests scale with nodes and bytes.
+- Never put a **data-dependent chain** of blob fetches on a user-facing path. The budget
+  is three sequential round trips; fan-out within a round is free, depth is not.
+- Never add a **lock, lease, or leader election** for correctness. CAS on a blob is the
+  fencing mechanism — a paused or partitioned writer is already safe.
+- Never give a node **ownership** of data. Nodes own nothing; that is what makes scaling
+  free and an AZ loss a cold-start event.
 - Never push unless asked.
 - Never commit a tree you know is broken, including "I will fix it next commit".
 - Never widen scope silently. Doing more than asked breaks one-change-one-commit as
   surely as doing less.
-- Never add a blob request that scales with records, documents, or indexes.
-- Never LIST on a read, write, or startup path.
