@@ -23,6 +23,10 @@ Warm query CPU is dominated by SIMD scanning of quantized codes, which is
 > valid at ~1M vectors scanned per query, and is off by an order of magnitude in either
 > direction for other workloads.
 
+Per core the scan is **memory-bound by ~7×** (750 M vectors/s of compute against 104 M/s of
+bandwidth), which is why 1-bit quantization moves this number 32× and a faster kernel does not.
+See [`hot-loop-performance.md`](hot-loop-performance.md) §1.
+
 **Corollary:** every capacity, pricing, and admission decision should be denominated in bytes
 scanned. That is also the number the query planner already knows before executing (`p` ×
 posting-list size), so it is available for admission control at zero cost.

@@ -49,6 +49,10 @@ unit-level logic. So the test infrastructure is a first-class deliverable:
 3. **Property tests** over the commit protocol: any interleaving of N committers must produce
    a linearizable epoch sequence with no lost or duplicated data.
 4. **Recall regression tests** in CI (`10-benchmarks-cost/evaluation-methodology.md`).
+5. **Differential fuzzing of SIMD kernels against a scalar reference**, plus Miri and
+   ASan/UBSan on the kernel crates. A buggy SIMD kernel does not crash — it silently returns
+   bad recall, so this is the primary defence, not a nicety
+   ([`hot-loop-performance.md`](hot-loop-performance.md) §8).
 
 > **D-32.** The simulator is built **before** the distributed features, not after. A
 > masterless design's whole risk is in rare interleavings; without deterministic simulation we

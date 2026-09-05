@@ -83,6 +83,12 @@ that most directly trades request count against bytes.
 ### Encoding
 - Attributes: dictionary + RLE + bit-packing + FOR (frame of reference), chosen per block by
   a cheap sampler. Arrow-compatible on decode.
+- **Strings and document ids use the Arrow `BinaryView` / German-string layout**: a 16-byte
+  view with ≤12 bytes inlined and a 4-byte prefix for short-circuit comparison. This takes
+  `filter`/`gather` from O(n·k) to O(n) — Polars reports pathological cases resolved, DataFusion
+  20–200% on string-heavy queries — and most document ids inline entirely, removing an
+  indirection from the doc-id lookup every query performs. **A format decision: free now,
+  expensive to retrofit** ([`../09-rust-stack/hot-loop-performance.md`](../09-rust-stack/hot-loop-performance.md) §7).
 - Compression: **zstd** by default at a low level; **lz4** for hot blocks where decode CPU
   matters more than size. Per-block, recorded in the block directory.
 - Vectors: quantized codes stored contiguously and SIMD-aligned (see `06-indexing/quantization.md`).

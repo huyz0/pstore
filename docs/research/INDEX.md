@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q42`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q43`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 39 documents, 42 research questions answered, 143 open
+**Status: research phase complete.** 40 documents, 43 research questions answered, 149 open
 questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
@@ -50,8 +50,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 42 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **143 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 43 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **149 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -125,6 +125,7 @@ If you read nothing else:
 | [crate-survey.md](09-rust-stack/crate-survey.md) | Q28 | `object_store`, `arrow-rs`, `simsimd`, `roaring`, `tantivy`, `foyer`. **The deterministic simulator is built before the distributed features, not after.** One binary, all roles. |
 | **[memory-management.md](09-rust-stack/memory-management.md)** | Q35 | **Rust allocation failure aborts and is not catchable**, so limits live above the allocator. In-flight fetch bytes (fan-out × block × concurrency) are the OOM source: score-and-drop makes query memory O(k + resident), not O(scanned). Byte reservations, an emergency reserve for the flush path, `memory.high` + PSI, and a degradation ladder that ends in 429 rather than abort. |
 | **[cpu-management.md](09-rust-stack/cpu-management.md)** | Q36 | **QPS is not a unit of capacity** — warm scan is memory-bandwidth-bound, so QPS/node swings 75× (16→1,221) with scan size. Capacity is bytes-scanned/s. Guard against metastable collapse: hedging off under load, retry budgets, CoDel. **Set CPU requests, never CPU limits.** |
+| **[hot-loop-performance.md](09-rust-stack/hot-loop-performance.md)** | Q43 | **The scan is memory-bound by ~7× per core**, so the win is fewer bytes, not faster instructions — budget SIMD effort accordingly. Huge pages cut a 96 MB scan from 23,438 TLB entries to 46. Rust 1.87 made most `std::arch` intrinsics safe. Adopt Polars' morsel+permit backpressure and German strings. |
 | [runtime-and-io.md](09-rust-stack/runtime-and-io.md) | Q29 | Tokio (work-stealing suits our wildly skewed work) + a separate rayon pool for SIMD. io_uring's win doesn't apply to 30 ms HTTPS. Round-trip depth is a **tested invariant**. |
 
 ## 10 — Benchmarks & cost

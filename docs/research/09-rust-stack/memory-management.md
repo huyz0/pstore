@@ -66,6 +66,13 @@ A cold vector query probing `p`=32 posting lists of ~3 MB, on a node handling 4 
 > Fetched blocks are decoded, scored into the top-k heap, and **dropped immediately**. Peak is
 > the number of blocks simultaneously resident, not the number fetched.
 
+> **Implementation:** this is exactly **morsel-driven parallelism with permit-based
+> backpressure**, the structure Polars' streaming engine converged on — workers *pull*
+> fixed-size morsels, and a semaphore permit per morsel gives exact backpressure. The permit
+> count **is** the in-flight byte reservation of §4. We derived the requirement from OOM
+> analysis; Polars derived the same structure from query-engine scaling. Adopt it rather than
+> invent one. See [`hot-loop-performance.md`](hot-loop-performance.md) §6.
+
 This is a 16× reduction and, more importantly, it makes per-query memory **independent of
 index size** — a 10 KB index and a 50 TB index cost the same peak. That property is what makes
 50M indexes on shared nodes safe.

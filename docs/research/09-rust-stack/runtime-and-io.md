@@ -79,10 +79,18 @@ More important than the runtime choice:
 ## Compute
 
 - **Runtime SIMD dispatch** — one binary must run on AVX2, AVX-512, and NEON. `simsimd` does
-  this; verify the dispatch overhead is amortized (dispatch once per batch, not per vector).
-- **Batch sizes** tuned to L2 cache, not to "looks nice" (1,024 rows is a starting guess, not
-  a conclusion).
-- **Prefetching** in scan loops.
+  this; detect features **once at startup**, never per batch. Note that **most `std::arch`
+  intrinsics are safe to call as of Rust 1.87**, so hand-written kernels no longer imply
+  scattered `unsafe`. See [`hot-loop-performance.md`](hot-loop-performance.md) §3.
+- **Batch sizes** tuned to L2 cache, not to "looks nice". The unit is a **block/morsel**
+  (64 KiB–4 MiB), the same unit used for fetch, decode, and cache — one unit of work throughout
+  the system ([`hot-loop-performance.md`](hot-loop-performance.md) §6).
+- **Prefetching** and **non-temporal loads** in scan loops: we score-and-drop, so scanned blocks
+  are never reused and should not evict the centroids that are.
+- **Huge pages.** A 96 MB scan touches 23,438 4 KiB page entries against an L2 TLB of ~2,000 —
+  guaranteed thrashing. 2 MiB pages reduce that to 46 (D-91).
+- **The scan is memory-bound by ~7× per core**, so the payoff is in *fewer bytes*, not faster
+  instructions. Budget kernel effort accordingly (D-90).
 - Consider **GPU** for very large exact scans much later; it breaks the homogeneous-fleet
   property, so the bar is high.
 

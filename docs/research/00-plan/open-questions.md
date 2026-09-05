@@ -50,6 +50,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
 | OQ-133 | Are three independent per-AZ caches better than one shared cache with cross-AZ reads? Arithmetic says yes overwhelmingly; verify the hot set is small enough at our largest tenant | `04/az-topology` |
 | ~~OQ-136~~ | **CLOSED** — probe mesh + blob health bulletin + peer-relative outlier detection; drain via node self-eviction (data-plane only). Surfaced that per-AZ cells removed the very traffic that reveals gray failure. | `04/gray-failure` |
+| OQ-144 | Measure the real scan roofline on target instance types. H-1's "7× memory-bound" assumes ~4 cycles/vector; if the real kernel is 12, kernel work becomes worthwhile again | `09/hot-loop-performance` |
+| OQ-145 | Huge pages: real TLB win vs allocation-latency and fragmentation cost; explicit `madvise` or THP? | `09/hot-loop-performance` |
+| OQ-148 | `simsimd` dispatch overhead at our batch sizes, and whether it handles the 2-vector batching 768 dims needs (refines OQ-71) | `09/hot-loop-performance` |
 | OQ-138 | Threshold calibration for gray detection: stdevs, confirmations, dwell. Start suspect-only with no auto-drain; tighten with real data | `04/gray-failure` |
 | OQ-142 | Interlock between our draining and AWS zonal autoshift — can both fire and effectively remove two AZs? | `04/gray-failure` |
 | OQ-143 | Gray failure of the **blob store** from one AZ's network path — same detection, different response, needs its own signal | `04/gray-failure` |
@@ -159,7 +162,10 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-135` does per-AZ cell structure generalize to per-region cells? ·
 `OQ-139` dedicated vs rotating probers (rotating avoids a correlated blind spot) ·
 `OQ-140` concrete load-normalization model for distinguishing gray failure from overload ·
-`OQ-141` should the blob health bulletin be signed?
+`OQ-141` should the blob health bulletin be signed? ·
+`OQ-146` German-string buffer GC interacting with arena-per-query allocation ·
+`OQ-147` non-temporal loads: less cache pollution vs losing L2 reuse within a morsel ·
+`OQ-149` `std::simd` (nightly) vs `multiversion` + `std::arch` on stable
 
 ## Strategic risks (not answerable by experiment)
 
