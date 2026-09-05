@@ -33,6 +33,7 @@ adapters that delegate here** and contain no logic.
 | [`gate-design`](.agents/skills/gate-design/SKILL.md) | Before adding any check, gate, or review step — and before writing an instruction that says "remember to" or "make sure you" |
 | [`research`](.agents/skills/research/SKILL.md) | Before any web search or design argument about object storage, cost, ANN indexes, or cluster topology — the answer is usually already here, with numbers |
 | [`review`](.agents/skills/review/SKILL.md) | Before every commit that changes code — defines what the reviewer is given, what it is deliberately denied, and the round budget that stops the loop |
+| [`spec`](.agents/skills/spec/SKILL.md) | Starting a milestone, when a task lacks a checkable acceptance criterion, or when what to build is clearer than how it will be checked |
 | [`tdd`](.agents/skills/tdd/SKILL.md) | Writing any code — covers the red-green cycle, what to assert, and why coverage alone does not answer the question |
 <!-- index:skills:end -->
 
@@ -42,20 +43,27 @@ loaded only when a skill says to read one — never wholesale.
 
 ## Non-negotiables
 
-1. **Never claim a test passes, a gate ran, or a number was measured, without having
+⚠️ Cite these **by name, never by number**. The numbering is for reading order and shifts when a rule is added — a numbered cross-reference in another file goes stale silently. It already did once.
+
+
+1. **Nothing is implemented before it is specified**, and a task without a *checkable*
+   acceptance criterion is not ready to start. Criteria are checkable by a test, a gate,
+   or a number inside a bound — never by an opinion.
+   → [`spec`](.agents/skills/spec/SKILL.md)
+2. **Never claim a test passes, a gate ran, or a number was measured, without having
    done it.** **No script enforces this and none can.** Every other rule rests on it.
    A green gate reported by someone who did not run it is worth less than no gate.
-2. **Never move a threshold in the weakening direction, and never delete or weaken a
+3. **Never move a threshold in the weakening direction, and never delete or weaken a
    test, to make a check pass.** Coverage and mutation floors are thresholds.
-3. **The test is written first and observed to fail.** A test never seen red is not
+4. **The test is written first and observed to fail.** A test never seen red is not
    known to test anything.
-4. **`unsafe` exists in exactly one crate**, `pstore-kernel`. Enforced by
+5. **`unsafe` exists in exactly one crate**, `pstore-kernel`. Enforced by
    `unsafe_code = "forbid"` at the workspace root — a stray `unsafe` block is a compile
    error, and `git diff Cargo.toml` is the complete audit.
-5. **A new check is deterministic by default.** Work down the ladder in
+6. **A new check is deterministic by default.** Work down the ladder in
    [`gate-design`](.agents/skills/gate-design/SKILL.md). **If the rule can be stated as
    a predicate over files in the tree, an agent must not be asked to check it.**
-6. **Numbers measured on WSL2 or against an emulator are `provisional`** and say so.
+7. **Numbers measured on WSL2 or against an emulator are `provisional`** and say so.
    They are relative, never absolute.
 
 ## Gates

@@ -46,6 +46,7 @@ one-line finding, which is usually enough on its own.
 | [`gate-design`](gate-design/SKILL.md) | Before adding any check, gate, or review step — and before writing an instruction that says "remember to" or "make sure you" |
 | [`research`](research/SKILL.md) | Before any web search or design argument about object storage, cost, ANN indexes, or cluster topology — the answer is usually already here, with numbers |
 | [`review`](review/SKILL.md) | Before every commit that changes code — defines what the reviewer is given, what it is deliberately denied, and the round budget that stops the loop |
+| [`spec`](spec/SKILL.md) | Starting a milestone, when a task lacks a checkable acceptance criterion, or when what to build is clearer than how it will be checked |
 | [`tdd`](tdd/SKILL.md) | Writing any code — covers the red-green cycle, what to assert, and why coverage alone does not answer the question |
 <!-- index:skills:end -->
 

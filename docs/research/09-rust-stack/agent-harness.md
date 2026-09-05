@@ -84,7 +84,7 @@ else is on demand.
 > ⚠️ **Corrected.** The first version of this line said ~4,800 tokens. That figure was
 > measured with the shell still in the *source* repository, so it counted **their**
 > `AGENTS.md` (3,100 words) rather than ours. The error is recorded rather than quietly
-> replaced, because non-negotiable 1 is about numbers as much as gates, and a measured
+> replaced, because the "never claim a number you did not measure" rule is about numbers
 > figure taken in the wrong directory is exactly the failure it names. The trim that
 > followed (removing the five conclusions, which `INDEX.md` already states with sources)
 > was therefore worth **~90 tokens, not ~3,400**. It is still right — two copies of a
@@ -136,7 +136,7 @@ the skill:
 | Bounded review with a tested counter | `.agents/skills/review/SKILL.md`, `scripts/review.sh` |
 | Reviewer denied the author's reasoning | packet header |
 | Generate, don't maintain | `scripts/build-index.py` |
-| **"Never claim a gate ran without running it"** as non-negotiable 1 | `AGENTS.md` |
+| **"Never claim a gate ran without running it"** as a non-negotiable | `AGENTS.md` |
 | An honest *Gates* section saying what actually runs today | `AGENTS.md` |
 | Naming things a reader can hold, not bare IDs | `AGENTS.md` § Never |
 

@@ -58,6 +58,8 @@ Each is tracked to a document. `Q` = question, `D` = the doc that answers it.
 - **Q16** What is the on-disk (on-blob) layout? LSM levels vs. tiered vs. delta-on-base; file formats; column layout; how a single blob is structured for ranged reads. → `05-storage-engine/file-format-and-layout.md`
 - **Q17** Compaction: policy, who runs it, how it is scheduled without a master, and its blob-request cost. → `05-storage-engine/compaction.md`
 - **Q18** Deletes, updates, MVCC, tombstones, TTL, and index branching/copy-on-write. → `05-storage-engine/mutations-and-mvcc.md`
+- **Q48** Is spec-driven development worth adopting, and is anything on the internet
+  better for a modern model? → `09-rust-stack/spec-driven-development.md`
 - **Q47** What is worth distilling from the `opensearch-bin-ingester` agent harness,
   without inheriting unbounded loops or token bloat? → `09-rust-stack/agent-harness.md`
 - **Q46** What are the code-quality, modularity, and test-rigour standards, and how are they
