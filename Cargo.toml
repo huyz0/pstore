@@ -13,6 +13,8 @@ members = [
     "crates/pstore-format",
     "crates/pstore-engine",
     "crates/pstore-testkit",
+    # Layer 3 - retrieval
+    "crates/pstore-index",
     # Layer 1 - substrate
     # "crates/pstore-blob",      # nothing above may touch object_store directly
     # "crates/pstore-kernel",    # the ONLY crate permitted unsafe
@@ -20,7 +22,6 @@ members = [
     # "crates/pstore-format",
     # "crates/pstore-engine",    # correctness core; Invariant I1 proven here
     # Layer 3 - retrieval
-    # "crates/pstore-index",
     # "crates/pstore-cluster",
     # Layer 4 - serving
     # "crates/pstore-query",

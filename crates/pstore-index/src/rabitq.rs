@@ -1,0 +1,278 @@
+//! RaBitQ: 1-bit quantization with an error bound and **no training** (D-11).
+//!
+//! ## Why this and not PQ
+//!
+//! PQ needs k-means over a per-index sample. At millions of tenants that is codebooks to
+//! schedule, store, version and re-run as distributions drift — and a cold ten-document
+//! index has no sample to train on. RaBitQ's construction is data-independent: one
+//! rotation derived from the dimension alone, working identically on ten vectors and ten
+//! billion. For a multi-tenant product that single property outweighs accuracy
+//! comparisons. PQ also has *no* error bound and reaches ~100% relative error on some real
+//! data, which for arbitrary customer embeddings is a defect rather than a tradeoff.
+//!
+//! ## The construction
+//!
+//! A unit vector `x` is rotated by a fixed random orthogonal transform, then each
+//! coordinate is kept only as its sign. The quantized vector is
+//! `x̄ = sign(Px) / sqrt(D)`, one bit per dimension.
+//!
+//! The naive estimate `<x̄, q>` is **biased** — `x̄` is not `x`, and the angle between them
+//! is systematic rather than random. RaBitQ's insight is that the bias is *measurable at
+//! encode time*: `<x̄, x>` is a scalar the encoder computes and stores, and dividing by it
+//! removes the bias. That single stored float is the difference between a bound and a hope,
+//! which is why [`Quantizer::estimate_unnormalized_for_test`] exists to show what happens
+//! without it.
+//!
+//! ## The rotation
+//!
+//! A Randomized Hadamard Transform: random sign flips, then a fast Walsh–Hadamard
+//! transform. `O(D log D)`, **no matrix stored**, and derived from the dimension and a
+//! global constant — never from the data, which would be training by another name.
+//!
+//! ⚠️ The transform needs a power-of-two length, so a vector is zero-padded first — and the
+//! code covers the **padded** length, not the original dimension. The rotation mixes energy
+//! into the padding, so those coordinates are not zero afterwards; storing signs for only
+//! the first `D` of them and inventing the rest makes the `<x̄, x>` measured at encode time
+//! describe a different `x̄` than the one the estimate uses, and the bound then fails about
+//! 10% of the time. That is not a subtle inefficiency, it is a wrong estimator, and it was
+//! found by the bound test rather than by reading this code. The cost is real: 384
+//! dimensions occupy 512 bits, so a dimension near a power of two is materially cheaper.
+
+use core::fmt;
+
+/// The bound's confidence parameter.
+///
+/// The error term is a fixed vector's projection onto a random direction, which is
+/// sub-Gaussian with parameter `1/sqrt(D-1)`. Two-sided, that gives a failure probability
+/// of at most `2·exp(-ε²/2)`; for the δ = 1e-3 the M3 spec pins, `ε = sqrt(2·ln(2000)) ≈
+/// 3.90`.
+///
+/// ⚠️ Derived, not tuned. The first draft used 2.25 on a half-remembered constant and the
+/// measured failure rate came out at 2.6% — which is exactly what a 2.25σ two-sided bound
+/// should do. The test did not catch a bug in the estimator; it caught a bound that had
+/// never been derived. Raising ε makes the bound hold more often and say less, so the
+/// number is written with its arithmetic beside it.
+pub const BOUND_EPSILON: f32 = 3.90;
+
+/// Fixed, global, and not a secret — it must be identical in every process that ever reads
+/// a code, so it is a constant rather than configuration.
+const ROTATION_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// What can go wrong, which is only ever a shape mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuantError {
+    /// The vector's length is not the dimension this quantizer was built for.
+    Dimension {
+        /// What the quantizer expects.
+        expected: usize,
+        /// What it was given.
+        got: usize,
+    },
+}
+
+impl fmt::Display for QuantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dimension { expected, got } => {
+                write!(f, "expected {expected} dimensions, got {got}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for QuantError {}
+
+/// One vector's 1-bit code, with the scalar that makes it unbiased.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Code {
+    bits: Vec<u8>,
+    /// `<x̄, x>` — how well the sign vector represents the original.
+    ///
+    /// Near `sqrt(2/π) ≈ 0.798` for a random unit vector in high dimension, and *higher*
+    /// for a vector that happens to align with the rotated axes. Stored rather than
+    /// assumed, because it varies per vector and it is what the bound is a function of.
+    alignment: f32,
+    dim: usize,
+}
+
+impl Code {
+    /// The packed sign bits, one per **padded** dimension.
+    ///
+    /// `padded` is the dimension rounded up to a power of two — see the module docs for why
+    /// it is not `dim`, and what it costs.
+    #[must_use]
+    pub fn bits(&self) -> &[u8] {
+        &self.bits
+    }
+
+    /// `<x̄, x>`, the alignment between the code and the vector it came from.
+    #[must_use]
+    pub fn alignment(&self) -> f32 {
+        self.alignment
+    }
+}
+
+/// A query, rotated once and ready to score against many codes.
+#[derive(Debug, Clone)]
+pub struct Query(Vec<f32>);
+
+/// A dimension's quantizer. Holds no data-derived state — that is the point.
+#[derive(Debug, Clone)]
+pub struct Quantizer {
+    dim: usize,
+    /// Padded to a power of two, which the Walsh–Hadamard transform requires.
+    padded: usize,
+    /// One sign flip per padded coordinate, derived from the dimension alone.
+    flips: Vec<f32>,
+}
+
+impl Quantizer {
+    /// A quantizer for `dim`-dimensional vectors.
+    #[must_use]
+    pub fn new(dim: usize) -> Self {
+        let padded = dim.max(1).next_power_of_two();
+        // Derived from the dimension and a fixed constant. Two quantizers built anywhere,
+        // at any time, for the same dimension are byte-identical -- which is the
+        // no-training property expressed as code rather than as a claim.
+        let mut state = ROTATION_SEED ^ (padded as u64);
+        let flips = (0..padded)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                if (z ^ (z >> 31)) & 1 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        Self { dim, padded, flips }
+    }
+
+    /// The dimension this quantizer encodes.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn check(&self, v: &[f32]) -> Result<(), QuantError> {
+        if v.len() == self.dim {
+            Ok(())
+        } else {
+            Err(QuantError::Dimension {
+                expected: self.dim,
+                got: v.len(),
+            })
+        }
+    }
+
+    /// Pads, flips signs, and applies the Walsh–Hadamard transform.
+    ///
+    /// Orthogonal up to the `1/sqrt(padded)` scaling applied at the end, so inner products
+    /// are preserved — which is what lets the estimate be compared against the original
+    /// vectors' inner product at all.
+    fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut a = vec![0.0f32; self.padded];
+        for ((slot, x), flip) in a.iter_mut().zip(v).zip(&self.flips) {
+            *slot = x * flip;
+        }
+        let mut h = 1;
+        while h < self.padded {
+            for chunk in a.chunks_mut(h * 2) {
+                let (lo, hi) = chunk.split_at_mut(h);
+                for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
+                    let (u, w) = (*x, *y);
+                    *x = u + w;
+                    *y = u - w;
+                }
+            }
+            h *= 2;
+        }
+        let scale = 1.0 / (self.padded as f32).sqrt();
+        for x in a.iter_mut() {
+            *x *= scale;
+        }
+        a
+    }
+
+    /// Encodes a **unit** vector.
+    ///
+    /// The caller normalizes, because in use the vector is a residual from a centroid whose
+    /// norm the caller already has and must keep anyway.
+    pub fn encode(&self, v: &[f32]) -> Result<Code, QuantError> {
+        self.check(v)?;
+        let r = self.rotate(v);
+        let mut bits = vec![0u8; self.padded.div_ceil(8)];
+        // `<x̄, x>` where `x̄ = sign(x)/sqrt(padded)`, which is `||x||₁ / sqrt(padded)`.
+        // Computed from the rotated vector, over the padded length, because that is the
+        // space the estimate lives in.
+        let l1: f32 = r.iter().map(|x| x.abs()).sum();
+        for (i, x) in r.iter().enumerate() {
+            if *x > 0.0
+                && let Some(byte) = bits.get_mut(i / 8)
+            {
+                *byte |= 1 << (i % 8);
+            }
+        }
+        Ok(Code {
+            bits,
+            alignment: l1 / (self.padded as f32).sqrt(),
+            dim: self.dim,
+        })
+    }
+
+    /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
+    fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
+        let scale = 1.0 / (self.padded as f32).sqrt();
+        let mut acc = 0.0f32;
+        for (i, q) in rotated_query.iter().enumerate() {
+            let bit = code
+                .bits
+                .get(i / 8)
+                .is_some_and(|b| b & (1 << (i % 8)) != 0);
+            acc += if bit { *q } else { -*q };
+        }
+        acc * scale
+    }
+
+    /// Rotates a query once, for scoring against many codes.
+    ///
+    /// ⚠️ The asymmetry D-11 buys accuracy from: the query is transformed **once per
+    /// query**, not once per vector, so work spent on it is amortised across every code in
+    /// every probed posting list. Rotating inside `estimate` would put an `O(D log D)`
+    /// transform on the inner loop of a scan over thousands of vectors.
+    pub fn prepare(&self, query: &[f32]) -> Result<Query, QuantError> {
+        self.check(query)?;
+        Ok(Query(self.rotate(query)))
+    }
+
+    /// Estimates `<o, q>` from `o`'s code and a prepared query.
+    #[must_use]
+    pub fn estimate_prepared(&self, code: &Code, query: &Query) -> f32 {
+        // ⚠️ The division is the whole construction. `<x̄, q>` is biased low by exactly the
+        // factor `<x̄, x>`, which the encoder measured; dividing removes it.
+        self.raw(code, &query.0) / code.alignment
+    }
+
+    /// Estimates `<o, q>` from `o`'s code and a unit query.
+    pub fn estimate(&self, code: &Code, query: &[f32]) -> Result<f32, QuantError> {
+        Ok(self.estimate_prepared(code, &self.prepare(query)?))
+    }
+
+    /// The same estimate **without** the normalisation, so a test can show the bound is
+    /// tight enough to reject it.
+    #[doc(hidden)]
+    pub fn estimate_unnormalized_for_test(&self, code: &Code, query: &Query) -> f32 {
+        self.raw(code, &query.0)
+    }
+
+    /// The error bound for this code, at [`BOUND_EPSILON`].
+    ///
+    /// Widens as the code's alignment falls: a vector the sign pattern represents poorly is
+    /// one the estimate is allowed to be more wrong about. That dependence is why the bound
+    /// is a function of the code rather than a constant.
+    #[must_use]
+    pub fn error_bound(&self, code: &Code) -> f32 {
+        let a = code.alignment.max(f32::EPSILON);
+        let d = (self.padded.max(2) - 1) as f32;
+        BOUND_EPSILON * ((1.0 - a * a).max(0.0) / d).sqrt() / a
+    }
+}
