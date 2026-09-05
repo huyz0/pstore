@@ -28,8 +28,14 @@ breaks it under versioning. See
   per-tenant request accounting.
 - The **fault-injecting store**: latency distributions, 412/409/503, delayed visibility,
   deterministic seeds. **Promoted to the primary correctness vehicle**, not a testing aid.
+- **`pstore-fake-s3`** on the `s3s` crate: ~12 operations with AWS's documented semantics plus
+  protocol-level fault injection (~1–2 weeks). Built **before** the sweeps, which want a
+  realistic transport. Unblocks OQ-6 and the 412/409 distinction, which are testable nowhere
+  else ([`../09-rust-stack/blob-store-fakes.md`](../09-rust-stack/blob-store-fakes.md)).
 - **Conformance suite**: probes each backend's real behaviour and *populates* the
-  `Capabilities` matrix rather than assuming it (D-100).
+  `Capabilities` matrix rather than assuming it (D-100). The same suite is the contract the
+  fake must satisfy, and later must satisfy *identically* against real S3 — that is what stops
+  the fake from merely encoding our own beliefs.
 - **Sensitivity sweeps** (D-101): rather than "what is the CAS rate?", sweep 0.5–50 CAS/s and
   find where the design breaks. Same for latency and error rate.
 - Containerized WSL2 dev environment with nested resource caps; CI parity.

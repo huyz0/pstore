@@ -27,7 +27,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 |---|---|---|
 | OQ-2 | Break-even gap `G*` for range coalescing, per backend | `02/request-efficiency-patterns` |
 | OQ-3 | Real p50/p99/p999 TTFB per backend per object size | `02/cost-and-latency` |
-| OQ-6 | Does the ABA nonce fully close the hole under S3 multipart ETags? | `03/manifest-and-cas` |
+| OQ-6 | Does the ABA nonce fully close the hole under S3 multipart ETags? **Unblocked** — `pstore-fake-s3` can synthesize the `-N` and non-MD5 ETag forms, so this is testable without cloud access | `03/manifest-and-cas`, `09/blob-store-fakes` |
 | OQ-10 | Cap on unindexed WAL volume before backpressure | `03/consistency-model` |
 | OQ-12 | Does Lifeguard's false-positive suppression hold when nodes are CPU-pinned by SIMD work? Our workload is SWIM's pathological case. | `04/membership` |
 | OQ-16 | Quantify the cache dip after a 2× scale-out; is shadow warming worth its cost? | `04/routing-and-placement` |
@@ -169,7 +169,10 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-147` non-temporal loads: less cache pollution vs losing L2 reuse within a morsel ·
 `OQ-149` `std::simd` (nightly) vs `multiversion` + `std::arch` on stable ·
 `OQ-151` contribute a wildcard `If-None-Match` fix upstream to MinIO? ·
-`OQ-152` a shared remote dev container later, to escape WSL2's benchmarking limits
+`OQ-152` a shared remote dev container later, to escape WSL2's benchmarking limits ·
+`OQ-154` does `s3s` model conditional-request headers on PutObject, or do we handle them above the generated types? ·
+`OQ-155` run `ceph/s3-tests` against our fake in CI, recording unimplemented ops as expected failures? ·
+`OQ-156` can one fake serve GCS/Azure behind a translation layer, or are generations vs ETags too different?
 
 ## Strategic risks (not answerable by experiment)
 

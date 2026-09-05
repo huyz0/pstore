@@ -23,8 +23,9 @@ research behind it: [`../docs/research/09-rust-stack/dev-and-test-environment.md
 
 | Layer | Runs | Proves |
 |---|---|---|
-| **In-process fault-injecting store** | `cargo test` | **Correctness.** The only backend with exact, assertable semantics. |
-| Emulators (MinIO/Azurite/fake-gcs) | `cargo test --features integration` | Plumbing: HTTP, auth, retries, encoding, error mapping |
+| **In-process fault-injecting store** | `cargo test` | **Correctness of our logic.** Exact, assertable semantics; no HTTP. |
+| **`pstore-fake-s3`** (ours, on `s3s`) | `cargo test --features integration` | **Correctness of our client**: wire, XML, error mapping. Correct `If-None-Match: *`, and the only place 409 vs 412 is testable. |
+| Emulators (MinIO/Azurite/fake-gcs) | `cargo test --features compat` | Third-party plumbing sanity — a compatibility check, not the default target |
 | Conformance suite | `cargo test -p pstore-conformance` | Records what each backend actually does |
 | Real clouds | **deferred — milestone M0b** | Economics: latency, CAS contention, cost |
 
@@ -32,7 +33,14 @@ research behind it: [`../docs/research/09-rust-stack/dev-and-test-environment.md
 
 **No emulator implements our core primitive faithfully.** MinIO rejects
 `If-None-Match: *` (it wants an exact ETag), Azurite got `If-Match: "*"` on a
-missing blob wrong until recently, SeaweedFS breaks it under versioning. So:
-correctness is proven in-process; emulators test plumbing only; CAS semantics are
-confirmed against real clouds in M0b. Backend versions are pinned because this
-behaviour changes between releases.
+missing blob wrong until recently, SeaweedFS breaks it under versioning. **So we
+build our own** — `pstore-fake-s3`, on the `s3s` crate, with exactly AWS's
+documented semantics and protocol-level fault injection.
+
+The trap to avoid: a fake we write encodes *our belief* about S3, so testing
+against it tests our belief. The escape is that the **conformance suite is the
+contract** — the fake and real S3 must pass it identically in M0b, and any
+divergence is a bug in the fake. See
+[`../docs/research/09-rust-stack/blob-store-fakes.md`](../docs/research/09-rust-stack/blob-store-fakes.md).
+
+Emulator versions are pinned here because this behaviour changes between releases.

@@ -166,6 +166,9 @@ to low MB** range.
 - OQ-1: Does S3's 409-on-concurrent-conditional-write have a bounded retry cost under a
   10K-node thundering herd on one manifest key? Needs measurement.
 - OQ-2: Exact break-even gap `G*` per backend for range coalescing. Needs measurement.
+- *(OQ-1/OQ-6 note: the ABA-under-multipart-ETag hazard is now testable without cloud access —
+  `pstore-fake-s3` can synthesize the `md5(concat)-N` and SSE-KMS-style ETag forms, making
+  Design rule 3 an executable test. See [`../09-rust-stack/blob-store-fakes.md`](../09-rust-stack/blob-store-fakes.md).)*
 
 ## Sources
 

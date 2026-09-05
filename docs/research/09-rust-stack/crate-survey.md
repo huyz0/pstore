@@ -76,6 +76,9 @@ pstore/
     pstore-api/         HTTP/gRPC surface, auth, quotas
     pstore-node/        the binary: one binary, all roles
     pstore-sim/         deterministic simulation harness
+    pstore-fake-s3/     S3 fake on `s3s`: exact AWS semantics + protocol fault injection
+                        (standalone; no dependency on pstore internals)
+    pstore-conformance/ backend capability probes; populates the Capabilities matrix
     pstore-bench/       benchmark + recall harness
 ```
 

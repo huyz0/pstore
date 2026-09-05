@@ -55,6 +55,14 @@ This is where **Invariant I1**, the commit protocol, and bundle recovery
 ([OQ-91](../00-plan/open-questions.md)) are actually proven. Runs in-process, no containers, no
 network, fast enough for every `cargo test`.
 
+### Layer 1b — Our own S3 fake (**decided: build it**)
+Since no emulator implements the primitive, we build `pstore-fake-s3` on the `s3s` crate —
+~12 operations with exactly AWS's documented semantics, plus protocol-level fault injection.
+It tests a layer the in-process store cannot: `object_store` → reqwest → wire → XML → error
+mapping. Crucially it **unblocks OQ-6 now** (ABA under multipart ETags) and makes the 412/409
+distinction testable, which it is nowhere else. Design, scope, and the anti-circularity rules:
+[`blob-store-fakes.md`](blob-store-fakes.md).
+
 ### Layer 2 — Emulator integration (plumbing, not semantics)
 MinIO, Azurite, fake-gcs-server in containers. What they genuinely validate:
 - HTTP client wiring, auth, retries, timeouts
@@ -94,6 +102,9 @@ profile must record which mode is in play and the engine must refuse to run in
 `durable` mode on a backend whose profile says CAS is `Divergent`. **Fail loudly at startup
 rather than silently corrupt.**
 
+For *development*, the answer is simpler: use `pstore-fake-s3`, which implements the wildcard
+correctly, and treat MinIO as a third-party compatibility check rather than the default target.
+
 ## 4. What "no cloud accounts" actually blocks
 
 | Open question | Blocked? |
@@ -104,6 +115,7 @@ rather than silently corrupt.**
 | OQ-1 409 retry cost under a herd | Blocked |
 | OQ-24 S3 Express One Zone semantics/cost | Blocked |
 | OQ-98 instance-store NVMe endurance | Blocked (needs real instance store) |
+| **OQ-6** ABA hazard under multipart ETags | **Unblocked by the fake** — synthesize the `-N` and non-MD5 ETag forms ([`blob-store-fakes.md`](blob-store-fakes.md) §5) |
 | OQ-51 LIRE quality under batched rewrites | **Not blocked** — algorithmic |
 | OQ-91 bundle recovery completeness | **Not blocked** — simulator |
 | OQ-111 bytes-scanned/s | **Partly** — measurable locally, but see §5 |
