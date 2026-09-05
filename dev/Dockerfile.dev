@@ -1,0 +1,8 @@
+FROM rust:1.90-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev clang mold git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# sccache: rebuilds must not re-link the world (matters most in CI, where
+# Docker layer caches are often unavailable).
+RUN cargo install sccache --locked && cargo install cargo-chef --locked
+ENV CARGO_HOME=/usr/local/cargo

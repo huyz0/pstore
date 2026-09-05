@@ -81,6 +81,17 @@ match our differentiation claims.
 | **Pinecone Serverless** | The closest architecture. |
 | **Exact brute force** | Ground truth for recall, and the honest baseline for small indexes. |
 
+## Provisional numbers and the environment
+
+Until real cloud accounts exist, every latency and throughput figure is measured either against
+emulators or on WSL2 — a VM under Windows with dynamic memory and no CPU pinning. Neither is a
+benchmarking environment.
+
+> **D-104 (from [`../09-rust-stack/dev-and-test-environment.md`](../09-rust-stack/dev-and-test-environment.md)).**
+> Such numbers are **relative** (did this change help?), never **absolute** (what is our
+> QPS/node?). Tag them *provisional*, record the environment alongside, and re-measure in M0b.
+> Cycles-per-vector survives virtualization reasonably; achieved memory bandwidth does not.
+
 ## Anti-patterns in benchmarking (things we must not do)
 
 - Reporting warm-only latency. (Everyone does this. We won't.)
@@ -90,6 +101,8 @@ match our differentiation claims.
 - Reporting QPS without stating recall — **QPS and recall are one number, never two**.
 - Omitting blob-request cost, which is our actual product claim.
 - Running on a cache pre-warmed by the ground-truth computation.
+- **Quoting an emulator or WSL2 number as if it were a cloud number.** MinIO's latency tells us
+  nothing about S3's, and its CAS semantics actively differ.
 
 ## Continuous evaluation
 

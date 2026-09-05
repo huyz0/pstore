@@ -1,0 +1,22 @@
+# Copy to .cargo/config.toml. Build memory, not build speed, is what kills
+# WSL2 -- linking is the peak. See The Rust Performance Book, "Build Configuration".
+[build]
+jobs = 6                                  # cap below core count; more jobs = more peak RAM
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]   # mold links fast and uses less memory than lld
+
+[profile.dev]
+debug = 1                                 # full debug info is a large memory contributor
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = 1
+
+# Release-ish profile for local benchmarking. NOTE: numbers measured under WSL2
+# are RELATIVE only (did this change help?), never absolute -- see D-104.
+[profile.bench]
+inherits = "release"
+debug = 1
+codegen-units = 1                         # slower build, faster code, lower LLVM parallel RAM

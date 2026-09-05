@@ -79,6 +79,12 @@ awkward to call is the cheapest possible enforcement of Design rule 4.
   fault behaviour** (412s, 409s, 503s, delayed visibility). Most of our correctness testing
   depends on being able to simulate a nasty blob store deterministically.
 
+> **Promoted.** With no cloud accounts and **no emulator implementing `If-None-Match: *`
+> faithfully** (MinIO requires an exact ETag; Azurite and SeaweedFS have their own divergences),
+> this is not a testing aid — it is the **primary correctness vehicle**, the only backend whose
+> semantics we control and can assert. Emulators test plumbing; real clouds test economics.
+> See [`../09-rust-stack/dev-and-test-environment.md`](../09-rust-stack/dev-and-test-environment.md).
+
 ## Sources
 
 - [object_store — docs.rs](https://docs.rs/object_store/latest/object_store/)

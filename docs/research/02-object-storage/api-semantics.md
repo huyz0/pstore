@@ -153,6 +153,14 @@ to low MB** range.
 > `delete_is_free`, `max_batch_delete`, `typical_ttfb_ms`). The engine reads capabilities and
 > adapts policy (e.g. compaction aggressiveness) rather than branching on backend name.
 
+> **Capabilities are measured, not declared.** A conformance suite probes each backend and
+> records what it *actually* does; the table above is the specification, not the observed
+> reality. Self-hosted implementations diverge on precisely the CAS semantics we depend on —
+> MinIO does not accept the `*` wildcard at all. A backend whose recorded profile marks CAS
+> `Divergent` must **refuse to serve `durable` writes**, failing loudly at startup rather than
+> corrupting silently. See
+> [`../09-rust-stack/dev-and-test-environment.md`](../09-rust-stack/dev-and-test-environment.md).
+
 ## Open questions raised
 
 - OQ-1: Does S3's 409-on-concurrent-conditional-write have a bounded retry cost under a

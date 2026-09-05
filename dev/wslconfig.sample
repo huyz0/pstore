@@ -1,0 +1,8 @@
+; Copy to %UserProfile%\.wslconfig on the Windows side, then: wsl --shutdown
+; WSL2 defaults to taking up to 50% of host RAM; vmmem is just the Windows-side
+; view of that VM. Cap it so a cargo link step cannot take the host down.
+[wsl2]
+memory=12GB              ; leave the host at least 8GB
+processors=8             ; leave cores for Windows
+swap=8GB
+autoMemoryReclaim=gradual

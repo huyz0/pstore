@@ -10,7 +10,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | ID | Question | Impact | Experiment |
 |---|---|---|---|
 | **OQ-51** | Does LIRE (SPFresh) preserve partition quality when its split/merge/reassign decisions are **batched into immutable-segment rewrites** instead of applied in place? | If not, every compaction needs full re-clustering — a large cost-model change. **The biggest unvalidated assumption in the design.** | M3.5 spike: implement both, compare recall and partition-length distribution over a simulated 90-day update stream. |
-| **OQ-5** | Real CAS throughput and loss-rate curves per backend under 2 / 8 / 64 / 512 concurrent contenders. | The "~5 writes/s" figure is borrowed, not measured. Everything about commit rate and register partitioning depends on it. | M0 microbenchmark inside each cloud. |
+| **OQ-5** | Real CAS throughput and loss-rate curves per backend under 2 / 8 / 64 / 512 concurrent contenders. | The "~5 writes/s" figure is borrowed, not measured. Everything about commit rate and register partitioning depends on it. | **Blocked on cloud accounts (M0b).** Meanwhile invert it (D-101): sweep the fault-injecting store 0.5–50 CAS/s and find the breaking point, so one later measurement says which regime we are in. |
 | **OQ-22** | Is forward-probing the lane tail with `k` parallel GETs cheaper than a per-lane tail-pointer object updated every M writes? | Determines read-path cost of the whole lane design. | Model both, then measure with realistic write-rate distributions. |
 | **OQ-75** | Real warm queries-per-second per node. Currently a guess (200/s). | The dominant term in the cost model (compute is 92% of cost). | Benchmark the scan path on target instance types. |
 | ~~OQ-84~~ | ~~What fraction of indexes are trickle writers?~~ | **ANSWERED:** 1M tenants × up to 50 indexes (~50M), **10% of tenants active per second**. Confirms bundling is essential and forces two further structural changes. | → [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) |
@@ -50,6 +50,8 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
 | OQ-133 | Are three independent per-AZ caches better than one shared cache with cross-AZ reads? Arithmetic says yes overwhelmingly; verify the hot set is small enough at our largest tenant | `04/az-topology` |
 | ~~OQ-136~~ | **CLOSED** — probe mesh + blob health bulletin + peer-relative outlier detection; drain via node self-eviction (data-plane only). Surfaced that per-AZ cells removed the very traffic that reveals gray failure. | `04/gray-failure` |
+| OQ-150 | Which backend has the highest CAS fidelity for day-to-day dev? MinIO's missing `*` wildcard is a real obstacle; run the conformance suite and pick on evidence | `09/dev-and-test-environment` |
+| OQ-153 | Is `fake-gcs-server` faithful to `ifGenerationMatch`? GCS generations are our cleanest CAS story on paper — if so, GCS may be the better primary dev target than S3 | `09/dev-and-test-environment` |
 | OQ-144 | Measure the real scan roofline on target instance types. H-1's "7× memory-bound" assumes ~4 cycles/vector; if the real kernel is 12, kernel work becomes worthwhile again | `09/hot-loop-performance` |
 | OQ-145 | Huge pages: real TLB win vs allocation-latency and fragmentation cost; explicit `madvise` or THP? | `09/hot-loop-performance` |
 | OQ-148 | `simsimd` dispatch overhead at our batch sizes, and whether it handles the 2-vector batching 768 dims needs (refines OQ-71) | `09/hot-loop-performance` |
@@ -165,7 +167,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-141` should the blob health bulletin be signed? ·
 `OQ-146` German-string buffer GC interacting with arena-per-query allocation ·
 `OQ-147` non-temporal loads: less cache pollution vs losing L2 reuse within a morsel ·
-`OQ-149` `std::simd` (nightly) vs `multiversion` + `std::arch` on stable
+`OQ-149` `std::simd` (nightly) vs `multiversion` + `std::arch` on stable ·
+`OQ-151` contribute a wildcard `If-None-Match` fix upstream to MinIO? ·
+`OQ-152` a shared remote dev container later, to escape WSL2's benchmarking limits
 
 ## Strategic risks (not answerable by experiment)
 

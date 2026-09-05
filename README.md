@@ -13,6 +13,7 @@ hybrid search — where the blob store is the **only** durable tier, for data *a
 | Blob API discipline | LIST banned on hot paths; writes batched; reads free. |
 
 **Status: research phase complete, no code yet.**
+Local dev environment (containerized for WSL2): [`dev/README.md`](dev/README.md).
 Start at **[docs/research/INDEX.md](docs/research/INDEX.md)**, then
 [the architecture](docs/research/11-design/architecture.md) and
 [the roadmap](docs/research/11-design/roadmap.md).

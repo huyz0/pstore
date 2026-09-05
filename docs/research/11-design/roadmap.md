@@ -16,20 +16,37 @@ test before writing a search engine:
 
 ## Milestones
 
-### M0 — Substrate truth (2–3 weeks)
-**Goal: replace every guessed number in the research with a measured one.**
+### M0a — Local substrate (2–3 weeks, unblocked)
+**Goal: find the breaking points, since we cannot yet measure the real ones.**
+
+No cloud accounts yet, and **no emulator implements our core CAS primitive faithfully** —
+MinIO rejects `If-None-Match: *`, Azurite got `If-Match: "*"` wrong until recently, SeaweedFS
+breaks it under versioning. See
+[`../09-rust-stack/dev-and-test-environment.md`](../09-rust-stack/dev-and-test-environment.md).
 
 - `pstore-blob`: the `BlobStore` trait over `object_store`, with congestion control and
   per-tenant request accounting.
 - The **fault-injecting store**: latency distributions, 412/409/503, delayed visibility,
-  deterministic seeds.
-- A **microbenchmark suite** run inside AWS/GCP/Azure answering: OQ-3 (real TTFB percentiles),
-  OQ-5 (**CAS throughput and loss curves under 2/8/64/512 contenders — the single most
-  important measurement in the project**), OQ-2 (range-coalescing break-even `G*`), OQ-6 (ABA
-  under multipart ETags), OQ-24 (Express One Zone semantics and cost).
+  deterministic seeds. **Promoted to the primary correctness vehicle**, not a testing aid.
+- **Conformance suite**: probes each backend's real behaviour and *populates* the
+  `Capabilities` matrix rather than assuming it (D-100).
+- **Sensitivity sweeps** (D-101): rather than "what is the CAS rate?", sweep 0.5–50 CAS/s and
+  find where the design breaks. Same for latency and error rate.
+- Containerized WSL2 dev environment with nested resource caps; CI parity.
 
-**Exit:** a document of measured numbers replacing §OQ-2/3/5/6/24, and a go/no-go on the CAS
-premise.
+**Exit:** we know *what would break and at what threshold*, plus a recorded capability matrix
+per backend. Numbers measured here are **relative only** (D-104).
+
+### M0b — Real-cloud validation (deferred until accounts exist)
+- Run the **same** conformance suite against real S3, GCS, Azure → complete the matrix and
+  confirm the CAS premise.
+- OQ-5 CAS contention curves, OQ-3 TTFB percentiles, OQ-2 `G*`, OQ-1 409 behaviour,
+  OQ-6 ABA under multipart ETags, OQ-24 Express One Zone, OQ-98 NVMe endurance.
+- Re-measure every number tagged provisional under D-104.
+
+**Exit:** every "provisional" tag removed from the cost model. Because M0a produced sensitivity
+curves, this is *"take five measurements and read off which regime we are in"* — days, not a
+re-analysis.
 
 ### M1 — Single-node storage engine (4–6 weeks)
 - `pstore-format`: segment encode/decode, footer, blocks, zone maps.
@@ -138,7 +155,9 @@ parallelism on M3/M5, which are largely independent of M2/M4.
    be large and continuously written, cross-index bundling is over-engineering and the simpler
    per-index path is fine. This is a customer-discovery question, not an engineering one, and
    it is cheap to answer first.
-1. **After M0:** does CAS behave well enough under contention? If a single key can't sustain
+1. **After M0a:** at what CAS rate does the design break? (A threshold, not a measurement —
+   and more useful, because it says how much headroom we have.) **After M0b:** which side of
+   that threshold is reality on? If a single key can't sustain
    even a few writes/second reliably, the partitioned-register plan needs rethinking.
 2. **After M2:** does the simulation find correctness bugs we cannot close? A masterless design
    that needs a lock service is just a worse design with extra steps.
