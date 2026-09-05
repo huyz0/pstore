@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q41`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q42`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 38 documents, 41 research questions answered, 137 open
+**Status: research phase complete.** 39 documents, 42 research questions answered, 143 open
 questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
@@ -50,8 +50,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 41 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **137 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 42 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **143 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -83,6 +83,7 @@ If you read nothing else:
 | [ownership-and-leases.md](04-cluster/ownership-and-leases.md) | Q13 | Optimistic work + CAS-on-publish. Duplicate work is an economics problem, not a correctness one. `needed_work(manifest)` is a pure function — no scheduler, no queue, no recovery. |
 | **[epoch-propagation.md](04-cluster/epoch-propagation.md)** | Q40 | **Don't gossip epochs — the committer computes who cares and unicasts.** Flooding 10k nodes costs ~$355k/mo in cross-AZ vs ~$107 targeted. Propagation doesn't remove the blob GET, it moves it off the query critical path; a node never serves state learned from a peer. |
 | **[az-topology.md](04-cluster/az-topology.md)** | Q41 | **S3 is our cross-AZ replication and it's free** (Standard spans ≥3 AZs, no transfer charge). So run independent per-AZ cells: zero inter-AZ cost, and an AZ loss degrades to a cold-start event because nodes own nothing. Watch the NAT-gateway landmine ($116k/mo for a routing mistake). |
+| **[gray-failure.md](04-cluster/gray-failure.md)** | Q42 | An AZ degraded-but-alive costs 17–67× effective latency with every liveness check green. Per-AZ cells removed the cross-AZ traffic that would reveal it — buy it back for ~$16/mo (probe mesh) + ~$10/mo (blob health bulletin, which survives an inter-AZ partition). Peer-relative outlier detection; drain by **self-eviction**, so no control plane is in the recovery path. |
 | [load-and-hotspots.md](04-cluster/load-and-hotspots.md) | Q14 | Size skew → shards; rate skew → **dynamic replication factor, free because nodes own nothing**; cold start → singleflight + centroid-first cache fill. |
 
 ## 05 — Storage engine

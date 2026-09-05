@@ -80,6 +80,10 @@ strategy" — known *before* M3 hardens around it.
 - Roster seeding from the blob store; routing hop; hedged requests.
 - Simulated 10,000-node runs in `pstore-sim`; measure convergence and post-scale-out cold
   ratio.
+- **Per-AZ cells** ([`../04-cluster/az-topology.md`](../04-cluster/az-topology.md)) and
+  **gray-failure detection** ([`../04-cluster/gray-failure.md`](../04-cluster/gray-failure.md)):
+  cross-AZ probe mesh, blob health bulletin, peer-relative outlier detection, self-eviction
+  draining. Gray fault injection in the simulator is part of this milestone, not a follow-up.
 
 **Exit:** 1,000 real nodes, 10,000 simulated; add/remove 50% of the fleet with zero data
 movement and a measured, bounded cache dip.

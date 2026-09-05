@@ -49,7 +49,10 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-95 | Does `W`-node write concentration collide with S3 per-prefix limits, especially on cohort-lane reads during recovery? | `10/tenancy-scale-model` |
 | OQ-97 | Adaptive promotion of hot indexes out of the tenant HEAD — reversible? demotion hysteresis? | `10/tenancy-scale-model` |
 | OQ-133 | Are three independent per-AZ caches better than one shared cache with cross-AZ reads? Arithmetic says yes overwhelmingly; verify the hot set is small enough at our largest tenant | `04/az-topology` |
-| OQ-136 | Gray AZ failure (degraded, not dead) — health-based draining, not liveness-based. **Not yet designed.** | `04/az-topology` |
+| ~~OQ-136~~ | **CLOSED** — probe mesh + blob health bulletin + peer-relative outlier detection; drain via node self-eviction (data-plane only). Surfaced that per-AZ cells removed the very traffic that reveals gray failure. | `04/gray-failure` |
+| OQ-138 | Threshold calibration for gray detection: stdevs, confirmations, dwell. Start suspect-only with no auto-drain; tighten with real data | `04/gray-failure` |
+| OQ-142 | Interlock between our draining and AWS zonal autoshift — can both fire and effectively remove two AZs? | `04/gray-failure` |
+| OQ-143 | Gray failure of the **blob store** from one AZ's network path — same detection, different response, needs its own signal | `04/gray-failure` |
 | OQ-137 | Do GCP/Azure have equivalent cross-zone pricing and a free regional-storage path? BYOC parity depends on it | `04/az-topology` |
 | OQ-132 | Do we need epoch notification at all once `session` is the default (the client carries the epoch)? Possibly only for background warming | `04/epoch-propagation` |
 | OQ-117 | Measured working-set fraction `f` on real query traces — everything about R rests on f ≈ 0.1, which is folklore not data | `07/storage-to-cache-ratio` |
@@ -153,7 +156,10 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-130` coalescing interval for epoch hint → revalidation ·
 `OQ-131` should a notification inline the manifest for small tenants (prefetch vs trusting peer state)? ·
 `OQ-134` per-AZ vs global write cohorts — confirm the PUT floor doesn't rise ·
-`OQ-135` does per-AZ cell structure generalize to per-region cells?
+`OQ-135` does per-AZ cell structure generalize to per-region cells? ·
+`OQ-139` dedicated vs rotating probers (rotating avoids a correlated blind spot) ·
+`OQ-140` concrete load-normalization model for distinguishing gray failure from overload ·
+`OQ-141` should the blob health bulletin be signed?
 
 ## Strategic risks (not answerable by experiment)
 

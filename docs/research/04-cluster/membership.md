@@ -12,6 +12,13 @@ It is needed only to answer: *"which node should I ask, so that the cache is lik
 > membership view degrades cache hit rate and nothing else. No correctness property may ever
 > depend on it.
 
+> **Scope note.** Rule 11 holds for *binary* liveness. It does **not** cover degraded-but-alive
+> nodes: a gray-failing AZ keeps passing liveness checks while ruining latency for a third of
+> traffic (17–67× effective mean). That needs a second, *continuous* signal which never removes
+> a node from membership and only adjusts routing weight — deliberately separate from
+> Lifeguard, which we chose precisely because it suppresses false positives. See
+> [`gray-failure.md`](gray-failure.md).
+
 This is a much weaker requirement than a typical distributed system, and it is what makes
 10K nodes easy rather than hard. Compare: in a system with data ownership, a wrong membership
 view means unavailability or split-brain.

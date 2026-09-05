@@ -182,7 +182,7 @@ event would turn a survivable failure into an outage
 | LB spreading a client's requests across AZs | Zone-aware LB / same-AZ target preference; session hints keep follow-ups local |
 | A tenant's writes arriving in all 3 AZs → 3 cohort lanes | Fine — lanes are designed for this, and `W* = bytes/s × T / B` self-adjusts per AZ, so total `W` is unchanged |
 | One AZ has fewer nodes (uneven capacity) | Per-AZ rings are independent; size each AZ for its own share plus headroom |
-| An AZ that is degraded but not dead ("gray failure") | Hardest case: shed and drain by health signal, not liveness. Needs explicit design (OQ-136) |
+| An AZ that is degraded but not dead ("gray failure") | **Designed — see [`gray-failure.md`](gray-failure.md).** Cross-AZ probe mesh + blob-store health bulletin restore the observability per-AZ cells removed (~$16/month); peer-relative outlier detection; drain by node self-eviction from the LB (data-plane only, so static stability holds). |
 | S3 itself degraded in one AZ | S3 handles this internally; our reads may see elevated latency. Congestion control and `bounded` reads absorb it |
 
 ## 7. Metrics
@@ -202,8 +202,9 @@ event would turn a survivable failure into an outage
   for zero cross-AZ, and the formula self-adjusts — confirm it does not raise the PUT floor.
 - OQ-135 — Multi-region is out of scope for v1, but does per-AZ cell structure generalize to
   per-region cells with async replication of immutable objects?
-- OQ-136 — Gray AZ failure (degraded, not dead) is the hardest case and is not yet designed.
-  Health-based draining, not liveness-based.
+- ~~OQ-136~~ **CLOSED** — see [`gray-failure.md`](gray-failure.md). Note it surfaced a real
+  cost of D-79: per-AZ cells eliminate the cross-AZ traffic that would otherwise let one AZ
+  observe another. Eliminating traffic also eliminates signal.
 - OQ-137 — Does GCP/Azure have equivalent cross-zone pricing and a free regional-storage path?
   The design assumes it does; verify per cloud before promising BYOC parity.
 

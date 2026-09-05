@@ -124,7 +124,7 @@ Our architecture has three built-in amplifiers that must be controlled:
 
 | Amplifier | Why it is dangerous | Control |
 |---|---|---|
-| **Hedged requests** ([`load-and-hotspots.md`](../04-cluster/load-and-hotspots.md)) | A hedge doubles CPU exactly when CPU is scarce — textbook positive feedback | **Disable hedging above a load threshold.** Hedging is a tail-latency tool for a healthy system, never an overload tool. |
+| **Hedged requests** ([`load-and-hotspots.md`](../04-cluster/load-and-hotspots.md)) | A hedge doubles CPU exactly when CPU is scarce — textbook positive feedback | Disable **blind** hedging above a load threshold. **Refined:** the decision is per-target-health, not global — hedging *away from a suspect target* is the best per-request gray-failure mitigation and should survive the load threshold. See [`../04-cluster/gray-failure.md`](../04-cluster/gray-failure.md) §7. |
 | **Client retries** | The single most common sustaining effect | **Retry budgets** (retries capped as a fraction of requests), server-advertised `Retry-After`, and exponential backoff *with jitter* |
 | **Cold-start stampede** → more cold work → slower → more cold | Positive feedback via cache misses | Singleflight + admission control on cold fills (already specified) |
 

@@ -42,7 +42,10 @@ unit-level logic. So the test infrastructure is a first-class deliverable:
    failures, and *deterministic* replay from a seed. Most of our real bugs will be found here.
 2. **Deterministic simulation** (`madsim` / `turmoil`) for the cluster: run 10,000 logical
    nodes on one machine with a controlled clock and network, and assert invariants (especially
-   **Invariant I1** from `03-metadata-consistency/consistency-model.md`).
+   **Invariant I1** from `03-metadata-consistency/consistency-model.md`). It must model **gray**
+   failures — injected latency, partial packet loss, asymmetric partitions, slow blob responses
+   confined to one AZ — not only crash-stop (D-89). A simulator that only kills nodes tests the
+   easy case.
 3. **Property tests** over the commit protocol: any interleaving of N committers must produce
    a linearizable epoch sequence with no lost or duplicated data.
 4. **Recall regression tests** in CI (`10-benchmarks-cost/evaluation-methodology.md`).

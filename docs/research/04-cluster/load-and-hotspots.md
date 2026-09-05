@@ -68,7 +68,9 @@ With 1,000-way fan-out, p99 of the *query* is roughly p99.9 of the *slowest shar
 remedies, all of which we can afford because nodes own nothing:
 
 - **Hedged requests.** After p95 of the expected shard latency, re-issue to placement #1.
-  Ownership-free means the hedge is always legal — no leader to check with.
+  Ownership-free means the hedge is always legal — no leader to check with. **Hedging is
+  health-aware, not a global switch**: hedge *away from* suspect targets even under load, but
+  never hedge blindly under overload (see [`gray-failure.md`](gray-failure.md) §7).
 - **Tied requests** for the most expensive shards.
 - **Partial results with a completeness flag** — for search, returning 998/1000 shards at
   20 ms often beats 1000/1000 at 400 ms. Expose it: the response states which shards were
