@@ -89,6 +89,18 @@ Mitigations for the scale-out cache dip:
   owner fetches from the blob store (not from the peer — peer-to-peer transfer would create
   the coupling we are trying to avoid).
 
+## Revision: key placement on the tenant for small tenants
+
+`LRH(index_id)` scatters a tenant's ~50 indexes across ~50 node sets, which for a *small*
+tenant means 50 independent cold starts and 50 nodes each caching a few hundred KB. At
+1M × 50 with ~98% of indexes small and idle, that is the common case rather than the tail.
+
+> **D-43.** Place on **`tenant_id`** below a size threshold and on **`index_id`** above it. A
+> small tenant's indexes then share one node set — one cold start warms all 50 — while large
+> indexes keep independent placement so a big tenant still spreads across the fleet.
+
+See [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) §5.
+
 ## Why not "one node owns an index"?
 
 Because it reintroduces everything we deleted: ownership needs leases, leases need liveness,

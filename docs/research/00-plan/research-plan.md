@@ -58,6 +58,8 @@ Each is tracked to a document. `Q` = question, `D` = the doc that answers it.
 - **Q16** What is the on-disk (on-blob) layout? LSM levels vs. tiered vs. delta-on-base; file formats; column layout; how a single blob is structured for ranged reads. → `05-storage-engine/file-format-and-layout.md`
 - **Q17** Compaction: policy, who runs it, how it is scheduled without a master, and its blob-request cost. → `05-storage-engine/compaction.md`
 - **Q18** Deletes, updates, MVCC, tombstones, TTL, and index branching/copy-on-write. → `05-storage-engine/mutations-and-mvcc.md`
+- **Q33** What does the real tenancy shape (1M tenants × up to 50 indexes, 10% active per
+  second) do to the design? → `10-benchmarks-cost/tenancy-scale-model.md` *(closes OQ-84)*
 - **Q32** How do we bundle more per PUT without delaying search-after-write? Cross-tenant
   bundling, the per-index flush floor, freshness layers, fold-rate economics. →
   `05-storage-engine/batching-and-visibility.md` *(added after P5; the write-path doc's

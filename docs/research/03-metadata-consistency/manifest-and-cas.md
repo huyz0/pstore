@@ -67,8 +67,18 @@ MANIFEST (immutable, per epoch)   ~100 KB – 50 MB
   └── segments[]: {id, level, shard, kind, byte_ranges, min/max, tombstone_ref, ...}
 ```
 
-- **HEAD** is the only mutable object in an index. Key:
-  `{h}/idx/{index_id}/HEAD`. It is small enough to read in one GET and CAS cheaply.
+- **HEAD** is the only mutable object. Key: `{h}/tnt/{tenant_id}/HEAD`.
+  It is small enough to read in one GET and CAS cheaply.
+
+> **Revision — the CAS unit is the TENANT, not the index.** See
+> [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md)
+> §4. At 1M tenants × ~50 indexes, a per-index register costs **$180k–$540k/month** in
+> structural commits; one register per tenant, committing all of that tenant's dirty indexes
+> together, costs **$3.6k–$10.8k** — a 50× reduction exactly matching indexes-per-tenant. A
+> tenant HEAD lists each index's epoch and manifest ref (or inlines small indexes outright).
+> Hot indexes are **adaptively promoted** to their own HEAD, referenced by pointer, so one
+> busy index cannot contend with 49 quiet siblings. Everything below applies unchanged to
+> whichever register is in play; only the key and the granularity move.
 - **MANIFEST** is immutable and named by epoch: `{h}/idx/{index_id}/m/{epoch:020}.manifest`.
   Readers who already hold epoch *E* and see HEAD at *E* skip the fetch entirely.
 - Every other object is immutable and content- or coordinate-addressed.

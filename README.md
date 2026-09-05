@@ -5,7 +5,8 @@ hybrid search — where the blob store is the **only** durable tier, for data *a
 
 | | |
 |---|---|
-| Unit of tenancy | **index** (millions of them) |
+| Scale | **1M tenants × up to 50 indexes ≈ 50M indexes**; 10% of tenants active per second |
+| Unit of tenancy | **index** (API/schema/query); the **tenant** is the unit of commit |
 | Durable state | S3 / GCS / Azure Blob only. No Postgres, etcd, ZooKeeper, or DynamoDB. |
 | Topology | No master, no leader election. Target: **10,000 nodes**. |
 | Local state | RAM + NVMe are pure cache. Nodes own nothing. |

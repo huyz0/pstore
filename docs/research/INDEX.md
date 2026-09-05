@@ -1,17 +1,19 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q31`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q33`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
-filters) in Rust. Unit of tenancy is an **index**. Blob store is the *only* durable tier,
-for data *and* metadata. Target: 10,000 nodes, millions of indexes, minimal blob-API spend.
+filters) in Rust. Unit of tenancy is an **index**; unit of commit is a **tenant**. Blob store is the *only* durable tier,
+for data *and* metadata. Target: 10,000 nodes, **~50M indexes across 1M tenants**, minimal
+blob-API spend.
 
 ---
 
-**Status: research phase complete.** 29 documents, 32 research questions answered, 91 open
-questions logged. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
+**Status: research phase complete.** 30 documents, 33 research questions answered, 97 open
+questions logged. Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
+tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
 substrate before writing an engine.
 
 ## The five load-bearing conclusions
@@ -45,8 +47,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 31 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **83 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 33 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **97 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -66,7 +68,7 @@ If you read nothing else:
 ## 03 — Metadata without a master
 | Doc | Answers | Status |
 |---|---|---|
-| [manifest-and-cas.md](03-metadata-consistency/manifest-and-cas.md) | Q8 | One CAS'd HEAD per index = a linearizable register. **Fencing is free** — the storage layer rejects stale writers, so no locks are needed for correctness. |
+| [manifest-and-cas.md](03-metadata-consistency/manifest-and-cas.md) | Q8 | One CAS'd HEAD **per tenant** = a linearizable register. **Fencing is free** — the storage layer rejects stale writers, so no locks are needed for correctness. |
 | [catalog-without-master.md](03-metadata-consistency/catalog-without-master.md) | Q9 | Keys are derived from the index id, so the hot path needs no catalog at all. Enumeration = one parallel round over fixed-width buckets. |
 | [consistency-model.md](03-metadata-consistency/consistency-model.md) | Q10 | Snapshot isolation + three client-chosen read modes. Freshness is a parameter, never a mystery. |
 
@@ -118,6 +120,7 @@ If you read nothing else:
 | Doc | Answers | Status |
 |---|---|---|
 | [evaluation-methodology.md](10-benchmarks-cost/evaluation-methodology.md) | Q30 | Never report latency without cache state. QPS and recall are one number, not two. Recall and round-trip depth are CI gates. |
+| **[tenancy-scale-model.md](10-benchmarks-cost/tenancy-scale-model.md)** | Q33 | **1M tenants × 50 indexes, 90% idle.** Naive per-index flushing costs $1.3M–$65M/month. Three fixes: fan writes *in* to `W = bytes/s × T / B` nodes; make the **tenant** the CAS unit (50×); co-locate small tenants' reads. Write path lands at ~$14k/month. |
 | [cost-model.md](10-benchmarks-cost/cost-model.md) | Q31 | At 100M docs: storage $8/mo, writes $1/mo, queries $780/mo, **compute $8,760/mo (92%)**. This is a compute-efficiency business. Idle tenants are free. |
 
 ## 11 — Design synthesis
@@ -134,7 +137,9 @@ If you read nothing else:
 
 | Term | Meaning |
 |---|---|
-| **Index** | The unit of tenancy and isolation. (turbopuffer calls this a namespace.) |
+| **Tenant** | Unit of **physical grouping, commit, and CAS**. ~1M of them, ~50 indexes each. |
+| **Index** | Unit of **API, schema, query, and isolation**. ~50M of them. (turbopuffer calls this a namespace.) Deliberately *not* the same as the tenant — see [tenancy-scale-model](10-benchmarks-cost/tenancy-scale-model.md) §4. |
+| **Write cohort** | The `W`-node derivable subset that buffers and flushes writes. `W = write_bytes/s × T / B`. |
 | **Shard** | A horizontal partition of one index, by hash of document id. |
 | **Lane** | A per-writer append-only WAL stream. Lanes remove CAS from the write path. |
 | **Epoch** | Monotonic counter incremented on structural change; part of every key. |

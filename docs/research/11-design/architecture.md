@@ -27,6 +27,7 @@ filtered search.
 | C3 | Blob CAS exists everywhere now (S3 since 2024) | [api-semantics](../02-object-storage/api-semantics.md) | A masterless metadata plane is finally possible |
 | C4 | CAS on one key ≈ 5 writes/s | [manifest-and-cas](../03-metadata-consistency/manifest-and-cas.md) | Lanes; partitioned registers; CAS only for structural change |
 | C4b | **Per-index flushing costs `2,592,000/T` PUTs/index/month whether the index writes 1 doc or 10⁹** | [batching-and-visibility](../05-storage-engine/batching-and-visibility.md) | Bundle across tenants; serve freshness from memory so `T` costs nothing in latency |
+| C4c | **1M tenants × ~50 indexes, 90% idle at any instant.** Naive per-index flushing = $1.3M–$65M/month | [tenancy-scale-model](../10-benchmarks-cost/tenancy-scale-model.md) | Fan writes *in* to `W` nodes; make the **tenant** the CAS unit (50×); co-locate small tenants' reads |
 | C5 | Stateless ⇒ no rebalancing ⇒ elasticity in seconds | [routing-and-placement](../04-cluster/routing-and-placement.md) | 10,000 nodes is tractable; placement is a hint |
 
 ## 3. System diagram
@@ -68,7 +69,9 @@ filtered search.
 
 | Concept | Definition |
 |---|---|
-| **Index** | Unit of tenancy, isolation, schema, and billing. Millions of them. |
+| **Tenant** | Unit of **physical grouping, commit, and CAS**. ~1M, each with up to 50 indexes. Its HEAD is the register; its indexes commit together. |
+| **Index** | Unit of **API, schema, query, isolation, and billing display**. ~50M of them. |
+| **Write cohort** | Derivable set of `W = write_bytes/s × T / B` nodes that buffer and flush. Writes fan *in* here; visibility fans *out* to read placements. |
 | **Shard** | Horizontal partition of an index by `hash(doc_id)`. Fixed at creation, resharding is a rewrite. |
 | **Document** | Id + optional vector(s) + typed attributes. |
 | **Segment** | Immutable object: data blocks + index section + footer. |
@@ -97,8 +100,9 @@ Every key is **derivable**. Nothing is ever discovered by LIST.
 ## 6. The write path
 
 ```
-client → routed to the index's read placements
-       → in-memory memtable, replicated R-way intra-AZ (~0.5 ms)
+client → fans to TWO destinations, both in-memory:
+   (a) write-cohort node for hash(tenant_id)  → buffers, bundles, issues the ONE PUT   [cost]
+   (b) the R read placements of each index    → memtable, replicated intra-AZ (~0.5 ms) [visibility]
        → SEARCHABLE  ◀── every node that can answer a query for this index now has it
        → (up to T later) ONE PUT of a CROSS-INDEX BUNDLE covering every index
                           this node buffered                ← durable, ack
@@ -107,8 +111,11 @@ client → routed to the index's read placements
 ```
 
 - **RA(write batch) = 1 W, shared across every index in the bundle. CAS per write = 0.**
-- PUT cost scales with **node count and write volume, not tenant count** — a per-index timer
-  would cost $216k–$13M/month at 1M indexes regardless of batch size.
+- PUT cost scales with **`W` and write volume, not index count**. `W = write_bytes/s × T / B`
+  is sized so the time-driven floor equals the data-driven term. A per-index timer would cost
+  $1.3M–$65M/month at this tenancy shape regardless of batch size; this lands at ~$14k.
+- Structural commits are **per tenant**, not per index: one CAS commits all ~50 of a tenant's
+  dirty indexes. Worth 50× ($540k → $10.8k/month). Hot indexes are promoted to their own HEAD.
 - **The flush interval `T` never appears in the time-to-searchable budget**, because visibility
   is served from the replicated memtable. Batch for seconds, be searchable in ~1 ms.
 - Readers derive candidate bundle lanes from the same placement function used for reads; the
@@ -176,7 +183,8 @@ transition is a CAS on a single key conditioned on the exact version the actor o
 | Dimension | turbopuffer | pstore |
 |---|---|---|
 | Per-index write rate | ~1 WAL entry/s, ~10k vectors/s | **lanes** ⇒ blob-rate-limited, target ≥1M vectors/s |
-| Cost floor per idle-ish index | one WAL entry/s ⇒ ~$13/mo/index if flushed on a timer | **cross-index bundles** ⇒ PUTs scale with nodes, not tenants |
+| Cost floor per idle-ish index | one WAL entry/s ⇒ ~$13/mo/index if flushed on a timer | **cross-tenant bundles + write cohorts** ⇒ PUTs scale with `W` and volume, not index count |
+| Commit unit | namespace | **tenant** — one CAS commits ~50 indexes |
 | Time-to-searchable | strong reads see writes; ~10 ms floor from checking object storage | **~1 ms** from a replicated memtable, decoupled from the flush interval |
 | Coordination | a stateless **broker** (a hidden master, with a failover window) | none |
 | Staleness in eventual mode | "up to about one hour" | **client-specified bound** |
@@ -206,6 +214,7 @@ transition is a CAS on a single key conditioned on the exact version the actor o
 | Cold-query ratio too high in practice | OQ-57 | Shadow warming, persistent NVMe cache, warm API |
 | Bundle recovery could miss un-folded records after node death or placement change | [OQ-91](../00-plan/open-questions.md) | Simulator proof in M2 — if this fails, cross-index bundling is unsafe and the cost argument collapses |
 | Cross-tenant data sharing one object may be a compliance blocker | OQ-87 | Per-byte-range encryption; **validate with customers before building** |
+| `A` (active indexes/s) is unknown within 50× | [OQ-92](../00-plan/open-questions.md) | Sets how much the write-cohort design is worth; instrument a pilot tenant |
 | S3 Vectors commoditizes the category | — | Compete on hybrid + filtering + warm latency + BYOC, not on $/GB |
 
 ## 13. Reading order for a newcomer

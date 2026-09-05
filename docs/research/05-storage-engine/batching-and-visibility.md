@@ -113,6 +113,14 @@ PUTs/s  =  max(  write_bytes_per_s / bundle_bytes  ,  active_writer_nodes / T  )
 The time-driven floor is now bounded by **node count**, not **index count**. That is the
 structural win: it decouples cost from tenancy.
 
+> **Refinement — size the writer set, don't inherit it.** This document assumed
+> `active_writer_nodes = N` (the whole fleet), because write placement followed read
+> placement. With most tenants idle at any instant that is wasteful: the floor should be set
+> deliberately. Writes fan **in** to a derivable cohort of `W* = write_bytes_per_s × T / B`
+> nodes, which balances the two terms above and takes the floor from $129,600/month
+> (W=10,000, T=1 s) to ~$1,555 (W=600, T=5 s). See
+> [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) §3.
+
 ### Worked example: 1M indexes each writing 1 doc/minute (~1 KB docs)
 
 Total: 16,667 docs/s ≈ 16.7 MB/s.
@@ -246,6 +254,11 @@ fleet-wide, versus $216,000 for per-index 60 s flushing. Idle indexes cost **zer
 
 > **D-39.** After bundling, the *fold rate* becomes the dominant per-index PUT cost. It must be
 > adaptive and size-driven, never a fixed timer.
+
+> **And the CAS unit must be the tenant, not the index** — at 1M × 50 that is worth another
+> 50× ($540k → $10.8k/month). A tenant's indexes are written by one application, buffered on
+> one cohort node, and commit together in one CAS. See
+> [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) §4.
 
 ---
 

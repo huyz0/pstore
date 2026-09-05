@@ -72,6 +72,12 @@ An index creation must not rewrite a whole catalog bucket. So catalog updates ar
 This is the same shape as the main storage engine (immutable runs + lanes + CAS'd pointer),
 which is deliberate: **one mechanism, used three times** (data, catalog, cluster state).
 
+> **Revision at 1M × 50.** Make the catalog **tenant-scoped**: 1M tenant records of ~10 KB
+> (each listing that tenant's ~50 indexes) = 10 GB, over 16,384 fixed-width buckets = 640 KB
+> per bucket, still one parallel round at ~$0.007. Cheaper than 50M index records and better
+> aligned with billing, which is per tenant. See
+> [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md) §8.
+
 ## 3. What about tenants, quotas, billing?
 
 Per-index config, quotas, and usage counters live **inside HEAD** (config) and in

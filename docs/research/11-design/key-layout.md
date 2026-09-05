@@ -22,6 +22,15 @@ at the front (rule 5), one mutable pointer (rule 1), and everything else immutab
 
 ## The tree
 
+> **Revision.** The tree below is keyed by index. Per
+> [`../10-benchmarks-cost/tenancy-scale-model.md`](../10-benchmarks-cost/tenancy-scale-model.md)
+> §4 it is now keyed by **tenant**: `{hash4}/tnt/{tenant_id}/HEAD` is the CAS register and
+> lists all ~50 of that tenant's indexes (inlining the small ones); per-index subtrees hang
+> beneath it, and a hot index may be promoted to its own HEAD. `{hash4}` is computed from
+> `tenant_id`. The WAL moves to a **cohort lane** — `{hash4}/wal/{cohort_node}/{seq}.bundle`,
+> derived via `LRH(tenant_id)` over a ring of `W` writer nodes (§3 there). Structure,
+> derivability, and the mutable-object census are otherwise unchanged.
+
 ```
 {root}/                                              ← deployment prefix (BYOC-friendly)
 │
