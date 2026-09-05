@@ -34,6 +34,17 @@ pub struct Head {
     pub indexes: BTreeMap<String, Vec<SegmentRef>>,
     /// How far each lane has been folded, so a reader knows what it still has to replay.
     pub watermarks: BTreeMap<u64, u64>,
+    /// Keys that **stopped being referenced** at a given epoch, newest last.
+    ///
+    /// ⚠️ This is what lets GC run with **zero LIST**. A bucket enumeration would tell us
+    /// which objects exist; it would not tell us which ones a reader might still be
+    /// holding, and it is priced like a PUT and capped at 1000 keys. Recording the
+    /// dereference at the moment it happens turns garbage collection into a manifest diff
+    /// — and the epoch it is recorded under is exactly what the retention window is
+    /// measured against.
+    ///
+    /// Bounded, not unbounded: GC prunes an entry in the same pass that reaps it.
+    pub graveyard: BTreeMap<u64, Vec<String>>,
 }
 
 impl Head {
@@ -64,6 +75,14 @@ impl Head {
             out.extend_from_slice(&lane.to_le_bytes());
             out.extend_from_slice(&seq.to_le_bytes());
         }
+        out.extend_from_slice(&(self.graveyard.len() as u32).to_le_bytes());
+        for (epoch, keys) in &self.graveyard {
+            out.extend_from_slice(&epoch.to_le_bytes());
+            out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+            for k in keys {
+                put_str(&mut out, k);
+            }
+        }
         out
     }
 
@@ -90,6 +109,15 @@ impl Head {
         for _ in 0..c.u32()? {
             let lane = c.u64()?;
             h.watermarks.insert(lane, c.u64()?);
+        }
+        for _ in 0..c.u32()? {
+            let epoch = c.u64()?;
+            let n = c.u32()?;
+            let mut keys = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                keys.push(c.string()?);
+            }
+            h.graveyard.insert(epoch, keys);
         }
         Ok(h)
     }

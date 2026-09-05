@@ -345,6 +345,13 @@ impl<S: BlobStore> Engine<S> {
                     next.watermarks.insert(lane.0, *tail);
                 }
             }
+            // The bundles just folded are now garbage: their rows live in a segment HEAD
+            // names. Recorded here rather than deleted here, because a reader holding the
+            // previous epoch may still be replaying them.
+            next.graveyard
+                .entry(next.epoch.0)
+                .or_default()
+                .extend(keys.iter().map(|(_, k)| k.as_str().to_owned()));
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
@@ -364,6 +371,98 @@ impl<S: BlobStore> Engine<S> {
             }
         }
         Err(EngineError::Lost)
+    }
+
+    /// Reaps objects dereferenced more than `retention` epochs ago.
+    ///
+    /// **Zero LIST.** GC works from the manifest's graveyard, which records each key at
+    /// the epoch it stopped being referenced. Enumerating the bucket would answer a
+    /// different question — what *exists*, rather than what is still reachable — and cost
+    /// a PUT per thousand keys to answer it wrongly.
+    ///
+    /// `retention` is a number of epochs, not a duration. A reader that read HEAD at
+    /// epoch *e* may take arbitrarily long to finish scanning, so what protects it is not
+    /// elapsed time but the guarantee that nothing referenced at *e* is reaped until the
+    /// tenant has committed `retention` further epochs.
+    ///
+    /// Returns how many objects were reaped.
+    pub async fn gc(&self, retention: u64) -> Result<usize, EngineError> {
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            // Everything dereferenced at an epoch this old is beyond the reach of any
+            // reader the window promises to protect.
+            let horizon = at.head.epoch.0.saturating_sub(retention);
+            let due: Vec<u64> = at
+                .head
+                .graveyard
+                .range(..=horizon)
+                .map(|(e, _)| *e)
+                .collect();
+            if due.is_empty() {
+                return Ok(0);
+            }
+            let live: std::collections::BTreeSet<&str> = at
+                .head
+                .indexes
+                .values()
+                .flatten()
+                .map(|r| r.key.as_str())
+                .collect();
+            let doomed: Vec<Key> = due
+                .iter()
+                .filter_map(|e| at.head.graveyard.get(e))
+                .flatten()
+                // ⚠️ Checked against what HEAD names *now*, not against what it named when
+                // the key was buried. Cheap, and the one thing standing between a bug
+                // anywhere in the commit path and deleting live data.
+                .filter(|k| !live.contains(k.as_str()))
+                .map(|k| Key::new(k.clone()))
+                .collect();
+
+            // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
+            // Pruning first and then failing to delete loses the only record that these
+            // objects exist, and they leak with nothing left to find them by. Deleting
+            // first and then failing to prune costs a repeated delete on the next pass,
+            // which is idempotent.
+            self.store.delete_batch(&doomed).await?;
+
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+            for e in &due {
+                next.graveyard.remove(e);
+            }
+            match head::commit(&*self.store, self.tenant, &at, &next).await {
+                Ok(_) => return Ok(doomed.len()),
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// Commits an arbitrary edit to HEAD.
+    ///
+    /// Exists for one reason: GC's live-reference guard refuses to reap a key HEAD still
+    /// names, and the commit protocol is supposed to make that state unreachable. A
+    /// defence that cannot be reached cannot be tested, and an untested defence is one
+    /// that quietly stops working — so a test is allowed to construct the state the
+    /// protocol forbids, and check that GC survives it.
+    #[doc(hidden)]
+    pub async fn commit_head_for_test(
+        &self,
+        mutate: impl FnOnce(&mut Head),
+    ) -> Result<Epoch, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        let mut next = at.head.clone();
+        next.epoch = next.epoch.next();
+        next.nonce = next.epoch.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.lane.0;
+        mutate(&mut next);
+        head::commit(&*self.store, self.tenant, &at, &next).await
     }
 
     /// The published manifest, so a test can assert on what is *referenced* rather than
@@ -469,6 +568,11 @@ impl<S: BlobStore> Engine<S> {
                     .cloned(),
             );
             next.indexes.insert(index.to_owned(), kept);
+            // Same rule for the segments this merge replaced.
+            next.graveyard
+                .entry(next.epoch.0)
+                .or_default()
+                .extend(inputs.iter().map(|i| i.key.clone()));
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => return Ok(Some(epoch)),
