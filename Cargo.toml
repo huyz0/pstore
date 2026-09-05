@@ -1,0 +1,68 @@
+# pstore workspace root.
+# Standards and rationale: docs/research/09-rust-stack/engineering-standards.md
+#
+# Layering is enforced by construction: Cargo forbids cycles, and each crate's
+# Cargo.toml lists only the layers below it. The dependency list IS the
+# architecture -- an upward dependency shows up in the diff.
+[workspace]
+resolver = "3"
+members = [
+    # Layer 0 - types only, no logic, no dependencies
+    "crates/pstore-types",
+    # Layer 1 - substrate
+    # "crates/pstore-blob",      # nothing above may touch object_store directly
+    # "crates/pstore-kernel",    # the ONLY crate permitted unsafe
+    # Layer 2 - storage
+    # "crates/pstore-format",
+    # "crates/pstore-engine",    # correctness core; Invariant I1 proven here
+    # Layer 3 - retrieval
+    # "crates/pstore-index",
+    # "crates/pstore-cluster",
+    # Layer 4 - serving
+    # "crates/pstore-query",
+    # "crates/pstore-server",
+    # Test infrastructure - never shipped
+    # "crates/pstore-testkit",
+    # "crates/pstore-fake-s3",   # standalone: no pstore dependencies
+]
+
+[workspace.package]
+edition      = "2024"
+rust-version = "1.90"
+license      = "Apache-2.0"
+repository   = "https://github.com/tuonghuy/pstore"
+
+# ---------------------------------------------------------------------------
+# Compiler-enforced invariants (D-109). Every crate opts in with:
+#     [lints]
+#     workspace = true
+# `unsafe_code = "forbid"` is relaxed to "allow" in EXACTLY ONE crate,
+# pstore-kernel, so `git diff Cargo.toml` is the complete unsafe audit.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code      = "forbid"
+missing_docs     = "warn"
+unreachable_pub  = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }   # group: must outrank individual lints
+
+[workspace.lints.clippy]
+unwrap_used      = "deny"   # #[cfg(test)] may allow
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"   # forces .get(); deliberate get_unchecked lives in pstore-kernel
+todo             = "deny"
+unimplemented    = "deny"
+dbg_macro        = "deny"
+float_cmp        = "deny"
+mem_forget       = "deny"
+
+[profile.release]
+codegen-units = 1
+lto           = "thin"
+debug         = 1          # keep symbols: profiling a memory-bound scan needs them
+
+# Local benchmarking profile. NOTE: numbers measured under WSL2 are RELATIVE
+# only, never absolute (D-104).
+[profile.bench]
+inherits      = "release"
+codegen-units = 1

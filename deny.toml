@@ -1,0 +1,17 @@
+# cargo-deny: advisories, licences, and dependency bans.
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+
+[bans]
+multiple-versions = "warn"
+# Enforces D-2 at the dependency level: only pstore-blob may depend on
+# object_store. Everything above it goes through the BlobStore trait so that
+# request accounting and congestion control are unavoidable.
+deny = [{ name = "object_store", wrappers = ["pstore-blob"] }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"

@@ -1,0 +1,89 @@
+# CI runs in an already-containerized environment, so nothing here re-containerizes.
+# The same commands run locally via `docker compose run dev <cmd>` -- see dev/README.md.
+# Gates and rationale: docs/research/09-rust-stack/engineering-standards.md
+name: ci
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo doc --no-deps --all-features
+      # Licences, advisories, and the object_store ban that keeps request
+      # accounting unavoidable above pstore-blob.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+        env: { MINIO_ROOT_USER: pstore, MINIO_ROOT_PASSWORD: pstore-dev-secret }
+        ports: ["9000:9000"]
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+        ports: ["10000:10000"]
+      gcs:
+        image: fsouza/fake-gcs-server:1.52
+        ports: ["4443:4443"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --all-features
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: llvm-tools-preview }
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Workspace floor is 95% (D-110). Per-crate targets are higher for the
+      # correctness core and are checked in the nightly job.
+      - run: cargo llvm-cov --all-features --workspace --fail-under-lines 95 --lcov --output-path lcov.info
+
+  # Coverage says a line ran; mutation says a test would have noticed if it changed.
+  # Only the second one makes 95% mean something (D-111). Changed files per PR;
+  # the full workspace run is nightly, because it is expensive.
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-mutants
+      - run: cargo mutants --in-diff <(git diff origin/${{ github.base_ref || 'main' }}...HEAD) --no-shuffle -j2
+        if: github.event_name == 'pull_request'
+        shell: bash
+
+  # unsafe lives in exactly one crate (D-109). This job is the audit trail:
+  # `unsafe_code = "forbid"` at the workspace root makes a stray unsafe block a
+  # compile error, and miri checks the one crate that is allowed to have them.
+  unsafe-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: miri }
+      - uses: Swatinem/rust-cache@v2
+      - name: Only pstore-kernel may relax the unsafe_code lint
+        run: |
+          offenders=$(grep -rlE '^\s*unsafe_code\s*=\s*"(allow|warn)"' --include=Cargo.toml . \
+                      | grep -v 'crates/pstore-kernel/' || true)
+          if [ -n "$offenders" ]; then echo "unsafe relaxed outside pstore-kernel:"; echo "$offenders"; exit 1; fi
+      - run: cargo miri test -p pstore-kernel
+        if: hashFiles('crates/pstore-kernel/Cargo.toml') != ''

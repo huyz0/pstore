@@ -1,0 +1,14 @@
+[package]
+name        = "pstore-types"
+version     = "0.1.0"
+description = "Shared identifier and version types for pstore. Types only, no logic, no dependencies."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+# Layer 0: no dependencies, by rule. See engineering-standards.md D-108.
+[dependencies]

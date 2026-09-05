@@ -60,31 +60,36 @@ unit-level logic. So the test infrastructure is a first-class deliverable:
 
 ## Workspace shape
 
+**Consolidated to 9 library crates + 2 test crates.** A crate boundary must encode an
+architectural invariant the compiler enforces; anything else is a module (D-108). Full rationale
+and the per-crate invariants: [`engineering-standards.md`](engineering-standards.md) §2.
+
 ```
 pstore/
   crates/
-    pstore-blob/        BlobStore trait, backends, congestion control, request accounting
-    pstore-format/      Segment format: encode/decode, footer, blocks, zone maps
-    pstore-manifest/    HEAD, manifest, CAS commit protocol, epochs
-    pstore-wal/         Lanes, group commit, tail discovery, lane bitmap
-    pstore-index-vec/   SPANN-family clustered index, LIRE maintenance
-    pstore-index-fts/   Tantivy Directory + BM25/sparse
-    pstore-quant/       RaBitQ, int8 SQ, SIMD kernels
-    pstore-cache/       foyer wrapper, class-aware admission
-    pstore-cluster/     gossip, LRH placement, work assignment
-    pstore-query/       planner + vectorized execution
-    pstore-api/         HTTP/gRPC surface, auth, quotas
-    pstore-node/        the binary: one binary, all roles
-    pstore-sim/         deterministic simulation harness
-    pstore-fake-s3/     S3 fake on `s3s`: exact AWS semantics + protocol fault injection
-                        (standalone; no dependency on pstore internals)
-    pstore-conformance/ backend capability probes; populates the Capabilities matrix
-    pstore-bench/       benchmark + recall harness
+    pstore-types/       newtype IDs, epochs, CAS tokens. Types only, no logic, no deps.
+    pstore-blob/        BlobStore trait, backends, cache, congestion control, accounting
+    pstore-kernel/      SIMD, quantization, bitmaps -- THE ONLY CRATE PERMITTED `unsafe`
+    pstore-format/      segment encode/decode, footer, zone maps; format versioning
+    pstore-engine/      manifest/CAS, WAL lanes and bundles, compaction, MVCC, GC
+    pstore-index/       SPANN vector index + sparse/BM25 postings + filtering
+    pstore-cluster/     gossip, LRH placement, work assignment, health/gray detection
+    pstore-query/       planner, vectorized execution, session tokens
+    pstore-server/      API surface, auth, quotas, the node binary
+    pstore-testkit/     simulator, conformance, fault injection  (dev-dependencies only)
+    pstore-fake-s3/     S3 fake on `s3s`  (standalone; no pstore dependencies)
 ```
+
+The earlier draft had 16 crates; several boundaries (manifest/wal, index-vec/index-fts,
+cache/blob) bought no enforced invariant and became modules instead.
 
 **One binary, all roles.** Any node can serve, index, compact, and GC
 (`04-cluster/ownership-and-leases.md`). Roles are runtime *biases* advertised in gossip, not
 separate deployables. This keeps ops trivial at 10,000 nodes.
+
+**Layering is enforced by construction**: Cargo forbids cycles, and each crate lists only the
+layers below it, so the dependency list *is* the architecture. `cargo-deny` additionally bans
+`object_store` outside `pstore-blob`, making request accounting unavoidable (D-2).
 
 ## Open questions raised
 

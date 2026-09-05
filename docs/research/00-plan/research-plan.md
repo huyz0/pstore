@@ -58,6 +58,8 @@ Each is tracked to a document. `Q` = question, `D` = the doc that answers it.
 - **Q16** What is the on-disk (on-blob) layout? LSM levels vs. tiered vs. delta-on-base; file formats; column layout; how a single blob is structured for ranged reads. → `05-storage-engine/file-format-and-layout.md`
 - **Q17** Compaction: policy, who runs it, how it is scheduled without a master, and its blob-request cost. → `05-storage-engine/compaction.md`
 - **Q18** Deletes, updates, MVCC, tombstones, TTL, and index branching/copy-on-write. → `05-storage-engine/mutations-and-mvcc.md`
+- **Q46** What are the code-quality, modularity, and test-rigour standards, and how are they
+  made enforceable rather than aspirational? → `09-rust-stack/engineering-standards.md`
 - **Q45** MinIO can't do our CAS primitive — should we build our own S3 fake, and how do we
   keep it from just encoding our own assumptions? → `09-rust-stack/blob-store-fakes.md`
 - **Q44** How do we build and test on WSL2 without killing the host, and validate the blob

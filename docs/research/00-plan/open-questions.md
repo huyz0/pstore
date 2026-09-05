@@ -172,7 +172,11 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-152` a shared remote dev container later, to escape WSL2's benchmarking limits ·
 `OQ-154` does `s3s` model conditional-request headers on PutObject, or do we handle them above the generated types? ·
 `OQ-155` run `ceph/s3-tests` against our fake in CI, recording unimplemented ops as expected failures? ·
-`OQ-156` can one fake serve GCS/Azure behind a translation layer, or are generations vs ETags too different?
+`OQ-156` can one fake serve GCS/Azure behind a translation layer, or are generations vs ETags too different? ·
+`OQ-157` is 100% region coverage on `pstore-engine` realistic, or does the CAS-retry surface make the last few percent brittle? ·
+`OQ-158` `cargo-mutants` runtime on a workspace this size; per-crate scheduling needed? ·
+`OQ-159` where exactly is the generics/`dyn` boundary — monomorphizing `BlobStore` through the engine could hurt compile times on a capped box ·
+`OQ-160` should `pstore-types` exist, or do newtypes belong with their owning layer? (junk-drawer risk)
 
 ## Strategic risks (not answerable by experiment)
 
