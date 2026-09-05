@@ -10,5 +10,11 @@ repository.workspace  = true
 workspace = true
 
 [dependencies]
+pstore-blob   = { path = "../pstore-blob" }
+pstore-format = { path = "../pstore-format" }
 
 [dev-dependencies]
+bytes          = "1"
+pstore-testkit = { path = "../pstore-testkit" }
+pstore-types   = { path = "../pstore-types" }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

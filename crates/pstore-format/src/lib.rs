@@ -20,9 +20,40 @@ mod docs;
 mod reader;
 mod writer;
 
-pub use docs::{decode_docs, encode_docs};
+pub use docs::{decode_docs, decode_rows, encode_docs, encode_rows};
 pub use reader::Segment;
 pub use writer::{INDEX_BUDGET, SegmentWriter};
+
+/// A footer-addressed region of a segment.
+///
+/// ⚠️ **Readers skip what they do not find.** A segment written before a section existed
+/// simply has no entry for it, and stays valid forever — which matters because segments are
+/// immutable, so "migrate the old ones" is never available. Ids are therefore reserved
+/// here, not assigned on first use, and **never reused**: a recycled id makes an old
+/// segment decode as something it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u16)]
+pub enum Section {
+    /// Block offsets, row counts and zone maps. Always present.
+    Blocks = 1,
+    /// Full-precision `f32` vectors, row-major and fixed-width.
+    ///
+    /// ⚠️ Deliberately **not** in the data blocks. At 384 dimensions this is 1,536 bytes a
+    /// row against 64 for the 1-bit code; interleaving them makes every approximate query
+    /// pay for precision it discards, and spends the compression the round-trip budget is
+    /// built on before it is used.
+    Vectors = 2,
+    /// RaBitQ 1-bit codes, fixed-width per row.
+    RaBitQ = 3,
+    /// int8 codes for the rerank rung, fixed-width per row.
+    Sq8 = 4,
+    /// Reserved: sparse postings (M5).
+    SparsePostings = 5,
+    /// Reserved: term dictionary (M6).
+    TermDict = 6,
+    /// Reserved: token positions (M6).
+    Positions = 7,
+}
 
 /// The index section's length, read from a segment's footer.
 ///

@@ -486,6 +486,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "pstore-blob",
  "pstore-types",
  "thiserror",
@@ -495,6 +496,14 @@ dependencies = [
 [[package]]
 name = "pstore-index"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pstore-blob",
+ "pstore-format",
+ "pstore-testkit",
+ "pstore-types",
+ "tokio",
+]
 
 [[package]]
 name = "pstore-testkit"

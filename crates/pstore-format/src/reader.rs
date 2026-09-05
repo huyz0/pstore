@@ -1,7 +1,9 @@
 //! Opening and reading a segment.
 
 use crate::codec::{Dec, checksum};
-use crate::{BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, VERSION};
+use crate::{
+    BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, Section, VERSION,
+};
 use bytes::Bytes;
 use pstore_blob::{BlobStore, Key};
 use std::collections::BTreeMap;
@@ -11,6 +13,8 @@ use std::collections::BTreeMap;
 pub struct Segment {
     blocks: Vec<BlockMeta>,
     rows: u32,
+    /// Where each section lives, from the footer-addressed directory.
+    sections: BTreeMap<u16, std::ops::Range<u64>>,
 }
 
 impl Segment {
@@ -37,8 +41,8 @@ impl Segment {
         if version != VERSION {
             return Err(FormatError::UnsupportedVersion(version));
         }
-        let index_offset = d.u64()?;
-        let index_len = d.u32()?;
+        let meta_offset = d.u64()?;
+        let meta_len = d.u32()?;
         let rows = d.u32()?;
         let sum = d.u64()?;
         // The trailing magic is what distinguishes a real footer from bytes that happen to
@@ -49,19 +53,19 @@ impl Segment {
 
         // Where in the object the bytes we hold begin. Derived from the footer's own
         // offsets rather than from a separately-fetched length.
-        let seg_len = index_offset + u64::from(index_len) + FOOTER_LEN as u64;
+        let seg_len = meta_offset + u64::from(meta_len) + FOOTER_LEN as u64;
         let tail_start = seg_len.saturating_sub(tail.len() as u64);
         let idx_bytes = {
-            if index_offset >= tail_start {
-                let lo = (index_offset - tail_start) as usize;
+            if meta_offset >= tail_start {
+                let lo = (meta_offset - tail_start) as usize;
                 let hi = lo
-                    .checked_add(index_len as usize)
+                    .checked_add(meta_len as usize)
                     .ok_or(FormatError::Truncated)?;
                 Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
             } else {
-                // Only now, and only for a segment whose index section is large.
+                // Only now, and only for a segment whose meta region is large.
                 store
-                    .get_range(key, index_offset..index_offset + u64::from(index_len))
+                    .get_range(key, meta_offset..meta_offset + u64::from(meta_len))
                     .await?
             }
         };
@@ -69,10 +73,111 @@ impl Segment {
             return Err(FormatError::ChecksumMismatch);
         }
 
+        // The meta region is the directory followed by the block index. Parsing the
+        // directory tells us where the block index is; everything else in it is a byte
+        // range a later fetch may or may not use.
+        let mut d = Dec::new(&idx_bytes);
+        let entries = d.u32()? as usize;
+        let mut sections = BTreeMap::new();
+        let mut blocks_span: Option<std::ops::Range<u64>> = None;
+        for _ in 0..entries {
+            let id = d.u16()?;
+            let offset = d.u64()?;
+            let len = d.u64()?;
+            let span = offset..offset.saturating_add(len);
+            // ⚠️ Recorded by RAW id, including ids this version has never heard of. There
+            // is deliberately no "is this known?" check: `section()` is looked up by a
+            // `Section`, so an unknown id is unreachable and storing it costs one map entry.
+            // A check would be equivalent code that no test could distinguish — and
+            // refusing would make every future section a breaking change for every deployed
+            // reader at once, which segments being immutable makes permanent.
+            if id == Section::Blocks as u16 {
+                blocks_span = Some(span.clone());
+            }
+            sections.insert(id, span);
+        }
+        let blocks_span = blocks_span.ok_or(FormatError::Corrupt("no block section"))?;
+        // The block index sits inside the region already fetched, at a known offset.
+        let lo = (blocks_span.start - meta_offset) as usize;
+        let hi = lo
+            .checked_add((blocks_span.end - blocks_span.start) as usize)
+            .ok_or(FormatError::Truncated)?;
+        let blocks = idx_bytes.get(lo..hi).ok_or(FormatError::Truncated)?;
+
         Ok(Self {
-            blocks: Self::decode_index(&idx_bytes)?,
+            blocks: Self::decode_index(blocks)?,
             rows,
+            sections,
         })
+    }
+
+    /// The byte offset just past the last data block.
+    ///
+    /// Data blocks are addressed by the index rather than by the directory, so nothing else
+    /// can tell whether a section overlaps them.
+    #[must_use]
+    pub fn data_end(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|b| b.offset + u64::from(b.len))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Where a section lives, or `None` if this segment does not carry it.
+    #[must_use]
+    pub fn section(&self, section: Section) -> Option<std::ops::Range<u64>> {
+        self.sections.get(&(section as u16)).cloned()
+    }
+
+    /// Fetches a whole section.
+    ///
+    /// One ranged read. The caller decides *which* section, which is how a rung-0 scan
+    /// avoids the full-precision bytes entirely rather than fetching and discarding them.
+    pub async fn fetch_section<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        section: Section,
+    ) -> Result<Option<Bytes>, FormatError> {
+        let Some(span) = self.section(section) else {
+            return Ok(None);
+        };
+        Ok(Some(store.get_range(key, span).await?))
+    }
+
+    /// Bytes per row in the vectors section, or 0 if there is none.
+    fn vector_row_len(&self) -> usize {
+        match (self.section(Section::Vectors), self.rows) {
+            (Some(span), rows) if rows > 0 => (span.end - span.start) as usize / rows as usize,
+            _ => 0,
+        }
+    }
+
+    /// The full-precision vectors, one row at a time.
+    ///
+    /// Width is derived by dividing the section by the row count, so the format needs no
+    /// separate dimension field and cannot disagree with itself about one.
+    pub async fn vectors<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+    ) -> Result<Vec<Vec<f32>>, FormatError> {
+        let Some(raw) = self.fetch_section(store, key, Section::Vectors).await? else {
+            return Ok(Vec::new());
+        };
+        if self.rows == 0 {
+            return Ok(Vec::new());
+        }
+        let per_row = raw.len() / self.rows as usize;
+        Ok(raw
+            .chunks_exact(per_row.max(1))
+            .map(|row| {
+                row.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                    .collect()
+            })
+            .collect())
     }
 
     fn decode_index(bytes: &[u8]) -> Result<Vec<BlockMeta>, FormatError> {
@@ -150,11 +255,49 @@ impl Segment {
             .filter_map(|i| self.blocks.get(*i))
             .map(|b| b.offset..b.offset + u64::from(b.len))
             .collect();
-        let bufs = store.get_ranges(key, &ranges).await?;
+        // Row indices, so a decoded row can find its own vector. Blocks are contiguous and
+        // in order, so the base is the sum of the rows before this block.
+        let mut base: Vec<usize> = Vec::with_capacity(self.blocks.len());
+        let mut running = 0usize;
+        for b in &self.blocks {
+            base.push(running);
+            running += b.rows as usize;
+        }
+
+        // ⚠️ Only the vector rows belonging to the blocks being read, not the whole
+        // section. Fetching all of it would undo zone-map pruning in bytes while leaving it
+        // intact in block count -- the plan would still say "one block" and the wire would
+        // still carry the entire segment's vectors.
+        let per_row = self.vector_row_len();
+        let mut all: Vec<std::ops::Range<u64>> = ranges;
+        let block_count = all.len();
+        if let (Some(vec_span), true) = (self.section(Section::Vectors), per_row > 0) {
+            for i in &wanted {
+                let (Some(start), Some(b)) = (base.get(*i), self.blocks.get(*i)) else {
+                    continue;
+                };
+                let lo = vec_span.start + (*start * per_row) as u64;
+                all.push(lo..lo + (b.rows as usize * per_row) as u64);
+            }
+        }
+        // ⚠️ One call, so blocks and vector rows go out TOGETHER. They are different
+        // sections of the same object, both spans are known before either is issued, and
+        // awaiting one before the other would make every scan a two-hop read for no reason
+        // a caller could see. Width is free; depth is not.
+        let bufs = store.get_ranges(key, &all).await?;
 
         let mut out = Vec::new();
-        for buf in &bufs {
-            for doc in Self::decode_block(buf)? {
+        for (n, _) in wanted.iter().enumerate() {
+            let Some(buf) = bufs.get(n) else { continue };
+            let rows = Self::decode_block(buf)?;
+            let vecs = bufs.get(block_count + n);
+            for (r, mut doc) in rows.into_iter().enumerate() {
+                if let Some(raw) = vecs.and_then(|v| v.get(r * per_row..(r + 1) * per_row)) {
+                    doc.vector = raw
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                        .collect();
+                }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);
                 }
@@ -208,11 +351,8 @@ impl Segment {
         Ok(scored)
     }
 
-    /// ⚠️ Delegates rather than duplicating. This was a second decoder for the same wire
-    /// format, byte-identical to `decode_docs` — which means every future change to the
-    /// document encoding had to be made twice, and the day one of them was missed the
-    /// reader and the writer would disagree with no compiler to say so.
+    /// Decodes one block's rows. Vectors arrive separately, from their own section.
     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
-        crate::decode_docs(buf)
+        crate::decode_rows(buf)
     }
 }

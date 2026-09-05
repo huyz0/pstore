@@ -110,6 +110,18 @@ impl Code {
     pub fn alignment(&self) -> f32 {
         self.alignment
     }
+
+    /// Appends this code's wire form: sign bits, then the alignment.
+    ///
+    /// ⚠️ The alignment travels **with** the bits. It is measured per vector at encode time
+    /// and the estimate is meaningless without it, so a section holding bits alone would be
+    /// a section of unusable codes — and would look fine, because the bits would decode.
+    /// Four bytes a vector, which is why the 1-bit tier is 22x smaller than float32 rather
+    /// than the 24x the bit count alone suggests.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bits);
+        out.extend_from_slice(&self.alignment.to_le_bytes());
+    }
 }
 
 /// A query, rotated once and ready to score against many codes.
@@ -145,6 +157,31 @@ impl Quantizer {
             })
             .collect();
         Self { dim, padded, flips }
+    }
+
+    /// Bytes one code occupies on the wire: sign bits plus the alignment.
+    #[must_use]
+    pub fn code_len(&self) -> usize {
+        self.padded.div_ceil(8) + 4
+    }
+
+    /// Reads a code back from [`Code::write_to`]'s form.
+    ///
+    /// Returns `None` for a wrong-length record rather than decoding a shifted one: a
+    /// fixed-width section read at the wrong stride yields plausible bits and silently wrong
+    /// answers, which is the failure this shape exists to make impossible.
+    #[must_use]
+    pub fn read_code(&self, raw: &[u8]) -> Option<Code> {
+        if raw.len() != self.code_len() {
+            return None;
+        }
+        let split = self.padded.div_ceil(8);
+        let (bits, tail) = raw.split_at_checked(split)?;
+        Some(Code {
+            bits: bits.to_vec(),
+            alignment: f32::from_le_bytes(tail.get(..4)?.try_into().ok()?),
+            dim: self.dim,
+        })
     }
 
     /// The dimension this quantizer encodes.

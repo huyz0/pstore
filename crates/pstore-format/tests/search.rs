@@ -33,7 +33,18 @@ async fn zone_maps_skip_blocks_that_cannot_match() {
     let t = TenantId(1);
     let v = s.as_tenant(t);
     let key = Key::new("seg");
-    v.put(&key, build(400, 10)).await.unwrap();
+    // ⚠️ 128-dimensional vectors, so the segment is ~800 KB rather than 21 KB. On a small
+    // segment the 64 KiB coalescing gap merges the wanted block with its vector rows and
+    // drags in everything between them -- which is the RIGHT trade for a 21 KB object and
+    // makes pruning unmeasurable. A fixture too small to show the behaviour under test is
+    // not a cheap test, it is a test of something else.
+    let mut w = SegmentWriter::new(10);
+    for i in 0..400 {
+        let mut d = Document::new(format!("d{i}"), vec![i as f32; 128]);
+        d.attrs.insert("n".to_owned(), Value::Int(i as i64));
+        w.push(d);
+    }
+    v.put(&key, w.finish()).await.unwrap();
     let seg = Segment::open(&v, &key).await.unwrap();
     assert_eq!(seg.block_count(), 40);
 
@@ -43,14 +54,41 @@ async fn zone_maps_skip_blocks_that_cannot_match() {
     assert_eq!(seg.blocks_to_read(None).len(), 40);
 
     // ...and the saving is real, not just planned.
-    let before = s.count(t, OpClass::Read);
+    //
+    // ⚠️ Asserted in BYTES, not in request count. A request count here is scale-dependent
+    // in a way the assertion cannot state: this fixture is a few kilobytes, so the block
+    // span and the vector rows fall inside the 64 KiB coalescing gap and arrive as one
+    // fetch. At any real size they are two — still one round, since they are issued
+    // together, but two requests. Pinning the count would make this test pass or fail on
+    // the fixture's size rather than on whether pruning works, which is exactly how the M1
+    // depth invariant came to hold only at 500 rows.
+    let (b0, r0) = (s.bytes(t, OpClass::Read), s.count(t, OpClass::Read));
     let got = seg
         .scan(&v, &key, Some(&Filter::Eq("n".to_owned(), Value::Int(55))))
         .await
         .unwrap();
-    assert_eq!(s.count(t, OpClass::Read) - before, 1, "one coalesced round");
+    let (narrow_bytes, narrow_reqs) = (
+        s.bytes(t, OpClass::Read) - b0,
+        s.count(t, OpClass::Read) - r0,
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].id, "d55");
+
+    let b1 = s.bytes(t, OpClass::Read);
+    seg.scan(&v, &key, None).await.unwrap();
+    let wide_bytes = s.bytes(t, OpClass::Read) - b1;
+    // ⚠️ Not 40x, and it should not be. Pruning selects 1 block of 40, but the block and
+    // its vector rows sit ~32 KB apart and the coalescing gap is 64 KiB, so the hole
+    // between them is fetched deliberately -- transferring it costs less than a second
+    // request, which is exactly the G* trade `coalesce` exists to make. Asserting a
+    // near-perfect saving here would be asserting that coalescing is off.
+    assert!(
+        narrow_bytes * 3 < wide_bytes,
+        "pruning to 1 block of 40 moved {narrow_bytes} bytes against {wide_bytes} unfiltered: \
+         the plan pruned but the wire did not"
+    );
+    // Width, not depth: however many spans, they go out in one call.
+    assert!(narrow_reqs <= 2, "{narrow_reqs} requests for one block");
 }
 
 #[tokio::test]
