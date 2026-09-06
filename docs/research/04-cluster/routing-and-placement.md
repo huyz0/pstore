@@ -152,3 +152,34 @@ a compromise; it is the whole architecture.
 - [Rendezvous hashing — Wikipedia](https://en.wikipedia.org/wiki/Rendezvous_hashing)
 - [Maglev: A Fast and Reliable Software Network Load Balancer — Google Research](https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/)
 - [Architecture — WarpStream docs](https://docs.warpstream.com/warpstream/overview/architecture)
+
+
+## C-6 — C must grow with N, and the balance figure is not reproduced (M4a)
+
+**Measured** by `cargo run --release -p pstore-cluster --example placement_report`. R=3,
+100,000 keys. ⚠️ `provisional`: a simulation of a pure function on WSL2 — but the function
+*is* the implementation, so what it cannot show is disagreement between nodes, not the
+numbers themselves.
+
+| N | max/mean, C fixed at 32 | max/mean, C = 3·√N |
+|---|---|---|
+| 100 | 1.208 | 1.208 (same: √100·3 = 30 < 32) |
+| 500 | 1.733 | 1.533 |
+| 2000 | **1.811** | **1.380** |
+
+**Two corrections.**
+
+1. ⚠️ **"C ≈ 32" is stated as a constant and cannot be one.** A fixed window covers an
+   ever-smaller slice of an ever-more-variable ring, so balance *degrades* with fleet size —
+   1.21× at N=100 but 1.81× at N=2000, and the design targets 10,000. Growing the window as
+   `3·√N` holds it near 1.4× at `O(√N)` work per placement, still far below plain
+   rendezvous's `O(N)`. The implementation does this; the decision above does not say to.
+2. ⚠️ **"Max load within 10–15% of average" is not reproduced at any N tried** — the best
+   measured is 1.208× (20.8% over) at N=100, and it is worse either side. The figure is
+   quoted from the LRH literature; whatever conditions produce it are not the ones here.
+   Anything that sized a fleet from 10–15% headroom should be re-derived from 40%.
+
+**Churn is unaffected** and matches the literature: a bulk fleet change moves 1.21–1.34× the
+theoretical minimum, and the minimum is what the changed nodes must own. ⚠️ Churn is large
+and **nothing is copied** — the two are different quantities, and an early draft of the M4a
+spec conflated them into a bound *below* the arithmetic floor.

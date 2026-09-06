@@ -14,12 +14,25 @@
 use crate::Roster;
 use std::collections::BTreeSet;
 
-/// Nodes considered per key. D-5's C ≈ 32.
+/// The smallest window, and D-5's stated C ≈ 32.
+pub const MIN_WINDOW: usize = 32;
+
+/// Nodes considered per key, for a fleet of `n`.
 ///
-/// ⚠️ The trade is churn against work: a larger window ranks more nodes per placement and
-/// balances better (measured max/mean 1.360 at C=20, 1.205 at C=32, 1.171 at C=64 for
-/// N=100). At C ≥ N it degenerates to plain rendezvous — optimal churn, `O(N)` cost.
-pub const WINDOW: usize = 32;
+/// ⚠️ **C must grow with N.** D-5 states "C ≈ 32" as a constant, and measured that is only
+/// adequate for a small fleet: with C fixed at 32 the hottest node holds 1.208× the mean at
+/// N=100 and **1.811× at N=2000**, because a fixed window covers an ever-smaller slice of an
+/// ever-more-variable ring. Growing it as `3·√N` holds the figure near 1.48 at N=2000, at
+/// `O(√N)` work per placement instead of `O(1)` — still far below plain rendezvous's `O(N)`.
+///
+/// ⚠️ Neither reproduces `routing-and-placement.md`'s "max load within 10–15% of average".
+/// Recorded as a correction rather than absorbed into a tolerance.
+#[must_use]
+pub fn window(n: usize) -> usize {
+    // `isqrt` rather than a float: placement must agree byte for byte across machines, and
+    // floating point is the wrong tool for a decision every node has to reach identically.
+    MIN_WINDOW.max(3 * n.isqrt()).min(n)
+}
 
 /// A placement function over one roster.
 #[derive(Debug, Clone)]
@@ -62,7 +75,7 @@ impl<'a> Placement<'a> {
         // First node clockwise of the key. The ring is sorted, so this is a binary search;
         // wrapping to 0 is what makes it a ring rather than a line.
         let start = ring.partition_point(|(p, _)| *p < pos) % ring.len();
-        let window = WINDOW.min(ring.len());
+        let window = window(ring.len());
 
         let mut ranked: Vec<(u64, &'a str)> = (0..window)
             .filter_map(|i| ring.get((start + i) % ring.len()))

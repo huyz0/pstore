@@ -226,3 +226,48 @@ fn a_small_fleet_places_on_everyone_it_has() {
     assert_ne!(got[0], got[1], "a node was repeated to pad the list");
     assert!(Placement::new(&nodes(0)).place("k", R).is_empty());
 }
+
+#[test]
+fn balance_holds_as_the_fleet_grows() {
+    // ⚠️ The correction to D-5. A window fixed at C=32 covers an ever-smaller slice of an
+    // ever-more-variable ring, so balance DEGRADES with fleet size: measured 1.208x at
+    // N=100 and 1.811x at N=2000. Growing the window as 3*sqrt(N) holds it. Without this
+    // test the constant looks fine, because it is fine at the only size anyone tests.
+    // ⚠️ 100,000 keys, the sample the bounds were measured over. At 20,000 the noise alone
+    // put N=100 at 1.253 against a 1.25 bound — a threshold compared against a different
+    // sample size is a threshold compared against a different quantity. N=2000 lives in
+    // `examples/placement_report.rs`, in release, for the same reason gate-scale recall does.
+    for (n, bound) in [(100usize, 1.25f64), (500, 1.60)] {
+        let r = nodes(n);
+        let p = Placement::new(&r);
+        let mut load: BTreeMap<&str, usize> = BTreeMap::new();
+        for k in big_keys() {
+            for id in p.place(&k, R) {
+                *load.entry(id).or_default() += 1;
+            }
+        }
+        let mean = (BIG_KEYS * R) as f64 / n as f64;
+        let max = *load.values().max().unwrap() as f64;
+        assert!(
+            max / mean <= bound,
+            "N={n}: hottest node holds {:.3}x the mean, over {bound}",
+            max / mean
+        );
+        assert_eq!(load.len(), n, "N={n}: some node received nothing");
+    }
+}
+
+#[test]
+fn the_window_grows_with_the_fleet_but_never_exceeds_it() {
+    use pstore_cluster::placement::{MIN_WINDOW, window};
+    assert_eq!(window(10), 10, "a window cannot exceed the fleet");
+    assert_eq!(window(100), MIN_WINDOW, "small fleets keep D-5's stated C");
+    assert!(
+        window(2000) > MIN_WINDOW,
+        "the window did not grow with the fleet"
+    );
+    assert!(
+        window(10_000) < 10_000,
+        "the window grew to the whole fleet"
+    );
+}
