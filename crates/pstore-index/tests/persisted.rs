@@ -546,3 +546,54 @@ async fn a_rerank_rung_reads_only_the_rows_it_scores() {
     );
     assert!(read > 0, "exact rerank read no full-precision bytes at all");
 }
+
+#[tokio::test]
+async fn a_query_names_the_field_it_searches() {
+    // ⚠️ M3b.4. With named fields, "search this index" is ambiguous — a document may carry a
+    // body embedding and a title embedding of different dimensions. A query that does not
+    // name its field either guesses or searches whichever happens to be first, and both are
+    // wrong answers rather than errors.
+    let s = MemoryStore::new();
+    let docs: Vec<Document> = (0..TEST_THRESHOLD + 400)
+        .map(|i| {
+            let base = corpus(1, 1, i as u64 + 1)[0].clone();
+            Document {
+                id: format!("d{i}"),
+                vectors: std::collections::BTreeMap::from([(
+                    "body".to_owned(),
+                    pstore_format::VectorField::dense(base.vector().to_vec()),
+                )]),
+                attrs: Default::default(),
+            }
+        })
+        .collect();
+    let built = vec_index::build_field(&docs, params(), "body");
+    s.put(&Key::new(SEG), built.segment.clone()).await.unwrap();
+    s.put(
+        &Key::new(CEN),
+        bytes::Bytes::from(built.centroids.as_ref().unwrap().encode()),
+    )
+    .await
+    .unwrap();
+
+    let idx = VecIndex::open(&s, &Key::new(SEG), &Key::new(CEN), DIM)
+        .await
+        .unwrap();
+    let q = &docs[9].field("body")[0];
+
+    // The field the index was built for answers.
+    let hits = idx
+        .search_field(&s, &Key::new(SEG), "body", q, Query::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10);
+
+    // A field the segment does not carry is an error, not an empty result: a caller cannot
+    // otherwise tell a typo from a legitimately unpopulated field.
+    assert!(
+        idx.search_field(&s, &Key::new(SEG), "title", q, Query::default())
+            .await
+            .is_err(),
+        "searching an absent field returned a result set"
+    );
+}

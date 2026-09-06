@@ -168,13 +168,29 @@ pub struct Built {
 /// exists, and there is no second code path that could disagree with the first.
 #[must_use]
 pub fn build(docs: &[Document], params: Params) -> Built {
-    let dim = docs.first().map_or(0, |d| d.vector().len());
+    build_field(docs, params, pstore_format::DEFAULT_FIELD)
+}
+
+/// Builds a segment and index over one **named** vector field.
+///
+/// ⚠️ The field is a parameter rather than an assumption. A document may carry a body
+/// embedding and a title embedding of different dimensions, so "build the index" is not a
+/// well-formed instruction without saying which.
+#[must_use]
+pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
+    let dim = docs
+        .iter()
+        .find_map(|d| d.field(field).first().map(Vec::len))
+        .unwrap_or(0);
     let quantizer = Quantizer::new(dim.max(1));
 
     let (order, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
         ((0..docs.len()).collect::<Vec<_>>(), None)
     } else {
-        let corpus: Vec<Vec<f32>> = docs.iter().map(|d| d.vector().to_vec()).collect();
+        let corpus: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| d.field(field).first().cloned().unwrap_or_default())
+            .collect();
         let c = Clustering::build(&corpus, params);
         // ⚠️ Rows are written in LIST order, so a posting list is one contiguous byte range
         // and a probe is one ranged read rather than a scatter of thousands.
@@ -218,10 +234,23 @@ pub fn build(docs: &[Document], params: Params) -> Built {
                 .as_ref()
                 .and_then(|c| c.vectors.get(*home.get(*row).unwrap_or(&usize::MAX)))
                 .unwrap_or(&zero);
-            if let Ok(code) = quantizer.encode_residual(d.vector(), cen) {
-                code.write_to(&mut rabitq);
+            // ⚠️ Zero-filled when the document lacks this field, never skipped. Codes are
+            // fixed width per row, so a skipped row shifts every later one — and the
+            // previous version silently swallowed the resulting dimension error with
+            // `if let Ok`, producing a segment whose code section was EMPTY and an index
+            // that returned nothing at all.
+            let v = d
+                .field(field)
+                .first()
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; dim]);
+            match quantizer.encode_residual(&v, cen) {
+                Ok(code) => code.write_to(&mut rabitq),
+                // Unreachable: `v` is `dim` long by construction. Filled rather than
+                // skipped so the row stride stays right even if that ever stops holding.
+                Err(_) => rabitq.extend(std::iter::repeat_n(0u8, quantizer.code_len())),
             }
-            sq8::write_to(&sq8::encode(d.vector()), &mut eights);
+            sq8::write_to(&sq8::encode(&v), &mut eights);
         }
     }
     Built {
@@ -284,6 +313,29 @@ impl VecIndex {
     }
 
     /// Nearest neighbours. **One further round trip**, whatever `p` is.
+    /// Nearest neighbours in a **named** field.
+    ///
+    /// An absent field is an error: a miss returning zero hits is indistinguishable from a
+    /// field with no matches, so a caller could not tell a typo from data.
+    pub async fn search_field<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        field: &str,
+        query: &[f32],
+        q: Query,
+    ) -> Result<Vec<(usize, f32)>, pstore_format::FormatError> {
+        if self.segment.field_layout(field).is_none() {
+            return Err(pstore_format::FormatError::UnknownField);
+        }
+        self.search(store, key, query, q).await
+    }
+
+    /// Nearest neighbours in the index's own field. **One further round trip**, whatever
+    /// `p` is.
+    ///
+    /// Prefer [`Self::search_field`], which names the field and errors on a miss; this is
+    /// the single-field convenience it is built on.
     pub async fn search<S: BlobStore>(
         &self,
         store: &S,
