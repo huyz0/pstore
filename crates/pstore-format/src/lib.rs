@@ -93,6 +93,40 @@ pub enum Value {
     Str(String),
 }
 
+/// Whether a document is one this format version can store faithfully.
+///
+/// ⚠️ Exists so the refusal can happen where documents **enter** rather than where segments
+/// are sealed. A write acknowledged and then found unstorable at fold time is a write the
+/// caller believes is durable and which will never appear.
+pub fn check_storable(d: &Document) -> Result<(), FormatError> {
+    if d.vectors.len() > 1 {
+        return Err(FormatError::Unsupported(
+            "several vector fields are not stored yet (M3b.3)",
+        ));
+    }
+    for (name, field) in &d.vectors {
+        match field {
+            VectorField::Sparse(_) => {
+                return Err(FormatError::Unsupported(
+                    "sparse vector fields are not stored yet (M5a)",
+                ));
+            }
+            VectorField::Dense(v) if v.len() > 1 => {
+                return Err(FormatError::Unsupported(
+                    "a field with several vectors per document is not stored yet (M3b.3)",
+                ));
+            }
+            VectorField::Dense(_) if name != DEFAULT_FIELD => {
+                return Err(FormatError::Unsupported(
+                    "named vector fields are not stored yet (M3b.3)",
+                ));
+            }
+            VectorField::Dense(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// A sparse posting's weight.
 ///
 /// ⚠️ **Opaque on purpose.** D-72 makes the impact *encoding* the configurable part — u8,
@@ -266,6 +300,13 @@ pub enum FormatError {
     /// Something was structurally wrong.
     #[error("segment corrupt: {0}")]
     Corrupt(&'static str),
+    /// A document shape the model can express but this format version cannot store.
+    ///
+    /// ⚠️ Refusal rather than truncation. The model gained named, plural and sparse fields
+    /// before the layout did, and in between the writer stored such documents as *nothing* —
+    /// silently. A caller cannot recover from a loss it is not told about.
+    #[error("cannot store this document: {0}")]
+    Unsupported(&'static str),
     /// Written by a version this build does not understand.
     #[error("unsupported segment version {0}")]
     UnsupportedVersion(u16),

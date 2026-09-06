@@ -200,6 +200,14 @@ impl<S: BlobStore> Engine<S> {
 
     /// Buffers documents. **Visible immediately**; durable at the next [`Self::flush`].
     pub async fn write(&self, index: &str, docs: Vec<Document>) -> Result<(), EngineError> {
+        // ⚠️ Refused at the DOOR, not at the fold. The document model expresses named,
+        // plural and sparse fields; the segment layout stores one dense vector until M3b.3.
+        // Accepting a document here and discovering at fold time that it cannot be stored
+        // means acknowledging a write that will never be visible — and before this check
+        // existed, such a document was written as *nothing*, silently.
+        for d in &docs {
+            pstore_format::check_storable(d).map_err(|e| EngineError::Format(e.to_string()))?;
+        }
         self.mem()
             .pending
             .entry(index.to_owned())

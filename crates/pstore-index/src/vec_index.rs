@@ -225,6 +225,12 @@ pub fn build(docs: &[Document], params: Params) -> Built {
         }
     }
     Built {
+        // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
+        // document through `d.vector()`, so anything the format cannot store was lost
+        // before this point. Refusing here would report the right error at the wrong layer.
+        // The refusal belongs where documents ENTER — `Engine::write` — and until M3b.3 the
+        // check lives in `SegmentWriter::try_finish` for callers that construct segments
+        // directly.
         segment: w
             .with_section(Section::RaBitQ, rabitq)
             .with_section(Section::Sq8, eights)

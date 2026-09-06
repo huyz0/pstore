@@ -1,7 +1,7 @@
 //! Building a segment.
 
 use crate::codec::{Enc, checksum};
-use crate::{BlockMeta, Document, FOOTER_LEN, MAGIC, Section, VERSION, Value};
+use crate::{BlockMeta, Document, FOOTER_LEN, FormatError, MAGIC, Section, VERSION, Value};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
@@ -151,9 +151,31 @@ impl SegmentWriter {
         idx
     }
 
+    /// Seals the last block and emits the segment, or reports what it cannot store.
+    ///
+    /// ⚠️ **Refusal, not truncation.** The document model expresses named, plural and sparse
+    /// fields (M3b.1); the segment layout stores one dense vector in
+    /// [`crate::DEFAULT_FIELD`] until M3b.3. In between, a document the format cannot hold
+    /// must fail loudly — silently writing it as nothing is what this actually did when the
+    /// model landed first, and a caller cannot recover from a loss it is not told about.
+    pub fn try_finish(self) -> Result<Bytes, FormatError> {
+        for d in &self.docs {
+            crate::check_storable(d)?;
+        }
+        Ok(self.finish_unchecked())
+    }
+
     /// Seals the last block and emits the segment.
+    ///
+    /// ⚠️ Panics-free but **lossy** for anything [`Self::try_finish`] would refuse. Kept for
+    /// callers that have already constructed only storable documents; new code should use
+    /// `try_finish`.
     #[must_use]
-    pub fn finish(mut self) -> Bytes {
+    pub fn finish(self) -> Bytes {
+        self.finish_unchecked()
+    }
+
+    fn finish_unchecked(mut self) -> Bytes {
         let docs = std::mem::take(&mut self.docs);
         // ⚠️ Grow the block size until the index fits the budget, rather than trusting the
         // caller's request. Doubling terminates: at one block the index is a handful of
