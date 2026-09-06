@@ -62,13 +62,13 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 |---|---|---|
 | Exact-scan threshold | **25,000 vectors** | Below D-10's ~50k–200k range, which is stated for 128d; higher dimensions scan more bytes per vector. Evidence for OQ-36. |
 | Gate dataset | **250,000 × 384d** | 10× the threshold, so the gate cannot silently measure brute force. 384d is a real embedding width (bge-small, Matryoshka-truncated) inside D-11's target family — **not** 128d, which `vector-index-survey.md` names as SPANN's weak spot. |
-| Default `p` | **16** posting lists | Mid-range of the corpus's 8–64. Measured: recall is flat from p=8 upward on clustered data, so 16 is headroom, not a tuned figure. |
+| Default `p` | **8** posting lists | ⚠️ **Corrected from 16 by measurement.** Recall is flat from p=4 (0.980 / 0.981 / 0.981 at p = 4 / 8 / 16) while bytes are linear (0.48 / 0.84 / 1.60 MB): 16 was 3.3× over-provisioned. 8 rather than 4 because the corpus is a Gaussian mixture, the case clustering handles best, and taking the exact minimum that works there fits the default to the generator. |
 | Default oversample | **32×** | ⚠️ **Corrected from 8 by measurement.** 8 gives recall 0.801, 32 gives 0.981. Oversample costs **no bytes and no round trips** at rung 0 — every candidate was already scored from lists the query fetched anyway — so "mid-range of 4–32" was leaving recall on the table for nothing. |
 | Posting list target | **4,000** vectors | `vector-index-survey.md` sizing; ≈192 KB of 1-bit codes at 384d. |
 | Recall floor | **recall@10 ≥ 0.90** | The low end of the roadmap's 90–95%. |
 | Default rerank mode | **`fast`** (int8) | ⚠️ **Corrected from `none`.** D-11 claims rung 0 alone reaches 90–95%; measured it reaches **0.30**. `fast` reaches 0.981 **in the same three round trips**, because the `sq8` ranges for the probed lists are known at the same moment as the `rabitq` ranges. Recorded as [C-3](../../research/06-indexing/quantization.md). |
 | Posting list target | **200** vectors at gate scale | ⚠️ Corrected from 4,000. `vector-index-survey.md` sizes lists for a 1B-vector index; at 20,000 vectors a 4,000-row list means five lists and `p` stops meaning anything — measured recall was identical at p=8, 16 and 32 because eight lists already held the whole neighbourhood. |
-| Byte ceiling | **≤8 MB fetched per query** at the defaults | Measured **0.23 MB** for the 1-bit codes plus ~1.2 MB for the int8 ranges. The ceiling binds against probing everything, which is ~12 MB. |
+| Byte ceiling | **≤8 MB fetched per query** at the defaults | Measured **0.84 MB** at p=8 (`fast`), against 1.60 MB at the old p=16. |
 | Augmentation margin | **≥5 points of recall@10 at `p` = 2** | Boundary augmentation only shows up at small `p`; a margin chosen after measuring is not a criterion. |
 | Balance bound | no list > **4× the mean** | On a dataset with 10:1 density skew. |
 | Bound confidence | **δ = 1e-3**, 384d, fixed seed | RaBitQ's bound is probabilistic; asserted on the empirical failure rate over ≥10,000 pairs, not per-pair. |

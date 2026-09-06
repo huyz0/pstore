@@ -154,6 +154,50 @@ impl Segment {
         }
     }
 
+    /// The full-precision vectors for **specific rows**.
+    ///
+    /// ⚠️ The rerank path's fetch, and the reason it is not [`Self::vectors`]: rung 2 scores
+    /// a few hundred survivors, and reading the whole section to reach them costs the
+    /// segment's entire bandwidth for a query that looks at a fraction of a percent of it.
+    /// Rows are fixed-width, so each is a computable range and the coalescer decides which
+    /// of the holes between them are cheaper to fetch than to skip.
+    pub async fn vector_rows<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        rows: &[usize],
+    ) -> Result<BTreeMap<usize, Vec<f32>>, FormatError> {
+        let per_row = self.vector_row_len();
+        let Some(span) = self.section(Section::Vectors) else {
+            return Ok(BTreeMap::new());
+        };
+        if per_row == 0 || rows.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut wanted: Vec<usize> = rows.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let ranges: Vec<std::ops::Range<u64>> = wanted
+            .iter()
+            .map(|r| {
+                let lo = span.start + (*r * per_row) as u64;
+                lo..lo + per_row as u64
+            })
+            .collect();
+        let bufs = store.get_ranges(key, &ranges).await?;
+        Ok(wanted
+            .into_iter()
+            .zip(bufs)
+            .map(|(row, raw)| {
+                let v = raw
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                    .collect();
+                (row, v)
+            })
+            .collect())
+    }
+
     /// The full-precision vectors, one row at a time.
     ///
     /// Width is derived by dividing the section by the row count, so the format needs no

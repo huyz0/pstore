@@ -139,7 +139,7 @@ If you read nothing else:
 |---|---|---|
 | [evaluation-methodology.md](10-benchmarks-cost/evaluation-methodology.md) | Q30 | Never report latency without cache state. QPS and recall are one number, not two. Recall and round-trip depth are CI gates. |
 | **[tenancy-scale-model.md](10-benchmarks-cost/tenancy-scale-model.md)** | Q33 | **1M tenants × 50 indexes, 90% idle.** Naive per-index flushing costs $1.3M–$65M/month. Three fixes: fan writes *in* to `W = bytes/s × T / B` nodes; make the **tenant** the CAS unit (50×); co-locate small tenants' reads. Write path lands at ~$14k/month. |
-| [cost-model.md](10-benchmarks-cost/cost-model.md) | Q31 | At 100M docs: storage $8/mo, writes $1/mo, queries $780/mo, **compute $8,760/mo (92%)**. This is a compute-efficiency business. Idle tenants are free. |
+| [cost-model.md](10-benchmarks-cost/cost-model.md) | Q31 | At 100M docs: storage $8/mo, writes $1/mo, queries $780/mo, **compute $8,760/mo (92%)**. This is a compute-efficiency business. Idle tenants are free. | **⚠️ M3 adds measured bytes/query: the scan is the int8 tier's, ~6× a 1-bit-only estimate.**
 
 ## 11 — Design synthesis
 | Doc | Answers | Status |

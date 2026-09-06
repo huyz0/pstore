@@ -79,6 +79,39 @@ deployment — this is a real knob, not a hand-wave.
 > purely on scan size — a 75× swing. See
 > [`../09-rust-stack/cpu-management.md`](../09-rust-stack/cpu-management.md) §1. Quote node
 > counts against a stated scan size or not at all.
+
+## Measured bytes per query (M3)
+
+The scan size the paragraph above says every QPS/node number must be stated against.
+Measured by `scripts/recall.sh` on 20,000 × 384d clustered synthetic, 100 posting lists,
+k=10, oversample=32. ⚠️ `provisional`: WSL2, synthetic corpus, and three orders of magnitude
+below the 100M this model prices.
+
+| `p` | candidates | `none` (3 rt) | `fast` (3 rt) | `exact` (4 rt) |
+|---|---|---|---|---|
+| 4 | 1,043 | 0.309 / 0.08 MB | 0.980 / **0.48 MB** | 0.998 / 0.57 MB |
+| 8 | 1,813 | 0.309 / 0.13 MB | 0.981 / **0.84 MB** | 0.999 / 0.62 MB |
+| 16 | 3,440 | 0.309 / 0.25 MB | 0.981 / 1.60 MB | 0.999 / 0.74 MB |
+
+**Three things this changes.**
+
+1. ⚠️ **The scan is the int8 tier's, not the 1-bit tier's.** [C-3](../06-indexing/quantization.md)
+   found rung 0 alone answers at 0.31, so the ladder's first two rungs both run on every
+   query. Any figure derived from 1-bit codes alone understates bytes per query by ~6×.
+   `fast` must fetch int8 for every *candidate*, not just the survivors, because the ranges
+   have to be chosen before rung 0 has ranked if it is to stay inside the same round trip.
+2. **`exact` is cheaper in bytes than `fast` above p≈8**, because it reads float32 for the
+   ~320 survivors rather than int8 for thousands of candidates. It buys 1.8 points of recall
+   and costs one round trip. That inverts the usual intuition and is worth knowing before
+   anyone prices the ladder from its name.
+3. **`p` was the expensive default.** Recall is flat from p=4 while bytes are linear in `p`,
+   so the M3 default of 16 — taken as the mid-range of a range stated for a *billion*-vector
+   index — was 3.3× over-provisioned. Now 8.
+
+⚠️ **Not derived here: QPS/node.** That needs measured bytes-scanned-per-second on real
+instance types (OQ-111), which WSL2 cannot provide. This supplies the *other* half of the
+input OQ-75 has been blocked on; multiplying it by a guessed bandwidth would produce exactly
+the unqualified QPS number this document forbids.
 `~6 × $2/hr × 730 = ~$8,760/month`.
 
 ### Totals

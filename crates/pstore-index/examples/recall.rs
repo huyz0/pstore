@@ -277,16 +277,60 @@ fn main() {
         Corpus::uniform(10_000, dim, 2),
     ] {
         let idx = build(&c, params);
+        // ⚠️ Swept over `p` at the gate, not just reported at one value. `p` is the only
+        // knob that drives BOTH recall and bytes, so a default picked without seeing the
+        // curve is a default picked from the corpus's range rather than from this index.
+        for probe in [4usize, 8, 16] {
+            let (r_none, cands) = measure(&c, &idx, 10, probe, 32, Rerank::None);
+            let (r_fast, _) = measure(&c, &idx, 10, probe, 32, Rerank::Int8);
+            let (r_exact, _) = measure(&c, &idx, 10, probe, 32, Rerank::Exact);
+            let survivors = (10 * 32) as f64;
+            let rung0 = cands * (dim.next_power_of_two() / 8 + 8) as f64;
+            println!(
+                "  p={probe:<3} cands={cands:<6.0} none={r_none:.4}/{:.2}MB  \
+                 fast={r_fast:.4}/{:.2}MB  exact={r_exact:.4}/{:.2}MB",
+                rung0 / 1e6,
+                (rung0 + cands * (dim + 8) as f64) / 1e6,
+                (rung0 + survivors * (dim * 4) as f64) / 1e6
+            );
+        }
         let (recall, cands) = measure(&c, &idx, 10, 16, 32, Rerank::Int8);
         let lists = idx.clustering.lists().len();
-        let bytes = cands * (dim.next_power_of_two() / 8 + 8) as f64;
+        // ⚠️ Bytes per query, per rerank mode, because that is the cost model's dominant
+        // input: `cost-model.md` prices a node on *vectors scanned per second*, and QPS/node
+        // swings 75x with scan size. A recall number without it is half a measurement.
+        //
+        //   rung 0  : every candidate's 1-bit code + its two scalars
+        //   fast    : + int8 for every CANDIDATE, because the ranges must be chosen before
+        //             rung 0 has ranked if it is to stay in the same round trip
+        //   exact   : + float32 for the SURVIVORS only, in a fourth round
+        let survivors = (10 * 32) as f64;
+        let rung0 = cands * (dim.next_power_of_two() / 8 + 8) as f64;
+        let fast = rung0 + cands * (dim + 8) as f64;
+        let exact = rung0 + survivors * (dim * 4) as f64;
         println!(
-            "{:>10}  n={:<7} dim={dim}  lists={lists:<4} p=16 over=32  \
-             recall@10={recall:.4}  cands={cands:.0}  rung0_bytes={:.2} MB",
+            "{:>10}  n={:<7} dim={dim}  lists={lists:<4} p=16 over=32  cands={cands:.0}",
             c.name,
-            c.vectors.len(),
-            bytes / 1e6
+            c.vectors.len()
         );
+        for (mode, r, mb) in [
+            (
+                "none  (3rt)",
+                measure(&c, &idx, 10, 16, 32, Rerank::None).0,
+                rung0,
+            ),
+            ("fast  (3rt)", recall, fast),
+            (
+                "exact (4rt)",
+                measure(&c, &idx, 10, 16, 32, Rerank::Exact).0,
+                exact,
+            ),
+        ] {
+            println!(
+                "             {mode}  recall@10={r:.4}  bytes/query={:.2} MB",
+                mb / 1e6
+            );
+        }
         if c.name == "clustered" && recall < FLOOR {
             eprintln!("FAIL recall@10 {recall:.4} is under the {FLOOR:.2} floor");
             failed = true;

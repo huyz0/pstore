@@ -39,7 +39,7 @@ pub const EXACT_SCAN_THRESHOLD: usize = 25_000;
 pub struct Query {
     /// Results wanted.
     pub k: usize,
-    /// Posting lists to probe. Free in depth, linear in bytes.
+    /// Posting lists to probe. Free in depth, **linear in bytes**.
     pub p: usize,
     /// Rung-0 candidates kept per result. Free in **both** — they were already scored.
     pub oversample: usize,
@@ -51,7 +51,22 @@ impl Default for Query {
     fn default() -> Self {
         Self {
             k: 10,
-            p: 16,
+            // ⚠️ 8, measured, not 16. Recall is flat from p=4 on clustered data
+            // (0.980 / 0.981 / 0.981 at p = 4 / 8 / 16) while bytes are linear in it
+            // (0.48 / 0.84 / 1.60 MB), so 16 was 3.3x over-provisioned — chosen as the
+            // "mid-range" of the corpus's 8-64, which is a range stated for a
+            // billion-vector index.
+            //
+            // 8 rather than the measured-sufficient 4 because the corpus these numbers come
+            // from is a Gaussian mixture, which is the case clustering handles best; taking
+            // the exact minimum that works on the flattering case is fitting the default to
+            // the generator. 8 is a 2x margin over what was needed and still halves the
+            // bytes.
+            //
+            // ⚠️ Bytes per query is the cost model's dominant input — `cost-model.md` prices
+            // a node on vectors scanned per second, with a 75x swing across scan sizes — so
+            // this is not a minor tuning change.
+            p: 8,
             // Measured: 8 gives 0.801, 32 gives 0.981, and it costs nothing.
             oversample: 32,
             // ⚠️ `Fast`, not `None`. C-3: rung 0 alone measures 0.30 recall@10, not the
@@ -379,10 +394,16 @@ impl VecIndex {
             Rerank::Exact => {
                 // The fourth round trip, and only here: which float32 rows to read cannot
                 // be known until rung 0 has ranked.
-                let vectors = self.segment.vectors(store, key).await?;
+                //
+                // ⚠️ Only the SURVIVORS' rows. Reading the whole section to score a few
+                // hundred of them costs the segment's entire bandwidth -- 60x the bytes at
+                // gate scale -- and it shipped that way, because the byte ceiling was
+                // asserted only at the default rerank mode.
+                let rows: Vec<usize> = top.iter().map(|(r, _)| *r).collect();
+                let vectors = self.segment.vector_rows(store, key, &rows).await?;
                 ladder.rung2(&top, |row| {
                     vectors
-                        .get(row)
+                        .get(&row)
                         .map_or(f32::NEG_INFINITY, |v| dot(v, query))
                 })
             }

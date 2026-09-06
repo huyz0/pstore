@@ -476,3 +476,55 @@ async fn a_cold_query_from_head_costs_three_round_trips() {
         s.depth()
     );
 }
+
+#[tokio::test]
+async fn a_rerank_rung_reads_only_the_rows_it_scores() {
+    // ⚠️ The ceiling was only ever asserted at the DEFAULT mode, which is how `exact`
+    // shipped reading the ENTIRE full-precision section -- every row in the segment -- to
+    // score the 320 survivors rung 0 handed it. Sixty times the bytes, past the query byte
+    // ceiling, and invisible: the depth tests measure rounds, and the rung-0 byte test uses
+    // `none`.
+    //
+    // Asserted against rows SCORED rather than against an absolute, so it says what is
+    // wrong rather than encoding this fixture's size.
+    // ⚠️ A 256-byte coalescing gap. At this fixture's size the survivors are ~960 bytes
+    // apart, well inside the default 64 KiB, so the coalescer merges them into one fetch
+    // spanning the whole section -- correctly, because a 960-byte hole is cheaper than a
+    // second request, and the fix then looks like it changed nothing. At gate scale the
+    // spacing is ~96 KB and they do not merge, which is where the 60x actually lives.
+    let s = Accounted::new(MemoryStore::with_coalesce_gap(256));
+    let t = TenantId(9);
+    let v = s.as_tenant(t);
+    let docs = corpus(TEST_THRESHOLD + 1_000, 12, 31);
+    put(&v, &docs).await;
+    let idx = VecIndex::open(&v, &Key::new(SEG), &Key::new(CEN), DIM)
+        .await
+        .unwrap();
+    let vectors = idx.segment().section(Section::Vectors).unwrap();
+    let q = Query::default();
+    // Rung 2 scores the survivors rung 0 kept: k x oversample.
+    let survivors = q.k * q.oversample;
+
+    s.record_ranges();
+    idx.search(
+        &v,
+        &Key::new(SEG),
+        &docs[11].vector,
+        Query {
+            rerank: Rerank::Exact,
+            ..q
+        },
+    )
+    .await
+    .unwrap();
+    let read = s.bytes_in(&Key::new(SEG), vectors.clone());
+    // x4 slack for coalescing, which legitimately fetches the holes between scattered rows
+    // when they are cheaper than another request.
+    let budget = (survivors * DIM * 4 * 4) as u64;
+    assert!(
+        read <= budget,
+        "exact rerank read {read} full-precision bytes to score {survivors} rows, against a \
+         budget of {budget}: it is fetching rows it never looks at"
+    );
+    assert!(read > 0, "exact rerank read no full-precision bytes at all");
+}
