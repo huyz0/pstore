@@ -175,7 +175,7 @@ impl SegmentWriter {
         // Vectors leave the data blocks entirely and become their own section: row-major,
         // fixed width, so row `i` is a computable byte range and a reader can fetch one row
         // or none without touching the rest.
-        let dim = docs.first().map_or(0, |d| d.vector.len());
+        let dim = docs.first().map_or(0, |d| d.vector().len());
         let vectors: Vec<u8> = if dim == 0 {
             Vec::new()
         } else {
@@ -185,7 +185,7 @@ impl SegmentWriter {
                 // conservative choice: a wrong-length vector is a caller bug, and truncating
                 // the section would corrupt rows that are fine.
                 for j in 0..dim {
-                    v.extend_from_slice(&d.vector.get(j).copied().unwrap_or(0.0).to_le_bytes());
+                    v.extend_from_slice(&d.vector().get(j).copied().unwrap_or(0.0).to_le_bytes());
                 }
             }
             v

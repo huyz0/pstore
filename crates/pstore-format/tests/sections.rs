@@ -166,7 +166,7 @@ async fn a_scan_still_returns_whole_documents() {
     let all = seg.scan(&s, &key, None).await.unwrap();
     assert_eq!(all.len(), 200);
     assert_eq!(all[7].id, "d7");
-    assert_eq!(all[7].vector, doc(7).vector);
+    assert_eq!(all[7].vector(), doc(7).vector());
     assert_eq!(all[7].attrs.get("n"), Some(&Value::Int(7)));
 }
 

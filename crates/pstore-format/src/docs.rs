@@ -63,8 +63,8 @@ pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
     e.u32(docs.len() as u32);
     for d in docs {
         e.bytes(d.id.as_bytes());
-        e.u32(d.vector.len() as u32);
-        for f in &d.vector {
+        e.u32(d.vector().len() as u32);
+        for f in d.vector() {
             e.f32(*f);
         }
         encode_attrs(&mut e, &d.attrs);
@@ -85,7 +85,17 @@ pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
             vector.push(d.f32()?);
         }
         let attrs = decode_attrs(&mut d)?;
-        out.push(Document { id, vector, attrs });
+        // The bundle format still carries one dense vector per document. Widening it to
+        // named fields is M5a's problem, not this milestone's: a bundle is replayed into a
+        // segment immediately, so its shape is not durable in the way a segment's is.
+        out.push(Document {
+            id,
+            vectors: BTreeMap::from([(
+                crate::DEFAULT_FIELD.to_owned(),
+                crate::VectorField::dense(vector),
+            )]),
+            attrs,
+        });
     }
     Ok(out)
 }
@@ -113,7 +123,7 @@ pub fn decode_rows(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
         let attrs = decode_attrs(&mut d)?;
         out.push(Document {
             id,
-            vector: Vec::new(),
+            vectors: BTreeMap::new(),
             attrs,
         });
     }

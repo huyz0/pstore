@@ -692,7 +692,7 @@ impl<S: BlobStore> Engine<S> {
             .into_iter()
             .map(|d| {
                 let dist = d
-                    .vector
+                    .vector()
                     .iter()
                     .zip(query)
                     .map(|(a, b)| (a - b) * (a - b))

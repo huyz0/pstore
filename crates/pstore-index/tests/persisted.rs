@@ -107,7 +107,7 @@ async fn a_clustered_query_costs_two_round_trips_beyond_head() {
             .search(
                 &*s,
                 &Key::new(SEG),
-                &docs[7].vector,
+                docs[7].vector(),
                 Query {
                     rerank,
                     ..Query::default()
@@ -140,7 +140,7 @@ async fn exact_rerank_costs_exactly_one_more_round() {
     idx.search(
         &*s,
         &Key::new(SEG),
-        &docs[3].vector,
+        docs[3].vector(),
         Query {
             rerank: Rerank::Exact,
             ..Query::default()
@@ -200,7 +200,7 @@ async fn probing_more_lists_costs_bytes_not_depth() {
         idx.search(
             &v,
             &Key::new(SEG),
-            &docs[1].vector,
+            docs[1].vector(),
             Query {
                 p,
                 ..Query::default()
@@ -229,7 +229,7 @@ async fn probing_more_lists_costs_bytes_not_depth() {
             .search(
                 &*d,
                 &Key::new(SEG),
-                &docs[1].vector,
+                docs[1].vector(),
                 Query {
                     p,
                     ..Query::default()
@@ -259,7 +259,7 @@ async fn a_rung_zero_query_reads_no_int8_or_float_bytes() {
     idx.search(
         &v,
         &Key::new(SEG),
-        &docs[5].vector,
+        docs[5].vector(),
         Query {
             rerank: Rerank::None,
             ..Query::default()
@@ -297,11 +297,20 @@ async fn a_small_index_answers_exactly_and_builds_no_index() {
     assert!(!idx.is_clustered());
 
     // Exactly right, not approximately: the top-10 must match brute force.
-    let query = &docs[42].vector;
+    let query = docs[42].vector();
     let mut want: Vec<(usize, f32)> = docs
         .iter()
         .enumerate()
-        .map(|(i, d)| (i, d.vector.iter().zip(query).map(|(a, b)| a * b).sum()))
+        .map(|(i, d)| {
+            (
+                i,
+                d.vector()
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(a, b)| a * b)
+                    .sum(),
+            )
+        })
         .collect();
     want.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let got = idx
@@ -372,11 +381,20 @@ async fn the_rerank_knob_buys_recall_and_not_only_bytes() {
 
     let mut hits = [0usize; 3];
     for qi in [1usize, 40, 90, 150, 220] {
-        let query = &docs[qi].vector;
+        let query = docs[qi].vector();
         let mut want: Vec<(usize, f32)> = docs
             .iter()
             .enumerate()
-            .map(|(i, d)| (i, d.vector.iter().zip(query).map(|(a, b)| a * b).sum()))
+            .map(|(i, d)| {
+                (
+                    i,
+                    d.vector()
+                        .iter()
+                        .zip(query.iter())
+                        .map(|(a, b)| a * b)
+                        .sum(),
+                )
+            })
             .collect();
         want.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let want: Vec<usize> = want.iter().take(10).map(|(i, _)| *i).collect();
@@ -465,7 +483,7 @@ async fn a_cold_query_from_head_costs_three_round_trips() {
         .await
         .unwrap();
     let hits = idx
-        .search(&*s, &seg_key, &docs[9].vector, Query::default())
+        .search(&*s, &seg_key, docs[9].vector(), Query::default())
         .await
         .unwrap();
     assert_eq!(hits.len(), 10);
@@ -509,7 +527,7 @@ async fn a_rerank_rung_reads_only_the_rows_it_scores() {
     idx.search(
         &v,
         &Key::new(SEG),
-        &docs[11].vector,
+        docs[11].vector(),
         Query {
             rerank: Rerank::Exact,
             ..q

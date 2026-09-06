@@ -168,13 +168,13 @@ pub struct Built {
 /// exists, and there is no second code path that could disagree with the first.
 #[must_use]
 pub fn build(docs: &[Document], params: Params) -> Built {
-    let dim = docs.first().map_or(0, |d| d.vector.len());
+    let dim = docs.first().map_or(0, |d| d.vector().len());
     let quantizer = Quantizer::new(dim.max(1));
 
     let (order, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
         ((0..docs.len()).collect::<Vec<_>>(), None)
     } else {
-        let corpus: Vec<Vec<f32>> = docs.iter().map(|d| d.vector.clone()).collect();
+        let corpus: Vec<Vec<f32>> = docs.iter().map(|d| d.vector().to_vec()).collect();
         let c = Clustering::build(&corpus, params);
         // ⚠️ Rows are written in LIST order, so a posting list is one contiguous byte range
         // and a probe is one ranged read rather than a scatter of thousands.
@@ -218,10 +218,10 @@ pub fn build(docs: &[Document], params: Params) -> Built {
                 .as_ref()
                 .and_then(|c| c.vectors.get(*home.get(*row).unwrap_or(&usize::MAX)))
                 .unwrap_or(&zero);
-            if let Ok(code) = quantizer.encode_residual(&d.vector, cen) {
+            if let Ok(code) = quantizer.encode_residual(d.vector(), cen) {
                 code.write_to(&mut rabitq);
             }
-            sq8::write_to(&sq8::encode(&d.vector), &mut eights);
+            sq8::write_to(&sq8::encode(d.vector()), &mut eights);
         }
     }
     Built {

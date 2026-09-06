@@ -93,26 +93,117 @@ pub enum Value {
     Str(String),
 }
 
-/// A row: an id, a vector, and typed attributes.
+/// A sparse posting's weight.
+///
+/// ⚠️ **Opaque on purpose.** D-72 makes the impact *encoding* the configurable part — u8,
+/// f16 or varint depending on the index — so a public `f32` payload would make choosing
+/// that encoding a breaking change to `Document` itself. The representation is private and
+/// the compiler enforces it, which is rung 1 of the gate ladder: M5a can change what is
+/// stored here without any caller noticing.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Impact(f32);
+
+impl Impact {
+    /// An impact from a weight.
+    #[must_use]
+    pub fn new(weight: f32) -> Self {
+        Self(weight)
+    }
+
+    /// The weight, to whatever precision the current encoding keeps.
+    ///
+    /// Deliberately not documented as exact: today it round-trips, and a quantized encoding
+    /// later will not. A caller that depends on exactness is a caller M5a would break.
+    #[must_use]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// One named vector field's contents.
+///
+/// ⚠️ **Kind-tagged, not a list of dense vectors.** A sparse vector is `(dimension, impact)`
+/// pairs; representing one as a dense array over a 30,000-term vocabulary costs **150×** the
+/// bytes — 12 TB against 0.08 TB at 100M documents. A model that can only hold dense arrays
+/// does not avoid the migration trap, it moves it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorField {
+    /// One vector for a dense field; several for late interaction (D-28).
+    Dense(Vec<Vec<f32>>),
+    /// `(dimension, impact)` pairs (D-72).
+    ///
+    /// ⚠️ Representable in v1 and **refused by the writer** — the shape must exist now, the
+    /// retriever is M5a. `modalities-and-sequencing.md` §3: "the shape must exist in v1 even
+    /// if only `dense` is implemented".
+    Sparse(Vec<(u32, Impact)>),
+}
+
+impl VectorField {
+    /// A single dense vector, the overwhelmingly common case.
+    #[must_use]
+    pub fn dense(v: Vec<f32>) -> Self {
+        Self::Dense(vec![v])
+    }
+
+    /// The dense vectors, or empty for a sparse field.
+    #[must_use]
+    pub fn as_dense(&self) -> &[Vec<f32>] {
+        match self {
+            Self::Dense(v) => v,
+            Self::Sparse(_) => &[],
+        }
+    }
+}
+
+/// The field a single-vector document uses.
+///
+/// Named rather than implicit: a segment written today must be readable by a reader that
+/// knows about many fields, and it can only be if today's one field has a name.
+pub const DEFAULT_FIELD: &str = "vector";
+
+/// A row: an id, its named vector fields, and typed attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     /// Unique within its index. Determines the shard, and never changes.
     pub id: String,
-    /// Dense vector. All vectors in a segment share a dimension.
-    pub vector: Vec<f32>,
+    /// ⚠️ **Named and plural.** `modalities-and-sequencing.md` §3 calls a singular `vector`
+    /// field "the migration trap", and D-28 says retrofitting *n* vectors into a
+    /// one-row-one-vector layout is a rewrite rather than a change.
+    pub vectors: BTreeMap<String, VectorField>,
     /// Filterable attributes.
     pub attrs: BTreeMap<String, Value>,
 }
 
 impl Document {
-    /// A document with no attributes.
+    /// A document with one dense vector in [`DEFAULT_FIELD`] and no attributes.
+    ///
+    /// Kept because it is what almost every caller wants; the general shape is one field
+    /// among several, and this is the one-field case spelled conveniently.
     #[must_use]
     pub fn new(id: impl Into<String>, vector: Vec<f32>) -> Self {
         Self {
             id: id.into(),
-            vector,
+            vectors: BTreeMap::from([(DEFAULT_FIELD.to_owned(), VectorField::dense(vector))]),
             attrs: BTreeMap::new(),
         }
+    }
+
+    /// The document's vectors in one named field, or empty if it has none.
+    #[must_use]
+    pub fn field(&self, name: &str) -> &[Vec<f32>] {
+        self.vectors.get(name).map_or(&[], VectorField::as_dense)
+    }
+
+    /// The single dense vector in [`DEFAULT_FIELD`], or empty.
+    ///
+    /// The bridge for code written against the old singular shape. It is a *convenience*,
+    /// not the model: a caller that only ever uses this is a caller that will be surprised
+    /// by a document with two fields.
+    #[must_use]
+    pub fn vector(&self) -> &[f32] {
+        self.field(DEFAULT_FIELD)
+            .first()
+            .map_or(&[][..], Vec::as_slice)
     }
 }
 

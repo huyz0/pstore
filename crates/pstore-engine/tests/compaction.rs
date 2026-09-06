@@ -26,7 +26,10 @@ use std::sync::Arc;
 fn doc(id: &str, v: f32) -> Document {
     Document {
         id: id.to_owned(),
-        vector: vec![v; 4],
+        vectors: std::collections::BTreeMap::from([(
+            pstore_format::DEFAULT_FIELD.to_owned(),
+            pstore_format::VectorField::dense(vec![v; 4]),
+        )]),
         attrs: Default::default(),
     }
 }

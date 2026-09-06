@@ -48,7 +48,7 @@ async fn a_segment_round_trips_through_the_blob_store() {
     // give a plausible-looking answer.
     assert_eq!(all[0].id, "d0");
     assert_eq!(all[49].id, "d49");
-    assert_eq!(all[7].vector, vec![7.0, 14.0, 1.0]);
+    assert_eq!(all[7].vector(), vec![7.0, 14.0, 1.0]);
     assert_eq!(all[7].attrs.get("n"), Some(&Value::Int(7)));
     assert_eq!(all[7].attrs.get("tag"), Some(&Value::Str("t1".to_owned())));
 }

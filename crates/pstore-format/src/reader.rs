@@ -337,10 +337,14 @@ impl Segment {
             let vecs = bufs.get(block_count + n);
             for (r, mut doc) in rows.into_iter().enumerate() {
                 if let Some(raw) = vecs.and_then(|v| v.get(r * per_row..(r + 1) * per_row)) {
-                    doc.vector = raw
+                    let v: Vec<f32> = raw
                         .chunks_exact(4)
                         .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
                         .collect();
+                    doc.vectors.insert(
+                        crate::DEFAULT_FIELD.to_owned(),
+                        crate::VectorField::dense(v),
+                    );
                 }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);
@@ -373,14 +377,14 @@ impl Segment {
         let docs = self.scan(store, key, filter).await?;
         let mut scored = Vec::with_capacity(docs.len());
         for d in docs {
-            if d.vector.len() != query.len() {
+            if d.vector().len() != query.len() {
                 return Err(FormatError::DimensionMismatch {
-                    expected: d.vector.len(),
+                    expected: d.vector().len(),
                     got: query.len(),
                 });
             }
             let dist: f32 = d
-                .vector
+                .vector()
                 .iter()
                 .zip(query)
                 .map(|(a, b)| (a - b) * (a - b))

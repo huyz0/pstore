@@ -67,7 +67,7 @@ async fn write_read_filter_and_search_one_index() {
         .iter()
         .map(|d| {
             let dist: f32 = d
-                .vector
+                .vector()
                 .iter()
                 .zip(&q)
                 .map(|(a, b)| (a - b) * (a - b))

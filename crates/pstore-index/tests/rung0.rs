@@ -47,8 +47,8 @@ fn build(docs: &[Document]) -> bytes::Bytes {
     let mut rabitq = Vec::new();
     let mut eights = Vec::new();
     for d in docs {
-        q.encode(&d.vector).unwrap().write_to(&mut rabitq);
-        sq8::write_to(&sq8::encode(&d.vector), &mut eights);
+        q.encode(d.vector()).unwrap().write_to(&mut rabitq);
+        sq8::write_to(&sq8::encode(d.vector()), &mut eights);
     }
     let mut w = SegmentWriter::new(64);
     for d in docs {
@@ -95,7 +95,7 @@ async fn a_rung_zero_scan_reads_no_full_precision_or_int8_bytes() {
     // every byte assertion above.
     let q = Quantizer::new(DIM);
     let width = codes.len() / N;
-    let query = &docs[7].vector;
+    let query = docs[7].vector();
     let prepared = q.prepare(query).unwrap();
     let mut best = (0usize, f32::NEG_INFINITY);
     for i in 0..N {
