@@ -56,8 +56,18 @@ Gate: `scripts/check-verified.py`.
 11. `./scripts/recall.sh` → **0.9810 unchanged** on 20,000 × 384d clustered synthetic, and
     `a_cold_query_from_head_costs_three_round_trips` still passes.
 12. `./scripts/coverage.sh --fail-under-regions 95` → **95.26% region**, 97.19% line on
-    shipped crates, exit 0. `cargo mutants --workspace` — figure in the notes below.
-    `./scripts/gates.sh` → green.
+    shipped crates, exit 0. `cargo mutants --workspace` → 1,605 mutants, 1,246 caught, 170
+    missed, 2 timeouts: **87.9% workspace, 89.0% on shipped crates** (up from M3's 83.0% /
+    84.4%). `./scripts/gates.sh` → green.
+
+    ⚠️ **170 mutants survive and are not claimed to be covered.** The largest groups are
+    unchanged from M3 and are structural rather than neglected: `object_store_backend.rs`
+    (25) needs a live cloud backend and is M0a.13; `rabitq.rs` (22) is arithmetic inside an
+    estimator whose output is consumed by a *ranking*, so a small perturbation reorders
+    nothing and no test can see it; `sim.rs` and `faulty.rs` are PRNG mixing constants,
+    where a mutated mixer is still a mixer and the property under test is determinism.
+    `lire.rs` (18) is the OQ-51 spike, whose verdict is a measurement rather than an
+    assertion.
 
 ## Bugs this milestone found in itself
 
