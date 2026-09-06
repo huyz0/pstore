@@ -19,4 +19,5 @@ bytes        = "1"
 thiserror    = "2"
 
 [dev-dependencies]
+pstore-testkit = { path = "../pstore-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

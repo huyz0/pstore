@@ -488,6 +488,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "pstore-blob",
+ "pstore-testkit",
  "pstore-types",
  "thiserror",
  "tokio",

@@ -316,3 +316,39 @@ async fn a_fixed_width_field_has_no_offset_table() {
     );
     assert_eq!(seg.field_layout("a").unwrap().per_row, 1);
 }
+
+#[tokio::test]
+async fn several_fields_are_read_in_one_round() {
+    // ⚠️ Width, not depth. Every field's section span is known the moment the segment is
+    // open, so reading three of them is one round trip and three times the bytes. Awaiting
+    // one field before issuing the next would make a hybrid query cost a hop per modality —
+    // the shape `prefetch[] + fusion` exists to avoid, and the reason `f` fields appear in
+    // the RA budget as bytes rather than as depth.
+    let s = std::sync::Arc::new(pstore_testkit::depth::DepthCounting::new(MemoryStore::new()));
+    let key = Key::new("multi");
+    let mut w = SegmentWriter::new(64);
+    for i in 0..300 {
+        w.push(doc(
+            i,
+            &[
+                ("a", vec![vec![i as f32; 8]]),
+                ("b", vec![vec![1.0; 8]]),
+                ("c", vec![vec![2.0; 8]]),
+            ],
+        ));
+    }
+    s.put(&key, w.try_finish().unwrap()).await.unwrap();
+    let seg = Segment::open(&*s, &key).await.unwrap();
+
+    s.reset();
+    let all = seg.read_fields(&*s, &key, &["a", "b", "c"]).await.unwrap();
+    assert_eq!(
+        s.depth(),
+        1,
+        "three fields took {} sequential round trips",
+        s.depth()
+    );
+    assert_eq!(all.len(), 3);
+    assert_eq!(all["a"][7][0], vec![7.0; 8]);
+    assert_eq!(all["c"][7][0], vec![2.0; 8]);
+}

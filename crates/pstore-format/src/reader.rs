@@ -192,6 +192,41 @@ impl Segment {
         self.sections.get(&id).cloned()
     }
 
+    /// Several fields' vectors, fetched **together**.
+    ///
+    /// ⚠️ One round trip, whatever the field count. Every span is known once the segment is
+    /// open, so a hybrid query reading a dense and a sparse field pays bytes rather than a
+    /// hop per modality. Reading them in a loop would be functionally identical and turn
+    /// `prefetch[]` into a depth multiplier.
+    pub async fn read_fields<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        names: &[&str],
+    ) -> Result<BTreeMap<String, Vec<Vec<Vec<f32>>>>, FormatError> {
+        let mut layouts = Vec::with_capacity(names.len());
+        for n in names {
+            layouts.push(
+                self.field_layout(n)
+                    .ok_or(FormatError::UnknownField)?
+                    .clone(),
+            );
+        }
+        let ranges: Vec<std::ops::Range<u64>> = names
+            .iter()
+            .filter_map(|n| self.field_section(n, Section::Vectors))
+            .collect();
+        let bufs = store.get_ranges(key, &ranges).await?;
+        let mut out = BTreeMap::new();
+        for ((name, layout), raw) in names.iter().zip(&layouts).zip(bufs) {
+            out.insert(
+                (*name).to_owned(),
+                decode_field(&raw, layout, self.rows as usize)?,
+            );
+        }
+        Ok(out)
+    }
+
     /// One field's vectors, one entry per row.
     ///
     /// An absent field is an **error**: a miss returning zero rows is indistinguishable
