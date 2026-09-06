@@ -29,6 +29,41 @@ research behind it: [`../docs/research/09-rust-stack/dev-and-test-environment.md
 | Conformance suite | `cargo test -p pstore-conformance` | Records what each backend actually does |
 | Real clouds | **deferred — milestone M0b** | Economics: latency, CAS contention, cost |
 
+## Running the 100-node fleet on WSL2
+
+`scripts/cluster.sh up 100` uses **host networking**, and that is not a stylistic choice.
+
+A bridged container needs an entry in the host's **ARP neighbour table** per node. Its
+default ceiling is `net.ipv4.neigh.default.gc_thresh3` (1024, with garbage collection from
+128), and once a bridge is busy enough to cross it the kernel starts **dropping packets
+silently** and logs:
+
+```
+neighbour: arp_cache: neighbor table overflow!
+```
+
+Measured here, that surfaced as joins stalling at ~33 of 100 nodes with the blob store idle
+at 1% CPU, every stuck node sitting in `SYN_SENT`, and the store's listen queue reporting
+zero overflows — a network failure wearing a distributed-systems costume. Raising the sysctl
+needs root on the **WSL2 host**, which the dev container does not have; host networking
+removes the entries instead of raising the ceiling.
+
+⚠️ **What it costs the numbers.** The nodes become 100 processes on one loopback rather than
+100 network peers, so convergence and gossip traffic measured this way are a **floor** — a
+real network can only be slower. Per-node RSS and CPU are unaffected, because `--memory` and
+`--cpus` still apply. [`M4b/VERIFIED.md`](../docs/milestones/M4b/VERIFIED.md) states this
+beside every timing it reports.
+
+If you have root on the host and prefer a bridge, this is the knob:
+
+```bash
+sudo sysctl -w net.ipv4.neigh.default.gc_thresh1=4096 net.ipv4.neigh.default.gc_thresh2=8192 net.ipv4.neigh.default.gc_thresh3=16384
+```
+
+`scripts/cluster.sh down` also removes the Docker network. Reusing a bridge across runs of
+~100 containers was observed to leave it in a state where **new** containers got no
+connectivity at all while existing ones kept working.
+
 ## The thing to know
 
 **No emulator implements our core primitive faithfully.** MinIO rejects

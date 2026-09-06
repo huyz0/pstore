@@ -271,3 +271,78 @@ fn the_window_grows_with_the_fleet_but_never_exceeds_it() {
         "the window grew to the whole fleet"
     );
 }
+
+/// Placements computed by a **previous process** and committed to the repository.
+///
+/// ⚠️ This is the whole point of the criterion. Comparing two `Placement`s inside one test
+/// process cannot catch a seed taken from the PID, the clock, or hash-map iteration order —
+/// both instances would share it and agree perfectly. Values that were computed on another
+/// day, in another process, and then written down are the only thing that can.
+///
+/// If a change to the hash makes this fail, that is the test working. Regenerating these
+/// numbers to match new behaviour is how a determinism test becomes decoration; the numbers
+/// change only when a deliberate format change is made and the ledger says so.
+const GOLDEN: [(&str, [&str; 3]); 4] = [
+    (
+        "tenant-a/idx0/s0",
+        ["10.0.0.8:7946", "10.0.0.4:7946", "10.0.0.2:7946"],
+    ),
+    (
+        "tenant-a/idx0/s1",
+        ["10.0.0.0:7946", "10.0.0.10:7946", "10.0.0.2:7946"],
+    ),
+    (
+        "tenant-b/idx7/s3",
+        ["10.0.0.7:7946", "10.0.0.2:7946", "10.0.0.8:7946"],
+    ),
+    (
+        "zzz/idx99/s9",
+        ["10.0.0.8:7946", "10.0.0.4:7946", "10.0.0.0:7946"],
+    ),
+];
+
+#[test]
+fn placement_matches_a_golden_vector_in_a_fresh_process() {
+    let roster = Roster::from_nodes((0..12).map(|i| format!("10.0.0.{i}:7946")));
+    let p = Placement::new(&roster);
+    for (key, want) in GOLDEN {
+        assert_eq!(
+            p.place(key, 3),
+            want.to_vec(),
+            "placement of {key} moved. Every node in the fleet computes this independently \
+             and they must agree; a placement that depends on the process cannot be a \
+             replacement for a control plane."
+        );
+    }
+}
+
+#[test]
+fn a_fleet_change_copies_nothing() {
+    // ⚠️ This asserts an ABSENCE, and the absence is the architecture. `routing-and-placement`
+    // says ~50% of keys remap when a fleet doubles — and that nothing is copied, because a
+    // node owns nothing. Both are true at once, and an earlier draft of the M4a spec
+    // conflated them and set a churn bound below the arithmetic floor.
+    //
+    // Placement takes no store at all, so this is checked by construction: there is no seam
+    // through which a rebalance could issue a request. The test pins that the seam stays
+    // absent — a `Placement::new` that grew a store parameter would not compile here.
+    let small = Roster::from_nodes((0..100).map(|i| format!("10.0.0.{i}:7946")));
+    let big = Roster::from_nodes((0..200).map(|i| format!("10.0.0.{i}:7946")));
+
+    let (a, b) = (Placement::new(&small), Placement::new(&big));
+    let moved = (0..2_000)
+        .filter(|i| {
+            let k = format!("t/idx{i}/s0");
+            a.place(&k, 3) != b.place(&k, 3)
+        })
+        .count();
+
+    // Placement churn is large by design; data movement is zero. Asserting the churn is real
+    // is what stops this test passing against a ring that was never rebuilt — which would
+    // also copy nothing, and would be broken.
+    assert!(
+        moved > 200,
+        "doubling the fleet moved only {moved} of 2,000 keys: the ring was not rebuilt, and \
+         a test of 'nothing was copied' passes trivially against a placement that never changes"
+    );
+}

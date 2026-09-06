@@ -1,0 +1,195 @@
+//! A cluster member.
+//!
+//! Joins from the roster (**one GET**, no LIST, no DNS), gossips, and reports what it would
+//! own. ⚠️ **Not a query server.** M4b measures membership and placement; a server would make
+//! every number here about something else, and the milestone would silently become a
+//! benchmark of a query path that does not exist yet.
+//!
+//! ## What this node is, in one sentence
+//!
+//! It owns nothing. Placement tells it which shards it would *cache*; the blob store holds
+//! everything. That is why adding or removing nodes copies no bytes.
+
+use pstore_blob::{BlobStore, Capabilities, ObjectStoreBackend};
+use pstore_cluster::Roster;
+use pstore_node::policy::{self, fresh_node_id, jitter, read_roster_patiently};
+use pstore_node::{ATTEMPT_TIMEOUT, GOSSIP_PERIOD, HEAL_PERIOD, gossip};
+use std::sync::Arc;
+
+fn env(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// A node id that is **fresh on every start**.
+///
+/// `membership.md`: not derived from IP or hostname, so a restarted node looks cold rather
+/// than inheriting the reputation and placements of its predecessor. A container-index id is
+/// the obvious shortcut and is wrong for exactly that reason.
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = env("PSTORE_CLUSTER", "c1");
+    let node_id = env("PSTORE_NODE_ID", &fresh_node_id());
+    let listen = env("PSTORE_GOSSIP_ADDR", "0.0.0.0:7946");
+    let advertise = env("PSTORE_ADVERTISE", &listen);
+    let endpoint = env("PSTORE_S3_ENDPOINT", "http://minio:9000");
+    let bucket = env("PSTORE_BUCKET", "pstore");
+
+    // Concrete, not `dyn`: `Roster`'s methods are generic over `BlobStore`, which keeps the
+    // trait object-safety question out of the trait itself.
+    let store = blob_store(&endpoint, &bucket)?;
+
+    // ⚠️ One GET. This is the whole of discovery: no DNS, no service registry, no LIST. The
+    // bucket we already depend on is how a node finds the fleet, which is what keeps "one
+    // stateful dependency" true.
+    let (roster, tag) = read_roster_patiently(&store, &cluster, &node_id).await?;
+    let seeds: Vec<String> = roster
+        .nodes()
+        .iter()
+        .filter(|n| **n != advertise)
+        .cloned()
+        .collect();
+    println!(
+        "JOIN node={node_id} advertise={advertise} seeds={}",
+        seeds.len()
+    );
+
+    // Injected probe loss (M4b criterion 3). Zero unless asked: a fleet that always drops
+    // datagrams cannot tell a loss result from a baseline one.
+    let loss: f64 = std::env::var("PSTORE_PROBE_LOSS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let handle = gossip::start(&node_id, &listen, &advertise, &seeds, loss).await?;
+    // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
+    // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the
+    // config says `pstore-n7:7946` — and a node comparing the configured name against its
+    // own gossip view never finds itself. Measured: every node reported owning 0 of 1000
+    // shards while holding a 44-member view, which reads as a placement bug and is a naming
+    // bug.
+    let me = handle.self_addr();
+    println!("SELF advertise={advertise} gossip={me}");
+
+    // ⚠️ Announce on join, not on the next refold tick. A cold cluster's roster is empty, so
+    // the first node has no seeds — and if it waits a full period before publishing itself,
+    // every node that starts meanwhile also finds an empty roster and forms its own
+    // one-member cluster. Measured: ten nodes, ten singleton views. The roster is a cache of
+    // gossip, and a cache nobody writes until later is one nobody can join through.
+    let mine = roster.merged(&Roster::from_nodes([me.clone()]));
+    match Roster::refold(&store, &cluster, &mine, tag).await {
+        Ok(()) => println!("ANNOUNCE ok members={}", mine.nodes().len()),
+        Err(_) => {
+            // Lost the race: rebase and try once. Losing repeatedly is fine — gossip will
+            // carry us in as soon as one peer knows us.
+            if let Ok((cur, t)) = Roster::read(&store, &cluster).await {
+                let merged = cur.merged(&Roster::from_nodes([me.clone()]));
+                let _ = Roster::refold(&store, &cluster, &merged, t).await;
+            }
+        }
+    }
+
+    // Report the view, and refold the roster from it. The roster is a *cache of gossip*, so
+    // a lost refold is never a lost membership — it is one fewer cache update.
+    let mut ticks = 0u64;
+    let mut sub = 0u64;
+    let mut last_size = usize::MAX;
+    loop {
+        // ⚠️ Sampled at the GOSSIP period, not once a second. Criterion 2 is stated in
+        // periods of 200ms and its bound is eight of them — an instrument that samples once
+        // a second resolves to ±5 periods, so a one-second sampler cannot tell 8 from 9 and
+        // any pass or fail it reports is unfalsifiable. Measured before this change: "9
+        // periods" against a bound of 8, from a sampler that could not have said otherwise.
+        tokio::time::sleep(GOSSIP_PERIOD).await;
+        sub += 1;
+        let members = handle.members().await;
+
+        // The view size changes rarely, so printing on CHANGE costs almost nothing and is
+        // what actually carries the timing: `docker logs -t` timestamps it to the
+        // millisecond, and convergence is the last of these across the fleet.
+        if members.len() != last_size {
+            last_size = members.len();
+            println!("VIEWCHANGE members={last_size} self={me}");
+        }
+
+        if !sub.is_multiple_of(5) {
+            continue;
+        }
+        ticks += 1;
+        // Scraped by `scripts/cluster.sh`; a line per second per node is cheap and needs no
+        // endpoint, which would be a server by another name.
+        println!("VIEW t={ticks} members={} self={me}", members.len());
+
+        if ticks % HEAL_PERIOD.as_secs() == jitter(&node_id, HEAL_PERIOD.as_secs()) {
+            // Read first. The roster is two things at once here: the directory this node
+            // publishes into, and the seed list it heals a partition from.
+            // Bounded for the same reason the join read is: an unbounded blob request on
+            // this loop stops the node reporting anything at all, and a node that has
+            // stopped reporting is one the harness cannot tell from a dead one.
+            if let Ok(Ok((cur, tag))) =
+                tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(&store, &cluster)).await
+            {
+                let healed = policy::to_dial(&cur, &members)
+                    .into_iter()
+                    .filter(|n| handle.dial(n))
+                    .count();
+
+                match policy::union_to_publish(&cur, &members) {
+                    None => {
+                        if healed > 0 {
+                            println!("HEAL dialled={healed} known={}", cur.nodes().len());
+                        }
+                    }
+                    Some(union) => {
+                        match tokio::time::timeout(
+                            ATTEMPT_TIMEOUT,
+                            Roster::refold(&store, &cluster, &union, tag),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                println!(
+                                    "REFOLD ok members={} healed={healed}",
+                                    union.nodes().len()
+                                );
+                            }
+                            // A lost CAS is not a lost membership: the winner wrote a union
+                            // too, and the next period rebases on it.
+                            Ok(Err(_)) => println!("REFOLD lost, {} known", cur.nodes().len()),
+                            Err(_) => println!("REFOLD timed out, {} known", cur.nodes().len()),
+                        }
+                    }
+                }
+            }
+        }
+        if ticks.is_multiple_of(5) {
+            let r = Roster::from_nodes(handle.members().await);
+            let mine = policy::owned_shards(&r, &me, 1000, 3);
+            let (sent, recvd, dropped) = handle.traffic();
+            println!(
+                "OWNS shards={mine} of=1000 members={} sent={sent} recvd={recvd} dropped={dropped}",
+                r.nodes().len()
+            );
+        }
+    }
+}
+
+fn blob_store(endpoint: &str, bucket: &str) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
+    let s3 = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_access_key_id(env("PSTORE_ACCESS_KEY", "pstore"))
+        .with_secret_access_key(env("PSTORE_SECRET_KEY", "pstore-dev-secret"))
+        .with_allow_http(true)
+        .with_region("us-east-1")
+        .build()?;
+    // ⚠️ `unprobed`: this backend's capabilities have NOT been measured here. MinIO is known
+    // to ignore `If-None-Match: *`, which is why the roster uses CAS on an observed tag and
+    // never create-if-absent.
+    Ok(ObjectStoreBackend::new(
+        Arc::new(s3),
+        Capabilities {
+            backend: format!("s3({endpoint})"),
+            ..ObjectStoreBackend::unprobed("s3")
+        },
+    ))
+}

@@ -1,0 +1,18 @@
+# The node image. Built from the workspace root so the whole source tree is available.
+#   docker build -f dev/Dockerfile.node -t pstore-node .
+# ⚠️ Pinned to the SAME Debian as the runtime stage. A newer build image links against a
+# newer glibc and every node dies with `GLIBC_2.38 not found` — which looks like a crash
+# loop rather than a packaging mistake.
+FROM rust:1.90-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p pstore-node
+
+# ⚠️ Distroless-ish runtime: 100 of these run at once, so the image's resident cost is
+# multiplied by 100. Measured, an idle container is ~1.4 MB of host memory; the binary's RSS
+# is what actually matters and is what M4b reports.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/pstore-node /usr/local/bin/pstore-node
+ENTRYPOINT ["/usr/local/bin/pstore-node"]

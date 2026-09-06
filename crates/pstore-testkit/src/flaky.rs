@@ -26,6 +26,14 @@ pub struct Flaky {
     /// Ordinals of writes to refuse outright, for a scenario that needs a *specific*
     /// failure rather than a plausible distribution of them.
     at: Vec<u64>,
+    /// Ordinals of READS to refuse, for a backend that is briefly unreachable rather than
+    /// down. A store that is down tests the give-up path; one that is briefly unreachable
+    /// tests the retry, and those are different bugs.
+    reads_fail_at: Vec<u64>,
+    /// Reads refused so far, counted separately: a read gate and a write gate share nothing
+    /// but the store, and a test asserting "three refusals" must not be satisfied by three
+    /// of the other kind.
+    reads_seen: AtomicU64,
     /// Every read fails. Models a backend that is down rather than busy.
     reads_fail: bool,
     /// `head` never reports a missing key.
@@ -56,6 +64,8 @@ impl Flaky {
             rate: (clamped * f64::from(u32::MAX)) as u64,
             at: Vec::new(),
             reads_fail: false,
+            reads_fail_at: Vec::new(),
+            reads_seen: AtomicU64::new(0),
             never_missing: false,
             always_contended: false,
             seen: AtomicU64::new(0),
@@ -75,6 +85,8 @@ impl Flaky {
             rate: 0,
             at: at.to_vec(),
             reads_fail: false,
+            reads_fail_at: Vec::new(),
+            reads_seen: AtomicU64::new(0),
             never_missing: false,
             always_contended: false,
             seen: AtomicU64::new(0),
@@ -118,6 +130,8 @@ impl Flaky {
     pub fn refusing_reads() -> Self {
         Self {
             reads_fail: true,
+            reads_fail_at: Vec::new(),
+            reads_seen: AtomicU64::new(0),
             ..Self::refusing(&[])
         }
     }
@@ -140,7 +154,25 @@ impl Flaky {
         }
     }
 
+    /// A store whose reads at these ordinals fail and whose others succeed.
+    ///
+    /// ⚠️ Models a backend that is *briefly* unreachable, which is the case a retry budget
+    /// exists for. `refusing_reads` models one that is down, and a node must tell them apart:
+    /// giving up on the first is how a cold fleet loses members it never had to.
+    #[must_use]
+    pub fn refusing_reads_at(at: &[u64]) -> Self {
+        Self {
+            reads_fail_at: at.to_vec(),
+            ..Self::refusing(&[])
+        }
+    }
+
     fn read_gate(&self) -> Result<(), BlobError> {
+        let ordinal = self.reads_seen.fetch_add(1, Ordering::Relaxed);
+        if self.reads_fail_at.contains(&ordinal) {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(BlobError::Other("injected read failure".to_owned()));
+        }
         if self.reads_fail {
             self.failures.fetch_add(1, Ordering::Relaxed);
             return Err(BlobError::Other("injected read failure".to_owned()));

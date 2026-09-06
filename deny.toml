@@ -3,14 +3,26 @@
 yanked = "deny"
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+# ⚠️ An allowance no crate uses is a FAILURE here, not a spare permission — `cargo deny`
+# reports it as "unmatched license allowance", and a list that accumulates unused entries
+# stops saying anything about what the tree actually depends on. `BSD-2-Clause` was removed
+# for exactly that reason; if a dependency ever needs it, the gate will say so and it goes
+# back with the crate that justified it named alongside.
+# `CDLA-Permissive-2.0` is here for exactly one crate: `webpki-root-certs`, the Mozilla CA
+# root bundle that `object_store`'s S3 client needs to speak TLS to a real cloud. It is a
+# permissive DATA licence with no copyleft and no attribution burden on a binary, and it
+# arrived with M4b's node — the first thing in this tree to open an outbound connection.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"
 # Enforces D-2 at the dependency level: only pstore-blob may depend on
 # object_store. Everything above it goes through the BlobStore trait so that
 # request accounting and congestion control are unavoidable.
-deny = [{ name = "object_store", wrappers = ["pstore-blob"] }]
+# ⚠️ `pstore-node` is the process that must name a real backend — it is a binary, and
+# something has to construct one. It may only CONSTRUCT: everything it does afterwards goes
+# through `BlobStore`, so the ban still holds where it matters, and this list is the audit.
+deny = [{ name = "object_store", wrappers = ["pstore-blob", "pstore-node"] }]
 
 [sources]
 unknown-registry = "deny"

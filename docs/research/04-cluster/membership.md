@@ -79,6 +79,21 @@ Concretely:
   a direct dividend of Design rule 9.
 
 ### Zone-sharded gossip is required, not optional
+
+> **C-7 — measured, M4b.** This section was an argument; it now has a number. Flat gossip on
+> a **100-node fleet** costs **22,776 / 37,423 / 75,391 bytes/s/node** at 25 / 50 / 100 nodes
+> — each doubling multiplies per-node cost by 1.64× then 2.01×, against 2.0× for O(N) and
+> ~1.2× for O(log N). Per-node cost is **linear in fleet size**, so total gossip traffic is
+> **quadratic**, at 100 nodes and without waiting for 10,000.
+>
+> ⚠️ Two things this does *not* say. It is not a measurement of the cross-AZ **bill**, which
+> is what makes zone-sharding a cost requirement rather than a scaling one — these 100 nodes
+> share a host and cross no AZ boundary. And it is `chitchat` (Scuttlebutt + phi-accrual),
+> not SWIM: `foca` is MPL-2.0 and outside the licence allow-list. A SWIM mesh gossips a
+> digest of similar shape, so the slope should carry, but that is an expectation and not a
+> measurement. Evidence: [`M4b/VERIFIED.md`](../../milestones/M4b/VERIFIED.md) criterion 5.
+> **OQ-13's crossover point remains open**, and is now bounded from below: flat gossip is
+> already the dominant per-node cost at 100.
 Shard the mesh by **AZ**, with a small number of cross-AZ relays, so per-node fanout stays
 constant *and* cross-AZ chatter stays negligible. This was framed as a scaling option; per
 [`az-topology.md`](az-topology.md) it is a **cost requirement** — cross-AZ traffic is
