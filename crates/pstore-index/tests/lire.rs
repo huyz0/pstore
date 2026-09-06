@@ -199,3 +199,83 @@ async fn the_split_bound_is_not_the_balance_bound() {
         (p.target_list_size as f32 * p.balance) as usize
     );
 }
+
+#[tokio::test]
+async fn a_starved_list_is_merged_into_its_neighbour() {
+    // The other half of the split rule. Without merging, deletes and drift leave a tail of
+    // near-empty lists, each costing a centroid, a directory entry and a probe that can
+    // barely return anything -- so a query's byte budget buys less and less over time.
+    let corpus = corpus(600, 4, 11);
+    // Many tiny lists to start with, so the merge rule has something to do.
+    let tiny = Params {
+        target_list_size: 8,
+        replicas: 0,
+        ..Params::default()
+    };
+    let mut c = Clustering::build(&corpus, tiny);
+    let before = c.lists().len();
+    assert!(before > 20, "only {before} lists to merge from");
+
+    // Maintaining under the normal target makes most of those lists starved.
+    let w = lire::maintain(&mut c, &corpus, &[], params(), Scope::All);
+    assert!(
+        w.merges > 0,
+        "{before} lists far under the target produced no merges"
+    );
+    assert!(
+        c.lists().len() < before,
+        "merging did not reduce the list count"
+    );
+    // And nothing was lost on the way.
+    let seen: usize = c.lists().iter().map(Vec::len).sum();
+    assert_eq!(seen, corpus.len(), "a merge lost or duplicated rows");
+}
+
+#[tokio::test]
+async fn maintenance_survives_the_degenerate_cases() {
+    // The branches a real corpus never reaches and a bad one does. None of these should
+    // panic, lose rows, or produce a clustering that later code cannot read.
+    let p = params();
+
+    // No centroids at all: nothing to maintain, and nothing to crash on.
+    let mut empty = Clustering::from_parts(Vec::new(), Vec::new());
+    let w = lire::maintain(&mut empty, &[], &[], p, Scope::Touched);
+    assert_eq!(w, Default::default());
+
+    // A list of IDENTICAL vectors cannot be bisected — every point is the farthest point
+    // from every other, so the split rule has nothing to divide on. It must leave the list
+    // alone rather than emit an empty half.
+    let same: Vec<Vec<f32>> = (0..400).map(|_| vec![1.0f32; DIM]).collect();
+    let mut c = Clustering::build(&same, p);
+    let before: usize = c.lists().iter().map(Vec::len).sum();
+    lire::maintain(&mut c, &same, &[], p, Scope::All);
+    let after: usize = c.lists().iter().map(Vec::len).sum();
+    assert_eq!(after, before, "an unsplittable list lost or gained rows");
+    assert!(
+        c.lists().iter().all(|l| !l.is_empty()),
+        "an empty list was created"
+    );
+
+    // An insert naming a row that does not exist is ignored rather than panicking: the
+    // caller's row list and corpus can disagree, and a panic in maintenance takes down a
+    // compaction rather than skipping a document.
+    let corpus = corpus(200, 4, 31);
+    let mut c = Clustering::build(&corpus, p);
+    let w = lire::maintain(&mut c, &corpus, &[9_999], p, Scope::Touched);
+    assert_eq!(w.inserted, 0, "a row outside the corpus was inserted");
+}
+
+#[test]
+fn the_split_factor_can_be_set_explicitly() {
+    // The sweep in `examples/lire.rs` chose 2x by measuring 4x, 2x and 1.5x; the knob it
+    // swept must keep working, or that measurement cannot be repeated.
+    let p = params();
+    assert_eq!(
+        Bounds::with_split_factor(p, 3.0).max,
+        p.target_list_size * 3
+    );
+    assert_eq!(
+        Bounds::with_split_factor(p, 1.5).max,
+        (p.target_list_size as f32 * 1.5) as usize
+    );
+}

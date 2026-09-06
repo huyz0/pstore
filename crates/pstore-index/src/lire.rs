@@ -363,6 +363,20 @@ pub fn maintain_with(
         l.dedup();
     }
 
+    // ⚠️ Drop lists that maintenance emptied. Reassignment can move every row out of a
+    // list — an identical-vector corpus does it immediately — and an empty posting list
+    // costs a centroid, a directory entry, and a probe that can never return anything.
+    // `Clustering::build` already drops them; a maintenance pass that did not would let
+    // them accumulate over exactly the cycles this protocol exists to allow.
+    let keep: Vec<usize> = (0..lists.len())
+        .filter(|i| lists.get(*i).is_some_and(|l| !l.is_empty()))
+        .collect();
+    let centroids = keep
+        .iter()
+        .filter_map(|i| centroids.get(*i).cloned())
+        .collect();
+    let lists = keep.iter().filter_map(|i| lists.get(*i).cloned()).collect();
+
     *clustering = Clustering::from_parts(centroids, lists);
     work
 }

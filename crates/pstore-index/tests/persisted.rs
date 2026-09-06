@@ -597,3 +597,47 @@ async fn a_query_names_the_field_it_searches() {
         "searching an absent field returned a result set"
     );
 }
+
+#[tokio::test]
+async fn a_ragged_dimension_does_not_shift_every_later_row() {
+    // ⚠️ Labelled "unreachable" in `build_field` and it is not: `dim` comes from the FIRST
+    // document that has the field, so a later document with a different width fails to
+    // encode. Codes are fixed-stride, so dropping that row would shift every row after it
+    // and every subsequent search would return the wrong documents — plausible ones, with
+    // no error anywhere.
+    let s = MemoryStore::new();
+    let mut docs = corpus(TEST_THRESHOLD + 400, 12, 41);
+    // One row of the wrong width, in the middle.
+    let bad = docs.len() / 2;
+    docs[bad] = Document {
+        id: format!("d{bad}"),
+        vectors: std::collections::BTreeMap::from([(
+            pstore_format::DEFAULT_FIELD.to_owned(),
+            pstore_format::VectorField::dense(vec![0.5; DIM * 2]),
+        )]),
+        attrs: Default::default(),
+    };
+    let built = vec_index::build(&docs, params());
+    s.put(&Key::new(SEG), built.segment.clone()).await.unwrap();
+    s.put(
+        &Key::new(CEN),
+        bytes::Bytes::from(built.centroids.as_ref().unwrap().encode()),
+    )
+    .await
+    .unwrap();
+    let idx = VecIndex::open(&s, &Key::new(SEG), &Key::new(CEN), DIM)
+        .await
+        .unwrap();
+
+    // A query for a known-good document still finds it: the stride survived.
+    let target = 7usize;
+    let hits = idx
+        .search(&s, &Key::new(SEG), docs[target].vector(), Query::default())
+        .await
+        .unwrap();
+    let ids: Vec<usize> = hits.iter().map(|(r, _)| built.order[*r]).collect();
+    assert!(
+        ids.contains(&target),
+        "one ragged row shifted the stride: searching for d{target} returned {ids:?}"
+    );
+}

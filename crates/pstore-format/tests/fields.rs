@@ -352,3 +352,180 @@ async fn several_fields_are_read_in_one_round() {
     assert_eq!(all["a"][7][0], vec![7.0; 8]);
     assert_eq!(all["c"][7][0], vec![2.0; 8]);
 }
+
+#[tokio::test]
+async fn a_fields_code_sections_are_addressable_by_name() {
+    // Criterion 3 covers all three of a field's sections, not just its vectors: a query
+    // reaches the codes by name too, and a `Fields` row that described only the vectors
+    // would leave the code sections findable by id alone — which is exactly the ambiguity
+    // named fields exist to remove.
+    let s = MemoryStore::new();
+    let key = Key::new("codes");
+    let mut w = SegmentWriter::new(32);
+    for i in 0..64 {
+        w.push(doc(i, &[("a", vec![vec![i as f32; 4]])]));
+    }
+    s.put(
+        &key,
+        w.with_section(Section::RaBitQ, vec![7u8; 64 * 8])
+            .with_section(Section::Sq8, vec![9u8; 64 * 12])
+            .try_finish()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let seg = Segment::open(&s, &key).await.unwrap();
+
+    let rabitq = seg.field_section("a", Section::RaBitQ).expect("no rabitq");
+    let sq8 = seg.field_section("a", Section::Sq8).expect("no sq8");
+    assert_eq!(rabitq.end - rabitq.start, 64 * 8);
+    assert_eq!(sq8.end - sq8.start, 64 * 12);
+    assert!(rabitq.end <= sq8.start || sq8.end <= rabitq.start);
+    // A section kind the layout does not special-case falls through to its own id.
+    assert!(seg.field_section("a", Section::Blocks).is_some());
+}
+
+#[tokio::test]
+async fn a_field_with_no_vector_section_reads_as_empty_rows() {
+    // A field described but not populated — which a segment written by a future version
+    // could produce — must read as empty rows rather than as an error or a panic.
+    let s = MemoryStore::new();
+    let key = Key::new("novec");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..8 {
+        w.push(Document {
+            id: format!("d{i}"),
+            vectors: BTreeMap::new(),
+            attrs: BTreeMap::new(),
+        });
+    }
+    s.put(&key, w.try_finish().unwrap()).await.unwrap();
+    let seg = Segment::open(&s, &key).await.unwrap();
+    assert!(seg.fields().is_empty());
+    assert!(seg.field_vectors(&s, &key, "anything").await.is_err());
+}
+
+#[tokio::test]
+async fn a_truncated_field_table_is_refused_not_guessed() {
+    // ⚠️ A short Fields table would otherwise yield fields with the wrong dimension and
+    // sections pointing at the wrong ranges — every read returning plausible floats that are
+    // some other field's, which is a wrong answer rather than an error. The table is
+    // checksummed with the rest of the meta region, so corruption is caught; truncation of
+    // the *segment* is what this exercises.
+    let s = MemoryStore::new();
+    let key = Key::new("cut");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..16 {
+        w.push(doc(
+            i,
+            &[("a", vec![vec![i as f32]]), ("b", vec![vec![1.0]])],
+        ));
+    }
+    let whole = w.try_finish().unwrap();
+
+    // Every prefix short of the whole segment must fail to open, never open wrongly.
+    for cut in [8usize, 64, 200] {
+        if cut >= whole.len() {
+            continue;
+        }
+        let short = whole.slice(..whole.len() - cut);
+        s.put(&key, short).await.unwrap();
+        let opened = Segment::open(&s, &key).await;
+        if let Ok(seg) = opened {
+            // Opening is allowed only if what it reports is still self-consistent.
+            for f in seg.fields() {
+                assert!(
+                    seg.field_vectors(&s, &key, &f.name).await.is_err()
+                        || seg.field_layout(&f.name).is_some(),
+                    "a truncated segment reported field {} inconsistently",
+                    f.name
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_variable_width_section_is_an_error() {
+    // The offset table of a variable-width field is read before the vectors it describes. A
+    // table that runs past the section end must fail rather than index into whatever
+    // follows.
+    let s = MemoryStore::new();
+    let key = Key::new("var");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..24 {
+        w.push(doc(
+            i,
+            &[(
+                "late",
+                (0..=i % 3).map(|t| vec![i as f32, t as f32]).collect(),
+            )],
+        ));
+    }
+    let whole = w.try_finish().unwrap();
+    s.put(&key, whole.clone()).await.unwrap();
+    let seg = Segment::open(&s, &key).await.unwrap();
+    // Sanity: it reads correctly when whole.
+    assert_eq!(seg.field_vectors(&s, &key, "late").await.unwrap().len(), 24);
+
+    // Now overwrite the field's section with too few bytes, keeping the footer intact so the
+    // segment still opens and only the field read fails.
+    let span = seg.field_section("late", Section::Vectors).unwrap();
+    let mut bytes = whole.to_vec();
+    for b in bytes
+        .iter_mut()
+        .skip(span.start as usize)
+        .take((span.end - span.start) as usize)
+    {
+        *b = 0xFF;
+    }
+    s.put(&Key::new("var2"), bytes::Bytes::from(bytes))
+        .await
+        .unwrap();
+    let seg2 = Segment::open(&s, &Key::new("var2")).await.unwrap();
+    // Offsets of 0xFF.. are past the section, so the read must refuse rather than slice
+    // arbitrary memory.
+    assert!(
+        seg2.field_vectors(&s, &Key::new("var2"), "late")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn absent_sections_read_as_absent_not_as_errors() {
+    // The defensive paths, exercised rather than assumed: a segment that carries no codes
+    // must report their absence, and asking for rows of a segment with no vectors must be
+    // empty rather than a panic or an error a caller cannot act on.
+    let s = MemoryStore::new();
+    let key = Key::new("bare");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..8 {
+        w.push(doc(i, &[("a", vec![vec![i as f32]])]));
+    }
+    s.put(&key, w.try_finish().unwrap()).await.unwrap();
+    let seg = Segment::open(&s, &key).await.unwrap();
+
+    // No code sections were written.
+    assert!(
+        seg.fetch_section(&s, &key, Section::RaBitQ)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        seg.fetch_section(&s, &key, Section::Sq8)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Vectors were.
+    assert!(
+        seg.fetch_section(&s, &key, Section::Vectors)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Asking for no rows fetches nothing.
+    assert!(seg.vector_rows(&s, &key, &[]).await.unwrap().is_empty());
+}

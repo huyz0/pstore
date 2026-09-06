@@ -261,3 +261,68 @@ fn a_dimension_mismatch_is_an_error_not_a_wrong_answer() {
     let code = q.encode(&vec![0.1; DIM]).unwrap();
     assert!(q.estimate(&code, &[0.0; 8]).is_err());
 }
+
+#[test]
+fn the_rotation_beats_no_rotation_on_structured_input() {
+    // ⚠️ The OQ-39 finding, as a test rather than only a number in an example. BBQ's
+    // construction is this one without the randomized transform — both subtract a centroid
+    // and keep per-vector corrections — and the rotation is what separates them: +5.7 points
+    // of recall@10 at rung 0, measured. Here the same difference shows as code quality on
+    // input that has structure, which real embeddings do.
+    //
+    let dim = 256;
+    let rotated = Quantizer::new(dim);
+    let plain = Quantizer::without_rotation(dim);
+
+    // ⚠️ Structured means **concentrated**, not alternating. A first attempt used a ±1
+    // square wave and measured unrotated alignment of 1.0000 — its best case, because every
+    // sign is exact when every coordinate has the same magnitude. What an unrotated scheme
+    // cannot handle is energy in a few coordinates: the signs of the near-zero rest are
+    // noise, and the code describes almost nothing. Real embeddings are concentrated far
+    // more often than they are alternating.
+    let mut worst_rotated = 1.0f32;
+    let mut worst_plain = 1.0f32;
+    for spike in [1usize, 2, 4] {
+        let mut v: Vec<f32> = (0..dim)
+            .map(|i| if i < spike { 1.0 } else { 0.001 })
+            .collect();
+        normalize(&mut v);
+        worst_rotated = worst_rotated.min(rotated.encode(&v).unwrap().alignment());
+        worst_plain = worst_plain.min(plain.encode(&v).unwrap().alignment());
+    }
+    assert!(
+        worst_rotated > worst_plain * 2.0,
+        "rotated alignment {worst_rotated:.4} against unrotated {worst_plain:.4}: the \
+         transform is not earning its cost on concentrated input"
+    );
+    assert!(worst_rotated > 0.5, "even rotated, alignment collapsed");
+}
+
+#[test]
+fn an_int4_query_costs_little_accuracy() {
+    // ⚠️ BBQ's asymmetry: 1-bit documents scored against a low-precision query. Our query is
+    // `f32`, which is *more* accurate, so int4 is a throughput option rather than an
+    // accuracy one — worth taking when SIMD lands. Measured at −1.3 points of recall@10;
+    // here the same claim is pinned as estimate error, which needs no corpus.
+    let q = Quantizer::new(DIM);
+    let mut rng = Rng(23);
+    let (mut full, mut quad) = (0.0f64, 0.0f64);
+    let n = 500;
+    for _ in 0..n {
+        let mut o = rng.vector(DIM);
+        normalize(&mut o);
+        let query = near(&o, &mut rng, 0.5);
+        let code = q.encode(&o).unwrap();
+        let prepared = q.prepare(&query).unwrap();
+        let truth = dot(&o, &query);
+        full += f64::from((q.estimate_prepared(&code, &prepared) - truth).abs());
+        let int4 = q.quantize_query_int4(&prepared);
+        quad += f64::from((q.estimate_prepared(&code, &int4) - truth).abs());
+    }
+    let (full, quad) = (full / f64::from(n), quad / f64::from(n));
+    assert!(
+        quad < full * 1.5,
+        "int4 query error {quad:.5} against f32's {full:.5}: the asymmetry costs more than \
+         a throughput trade should"
+    );
+}

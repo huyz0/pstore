@@ -239,3 +239,23 @@ fn int8_never_drops_a_true_neighbour_out_of_reach_of_the_exact_rung() {
         assert_eq!(got, want, "exact rerank disagreed with brute force");
     }
 }
+
+#[test]
+fn a_constant_vector_quantises_without_dividing_by_zero() {
+    // A vector whose coordinates are all equal has no range, so the step is zero and every
+    // code is the same. The reconstruction is exact and the estimate is well-defined; the
+    // only thing that could go wrong is dividing by the range, which is why the guard exists
+    // and why this exercises it.
+    let v = vec![0.25f32; 32];
+    let c = sq8::encode(&v);
+    assert_eq!(c.step(), 0.0);
+    assert_eq!(sq8::decode(&c), v, "a constant vector did not round-trip");
+    let q = vec![1.0f32; 32];
+    assert!((sq8::estimate(&c, &q) - 8.0).abs() < 1e-4);
+
+    // And through the wire form, which is what a segment stores.
+    let mut raw = Vec::new();
+    sq8::write_to(&c, &mut raw);
+    assert_eq!(raw.len(), sq8::record_len(32));
+    assert!((sq8::estimate_raw(&raw, &q) - 8.0).abs() < 1e-4);
+}

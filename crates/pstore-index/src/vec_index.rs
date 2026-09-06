@@ -171,6 +171,21 @@ pub fn build(docs: &[Document], params: Params) -> Built {
     build_field(docs, params, pstore_format::DEFAULT_FIELD)
 }
 
+/// One document's vector in `field`, at exactly `dim` components.
+///
+/// ⚠️ **The field's width is defined once, here.** `dim` comes from the first document that
+/// carries the field, and the segment writer pads or truncates to the same number — so
+/// letting a differently-sized vector through to the clustering is not a smaller problem
+/// than letting it through to the layout. A ragged corpus makes farthest-point seeding pick
+/// the outlier as a centroid, the centroid table becomes ragged, `Centroids::encode` writes
+/// one `dim` for all of them, and the spans decode to garbage: measured as a request for
+/// bytes `16477954617..457680856537` of a 218 KB object.
+fn fit(d: &Document, field: &str, dim: usize) -> Vec<f32> {
+    let mut v = d.field(field).first().cloned().unwrap_or_default();
+    v.resize(dim, 0.0);
+    v
+}
+
 /// Builds a segment and index over one **named** vector field.
 ///
 /// ⚠️ The field is a parameter rather than an assumption. A document may carry a body
@@ -187,10 +202,7 @@ pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
     let (order, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
         ((0..docs.len()).collect::<Vec<_>>(), None)
     } else {
-        let corpus: Vec<Vec<f32>> = docs
-            .iter()
-            .map(|d| d.field(field).first().cloned().unwrap_or_default())
-            .collect();
+        let corpus: Vec<Vec<f32>> = docs.iter().map(|d| fit(d, field, dim)).collect();
         let c = Clustering::build(&corpus, params);
         // ⚠️ Rows are written in LIST order, so a posting list is one contiguous byte range
         // and a probe is one ranged read rather than a scatter of thousands.
@@ -239,11 +251,7 @@ pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
             // previous version silently swallowed the resulting dimension error with
             // `if let Ok`, producing a segment whose code section was EMPTY and an index
             // that returned nothing at all.
-            let v = d
-                .field(field)
-                .first()
-                .cloned()
-                .unwrap_or_else(|| vec![0.0; dim]);
+            let v = fit(d, field, dim);
             match quantizer.encode_residual(&v, cen) {
                 Ok(code) => code.write_to(&mut rabitq),
                 // Unreachable: `v` is `dim` long by construction. Filled rather than

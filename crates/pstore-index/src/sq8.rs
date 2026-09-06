@@ -19,12 +19,6 @@ pub struct Code {
 }
 
 impl Code {
-    /// The packed codes, one byte per dimension.
-    #[must_use]
-    pub fn codes(&self) -> &[u8] {
-        &self.codes
-    }
-
     /// The reconstruction step: no coordinate is further than this from its original.
     #[must_use]
     pub fn step(&self) -> f32 {

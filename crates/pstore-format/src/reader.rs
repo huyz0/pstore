@@ -609,8 +609,13 @@ fn decode_field(
                 *offsets.get(i).ok_or(FormatError::Truncated)? as usize,
                 *offsets.get(i + 1).ok_or(FormatError::Truncated)? as usize,
             );
-            let body = raw
-                .get(table + lo..table + hi)
+            // ⚠️ Checked. A corrupt offset table — 0xFF bytes, say — makes these add past
+            // `usize::MAX` and panic on malformed input, which is the one thing a decoder
+            // must never do. Found by writing the truncation test, not by reading this.
+            let body = table
+                .checked_add(lo)
+                .zip(table.checked_add(hi))
+                .and_then(|(a, b)| raw.get(a..b))
                 .ok_or(FormatError::Truncated)?;
             out.push(body.chunks_exact(width).map(read).collect());
         }
