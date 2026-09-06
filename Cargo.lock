@@ -467,6 +467,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-cluster"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pstore-blob",
+ "pstore-testkit",
+ "pstore-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-engine"
 version = "0.1.0"
 dependencies = [

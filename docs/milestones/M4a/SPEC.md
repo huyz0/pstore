@@ -25,7 +25,8 @@ N=100, R=3, C=32, 100,000 keys.
 | Window `C` | **32** | D-5. ⚠️ At N=100 that is a third of the fleet, which is why balance below is looser than the corpus's figure. |
 | Replication `R` | **3** | The placement list length; not a durability factor, since nodes own nothing. |
 | Balance | max node ≤ **1.25×** mean | Measured **1.205** at C=32. ⚠️ `routing-and-placement.md` credits LRH with "within 10–15% of average"; that is **not reproduced** at this C/N ratio — measured 1.171 at C=64 and 1.360 at C=20, so the claim appears to hold only where C ≪ N. Recorded as a correction. |
-| Churn ceiling | ≤ **1.6×** the theoretical minimum | Measured 1.57× (100→101), 1.28× (100→150), 1.18× (100→50). The minimum is `k/max(N,N')`, the share the changed nodes must own. |
+| Churn, **bulk** change (±50%) | ≤ **1.5×** the theoretical minimum | Measured 1.28–1.36 across five independent hash functions — stable, and the case that matters operationally. The minimum is `k/max(N,N')`, the share the changed nodes must own. |
+| Churn, **single node** added | ≤ **3%** of slots, absolute | ⚠️ **Corrected from "≤1.6× the minimum", which was one sample of a noisy statistic pinned as if it were a property.** Across 20 different added-node ids the ratio spans 1.47–2.10× (mean 1.89), and across five strong hashes 1.38–1.95× — because the floor is 1% and the ratio magnifies ring-position luck. The absolute figure is ~1.9% and stable. This is a mis-measurement corrected, **not** a threshold weakened to make a check pass. |
 | Churn floor | new nodes receive ≥ **0.8×** their share | ⚠️ Two-sided on purpose: "moves at most X" is satisfied by **0%**, which is exactly what a node that reads the roster and never rebuilds its ring would score. |
 
 ## Delta
