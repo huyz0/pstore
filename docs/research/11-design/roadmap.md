@@ -119,6 +119,13 @@ immutable segment rewrite, and measure partition quality against a global rebuil
 **Exit:** either "batched LIRE preserves quality" or "we need a different maintenance
 strategy" — known *before* M3 hardens around it.
 
+> ✅ **Delivered: "batched LIRE preserves quality."** See
+> [C-4](../06-indexing/incremental-maintenance.md). Recall within 0.4 points of a rebuild,
+> better balanced, 3.4× less work. ⚠️ **Run after M3 hardened, not before**, which the
+> milestone was placed out of order to avoid — so the verdict arrived against code that
+> already existed. It came back positive, so the cost was zero this time; that is luck, not
+> process.
+
 ### M4 — Cluster (4–6 weeks)
 - `pstore-cluster`: gossip (SWIM+Lifeguard via `chitchat`/`foca`), LRH+CHBL placement,
   work assignment.

@@ -114,7 +114,7 @@ Zero downtime, one CAS to cut over, trivial rollback.
 
 - OQ-50: How much recall is lost from segment fragmentation (probing `p` lists across 10
   segments vs. one)? Measure — this determines the merge policy's aggressiveness.
-- OQ-51: LIRE on immutable storage — does batching decisions into compaction preserve its
+- ~~OQ-51~~ **ANSWERED in M3.5 — batched LIRE preserves quality.** See C-4 below.
   quality guarantees, or does deferral degrade the partition quality? **This is the biggest
   unvalidated assumption in the indexing design.**
 - OQ-52: Drift thresholds for triggering re-cluster.
@@ -127,3 +127,44 @@ Zero downtime, one CAS to cut over, trivial rollback.
 - [SPFresh notes — Hrushikesh Dokala](https://hrushikesh.dev/notes/spfresh/)
 - [SPANN: Highly-efficient Billion-scale ANN Search — arXiv](https://arxiv.org/pdf/2111.08566)
 - [turbopuffer — Architecture (SPFresh, minimizing write amplification)](https://turbopuffer.com/docs/architecture)
+
+
+## C-4 — OQ-51 answered: batched LIRE preserves quality
+
+**Measured** by `cargo run --release -p pstore-index --example lire`. 10,000 × 64d, 20
+groups, 6,000 initial rows then 10 batches of 400 with a **drifting** distribution — later
+batches favour groups the index was not built for, because a stationary stream lets any
+maintenance strategy look fine. ⚠️ `provisional`: WSL2, synthetic, thousands of vectors
+rather than a billion.
+
+| Strategy | lists | max/mean | cost/floor | recall@10 | examined | moved |
+|---|---|---|---|---|---|---|
+| **LIRE, split at 2× target** | 51 | **1.48** | 1.000 | 0.977 | **29,730** | **427** |
+| LIRE, reassigning everything | 51 | 1.46 | 1.000 | 0.979 | 637,600 | 871 |
+| Global rebuild | 67 | 3.35 | 1.000 | 0.981 | 100,000 | 10,000 |
+
+**Verdict: it holds.** Recall is within 0.4 points of a rebuild, assignment cost is
+identical, and the partition is *better balanced* (1.48 against 3.35) because LIRE inserts
+into the true nearest list while a balanced build refuses it. It examines 3.4× less than a
+rebuild and 21× less than reassigning every list, and moves 4.3% of the corpus.
+
+**Three corrections to the protocol as described above**, each found by the spike:
+
+1. **Splitting must iterate.** Bisecting a list that is 17× its bound gives two lists still
+   over it. A single pass left the largest list at 335 against a bound of 100.
+2. **Reassignment must run to a fixed point.** Moving a vector moves two centroids, which
+   can change a third vector's nearest. One pass left the index still drifting, so the next
+   cycle found work on an unchanged corpus — an index that rewrites a segment every cycle
+   for nothing.
+3. ⚠️ **An insert must not mark its list disturbed.** The rule above says reassignment is
+   triggered by *split and merge*; appending a row shifts a centroid by ~1/n and changes
+   nobody else's nearest. Dirtying on insert marks every list disturbed for any batch that
+   touches most lists — which at realistic batch sizes is every batch — and the saving
+   collapses from 21× to 1.36×. **The trigger condition is the whole economic claim.**
+
+Also: the split bound must **not** be the balance bound. Reusing it (4× target) settles the
+index on 40 large lists where a rebuild makes 67 — same recall, but every probe reads a
+bigger list, a cost the recall number hides. 2× target gives the best balance measured.
+
+⚠️ **Not shown:** deletes, which the rule table covers and this spike does not exercise; and
+anything at a scale where the centroid table itself needs a hierarchy (OQ-37).

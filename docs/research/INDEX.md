@@ -104,7 +104,7 @@ If you read nothing else:
 | [full-text-search.md](06-indexing/full-text-search.md) | Q21 | Inverted indexes already are ranged-read structures. Tantivy behind a custom `Directory`. Block-max metadata must live in the *cached* index section — a skipped block is a skipped network fetch. |
 | **[modalities-and-sequencing.md](06-indexing/modalities-and-sequencing.md)** | Q39 | Dense, sparse, and BM25 are one structure: postings with a generic impact payload. Build the general data model (named plural vectors, optional sections, `prefetch[]`+`fusion`) in v1; ship one retriever at a time. **Sparse before BM25** — it's exact, so it's far cheaper. |
 | [filtering.md](06-indexing/filtering.md) | Q22 | Graph indexes collapse under selective filters (islands/dead ends). Clustered indexes compose with pre-filtering. **Our round-trip choice hands us the better filtering architecture for free.** |
-| [incremental-maintenance.md](06-indexing/incremental-maintenance.md) | Q23 | LIRE/SPFresh touches only boundary vectors: 1% of DRAM, <10% of cores vs. global rebuild. Adapting it to immutable objects is **the design's biggest open risk (OQ-51)**. |
+| [incremental-maintenance.md](06-indexing/incremental-maintenance.md) | Q23 | LIRE/SPFresh touches only boundary vectors: 1% of DRAM, <10% of cores vs. global rebuild. ~~the design's biggest open risk (OQ-51)~~ **✅ C-4: measured, it holds — 3.4× less work than a rebuild at 0.4 points of recall. The trigger condition is the whole claim: dirtying on insert collapses the saving from 21× to 1.36×.** |
 
 ## 07 — Caching
 | Doc | Answers | Status |

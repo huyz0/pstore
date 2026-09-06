@@ -5,6 +5,7 @@
 
 pub mod cluster;
 pub mod ladder;
+pub mod lire;
 pub mod rabitq;
 pub mod search;
 pub mod sq8;
