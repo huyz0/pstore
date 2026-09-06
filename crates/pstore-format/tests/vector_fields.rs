@@ -130,82 +130,49 @@ fn a_document_with_no_vectors_is_legal() {
 }
 
 #[tokio::test]
-async fn a_writer_refuses_what_it_cannot_store() {
-    // ⚠️ Found by probing M3b.1 rather than by a test: making the MODEL expressible ahead of
-    // the FORMAT opened a window where a document with a field named anything but
-    // `DEFAULT_FIELD` round-tripped to nothing at all. Not truncated to one field --
-    // discarded, silently, because the writer reads `d.vector()` and a differently-named
-    // field yields an empty slice, so no vector section is written and the reader returns
-    // documents with no vectors.
-    //
-    // The old model could not express what it could not store, so it could not lose it.
-    // Until M3b.3 makes these storable, the writer must REFUSE them: a loud failure is
-    // recoverable and silent loss is not.
+async fn a_writer_refuses_only_what_it_still_cannot_store() {
+    // ⚠️ This test began much wider, and the history is the point. M3b.1 made the MODEL
+    // expressible ahead of the FORMAT, and in between a document with a field named
+    // anything but `DEFAULT_FIELD` round-tripped to *nothing* — discarded, silently,
+    // because the writer read one field by name and any other yielded an empty slice. The
+    // refusal turned that into a loud failure; M3b.3 then made those documents storable, so
+    // the refusal narrowed to what is genuinely still unsupported.
     use pstore_blob::{BlobStore, Key, MemoryStore};
     use pstore_format::{Segment, SegmentWriter};
 
-    let cases: Vec<(&str, Document)> = vec![
-        (
-            "a field that is not the default",
-            Document {
-                id: "d".to_owned(),
-                vectors: BTreeMap::from([("other".to_owned(), VectorField::dense(vec![1.0]))]),
-                attrs: BTreeMap::new(),
-            },
-        ),
-        (
-            "two named fields",
-            Document {
-                id: "d".to_owned(),
-                vectors: BTreeMap::from([
-                    (DEFAULT_FIELD.to_owned(), VectorField::dense(vec![1.0])),
-                    ("second".to_owned(), VectorField::dense(vec![2.0])),
-                ]),
-                attrs: BTreeMap::new(),
-            },
-        ),
-        (
-            "many vectors in one field",
-            Document {
-                id: "d".to_owned(),
-                vectors: BTreeMap::from([(
-                    DEFAULT_FIELD.to_owned(),
-                    VectorField::Dense(vec![vec![1.0], vec![2.0]]),
-                )]),
-                attrs: BTreeMap::new(),
-            },
-        ),
-        (
-            "a sparse field",
-            Document {
-                id: "d".to_owned(),
-                vectors: BTreeMap::from([(
-                    "s".to_owned(),
-                    VectorField::Sparse(vec![(1, Impact::new(0.5))]),
-                )]),
-                attrs: BTreeMap::new(),
-            },
-        ),
-    ];
+    let mut w = SegmentWriter::new(8);
+    w.push(Document {
+        id: "d".to_owned(),
+        vectors: BTreeMap::from([(
+            "s".to_owned(),
+            VectorField::Sparse(vec![(1, Impact::new(0.5))]),
+        )]),
+        attrs: BTreeMap::new(),
+    });
+    let err = w.try_finish().unwrap_err();
+    assert!(
+        format!("{err}").contains("M5a"),
+        "a sparse field was refused without naming what would support it: {err}"
+    );
 
-    for (what, doc) in cases {
-        let mut w = SegmentWriter::new(8);
-        w.push(doc);
-        assert!(
-            w.try_finish().is_err(),
-            "{what}: accepted by the writer, which stores it as nothing"
-        );
-    }
-
-    // And the case it CAN store is untouched.
+    // Named and plural fields are stored now, not refused.
     let s = MemoryStore::new();
     let key = Key::new("ok");
     let mut w = SegmentWriter::new(8);
-    w.push(Document::new("d0", vec![1.0, 2.0]));
+    w.push(Document {
+        id: "d0".to_owned(),
+        vectors: BTreeMap::from([
+            ("other".to_owned(), VectorField::dense(vec![1.0])),
+            (
+                "late".to_owned(),
+                VectorField::Dense(vec![vec![2.0], vec![3.0]]),
+            ),
+        ]),
+        attrs: BTreeMap::new(),
+    });
     s.put(&key, w.try_finish().unwrap()).await.unwrap();
     let seg = Segment::open(&s, &key).await.unwrap();
-    assert_eq!(
-        seg.scan(&s, &key, None).await.unwrap()[0].vector(),
-        [1.0, 2.0]
-    );
+    let out = seg.scan(&s, &key, None).await.unwrap();
+    assert_eq!(out[0].field("other"), [vec![1.0]]);
+    assert_eq!(out[0].field("late").len(), 2);
 }

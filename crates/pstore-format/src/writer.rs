@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 #[derive(Debug)]
 pub struct SegmentWriter {
     index_budget: usize,
+    write_fields: bool,
     rows_per_block: usize,
     /// Opaque, fixed-width payloads supplied by a higher layer.
     ///
@@ -51,6 +52,7 @@ impl SegmentWriter {
     pub fn new(rows_per_block: usize) -> Self {
         Self {
             index_budget: INDEX_BUDGET,
+            write_fields: true,
             rows_per_block: rows_per_block.max(1),
             extra: Vec::new(),
             raw_extra: Vec::new(),
@@ -93,6 +95,17 @@ impl SegmentWriter {
     #[must_use]
     pub fn with_raw_section(mut self, id: u16, bytes: Vec<u8>) -> Self {
         self.raw_extra.push((id, bytes));
+        self
+    }
+
+    /// Emits a segment with **no** `Fields` section, as one written before it existed.
+    ///
+    /// The only way to build the old shape once the writer always emits the new one, and
+    /// forward compatibility that cannot be constructed cannot be tested.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_fields_section_for_test(mut self) -> Self {
+        self.write_fields = false;
         self
     }
 
@@ -162,7 +175,16 @@ impl SegmentWriter {
         for d in &self.docs {
             crate::check_storable(d)?;
         }
-        Ok(self.finish_unchecked())
+        // Sealing is the only way to learn how big the meta region came out, so the width
+        // check reads the result rather than predicting it from the inputs.
+        let (bytes, fits) = self.seal_segment();
+        if !fits {
+            return Err(FormatError::Unsupported(
+                "too wide to open in one round trip: the directory and field table do not \
+                 fit the suffix read, so every query would cost an extra round trip",
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Seals the last block and emits the segment.
@@ -172,10 +194,11 @@ impl SegmentWriter {
     /// `try_finish`.
     #[must_use]
     pub fn finish(self) -> Bytes {
-        self.finish_unchecked()
+        self.seal_segment().0
     }
 
-    fn finish_unchecked(mut self) -> Bytes {
+    /// Seals the segment, and reports whether its meta region fits the suffix read.
+    fn seal_segment(mut self) -> (Bytes, bool) {
         let docs = std::mem::take(&mut self.docs);
         // ⚠️ Grow the block size until the index fits the budget, rather than trusting the
         // caller's request. Doubling terminates: at one block the index is a handful of
@@ -194,30 +217,82 @@ impl SegmentWriter {
             self.rows_per_block = self.rows_per_block.saturating_mul(2);
         };
 
-        // Vectors leave the data blocks entirely and become their own section: row-major,
-        // fixed width, so row `i` is a computable byte range and a reader can fetch one row
-        // or none without touching the rest.
-        let dim = docs.first().map_or(0, |d| d.vector().len());
-        let vectors: Vec<u8> = if dim == 0 {
-            Vec::new()
-        } else {
-            let mut v = Vec::with_capacity(docs.len() * dim * 4);
-            for d in &docs {
-                // A ragged vector would silently shift every later row. Padding is the
-                // conservative choice: a wrong-length vector is a caller bug, and truncating
-                // the section would corrupt rows that are fine.
-                for j in 0..dim {
-                    v.extend_from_slice(&d.vector().get(j).copied().unwrap_or(0.0).to_le_bytes());
-                }
-            }
-            v
-        };
+        // ⚠️ One set of sections per named field. Fields are taken in name order so the
+        // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader
+        // that predates the Fields table sees exactly the single-dense view it expects
+        // rather than an arbitrary field's vectors.
+        let mut names: Vec<String> = docs
+            .iter()
+            .flat_map(|d| d.vectors.keys().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
 
         let mut out = self.body;
         let mut dir: Vec<(Section, u64, u64)> = Vec::new();
-        if !vectors.is_empty() {
-            dir.push((Section::Vectors, out.len() as u64, vectors.len() as u64));
-            out.raw(&vectors);
+        let mut fields: Vec<crate::FieldLayout> = Vec::new();
+        for (fi, name) in names.iter().enumerate() {
+            let vectors_id = if fi == 0 {
+                Section::Vectors
+            } else {
+                Section::FieldVectors
+            };
+            let dims = docs
+                .iter()
+                .find_map(|d| d.field(name).first().map(Vec::len))
+                .unwrap_or(0);
+            if dims == 0 {
+                continue;
+            }
+            // Fixed width when every row holds exactly one vector, which is the dense case
+            // and the one worth keeping cheap.
+            let per_row = if docs.iter().all(|d| d.field(name).len() == 1) {
+                1u32
+            } else {
+                0
+            };
+            let mut body: Vec<u8> = Vec::new();
+            if per_row == 0 {
+                // (rows + 1) offsets, so row `i` is `offsets[i]..offsets[i + 1]` and the
+                // last row needs no special case.
+                let mut at = 0u64;
+                let mut offsets: Vec<u64> = Vec::with_capacity(docs.len() + 1);
+                for d in &docs {
+                    offsets.push(at);
+                    at += (d.field(name).len() * dims * 4) as u64;
+                }
+                offsets.push(at);
+                for o in &offsets {
+                    body.extend_from_slice(&o.to_le_bytes());
+                }
+            }
+            for d in &docs {
+                for v in d.field(name) {
+                    for j in 0..dims {
+                        body.extend_from_slice(&v.get(j).copied().unwrap_or(0.0).to_le_bytes());
+                    }
+                }
+            }
+            dir.push((vectors_id, out.len() as u64, body.len() as u64));
+            out.raw(&body);
+            fields.push(crate::FieldLayout {
+                name: name.clone(),
+                kind: 0,
+                metric: 0,
+                dims: dims as u32,
+                per_row,
+                vectors: vectors_id as u16,
+                rabitq: if fi == 0 {
+                    Section::RaBitQ as u16
+                } else {
+                    Section::FieldRaBitQ as u16
+                },
+                sq8: if fi == 0 {
+                    Section::Sq8 as u16
+                } else {
+                    Section::FieldSq8 as u16
+                },
+            });
         }
         let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
         for (section, bytes) in &self.extra {
@@ -238,12 +313,35 @@ impl SegmentWriter {
         // The meta region: directory first, then the block index, checksummed together and
         // addressed by the footer as one span. One suffix read brings back the footer and,
         // for any segment the writer produced, this whole region.
+        // ⚠️ The Fields table lives INSIDE the meta region, beside the directory and the
+        // block index, so the one suffix read that opens a segment brings it back. Written
+        // into the body instead it would sit outside those bytes and cost a second round
+        // trip on every cold open — for a table of a few dozen bytes that every read needs.
+        let fields_bytes = if fields.is_empty() || !self.write_fields {
+            Vec::new()
+        } else {
+            let mut t = Enc::default();
+            t.u32(fields.len() as u32);
+            for f in &fields {
+                t.bytes(f.name.as_bytes());
+                t.u8(f.kind);
+                t.u8(f.metric);
+                t.u32(f.dims);
+                t.u32(f.per_row);
+                t.u16(f.vectors);
+                t.u16(f.rabitq);
+                t.u16(f.sq8);
+            }
+            t.0
+        };
+
         let meta_offset = out.len() as u64;
-        dir.push((
-            Section::Blocks,
-            0, // patched below, once the directory's own length is known
-            idx.len() as u64,
-        ));
+        // Both of these live inside the meta region, so their offsets are not known until
+        // the directory's own length is. Pushed last, in this order, and patched below.
+        if !fields_bytes.is_empty() {
+            dir.push((Section::Fields, 0, fields_bytes.len() as u64));
+        }
+        dir.push((Section::Blocks, 0, idx.len() as u64));
         let mut meta = Enc::default();
         meta.u32((dir.len() + raw_dir.len()) as u32);
         for (section, offset, len) in &dir {
@@ -256,15 +354,36 @@ impl SegmentWriter {
             meta.u64(*offset);
             meta.u64(*len);
         }
-        let blocks_at = meta_offset + meta.len() as u64;
-        // Patch the Blocks entry now that the directory's size is known. Encoding it twice
-        // would be simpler and would silently break the moment the directory's size depended
-        // on the value being patched.
-        let entry = 4 + (dir.len() - 1) * (2 + 8 + 8) + 2;
-        if let Some(slot) = meta.0.get_mut(entry..entry + 8) {
-            slot.copy_from_slice(&blocks_at.to_le_bytes());
+        // Patch the offsets of the entries that live inside the meta region, now that the
+        // directory's own length is known. Encoding twice would be simpler and would break
+        // the moment a directory's size depended on the value being patched.
+        //
+        // ⚠️ Entries are FIXED width — 2 + 8 + 8 — which is what makes this arithmetic
+        // sound. It is also why the field names went into their own section rather than
+        // into the entries: a variable-length name would make this patch land in the wrong
+        // slot and corrupt silently rather than fail.
+        const ENTRY: usize = 2 + 8 + 8;
+        let mut at = meta_offset + meta.len() as u64;
+        let patched = if fields_bytes.is_empty() { 1 } else { 2 };
+        for n in 0..patched {
+            let entry = 4 + (dir.len() - patched + n) * ENTRY + 2;
+            if let Some(slot) = meta.0.get_mut(entry..entry + 8) {
+                slot.copy_from_slice(&at.to_le_bytes());
+            }
+            at += if patched == 2 && n == 0 {
+                fields_bytes.len() as u64
+            } else {
+                0
+            };
         }
+        meta.raw(&fields_bytes);
         meta.raw(&idx.0);
+
+        // ⚠️ The meta region must fit the one suffix read that opens a segment. The fitting
+        // loop above can only shrink the BLOCK index; the directory and the Fields table
+        // grow with the field count and it cannot help with those. Past that point a cold
+        // open silently costs a second round trip — and every query built on it a fourth.
+        let fits = meta.len() <= self.index_budget;
 
         let meta_len = meta.len() as u32;
         let sum = checksum(&meta.0);
@@ -283,6 +402,6 @@ impl SegmentWriter {
             out.len() as u64 - meta_offset - u64::from(meta_len),
             FOOTER_LEN as u64
         );
-        Bytes::from(out.0)
+        (Bytes::from(out.0), fits)
     }
 }

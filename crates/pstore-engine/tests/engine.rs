@@ -391,34 +391,24 @@ async fn a_corrupt_bundle_fails_the_fold_rather_than_losing_rows() {
 #[tokio::test]
 async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     // ⚠️ Refused on `write`, not discovered at `fold`. A document accepted here and found
-    // unstorable later is a write the caller believes is durable and which never appears —
-    // and before this check existed it was written as *nothing*, silently, because the
-    // writer read one field by name and a differently-named field yielded an empty slice.
+    // unstorable later is a write the caller believes is durable and which never appears.
+    // Sparse is what remains unstorable; named and plural fields are stored as of M3b.3.
     let s = Arc::new(MemoryStore::new());
     let e = Engine::new(Arc::clone(&s), TenantId(77), pstore_types::LaneId(0));
 
-    let mut named = pstore_format::Document::new("d", vec![1.0]);
-    named.vectors.clear();
-    named.vectors.insert(
-        "other".to_owned(),
-        pstore_format::VectorField::dense(vec![1.0]),
+    let mut sparse = pstore_format::Document::new("d", vec![1.0]);
+    sparse.vectors.clear();
+    sparse.vectors.insert(
+        "s".to_owned(),
+        pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
     );
     assert!(
-        e.write("idx", vec![named]).await.is_err(),
-        "a differently-named field was accepted, and it stores as nothing"
+        e.write("idx", vec![sparse]).await.is_err(),
+        "a sparse field was accepted, and it has no layout to be stored in"
     );
-
-    let mut multi = pstore_format::Document::new("d", vec![1.0]);
-    multi.vectors.insert(
-        pstore_format::DEFAULT_FIELD.to_owned(),
-        pstore_format::VectorField::Dense(vec![vec![1.0], vec![2.0]]),
-    );
-    assert!(e.write("idx", vec![multi]).await.is_err());
-
     // Nothing was buffered by a refused write: a rejected batch must not half-land.
     assert!(e.pending_for_test().await.is_empty());
 
-    // The storable case is untouched.
     e.write("idx", vec![doc("ok", 1)]).await.unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();

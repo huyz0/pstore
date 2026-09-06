@@ -53,6 +53,53 @@ pub enum Section {
     TermDict = 6,
     /// Reserved: token positions (M6).
     Positions = 7,
+    /// Describes every vector field: name, kind, metric, dims, and row width.
+    ///
+    /// ⚠️ **Additive.** The names could have gone into the directory entries, and that would
+    /// have needed a version bump — breaking every existing segment, against
+    /// `modalities-and-sequencing.md` §3's promise that old segments stay valid forever. It
+    /// would also have broken `writer.rs`'s fixed-width patch of the `Blocks` entry offset,
+    /// silently. As its own section, a reader that has never heard of it is unaffected.
+    Fields = 8,
+    /// Vectors of the **second and later** fields.
+    ///
+    /// ⚠️ Field 0 keeps [`Section::Vectors`]. Letting every field share that id looks
+    /// additive and is not: `Segment::open` keys sections by id, last wins, so a reader
+    /// predating this table would return *another field's* vectors as the segment's — a
+    /// wrong answer rather than a skip, in the one direction the mechanism exists to
+    /// protect.
+    FieldVectors = 9,
+    /// RaBitQ codes of the second and later fields.
+    FieldRaBitQ = 10,
+    /// int8 codes of the second and later fields.
+    FieldSq8 = 11,
+}
+
+/// How a vector field is laid out in a segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldLayout {
+    /// The field's name, as the document used it.
+    pub name: String,
+    /// 0 = dense, 1 = sparse.
+    pub kind: u8,
+    /// 0 = dot, 1 = cosine, 2 = l2. Named by the schema in
+    /// `modalities-and-sequencing.md` §3, which the M3 index hardcoded as dot.
+    pub metric: u8,
+    /// Components per vector.
+    pub dims: u32,
+    /// Vectors per row, or **0 for variable** — then the section opens with `rows + 1`
+    /// `u64` offsets.
+    ///
+    /// ⚠️ Fixed width is the common case and stays the fast path: a row-offset table on a
+    /// single-vector field costs four bytes a row and buys nothing, and no recall or query
+    /// byte gate can see it.
+    pub per_row: u32,
+    /// Which section id carries this field's vectors.
+    pub vectors: u16,
+    /// Which section id carries its 1-bit codes.
+    pub rabitq: u16,
+    /// Which section id carries its int8 codes.
+    pub sq8: u16,
 }
 
 /// The index section's length, read from a segment's footer.
@@ -99,29 +146,15 @@ pub enum Value {
 /// are sealed. A write acknowledged and then found unstorable at fold time is a write the
 /// caller believes is durable and which will never appear.
 pub fn check_storable(d: &Document) -> Result<(), FormatError> {
-    if d.vectors.len() > 1 {
-        return Err(FormatError::Unsupported(
-            "several vector fields are not stored yet (M3b.3)",
-        ));
-    }
-    for (name, field) in &d.vectors {
-        match field {
-            VectorField::Sparse(_) => {
-                return Err(FormatError::Unsupported(
-                    "sparse vector fields are not stored yet (M5a)",
-                ));
-            }
-            VectorField::Dense(v) if v.len() > 1 => {
-                return Err(FormatError::Unsupported(
-                    "a field with several vectors per document is not stored yet (M3b.3)",
-                ));
-            }
-            VectorField::Dense(_) if name != DEFAULT_FIELD => {
-                return Err(FormatError::Unsupported(
-                    "named vector fields are not stored yet (M3b.3)",
-                ));
-            }
-            VectorField::Dense(_) => {}
+    // ⚠️ Narrowed to sparse alone once M3b.3 made named and plural fields storable. It was
+    // briefly much wider, as a stopgap: the model gained those shapes before the layout did,
+    // and in between a document carrying one was written as *nothing*. The refusal is what
+    // turned silent loss into a loud failure; the fix was to make it unnecessary.
+    for field in d.vectors.values() {
+        if matches!(field, VectorField::Sparse(_)) {
+            return Err(FormatError::Unsupported(
+                "sparse vector fields are not stored yet (M5a)",
+            ));
         }
     }
     Ok(())
@@ -307,6 +340,9 @@ pub enum FormatError {
     /// silently. A caller cannot recover from a loss it is not told about.
     #[error("cannot store this document: {0}")]
     Unsupported(&'static str),
+    /// A field the segment does not carry.
+    #[error("no such vector field")]
+    UnknownField,
     /// Written by a version this build does not understand.
     #[error("unsupported segment version {0}")]
     UnsupportedVersion(u16),

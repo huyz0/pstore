@@ -15,6 +15,8 @@ pub struct Segment {
     rows: u32,
     /// Where each section lives, from the footer-addressed directory.
     sections: BTreeMap<u16, std::ops::Range<u64>>,
+    /// The vector fields this segment carries.
+    fields: Vec<crate::FieldLayout>,
 }
 
 impl Segment {
@@ -104,11 +106,111 @@ impl Segment {
             .ok_or(FormatError::Truncated)?;
         let blocks = idx_bytes.get(lo..hi).ok_or(FormatError::Truncated)?;
 
-        Ok(Self {
+        let mut seg = Self {
             blocks: Self::decode_index(blocks)?,
             rows,
             sections,
-        })
+            fields: Vec::new(),
+        };
+        seg.fields = seg.decode_fields(&idx_bytes, meta_offset)?;
+        Ok(seg)
+    }
+
+    /// Parses the `Fields` table, or synthesises the legacy one-dense-field view.
+    ///
+    /// ⚠️ A segment without the table is not an error and not empty: it is exactly today's
+    /// segment, one dense field named [`crate::DEFAULT_FIELD`]. That is the whole point of
+    /// putting the table in its own section — `modalities-and-sequencing.md` §3 promises old
+    /// segments stay valid forever.
+    fn decode_fields(
+        &self,
+        meta: &[u8],
+        meta_offset: u64,
+    ) -> Result<Vec<crate::FieldLayout>, FormatError> {
+        let Some(span) = self.section(Section::Fields) else {
+            return Ok(if self.section(Section::Vectors).is_some() {
+                vec![crate::FieldLayout {
+                    name: crate::DEFAULT_FIELD.to_owned(),
+                    kind: 0,
+                    metric: 0,
+                    dims: self.vector_row_len() as u32 / 4,
+                    per_row: 1,
+                    vectors: Section::Vectors as u16,
+                    rabitq: Section::RaBitQ as u16,
+                    sq8: Section::Sq8 as u16,
+                }]
+            } else {
+                Vec::new()
+            });
+        };
+        // The table lives outside the meta region, so it needs its own read unless it
+        // happens to fall inside the bytes already fetched.
+        let lo = span.start.checked_sub(meta_offset).unwrap_or(u64::MAX) as usize;
+        let raw = meta
+            .get(lo..lo + (span.end - span.start) as usize)
+            .ok_or(FormatError::Truncated)?;
+        let mut d = Dec::new(raw);
+        let n = d.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1 << 12));
+        for _ in 0..n {
+            out.push(crate::FieldLayout {
+                name: d.string()?,
+                kind: d.u8()?,
+                metric: d.u8()?,
+                dims: d.u32()?,
+                per_row: d.u32()?,
+                vectors: d.u16()?,
+                rabitq: d.u16()?,
+                sq8: d.u16()?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every vector field this segment carries.
+    #[must_use]
+    pub fn fields(&self) -> &[crate::FieldLayout] {
+        &self.fields
+    }
+
+    /// The layout of one named field.
+    #[must_use]
+    pub fn field_layout(&self, name: &str) -> Option<&crate::FieldLayout> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Where one field's `kind` section lives.
+    #[must_use]
+    pub fn field_section(&self, name: &str, kind: Section) -> Option<std::ops::Range<u64>> {
+        let f = self.field_layout(name)?;
+        let id = match kind {
+            Section::Vectors | Section::FieldVectors => f.vectors,
+            Section::RaBitQ | Section::FieldRaBitQ => f.rabitq,
+            Section::Sq8 | Section::FieldSq8 => f.sq8,
+            other => other as u16,
+        };
+        self.sections.get(&id).cloned()
+    }
+
+    /// One field's vectors, one entry per row.
+    ///
+    /// An absent field is an **error**: a miss returning zero rows is indistinguishable
+    /// from a legitimately empty field, so a caller could not tell a typo from data.
+    pub async fn field_vectors<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        name: &str,
+    ) -> Result<Vec<Vec<Vec<f32>>>, FormatError> {
+        let f = self
+            .field_layout(name)
+            .ok_or(FormatError::UnknownField)?
+            .clone();
+        let Some(span) = self.field_section(name, Section::Vectors) else {
+            return Ok(vec![Vec::new(); self.rows as usize]);
+        };
+        let raw = store.get_range(key, span).await?;
+        decode_field(&raw, &f, self.rows as usize)
     }
 
     /// The byte offset just past the last data block.
@@ -330,21 +432,56 @@ impl Segment {
         // a caller could see. Width is free; depth is not.
         let bufs = store.get_ranges(key, &all).await?;
 
+        // ⚠️ Every field, not just the first. `scan` returns whole documents, and a
+        // document that comes back missing a field it was written with is silent loss at
+        // the read side — the mirror of the write-side bug this milestone opened and closed.
+        // ⚠️ The inline path below reads one fixed-width vector per row and prunes to the
+        // blocks the filter selected — the common case, and the one where zone-map pruning
+        // saves bytes. It cannot serve a variable-width field (several vectors per row), so
+        // anything that is not exactly one fixed-width field is read whole, per field.
+        let simple = self.fields.len() == 1 && self.fields.first().is_some_and(|f| f.per_row == 1);
+        let extra = if simple {
+            Vec::new()
+        } else {
+            let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::new();
+            for f in &self.fields {
+                m.push((
+                    f.name.clone(),
+                    self.field_vectors(store, key, &f.name).await?,
+                ));
+            }
+            m
+        };
+        let first_field = self
+            .fields
+            .first()
+            .map_or_else(|| crate::DEFAULT_FIELD.to_owned(), |f| f.name.clone());
+
         let mut out = Vec::new();
-        for (n, _) in wanted.iter().enumerate() {
+        for (n, block) in wanted.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
             let rows = Self::decode_block(buf)?;
             let vecs = bufs.get(block_count + n);
+            // The absolute row index this block starts at, so a per-row lookup into a
+            // whole-field vector lands on the right row.
+            let start = base.get(*block).copied().unwrap_or(0);
             for (r, mut doc) in rows.into_iter().enumerate() {
-                if let Some(raw) = vecs.and_then(|v| v.get(r * per_row..(r + 1) * per_row)) {
+                if let Some(raw) = vecs
+                    .filter(|_| simple)
+                    .and_then(|v| v.get(r * per_row..(r + 1) * per_row))
+                {
                     let v: Vec<f32> = raw
                         .chunks_exact(4)
                         .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
                         .collect();
-                    doc.vectors.insert(
-                        crate::DEFAULT_FIELD.to_owned(),
-                        crate::VectorField::dense(v),
-                    );
+                    doc.vectors
+                        .insert(first_field.clone(), crate::VectorField::dense(v));
+                }
+                for (name, all) in &extra {
+                    if let Some(v) = all.get(start + r) {
+                        doc.vectors
+                            .insert(name.clone(), crate::VectorField::Dense(v.clone()));
+                    }
                 }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);
@@ -403,4 +540,50 @@ impl Segment {
     fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
         crate::decode_rows(buf)
     }
+}
+
+/// Decodes one field's vector section.
+fn decode_field(
+    raw: &[u8],
+    f: &crate::FieldLayout,
+    rows: usize,
+) -> Result<Vec<Vec<Vec<f32>>>, FormatError> {
+    let dims = f.dims as usize;
+    let width = dims * 4;
+    if dims == 0 {
+        return Ok(vec![Vec::new(); rows]);
+    }
+    let read = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
+            .collect()
+    };
+    if f.per_row == 0 {
+        // Variable width: `rows + 1` offsets, so row `i` is `offsets[i]..offsets[i + 1]`
+        // and the last row is not a special case.
+        let table = (rows + 1) * 8;
+        let offsets: Vec<u64> = raw
+            .get(..table)
+            .ok_or(FormatError::Truncated)?
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .collect();
+        let mut out = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let (lo, hi) = (
+                *offsets.get(i).ok_or(FormatError::Truncated)? as usize,
+                *offsets.get(i + 1).ok_or(FormatError::Truncated)? as usize,
+            );
+            let body = raw
+                .get(table + lo..table + hi)
+                .ok_or(FormatError::Truncated)?;
+            out.push(body.chunks_exact(width).map(read).collect());
+        }
+        return Ok(out);
+    }
+    Ok(raw
+        .chunks_exact(width)
+        .map(|b| vec![read(b)])
+        .take(rows)
+        .collect())
 }
