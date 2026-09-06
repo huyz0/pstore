@@ -160,6 +160,14 @@ pub struct Query(Vec<f32>);
 /// A dimension's quantizer. Holds no data-derived state — that is the point.
 #[derive(Debug, Clone)]
 pub struct Quantizer {
+    /// Whether the Randomized Hadamard Transform is applied.
+    ///
+    /// ⚠️ Off is **not** a supported configuration — it exists so OQ-39 can measure what the
+    /// rotation buys, which is the substantive difference between RaBitQ and BBQ. BBQ
+    /// (Lucene) subtracts a centroid and quantizes the residual's signs with per-vector
+    /// corrections, and does *not* rotate; RaBitQ's error bound is derived over the
+    /// randomized transform and does not hold without it.
+    rotate: bool,
     dim: usize,
     /// Padded to a power of two, which the Walsh–Hadamard transform requires.
     padded: usize,
@@ -185,7 +193,43 @@ impl Quantizer {
                 if (z ^ (z >> 31)) & 1 == 0 { 1.0 } else { -1.0 }
             })
             .collect();
-        Self { dim, padded, flips }
+        Self {
+            rotate: true,
+            dim,
+            padded,
+            flips,
+        }
+    }
+
+    /// A quantizer with the rotation disabled, for the OQ-39 comparison.
+    ///
+    /// ⚠️ Not for production. Without the randomized transform the error bound has no
+    /// derivation behind it, and structured input — which real embeddings are — collapses
+    /// the code's information content.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_rotation(dim: usize) -> Self {
+        Self {
+            rotate: false,
+            ..Self::new(dim)
+        }
+    }
+
+    /// Quantizes a prepared query to int4, BBQ-style.
+    ///
+    /// The asymmetry BBQ contributes: 1-bit documents scored against a low-precision query
+    /// costs nothing in storage and buys integer SIMD. Measured here because our query is
+    /// currently full `f32`, which is *more* accurate than int4 — so this is a throughput
+    /// trade, not an accuracy one, and OQ-39 should say what it costs.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn quantize_query_int4(&self, q: &Query) -> Query {
+        let hi = q.0.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        if hi <= 0.0 {
+            return q.clone();
+        }
+        let step = hi / 7.0;
+        Query(q.0.iter().map(|x| (x / step).round() * step).collect())
     }
 
     /// Bytes one code occupies on the wire: sign bits plus the alignment.
@@ -237,6 +281,13 @@ impl Quantizer {
     /// are preserved — which is what lets the estimate be compared against the original
     /// vectors' inner product at all.
     fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        if !self.rotate {
+            let mut a = vec![0.0f32; self.padded];
+            for (slot, x) in a.iter_mut().zip(v) {
+                *slot = *x;
+            }
+            return a;
+        }
         let mut a = vec![0.0f32; self.padded];
         for ((slot, x), flip) in a.iter_mut().zip(v).zip(&self.flips) {
             *slot = x * flip;

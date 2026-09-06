@@ -135,8 +135,8 @@ single argument for aggressive quantization.
 
 ## Open questions raised
 
-- OQ-39: Measure RaBitQ vs BBQ vs int8 on our target embedding families (OpenAI, Cohere,
-  Voyage, open models) at 768/1024/1536/3072 dims.
+- ~~OQ-39~~ **ANSWERED (M3): see C-5.** Remains open only for *real* embedding families;
+  the structural question is settled.
 - OQ-40: Optimal oversample factor per rung as a function of dimension and target recall.
 - OQ-41: Does 1-bit hold up at 3072 dims with Matryoshka-truncated embeddings?
 - OQ-42: Should we support per-index opt-in PQ for customers who benchmark it as better on
@@ -152,3 +152,37 @@ single argument for aggressive quantization.
 - [Quantization — Qdrant docs](https://qdrant.tech/documentation/manage-data/quantization/)
 - [Binary quantization in Azure AI Search — Microsoft](https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/binary-quantization-in-azure-ai-search-optimized-storage-and-faster-search/4221918)
 - [Bang for the Buck: Vector Search on Cloud CPUs — arXiv](https://arxiv.org/pdf/2505.07621)
+
+
+## C-5 — OQ-39 answered: keep RaBitQ, and the int8 rung is structural
+
+**Measured** by `cargo run --release -p pstore-index --example oq39`. 20,000 × 384d
+clustered synthetic, 100 posting lists, k=10, p=8, oversample=32. ⚠️ `provisional`: WSL2,
+synthetic corpus — the question of real embedding families (OpenAI, Cohere, Voyage) is
+still open.
+
+| Variant | rung 0 alone | with the int8 rung |
+|---|---|---|
+| **RaBitQ** — rotated, `f32` query | **0.3200** | 0.9740 |
+| **BBQ-like** — no rotation, `f32` query | 0.2630 | 0.9710 |
+| RaBitQ + **int4 query** (BBQ's asymmetry) | 0.3070 | 0.9750 |
+
+**Three answers.**
+
+1. ⚠️ **No binary scheme rescues rung 0.** The best variant reaches 0.32 against a 0.90
+   floor. Combined with [C-3](#c-3--rung-0-alone-does-not-suffice-and-the-ladders-first-two-rungs-share-a-round-trip),
+   this settles it: **the int8 rung is structural, not a tuning artefact**, and the ~4× bytes
+   per query it costs cannot be optimized away by choosing a better 1-bit code. Anything
+   sizing bandwidth should assume the int8 tier.
+2. **The randomized rotation earns its cost**: +5.7 points at rung 0 (0.320 against 0.263),
+   a 22% relative gain, over the same construction without it. That is the substantive
+   difference between RaBitQ and BBQ here — both subtract a centroid and keep per-vector
+   corrections; only RaBitQ rotates. It is also what the error bound is derived over.
+3. **BBQ's int4 query is nearly free**: −1.3 points at rung 0, indistinguishable after
+   rerank (0.975 against 0.974). Our query is `f32` today, so this is a **throughput option,
+   not an accuracy one** — worth taking when SIMD lands, since integer kernels are the point.
+
+**What remains open in OQ-39**: real embedding families at 768/1024/1536/3072 dims. The
+structural finding above is unlikely to move — it follows from the 1-bit code's error being
+larger than the spread among vectors that share a posting list — but the *margins* between
+schemes may.

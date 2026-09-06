@@ -34,7 +34,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-24 | S3 Express One Zone durability semantics; dual-write cost at real batch sizes | `05/write-path-and-wal` |
 | OQ-26 | Our segment format vs. Lance for random access and scan — should we adopt rather than build? | `05/file-format-and-layout` |
 | OQ-35 | Two-index design (SPANN cold / DiskANN warm) — measure before rejecting permanently | `06/vector-index-survey` |
-| OQ-39 | RaBitQ vs BBQ vs int8 on our target embedding families and dimensions | `06/quantization` |
+| ~~OQ-39~~ | RaBitQ vs BBQ vs int8 on our target embedding families and dimensions. **ANSWERED structurally (M3, C-5): keep RaBitQ (rotation is +5.7 points), no binary scheme rescues rung 0, int4 query is a free throughput option. Open only for real embedding families.** | `06/quantization` |
 | OQ-43 | Tantivy-over-`Directory` request amplification for a realistic multi-term query | `06/full-text-search` |
 | OQ-46 | Selectivity thresholds for filter plan switching (YFCC + synthetic correlated) | `06/filtering` |
 | OQ-50 | Recall lost to segment fragmentation (probing `p` lists across 10 segments vs 1) | `06/incremental-maintenance` |
