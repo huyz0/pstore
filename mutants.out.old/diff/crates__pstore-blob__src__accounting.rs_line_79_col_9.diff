@@ -1,23 +1,25 @@
 --- crates/pstore-blob/src/accounting.rs
-+++ replace Accounted<S>::lock -> std::sync::MutexGuard<'_, Counters> with MutexGuard::new()
-@@ -71,19 +71,17 @@
++++ replace Accounted<S>::count -> u64 with 0
+@@ -71,21 +71,17 @@
+             counters: Arc::clone(&self.counters),
+             tenant,
+         }
+     }
  
-     /// Requests of `class` across every tenant.
+     /// Requests of `class` billed to `tenant`.
      #[must_use]
-     pub fn total(&self, class: OpClass) -> u64 {
-         self.lock().totals.get(&class).copied().unwrap_or(0)
+     pub fn count(&self, tenant: TenantId, class: OpClass) -> u64 {
+-        self.lock()
+-            .per_tenant
+-            .get(&(tenant, class))
+-            .copied()
+-            .unwrap_or(0)
++        0 /* ~ changed by cargo-mutants ~ */
      }
  
-     fn lock(&self) -> std::sync::MutexGuard<'_, Counters> {
--        self.counters
--            .lock()
--            .unwrap_or_else(std::sync::PoisonError::into_inner)
-+        MutexGuard::new() /* ~ changed by cargo-mutants ~ */
-     }
- }
- 
- /// One tenant's view of an [`Accounted`] store.
- #[derive(Debug, Clone)]
- pub struct TenantView<S> {
-     inner: Arc<S>,
-     counters: Arc<Mutex<Counters>>,
+     /// Bytes of `class` billed to `tenant`.
+     ///
+     /// A `head` moves no body and adds nothing here: counting it as the object's size
+     /// would make a metadata probe look like a full fetch and hide the exact difference
+     /// the design turns on.
+     #[must_use]

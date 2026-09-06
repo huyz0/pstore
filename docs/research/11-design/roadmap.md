@@ -111,6 +111,14 @@ disproven.
 > ⚠️ **[C-3](../00-plan/open-questions.md) corrects D-11.** Rung 0 alone measures 0.30
 > recall@10, not the 90–95% `quantization.md` claims. int8 rerank reaches 0.981 in the same
 > three round trips, so the default rerank mode is `fast` and the budget still closes.
+>
+> ⚠️ **M3 also shipped violating two of the three v1 data-model properties**
+> `06-indexing/modalities-and-sequencing.md` §3 requires: vectors were singular
+> ("the migration trap") and the layout was one-row-one-vector (D-28: "a rewrite").
+> Corrected out of order in **M3b** — see
+> [`docs/milestones/M3b/VERIFIED.md`](../../milestones/M3b/VERIFIED.md) — because the cost
+> of that correction grows with every milestone built on top, and M5a is where it would
+> have bitten.
 
 ### M3.5 — LIRE spike (run in parallel from M1, 2 weeks of effort)
 **Out of order deliberately.** Prototype LIRE-style split/merge/reassign batched into an

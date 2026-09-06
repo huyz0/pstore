@@ -29,22 +29,22 @@
        Fresh unicode-ident v1.0.24
        Fresh proc-macro2 v1.0.107
        Fresh pin-project-lite v0.2.17
-       Dirty pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-ayi9Ve.tmp/crates/pstore-types): the file `crates/pstore-types/src/lib.rs` has changed (1788615405.314096925s, 8m 7s after last build at 1788614918.102963258s)
-   Compiling pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-ayi9Ve.tmp/crates/pstore-types)
-       Fresh futures-task v0.3.34
-       Fresh futures-core v0.3.34
        Fresh slab v0.4.12
+       Dirty pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-DJ9WhG.tmp/crates/pstore-types): the file `crates/pstore-types/src/lib.rs` has changed (1788646191.705217327s, 37m 54s after last build at 1788643917.141164233s)
+   Compiling pstore-types v0.1.0 (/tmp/cargo-mutants-pstore-DJ9WhG.tmp/crates/pstore-types)
+       Fresh futures-core v0.3.34
+       Fresh futures-task v0.3.34
        Fresh bytes v1.12.1
        Fresh futures-util v0.3.34
-     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps`
+     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps`
        Fresh quote v1.0.47
-     Running `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps`
        Fresh syn v3.0.5
        Fresh tokio-macros v2.7.2
        Fresh thiserror-impl v2.0.20
        Fresh async-trait v0.1.92
-       Fresh tokio v1.53.1
        Fresh thiserror v2.0.20
+       Fresh tokio v1.53.1
 error[E0015]: cannot call non-const associated function `<Epoch as Default>::default` in constant functions
   --> crates/pstore-types/src/lib.rs:46:9
    |
@@ -54,14 +54,14 @@ error[E0015]: cannot call non-const associated function `<Epoch as Default>::def
    = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
 
 For more information about this error, try `rustc --explain E0015`.
-error: could not compile `pstore-types` (lib) due to 1 previous error
-
-Caused by:
-  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps` (exit status: 1)
-warning: build failed, waiting for other jobs to finish...
 error: could not compile `pstore-types` (lib test) due to 1 previous error
 
 Caused by:
-  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-ayi9Ve.tmp/target/debug/deps` (exit status: 1)
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0797840b733e1881 -C extra-filename=-ac8d1ba0068fec8f --out-dir /tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `pstore-types` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/tuong/.rustup/toolchains/1.90-x86_64-unknown-linux-gnu/bin/rustc --crate-name pstore_types --edition=2024 crates/pstore-types/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --warn=rust_2018_idioms '--deny=clippy::unwrap_used' --forbid=unsafe_code --warn=unreachable_pub '--deny=clippy::unimplemented' '--deny=clippy::todo' '--deny=clippy::panic' --warn=missing_docs '--deny=clippy::mem_forget' '--deny=clippy::indexing_slicing' '--deny=clippy::float_cmp' '--deny=clippy::expect_used' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=8e75c1784602381c -C extra-filename=-c19df0e60947a156 --out-dir /tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-pstore-DJ9WhG.tmp/target/debug/deps` (exit status: 1)
 
 *** result: Failure(101)

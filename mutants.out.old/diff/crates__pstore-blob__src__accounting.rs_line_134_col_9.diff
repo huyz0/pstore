@@ -1,0 +1,21 @@
+--- crates/pstore-blob/src/accounting.rs
++++ replace Accounted<S>::total -> u64 with 0
+@@ -126,17 +126,17 @@
+             .filter(|(k, _)| k == key)
+             .map(|(_, r)| r.end.min(span.end).saturating_sub(r.start.max(span.start)))
+             .sum()
+     }
+ 
+     /// Requests of `class` across every tenant.
+     #[must_use]
+     pub fn total(&self, class: OpClass) -> u64 {
+-        self.lock().totals.get(&class).copied().unwrap_or(0)
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn lock(&self) -> std::sync::MutexGuard<'_, Counters> {
+         self.counters
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+     }
+ }
