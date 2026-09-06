@@ -1,1 +1,0 @@
-crates/pstore-blob/src/faulty.rs:38:9: replace Faults::none -> Self with Default::default()
