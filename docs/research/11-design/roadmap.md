@@ -135,6 +135,14 @@ strategy" — known *before* M3 hardens around it.
 > process.
 
 ### M4 — Cluster (4–6 weeks)
+
+> ⚠️ **Split, and scoped to the machine.** M4a (roster + placement, pure and deterministic)
+> and M4b (gossip + a **100-node** Docker fleet, every number `provisional`) are specified;
+> M4c (cache and the post-scale-out dip) and M4d (per-AZ cells, gray failure) follow. The
+> exit's **1,000 real nodes** is `NOT-RUN` — measured, a container costs ~1.4 MB of host
+> memory so 100 is affordable, and 1,000 is not on this hardware. The split is by *evidence
+> regime*: M4a's criteria are exact, M4b's are protocol-period counts on a network that is
+> not a datacentre.
 - `pstore-cluster`: gossip (SWIM+Lifeguard via `chitchat`/`foca`), LRH+CHBL placement,
   work assignment.
 - Roster seeding from the blob store; routing hop; hedged requests.
