@@ -21,12 +21,24 @@ const fn rank(s: State) -> u8 {
 /// How many periods a probe may go unanswered before its target is suspected.
 const PROBE_TIMEOUT: u64 = 3;
 
-/// How many periods a suspect may remain unrefuted before it is declared dead.
+/// The floor on how many periods a suspect may remain unrefuted before it is declared dead.
 ///
 /// ⚠️ Generous relative to `PROBE_TIMEOUT`, because this is the window in which a node that
 /// was merely busy gets to answer. Shortening it is how a loaded fleet evicts its own healthy
 /// members — OQ-12, in the form the timeouts control.
-const SUSPECT_TIMEOUT: u64 = 6;
+const SUSPECT_TIMEOUT_MIN: u64 = 6;
+
+/// How the suspicion window grows with the fleet.
+///
+/// ⚠️ **It has to grow.** A suspicion is only refutable if it reaches the suspected node, and
+/// dissemination takes O(log N) periods to cross a fleet of N. A constant window is therefore
+/// a window that is too short at scale, and the node gets buried before the news that it is
+/// suspected ever arrives. Measured at 100 nodes under 10% loss, with a constant 6: healthy
+/// nodes were declared dead and the worst view sat at 98 of 100 indefinitely.
+fn suspect_timeout(members: usize) -> u64 {
+    let log2 = usize::BITS - members.max(1).leading_zeros();
+    SUSPECT_TIMEOUT_MIN.max(3 * u64::from(log2))
+}
 
 /// How many peers are asked to probe on our behalf when a direct probe fails.
 const INDIRECT_PROBES: usize = 3;
@@ -56,8 +68,14 @@ const MAX_PIGGYBACK: usize = 6;
 pub struct Protocol {
     cluster: Cluster,
     seq: u64,
-    /// Probes awaiting an ack: sequence number to (target, the tick it was sent).
-    pending: BTreeMap<u64, (NodeId, u64)>,
+    /// Probes awaiting an ack: sequence number to (target, tick sent, whether the indirect
+    /// round has already been tried).
+    pending: BTreeMap<u64, (NodeId, u64, bool)>,
+    /// Probes we are making on someone else's behalf: our sequence to (who asked, their
+    /// sequence). ⚠️ The ack has to be **relayed back**, or the requester learns nothing from
+    /// the indirect round and suspects anyway — which makes the whole indirect step
+    /// decorative.
+    relaying: BTreeMap<u64, (String, u64)>,
     /// When each suspect was first suspected, so it can be given up on.
     suspected_at: BTreeMap<NodeId, u64>,
     /// Recent changes worth telling peers about, newest last, each with the number of times
@@ -74,6 +92,7 @@ impl Protocol {
             cluster,
             seq: 0,
             pending: BTreeMap::new(),
+            relaying: BTreeMap::new(),
             suspected_at: BTreeMap::new(),
             updates: Vec::new(),
             tick: 0,
@@ -104,7 +123,7 @@ impl Protocol {
         // wearing a constant's clothing.
         if let Some(target) = self.pick_peer(seed) {
             self.seq = self.seq.wrapping_add(1);
-            self.pending.insert(self.seq, (target.id, self.tick));
+            self.pending.insert(self.seq, (target.id, self.tick, false));
             out.push((
                 target.addr.clone(),
                 Message::Ping {
@@ -169,6 +188,19 @@ impl Protocol {
                 self.pending.remove(seq);
                 self.mark_alive(from);
                 let mut out = Vec::new();
+                // If this ack answers a probe someone else asked for, pass it on — that is
+                // the entire value of having asked.
+                if let Some((asker, their_seq)) = self.relaying.remove(seq) {
+                    out.push((
+                        asker,
+                        Message::Ack {
+                            from: *from,
+                            seq: their_seq,
+                            checksum: *checksum,
+                            updates: Vec::new(),
+                        },
+                    ));
+                }
                 let evidence = self.evidence_for(from);
                 if let Some(addr) = self.addr_of(from) {
                     // It acked, so it is alive; it does not yet know we had given up on it.
@@ -196,7 +228,10 @@ impl Protocol {
                 let mut out = Vec::new();
                 if let Some(addr) = self.addr_of(target) {
                     self.seq = self.seq.wrapping_add(1);
-                    self.pending.insert(self.seq, (*target, self.tick));
+                    self.pending.insert(self.seq, (*target, self.tick, true));
+                    if let Some(asker) = self.addr_of(from) {
+                        self.relaying.insert(self.seq, (asker, *seq));
+                    }
                     out.push((
                         addr,
                         Message::Ping {
@@ -207,7 +242,6 @@ impl Protocol {
                         },
                     ));
                 }
-                let _ = (from, seq);
                 out
             }
             Message::Sync { from, members } => {
@@ -326,22 +360,33 @@ impl Protocol {
         let _ = id;
     }
 
-    /// Probes that have gone unanswered long enough to doubt their target.
+    /// Probes that have gone unanswered long enough to act on.
+    ///
+    /// ⚠️ **A direct timeout does not suspect.** It means *we* could not reach the peer, which
+    /// is not the same claim as its being gone — and on a lossy network the two are confused
+    /// constantly. Measured at 100 nodes under 10% loss with everything healthy: the worst
+    /// view fell to 92 of 100 and the fleet flapped indefinitely, because every lost datagram
+    /// became a suspicion. So a direct timeout asks other peers, and only a second timeout,
+    /// with their answers also missing, is evidence of absence.
     fn expire_probes(&mut self, out: &mut Vec<(String, Message)>) {
-        let due: Vec<(u64, NodeId)> = self
+        let due: Vec<(u64, NodeId, bool)> = self
             .pending
             .iter()
-            .filter(|(_, (_, sent))| self.tick.saturating_sub(*sent) >= PROBE_TIMEOUT)
-            .map(|(seq, (id, _))| (*seq, *id))
+            .filter(|(_, (_, sent, _))| self.tick.saturating_sub(*sent) >= PROBE_TIMEOUT)
+            .map(|(seq, (id, _, asked))| (*seq, *id, *asked))
             .collect();
-        for (seq, id) in due {
+        for (seq, id, already_asked) in due {
             self.pending.remove(&seq);
             if self.cluster.state(&id) != Some(State::Alive) {
                 continue;
             }
-            // ⚠️ Ask others before concluding. A direct probe failing means *we* could not
-            // reach it, which is not the same claim as its being gone, and treating them as
-            // the same is how one node's bad link evicts a healthy peer.
+            if already_asked {
+                // The indirect round produced nothing either. Now it is evidence.
+                self.cluster.suspect(&id);
+                self.suspected_at.entry(id).or_insert(self.tick);
+                self.note_update(&id);
+                continue;
+            }
             for peer in self.helpers(&id) {
                 out.push((
                     peer,
@@ -352,18 +397,18 @@ impl Protocol {
                     },
                 ));
             }
-            self.cluster.suspect(&id);
-            self.suspected_at.entry(id).or_insert(self.tick);
-            self.note_update(&id);
+            // Re-arm: the same probe, now waiting on the indirect answers.
+            self.pending.insert(seq, (id, self.tick, true));
         }
     }
 
     fn bury_suspects(&mut self) {
+        let window = suspect_timeout(self.cluster.len());
         let done: Vec<NodeId> = self
             .suspected_at
             .iter()
             .filter(|(id, since)| {
-                self.tick.saturating_sub(**since) >= SUSPECT_TIMEOUT
+                self.tick.saturating_sub(**since) >= window
                     && self.cluster.state(id) == Some(State::Suspect)
             })
             .map(|(id, _)| *id)

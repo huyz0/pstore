@@ -170,9 +170,13 @@ kill)
   echo "killing $K nodes"
   # SIGKILL, not stop: a clean shutdown would let the node announce its own departure, which
   # tests the goodbye path rather than the failure detector.
+  before=$(docker ps -q --filter name=pstore-n | wc -l)
   for v in $victims; do docker kill "$v" >/dev/null; done
-  N=$(docker ps -q --filter name=pstore-n | wc -l)
-  killed_at=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+  # ⚠️ Arithmetic, not a re-count. `docker ps` right after `docker kill` still lists a
+  # container that is on its way out, so the survivor count came back one too high and the
+  # wait loop then watched for a number no node would ever report.
+  N=$((before - K))
+  killed_at=$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)
   echo "$K killed; $N survivors must drop to $N"
   # ⚠️ Detection is timed from the survivors' own `VIEWCHANGE` lines, not from polling.
   # Polling once a second resolves to five gossip periods, and a criterion counted in

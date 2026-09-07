@@ -37,6 +37,8 @@ struct Sim {
     /// Fraction of datagrams dropped, as a deterministic every-Nth rather than a random draw.
     drop_every: u64,
     sent: u64,
+    /// Sent last period, delivered this one.
+    in_flight: Vec<(String, String, Message)>,
 }
 
 impl Sim {
@@ -59,47 +61,47 @@ impl Sim {
             bytes: 0,
             drop_every: 0,
             sent: 0,
+            in_flight: Vec::new(),
         }
     }
 
-    /// One period for every node, then delivery of everything they produced.
+    /// One period for every node. Messages produced this period are delivered **next**.
+    ///
+    /// ⚠️ A first version delivered replies within the same round, up to a depth of four. That
+    /// made every ack instantaneous, so a probe timeout could never elapse and no amount of
+    /// injected loss ever produced a suspicion — a lossy-network test passed against a
+    /// protocol that, on a real fleet under 10% loss, flapped indefinitely. A simulation more
+    /// generous than the network is worse than none: it certifies the bug.
     fn round(&mut self, seed: u64) {
-        // (from_addr, to_addr, msg) — the transport knows who sent a datagram, so the
-        // simulation has to as well, or it tests a protocol nobody can deploy.
-        let mut queue: Vec<(String, String, Message)> = Vec::new();
+        // Deliver what was sent last period, collecting whatever it provokes.
+        let mut produced: Vec<(String, String, Message)> = Vec::new();
+        for (from, to, msg) in std::mem::take(&mut self.in_flight) {
+            self.sent += 1;
+            self.bytes += msg.encode().len() as u64;
+            if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
+                continue;
+            }
+            if let Some(&i) = self.by_addr.get(&to)
+                && let Some(n) = self.nodes.get_mut(i)
+            {
+                let here = to.clone();
+                produced.extend(
+                    n.receive(&from, &msg)
+                        .into_iter()
+                        .map(|(t, m)| (here.clone(), t, m)),
+                );
+            }
+        }
+        // Then let every node take its period.
         for (i, n) in self.nodes.iter_mut().enumerate() {
             let from = addr(i as u16);
-            queue.extend(
+            produced.extend(
                 n.tick(seed.wrapping_add(i as u64))
                     .into_iter()
                     .map(|(to, m)| (from.clone(), to, m)),
             );
         }
-        // Deliver to a fixed depth so a reply-to-a-reply cannot loop forever unnoticed.
-        for _ in 0..4 {
-            let mut next: Vec<(String, String, Message)> = Vec::new();
-            for (from, to, msg) in queue.drain(..) {
-                self.sent += 1;
-                self.bytes += msg.encode().len() as u64;
-                if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
-                    continue;
-                }
-                if let Some(&i) = self.by_addr.get(&to)
-                    && let Some(n) = self.nodes.get_mut(i)
-                {
-                    let here = to.clone();
-                    next.extend(
-                        n.receive(&from, &msg)
-                            .into_iter()
-                            .map(|(t, m)| (here.clone(), t, m)),
-                    );
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            queue = next;
-        }
+        self.in_flight = produced;
     }
 
     fn all_see(&self, n: usize) -> bool {
@@ -240,6 +242,34 @@ fn a_silent_node_is_suspected_then_declared_dead() {
         }
     }
     panic!("a silent node was never declared dead by every survivor");
+}
+
+#[test]
+fn a_lossy_network_does_not_manufacture_deaths() {
+    // ⚠️ Nothing is actually dead here. A protocol that suspects on one lost datagram turns
+    // packet loss into membership churn, and churn is exactly what defeats a checksum: the
+    // cluster state never settles, so nodes reconcile forever and the steady state is never
+    // reached. Measured on a real 100-node fleet under 10% loss before this was fixed: the
+    // views FLAPPED, 88 nodes at 100 members, 11 at 99, one at 98, indefinitely.
+    // ⚠️ 100 nodes, not a dozen. At a dozen, an every-Nth drop pattern happens to miss the
+    // interleavings that matter and the test passes against a protocol that flaps on a real
+    // fleet -- which is exactly what it did.
+    let mut sim = Sim::new(100, true);
+    sim.drop_every = 10; // 10% of datagrams discarded, every node healthy
+    for r in 0..300 {
+        sim.round(r);
+    }
+    let worst = sim
+        .nodes
+        .iter()
+        .map(|p| p.cluster().alive().len())
+        .min()
+        .unwrap_or(0);
+    assert_eq!(
+        worst, 100,
+        "with every node alive and 10% loss, the worst view fell to {worst} of 100: lost \
+         datagrams are being read as deaths"
+    );
 }
 
 #[test]

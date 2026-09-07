@@ -108,6 +108,22 @@ Concretely:
 > answered: it lies between 100 and 1,000**, and neither run locates it. That bracket is what
 > [M4c](../../milestones/M4c/SPEC.md) has to beat, and what its group size has to be chosen
 > against.
+> **C-8 — the premise of C-7 is now moot for cost, M4c.** C-7 measured *flat Scuttlebutt*
+> and concluded zone-sharding was required. Replacing the protocol removed the growth it was
+> required against: `pstore-gossip` takes liveness from message arrival rather than a gossiped
+> heartbeat, and costs **74 bytes per node per round — identical at 100, 1,000 and 10,000
+> nodes**. On real fleets: **764 B/s/node at 100 and 1,057 at 1,000**, a 1.38× spread against
+> `chitchat`'s 6.2×; ~17 cores became 1.90.
+>
+> ⚠️ **The cost argument below still stands, and it is a different argument.** Cross-AZ
+> traffic is billed whatever the protocol, so zone-*awareness* — which peers a node probes —
+> remains required. What is no longer required is **hierarchy**: tiers of nodes, delegates, a
+> second mesh. M4c's Phase B was specified, gated on this measurement, and **not built**.
+> Evidence: [`M4c/VERIFIED.md`](../../milestones/M4c/VERIFIED.md).
+>
+> ⚠️ OQ-13 asked where flat gossip crosses over. It is answered by removal rather than by a
+> number: there is no crossover to find, because per-node cost no longer grows.
+
 Shard the mesh by **AZ**, with a small number of cross-AZ relays, so per-node fanout stays
 constant *and* cross-AZ chatter stays negligible. This was framed as a scaling option; per
 [`az-topology.md`](az-topology.md) it is a **cost requirement** — cross-AZ traffic is
