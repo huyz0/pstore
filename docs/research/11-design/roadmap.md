@@ -136,19 +136,25 @@ strategy" — known *before* M3 hardens around it.
 
 ### M4 — Cluster (4–6 weeks)
 
-> ⚠️ **Split, and scoped to the machine.** M4a (roster + placement, pure and deterministic)
-> and M4b (gossip + a **100-node** Docker fleet, every number `provisional`) are specified;
-> M4c (hierarchical membership), then M4d (cache and the post-scale-out dip) and M4e (per-AZ
-> cells, gray failure) follow. ⚠️ M4c shipped as `pstore-gossip` instead — hierarchy was
-> **gated out by its own criterion** once per-node cost stopped growing with the fleet. M4d is
-> complete across three phases; M4e phase 1 (zone identity) is done, with placement and gray
-> failure to follow. ⚠️ Membership took the M4c letter after the 1,000-node run
-> measured flat gossip at ~17 of 20 cores: a cache benchmarked on a fleet whose membership
-> consumes the host measures the host. The
-> exit's **1,000 real nodes** is `NOT-RUN` — measured, a container costs ~1.4 MB of host
-> memory so 100 is affordable, and 1,000 is not on this hardware. The split is by *evidence
-> regime*: M4a's criteria are exact, M4b's are protocol-period counts on a network that is
-> not a datacentre.
+> ⚠️ **COMPLETE**, across five milestones each with a `VERIFIED.md`: M4a (roster,
+> placement), M4b (membership, the Docker fleet), M4c (`pstore-gossip`), M4d (caching),
+> M4e (per-AZ cells, gray failure).
+>
+> Three things went differently from this plan, and each is recorded where it happened:
+>
+> * **M4c was going to be hierarchical membership; it became our own gossip.** Hierarchy was
+>   **gated out by its own criterion** — a checksum cannot be bolted onto Scuttlebutt, because
+>   its digest carries a heartbeat that every node increments every round, so the cluster state
+>   never reaches a fixed point. Taking liveness from message arrival instead is SWIM, which is
+>   what D-4 specified before a licence sent us to `chitchat`. Per-node cost went from 406 KB/s
+>   at 1,000 nodes to **74 bytes per round, flat to 10,000**, at which point a tier of delegates
+>   was solving a problem that no longer existed.
+> * **1,000 real nodes ran**, contradicting the note that used to stand here. Flat gossip
+>   converged at that size but cost ~17 of 20 cores; the replacement costs 1.9.
+> * **The 10,000-simulated exit criterion is withdrawn**, not deferred: it would have measured
+>   a simulator. `pstore-gossip`'s cost example runs the **real protocol** in-process at 10,000
+>   nodes instead, which measures message sizes and round counts exactly and claims nothing
+>   about CPU.
 - `pstore-cluster`: gossip (SWIM+Lifeguard via `chitchat`/`foca`), LRH+CHBL placement,
   work assignment.
 - Roster seeding from the blob store; routing hop; hedged requests.
@@ -159,8 +165,19 @@ strategy" — known *before* M3 hardens around it.
   cross-AZ probe mesh, blob health bulletin, peer-relative outlier detection, self-eviction
   draining. Gray fault injection in the simulator is part of this milestone, not a follow-up.
 
-**Exit:** 1,000 real nodes, 10,000 simulated; add/remove 50% of the fleet with zero data
-movement and a measured, bounded cache dip.
+**Exit:** met, with one criterion withdrawn.
+
+| Exit criterion | Status |
+|---|---|
+| 1,000 real nodes | **met** — converged, all 1,000 holding a full view ([M4b](../../milestones/M4b/VERIFIED.md)) |
+| 10,000 simulated | ⚠️ **withdrawn** — it would measure a simulator; the real protocol is run in-process at 10,000 instead ([M4c](../../milestones/M4c/VERIFIED.md)) |
+| add/remove 50% of the fleet, zero data movement | **met** — `a_fleet_change_copies_nothing` ([M4a](../../milestones/M4a/VERIFIED.md) criterion 7) |
+| a measured, bounded cache dip | **met** — sequential depth 2 → 1 on the first query ([M4d](../../milestones/M4d/VERIFIED.md) criterion 15) |
+
+⚠️ **Not built, and named rather than omitted:** the NVMe cache tier (D-23), so a rolling
+restart still flushes every cache; and the cross-AZ probe mesh (D-82) and blob health bulletin
+(D-83) as running subsystems — the gray-failure *decisions* ship, their transports need a
+query path and a real multi-AZ deployment.
 
 ### M5a — Sparse vectors and hybrid (2 weeks)
 - Sparse/learned-sparse retrieval over the generic-impact posting lists built in M3.
