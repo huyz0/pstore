@@ -285,4 +285,42 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         self.bill(OpClass::List);
         self.inner.list_unrestricted(prefix).await
     }
+
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+        class: crate::Class,
+    ) -> Result<Bytes, BlobError> {
+        self.bill(OpClass::Read);
+        let out = self.inner.get_range_as(key, range.clone(), class).await;
+        if let Ok(b) = &out {
+            self.bill_bytes(OpClass::Read, b.len() as u64);
+            self.note_range(key, range);
+        }
+        out
+    }
+
+    async fn get_suffix_as(
+        &self,
+        key: &Key,
+        n: u64,
+        class: crate::Class,
+    ) -> Result<Bytes, BlobError> {
+        self.bill(OpClass::Read);
+        let out = self.inner.get_suffix_as(key, n, class).await;
+        if let Ok(b) = &out {
+            self.bill_bytes(OpClass::Read, b.len() as u64);
+        }
+        out
+    }
+
+    async fn get_immutable(&self, key: &Key, class: crate::Class) -> Result<Bytes, BlobError> {
+        self.bill(OpClass::Read);
+        let out = self.inner.get_immutable(key, class).await;
+        if let Ok(b) = &out {
+            self.bill_bytes(OpClass::Read, b.len() as u64);
+        }
+        out
+    }
 }

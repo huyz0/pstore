@@ -121,4 +121,48 @@ impl BlobStore for Broken {
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
         self.inner.list_unrestricted(prefix).await
     }
+
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        if self.defect == Defect::ShortReadsPastTheEnd {
+            let body = self.inner.get(key).await?;
+            let start = (range.start as usize).min(body.len());
+            let end = (range.end as usize).min(body.len());
+            return Ok(body.slice(start..end));
+        }
+        self.inner.get_range_as(key, range, class).await
+    }
+
+    async fn get_suffix_as(
+        &self,
+        key: &Key,
+        n: u64,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        if self.defect == Defect::SuffixReturnsEverything {
+            return self.inner.get(key).await;
+        }
+        self.inner.get_suffix_as(key, n, class).await
+    }
+
+    async fn get_immutable(
+        &self,
+        key: &Key,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        self.inner.get_immutable(key, class).await
+    }
 }

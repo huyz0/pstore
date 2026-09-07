@@ -48,6 +48,12 @@ impl<S: pstore_blob::BlobStore> DepthCounting<S> {
         }
     }
 
+    /// The store beneath, for a test that needs to see what the decorator passed down.
+    #[must_use]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     /// Sequential rounds observed since [`Self::reset`].
     #[must_use]
     pub fn depth(&self) -> usize {
@@ -149,5 +155,43 @@ impl<S: pstore_blob::BlobStore> pstore_blob::BlobStore for DepthCounting<S> {
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
         let _g = self.begin_async().await;
         self.inner.list_unrestricted(prefix).await
+    }
+
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        let _g = self.begin_async().await;
+        self.inner.get_range_as(key, range, class).await
+    }
+
+    async fn get_suffix_as(
+        &self,
+        key: &Key,
+        n: u64,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        let _g = self.begin_async().await;
+        self.inner.get_suffix_as(key, n, class).await
+    }
+
+    async fn get_immutable(
+        &self,
+        key: &Key,
+        class: pstore_blob::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        let _g = self.begin_async().await;
+        self.inner.get_immutable(key, class).await
     }
 }

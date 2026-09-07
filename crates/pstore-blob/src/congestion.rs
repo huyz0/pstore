@@ -177,4 +177,38 @@ impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
         self.with_retry(|| self.inner.list_unrestricted(prefix))
             .await
     }
+
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+        class: crate::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        self.with_retry(|| self.inner.get_range_as(key, range.clone(), class))
+            .await
+    }
+
+    async fn get_suffix_as(
+        &self,
+        key: &Key,
+        n: u64,
+        class: crate::Class,
+    ) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        self.with_retry(|| self.inner.get_suffix_as(key, n, class))
+            .await
+    }
+
+    async fn get_immutable(&self, key: &Key, class: crate::Class) -> Result<Bytes, BlobError> {
+        // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
+        // then admitted as `Bulk` -- D-21 off, with every test still green.
+
+        self.with_retry(|| self.inner.get_immutable(key, class))
+            .await
+    }
 }

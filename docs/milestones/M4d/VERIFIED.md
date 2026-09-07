@@ -5,10 +5,9 @@ demonstrated it.
 
 Gate: `scripts/check-verified.py`.
 
-⚠️ **This is phase 1 of three, and caching is not done.** Eviction is a plain LRU; **D-21
-requires class-aware admission** so a burst of bulk traffic cannot evict the centroid table
-every query needs, and this does not implement it. Phases 2 (class-aware admission) and 3
-(shadow warming, the post-scale-out dip) are specified only by name, deliberately.
+⚠️ **Phases 1 and 2 are done; caching is still not finished.** Phase 3 — shadow warming
+(D-44) and the post-scale-out dip — is named only. The **NVMe tier (D-23) remains `NOT-RUN`**,
+so a rolling restart still flushes every cache.
 
 1. **A repeated read costs nothing.** `a_second_read_of_the_same_ranges_costs_nothing`
    (`cargo test -p pstore-cache`), covering `get_ranges`, `get_range` and `get_suffix`, with
@@ -34,13 +33,39 @@ every query needs, and this does not implement it. Phases 2 (class-aware admissi
 7. **Eviction does not corrupt.** `an_evicted_range_is_re_read_correctly`,
    `eviction_is_least_recently_used`, `an_entry_larger_than_the_budget_is_refused_not_ruinous`,
    and `a_repeated_range_within_one_call_fills_both_positions`.
-8. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
-   **95.60%** region, 97.34% line. `cargo mutants -p pstore-cache --timeout 60` → **28 caught,
-   2 missed = 93.3%**, from 67.9% before the tests above; the one remaining behavioural
-   survivor was killed by criterion 7's duplicate-range test, verified by hand. `cargo fmt
-   --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
-   `cargo deny check`, `scripts/check-links.sh`, `scripts/build-index.py --check`,
-   `scripts/check-verified.py` all green.
+8. ⚠️ **Bulk traffic never evicts metadata — D-21's entire claim.**
+   `bulk_traffic_does_not_evict_metadata`: `Pinned` and `Meta` entries admitted, then **10×
+   the whole budget** read as `Bulk`, then both metadata entries served with **zero** further
+   requests. Observed to fail with the three arenas collapsed into one: *"bulk traffic evicted
+   metadata: this is a global LRU wearing a class-aware name"*.
+9. **Each class is bounded by its own quota**, and the total by the budget, checked on every
+   admission of a 120-read sweep — `each_class_stays_within_its_quota`. Without it, criterion
+   8 is satisfiable by never evicting anything.
+10. ⚠️ **A hint survives a decorator stack.** `a_class_hint_survives_a_decorator_stack`, a
+    `Pinned` read through `DepthCounting<Caching<_>>`. Observed to fail with that decorator's
+    forwarding deleted: *"the hint was stripped on the way through the stack and admitted as
+    Bulk"*. All **eight** decorators forward — `accounting`, `congestion`, `faulty`, and five
+    in `pstore-testkit`.
+11. **`get_immutable` caches and `get` does not.**
+    `an_immutable_get_is_cached_and_a_plain_get_is_not` — the whole-object read is free on
+    repeat, and criterion 6 still holds in the same test.
+12. ⚠️ **The readers actually opt in**, asserted by what the cache *holds* after a real
+    `Segment::open` rather than by reading the call site —
+    `opening_a_segment_admits_its_index_as_meta`. Observed to fail with the hint changed to
+    `Bulk`: *"the index section is Bulk, and a scan burst will evict what every query on this
+    segment needs"*. `Segment::open` hints `Meta` for both its suffix and its large-index
+    path; `VecIndex::open` hints `Pinned` for centroids via `get_immutable`.
+13. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
+    **95.39%** region, 97.10% line; `pstore-cache` itself 96.34%.
+    `cargo mutants -p pstore-cache --timeout 60` → **38 caught, 1 missed = 97.4%** after phase
+    2, against a floor of 80%. Phase 1 alone went 67.9% → 93.3%, and every point of both
+    climbs was a real hole: the suffix read could return an **empty buffer** and still pass
+    the request-count test, the resident-byte total could return a constant 1 and satisfy
+    "≤ budget and > 0", LRU touch-on-hit could be deleted outright, a range requested twice in
+    one call filled only one slot, and an entry exactly the size of the budget was refused. `cargo fmt
+    --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
+    `cargo deny check`, `scripts/check-links.sh`, `scripts/build-index.py --check`,
+    `scripts/check-verified.py` all green.
 
 ## What review caught before any code was written
 

@@ -28,7 +28,12 @@ impl Segment {
     pub async fn open<S: BlobStore>(store: &S, key: &Key) -> Result<Self, FormatError> {
         // One suffix read. No `head` first: it is billed as a read, so requiring one
         // would double every cold open -- found by the request counter, not by inspection.
-        let tail = store.get_suffix(key, SUFFIX_FETCH).await?;
+        // ⚠️ `Meta`, not the default `Bulk`. This suffix IS the index section for most
+        // segments, it is read by every query on that segment, and it is <0.1% of the bytes
+        // — D-21 exists so a burst of scan traffic cannot evict it.
+        let tail = store
+            .get_suffix_as(key, SUFFIX_FETCH, pstore_blob::Class::Meta)
+            .await?;
 
         let foot_at = tail
             .len()
@@ -65,9 +70,15 @@ impl Segment {
                     .ok_or(FormatError::Truncated)?;
                 Bytes::copy_from_slice(tail.get(lo..hi).ok_or(FormatError::Truncated)?)
             } else {
-                // Only now, and only for a segment whose meta region is large.
+                // Only now, and only for a segment whose meta region is large. ⚠️ Still
+                // `Meta`: it is the same index section, just too big to have arrived with
+                // the footer, and it is exactly as valuable.
                 store
-                    .get_range(key, meta_offset..meta_offset + u64::from(meta_len))
+                    .get_range_as(
+                        key,
+                        meta_offset..meta_offset + u64::from(meta_len),
+                        pstore_blob::Class::Meta,
+                    )
                     .await?
             }
         };

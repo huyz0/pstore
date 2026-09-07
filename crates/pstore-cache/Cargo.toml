@@ -19,5 +19,6 @@ tokio       = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
+pstore-format   = { path = "../pstore-format" }
 async-trait     = "0.1"
 tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -297,8 +297,15 @@ impl VecIndex {
         // ⚠️ `join`, not two awaits. Both keys are derived, neither depends on the other's
         // contents, and awaiting the footer first would make every cold open two hops for
         // no reason a caller could see.
-        let (seg, cen) =
-            futures_util::future::join(Segment::open(store, segment), store.get(centroids)).await;
+        // ⚠️ `get_immutable`, not `get`: a centroid table is written once and never changes,
+        // and saying so is what lets it be cached at all — plain `get` is never cached,
+        // because that is also how the mutable lane registry is read. `Pinned` because every
+        // vector query needs this and it unblocks everything downstream (D-21).
+        let (seg, cen) = futures_util::future::join(
+            Segment::open(store, segment),
+            store.get_immutable(centroids, pstore_blob::Class::Pinned),
+        )
+        .await;
         Ok(Self {
             segment: seg?,
             // A missing centroid object is not an error: it is how an index below the

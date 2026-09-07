@@ -42,7 +42,10 @@ async fn fixture(
     let key = Key::new("seg/one");
     let view = acct.as_tenant(TenantId(1));
     view.put(&key, body()).await.unwrap();
-    let cache = Caching::new(Arc::new(acct.as_tenant(TenantId(1))), budget);
+    // ⚠️ One arena, holding exactly `budget`. `Caching::new` splits the budget across classes,
+    // so these tests — which are about the LRU and the budget bound, not about classes —
+    // would otherwise be measuring a bulk quota of 80% of what they asked for.
+    let cache = Caching::with_quotas(Arc::new(acct.as_tenant(TenantId(1))), 0, 0, budget);
     (cache, acct, key)
 }
 
@@ -445,6 +448,16 @@ async fn an_entry_larger_than_the_budget_is_refused_not_ruinous() {
     assert_eq!(cache.resident_bytes(), 200);
 
     cache.get_range(&key, 0..4096).await.unwrap(); // four thousand into five hundred
+
+    // ⚠️ And an entry EXACTLY the budget fits. Refusing it wastes the whole arena on nothing,
+    // which is the off-by-one mutation testing found here and nothing else caught.
+    let (exact, _, k2) = fixture(512).await;
+    exact.get_range(&k2, 0..512).await.unwrap();
+    assert_eq!(
+        exact.resident_bytes(),
+        512,
+        "an entry exactly the size of the budget was refused, so the arena holds nothing"
+    );
     assert_eq!(
         cache.resident_bytes(),
         200,
@@ -475,4 +488,208 @@ async fn a_repeated_range_within_one_call_fills_both_positions() {
 
     // And warm, where the duplicates are served from cache rather than assembled.
     assert_eq!(cache.get_ranges(&key, &rs).await.unwrap(), want);
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 2 — class-aware admission (D-21)
+// ---------------------------------------------------------------------------------------
+
+use pstore_blob::Class;
+
+/// A cache with a small per-class budget, so eviction is easy to provoke.
+async fn classed(
+    pinned: usize,
+    meta: usize,
+    bulk: usize,
+) -> (
+    Caching<TenantView<MemoryStore>>,
+    Arc<Accounted<MemoryStore>>,
+    Key,
+) {
+    let acct = Arc::new(Accounted::new(MemoryStore::with_coalesce_gap(GAP)));
+    let key = Key::new("seg/classed");
+    // Large enough that a sweep of ten times the budget stays inside the object; a read past
+    // the end is an error, not a miss.
+    let big = Bytes::from((0..32_768).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    acct.as_tenant(TenantId(1)).put(&key, big).await.unwrap();
+    let cache = Caching::with_quotas(Arc::new(acct.as_tenant(TenantId(1))), pinned, meta, bulk);
+    (cache, acct, key)
+}
+
+#[tokio::test]
+async fn bulk_traffic_does_not_evict_metadata() {
+    // ⚠️ D-21's entire claim, and the one a plain LRU fails. A byte of centroid table is worth
+    // thousands of bytes of raw vectors because every query needs it, so a burst of scan
+    // traffic must not be able to walk it out of the cache.
+    let (cache, acct, key) = classed(256, 256, 512).await;
+
+    cache
+        .get_range_as(&key, 0..128, Class::Pinned)
+        .await
+        .unwrap();
+    cache
+        .get_range_as(&key, 200..328, Class::Meta)
+        .await
+        .unwrap();
+    let after_metadata = acct.count(TenantId(1), OpClass::Read);
+
+    // Ten times the WHOLE budget, as bulk.
+    for i in 0..80u64 {
+        let at = 1000 + i * 128;
+        cache
+            .get_range_as(&key, at..at + 128, Class::Bulk)
+            .await
+            .unwrap();
+    }
+    let after_bulk = acct.count(TenantId(1), OpClass::Read);
+    assert!(
+        after_bulk > after_metadata,
+        "the bulk sweep fetched nothing"
+    );
+
+    // Both metadata entries must still be hits: zero further requests.
+    cache
+        .get_range_as(&key, 0..128, Class::Pinned)
+        .await
+        .unwrap();
+    cache
+        .get_range_as(&key, 200..328, Class::Meta)
+        .await
+        .unwrap();
+    assert_eq!(
+        acct.count(TenantId(1), OpClass::Read),
+        after_bulk,
+        "bulk traffic evicted metadata: this is a global LRU wearing a class-aware name"
+    );
+}
+
+#[tokio::test]
+async fn each_class_stays_within_its_quota() {
+    // ⚠️ Criterion 8 is satisfiable by never evicting anything at all. The quotas have to
+    // bind, or "metadata survived" means "nothing was ever removed".
+    let (cache, _, key) = classed(256, 256, 512).await;
+    for i in 0..40u64 {
+        let at = i * 128;
+        cache
+            .get_range_as(&key, at..at + 128, Class::Pinned)
+            .await
+            .unwrap();
+        cache
+            .get_range_as(&key, at..at + 128, Class::Meta)
+            .await
+            .unwrap();
+        cache
+            .get_range_as(&key, at..at + 128, Class::Bulk)
+            .await
+            .unwrap();
+        assert!(cache.resident_in(Class::Pinned) <= 256, "pinned over quota");
+        assert!(cache.resident_in(Class::Meta) <= 256, "meta over quota");
+        assert!(cache.resident_in(Class::Bulk) <= 512, "bulk over quota");
+        assert!(
+            cache.resident_bytes() <= 256 + 256 + 512,
+            "total over budget"
+        );
+    }
+    assert!(
+        cache.resident_in(Class::Bulk) > 0,
+        "bulk was evicted to nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_class_hint_survives_a_decorator_stack() {
+    // ⚠️ The cache is outermost by design, but tests compose these freely — and a defaulted
+    // hint method that a decorator forgets to forward arrives classless and is admitted as
+    // `Bulk`, disabling D-21 while every other test still passes.
+    use pstore_testkit::depth::DepthCounting;
+    let inner = Arc::new(MemoryStore::with_coalesce_gap(GAP));
+    let key = Key::new("seg/stacked");
+    inner.put(&key, body()).await.unwrap();
+
+    // A decorator ABOVE the cache, which is the layering the hint has to survive. The stack
+    // owns the cache, so what it admitted is read back through the stack's own inner handle.
+    let stacked = DepthCounting::new(Caching::with_quotas(Arc::clone(&inner), 256, 256, 256));
+
+    stacked
+        .get_range_as(&key, 0..128, Class::Pinned)
+        .await
+        .unwrap();
+    let cache = stacked.inner();
+    assert_eq!(
+        cache.resident_in(Class::Pinned),
+        128,
+        "the hint was stripped on the way through the stack and admitted as Bulk"
+    );
+    assert_eq!(cache.resident_in(Class::Bulk), 0);
+}
+
+#[tokio::test]
+async fn an_immutable_get_is_cached_and_a_plain_get_is_not() {
+    // ⚠️ Both halves. `get_immutable` is the caller asserting the object never changes, which
+    // is what lets centroids be cached; plain `get` must stay uncached, because the lane
+    // registry is read that way and CAS-mutated.
+    let (cache, acct, key) = classed(1 << 16, 256, 256).await;
+
+    cache.get_immutable(&key, Class::Pinned).await.unwrap();
+    let after = acct.count(TenantId(1), OpClass::Read);
+    let first = cache.get_immutable(&key, Class::Pinned).await.unwrap();
+    let again = cache.get_immutable(&key, Class::Pinned).await.unwrap();
+    assert_eq!(
+        acct.count(TenantId(1), OpClass::Read),
+        after,
+        "an immutable get was not cached, so centroids never will be"
+    );
+    assert_eq!(
+        again, first,
+        "the cached whole object differs from the first read"
+    );
+    assert_eq!(again.len(), 32_768);
+
+    // And the mutable path is untouched.
+    cache
+        .inner()
+        .put(&key, Bytes::from_static(b"changed"))
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.get(&key).await.unwrap(),
+        Bytes::from_static(b"changed"),
+        "a plain `get` was served from cache"
+    );
+}
+
+#[tokio::test]
+async fn opening_a_segment_admits_its_index_as_meta() {
+    // ⚠️ Asserted by what the cache HOLDS, never by reading the call site. A caller that
+    // hints `Bulk` — or that forgets to hint at all — loses D-21 silently, and the only
+    // observable difference is which arena the bytes landed in.
+    use pstore_format::{Document, SegmentWriter};
+
+    let inner = Arc::new(MemoryStore::with_coalesce_gap(GAP));
+    let key = Key::new("seg/real");
+    let mut w = SegmentWriter::new(8);
+    for i in 0..64 {
+        w.push(Document::new(format!("d{i}"), vec![i as f32, 1.0, 2.0]));
+    }
+    inner.put(&key, w.finish()).await.unwrap();
+
+    let cache = Caching::with_quotas(Arc::clone(&inner), 1 << 16, 1 << 16, 1 << 16);
+    let seg = pstore_format::Segment::open(&cache, &key).await.unwrap();
+    assert_eq!(seg.row_count(), 64);
+
+    assert!(
+        cache.resident_in(Class::Meta) > 0,
+        "opening a segment admitted nothing as Meta: the index section is Bulk, and a scan \
+         burst will evict what every query on this segment needs"
+    );
+    assert_eq!(
+        cache.resident_in(Class::Bulk),
+        0,
+        "opening a segment admitted bulk bytes; open should read metadata only"
+    );
+
+    // And a second open is free.
+    let before = cache.resident_in(Class::Meta);
+    pstore_format::Segment::open(&cache, &key).await.unwrap();
+    assert_eq!(cache.resident_in(Class::Meta), before);
 }

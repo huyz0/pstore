@@ -23,5 +23,5 @@ pub use faulty::{Faults, Faulty};
 pub use memory::{MemoryStore, TagStyle};
 #[cfg(feature = "object_store")]
 pub use object_store_backend::ObjectStoreBackend;
-pub use store::BlobStore;
+pub use store::{BlobStore, Class};
 pub use types::{BlobError, Capabilities, CasError, Key, Precondition, PutOutcome, Support};

@@ -1026,6 +1026,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "pstore-blob",
+ "pstore-format",
  "pstore-testkit",
  "pstore-types",
  "tokio",

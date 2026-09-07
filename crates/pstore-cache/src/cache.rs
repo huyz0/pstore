@@ -1,7 +1,7 @@
 //! The decorator itself.
 
 use bytes::Bytes;
-use pstore_blob::{BlobError, BlobStore, Capabilities, Key, Precondition, PutOutcome};
+use pstore_blob::{BlobError, BlobStore, Capabilities, Class, Key, Precondition, PutOutcome};
 use pstore_types::CasTag;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 enum Id {
     /// An exact byte range of an object.
     Range(String, u64, u64),
+    /// A whole object the caller asserted is immutable.
+    Whole(String),
     /// The last *n* bytes. ⚠️ A separate shape on purpose: `get_suffix` exists because the
     /// caller does **not** know the object's length, so it cannot be expressed as a range
     /// without the `head` this design refuses to put on the read path.
@@ -27,8 +29,16 @@ enum Id {
 #[derive(Debug)]
 pub struct Caching<S> {
     inner: Arc<S>,
-    state: Mutex<State>,
-    budget: usize,
+    /// ⚠️ One `State` per class, so a class can only ever evict within itself. **Quotas, not
+    /// priorities** (D-21): a priority scheme still lets a large enough bulk burst walk the
+    /// metadata out, because the bulk entries keep arriving and something has to go. A quota
+    /// cannot, because the bulk arena is the only place bulk pressure is felt.
+    pinned: Mutex<State>,
+    meta: Mutex<State>,
+    bulk: Mutex<State>,
+    quota_pinned: usize,
+    quota_meta: usize,
+    quota_bulk: usize,
 }
 
 #[derive(Debug, Default)]
@@ -44,13 +54,46 @@ struct State {
 
 impl<S: BlobStore> Caching<S> {
     /// A cache over `inner`, holding at most `budget` bytes.
+    ///
+    /// ⚠️ Splits the budget by class using the shape `cache-hierarchy.md` argues for: the
+    /// metadata classes are *tiny* — "<0.1% of a segment" for an index section, "~100 MB per
+    /// 1B vectors" for centroids — and are read by every query, so they get a small
+    /// guaranteed reservation and bulk gets the rest. Giving them a share proportional to
+    /// their size would be giving them nothing.
     #[must_use]
     pub fn new(inner: Arc<S>, budget: usize) -> Self {
+        let pinned = (budget / 10).max(1);
+        let meta = (budget / 10).max(1);
+        Self::with_quotas(inner, pinned, meta, budget.saturating_sub(pinned + meta))
+    }
+
+    /// A cache with an explicit byte quota per class.
+    #[must_use]
+    pub fn with_quotas(inner: Arc<S>, pinned: usize, meta: usize, bulk: usize) -> Self {
         Self {
             inner,
-            state: Mutex::new(State::default()),
-            budget,
+            pinned: Mutex::new(State::default()),
+            meta: Mutex::new(State::default()),
+            bulk: Mutex::new(State::default()),
+            quota_pinned: pinned,
+            quota_meta: meta,
+            quota_bulk: bulk,
         }
+    }
+
+    fn arena(&self, class: Class) -> (&Mutex<State>, usize) {
+        match class {
+            Class::Pinned => (&self.pinned, self.quota_pinned),
+            Class::Meta => (&self.meta, self.quota_meta),
+            Class::Bulk => (&self.bulk, self.quota_bulk),
+        }
+    }
+
+    /// Bytes held in one class.
+    #[must_use]
+    pub fn resident_in(&self, class: Class) -> usize {
+        let (arena, _) = self.arena(class);
+        arena.try_lock().map_or(0, |s| s.resident)
     }
 
     /// The store beneath, for a test that needs to change what the cache is caching.
@@ -64,19 +107,23 @@ impl<S: BlobStore> Caching<S> {
     #[must_use]
     pub fn holds(&self, key: &Key, range: Range<u64>) -> bool {
         let id = Id::Range(key.as_str().to_owned(), range.start, range.end);
-        self.state
-            .try_lock()
-            .is_ok_and(|s| s.entries.contains_key(&id))
+        [&self.pinned, &self.meta, &self.bulk]
+            .iter()
+            .any(|a| a.try_lock().is_ok_and(|s| s.entries.contains_key(&id)))
     }
 
     /// Bytes currently held.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        self.state.try_lock().map_or(0, |s| s.resident)
+        [&self.pinned, &self.meta, &self.bulk]
+            .iter()
+            .map(|a| a.try_lock().map_or(0, |s| s.resident))
+            .sum()
     }
 
-    async fn lookup(&self, id: &Id) -> Option<Bytes> {
-        let mut s = self.state.lock().await;
+    async fn lookup(&self, id: &Id, class: Class) -> Option<Bytes> {
+        let (arena, _) = self.arena(class);
+        let mut s = arena.lock().await;
         let hit = s.entries.get(id).cloned();
         if hit.is_some() {
             s.touch(id);
@@ -84,9 +131,9 @@ impl<S: BlobStore> Caching<S> {
         hit
     }
 
-    async fn admit(&self, id: Id, bytes: Bytes) {
-        let mut s = self.state.lock().await;
-        s.admit(id, bytes, self.budget);
+    async fn admit(&self, id: Id, bytes: Bytes, class: Class) {
+        let (arena, quota) = self.arena(class);
+        arena.lock().await.admit(id, bytes, quota);
     }
 
     /// Fetch under singleflight: whoever arrives first fetches, the rest wait and then read
@@ -95,17 +142,18 @@ impl<S: BlobStore> Caching<S> {
     /// ⚠️ Concurrent misses for one range collapsing into one request is called *mandatory,
     /// not optional* by `load-and-hotspots.md`. A stampede must produce slow queries, never a
     /// multiplied load on the store.
-    async fn fetch_once<F, Fut>(&self, id: Id, fetch: F) -> Result<Bytes, BlobError>
+    async fn fetch_once<F, Fut>(&self, id: Id, class: Class, fetch: F) -> Result<Bytes, BlobError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Bytes, BlobError>>,
     {
-        if let Some(hit) = self.lookup(&id).await {
+        if let Some(hit) = self.lookup(&id, class).await {
             return Ok(hit);
         }
+        let (arena, quota) = self.arena(class);
         // Claim the fetch, or find the claim someone else made.
         let gate = {
-            let mut s = self.state.lock().await;
+            let mut s = arena.lock().await;
             if let Some(g) = s.in_flight.get(&id) {
                 Some(Arc::clone(g))
             } else {
@@ -117,21 +165,21 @@ impl<S: BlobStore> Caching<S> {
         if let Some(gate) = gate {
             // Someone else is fetching. Wait for them, then read what they admitted.
             let _ = gate.acquire().await;
-            if let Some(hit) = self.lookup(&id).await {
+            if let Some(hit) = self.lookup(&id, class).await {
                 return Ok(hit);
             }
             // Their fetch failed; ours is now the claim-free path.
         }
 
         let out = fetch().await;
-        let mut s = self.state.lock().await;
+        let mut s = arena.lock().await;
         if let Some(gate) = s.in_flight.remove(&id) {
             // ⚠️ Release every waiter, not one. A permit per waiter would strand the rest
             // until the next fetch, which is a deadlock that only appears under contention.
             gate.close();
         }
         if let Ok(bytes) = &out {
-            s.admit(id, bytes.clone(), self.budget);
+            s.admit(id, bytes.clone(), quota);
         }
         out
     }
@@ -184,18 +232,38 @@ impl<S: BlobStore> BlobStore for Caching<S> {
     }
 
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, BlobError> {
+        self.get_range_as(key, range, Class::default()).await
+    }
+
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: Range<u64>,
+        class: Class,
+    ) -> Result<Bytes, BlobError> {
         let id = Id::Range(key.as_str().to_owned(), range.start, range.end);
-        self.fetch_once(id, || self.inner.get_range(key, range.clone()))
-            .await
+        self.fetch_once(id, class, || {
+            self.inner.get_range_as(key, range.clone(), class)
+        })
+        .await
     }
 
     async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
+        self.get_ranges_as(key, ranges, Class::default()).await
+    }
+
+    async fn get_ranges_as(
+        &self,
+        key: &Key,
+        ranges: &[Range<u64>],
+        class: Class,
+    ) -> Result<Vec<Bytes>, BlobError> {
         // Split hits from misses, keyed by what was ASKED for.
         let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
         let mut missing: Vec<Range<u64>> = Vec::new();
         for r in ranges {
             let id = Id::Range(key.as_str().to_owned(), r.start, r.end);
-            let hit = self.lookup(&id).await;
+            let hit = self.lookup(&id, class).await;
             if hit.is_none() {
                 missing.push(r.clone());
             }
@@ -206,11 +274,12 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             // ⚠️ The misses go to the inner `get_ranges`, so coalescing still happens — below
             // the cache, where it belongs. The cache decides *what* to fetch; the store
             // decides how few requests that takes.
-            let fetched = self.inner.get_ranges(key, &missing).await?;
+            let fetched = self.inner.get_ranges_as(key, &missing, class).await?;
             for (r, bytes) in missing.iter().zip(fetched) {
                 self.admit(
                     Id::Range(key.as_str().to_owned(), r.start, r.end),
                     bytes.clone(),
+                    class,
                 )
                 .await;
                 if let Some(slot) = ranges
@@ -232,8 +301,21 @@ impl<S: BlobStore> BlobStore for Caching<S> {
     }
 
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        self.get_suffix_as(key, n, Class::default()).await
+    }
+
+    async fn get_suffix_as(&self, key: &Key, n: u64, class: Class) -> Result<Bytes, BlobError> {
         let id = Id::Suffix(key.as_str().to_owned(), n);
-        self.fetch_once(id, || self.inner.get_suffix(key, n)).await
+        self.fetch_once(id, class, || self.inner.get_suffix_as(key, n, class))
+            .await
+    }
+
+    /// ⚠️ Cached, unlike `get` — because the caller has asserted the object never changes.
+    /// That assertion is the whole difference, and it is the caller's to make.
+    async fn get_immutable(&self, key: &Key, class: Class) -> Result<Bytes, BlobError> {
+        let id = Id::Whole(key.as_str().to_owned());
+        self.fetch_once(id, class, || self.inner.get_immutable(key, class))
+            .await
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

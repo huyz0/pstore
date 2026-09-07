@@ -6,6 +6,29 @@ use bytes::Bytes;
 use pstore_types::CasTag;
 use std::ops::Range;
 
+/// How valuable a read's bytes are to a cache.
+///
+/// ⚠️ **Names, never numbers.** `cache-hierarchy.md` numbers cache classes 1–9, this codebase
+/// already has `Section` ids 1–11 whose numbers mean the *opposite* — `Section::Vectors = 2`
+/// is full-precision vectors, cache class **9**, "do not cache by default" — and `OpClass` is
+/// a third numbering. A fourth would be a bug generator, so this one has no numbers at all.
+///
+/// ⚠️ These are **quotas, not priorities** (D-21). A priority scheme still lets a large enough
+/// bulk burst walk the metadata out; a quota cannot, because a class only ever evicts within
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Class {
+    /// Centroid tables. Every vector query needs them and they unblock everything downstream.
+    Pinned,
+    /// Segment index sections, zone maps, term dictionaries — small, and read by every query
+    /// on that segment.
+    Meta,
+    /// Vectors, quantized codes, postings, documents. The scan tier, and **the default**:
+    /// an un-hinted read is assumed evictable, which is the safe direction to be wrong in.
+    #[default]
+    Bulk,
+}
+
 /// The only way pstore touches durable storage.
 #[async_trait::async_trait]
 pub trait BlobStore: Send + Sync + 'static {
@@ -17,6 +40,67 @@ pub trait BlobStore: Send + Sync + 'static {
 
     /// One byte range.
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, BlobError>;
+
+    /// The same read, telling a cache how valuable the bytes are.
+    ///
+    /// ⚠️ **Defaulted, and every decorator must forward it.** A decorator that inherits this
+    /// default drops the class on the floor, and the read is then admitted as `Bulk` — D-21
+    /// disabled, with every test still passing. The default exists so adding the method
+    /// breaks nothing; forwarding it is what makes it mean anything.
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: Range<u64>,
+        class: Class,
+    ) -> Result<Bytes, BlobError> {
+        let _ = class;
+        self.get_range(key, range).await
+    }
+
+    /// Several ranges, with a class.
+    ///
+    /// ⚠️ **No decorator needs to override this**, and that is deliberate: it coalesces and
+    /// then dispatches back through `self.get_range_as`, so the class rides along wherever
+    /// that lands. Delegating to the unhinted `get_ranges` instead — which is what the
+    /// obvious default does — would drop the class at the very first decorator, and the
+    /// batched path is the one every query actually uses.
+    async fn get_ranges_as(
+        &self,
+        key: &Key,
+        ranges: &[Range<u64>],
+        class: Class,
+    ) -> Result<Vec<Bytes>, BlobError> {
+        let gap = self.capabilities().coalesce_gap;
+        let plan = crate::coalesce(ranges, gap);
+        let fetched = futures_util::future::try_join_all(
+            plan.iter()
+                .map(|f| self.get_range_as(key, f.span.clone(), class)),
+        )
+        .await?;
+
+        let mut out: Vec<(usize, Bytes)> = Vec::with_capacity(ranges.len());
+        for (fetch, buf) in plan.into_iter().zip(fetched) {
+            let base = fetch.span.start;
+            for (i, r) in fetch.serves {
+                let (lo, hi) = ((r.start - base) as usize, (r.end - base) as usize);
+                out.push((i, buf.slice(lo..hi)));
+            }
+        }
+        out.sort_by_key(|(i, _)| *i);
+        Ok(out.into_iter().map(|(_, b)| b).collect())
+    }
+
+    /// A whole object the caller **asserts is immutable**, and its class.
+    ///
+    /// ⚠️ The name is the warning. Plain `get` is never cached, because the lane registry is
+    /// read that way and CAS-mutated in place — a cached one makes a newly registered lane
+    /// permanently invisible. Calling this on anything that can change is that bug, taken
+    /// deliberately. Segments and centroid tables qualify; nothing under `pstore-engine`'s
+    /// mutable keys does.
+    async fn get_immutable(&self, key: &Key, class: Class) -> Result<Bytes, BlobError> {
+        let _ = class;
+        self.get(key).await
+    }
 
     /// Several byte ranges at once, **coalescing nearby ones into a single request**.
     ///
@@ -58,6 +142,12 @@ pub trait BlobStore: Send + Sync + 'static {
     ///
     /// Returns fewer than `n` bytes only when the object is shorter than `n`.
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError>;
+
+    /// The last `n` bytes, with a class. See `get_range_as`.
+    async fn get_suffix_as(&self, key: &Key, n: u64, class: Class) -> Result<Bytes, BlobError> {
+        let _ = class;
+        self.get_suffix(key, n).await
+    }
 
     /// The object **and** the tag it had when read, in one operation.
     ///
