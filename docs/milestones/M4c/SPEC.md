@@ -95,8 +95,11 @@ election for correctness* intact.
    stable fleet at **100 and 1,000** nodes must vary by **< 2×**, and must be **< 1 KB/s** at
    both — against `chitchat`'s measured 65.7 KB/s at 100 and 406 KB/s at 1,000. This is the
    criterion the milestone exists for.
-5. **Fleet CPU at 1,000 nodes ≤ 1 core**, against `chitchat`'s ~17. Absolute, because the
-   question is whether the machine can also run a query path.
+5. **Fleet CPU at 1,000 nodes ≤ 1 core, summed across all 1,000** — i.e. ≤ 1 millicore per
+   node — against `chitchat`'s ~17 cores total. ⚠️ Stated as a **total** because the question
+   is what fraction of a machine membership consumes before a query path gets any, and a
+   per-node figure hides that behind a number that looks small at any fleet size.
+   `scripts/cluster.sh cpu` prints both.
 6. **Dead-node detection ≤ 14 periods with 10% probe loss injected** — M4b's measured number,
    reused so a regression is visible. The `Metered` transport from M4b.5 provides the loss.
 7. ⚠️ **OQ-12, re-asked.** A CPU-starved *accuser* must evict nobody. M4b answered this for

@@ -35,14 +35,20 @@ so timings are a floor. `dev/README.md` has the reason.
    real fleet, was ~13,000 bytes per round at 100 nodes.
 5. ⚠️ **Fleet CPU at 1,000 nodes: 1.90 cores against a bound of 1. FAILS, and the bound was
    written against a floor I had not measured.** `./scripts/cluster.sh cpu 60` at a 1s period.
-   Decomposed, by measurement rather than argument:
+
+   ⚠️ **Every figure here is a TOTAL, summed across all 1,000 nodes** — 1.90 cores is 1.9
+   millicores per node, and **9.5% of this 20-core host**. `chitchat`'s ~17 cores was 85% of
+   it. Per-node numbers are the ones that look reassuring at every fleet size, which is why
+   the criterion is stated as a total.
+
+   Decomposed, by measurement rather than argument, and also as totals:
    * **0.72 cores** is the floor for a thousand near-idle containers — measured by running the
      same fleet at a 10s period, where the protocol does almost nothing;
    * **0.73 cores** is the protocol;
    * **0.47 cores** is the `OWNS` diagnostic, which is not the protocol at all.
 
-   So "≤1 core" left 0.28 cores for everything above a floor of 0.72, and no protocol could
-   have met it. The comparison that means something: `chitchat` cost **~17 cores** on the same
+   So "≤1 core" left 0.28 cores of the fleet's total above a floor of 0.72, and no protocol
+   could have met it. The comparison that means something: `chitchat` cost **~17 cores** on the same
    fleet, at load average 1162; this costs 1.90 at load 11.6.
 6. ⚠️ **Detection under 10% injected loss: 31 periods against a bound of 14. FAILS, and the
    bound was copied from a protocol with different properties.** Measured with
