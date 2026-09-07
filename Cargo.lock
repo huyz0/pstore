@@ -1020,6 +1020,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "pstore-blob",
+ "pstore-testkit",
+ "pstore-types",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-cluster"
 version = "0.1.0"
 dependencies = [

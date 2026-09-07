@@ -17,6 +17,7 @@ members = [
     "crates/pstore-index",
     "crates/pstore-cluster",
     "crates/pstore-gossip",
+    "crates/pstore-cache",
     # Layer 4 - serving
     "crates/pstore-node",
     # Layer 1 - substrate
