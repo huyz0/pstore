@@ -46,6 +46,7 @@ async fn member(port: u16, seeds: &[String]) -> gossip::Member {
         &format!("127.0.0.1:{port}"),
         seeds,
         0.0,
+        pstore_node::DEFAULT_GOSSIP_PERIOD,
     )
     .await
     .expect("a member must start on loopback")
@@ -79,7 +80,7 @@ async fn two_members_find_each_other_from_a_seed() {
             seen = true;
             break;
         }
-        tokio::time::sleep(pstore_node::GOSSIP_PERIOD).await;
+        tokio::time::sleep(pstore_node::DEFAULT_GOSSIP_PERIOD).await;
     }
     assert!(seen, "two seeded members never converged within 50 periods");
     assert!(a.members().await.contains(&b.self_addr()));
@@ -117,7 +118,7 @@ async fn traffic_is_counted_from_the_first_round() {
             moved = true;
             break;
         }
-        tokio::time::sleep(pstore_node::GOSSIP_PERIOD).await;
+        tokio::time::sleep(pstore_node::DEFAULT_GOSSIP_PERIOD).await;
     }
     assert!(moved, "no gossip bytes were counted in 50 periods");
 }

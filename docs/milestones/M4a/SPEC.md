@@ -6,7 +6,8 @@ D-5 (Local Rendezvous Hashing, C ≈ 32, with CHBL-style overload skipping).
 ⚠️ **D-43 is not served** and is not cited: placing on `tenant_id` below a size threshold
 needs a size signal this milestone has no source for, and `tenancy-scale-model.md` puts ~98%
 of indexes in that regime — so a balance figure measured over index-keyed shards says
-nothing about the common case. Carried, and named in M4c.
+nothing about the common case. Carried, and named in M4d (renumbered from M4c when
+hierarchical membership took that letter).
 
 **Scope.** M4 is split. This is the **pure** half — roster, placement, overload skipping —
 which has deterministic criteria and needs no network. Membership gossip, the node binary
@@ -44,9 +45,9 @@ above it, which `Cargo.toml` audits):
 
 **Does not add**
 - **Gossip, the node binary, the Docker fleet.** [M4b](../M4b/SPEC.md).
-- **Caching and the post-scale-out cache dip.** M4c — and it is what "zero data movement"
+- **Caching and the post-scale-out cache dip.** M4d — and it is what "zero data movement"
   actually costs, so it is where that claim becomes observable.
-- **Per-AZ cells and gray failure.** M4d.
+- **Per-AZ cells and gray failure.** M4e.
 
 ## Acceptance criteria
 

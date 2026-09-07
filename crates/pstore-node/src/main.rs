@@ -13,8 +13,9 @@
 use pstore_blob::{BlobStore, Capabilities, ObjectStoreBackend};
 use pstore_cluster::Roster;
 use pstore_node::policy::{self, fresh_node_id, jitter, read_roster_patiently};
-use pstore_node::{ATTEMPT_TIMEOUT, GOSSIP_PERIOD, HEAL_PERIOD, gossip};
+use pstore_node::{ATTEMPT_TIMEOUT, DEFAULT_GOSSIP_PERIOD, HEAL_PERIOD, gossip};
 use std::sync::Arc;
+use std::time::Duration;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -60,7 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0);
-    let handle = gossip::start(&node_id, &listen, &advertise, &seeds, loss).await?;
+    // ⚠️ One value, used twice: chitchat's gossip interval and this loop's sampling
+    // interval are the same number, so a timing reported in periods means the same thing to
+    // the node and to the harness that reads its log.
+    let period = std::env::var("PSTORE_GOSSIP_PERIOD_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(DEFAULT_GOSSIP_PERIOD, Duration::from_millis);
+    let handle = gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?;
     // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
     // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the
     // config says `pstore-n7:7946` — and a node comparing the configured name against its
@@ -90,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report the view, and refold the roster from it. The roster is a *cache of gossip*, so
     // a lost refold is never a lost membership — it is one fewer cache update.
+    // ⚠️ Everything below is counted in PERIODS, not seconds, because the period is no
+    // longer fixed — it scales with the fleet. `ticks % HEAL_PERIOD.as_secs()` was correct
+    // only while a period happened to be 200ms and five of them made a second; at a 2s
+    // period the same expression heals every 100 seconds.
+    let view_every = (Duration::from_secs(1).as_millis() / period.as_millis().max(1)).max(1) as u64;
+    let heal_every = (HEAL_PERIOD.as_millis() / period.as_millis().max(1)).max(1) as u64;
     let mut ticks = 0u64;
     let mut sub = 0u64;
     let mut last_size = usize::MAX;
@@ -99,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a second resolves to ±5 periods, so a one-second sampler cannot tell 8 from 9 and
         // any pass or fail it reports is unfalsifiable. Measured before this change: "9
         // periods" against a bound of 8, from a sampler that could not have said otherwise.
-        tokio::time::sleep(GOSSIP_PERIOD).await;
+        tokio::time::sleep(period).await;
         sub += 1;
         let members = handle.members().await;
 
@@ -111,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("VIEWCHANGE members={last_size} self={me}");
         }
 
-        if !sub.is_multiple_of(5) {
+        if !sub.is_multiple_of(view_every) {
             continue;
         }
         ticks += 1;
@@ -119,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // endpoint, which would be a server by another name.
         println!("VIEW t={ticks} members={} self={me}", members.len());
 
-        if ticks % HEAL_PERIOD.as_secs() == jitter(&node_id, HEAL_PERIOD.as_secs()) {
+        if ticks % heal_every == jitter(&node_id, heal_every) {
             // Read first. The roster is two things at once here: the directory this node
             // publishes into, and the seed list it heals a partition from.
             // Bounded for the same reason the join read is: an unbounded blob request on

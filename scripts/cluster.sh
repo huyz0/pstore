@@ -24,7 +24,24 @@ cd "$(dirname "$0")/.."
 
 NET=pstore-cluster
 IMAGE=pstore-node
-GOSSIP_PERIOD_MS=200
+# ⚠️ Written by `up` and read by everything else, because the period is no longer a
+# constant — it scales with the fleet, and a reporter using the wrong one silently rescales
+# every number it prints into periods that were never used.
+PERIOD_FILE=/tmp/pstore-cluster-period
+GOSSIP_PERIOD_MS=$(cat "$PERIOD_FILE" 2>/dev/null || echo 200)
+
+# One `docker logs` costs ~40ms of daemon time, so a serial sweep of 1,000 containers is 40
+# seconds — longer than the convergence it is trying to observe. Every sweep below fans out.
+views() {
+  docker ps -q --filter name=pstore-n |
+    xargs -P 32 -I{} sh -c 'docker logs --tail 1 {} 2>/dev/null' |
+    sed -n 's/.*members=\([0-9]*\).*/\1/p'
+}
+count_matching() { # $1 = grep pattern; prints how many containers have at least one match
+  docker ps -q --filter name=pstore-n |
+    xargs -P 32 -I{} sh -c "docker logs {} 2>/dev/null | grep -c '$1'" |
+    grep -c '^[1-9]'
+}
 # ⚠️ Not 9000. In host networking the store binds a real host port, and 9000 is a common
 # one — a collision surfaces as MinIO exiting with "port is already in use" while the nodes
 # report only that the roster never answered.
@@ -51,40 +68,60 @@ up)
   # PROCESSES on one loopback, not 100 network peers. Gossip no longer crosses a bridge, so
   # convergence and traffic here are a floor. `--memory` and `--cpus` still apply, so the
   # per-node cost figures are unaffected.
-  base_port=7946
   # MinIO holds the roster. Only the roster: nodes own nothing, so there is no data to move.
   docker rm -f pstore-minio >/dev/null 2>&1 || true
   docker run -d --name pstore-minio --network host \
     -e MINIO_ROOT_USER=pstore -e MINIO_ROOT_PASSWORD=pstore-dev-secret \
-    --memory 512m --cpus 1 \
+    --memory 1g --cpus 2 \
     minio/minio:RELEASE.2025-04-22T22-12-26Z server /data --address ":$MINIO_PORT" >/dev/null
   sleep 3
   docker run --rm --network host --entrypoint sh minio/mc:latest -c \
     "mc alias set d http://127.0.0.1:$MINIO_PORT pstore pstore-dev-secret >/dev/null 2>&1 && \
      mc mb -p d/pstore >/dev/null 2>&1" || true
 
-  echo "starting $N nodes..."
-  for i in $(seq 1 "$N"); do
-    # ⚠️ Capped per node. 100 unbounded containers is how a fleet test takes down the host
-    # it is measuring, and the three nested ceilings in dev/README.md exist for this.
-    port=$((base_port + i))
+  # ⚠️ The period is FIXED unless asked otherwise, and a first draft of this had it scale
+  # with the fleet — which would have made the 1,000-node numbers incomparable to the
+  # 100-node ones, and so would have destroyed the only thing the run is for. The
+  # justification for scaling was an extrapolation of *traffic*; measured CPU per node was
+  # flat across 25/50/100 (1.11%, 1.23%, 0.50-0.84%) while traffic tripled, so where bytes
+  # begin to dominate is not known, and a run that changes the period cannot find out.
+  #
+  # Pass a period explicitly to compare a scaled fleet against the baseline.
+  PERIOD_MS="${4:-200}"
+  echo "$PERIOD_MS" > "$PERIOD_FILE"
+  GOSSIP_PERIOD_MS="$PERIOD_MS"
+  echo "starting $N nodes (gossip period ${PERIOD_MS}ms)..."
+
+  # ⚠️ Started in parallel batches. `docker run` costs ~200ms of daemon time, so 1,000
+  # sequential starts is six minutes of the measurement window spent launching -- and the
+  # first node then sits alone for six minutes, which is a partition the test manufactured.
+  start_one() {
+    i="$1"
+    port=$((7946 + i))
     docker run -d --name "pstore-n$i" --network host --memory 128m --cpus 0.1 \
       -e PSTORE_CLUSTER=c1 \
-      -e PSTORE_PROBE_LOSS="${LOSS:-0}" \
+      -e PSTORE_PROBE_LOSS="$LOSS" \
+      -e PSTORE_GOSSIP_PERIOD_MS="$PERIOD_MS" \
       -e PSTORE_GOSSIP_ADDR="0.0.0.0:$port" \
       -e PSTORE_ADVERTISE="127.0.0.1:$port" \
       -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$MINIO_PORT" \
+      -e PSTORE_BUCKET=pstore \
+      -e AWS_ACCESS_KEY_ID=pstore -e AWS_SECRET_ACCESS_KEY=pstore-dev-secret \
+      -e AWS_ALLOW_HTTP=true \
       "$IMAGE" >/dev/null
-    # A node joins from the roster, so the first few must seed it before the rest arrive.
-    # ⚠️ Staggered. Starting 100 nodes in a tight loop puts 100 GETs and 100 conditional
-    # PUTs on ONE key within a second: measured, 56 of 100 exited before the roster
-    # answered. Real fleets do not start simultaneously, and the node backs off anyway —
-    # this keeps the harness from manufacturing a herd the deployment would not have.
-    sleep 0.15
-    if [ "$i" -le 3 ]; then sleep 1; fi
-  done
+  }
+  export -f start_one
+  export IMAGE LOSS PERIOD_MS MINIO_PORT
+
+  # The first few in order and alone: the roster starts empty, so somebody has to create it
+  # before a herd arrives to contend for it.
+  for i in 1 2 3; do start_one "$i"; sleep 1; done
+  if [ "$N" -gt 3 ]; then
+    seq 4 "$N" | xargs -P 12 -I{} bash -c 'start_one {}'
+  fi
   echo "up: $(docker ps -q --filter name=pstore-n | wc -l) nodes"
   ;;
+
 
 converge)
   N=$(docker ps -q --filter name=pstore-n | wc -l)
@@ -93,9 +130,7 @@ converge)
   for _ in $(seq 1 120); do
     # The smallest view any node holds. Convergence is when the WORST node is complete —
     # an average would report success while a node still had a partial view.
-    worst=$(docker ps -q --filter name=pstore-n | while read -r c; do
-      docker logs --tail 1 "$c" 2>/dev/null | sed -n 's/.*members=\([0-9]*\).*/\1/p'
-    done | sort -n | head -1)
+    worst=$(views | sort -n | head -1)
     worst=${worst:-0}
     now=$(date +%s%3N)
     if [ "$worst" -ge "$N" ]; then
@@ -136,9 +171,7 @@ kill)
   # Polling once a second resolves to five gossip periods, and a criterion counted in
   # periods cannot be judged by an instrument coarser than the thing it measures.
   for _ in $(seq 1 120); do
-    done_n=$(docker ps -q --filter name=pstore-n | while read -r c; do
-      docker logs "$c" 2>/dev/null | grep -c "VIEWCHANGE members=$N "
-    done | grep -c '^[1-9]')
+    done_n=$(count_matching "VIEWCHANGE members=$N ")
     if [ "$done_n" -ge "$N" ]; then
       python3 scripts/cluster-report.py --detect "$killed_at" "$N" "$GOSSIP_PERIOD_MS"
       exit 0
@@ -156,10 +189,10 @@ traffic)
   W="${2:-30}"
   N=$(docker ps -q --filter name=pstore-n | wc -l)
   sample() {
-    docker ps -q --filter name=pstore-n | while read -r c; do
-      docker logs "$c" 2>/dev/null | grep -o 'sent=[0-9]* recvd=[0-9]*' | tail -1 |
-        tr -d 'sentrecvd=' 
-    done | awk '{s += $1 + $2} END {print s + 0}'
+    docker ps -q --filter name=pstore-n |
+      xargs -P 32 -I{} sh -c "docker logs {} 2>/dev/null | grep -o 'sent=[0-9]* recvd=[0-9]*' | tail -1" |
+      tr -d 'sentrecvd=' |
+      awk '{s += $1 + $2} END {print s + 0}'
   }
   a=$(sample); sleep "$W"; b=$(sample)
   echo "$N $a $b $W" | awk '{printf "gossip: %.0f bytes/s/node at %d nodes (provisional)\n", ($3-$2)/$4/$1, $1}'
@@ -191,9 +224,7 @@ starve)
   vt=$(( $(docker logs "$V" 2>&1 | grep -c '^VIEW') - v0 ))
   ct=$(( $(docker logs "$C" 2>&1 | grep -c '^VIEW') - c0 ))
   after=$(docker logs --tail 1 "$V" 2>/dev/null | sed -n 's/.*members=\([0-9]*\).*/\1/p')
-  peers=$(docker ps -q --filter name=pstore-n | while read -r c; do
-    docker logs --tail 1 "$c" 2>/dev/null | sed -n 's/.*members=\([0-9]*\).*/\1/p'
-  done | sort -n | head -1)
+  peers=$(views | sort -n | head -1)
   echo "starved accuser: view ${before:-?} -> ${after:-?} of $N; worst peer view $peers"
   docker update --cpus 0.1 "$V" >/dev/null
   docker exec "$V" sh -c 'kill -9 $(pidof sh) 2>/dev/null' >/dev/null 2>&1 || true

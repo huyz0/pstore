@@ -10,7 +10,9 @@ nodes staggered, and a node cannot list a peer that does not yet exist; measurin
 first join reports the stagger.
 """
 
+import concurrent.futures
 import datetime
+import pathlib
 import re
 import subprocess
 import sys
@@ -72,15 +74,30 @@ def detect(killed_at: str, survivors: int, period_ms: int) -> int:
     return 0
 
 
+def default_period() -> int:
+    """The period `cluster.sh up` actually used.
+
+    ⚠️ Read, not assumed. Above 100 nodes the harness scales the gossip period with the
+    fleet, and a reporter that assumed 200ms would silently divide by the wrong number and
+    report periods nobody used.
+    """
+    try:
+        return int(pathlib.Path("/tmp/pstore-cluster-period").read_text().strip())
+    except (OSError, ValueError):
+        return 200
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--detect":
         return detect(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
-    period_ms = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    period_ms = int(sys.argv[1]) if len(sys.argv) > 1 else default_period()
     names = containers()
     joins, fulls, traffic = [], [], []
     n = len(names)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        all_rows = dict(zip(names, pool.map(logs, names), strict=True))
     for c in names:
-        rows = logs(c)
+        rows = all_rows[c]
         join = next((t for t, l in rows if l.startswith("JOIN")), None)
         # The first moment this node's view covered the whole fleet.
         full = next(

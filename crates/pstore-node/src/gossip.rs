@@ -88,6 +88,7 @@ pub async fn start(
     advertise: &str,
     seeds: &[String],
     loss: f64,
+    period: std::time::Duration,
 ) -> Result<Member, Box<dyn std::error::Error>> {
     let listen: SocketAddr = listen.parse()?;
     // ⚠️ Resolved, not parsed. The advertised address is how peers reach this node, and in a
@@ -101,7 +102,7 @@ pub async fn start(
     let config = ChitchatConfig {
         chitchat_id: ChitchatId::new(node_id.to_owned(), 0, resolved),
         cluster_id: "pstore".to_owned(),
-        gossip_interval: crate::GOSSIP_PERIOD,
+        gossip_interval: period,
         listen_addr: listen,
         seed_nodes: seeds.to_vec(),
         failure_detector_config: FailureDetectorConfig::default(),

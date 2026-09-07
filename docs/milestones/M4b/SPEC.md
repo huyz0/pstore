@@ -6,11 +6,16 @@ milestone's reason for existing and which the first draft of M4a failed to cite.
 
 **Depends on:** [M4a](../M4a/SPEC.md) — placement is what a member is *for*.
 
-⚠️ **Scope, stated before anything is built.** M4's exit asks for 1,000 real nodes and
-10,000 simulated. This does **100 real nodes in Docker**: measured, an idle container costs
+⚠️ **Scope, stated before anything is built.** M4's exit asked for 1,000 real nodes and
+10,000 simulated; the 10,000-simulated criterion was later **withdrawn** — see the ledger.
+This does **100 real nodes in Docker**: measured, an idle container costs
 ~1.4 MB of host memory, so 100 is ~140 MB against ~20 GB free, and the binding cost is the
-node process. 1,000 real nodes needs hardware this environment does not have; that is
-`NOT-RUN`, not deferred effort.
+node process.
+
+⚠️ **"1,000 real nodes needs hardware this environment does not have" was wrong**, and is
+left here rather than quietly corrected. 1,000 were run after this milestone closed: they
+fit, they converged, and they cost the whole machine. The ledger has the numbers and they
+are the argument for [M4c](../M4c/SPEC.md).
 
 ⚠️ **Every wall-clock number here is `provisional`.** 100 processes on one host bridge see
 microsecond latency and near-zero loss, and the dev container is capped at 6 CPUs — so
@@ -31,7 +36,8 @@ gated on nothing.
   restart looks cold (`membership.md`).
 - `dev/cluster-compose.yml` and `scripts/cluster.sh` — bring up *N*, measure, tear down.
 
-**Does not add** — caching and the cache dip (M4c); per-AZ cells and gray failure (M4d);
+**Does not add** — caching and the cache dip (M4d, renumbered from M4c); per-AZ cells and
+gray failure (M4e);
 zone-sharded gossip, which `membership.md` calls *required, not optional*, and whose absence
 is why criterion 4 measures growth rather than an absolute.
 
@@ -59,8 +65,11 @@ is why criterion 4 measures growth rather than an absolute.
   counted in periods.
 - **Adopting a gossip crate means criterion 4 tests a library**, not our algorithm. Worth it:
   writing SWIM to test SWIM is how a milestone becomes a quarter.
-- **100 nodes is one order below M4's exit.** What holds here may not at 10,000; the
-  simulator is where that goes.
+- **100 nodes is one order below M4's exit.** What holds here did not hold at 1,000: the
+  same binary converged, but membership alone consumed ~17 cores and 406 MB/s. ⚠️ The
+  10,000-simulated-node criterion is **withdrawn** — a simulator would have measured a
+  simulator, and the 1,000-node run already establishes that flat gossip does not reach that
+  order. [M4c](../M4c/SPEC.md) specifies the structural fix.
 
 ## Tasks
 

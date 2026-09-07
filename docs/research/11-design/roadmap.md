@@ -138,7 +138,10 @@ strategy" — known *before* M3 hardens around it.
 
 > ⚠️ **Split, and scoped to the machine.** M4a (roster + placement, pure and deterministic)
 > and M4b (gossip + a **100-node** Docker fleet, every number `provisional`) are specified;
-> M4c (cache and the post-scale-out dip) and M4d (per-AZ cells, gray failure) follow. The
+> M4c (hierarchical membership), then M4d (cache and the post-scale-out dip) and M4e (per-AZ
+> cells, gray failure) follow. ⚠️ Membership took the M4c letter after the 1,000-node run
+> measured flat gossip at ~17 of 20 cores: a cache benchmarked on a fleet whose membership
+> consumes the host measures the host. The
 > exit's **1,000 real nodes** is `NOT-RUN` — measured, a container costs ~1.4 MB of host
 > memory so 100 is affordable, and 1,000 is not on this hardware. The split is by *evidence
 > regime*: M4a's criteria are exact, M4b's are protocol-period counts on a network that is

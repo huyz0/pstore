@@ -16,14 +16,18 @@ pub mod gossip;
 pub mod policy;
 pub mod transport;
 
-/// The gossip period, and therefore the resolution of every timing a node reports.
+/// The gossip period a node uses unless told otherwise, and therefore the resolution of
+/// every timing it reports.
 ///
-/// ⚠️ This constant IS `chitchat`'s `gossip_interval` — `gossip::start` reads it rather than
-/// repeating the literal, because a comment saying two numbers must match is a rule an agent
-/// has to remember, and the compiler can hold it instead. `scripts/cluster.sh`'s
-/// `GOSSIP_PERIOD_MS` still has to agree by hand; it converts seconds to periods for
-/// reporting only, and gates nothing.
-pub const GOSSIP_PERIOD: Duration = Duration::from_millis(200);
+/// ⚠️ **It has to scale with the fleet.** Gossip cost per node is linear in N (M4b criterion
+/// 5), so the period that suits 100 nodes asks for roughly 84 cores at 1,000 — and a
+/// CPU-starved fleet measures the scheduler, not the protocol. `PSTORE_GOSSIP_PERIOD_MS`
+/// overrides it, and `scripts/cluster.sh` sets it proportionally above 100 nodes.
+///
+/// ⚠️ Whatever the value, ONE value: it is `chitchat`'s `gossip_interval` and the loop's
+/// sampling interval both, passed rather than repeated, because a comment saying two numbers
+/// must match is a rule an agent has to remember and the compiler can hold it instead.
+pub const DEFAULT_GOSSIP_PERIOD: Duration = Duration::from_millis(200);
 
 /// How long one roster request may take before it counts as failed.
 ///

@@ -92,8 +92,22 @@ Concretely:
 > not SWIM: `foca` is MPL-2.0 and outside the licence allow-list. A SWIM mesh gossips a
 > digest of similar shape, so the slope should carry, but that is an expectation and not a
 > measurement. Evidence: [`M4b/VERIFIED.md`](../../milestones/M4b/VERIFIED.md) criterion 5.
-> **OQ-13's crossover point remains open**, and is now bounded from below: flat gossip is
-> already the dominant per-node cost at 100.
+> **Extended to 1,000 nodes.** Same host, same 200ms period, same binary — the period was
+> deliberately *not* scaled, because scaling it would have made the two fleets incomparable.
+> All 1,000 joined and all reached a full 1,000-member view, so **correctness held**;
+> everything else did not. Per node: **406 KB/s** (against 75 KB/s at 100), 11.94 MiB RSS
+> (3.25), 1.69% CPU (0.50–0.84). In aggregate: **406 MB/s and ~17 of 20 cores, at load
+> average 1162** — for membership alone, with no index, no query path and no data. Convergence
+> went from 5–6 periods to **142**.
+>
+> ⚠️ 406 KB/s/node is **supply-limited, not demand**: the fleet was CPU-starved, so it is what
+> the nodes managed. A linear extrapolation predicts ~750 KB/s. Read it as a floor.
+>
+> ⚠️ Per-node CPU was **flat** across 25/50/100 while traffic tripled, so the bytes did not
+> dominate CPU until somewhere above 100. **OQ-13's crossover is therefore bracketed, not
+> answered: it lies between 100 and 1,000**, and neither run locates it. That bracket is what
+> [M4c](../../milestones/M4c/SPEC.md) has to beat, and what its group size has to be chosen
+> against.
 Shard the mesh by **AZ**, with a small number of cross-AZ relays, so per-node fanout stays
 constant *and* cross-AZ chatter stays negligible. This was framed as a scaling option; per
 [`az-topology.md`](az-topology.md) it is a **cost requirement** — cross-AZ traffic is
