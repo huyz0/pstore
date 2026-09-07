@@ -102,6 +102,8 @@ up)
       -e PSTORE_CLUSTER=c1 \
       -e PSTORE_PROBE_LOSS="$LOSS" \
       -e PSTORE_GOSSIP_PERIOD_MS="$PERIOD_MS" \
+      -e PSTORE_OWNS_PERIOD_S="${OWNS_S:-5}" \
+      -e PSTORE_POLL_PERIOD_MS="${POLL_MS:-0}" \
       -e PSTORE_GOSSIP_ADDR="0.0.0.0:$port" \
       -e PSTORE_ADVERTISE="127.0.0.1:$port" \
       -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$MINIO_PORT" \
@@ -111,7 +113,7 @@ up)
       "$IMAGE" >/dev/null
   }
   export -f start_one
-  export IMAGE LOSS PERIOD_MS MINIO_PORT
+  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS
 
   # The first few in order and alone: the roster starts empty, so somebody has to create it
   # before a herd arrives to contend for it.
@@ -180,6 +182,29 @@ kill)
   done
   echo "NOT detected; only $done_n of $N survivors dropped to $N"
   exit 1
+  ;;
+
+cpu)
+  # ⚠️ CUMULATIVE CPU time over a window, not `docker stats`. `cost` samples one second and
+  # its run-to-run spread is +-40% — measured, it reported a fleet with a diagnostic DISABLED
+  # as costing more than the same fleet with it enabled, which is not a thing that can
+  # happen. An instrument noisier than the effect cannot attribute cost, and every per-node
+  # CPU number taken with it is a single noisy draw.
+  #
+  # /proc counts every tick the kernel charged the process. Two reads and a subtraction.
+  # ⚠️ Read from inside each container: this dev environment is in its own PID namespace, so
+  # host /proc cannot see the node processes at all and a host-side `ps` sums to exactly zero.
+  W="${2:-60}"
+  total() {
+    docker ps -q --filter name=pstore-n |
+      xargs -P 32 -I{} sh -c 'docker exec {} cat /sys/fs/cgroup/cpu.stat 2>/dev/null | head -1' |
+      awk '{s += $2} END {print s + 0}'
+  }
+  N=$(docker ps -q --filter name=pstore-n | wc -l)
+  a=$(total); sleep "$W"; b=$(total)
+  # usage_usec is MICROseconds of CPU, so a delta over W seconds is cores after /1e6.
+  echo "$a $b $W $N" | awk '{c = ($2-$1)/1e6/$3;
+    printf "cpu: %.3f cores total, %.2f mcores/node, over %ds at n=%d\n", c, c/$4*1000, $3, $4}'
   ;;
 
 traffic)

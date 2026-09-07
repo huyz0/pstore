@@ -69,6 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .filter(|ms| *ms > 0)
         .map_or(DEFAULT_GOSSIP_PERIOD, Duration::from_millis);
+    // ⚠️ Separable from the gossip period ON PURPOSE. This loop asks chitchat for its member
+    // list every tick, which locks its state and clones a `String` per member — 500
+    // allocations a second per node at 100 members and a 200ms period, all of it ours rather
+    // than the protocol's. Whether that matters is a measurement, and it cannot be taken
+    // while the two intervals are the same number.
+    let poll = std::env::var("PSTORE_POLL_PERIOD_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(period, Duration::from_millis);
     let handle = gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?;
     // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
     // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the
@@ -103,8 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // longer fixed — it scales with the fleet. `ticks % HEAL_PERIOD.as_secs()` was correct
     // only while a period happened to be 200ms and five of them made a second; at a 2s
     // period the same expression heals every 100 seconds.
-    let view_every = (Duration::from_secs(1).as_millis() / period.as_millis().max(1)).max(1) as u64;
-    let heal_every = (HEAL_PERIOD.as_millis() / period.as_millis().max(1)).max(1) as u64;
+    let view_every = (Duration::from_secs(1).as_millis() / poll.as_millis().max(1)).max(1) as u64;
+    let heal_every = (HEAL_PERIOD.as_millis() / poll.as_millis().max(1)).max(1) as u64;
+    // How often to report what this node would own, in seconds; 0 disables it.
+    let owns_every: u64 = std::env::var("PSTORE_OWNS_PERIOD_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let mut ticks = 0u64;
     let mut sub = 0u64;
     let mut last_size = usize::MAX;
@@ -114,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a second resolves to ±5 periods, so a one-second sampler cannot tell 8 from 9 and
         // any pass or fail it reports is unfalsifiable. Measured before this change: "9
         // periods" against a bound of 8, from a sampler that could not have said otherwise.
-        tokio::time::sleep(period).await;
+        tokio::time::sleep(poll).await;
         sub += 1;
         let members = handle.members().await;
 
@@ -176,8 +191,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if ticks.is_multiple_of(5) {
-            let r = Roster::from_nodes(handle.members().await);
+        // ⚠️ **Diagnostics, not protocol**, and separable because it turned out to be
+        // neither free nor obviously not-free. This block builds a ring and does 1,000
+        // placements — 32,000 rendezvous hashes at 100 nodes, ~93,000 at 1,000 — and it
+        // exists only so a fleet run can report what a node WOULD own. It was inside the
+        // number M4b attributed to gossip. `PSTORE_OWNS_PERIOD_S=0` turns it off, which is
+        // what makes the attribution measurable instead of assumed.
+        if owns_every > 0 && ticks.is_multiple_of(owns_every) {
+            // Reuse the view already fetched this tick. Fetching again locks chitchat's
+            // state and clones a String per member, for a list that cannot have changed.
+            let r = Roster::from_nodes(members.iter().cloned());
             let mine = policy::owned_shards(&r, &me, 1000, 3);
             let (sent, recvd, dropped) = handle.traffic();
             println!(

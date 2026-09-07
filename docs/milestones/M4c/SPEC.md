@@ -62,6 +62,17 @@ fleet must still reach correct membership through the roster.
 - `scripts/cluster.sh`: `--hierarchical`, so the flat mesh stays runnable and every number
   below has a control.
 
+- **Checksum-first reconciliation.** ⚠️ Orthogonal to hierarchy, and measured to matter more
+  in steady state. chitchat's `Syn` carries a full `Digest` — a per-node version map — **every
+  round, whether or not anything changed**: at 100 nodes that is a constant **~13 KB per
+  round** regardless of period (M4b, "Where the CPU actually goes"). Two nodes whose state
+  already agrees should exchange a **checksum of the cluster state** and stop, paying O(1)
+  instead of O(N).
+
+  Hierarchy bounds how cost *grows*; this bounds what it costs to *sit still*, and a fleet is
+  converged almost all of the time. It needs a change to the wire protocol, so the options are
+  an upstream contribution to `chitchat` or a fork — named here as a decision, not assumed.
+
 **Does not add** — a third tier (needed only past ~100k nodes; `G = √N` keeps both meshes at
 √N up to that point), cross-AZ relay accounting (M4e), caching (M4d).
 
@@ -105,7 +116,19 @@ figure of 22.8 KB/s, not its 1,000-node figure of 406 KB/s.
    honestly larger than M4b's 14, because it is three gossip hops instead of one. The number
    is in the criterion so that a regression is visible rather than absorbed.
 8. **Group balance**: no group larger than **1.25×** the mean, at 1,000 nodes.
-9. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
+9. ⚠️ **A converged cluster's gossip is O(1) per round, not O(N).** With checksum-first
+   reconciliation, bytes per round on a **stable** 100-node group must be **< 1 KB**, against
+   the ~13 KB measured for chitchat as it stands — and must not grow when the group does:
+   measured at group sizes 32 and 100, the per-round bytes vary by **< 2×**. ⚠️ This is
+   separately falsifiable from criterion 3, which a hierarchy alone can satisfy while still
+   paying O(N) inside each group.
+10. **The steady-state saving does not cost detection.** With checksum-first in place,
+    criterion 7's cross-group detection bound must still hold at the **200ms** period — the
+    point of making a stable cluster cheap is to *avoid* having to slow gossip down. ⚠️ Stated
+    because the cheap alternative is simply raising the period, which M4b showed reaches
+    0.11 cores at 100 nodes with no code at all, and pays for it in seconds of detection
+    latency.
+11. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
 
 ## Test plan
 
@@ -117,6 +140,8 @@ figure of 22.8 KB/s, not its 1,000-node figure of 406 KB/s.
 | 6 | `a_group_survives_losing_every_delegate` | delegates becoming a correctness dependency — a control plane by accident |
 | 6 | `the_roster_backstop_is_what_saves_it` | the above passing because gossip healed it anyway, which would prove nothing |
 | 8 | `groups_are_balanced_at_a_thousand_nodes` | a hash that clusters, so one group is the whole fleet |
+| 9 | `a_converged_group_exchanges_a_checksum_not_a_digest` | a "checksum" that is sent *alongside* the digest, saving nothing |
+| 9 | `a_changed_group_still_reconciles` | a checksum that matches when the states differ — silent, permanent divergence |
 
 ## Risks
 

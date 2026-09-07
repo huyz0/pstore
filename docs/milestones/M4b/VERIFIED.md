@@ -140,6 +140,50 @@ have to enumerate 100 generated services. That is `cluster.sh` written twice, in
 that cannot express the stagger, the loss parameter, or the teardown of the bridge. One
 definition, in the file that already had to exist.
 
+## Where the CPU actually goes
+
+"~0.6 cores for 100 nodes" invited the obvious question — of what? — and the first two
+answers were wrong. Both are recorded, because a disproved hypothesis is the only thing that
+makes the third believable.
+
+⚠️ **The instrument had to be replaced first.** `cluster.sh cost` samples `docker stats` for
+one second, and its run-to-run spread is ±40%: it reported the fleet with a diagnostic
+**disabled** as costing *more* than the same fleet with it enabled, which cannot happen. An
+instrument noisier than the effect cannot attribute anything. `cluster.sh cpu <window>` reads
+cumulative `usage_usec` from each container's cgroup instead — two reads and a subtraction,
+exact. ⚠️ It reads from *inside* the containers: this dev environment has its own PID
+namespace, so a host-side `ps` over `/proc` sums to exactly zero and looks like an idle fleet.
+
+| Hypothesis | Measured | Verdict |
+|---|---|---|
+| The `OWNS` diagnostic — a ring rebuild and 1,000 placements, ~32,000 rendezvous hashes per node per 5s | on **0.597** cores / off **0.627** | **not the cost** |
+| Our poll loop — `members()` every 200ms, cloning a `String` per member, ~500 allocations/s/node | poll at 200ms **0.597** / at 1s **0.597** | **not the cost** |
+| chitchat's gossip rounds | see below | **all of it** |
+
+Sweeping the gossip period at 100 nodes, everything else fixed:
+
+| period | rounds/s | cores (fleet) | KB/s/node | **KB per round** |
+|---|---|---|---|---|
+| 200ms | 5.0 | 0.597 | 65.7 | 13.1 |
+| 1s | 1.0 | 0.203 | 13.3 | 13.3 |
+| 2s | 0.5 | **0.110** | 6.9 | 13.8 |
+
+⚠️ **Bytes per round are constant at ~13 KB**, and that is the finding. chitchat's `Syn`
+carries a full `Digest` — a per-node version map — **every round, whether or not anything
+changed**. A converged cluster pays exactly what a churning one does, forever. The period is
+therefore a straight lever on cost, and **0.11 cores for 100 nodes is reachable today with
+configuration alone**: `scripts/cluster.sh up 100 0 2000`.
+
+⚠️ Do **not** extrapolate the CPU column: cost per round is 1.19ms at 200ms but 2.20ms at 2s,
+so it is not linear in frequency and two points would have fitted a line through neither. The
+price of the lever is honest and unavoidable — detection is counted in periods, so M4b
+criterion 3's 14 periods becomes 28 **seconds** at a 2s period rather than 2.8.
+
+The structural fix is orthogonal to hierarchy and is carried to [M4c](../M4c/SPEC.md): a
+cluster whose state is unchanged should exchange a **checksum**, not a digest, and pay O(1)
+per round instead of O(N). Hierarchy bounds how cost grows; this bounds what it costs to sit
+still.
+
 ## Beyond scope: 1,000 real nodes
 
 M4b specified 100. **1,000 were run anyway**, because criterion 5 said flat gossip was linear
