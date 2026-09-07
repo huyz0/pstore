@@ -19,5 +19,6 @@ pstore-format = { path = "../pstore-format" }
 bytes          = "1"
 pstore-engine  = { path = "../pstore-engine" }
 pstore-testkit = { path = "../pstore-testkit" }
+pstore-cache   = { path = "../pstore-cache" }
 pstore-types   = { path = "../pstore-types" }
 tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

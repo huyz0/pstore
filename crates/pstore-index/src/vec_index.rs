@@ -286,6 +286,32 @@ pub struct VecIndex {
 }
 
 impl VecIndex {
+    /// Pull an index's metadata into cache without querying it — **shadow warming** (D-44).
+    ///
+    /// ⚠️ Deliberately **identical to `open`, with the result dropped**, and that is the whole
+    /// design rather than a shortcut. `open` already reads the segment index section (`Meta`)
+    /// and the centroid table (`Pinned`) and **nothing else** — the two classes D-44 says to
+    /// warm, which are 0.1–1% of an index's bytes and unblock every query on it. Anything
+    /// more would be a cache fill, which device endurance caps at ~67 MB/s and which
+    /// `disk-space-management.md` says never to do for bulk.
+    ///
+    /// Expressing it as `open` means the two cannot drift: a future change that puts a bulk
+    /// read into `open` fails `warming_fetches_no_bulk_bytes`, rather than silently turning
+    /// every warm-up into a fill.
+    ///
+    /// ⚠️ **Off the query path.** This returns a future and the caller decides whether to
+    /// await it; on a placement change the new owner warms while the previous owner is still
+    /// serving. Awaiting it *before* the first query is what a test does to measure the dip,
+    /// not what a deployment does to create one.
+    pub async fn warm<S: BlobStore>(
+        store: &S,
+        segment: &Key,
+        centroids: &Key,
+    ) -> Result<(), pstore_format::FormatError> {
+        // `dim` is irrelevant to which bytes are fetched; it only shapes the decoded view.
+        Self::open(store, segment, centroids, 1).await.map(|_| ())
+    }
+
     /// Opens an index. **One round trip**: the centroid object and the segment footer are
     /// different objects, so they are fetched together.
     pub async fn open<S: BlobStore>(

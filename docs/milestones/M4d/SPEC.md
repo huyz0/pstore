@@ -8,54 +8,46 @@ free — and the mechanism every later cache decision needs
 
 ⚠️ **Renumbered** from M4c when hierarchical membership took that letter.
 
+⚠️ **218 lines against the `spec` skill's 200-line cap**, and the excess is deliberate: this
+is three phases' worth of delta in one document, kept together because they are one
+subsystem and one ledger. The cap exists to stop a spec restating the corpus; each phase
+here is ~70 lines.
+
 ## ⚠️ Scope: three phases, split under review
 
-Two review rounds against a draft that bundled the cache, class-aware admission (D-21) and
-shadow warming produced **thirteen blocking findings**. The review budget's own rule is that
-the remedy at round two is to *split*, not to argue a third round. So:
+Two review rounds against a draft bundling all three produced **thirteen blocking findings**,
+and the review budget's own rule is that the remedy at round two is to *split*:
 
 | Phase | What | State |
 |---|---|---|
 | **1** | The cache: what it intercepts, how it is keyed, singleflight, and what it must refuse to cache | **shipped** |
 | **2** | Class-aware admission (D-21), the `Class` hint and its plumbing, cacheable `get` for centroids | specified below |
-| 3 | Shadow warming (D-44) and the post-scale-out dip | named only |
+| **3** | Shadow warming (D-44) and the post-scale-out dip | specified below |
 
-Phases 2 and 3 are deliberately **not** decomposed here: the spec skill says decompose only
-what is next, and both were mis-specified precisely because they were written three steps
-ahead.
+Each phase was decomposed only when it became next — both were mis-specified in the original
+draft precisely because they were written three steps ahead.
 
 ## ⚠️ Two findings that decide the design
 
-**Outermost.** No decorator here overrides `get_ranges`; the trait default *coalesces* and
-then calls `get_range` (`store.rs:25-50`), so a cache placed underneath sees only coalesced
-spans, whose shape changes with the probe set — two queries touching the same posting list
-would share nothing. The cache is therefore the outermost decorator, `Caching<Accounted<_>>`,
-which is also the only layering in which criterion 1 is observable.
-
-**It refuses `get`.** Immutability is what makes an entry correct forever and does not extend
-to whole-object reads: `lanes.rs:101` reads the lane registry with `get` and `lanes.rs:77-95`
-CAS-mutates it. Phase 2 adds `get_immutable` for the caller to take that judgement explicitly,
-which is what lets centroids (`vec_index.rs:301`) be cached at all.
+**Outermost**, because no decorator overrides `get_ranges` and the trait default coalesces
+before calling `get_range` — a cache underneath would key on spans whose shape changes with
+the probe set. **It refuses `get`**, because immutability does not extend to whole-object
+reads: `lanes.rs:101` reads the mutable lane registry that way. `get_immutable` is the caller
+taking that judgement explicitly, which is what lets centroids be cached at all.
 
 ## Delta
 
-**Adds**
-- `pstore-cache`: a `BlobStore` decorator over **`get_range`, `get_ranges` and `get_suffix`**
-  — the three the read path actually uses (`reader.rs:31,70,219,247,283,324,468`,
-  `vec_index.rs:401`).
-- Keyed by the **requested** range, not the fetched one; misses pass to the inner
-  `get_ranges` so coalescing survives beneath.
-- **Singleflight**: concurrent misses for one range collapse into one request.
-  `load-and-hotspots.md` calls this *mandatory, not optional*.
-- A byte budget with plain LRU eviction. ⚠️ Plain, and labelled plain: D-21 says admission
-  must be class-aware, and phase 1 does **not** implement it. Calling this "the cache" and
-  stopping would be the defect D-21 exists to prevent.
+**Adds** — `pstore-cache`, a `BlobStore` decorator over **`get_range`, `get_ranges` and
+`get_suffix`**, the three the read path actually uses. Keyed by the **requested** range, not
+the fetched one; misses pass to the inner `get_ranges` so coalescing survives beneath.
+**Singleflight** on concurrent misses, which `load-and-hotspots.md` calls *mandatory, not
+optional*. A byte budget with plain LRU eviction — ⚠️ plain, and labelled plain: D-21 says
+admission must be class-aware and phase 1 does not implement it.
 
-**Does not add** — class-aware admission and the `Class` hint (phase 2); warming and the dip
-(phase 3); cacheable `get` (phase 2); the NVMe tier and `foyer` (D-23, `NOT-RUN` — it needs a
-real device and this environment has none, and until it lands **a rolling restart still
-flushes every cache**); OQ-56, which asks about S3-FIFO/W-TinyLFU and which OQ-101 refines to
-*real traces* we do not have.
+**Does not add** — class-aware admission and cacheable `get` (phase 2); warming and the dip
+(phase 3); the NVMe tier and `foyer` (D-23, `NOT-RUN` — it needs a real device and until it
+lands **a rolling restart still flushes every cache**); OQ-56, which asks about
+S3-FIFO/W-TinyLFU and which OQ-101 refines to *real traces* we do not have.
 
 ## Acceptance criteria
 
@@ -98,9 +90,32 @@ fixture merges into one fetch, and a broken cache scores what a correct one scor
     `VecIndex::open` its centroids as `Pinned` — asserted by what the cache *holds* after a
     real open, never by reading the call site.
 
-**Both**
+**Phase 3 — shadow warming (D-44) and the dip**
 
-13. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
+13. **Warming fetches metadata and nothing else.** After warming an index, the cache holds
+    `Pinned` and `Meta` bytes and **zero** `Bulk` — D-44 is a rule about *what*, and a warm-up
+    that pulls the vector section is a cache fill wearing another name.
+14. **Warming costs O(1) requests per segment**, not one per document: the same **2** requests
+    at 500 rows and at 5,000, asserted by the counter.
+15. ⚠️ **The dip is a DEPTH reduction, measured on the first query.** A warmed node's first
+    query has **sequential depth 1**; a cold node's has **≥2**. Requests saved are *reported*
+    beside it, not bounded.
+
+    Measured on the first query because that is where the dip is: the cache self-warms on
+    query one, so a mean over 200 queries differs by about two requests and reports ~1.005×.
+
+    ⚠️ And measured as **depth, not request count**, because a count ratio is not a property
+    of warming at all. Warming removes a fixed **2** metadata requests while the query fans
+    out to *p* probes, so the ratio is `(2 + p) / p` — 3× at one probe, 1.25× at eight.
+    A first draft asserted "≥2× fewer requests" and measured **8 against 10**. Depth is what
+    "cold is 30–60× warm" is actually about, and this architecture's own rule is that width is
+    free and depth is not.
+16. **Warming is idempotent**: warming an already-warm index issues **0** requests, so a
+    repeated placement change is free rather than a second fill.
+
+**All phases**
+
+17. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
 
 ## Test plan
 
@@ -118,6 +133,10 @@ fixture merges into one fetch, and a broken cache scores what a correct one scor
 | 10 | `a_class_hint_survives_a_decorator_stack` | a defaulted hint a decorator forgets to forward |
 | 11 | `an_immutable_get_is_cached_and_a_plain_get_is_not` | `get_immutable` delegating to the uncached path |
 | 12 | `opening_a_segment_admits_its_index_as_meta` | a caller that hints `Bulk`, losing D-21 silently |
+| 13 | `warming_fetches_no_bulk_bytes` | a warm-up that pulls the vector section |
+| 14 | `warming_costs_the_same_at_any_row_count` | a warm-up that scales with documents |
+| 15 | `warming_cuts_the_first_query_cost` | warming that fetches nothing, or the wrong classes |
+| 16 | `warming_an_already_warm_index_is_free` | a warm-up that refetches what it just admitted |
 
 ## RA budget
 
@@ -127,7 +146,13 @@ fixture merges into one fetch, and a broken cache scores what a correct one scor
 | Cached read (miss) | 0 | unchanged | unchanged | 0 | **unchanged** |
 | *n* concurrent misses, one range | 0 | **1** | 0 | 0 | 1 |
 | `get` (any) | 0 | unchanged | unchanged | 0 | unchanged — never cached |
-| Placement change | 0 | 0 | 0 | 0 | 0 — nothing is copied, and nothing is warmed yet |
+| Placement change itself | 0 | 0 | 0 | 0 | 0 — nothing is copied |
+| Warm one index | 0 | **2** | 0 | 0 | **2** — suffix, then centroids, fanned out |
+
+⚠️ Warming is a **separate row** on purpose: an earlier draft claimed a placement change cost
+0 *while adding warming triggered by one*. Warming has its own cost and its own completion,
+and the caller decides whether to await it — in production it runs while the previous owner
+still serves.
 
 ## Risks
 
@@ -144,17 +169,12 @@ fixture merges into one fetch, and a broken cache scores what a correct one scor
 
 ## Phase 2 — class-aware admission (D-21)
 
-Phase 1 shipped a plain LRU and said so. **D-21 is the reason the cache exists in the shape it
-does**: a byte of centroid table is worth thousands of bytes of raw vectors because every
-query needs it, so admission must be by *class*, and a burst of bulk traffic must not be able
-to evict it. This phase adds that, and the two things it needs to work.
+**D-21 is the reason the cache exists in the shape it does**: a byte of centroid table is
+worth thousands of bytes of raw vectors because every query needs it.
 
-### The vocabulary, and why not numbers
-
-`cache-hierarchy.md` numbers cache classes 1–9. This codebase already has `Section` ids 1–11
-(`format/src/lib.rs:38-75`) whose numbers mean the **opposite** — `Section::Vectors = 2` is
-full-precision vectors, cache class **9**, "do not cache by default" — and `OpClass`
-(Read/Write/List/Delete). Names only, and the mapping is committed here:
+⚠️ **Names, never numbers.** `cache-hierarchy.md` numbers cache classes 1–9; `Section` ids
+1–11 (`format/src/lib.rs:38-75`) mean the **opposite** — `Section::Vectors = 2` is
+full-precision vectors, cache class **9** — and `OpClass` is a third. The mapping:
 
 | `Class` | Holds | Policy |
 |---|---|---|
@@ -199,3 +219,5 @@ about S3-FIFO/W-TinyLFU on *real traces* we do not have.
 | M4d.7 | Per-class quotas, and eviction within a class |
 | M4d.8 | `get_immutable`, and centroids cached as `Pinned` |
 | M4d.9 | `Segment` and `VecIndex` opt in to their classes |
+| M4d.10 | `warm`: fetch `Pinned`+`Meta` for an index, and nothing else |
+| M4d.11 | The dip measurement: first-query requests, warmed against cold |

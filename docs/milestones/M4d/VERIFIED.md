@@ -5,9 +5,9 @@ demonstrated it.
 
 Gate: `scripts/check-verified.py`.
 
-⚠️ **Phases 1 and 2 are done; caching is still not finished.** Phase 3 — shadow warming
-(D-44) and the post-scale-out dip — is named only. The **NVMe tier (D-23) remains `NOT-RUN`**,
-so a rolling restart still flushes every cache.
+⚠️ **All three phases are done. The NVMe tier (D-23) remains `NOT-RUN`**, so a rolling
+restart still flushes every cache — `affinity-and-coldstart.md` puts a full refill at ~10
+hours per node, and that is a real correctness gap for deploys, not a tidy omission.
 
 1. **A repeated read costs nothing.** `a_second_read_of_the_same_ranges_costs_nothing`
    (`cargo test -p pstore-cache`), covering `get_ranges`, `get_range` and `get_suffix`, with
@@ -55,8 +55,24 @@ so a rolling restart still flushes every cache.
     `Bulk`: *"the index section is Bulk, and a scan burst will evict what every query on this
     segment needs"*. `Segment::open` hints `Meta` for both its suffix and its large-index
     path; `VecIndex::open` hints `Pinned` for centroids via `get_immutable`.
-13. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
-    **95.39%** region, 97.10% line; `pstore-cache` itself 96.34%.
+13. **Warming fetches metadata and nothing else.** `warming_fetches_no_bulk_bytes`
+    (`cargo test -p pstore-index --test warming`): after warming, the cache holds `Meta` and
+    `Pinned` bytes and **zero** `Bulk`. Observed to fail with `warm` stubbed to a no-op.
+14. **Warming costs O(1) per segment**, not one request per document:
+    `warming_costs_the_same_at_any_row_count` — the same count at 600 rows and at 3,000, and
+    ≤3 requests for one segment.
+15. ⚠️ **The dip, as a depth reduction on the first query.**
+    `warming_cuts_the_first_query_cost`, measured with `DepthCounting` beneath the cache: a
+    cold first query takes **2** sequential rounds, a warmed one **1**. Requests are reported
+    beside it — 3 warmed against 3 cold at this fixture size — and deliberately **not**
+    bounded; see below.
+16. **Warming is idempotent.** `warming_an_already_warm_index_is_free` — a second warm issues
+    **0** requests, so a repeated placement change is free rather than a second fill.
+17. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
+    **95.36%** region, 97.08% line; `pstore-cache` itself 96.34%, `vec_index.rs` 93.92%.
+    `cargo mutants -p pstore-index --file crates/pstore-index/src/vec_index.rs --timeout 120`
+    → **55 caught, 3 missed = 94.8%**, with **no warming-related survivors**; the three are
+    pre-existing arithmetic in the index builder and the search path.
     `cargo mutants -p pstore-cache --timeout 60` → **38 caught, 1 missed = 97.4%** after phase
     2, against a floor of 80%. Phase 1 alone went 67.9% → 93.3%, and every point of both
     climbs was a real hole: the suffix read could return an **empty buffer** and still pass
@@ -66,6 +82,19 @@ so a rolling restart still flushes every cache.
     --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
     `cargo deny check`, `scripts/check-links.sh`, `scripts/build-index.py --check`,
     `scripts/check-verified.py` all green.
+
+## ⚠️ The dip is a depth reduction, not a request-count ratio
+
+The spec first asked for **"≥2× fewer requests"** on the first query after warming, and
+measured **8 against 10**. The criterion was wrong, not the code: warming removes a **fixed
+2** metadata requests while the query fans out to *p* probes, so any count ratio is
+`(2 + p) / p` — 3× at one probe, 1.25× at eight. It is a property of the probe count.
+
+What warming actually removes is a **data-dependent chain**: a cold query cannot know which
+posting lists to read until it has the centroids, so it walks {footer, centroids} and only
+then the lists. Warming moves that chain off the query path, and sequential depth goes from
+2 to 1. That is what "cold is 30–60× warm" measures, and this architecture's own rule is that
+width is free and depth is not.
 
 ## What review caught before any code was written
 
