@@ -29,11 +29,80 @@ pub struct Roster {
     ring: Vec<(u64, String)>,
 }
 
-impl Roster {
-    /// The key a cluster's roster lives at. Derived, never discovered.
+/// The unit of placement: one cluster in one availability zone.
+///
+/// ⚠️ **A type, not a convention.** D-79 gives each AZ its own ring, and the failure mode of
+/// doing that by passing strings is silent: a bare cluster name yields one global ring, every
+/// query crosses an AZ boundary, and **every one of them is billed** at $0.02/GB round trip.
+/// Nothing observable goes wrong until the invoice. Making the zone an unavoidable argument
+/// puts that on the compiler rather than on a reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Cell {
+    cluster: String,
+    zone: String,
+}
+
+impl Cell {
+    /// A cell, from its cluster and zone.
     #[must_use]
-    pub fn key(cluster: &str) -> Key {
-        Key::new(format!("{:04x}/clu/ROSTER", fnv(cluster.as_bytes()) as u16))
+    pub fn new(cluster: &str, zone: &str) -> Self {
+        Self {
+            cluster: cluster.to_owned(),
+            zone: zone.to_owned(),
+        }
+    }
+
+    /// The zone half.
+    #[must_use]
+    pub fn zone(&self) -> &str {
+        &self.zone
+    }
+
+    /// The cluster half.
+    #[must_use]
+    pub fn cluster(&self) -> &str {
+        &self.cluster
+    }
+}
+
+impl Roster {
+    /// The key a cell's roster lives at. Derived, never discovered.
+    ///
+    /// ⚠️ The names are in the **path**, not only in the hash prefix. This previously read
+    /// `format!("{:04x}/clu/ROSTER", fnv(cluster) as u16)` — sixteen bits of hash and the
+    /// cluster name absent entirely, so two clusters colliding in 65,536 shared one roster
+    /// object and therefore one ring. `head.rs` had the right shape all along: a prefix that
+    /// spreads keys across the store's partitions, *and* the identity that makes them
+    /// distinct.
+    #[must_use]
+    pub fn key(cell: &Cell) -> Key {
+        let spread = fnv(format!("{}/{}", cell.cluster, cell.zone).as_bytes()) as u16;
+        Key::new(format!(
+            "{spread:04x}/clu/{}/{}/ROSTER",
+            cell.cluster, cell.zone
+        ))
+    }
+
+    /// A cell's roster, from a gossip view that spans every zone.
+    ///
+    /// ⚠️ **Filtered, and never widened.** A per-cell roster *address* is worthless if its
+    /// contents come from the fleet-wide view: a node in one zone would write another zone's
+    /// members into its own cell and place across zones anyway, with every other test passing.
+    ///
+    /// A zone with no members yields an **empty** roster, never the whole view. The tempting
+    /// fallback — "nobody here, so use everyone" — is one global ring wearing a cell's name,
+    /// and it fires exactly when a zone is new or has just lost its last node.
+    #[must_use]
+    pub fn from_members<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+        members: I,
+        zone: &str,
+    ) -> Self {
+        Self::from_nodes(
+            members
+                .into_iter()
+                .filter(|(_, z)| *z == zone)
+                .map(|(addr, _)| addr.to_owned()),
+        )
     }
 
     /// A roster from node ids.
@@ -86,9 +155,9 @@ impl Roster {
     /// first node to start must be able to join one.
     pub async fn read<S: BlobStore>(
         store: &S,
-        cluster: &str,
+        cell: &Cell,
     ) -> Result<(Self, Option<CasTag>), RosterError> {
-        match store.get_with_tag(&Self::key(cluster)).await {
+        match store.get_with_tag(&Self::key(cell)).await {
             Ok((bytes, tag)) => Ok((Self::decode(&bytes)?, Some(tag))),
             Err(pstore_blob::BlobError::NotFound(_)) => Ok((Self::default(), None)),
             Err(e) => Err(RosterError::Blob(e.to_string())),
@@ -107,7 +176,7 @@ impl Roster {
     /// would drop whatever members the winner had just recorded.
     pub async fn refold<S: BlobStore>(
         store: &S,
-        cluster: &str,
+        cell: &Cell,
         view: &Self,
         at: Option<CasTag>,
     ) -> Result<(), RosterError> {
@@ -116,7 +185,7 @@ impl Roster {
             None => Precondition::NotExists,
         };
         match store
-            .put_conditional(&Self::key(cluster), view.encode().into(), pre)
+            .put_conditional(&Self::key(cell), view.encode().into(), pre)
             .await
         {
             Ok(_) => Ok(()),

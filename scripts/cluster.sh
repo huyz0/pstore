@@ -104,6 +104,7 @@ up)
     port=$((7946 + i))
     docker run -d --name "pstore-n$i" --network host --memory 128m --cpus 0.1 \
       -e PSTORE_CLUSTER=c1 \
+      -e PSTORE_AZ="${AZ:-az-a}" \
       -e PSTORE_PROBE_LOSS="$LOSS" \
       -e PSTORE_GOSSIP_PERIOD_MS="$PERIOD_MS" \
       -e PSTORE_OWNS_PERIOD_S="${OWNS_S:-5}" \
@@ -118,7 +119,7 @@ up)
       "$IMAGE" >/dev/null
   }
   export -f start_one
-  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS GOSSIP
+  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS GOSSIP AZ
 
   # The first few in order and alone: the roster starts empty, so somebody has to create it
   # before a herd arrives to contend for it.

@@ -21,6 +21,7 @@ fn member(n: u8, state: State) -> Member {
     Member {
         id: id(n),
         addr: format!("10.0.0.{n}:7946"),
+        zone: "az-a".to_owned(),
         incarnation: u64::from(n),
         state,
     }
@@ -160,5 +161,57 @@ fn an_unknown_state_tag_is_refused() {
             }
         }
         bytes[i] = saved;
+    }
+}
+
+#[test]
+fn a_zone_survives_the_wire() {
+    // ⚠️ A decoder that drops the zone leaves an empty string, which puts the member in no
+    // cell at all — invisible to every ring rather than in the wrong one. Quieter than a
+    // crash and just as wrong.
+    let m = Member {
+        id: id(9),
+        addr: "10.0.0.9:7946".to_owned(),
+        zone: "eu-west-1c".to_owned(),
+        incarnation: 4,
+        state: State::Suspect,
+    };
+    let back = Message::decode(
+        &Message::Sync {
+            from: id(1),
+            members: vec![m.clone()],
+        }
+        .encode(),
+    )
+    .expect("a message this crate encoded must decode");
+    let Message::Sync { members, .. } = back else {
+        panic!("a Sync decoded as something else")
+    };
+    assert_eq!(
+        members[0].zone, "eu-west-1c",
+        "the zone did not survive the wire"
+    );
+    assert_eq!(members[0], m);
+}
+
+#[test]
+fn a_frame_without_a_zone_is_refused() {
+    // ⚠️ Refused, never defaulted. A guessed zone puts a node in the wrong cell — a ring it
+    // does not belong to — and D-79's whole point is that a cell is served entirely within
+    // one AZ. Truncating the frame just before the zone is exactly what an older encoder
+    // would produce.
+    let full = Message::Sync {
+        from: id(1),
+        members: vec![member(2, State::Alive)],
+    }
+    .encode();
+    // Every truncation that lands inside the trailing zone field must be refused, not
+    // silently decoded with an empty zone.
+    for cut in (full.len() - 8)..full.len() {
+        assert!(
+            Message::decode(&full[..cut]).is_none(),
+            "a frame truncated to {cut} of {} bytes decoded with a guessed zone",
+            full.len()
+        );
     }
 }

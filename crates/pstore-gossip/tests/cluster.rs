@@ -26,16 +26,16 @@ fn addr(n: u8) -> String {
 }
 
 fn cluster_of(n: u8) -> Cluster {
-    let mut c = Cluster::new(id(0), addr(0));
+    let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
     for i in 1..n {
-        c.join(id(i), addr(i));
+        c.join(id(i), addr(i), "az-a".to_owned());
     }
     c
 }
 
 #[test]
 fn a_new_cluster_contains_only_itself() {
-    let c = Cluster::new(id(0), addr(0));
+    let c = Cluster::new(id(0), addr(0), "az-a".to_owned());
     assert_eq!(c.len(), 1);
     assert_eq!(c.alive().len(), 1, "a node must consider itself alive");
 }
@@ -60,13 +60,13 @@ fn the_checksum_of_a_stable_cluster_does_not_change() {
 fn two_clusters_that_agree_have_the_same_checksum() {
     // Order of joins must not matter: two nodes learn of members in different orders and
     // still have to recognise agreement, or they reconcile forever.
-    let mut a = Cluster::new(id(0), addr(0));
-    let mut b = Cluster::new(id(0), addr(0));
+    let mut a = Cluster::new(id(0), addr(0), "az-a".to_owned());
+    let mut b = Cluster::new(id(0), addr(0), "az-a".to_owned());
     for i in 1..30 {
-        a.join(id(i), addr(i));
+        a.join(id(i), addr(i), "az-a".to_owned());
     }
     for i in (1..30).rev() {
-        b.join(id(i), addr(i));
+        b.join(id(i), addr(i), "az-a".to_owned());
     }
     assert_eq!(
         a.checksum(),
@@ -82,7 +82,7 @@ fn any_difference_changes_the_checksum() {
     let base = cluster_of(20);
 
     let mut extra = cluster_of(20);
-    extra.join(id(99), addr(99));
+    extra.join(id(99), addr(99), "az-a".to_owned());
     assert_ne!(
         base.checksum(),
         extra.checksum(),
@@ -117,9 +117,9 @@ fn the_checksum_is_maintained_incrementally() {
     // rather than removing it — and at 1,000 nodes that is the cost this crate exists to
     // remove. Compared against a from-scratch computation so the incremental path cannot
     // drift from the definition.
-    let mut c = Cluster::new(id(0), addr(0));
+    let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
     for i in 1..40 {
-        c.join(id(i), addr(i));
+        c.join(id(i), addr(i), "az-a".to_owned());
         assert_eq!(
             c.checksum(),
             c.checksum_from_scratch(),
@@ -196,7 +196,7 @@ fn a_node_never_suspects_itself() {
 fn joining_a_member_twice_does_not_double_count_it() {
     let mut c = cluster_of(10);
     let before = (c.len(), c.checksum());
-    c.join(id(5), addr(5));
+    c.join(id(5), addr(5), "az-a".to_owned());
     assert_eq!((c.len(), c.checksum()), before, "a rejoin changed the set");
 }
 
@@ -279,9 +279,9 @@ fn members_that_differ_have_different_fingerprints() {
     // sides then stop reconciling and stay wrong. Mutation testing reached the mixing step
     // (`^=` to `|=`) and nothing noticed.
     let mut seen = std::collections::HashSet::new();
-    let mut c = Cluster::new(id(0), addr(0));
+    let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
     for i in 1..60u8 {
-        c.join(id(i), addr(i));
+        c.join(id(i), addr(i), "az-a".to_owned());
     }
     // Every distinct (member, incarnation, state) must land on a distinct checksum
     // contribution, which we observe through the cluster checksum changing every time.

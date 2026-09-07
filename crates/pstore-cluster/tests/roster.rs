@@ -14,12 +14,16 @@
 //! and no leader.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
-use pstore_cluster::{Roster, RosterError};
+use pstore_cluster::{Cell, Roster, RosterError};
 use pstore_testkit::flaky::Flaky;
 use pstore_types::TenantId;
 use std::sync::Arc;
 
-const CLUSTER: &str = "c1";
+/// The cell these tests operate on. ⚠️ A cell, not a cluster: D-79 gives each AZ its own ring
+/// and `Roster` no longer has an address that omits one.
+fn cell() -> Cell {
+    Cell::new("c1", "az-a")
+}
 
 #[tokio::test]
 async fn reading_the_roster_costs_one_get_and_no_list() {
@@ -31,7 +35,7 @@ async fn reading_the_roster_costs_one_get_and_no_list() {
     let v = s.as_tenant(t);
     Roster::refold(
         &v,
-        CLUSTER,
+        &cell(),
         &Roster::from_nodes(["a".into(), "b".into()]),
         None,
     )
@@ -39,7 +43,7 @@ async fn reading_the_roster_costs_one_get_and_no_list() {
     .unwrap();
 
     let before = (s.count(t, OpClass::Read), s.count(t, OpClass::List));
-    let (r, tag) = Roster::read(&v, CLUSTER).await.unwrap();
+    let (r, tag) = Roster::read(&v, &cell()).await.unwrap();
     assert_eq!(
         s.count(t, OpClass::Read) - before.0,
         1,
@@ -54,7 +58,9 @@ async fn reading_the_roster_costs_one_get_and_no_list() {
 async fn a_cold_cluster_reads_an_empty_fleet_not_an_error() {
     // The first node to start must be able to join a cluster that does not exist yet.
     let s = MemoryStore::new();
-    let (r, tag) = Roster::read(&s, "brand-new").await.unwrap();
+    let (r, tag) = Roster::read(&s, &Cell::new("brand-new", "az-a"))
+        .await
+        .unwrap();
     assert!(r.nodes().is_empty());
     assert!(
         tag.is_none(),
@@ -74,12 +80,12 @@ async fn a_lost_refold_rebases_rather_than_overwriting() {
     // survive there, and a green test on an emulator would mean nothing.
     let s = MemoryStore::new();
     let seed = Roster::from_nodes(["a".into()]);
-    Roster::refold(&s, CLUSTER, &seed, None).await.unwrap();
-    let (base, tag) = Roster::read(&s, CLUSTER).await.unwrap();
+    Roster::refold(&s, &cell(), &seed, None).await.unwrap();
+    let (base, tag) = Roster::read(&s, &cell()).await.unwrap();
 
     // Node one wins, adding "b".
     let one = base.merged(&Roster::from_nodes(["b".into()]));
-    Roster::refold(&s, CLUSTER, &one, tag.clone())
+    Roster::refold(&s, &cell(), &one, tag.clone())
         .await
         .unwrap();
 
@@ -87,17 +93,17 @@ async fn a_lost_refold_rebases_rather_than_overwriting() {
     let two = base.merged(&Roster::from_nodes(["c".into()]));
     assert!(
         matches!(
-            Roster::refold(&s, CLUSTER, &two, tag).await,
+            Roster::refold(&s, &cell(), &two, tag).await,
             Err(RosterError::Lost)
         ),
         "a stale refold was accepted, which drops the winner's members"
     );
 
     // Rebasing keeps both.
-    let (now, tag2) = Roster::read(&s, CLUSTER).await.unwrap();
+    let (now, tag2) = Roster::read(&s, &cell()).await.unwrap();
     let merged = now.merged(&two);
-    Roster::refold(&s, CLUSTER, &merged, tag2).await.unwrap();
-    let (fin, _) = Roster::read(&s, CLUSTER).await.unwrap();
+    Roster::refold(&s, &cell(), &merged, tag2).await.unwrap();
+    let (fin, _) = Roster::read(&s, &cell()).await.unwrap();
     assert_eq!(
         fin.nodes(),
         ["a", "b", "c"],
@@ -114,7 +120,7 @@ async fn a_hundred_concurrent_refolds_are_bounded() {
     let s = Accounted::new(MemoryStore::new());
     let t = TenantId(2);
     let v = Arc::new(s.as_tenant(t));
-    Roster::refold(&*v, CLUSTER, &Roster::from_nodes(["seed".into()]), None)
+    Roster::refold(&*v, &cell(), &Roster::from_nodes(["seed".into()]), None)
         .await
         .unwrap();
 
@@ -125,9 +131,9 @@ async fn a_hundred_concurrent_refolds_are_bounded() {
         tasks.push(tokio::spawn(async move {
             // One read, one attempt, one rebase-and-retry. Bounded on purpose.
             for _ in 0..2 {
-                let (cur, tag) = Roster::read(&*v, CLUSTER).await.unwrap();
+                let (cur, tag) = Roster::read(&*v, &cell()).await.unwrap();
                 let mine = cur.merged(&Roster::from_nodes([format!("n{i}")]));
-                if Roster::refold(&*v, CLUSTER, &mine, tag).await.is_ok() {
+                if Roster::refold(&*v, &cell(), &mine, tag).await.is_ok() {
                     return;
                 }
             }
@@ -150,11 +156,11 @@ async fn a_corrupt_roster_is_refused_not_guessed() {
     // A roster that decodes to nonsense would place every key on nodes that do not exist,
     // and every query would fail somewhere else entirely.
     let s = MemoryStore::new();
-    s.put(&Roster::key(CLUSTER), bytes::Bytes::from(vec![0xff, 0xfe]))
+    s.put(&Roster::key(&cell()), bytes::Bytes::from(vec![0xff, 0xfe]))
         .await
         .unwrap();
     assert!(matches!(
-        Roster::read(&s, CLUSTER).await,
+        Roster::read(&s, &cell()).await,
         Err(RosterError::Corrupt(_))
     ));
 }
@@ -166,15 +172,19 @@ async fn a_failed_read_is_an_error_not_an_empty_fleet() {
     // backend join an empty fleet, place every key on itself, and report success.
     let s = Flaky::refusing_reads();
     assert!(matches!(
-        Roster::read(&s, CLUSTER).await,
+        Roster::read(&s, &cell()).await,
         Err(RosterError::Blob(_))
     ));
 }
 
 #[tokio::test]
 async fn the_roster_key_is_derived_not_discovered() {
-    // No lookup, no catalog, no DNS: the key falls out of the cluster name.
-    assert_eq!(Roster::key("c1"), Roster::key("c1"));
-    assert_ne!(Roster::key("c1"), Roster::key("c2"));
-    assert!(Roster::key("c1").as_str().ends_with("/clu/ROSTER"));
+    // No lookup, no catalog, no DNS: the key falls out of the cell.
+    // ⚠️ Injectivity across a generated set lives in `tests/cell.rs`; two hand-picked
+    // inequalities cannot see a collision, which is how the old 16-bit key survived M4a.
+    let a = Cell::new("c1", "az-a");
+    assert_eq!(Roster::key(&a), Roster::key(&Cell::new("c1", "az-a")));
+    assert_ne!(Roster::key(&a), Roster::key(&Cell::new("c2", "az-a")));
+    assert_ne!(Roster::key(&a), Roster::key(&Cell::new("c1", "az-b")));
+    assert!(Roster::key(&a).as_str().ends_with("/ROSTER"));
 }

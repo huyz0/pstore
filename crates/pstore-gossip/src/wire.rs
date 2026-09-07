@@ -70,13 +70,15 @@ fn put_member(out: &mut Vec<u8>, m: &Member) {
         State::Suspect => 2,
         State::Dead => 3,
     });
-    let addr = m.addr.as_bytes();
-    // A length that does not fit is a member that cannot be encoded; truncating its address
-    // would produce a member nobody can reach, which is worse than refusing to carry it.
-    let len = u32::try_from(addr.len()).unwrap_or(0);
-    out.extend_from_slice(&len.to_le_bytes());
-    if len > 0 {
-        out.extend_from_slice(addr);
+    for field in [m.addr.as_bytes(), m.zone.as_bytes()] {
+        // A length that does not fit is a member that cannot be encoded; truncating its
+        // address would produce a member nobody can reach, which is worse than refusing to
+        // carry it.
+        let len = u32::try_from(field.len()).unwrap_or(0);
+        out.extend_from_slice(&len.to_le_bytes());
+        if len > 0 {
+            out.extend_from_slice(field);
+        }
     }
 }
 
@@ -128,9 +130,14 @@ impl<'a> Reader<'a> {
         };
         let len = self.u32()? as usize;
         let addr = String::from_utf8(self.take(len)?.to_vec()).ok()?;
+        // ⚠️ Refused when absent, never defaulted. A guessed zone puts a node in the wrong
+        // cell — and a wrong cell is a ring it does not belong to, which is silent.
+        let zlen = self.u32()? as usize;
+        let zone = String::from_utf8(self.take(zlen)?.to_vec()).ok()?;
         Some(Member {
             id,
             addr,
+            zone,
             incarnation,
             state,
         })

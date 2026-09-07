@@ -71,6 +71,22 @@ impl Member {
             .collect()
     }
 
+    /// Every reachable peer with the zone it declared.
+    ///
+    /// ⚠️ The zone is what makes a cell's roster a cell's roster. Without it a node writes
+    /// every zone's members into its own cell and places across AZs anyway — a per-cell
+    /// roster *address* with fleet-wide *contents*.
+    pub async fn members_zoned(&self) -> Vec<(String, String)> {
+        self.proto
+            .lock()
+            .await
+            .cluster()
+            .alive()
+            .into_iter()
+            .map(|m| (m.addr.clone(), m.zone.clone()))
+            .collect()
+    }
+
     /// Bytes sent, received, and dropped since start.
     #[must_use]
     pub fn traffic(&self) -> (u64, u64, u64) {
@@ -82,11 +98,12 @@ impl Member {
         let Ok(id) = derive_id(addr) else {
             return false;
         };
+        // ⚠️ Zone unknown: the roster gives an address, not a zone. Gossip supplies it.
         self.proto
             .lock()
             .await
             .cluster_mut()
-            .join(id, addr.to_owned());
+            .join(id, addr.to_owned(), String::new());
         true
     }
 }
@@ -115,6 +132,7 @@ fn derive_id(addr: &str) -> Result<NodeId, ()> {
 pub async fn start(
     listen: &str,
     advertise: &str,
+    zone: &str,
     seeds: &[String],
     loss: f64,
     period: std::time::Duration,
@@ -123,10 +141,10 @@ pub async fn start(
     let socket = Arc::new(UdpSocket::bind(listen).await?);
 
     let me = derive_id(advertise).map_err(|()| "unusable advertise address")?;
-    let mut cluster = Cluster::new(me, advertise.to_owned());
+    let mut cluster = Cluster::new(me, advertise.to_owned(), zone.to_owned());
     for s in seeds {
         if let Ok(id) = derive_id(s) {
-            cluster.join(id, s.clone());
+            cluster.join(id, s.clone(), String::new());
         }
     }
 

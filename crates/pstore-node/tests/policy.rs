@@ -13,7 +13,7 @@
 //! library: these are branches, and branches belong in tests.
 
 use pstore_blob::MemoryStore;
-use pstore_cluster::Roster;
+use pstore_cluster::{Cell, Roster};
 use pstore_node::policy::{
     fresh_node_id, jitter, owned_shards, read_roster_patiently, to_dial, union_to_publish,
 };
@@ -154,7 +154,9 @@ fn an_identity_is_fresh_on_every_start() {
 #[tokio::test]
 async fn a_join_reads_the_roster_once_and_tolerates_an_empty_one() {
     let store = MemoryStore::new();
-    let (roster, _) = read_roster_patiently(&store, "c1", "n1").await.unwrap();
+    let (roster, _) = read_roster_patiently(&store, &Cell::new("c1", "az-a"), "n1")
+        .await
+        .unwrap();
     assert!(
         roster.nodes().is_empty(),
         "a cold cluster's roster is empty, not an error: the first node has to be able to join"
@@ -165,9 +167,13 @@ async fn a_join_reads_the_roster_once_and_tolerates_an_empty_one() {
 async fn a_join_returns_the_members_already_present() {
     let store = MemoryStore::new();
     let seeded = Roster::from_nodes(nodes(4));
-    Roster::refold(&store, "c1", &seeded, None).await.unwrap();
+    Roster::refold(&store, &Cell::new("c1", "az-a"), &seeded, None)
+        .await
+        .unwrap();
 
-    let (roster, tag) = read_roster_patiently(&store, "c1", "n9").await.unwrap();
+    let (roster, tag) = read_roster_patiently(&store, &Cell::new("c1", "az-a"), "n9")
+        .await
+        .unwrap();
     assert_eq!(roster.nodes().len(), 4);
     assert!(tag.is_some(), "an existing roster must carry a CAS tag");
 }
@@ -178,7 +184,7 @@ async fn a_join_gives_up_rather_than_retrying_a_dead_store_forever() {
     // learned nothing — so it retries. But the budget has to END, or a misconfigured fleet
     // reports nothing at all rather than an error. `Flaky::refusing_reads` is the store that
     // is never coming back.
-    let err = read_roster_patiently(&Flaky::refusing_reads(), "c1", "n1")
+    let err = read_roster_patiently(&Flaky::refusing_reads(), &Cell::new("c1", "az-a"), "n1")
         .await
         .unwrap_err();
     assert!(
@@ -197,7 +203,8 @@ async fn the_retry_schedule_actually_backs_off() {
     //
     // On a paused clock the virtual elapsed time IS the schedule, exactly and for free.
     let start = tokio::time::Instant::now();
-    let _ = read_roster_patiently(&Flaky::refusing_reads(), "c1", "node-a").await;
+    let _ =
+        read_roster_patiently(&Flaky::refusing_reads(), &Cell::new("c1", "az-a"), "node-a").await;
     let elapsed = start.elapsed();
 
     // Twelve attempts: 250ms doubling to a 8s ceiling, plus a per-node jitter of up to the
@@ -215,7 +222,8 @@ async fn the_retry_schedule_actually_backs_off() {
     // And the jitter must actually differ between nodes, or the fleet retries in lockstep
     // and the backoff spreads nothing.
     let other = tokio::time::Instant::now();
-    let _ = read_roster_patiently(&Flaky::refusing_reads(), "c1", "node-b").await;
+    let _ =
+        read_roster_patiently(&Flaky::refusing_reads(), &Cell::new("c1", "az-a"), "node-b").await;
     assert_ne!(
         other.elapsed(),
         elapsed,
@@ -229,7 +237,7 @@ async fn a_join_survives_a_store_that_is_briefly_unreachable() {
     // measured, 56 of 100 nodes exhausted their client's retries in 58s and exited, leaving
     // the fleet stable at 44. Transient refusal must not cost a member.
     let store = Flaky::refusing_reads_at(&[0, 1, 2]);
-    let (roster, _) = read_roster_patiently(&store, "c1", "n1")
+    let (roster, _) = read_roster_patiently(&store, &Cell::new("c1", "az-a"), "n1")
         .await
         .expect("three refusals is well inside the budget");
     assert!(roster.nodes().is_empty());
@@ -238,4 +246,31 @@ async fn a_join_survives_a_store_that_is_briefly_unreachable() {
         "only {} refusals were injected",
         store.failures()
     );
+}
+
+#[test]
+fn a_node_without_a_zone_refuses_to_start() {
+    // ⚠️ Required, with no default. D-79 gives each AZ its own placement ring, so a node with
+    // no zone joins the wrong cell — and that is silent: placement still answers, queries
+    // still return, and every cross-AZ byte is billed at $0.02/GB round trip. Nothing
+    // observable goes wrong until the invoice.
+    //
+    // ⚠️ Tested against the pure decision rather than the environment, because mutating the
+    // process env is `unsafe` in this edition and `unsafe_code = "forbid"` is a workspace
+    // non-negotiable. A guard that can only be exercised by setting a variable is a guard
+    // that cannot be tested at all.
+    let err = pstore_node::policy::zone(None).unwrap_err();
+    assert!(
+        err.contains("PSTORE_AZ"),
+        "the error must name the variable an operator has to set, got: {err}"
+    );
+    assert!(
+        pstore_node::policy::zone(Some("   ")).is_err(),
+        "a blank zone was accepted, which is a cell nobody is in"
+    );
+    assert!(
+        pstore_node::policy::zone(Some("")).is_err(),
+        "an empty zone was accepted"
+    );
+    assert_eq!(pstore_node::policy::zone(Some("az-b")).unwrap(), "az-b");
 }

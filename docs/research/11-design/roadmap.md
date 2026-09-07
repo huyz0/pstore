@@ -139,7 +139,10 @@ strategy" — known *before* M3 hardens around it.
 > ⚠️ **Split, and scoped to the machine.** M4a (roster + placement, pure and deterministic)
 > and M4b (gossip + a **100-node** Docker fleet, every number `provisional`) are specified;
 > M4c (hierarchical membership), then M4d (cache and the post-scale-out dip) and M4e (per-AZ
-> cells, gray failure) follow. ⚠️ Membership took the M4c letter after the 1,000-node run
+> cells, gray failure) follow. ⚠️ M4c shipped as `pstore-gossip` instead — hierarchy was
+> **gated out by its own criterion** once per-node cost stopped growing with the fleet. M4d is
+> complete across three phases; M4e phase 1 (zone identity) is done, with placement and gray
+> failure to follow. ⚠️ Membership took the M4c letter after the 1,000-node run
 > measured flat gossip at ~17 of 20 cores: a cache benchmarked on a fleet whose membership
 > consumes the host measures the host. The
 > exit's **1,000 real nodes** is `NOT-RUN` — measured, a container costs ~1.4 MB of host

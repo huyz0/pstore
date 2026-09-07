@@ -11,4 +11,4 @@ pub mod placement;
 pub mod roster;
 
 pub use placement::Placement;
-pub use roster::{Roster, RosterError};
+pub use roster::{Cell, Roster, RosterError};

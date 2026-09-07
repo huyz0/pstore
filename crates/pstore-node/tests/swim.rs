@@ -33,6 +33,7 @@ async fn member(port: u16, seeds: &[String]) -> swim::Member {
     swim::start(
         &format!("127.0.0.1:{port}"),
         &format!("127.0.0.1:{port}"),
+        "az-a",
         seeds,
         0.0,
         FAST,
@@ -59,7 +60,7 @@ async fn a_hostname_is_not_parsed_as_a_socket_address() {
     // fleet advertises a NAME, and `SocketAddr::parse` fails on it. Every node exited at
     // startup, which reads as a crash loop rather than an address that was never resolved.
     // The listen address must be refused clearly rather than panicking.
-    let r = swim::start("not-a-socket-addr", "127.0.0.1:1", &[], 0.0, FAST).await;
+    let r = swim::start("not-a-socket-addr", "127.0.0.1:1", "az-a", &[], 0.0, FAST).await;
     assert!(r.is_err(), "an unparseable listen address was accepted");
 }
 
@@ -125,6 +126,7 @@ async fn total_loss_stops_the_bytes_but_not_the_node() {
     let m = swim::start(
         &format!("127.0.0.1:{}", free_port()),
         &format!("127.0.0.1:{}", free_port()),
+        "az-a",
         &[format!("127.0.0.1:{}", free_port())],
         1.0,
         FAST,

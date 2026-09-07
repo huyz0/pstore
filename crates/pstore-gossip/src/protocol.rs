@@ -286,7 +286,7 @@ impl Protocol {
                 continue;
             }
             let Some(local) = self.cluster.member(&m.id).cloned() else {
-                self.cluster.join(m.id, m.addr.clone());
+                self.cluster.join(m.id, m.addr.clone(), m.zone.clone());
                 self.apply(m);
                 continue;
             };
@@ -299,7 +299,11 @@ impl Protocol {
     }
 
     /// Set a member to exactly what the winning record says.
+    ///
+    /// ⚠️ Takes the record's address and zone as well as its state — this is how a peer first
+    /// learned from a bare probe, with no zone, acquires one.
     fn apply(&mut self, m: &Member) {
+        self.cluster.upsert(m.clone());
         match m.state {
             // ⚠️ `refute` is the only path that raises an incarnation, and it never invents
             // one: the value comes from the record, which came from the member itself.
@@ -348,7 +352,10 @@ impl Protocol {
     /// Record a peer we had not heard of, at the address it just contacted us from.
     fn learn(&mut self, id: NodeId, addr: &str) {
         if self.cluster.member(&id).is_none() {
-            self.cluster.join(id, addr.to_owned());
+            // ⚠️ Zone unknown: a probe does not carry one. Until an authoritative record
+            // arrives this peer belongs to no cell, which keeps it out of every ring rather
+            // than putting it in the wrong one.
+            self.cluster.join(id, addr.to_owned(), String::new());
             self.note_update(&id);
         }
     }

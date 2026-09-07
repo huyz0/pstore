@@ -46,10 +46,10 @@ impl Sim {
         let mut nodes = Vec::new();
         let mut by_addr = BTreeMap::new();
         for i in 0..n {
-            let mut c = Cluster::new(id(i), addr(i));
+            let mut c = Cluster::new(id(i), addr(i), "az-a".to_owned());
             if seeded {
                 for j in 0..n {
-                    c.join(id(j), addr(j));
+                    c.join(id(j), addr(j), "az-a".to_owned());
                 }
             }
             by_addr.insert(addr(i), usize::from(i));
@@ -148,7 +148,9 @@ fn a_disagreement_still_reconciles() {
     // The other half: cheap when agreeing is worthless if it never notices a disagreement.
     // One node knows a member the rest do not, and the fleet must converge on it.
     let mut sim = Sim::new(20, true);
-    sim.nodes[0].cluster_mut().join(id(900), addr(900));
+    sim.nodes[0]
+        .cluster_mut()
+        .join(id(900), addr(900), "az-a".to_owned());
     assert!(!sim.all_see(21));
     for r in 0..40 {
         sim.round(r);
@@ -169,8 +171,12 @@ fn two_nodes_each_holding_news_both_converge() {
     // resyncing forever, and a checksum that never matches is a checksum that costs bytes and
     // buys nothing.
     let mut sim = Sim::new(6, true);
-    sim.nodes[0].cluster_mut().join(id(700), addr(700));
-    sim.nodes[1].cluster_mut().join(id(800), addr(800));
+    sim.nodes[0]
+        .cluster_mut()
+        .join(id(700), addr(700), "az-a".to_owned());
+    sim.nodes[1]
+        .cluster_mut()
+        .join(id(800), addr(800), "az-a".to_owned());
 
     for r in 0..80 {
         sim.round(r);
@@ -196,7 +202,9 @@ fn a_cold_fleet_converges_from_a_seed() {
     // Nobody knows anybody except through one seed, which is what a real join looks like.
     let mut sim = Sim::new(30, false);
     for i in 1..30u16 {
-        sim.nodes[usize::from(i)].cluster_mut().join(id(0), addr(0));
+        sim.nodes[usize::from(i)]
+            .cluster_mut()
+            .join(id(0), addr(0), "az-a".to_owned());
     }
     for r in 0..200 {
         sim.round(r);
@@ -369,8 +377,8 @@ fn a_peer_that_believes_us_dead_is_told_so_it_can_refute() {
     // raise it. Mutation testing found `evidence_for -> vec![]` survived, meaning nothing
     // tested the mechanism directly -- the heal test passed through some other path.
     let mut a = Protocol::new({
-        let mut c = Cluster::new(id(0), addr(0));
-        c.join(id(1), addr(1));
+        let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
+        c.join(id(1), addr(1), "az-a".to_owned());
         c
     });
     a.cluster_mut().suspect(&id(1));
@@ -492,9 +500,9 @@ fn a_change_is_retransmitted_a_bounded_number_of_times() {
     // with nothing changing at all. Mutation testing reached the retirement comparison and
     // every variant survived.
     let mut proto = {
-        let mut c = Cluster::new(id(0), addr(0));
+        let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
         for i in 1..5 {
-            c.join(id(i), addr(i));
+            c.join(id(i), addr(i), "az-a".to_owned());
         }
         Protocol::new(c)
     };

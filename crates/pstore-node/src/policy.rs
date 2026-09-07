@@ -33,7 +33,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The jitter comes from the node id rather than a clock, so it is reproducible.
 pub async fn read_roster_patiently<S: BlobStore>(
     store: &S,
-    cluster: &str,
+    cell: &pstore_cluster::Cell,
     node_id: &str,
 ) -> Result<(Roster, Option<pstore_types::CasTag>), String> {
     let mut last = String::new();
@@ -44,7 +44,7 @@ pub async fn read_roster_patiently<S: BlobStore>(
         // first `println!` is indistinguishable from a node that never started, and the
         // retry budget below never ran at all, because the attempt it was protecting had
         // not returned. A timeout is what turns a hang into an error the backoff can see.
-        let attempt_result = tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(store, cluster))
+        let attempt_result = tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(store, cell))
             .await
             .map_err(|_| format!("no answer in {ATTEMPT_TIMEOUT:?}"))
             .and_then(|r| r.map_err(|e| e.to_string()));
@@ -140,6 +140,33 @@ pub fn jitter(node_id: &str, period: u64) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h % period.max(1)
+}
+
+/// The availability zone this node is in, from the environment.
+///
+/// ⚠️ **Required, with no default.** D-79 gives each AZ its own placement ring, so a node with
+/// no zone is a node that would join the wrong cell — and joining the wrong cell is silent:
+/// placement still returns nodes, queries still answer, and every cross-AZ byte is billed at
+/// $0.02/GB round trip. A default here is the bug, not the convenience.
+///
+/// ⚠️ In the library rather than in `main`, because `scripts/coverage.sh` excludes binary
+/// entry points and a guard the coverage gate cannot see is not a guard.
+pub fn zone_from_env() -> Result<String, String> {
+    zone(std::env::var("PSTORE_AZ").ok().as_deref())
+}
+
+/// The decision `zone_from_env` makes, without the environment.
+///
+/// ⚠️ Separated because mutating the process environment is `unsafe` in this edition and
+/// `unsafe_code = "forbid"` is a workspace non-negotiable — so a guard that could only be
+/// tested by setting a variable could not be tested at all. The rule that keeps decisions out
+/// of `main` applies one level further down: the wrapper reads, this decides.
+pub fn zone(raw: Option<&str>) -> Result<String, String> {
+    match raw {
+        Some(z) if !z.trim().is_empty() => Ok(z.to_owned()),
+        Some(_) => Err("PSTORE_AZ is set but blank".to_owned()),
+        None => Err("PSTORE_AZ is required: a node with no zone joins the wrong cell".to_owned()),
+    }
 }
 
 /// A node identity that is fresh on every start.

@@ -44,6 +44,14 @@ pub struct Member {
     pub id: NodeId,
     /// Where to probe it.
     pub addr: String,
+    /// Which availability zone it is in.
+    ///
+    /// ⚠️ Carried in membership because a node cannot filter peers it cannot identify. D-79
+    /// gives each AZ its own placement ring, and a cell's roster must hold only that cell's
+    /// members — which is impossible if the gossip view does not say who is where. It is
+    /// **self-declared**: nothing here can check it, and a node claiming the wrong zone joins
+    /// the wrong cell. D-83's health bulletin is where that would later be cross-checked.
+    pub zone: String,
     /// Bumped by the member itself to refute a suspicion. Higher always wins.
     pub incarnation: u64,
     /// What this node believes about it.
@@ -64,6 +72,11 @@ impl Member {
         };
         for b in self.id {
             mix(b);
+        }
+        // ⚠️ The zone is part of the identity a checksum must cover: a member that moved zone
+        // is a different placement, and two nodes disagreeing about it must reconcile.
+        for b in self.zone.as_bytes() {
+            mix(*b);
         }
         for b in self.incarnation.to_le_bytes() {
             mix(b);
@@ -86,7 +99,7 @@ pub struct Cluster {
 impl Cluster {
     /// A cluster containing only this node, alive.
     #[must_use]
-    pub fn new(me: NodeId, addr: String) -> Self {
+    pub fn new(me: NodeId, addr: String, zone: String) -> Self {
         let mut c = Self {
             me,
             members: BTreeMap::new(),
@@ -95,6 +108,7 @@ impl Cluster {
         c.insert(Member {
             id: me,
             addr,
+            zone,
             incarnation: 0,
             state: State::Alive,
         });
@@ -186,16 +200,28 @@ impl Cluster {
     }
 
     /// Learn of a member, or do nothing if it is already known.
-    pub fn join(&mut self, id: NodeId, addr: String) {
+    pub fn join(&mut self, id: NodeId, addr: String, zone: String) {
         if self.members.contains_key(&id) {
             return;
         }
         self.insert(Member {
             id,
             addr,
+            zone,
             incarnation: 0,
             state: State::Alive,
         });
+    }
+
+    /// Insert or replace a member wholesale, from a record that won on incarnation.
+    ///
+    /// ⚠️ Replaces the **address and zone** too, not only the state. A peer first learned from
+    /// a bare probe has an unknown zone — a `Ping` carries none, and putting one on every
+    /// probe would tax the steady state this crate exists to keep at 74 bytes. The first
+    /// authoritative `Member` record about it is what fills that in, and it can only do so if
+    /// this replaces rather than merges.
+    pub fn upsert(&mut self, m: Member) {
+        self.insert(m);
     }
 
     /// Mark a peer as having missed a probe.

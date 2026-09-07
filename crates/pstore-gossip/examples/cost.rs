@@ -23,9 +23,9 @@ fn converged_round_bytes(n: u32) -> (u64, u64) {
     let mut nodes: Vec<Protocol> = Vec::new();
     let mut by_addr = BTreeMap::new();
     for i in 0..n {
-        let mut c = Cluster::new(id(i), addr(i));
+        let mut c = Cluster::new(id(i), addr(i), "az-a".to_owned());
         for j in 0..n {
-            c.join(id(j), addr(j));
+            c.join(id(j), addr(j), "az-a".to_owned());
         }
         by_addr.insert(addr(i), i as usize);
         nodes.push(Protocol::new(c));

@@ -46,6 +46,24 @@ impl Membership {
         }
     }
 
+    /// Peers with their zones, for building this cell's roster.
+    ///
+    /// ⚠️ The `chitchat` arm labels every peer with **this node's own zone**, because
+    /// Scuttlebutt here carries no zone at all — so a chitchat fleet is necessarily a single
+    /// cell. Said plainly rather than left blank, which would silently yield an empty roster
+    /// and a node that places on nobody.
+    async fn members_zoned(&self, my_zone: &str) -> Vec<(String, String)> {
+        match self {
+            Self::Chitchat(m) => m
+                .members()
+                .await
+                .into_iter()
+                .map(|a| (a, my_zone.to_owned()))
+                .collect(),
+            Self::Swim(m) => m.members_zoned().await,
+        }
+    }
+
     async fn members(&self) -> Vec<String> {
         match self {
             Self::Chitchat(m) => m.members().await,
@@ -84,6 +102,10 @@ impl Membership {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = env("PSTORE_CLUSTER", "c1");
+    // ⚠️ No default. A node with no zone joins the wrong cell, and joining the wrong cell is
+    // silent: placement still answers, and every cross-AZ byte is billed.
+    let zone = policy::zone_from_env()?;
+    let cell = pstore_cluster::Cell::new(&cluster, &zone);
     let node_id = env("PSTORE_NODE_ID", &fresh_node_id());
     let listen = env("PSTORE_GOSSIP_ADDR", "0.0.0.0:7946");
     let advertise = env("PSTORE_ADVERTISE", &listen);
@@ -97,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ⚠️ One GET. This is the whole of discovery: no DNS, no service registry, no LIST. The
     // bucket we already depend on is how a node finds the fleet, which is what keeps "one
     // stateful dependency" true.
-    let (roster, tag) = read_roster_patiently(&store, &cluster, &node_id).await?;
+    let (roster, tag) = read_roster_patiently(&store, &cell, &node_id).await?;
     let seeds: Vec<String> = roster
         .nodes()
         .iter()
@@ -141,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?,
         )
     } else {
-        Membership::Swim(swim::start(&listen, &advertise, &seeds, loss, period).await?)
+        Membership::Swim(swim::start(&listen, &advertise, &zone, &seeds, loss, period).await?)
     };
     // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
     // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the
@@ -158,14 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one-member cluster. Measured: ten nodes, ten singleton views. The roster is a cache of
     // gossip, and a cache nobody writes until later is one nobody can join through.
     let mine = roster.merged(&Roster::from_nodes([me.clone()]));
-    match Roster::refold(&store, &cluster, &mine, tag).await {
+    match Roster::refold(&store, &cell, &mine, tag).await {
         Ok(()) => println!("ANNOUNCE ok members={}", mine.nodes().len()),
         Err(_) => {
             // Lost the race: rebase and try once. Losing repeatedly is fine — gossip will
             // carry us in as soon as one peer knows us.
-            if let Ok((cur, t)) = Roster::read(&store, &cluster).await {
+            if let Ok((cur, t)) = Roster::read(&store, &cell).await {
                 let merged = cur.merged(&Roster::from_nodes([me.clone()]));
-                let _ = Roster::refold(&store, &cluster, &merged, t).await;
+                let _ = Roster::refold(&store, &cell, &merged, t).await;
             }
         }
     }
@@ -221,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // this loop stops the node reporting anything at all, and a node that has
             // stopped reporting is one the harness cannot tell from a dead one.
             if let Ok(Ok((cur, tag))) =
-                tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(&store, &cluster)).await
+                tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(&store, &cell)).await
             {
                 let mut healed = 0usize;
                 for n in policy::to_dial(&cur, &members) {
@@ -230,7 +252,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                match policy::union_to_publish(&cur, &members) {
+                // ⚠️ Filtered to THIS cell. Publishing the whole gossip view into a
+                // per-cell key is a per-AZ roster in name only: the address is per-cell and
+                // the contents are the fleet, so placement crosses AZs anyway and every byte
+                // of it is billed.
+                let zoned = handle.members_zoned(&zone).await;
+                let mine: Vec<String> = zoned
+                    .iter()
+                    .filter(|(_, z)| *z == zone)
+                    .map(|(a, _)| a.clone())
+                    .collect();
+                match policy::union_to_publish(&cur, &mine) {
                     None => {
                         if healed > 0 {
                             println!("HEAL dialled={healed} known={}", cur.nodes().len());
@@ -239,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(union) => {
                         match tokio::time::timeout(
                             ATTEMPT_TIMEOUT,
-                            Roster::refold(&store, &cluster, &union, tag),
+                            Roster::refold(&store, &cell, &union, tag),
                         )
                         .await
                         {
