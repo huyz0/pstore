@@ -1060,6 +1060,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-gossip"
+version = "0.1.0"
+
+[[package]]
 name = "pstore-index"
 version = "0.1.0"
 dependencies = [

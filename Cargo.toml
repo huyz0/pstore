@@ -16,6 +16,7 @@ members = [
     # Layer 3 - retrieval
     "crates/pstore-index",
     "crates/pstore-cluster",
+    "crates/pstore-gossip",
     # Layer 4 - serving
     "crates/pstore-node",
     # Layer 1 - substrate
