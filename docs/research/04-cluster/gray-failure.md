@@ -100,6 +100,19 @@ rate and latency.
 > **D-84.** Gray detection is **peer-relative and self-calibrating**: is AZ-b an outlier versus
 > AZ-a and AZ-c *right now*? Never "is AZ-b slower than 100 ms?"
 
+> **C-9 — the statistic, corrected. M4e, measured.** D-84's principle holds exactly; the
+> **Envoy default it borrows does not transfer**. With *n* samples the largest z-score any one
+> can reach is `(n − 1) / √n`, so with **three zones the ceiling is 1.155** and a factor of
+> **1.9 can never fire, whatever the degradation**. Implemented as written, gray failure would
+> have been undetectable at precisely the fleet shape D-79 prescribes — three AZs.
+>
+> Excluding the candidate from its own baseline fixes the masking but not the sensitivity:
+> with two peers a standard deviation is nearly meaningless, and a zone 4% slower than its
+> neighbours becomes a 3σ event. The shipped test is a **relative margin against the peer
+> median** — 50% on latency, 5 points on success rate — robust with two peers and
+> scale-invariant, so it stays peer-relative in D-84's sense rather than an absolute threshold
+> in disguise. Evidence: [`M4e/VERIFIED.md`](../../milestones/M4e/VERIFIED.md) criterion 10.
+
 ### Detection latency
 
 | Signal | Sample | Confirmations | Time to suspect |

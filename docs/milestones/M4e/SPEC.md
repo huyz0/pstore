@@ -22,7 +22,7 @@ state, and **no zone**. A node cannot filter peers it cannot identify. So:
 |---|---|---|
 | **1 — this spec** | Zone identity: members carry a zone, cells are addressable without collision, a cell's roster holds only its own members | specified |
 | **2** | Per-AZ placement and OQ-59, once a cell's membership is real | specified below |
-| 3 | Gray failure (D-82–D-87): probe mesh, blob bulletin, peer-relative detection, self-eviction | named only |
+| **3** | Gray failure (D-84–D-87): peer-relative detection, the drain precondition, self-eviction | specified below |
 
 ## ⚠️ A pre-existing collision, found by this review
 
@@ -80,6 +80,33 @@ So the question is split, because the answer is:
 That makes OQ-59 a measurement of imbalance against `N`, with enough trials to see past the
 spread — not a single ratio between two configurations.
 
+## Phase 3 — gray failure
+
+An AZ that is **degraded but alive** costs 17–67× effective latency with every liveness check
+green ([`gray-failure.md`](../../research/04-cluster/gray-failure.md)). ⚠️ And per-AZ cells
+*caused* the blind spot: eliminating cross-AZ traffic eliminates the signal that would have
+revealed it. This is the bill for D-79, and phase 3 is paying it.
+
+**Adds** — `pstore_cluster::gray`: the decisions, as pure functions over health samples.
+
+- **Peer-relative detection (D-84)**: is this zone an outlier versus its peers *right now*,
+  never "slower than 100 ms". Envoy's model — eject below `mean − stdev × factor`, default
+  **1.9**.
+- ⚠️ **The drain precondition (D-85)**, which is the safety property that matters most.
+  Draining an overloaded AZ moves its load onto the others and can cascade: *the detector
+  would cause the outage it was built to prevent*. So degradation that rises **with**
+  utilization is `Shed`; degradation at **normal or low** utilization is `Drain`. Encoded as
+  a precondition, which is what D-85 asks for, rather than a runbook note.
+- **Self-eviction (D-86/D-87)**: a node drains by failing its own LB health check — pure data
+  plane, no control plane in the recovery path. It decides on what *external* observers say,
+  never its own opinion of itself; the one exception is D-87, a node that cannot reach the
+  blob store, which is the single case where self-assessment is reliable.
+
+**Does not add** — the cross-AZ probe mesh (D-82) and blob bulletin (D-83) as running
+subsystems: those are transports for these decisions, they need a query path and a real
+multi-AZ deployment to mean anything, and neither exists. The decisions are what can be built
+and tested now, and they are the part that is dangerous to get wrong.
+
 ## Acceptance criteria
 
 1. ⚠️ **Cell addresses do not collide.** Over **10,000** generated `(cluster, zone)` pairs,
@@ -107,7 +134,19 @@ spread — not a single ratio between two configurations.
    stays under **1.6×**, which is above the observed maximum and below anything a broken hash
    would produce. ⚠️ Not 1.25×: that was M4a's bound at **N=100**, and requiring it at 300 is
    what made the first draft of this criterion unsatisfiable.
-9. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
+10. ⚠️ **Detection is peer-relative, never absolute (D-84).** Multiplying *every* zone's
+    latency by 10 changes no verdict — a uniformly slow fleet has no outlier. A zone 5× slower
+    than its peers is one.
+11. ⚠️ **Load-correlated degradation sheds; infrastructure degradation drains (D-85).** A slow,
+    highly-utilized zone yields `Shed`; a slow, lightly-utilized zone yields `Drain`. This is
+    the criterion that stops the detector causing a cascade.
+12. **Draining requires headroom in the survivors**, and is refused without it — draining into
+    a fleet that cannot absorb the load is the cascade by another route.
+13. **A majority can never drain.** With two of three zones degraded, neither drains: that is
+    a fleet-wide event, and the answer is not to switch the fleet off.
+14. **A node self-evicts on others' evidence, not its own** (D-86) — except when it cannot
+    reach the blob store (D-87), which is the one case where self-assessment is reliable.
+15. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
 
 ## Test plan
 
@@ -122,6 +161,11 @@ spread — not a single ratio between two configurations.
 | 4 | `a_node_without_a_zone_refuses_to_start` | a default zone in the node |
 | 6 | `placement_stays_inside_its_cell` | a call site that builds its ring from the unfiltered view |
 | 8 | `imbalance_at_cell_scale_stays_bounded` | a hash that clusters at the smaller per-cell node count |
+| 10 | `a_uniformly_slow_fleet_has_no_outlier` | an absolute latency threshold wearing a peer-relative name |
+| 11 | `an_overloaded_zone_sheds_rather_than_draining` | a detector that drains under load and cascades |
+| 12 | `draining_requires_headroom_in_the_survivors` | a drain that moves load onto a fleet that cannot take it |
+| 13 | `a_majority_can_never_drain` | a rule that switches the whole fleet off |
+| 14 | `a_node_that_cannot_reach_the_store_evicts_itself` | self-eviction that waits for a bulletin it cannot fetch |
 
 ## RA budget
 
@@ -157,3 +201,6 @@ does not exist yet; relays are C-8's open item.
 | M4e.5 | `zone_from_env` in the node library, required |
 | M4e.6 | Every placement call site uses the cell's roster, including `OWNS` |
 | M4e.7 | OQ-59: the imbalance curve, its spread, and its conclusion |
+| M4e.8 | `gray`: peer-relative outlier detection (D-84) |
+| M4e.9 | The drain precondition: shed vs drain, headroom, majority (D-85) |
+| M4e.10 | Self-eviction, including the blob-unreachable case (D-86/D-87) |

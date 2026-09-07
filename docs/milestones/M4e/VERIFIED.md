@@ -5,8 +5,10 @@ demonstrated it.
 
 Gate: `scripts/check-verified.py`.
 
-⚠️ **Phase 1 of three.** Per-AZ placement and OQ-59 are phase 2; gray failure (D-82–D-87) is
-phase 3. Neither is decomposed yet, deliberately.
+⚠️ **All three phases are done.** What is deliberately **not** built: the cross-AZ probe mesh
+(D-82) and the blob health bulletin (D-83) as running subsystems. They are transports for the
+phase-3 decisions and need a query path and a real multi-AZ deployment to mean anything;
+neither exists. The decisions are what can be built now, and they are the dangerous part.
 
 1. ⚠️ **Cell addresses do not collide**, over 10,000 generated `(cluster, zone)` pairs —
    `cell_keys_do_not_collide_across_ten_thousand_cells`,
@@ -62,8 +64,42 @@ phase 3. Neither is decomposed yet, deliberately.
 8. **A regression guard set from the measurement**: `imbalance_at_cell_scale_stays_bounded`
    holds a 300-node ring under **1.6×** across trials — above the observed 1.435 maximum, far
    below anything a clustering hash produces. ⚠️ Not 1.25×, which was M4a's bound at N=100.
-9. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
-   **95.15%** region, 96.77% line; `roster.rs` itself 94.93%. `cargo mutants -p pstore-cluster --file crates/pstore-cluster/src/roster.rs`
+10. ⚠️ **Detection is peer-relative, and the corpus's statistic had to be corrected.**
+    `a_uniformly_slow_fleet_has_no_outlier` — multiplying every zone's latency by 10 changes no
+    verdict — plus `a_zone_much_slower_than_its_peers_is_an_outlier` and
+    `a_zone_failing_requests_is_an_outlier_even_when_fast`
+    (`cargo test -p pstore-cluster --test gray`).
+
+    ⚠️ **D-84's Envoy default cannot work at three zones**, and this is recorded as
+    [C-9](../../research/04-cluster/gray-failure.md). With *n* samples the largest z-score any
+    one can reach is `(n − 1)/√n`; at **n=3 the ceiling is 1.155**, so a factor of **1.9 never
+    fires, whatever the degradation** — gray failure would have been undetectable at exactly
+    the fleet shape D-79 prescribes. Excluding the candidate from its own baseline fixes the
+    masking but not the sensitivity, because with two peers a standard deviation is nearly
+    meaningless. The shipped test is a relative margin against the **peer median**.
+11. ⚠️ **Load-correlated degradation sheds; infrastructure degradation drains (D-85).**
+    `an_overloaded_zone_sheds_rather_than_draining` — the same latency at 95% utilization is
+    `Shed` and at 25% is `Drain`. This is the criterion that stops the detector causing the
+    cascade it exists to prevent.
+12. **Draining requires headroom.** `draining_requires_headroom_in_the_survivors`: survivors at
+    88–90% utilization turn a `Drain` into a `Shed`.
+13. **A majority can never drain.** `a_majority_can_never_drain` — two of three degraded is a
+    fleet-wide event, and the answer to one is not to switch the fleet off.
+14. **Self-eviction is on others' evidence, except one case.**
+    `a_node_evicts_on_others_evidence_and_not_its_own` (a `Shed` verdict must **not** evict, or
+    shedding becomes draining and cascades) and
+    `a_node_that_cannot_reach_the_store_evicts_itself` — D-87, the one case where
+    self-assessment is reliable, and a node must not wait for a bulletin it cannot fetch.
+15. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
+    **95.12%** region, 96.73% line. `cargo mutants -p pstore-cluster` → **27 caught, 0 missed
+    = 100%** on `roster.rs` (from 70.4%) and **27 caught, 0 missed = 100%** on `gray.rs`.
+    `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
+    `cargo deny check`, `scripts/check-links.sh`, `scripts/build-index.py --check`,
+    `scripts/check-verified.py` all green. A 40-node fleet converged end-to-end with cells
+    wired in: all 40 nodes saw 40, placement settled at 81 of 1,000 shards against a fair
+    share of 75.
+
+ `cargo mutants -p pstore-cluster --file crates/pstore-cluster/src/roster.rs`
    → **27 caught, 0 missed = 100%**, from 70.4% before the two tests above. `cargo fmt
    --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,
    `cargo deny check`, `scripts/check-links.sh`, `scripts/build-index.py --check`,

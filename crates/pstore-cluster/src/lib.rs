@@ -7,6 +7,7 @@
 //! *and* data movement is zero, and conflating those two is how a scaling story turns into
 //! a rebalancing protocol.
 
+pub mod gray;
 pub mod placement;
 pub mod roster;
 
