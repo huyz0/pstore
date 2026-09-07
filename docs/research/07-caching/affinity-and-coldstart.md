@@ -92,7 +92,17 @@ Metrics that must exist from day one:
 - OQ-58: How long does the NVMe cache remain useful after a placement change (i.e. should a
   node retain an index's cache after losing placement, in case it comes back)? Leaning yes,
   with decay.
-- OQ-59: AZ-aware LRH — how much balance do we lose by constraining placement to an AZ?
+- ~~OQ-59~~ **ANSWERED — M4e, measured.** AZ-aware LRH costs **essentially nothing** in
+  balance. At a fixed ring size the constraint is free: `place` has no AZ term, so a 300-node
+  cell *is* a 300-node ring. And shrinking the ring does not hurt either — imbalance (max node
+  load ÷ mean, 100k keys, R=3, 8 node-naming trials) is 1.268 mean at N=100, 1.333 at 300 and
+  1.338 at 900, with a trial spread of ±0.1 that is **wider than the gap between fleet sizes**.
+  ⚠️ `provisional`, WSL2.
+
+  ⚠️ The mechanism is the opposite of the intuition: `window(n) = max(32, 3√n)` covers ~32% of
+  a 100-node ring and ~10% of a 900-node one, so a relatively wider window **offsets** the law
+  of large numbers rather than compounding with it. Evidence:
+  [`M4e/VERIFIED.md`](../../milestones/M4e/VERIFIED.md) criterion 7.
 
 ## Sources
 

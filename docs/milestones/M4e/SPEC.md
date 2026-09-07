@@ -21,7 +21,7 @@ state, and **no zone**. A node cannot filter peers it cannot identify. So:
 | Phase | What | State |
 |---|---|---|
 | **1 — this spec** | Zone identity: members carry a zone, cells are addressable without collision, a cell's roster holds only its own members | specified |
-| 2 | Per-AZ placement and OQ-59, once a cell's membership is real | named only |
+| **2** | Per-AZ placement and OQ-59, once a cell's membership is real | specified below |
 | 3 | Gray failure (D-82–D-87): probe mesh, blob bulletin, peer-relative detection, self-eviction | named only |
 
 ## ⚠️ A pre-existing collision, found by this review
@@ -52,6 +52,34 @@ which is free at this stage — there is no deployment — and is said rather th
 a measurement design this spec does not have); gray failure (phase 3); cross-AZ gossip relays,
 which C-8 leaves open; multi-region (OQ-135).
 
+## Phase 2 — placement within the cell, and what that costs
+
+Phase 1 made a cell's *roster* hold only its own members. Placement then follows — but only
+where the caller uses the cell's roster, and `main.rs:302` still builds one from the whole
+gossip view for its own reporting. A per-cell roster that some call sites bypass is the same
+bug in a smaller place.
+
+### ⚠️ OQ-59, redesigned after the first attempt was shown unmeasurable
+
+The first draft asked for the imbalance of one 900-node ring against three 300-node rings, and
+review measured the effect at **0.026** on the mean against a spread of **0.28** across
+node-naming trials — an order of magnitude smaller than the noise. It also moved two variables
+at once: the AZ constraint *and* per-ring `N`, and therefore `window()`, which pulls the other
+way.
+
+So the question is split, because the answer is:
+
+* **At fixed ring size, constraining to an AZ costs nothing.** A 300-node cell and a 300-node
+  global ring are the same ring; there is no AZ term in `place`.
+* **And splitting a fleet costs nothing measurable either** — ⚠️ which is the *opposite* of
+  what this section assumed before it was measured. `window(n) = max(32, 3√n)` covers ~32% of
+  a 100-node ring but only ~10% of a 900-node one, and a relatively wider window balances
+  better: it offsets the law of large numbers rather than compounding with it. The correction
+  is left visible because the wrong intuition is why the first criterion was unsatisfiable.
+
+That makes OQ-59 a measurement of imbalance against `N`, with enough trials to see past the
+spread — not a single ratio between two configurations.
+
 ## Acceptance criteria
 
 1. ⚠️ **Cell addresses do not collide.** Over **10,000** generated `(cluster, zone)` pairs,
@@ -68,7 +96,18 @@ which C-8 leaves open; multi-region (OQ-135).
    testable, and inside the coverage gate.
 5. **No new blob requests.** Building a cell's roster from a view is a pure function: **0**
    requests, asserted by the counter.
-6. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
+6. **Placement never leaves the cell**, end to end: with a gossip view spanning three zones,
+   every node a nodeplaces on is in its own zone — asserted over 1,000 keys, and including the
+   node's own `OWNS` reporting path, which built its ring from the unfiltered view.
+7. ⚠️ **OQ-59 answered as a curve, with its spread.** Imbalance (max node load ÷ mean) over
+   100,000 keys at **N = 100, 300, 900**, each over **≥8 node-naming trials**, reporting mean
+   and range. The committed conclusion is which of the two terms — the constraint or the ring
+   size — the cost belongs to. ⚠️ `provisional`: measured on WSL2.
+8. **A regression guard, set from the measurement rather than before it**: imbalance at N=300
+   stays under **1.6×**, which is above the observed maximum and below anything a broken hash
+   would produce. ⚠️ Not 1.25×: that was M4a's bound at **N=100**, and requiring it at 300 is
+   what made the first draft of this criterion unsatisfiable.
+9. Region coverage ≥95% on shipped crates, mutation ≥80%, full gate set green.
 
 ## Test plan
 
@@ -81,6 +120,8 @@ which C-8 leaves open; multi-region (OQ-135).
 | 3 | `a_cells_roster_holds_only_its_own_members` | a filter that returns the whole view |
 | 3 | `a_cell_with_no_members_is_empty_not_everyone` | an empty-filter fallback that widens to the fleet |
 | 4 | `a_node_without_a_zone_refuses_to_start` | a default zone in the node |
+| 6 | `placement_stays_inside_its_cell` | a call site that builds its ring from the unfiltered view |
+| 8 | `imbalance_at_cell_scale_stays_bounded` | a hash that clusters at the smaller per-cell node count |
 
 ## RA budget
 
@@ -114,3 +155,5 @@ does not exist yet; relays are C-8's open item.
 | M4e.3 | `Cell`, and `Roster::{key, read, refold}` taking one |
 | M4e.4 | `Roster::from_members`, filtered to a cell |
 | M4e.5 | `zone_from_env` in the node library, required |
+| M4e.6 | Every placement call site uses the cell's roster, including `OWNS` |
+| M4e.7 | OQ-59: the imbalance curve, its spread, and its conclusion |

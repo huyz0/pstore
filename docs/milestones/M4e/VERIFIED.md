@@ -34,7 +34,35 @@ phase 3. Neither is decomposed yet, deliberately.
 5. **No new blob requests.** `Roster::from_members` is a pure function of a view; the roster
    read is unchanged at 1 GET, still asserted by
    `reading_the_roster_costs_one_get_and_no_list` (`--test roster`).
-6. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
+6. **Placement never leaves the cell**, end to end. `placement_stays_inside_its_cell`
+   (`cargo test -p pstore-cluster --test cell`): a 90-node view across three zones, a roster
+   per zone, 1,000 keys each, every placed node in its own zone. ⚠️ The node's own `OWNS`
+   reporting built its ring from the **unfiltered** view until this phase — a per-cell roster
+   that one call site bypasses is the same bug in a smaller place.
+7. ⚠️ **OQ-59 answered, and the answer contradicts what this milestone assumed.**
+   `cargo run --release -p pstore-cluster --example az_balance` — imbalance (max node load ÷
+   mean), 100,000 keys, R=3, 8 node-naming trials per row. **`provisional`: measured on WSL2.**
+
+   | nodes | min | mean | max |
+   |---|---|---|---|
+   | 100 | 1.173 | **1.268** | 1.388 |
+   | 300 | 1.240 | **1.333** | 1.435 |
+   | 900 | 1.275 | **1.338** | 1.398 |
+
+   **AZ-aware placement costs essentially nothing in balance.** At a fixed ring size the
+   constraint is free — `place` has no AZ term, so a 300-node cell *is* a 300-node ring. And
+   shrinking the ring does not hurt either: the trial spread (±0.1) is wider than the gap
+   between 100 and 900 nodes.
+
+   ⚠️ The mechanism runs **opposite** to the intuition the spec was written on.
+   `window(n) = max(32, 3√n)` covers ~32% of a 100-node ring and ~10% of a 900-node one, and a
+   relatively wider window balances better — it offsets the law of large numbers rather than
+   compounding with it. The spec's wrong assumption is left visible, because it is why the
+   first version of this criterion was unsatisfiable.
+8. **A regression guard set from the measurement**: `imbalance_at_cell_scale_stays_bounded`
+   holds a 300-node ring under **1.6×** across trials — above the observed 1.435 maximum, far
+   below anything a clustering hash produces. ⚠️ Not 1.25×, which was M4a's bound at N=100.
+9. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
    **95.15%** region, 96.77% line; `roster.rs` itself 94.93%. `cargo mutants -p pstore-cluster --file crates/pstore-cluster/src/roster.rs`
    → **27 caught, 0 missed = 100%**, from 70.4% before the two tests above. `cargo fmt
    --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`,

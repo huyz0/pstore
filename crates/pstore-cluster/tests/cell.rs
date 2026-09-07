@@ -142,3 +142,76 @@ fn a_cell_reports_the_parts_it_was_built_from() {
     assert_eq!(c.cluster(), "prod-eu");
     assert_eq!(c.zone(), "eu-west-1b");
 }
+
+#[test]
+fn placement_stays_inside_its_cell() {
+    // ⚠️ End to end: a gossip view spanning three zones, a roster built for one of them, and
+    // 1,000 keys placed. The bug this catches is a call site that builds its ring from the
+    // *unfiltered* view — which the node's own `OWNS` reporting did until this phase. A
+    // per-cell roster that some call sites bypass is the same bug in a smaller place.
+    use pstore_cluster::Placement;
+
+    let view: Vec<(String, String)> = (0..90)
+        .map(|i| {
+            (
+                format!("10.0.{}.{}:7946", i / 256, i % 256),
+                format!("az-{}", i % 3),
+            )
+        })
+        .collect();
+
+    for zone in ["az-0", "az-1", "az-2"] {
+        let roster = Roster::from_members(view.iter().map(|(a, z)| (a.as_str(), z.as_str())), zone);
+        assert_eq!(
+            roster.nodes().len(),
+            30,
+            "{zone} should hold a third of the fleet"
+        );
+
+        let mine: std::collections::HashSet<&str> =
+            roster.nodes().iter().map(String::as_str).collect();
+        let p = Placement::new(&roster);
+        for i in 0..1_000 {
+            for node in p.place(&format!("tenant/idx{i}/s0"), 3) {
+                assert!(
+                    mine.contains(node),
+                    "{zone} placed on {node}, which is in another cell — every byte of that \
+                     query would cross an AZ boundary and be billed"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn imbalance_at_cell_scale_stays_bounded() {
+    // ⚠️ A regression guard set FROM the measurement, not before it. `examples/az_balance.rs`
+    // measures 1.31 mean and 1.50 worst at N=300 across trials; 1.6 is above that and far
+    // below anything a clustering hash would produce.
+    //
+    // ⚠️ **Not 1.25×.** That was M4a's bound at **N=100**, and requiring it at 300 is what made
+    // the first draft of this criterion unsatisfiable — a 300-node cell exceeds 1.25 in 23 of
+    // 24 samples, so the only exits were to fail the milestone or tune the hash until the
+    // number appeared.
+    use pstore_cluster::Placement;
+
+    for trial in 0..4u32 {
+        let roster = Roster::from_nodes(
+            (0..300).map(|i| format!("10.{trial}.{}.{}:7946", i / 256, i % 256)),
+        );
+        let p = Placement::new(&roster);
+        let mut load: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let keys = 20_000;
+        for i in 0..keys {
+            for n in p.place(&format!("t/idx{i}/s0"), 3) {
+                *load.entry(n).or_default() += 1;
+            }
+        }
+        let mean = (keys * 3) as f64 / 300.0;
+        let worst = load.values().copied().max().unwrap_or(0) as f64 / mean;
+        assert!(
+            worst < 1.6,
+            "trial {trial}: imbalance {worst:.3} at a 300-node cell"
+        );
+    }
+}

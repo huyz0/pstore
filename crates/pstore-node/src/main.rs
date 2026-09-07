@@ -299,7 +299,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if owns_every > 0 && ticks.is_multiple_of(owns_every) {
             // Reuse the view already fetched this tick. Fetching again locks chitchat's
             // state and clones a String per member, for a list that cannot have changed.
-            let r = Roster::from_nodes(members.iter().cloned());
+            // ⚠️ This cell's members, not the gossip view. Building a ring from the
+            // unfiltered view here would place across AZs while the *published* roster was
+            // correctly filtered — a per-cell roster that one call site bypasses, which is
+            // the same bug in a smaller place and just as silent.
+            let zoned = handle.members_zoned(&zone).await;
+            let r =
+                Roster::from_members(zoned.iter().map(|(a, z)| (a.as_str(), z.as_str())), &zone);
             let mine = policy::owned_shards(&r, &me, 1000, 3);
             let (sent, recvd, dropped) = handle.traffic();
             println!(
