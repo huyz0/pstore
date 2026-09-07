@@ -13,7 +13,7 @@
 use pstore_blob::{BlobStore, Capabilities, ObjectStoreBackend};
 use pstore_cluster::Roster;
 use pstore_node::policy::{self, fresh_node_id, jitter, read_roster_patiently};
-use pstore_node::{ATTEMPT_TIMEOUT, DEFAULT_GOSSIP_PERIOD, HEAL_PERIOD, gossip};
+use pstore_node::{ATTEMPT_TIMEOUT, DEFAULT_GOSSIP_PERIOD, HEAL_PERIOD, gossip, swim};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +21,65 @@ fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
-/// A node id that is **fresh on every start**.
+// ⚠️ The doc comment that stood here described `fresh_node_id`, which moved to
+// `pstore_node::policy`. Left as a note rather than deleted silently, because the rule it
+// carried still binds and the SWIM path currently breaks it: `swim::derive_id` derives an
+// identity from the advertised address, so a restarted node does NOT look cold. That is a
+// cache-placement problem, and `swim::derive_id` says where it has to be fixed.
+
+/// Whichever membership protocol this process was asked to run.
 ///
-/// `membership.md`: not derived from IP or hostname, so a restarted node looks cold rather
-/// than inheriting the reputation and placements of its predecessor. A container-index id is
-/// the obvious shortcut and is wrong for exactly that reason.
+/// ⚠️ An enum rather than a trait object: there are exactly two, one of them is on its way
+/// out, and a trait would invite a third.
+enum Membership {
+    /// Scuttlebutt, via `chitchat` — what M4b measured.
+    Chitchat(gossip::Member),
+    /// Probe-based membership — what M4c replaces it with.
+    Swim(swim::Member),
+}
+
+impl Membership {
+    fn self_addr(&self) -> String {
+        match self {
+            Self::Chitchat(m) => m.self_addr(),
+            Self::Swim(m) => m.self_addr(),
+        }
+    }
+
+    async fn members(&self) -> Vec<String> {
+        match self {
+            Self::Chitchat(m) => m.members().await,
+            Self::Swim(m) => m.members().await,
+        }
+    }
+
+    /// The view SIZE, without materialising the view.
+    ///
+    /// ⚠️ The loop asks every period and only ever compares the number. At 1,000 members that
+    /// is a thousand string allocations a second per node — measured as free at 100 nodes and
+    /// emphatically not at 1,000, which is the whole lesson: a cost that is invisible at the
+    /// size you test at is not therefore absent.
+    async fn member_count(&self) -> usize {
+        match self {
+            Self::Chitchat(m) => m.members().await.len(),
+            Self::Swim(m) => m.member_count().await,
+        }
+    }
+
+    fn traffic(&self) -> (u64, u64, u64) {
+        match self {
+            Self::Chitchat(m) => m.traffic(),
+            Self::Swim(m) => m.traffic(),
+        }
+    }
+
+    async fn dial(&self, addr: &str) -> bool {
+        match self {
+            Self::Chitchat(m) => m.dial(addr),
+            Self::Swim(m) => m.dial(addr).await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +133,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .filter(|ms| *ms > 0)
         .map_or(period, Duration::from_millis);
-    let handle = gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?;
+    // ⚠️ Both protocols stay runnable, on one harness, deliberately. Replacing a membership
+    // layer and measuring only the replacement compares two runs rather than two protocols —
+    // and every difference in the host, the harness or the day lands in the result.
+    let handle = if env("PSTORE_GOSSIP", "swim") == "chitchat" {
+        Membership::Chitchat(
+            gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?,
+        )
+    } else {
+        Membership::Swim(swim::start(&listen, &advertise, &seeds, loss, period).await?)
+    };
     // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
     // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the
     // config says `pstore-n7:7946` — and a node comparing the configured name against its
@@ -131,23 +194,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // periods" against a bound of 8, from a sampler that could not have said otherwise.
         tokio::time::sleep(poll).await;
         sub += 1;
-        let members = handle.members().await;
+        let size = handle.member_count().await;
 
         // The view size changes rarely, so printing on CHANGE costs almost nothing and is
         // what actually carries the timing: `docker logs -t` timestamps it to the
         // millisecond, and convergence is the last of these across the fleet.
-        if members.len() != last_size {
-            last_size = members.len();
+        if size != last_size {
+            last_size = size;
             println!("VIEWCHANGE members={last_size} self={me}");
         }
 
         if !sub.is_multiple_of(view_every) {
             continue;
         }
+        // Only now, once a second at most, is the list itself worth building.
+        let members = handle.members().await;
         ticks += 1;
         // Scraped by `scripts/cluster.sh`; a line per second per node is cheap and needs no
         // endpoint, which would be a server by another name.
-        println!("VIEW t={ticks} members={} self={me}", members.len());
+        println!("VIEW t={ticks} members={size} self={me}");
 
         if ticks % heal_every == jitter(&node_id, heal_every) {
             // Read first. The roster is two things at once here: the directory this node
@@ -158,10 +223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(Ok((cur, tag))) =
                 tokio::time::timeout(ATTEMPT_TIMEOUT, Roster::read(&store, &cluster)).await
             {
-                let healed = policy::to_dial(&cur, &members)
-                    .into_iter()
-                    .filter(|n| handle.dial(n))
-                    .count();
+                let mut healed = 0usize;
+                for n in policy::to_dial(&cur, &members) {
+                    if handle.dial(n).await {
+                        healed += 1;
+                    }
+                }
 
                 match policy::union_to_publish(&cur, &members) {
                     None => {

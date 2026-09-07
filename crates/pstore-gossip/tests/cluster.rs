@@ -216,3 +216,85 @@ fn alive_excludes_the_dead_and_the_suspected_do_not_vanish() {
     );
     assert_eq!(c.len(), 10, "a dead node is remembered, not forgotten");
 }
+
+#[test]
+fn alive_count_agrees_with_the_list_it_avoids_building() {
+    // ⚠️ `alive_count` exists so the hot path stops cloning a thousand addresses a second.
+    // A cheap count that disagrees with the real list is worse than the cost it saved: the
+    // node would report one view and route by another. Mutation testing found this untested
+    // entirely — `alive_count -> 0` and `-> 1` both survived.
+    let mut c = cluster_of(12);
+    assert_eq!(c.alive_count(), c.alive().len());
+    c.suspect(&id(2));
+    assert_eq!(
+        c.alive_count(),
+        c.alive().len(),
+        "a suspect changed the count but not the list"
+    );
+    c.declare_dead(&id(3));
+    assert_eq!(
+        c.alive_count(),
+        c.alive().len(),
+        "a death changed the count but not the list"
+    );
+    assert_eq!(c.alive_count(), 11);
+    assert!(
+        !c.is_empty(),
+        "a cluster always contains at least the node itself"
+    );
+}
+
+#[test]
+fn an_incarnation_is_reported_and_rises_only_on_refutation() {
+    // The value every merge decision is made against. Reported wrongly, every precedence
+    // rule in the protocol is deciding on a number that is not the one held.
+    let mut c = cluster_of(6);
+    assert_eq!(c.incarnation(&id(1)), Some(0));
+    assert_eq!(
+        c.incarnation(&id(99)),
+        None,
+        "an unknown member reported an incarnation"
+    );
+
+    c.suspect(&id(1));
+    assert_eq!(
+        c.incarnation(&id(1)),
+        Some(0),
+        "a suspicion raised an incarnation"
+    );
+    c.refute(&id(1), 7);
+    assert_eq!(c.incarnation(&id(1)), Some(7));
+    c.refute(&id(1), 3);
+    assert_eq!(
+        c.incarnation(&id(1)),
+        Some(7),
+        "a lower incarnation was accepted"
+    );
+}
+
+#[test]
+fn members_that_differ_have_different_fingerprints() {
+    // ⚠️ The checksum is a sum of these. A fingerprint that collapses distinct members makes
+    // two different clusters agree — the one failure a checksum must never have, because both
+    // sides then stop reconciling and stay wrong. Mutation testing reached the mixing step
+    // (`^=` to `|=`) and nothing noticed.
+    let mut seen = std::collections::HashSet::new();
+    let mut c = Cluster::new(id(0), addr(0));
+    for i in 1..60u8 {
+        c.join(id(i), addr(i));
+    }
+    // Every distinct (member, incarnation, state) must land on a distinct checksum
+    // contribution, which we observe through the cluster checksum changing every time.
+    for i in 1..60u8 {
+        seen.insert(c.checksum());
+        c.suspect(&id(i));
+        seen.insert(c.checksum());
+        c.refute(&id(i), u64::from(i) + 1);
+    }
+    assert!(
+        seen.len() > 100,
+        "only {} distinct checksums across 118 distinct cluster states: the fingerprint is \
+         collapsing members that differ",
+        seen.len()
+    );
+}

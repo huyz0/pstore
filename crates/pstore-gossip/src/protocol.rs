@@ -38,6 +38,13 @@ const INDIRECT_PROBES: usize = 3;
 /// per period is one probe per period, whoever it goes to.
 const REVISIT_DEAD_EVERY: u64 = 5;
 
+/// How many times one change rides along before it is retired.
+///
+/// ⚠️ Finite. Dissemination is best-effort by design; a change that misses every retransmit
+/// is repaired by reconciliation, and that is what makes it safe to stop sending it. Keeping
+/// changes forever is not caution, it is a permanent tax on every probe.
+const RETRANSMITS: u8 = 4;
+
 /// How many changes ride along on a probe.
 ///
 /// ⚠️ Bounded, so a fleet in churn cannot turn a probe back into the O(N) message this crate
@@ -53,8 +60,9 @@ pub struct Protocol {
     pending: BTreeMap<u64, (NodeId, u64)>,
     /// When each suspect was first suspected, so it can be given up on.
     suspected_at: BTreeMap<NodeId, u64>,
-    /// Recent changes worth telling peers about, newest last.
-    updates: Vec<Member>,
+    /// Recent changes worth telling peers about, newest last, each with the number of times
+    /// it has already ridden along.
+    updates: Vec<(Member, u8)>,
     tick: u64,
 }
 
@@ -370,14 +378,30 @@ impl Protocol {
     fn note_update(&mut self, id: &NodeId) {
         if let Some(m) = self.cluster.member(id) {
             let m = m.clone();
-            self.updates.retain(|u| u.id != m.id);
-            self.updates.push(m);
+            self.updates.retain(|(u, _)| u.id != m.id);
+            self.updates.push((m, 0));
         }
     }
 
+    /// The changes to ride along on the next message, and the count that retires them.
+    ///
+    /// ⚠️ **Drains.** An earlier version read this list and never emptied it, so every probe
+    /// carried the same six member records for the life of the process — turning a 74-byte
+    /// round into a 1,200-byte one and quietly restoring the O(N)-ish cost this crate exists
+    /// to remove. Measured on a real 100-node fleet: 6,000 bytes/s/node against a predicted
+    /// 370, with the member sets in perfect agreement and nothing whatsoever changing.
+    ///
+    /// Each change is retransmitted a fixed number of times and then dropped. Anything that
+    /// misses every one of those is repaired by reconciliation, which is what the checksum is
+    /// for — dissemination is allowed to be lossy precisely because repair exists.
     fn piggyback(&mut self) -> Vec<Member> {
-        let n = self.updates.len().min(MAX_PIGGYBACK);
-        self.updates.iter().rev().take(n).cloned().collect()
+        let mut out = Vec::new();
+        for (m, sent) in self.updates.iter_mut().rev().take(MAX_PIGGYBACK) {
+            out.push(m.clone());
+            *sent = sent.saturating_add(1);
+        }
+        self.updates.retain(|(_, sent)| *sent < RETRANSMITS);
+        out
     }
 
     fn addr_of(&self, id: &NodeId) -> Option<String> {

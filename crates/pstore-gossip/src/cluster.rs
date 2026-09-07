@@ -136,6 +136,19 @@ impl Cluster {
         self.members.is_empty()
     }
 
+    /// How many members are worth routing to, without building a list of them.
+    ///
+    /// ⚠️ Exists because the caller that asks most often only wants the number. Cloning a
+    /// thousand addresses once a second, per node, to discover that a count did not change is
+    /// a cost that scales with the fleet and buys nothing.
+    #[must_use]
+    pub fn alive_count(&self) -> usize {
+        self.members
+            .values()
+            .filter(|m| m.state != State::Dead)
+            .count()
+    }
+
     /// The members worth routing to: alive, and suspects that have not yet been given up on.
     #[must_use]
     pub fn alive(&self) -> Vec<&Member> {

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub mod gossip;
 pub mod policy;
+pub mod swim;
 pub mod transport;
 
 /// The gossip period a node uses unless told otherwise, and therefore the resolution of

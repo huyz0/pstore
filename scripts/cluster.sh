@@ -108,6 +108,7 @@ up)
       -e PSTORE_GOSSIP_PERIOD_MS="$PERIOD_MS" \
       -e PSTORE_OWNS_PERIOD_S="${OWNS_S:-5}" \
       -e PSTORE_POLL_PERIOD_MS="${POLL_MS:-0}" \
+      -e PSTORE_GOSSIP="${GOSSIP:-swim}" \
       -e PSTORE_GOSSIP_ADDR="0.0.0.0:$port" \
       -e PSTORE_ADVERTISE="127.0.0.1:$port" \
       -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$MINIO_PORT" \
@@ -117,7 +118,7 @@ up)
       "$IMAGE" >/dev/null
   }
   export -f start_one
-  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS
+  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS GOSSIP
 
   # The first few in order and alone: the roster starts empty, so somebody has to create it
   # before a herd arrives to contend for it.

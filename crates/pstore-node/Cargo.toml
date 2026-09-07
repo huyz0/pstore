@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 pstore-blob    = { path = "../pstore-blob", features = ["object_store"] }
 pstore-cluster = { path = "../pstore-cluster" }
+pstore-gossip  = { path = "../pstore-gossip" }
 pstore-types   = { path = "../pstore-types" }
 bytes          = "1"
 chitchat       = "0.13"

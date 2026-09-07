@@ -1088,6 +1088,7 @@ dependencies = [
  "object_store",
  "pstore-blob",
  "pstore-cluster",
+ "pstore-gossip",
  "pstore-testkit",
  "pstore-types",
  "tokio",
