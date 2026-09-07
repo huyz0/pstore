@@ -87,6 +87,10 @@ up)
   # begin to dominate is not known, and a run that changes the period cannot find out.
   #
   # Pass a period explicitly to compare a scaled fleet against the baseline.
+  # ⚠️ 200ms here, NOT the node's 1s default, because every number in M4b's ledger was
+  # measured at 200ms and a harness that silently used a different period would make the
+  # ledger unreproducible. Pass a period to change it; the node's own default is what a
+  # deployment gets.
   PERIOD_MS="${4:-200}"
   echo "$PERIOD_MS" > "$PERIOD_FILE"
   GOSSIP_PERIOD_MS="$PERIOD_MS"

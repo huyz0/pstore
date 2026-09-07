@@ -179,6 +179,13 @@ so it is not linear in frequency and two points would have fitted a line through
 price of the lever is honest and unavoidable — detection is counted in periods, so M4b
 criterion 3's 14 periods becomes 28 **seconds** at a 2s period rather than 2.8.
 
+⚠️ **Acted on: the node's default period is now 1s**, where it was 200ms for every
+measurement above. 0.20 cores rather than 0.60, for a constant that buys only wall-clock.
+**No criterion in this ledger moves** — they are counted in periods — but their translation
+into seconds does, and detection at 14 periods now reads 14s rather than 2.8s. Every number
+above names the period it was taken at, and `scripts/cluster.sh` still defaults to 200ms so
+they stay reproducible.
+
 The structural fix is orthogonal to hierarchy and is carried to [M4c](../M4c/SPEC.md): a
 cluster whose state is unchanged should exchange a **checksum**, not a digest, and pay O(1)
 per round instead of O(N). Hierarchy bounds how cost grows; this bounds what it costs to sit

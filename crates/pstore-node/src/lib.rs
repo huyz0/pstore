@@ -22,12 +22,19 @@ pub mod transport;
 /// ⚠️ **It has to scale with the fleet.** Gossip cost per node is linear in N (M4b criterion
 /// 5), so the period that suits 100 nodes asks for roughly 84 cores at 1,000 — and a
 /// CPU-starved fleet measures the scheduler, not the protocol. `PSTORE_GOSSIP_PERIOD_MS`
-/// overrides it, and `scripts/cluster.sh` sets it proportionally above 100 nodes.
+/// overrides it, and every number in a milestone ledger names the period it was taken at.
+///
+/// ⚠️ **1s, not the 200ms M4b measured at.** Measured at 100 nodes, 200ms costs the fleet
+/// 0.60 cores and 1s costs 0.20 — 3x, for a constant that buys nothing but wall-clock. Every
+/// criterion is counted in *periods*, so none of them move; only their translation into
+/// seconds does, and detection at 14 periods becomes 14s rather than 2.8s. A fleet whose
+/// nodes own nothing tolerates that: a stale liveness view costs a retry, never a wrong
+/// answer.
 ///
 /// ⚠️ Whatever the value, ONE value: it is `chitchat`'s `gossip_interval` and the loop's
 /// sampling interval both, passed rather than repeated, because a comment saying two numbers
 /// must match is a rule an agent has to remember and the compiler can hold it instead.
-pub const DEFAULT_GOSSIP_PERIOD: Duration = Duration::from_millis(200);
+pub const DEFAULT_GOSSIP_PERIOD: Duration = Duration::from_secs(1);
 
 /// How long one roster request may take before it counts as failed.
 ///
