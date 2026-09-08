@@ -687,6 +687,21 @@ fn a_dictionary_with_an_unknown_encoding_is_refused() {
         "an unsorted dictionary decoded, and every lookup past the swap would miss"
     );
 
+    // ⚠️ A DUPLICATE dimension, which is neither unsorted nor short. `binary_search` returns
+    // an arbitrary one of a run of equals, so one of the two entries' postings become
+    // unreachable — a term that is in the index and cannot be found. Mutation testing caught
+    // this: the sortedness check reads `a < b`, and `a <= b` accepts duplicates while every
+    // other test passes, because `build` cannot produce one.
+    let mut dupes = sparse::build(&covering_corpus(20, 8, 3), FIELD, ImpactEncoding::U8);
+    let (a, b) = (15, 15 + 24);
+    let first: Vec<u8> = dupes.dictionary[a..a + 4].to_vec();
+    dupes.dictionary[b..b + 4].copy_from_slice(&first);
+    assert!(
+        Dictionary::decode(&dupes.dictionary).is_none(),
+        "a dictionary with a duplicate dimension decoded, and one of the two lists is now \
+         unreachable"
+    );
+
     let mut wrong_version = sparse::build(&corpus(10, 20, 3), FIELD, ImpactEncoding::U8);
     wrong_version.dictionary[8] = 7;
     assert!(

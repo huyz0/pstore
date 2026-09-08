@@ -249,7 +249,11 @@ fn a_dictionary_from_another_format_or_an_unsorted_one_is_refused() {
     // Swap the first two entries' term pointers, which unsorts the table without changing
     // its length.
     let mut unsorted = text::build(&corpus(), text::DEFAULT_TEXT_FIELD).dictionary;
-    let (a, b) = (18 + 8, 18 + 8 + 22);
+    // MAGIC(8) VERSION(2) terms(4) blob_len(4) rows(4) total_tokens(8) = 30, then 22-byte
+    // entries whose first six bytes are the term pointer.
+    const HEADER: usize = 30;
+    const ENTRY: usize = 22;
+    let (a, b) = (HEADER, HEADER + ENTRY);
     let first: Vec<u8> = unsorted[a..a + 6].to_vec();
     let second: Vec<u8> = unsorted[b..b + 6].to_vec();
     unsorted[a..a + 6].copy_from_slice(&second);
@@ -257,6 +261,17 @@ fn a_dictionary_from_another_format_or_an_unsorted_one_is_refused() {
     assert!(
         TermDict::decode(&unsorted).is_none(),
         "an unsorted term dictionary decoded, and every lookup past the swap would miss"
+    );
+
+    // ⚠️ A DUPLICATE term, which is neither unsorted nor short. `binary_search` returns an
+    // arbitrary one of a run of equals, so one entry's postings become unreachable — a term
+    // that is in the index and cannot be found.
+    let mut dupes = text::build(&corpus(), text::DEFAULT_TEXT_FIELD).dictionary;
+    let first: Vec<u8> = dupes[a..a + 6].to_vec();
+    dupes[b..b + 6].copy_from_slice(&first);
+    assert!(
+        TermDict::decode(&dupes).is_none(),
+        "a dictionary with a duplicate term decoded, and one of the two lists is unreachable"
     );
 }
 
