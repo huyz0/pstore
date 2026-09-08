@@ -190,6 +190,18 @@ impl Segment {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// Whether this segment carries a full-text index.
+    ///
+    /// ⚠️ Answered by the **section**, not by a `Fields` row, and deliberately: that table
+    /// describes *vector* fields, whose layout a reader must know to decode them. A row for a
+    /// text field would send its postings to `decode_field`, which reads them as `f32` and
+    /// returns a dense field of noise — the failure a sparse field's `kind` guard exists for,
+    /// reintroduced by a table entry nothing needed.
+    #[must_use]
+    pub fn has_text(&self) -> bool {
+        self.section(Section::TextPostings).is_some()
+    }
+
     /// The segment's sparse field, if it has one.
     ///
     /// ⚠️ At most one in M5a: a second would need its own section id pair, the way

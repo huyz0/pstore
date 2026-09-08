@@ -30,16 +30,26 @@ pub enum ImpactEncoding {
     F16,
     /// Four bytes, exact.
     F32,
+    /// A varint of the value rounded to an integer — **exact** for integers, and variable
+    /// width.
+    ///
+    /// ⚠️ The third encoding D-72 names, and the one full-text needs: a term frequency is an
+    /// integer, and `U8`'s per-term scale is a *quantization* — a tf of 3 in a list whose
+    /// maximum is 4 decodes as 2.99, BM25 saturates it differently, and the scorer disagrees
+    /// with an oracle for a reason no test names. Exact to 2^24, which is the largest integer
+    /// an `f32` holds; a term appearing 16 million times in one document is not a case.
+    Varint,
 }
 
 impl ImpactEncoding {
-    /// Bytes one impact occupies.
+    /// Bytes one impact occupies, or **0 for variable**.
     #[must_use]
     pub fn width(self) -> usize {
         match self {
             Self::U8 => 1,
             Self::F16 => 2,
             Self::F32 => 4,
+            Self::Varint => 0,
         }
     }
 
@@ -48,6 +58,7 @@ impl ImpactEncoding {
             Self::U8 => 1,
             Self::F16 => 2,
             Self::F32 => 4,
+            Self::Varint => 5,
         }
     }
 
@@ -56,6 +67,7 @@ impl ImpactEncoding {
             1 => Some(Self::U8),
             2 => Some(Self::F16),
             4 => Some(Self::F32),
+            5 => Some(Self::Varint),
             _ => None,
         }
     }
@@ -137,14 +149,7 @@ pub fn build(docs: &[Document], field: &str, encoding: ImpactEncoding) -> Postin
     for (dim, list) in by_dim {
         let offset = section.len() as u64;
         let max_impact = list.iter().fold(0.0f32, |m, (_, w)| m.max(w.abs()));
-        let mut prev = 0u32;
-        for (row, _) in &list {
-            put_varint(&mut section, u64::from(*row - prev));
-            prev = *row;
-        }
-        for (_, w) in &list {
-            put_impact(&mut section, *w, max_impact, encoding);
-        }
+        write_list(&mut section, &list, encoding, max_impact);
         entries.push(Entry {
             dim,
             offset,
@@ -210,6 +215,15 @@ pub struct Dictionary {
     raw: bytes::Bytes,
     encoding: ImpactEncoding,
     count: usize,
+    /// The dimensions, ascending, decoded once.
+    ///
+    /// ⚠️ Four bytes a term of duplication, deliberately, so the lookup is
+    /// `slice::binary_search` rather than a hand-written loop. Mutation testing found the
+    /// reason: `lo < hi` flipped to `lo <= hi` does not return a wrong answer, it **fails to
+    /// terminate** — on a query path — and the only test that could tell looks up a dimension
+    /// falling in a *gap* between two entries, which is not an obvious case to write. Rung 1
+    /// of the gate ladder: the condition that can be wrong no longer exists.
+    dims: Vec<u32>,
 }
 
 impl Dictionary {
@@ -227,11 +241,19 @@ impl Dictionary {
         if raw.len() != HEADER + count * ENTRY {
             return None;
         }
-        Some(Self {
+        let mut me = Self {
             raw: bytes::Bytes::copy_from_slice(raw),
             encoding,
             count,
-        })
+            dims: Vec::new(),
+        };
+        me.dims = (0..count).filter_map(|i| me.at(i).map(|e| e.dim)).collect();
+        // A table that is not sorted cannot be searched, and searching it anyway answers
+        // "absent" for terms that are present — a silent recall loss rather than a failure.
+        if !me.dims.is_sorted_by(|a, b| a < b) {
+            return None;
+        }
+        Some(me)
     }
 
     /// How impacts in this segment are stored.
@@ -265,7 +287,7 @@ impl Dictionary {
 
     /// Every dimension, ascending.
     pub fn dims(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..self.count).filter_map(|i| self.at(i).map(|e| e.dim))
+        self.dims.iter().copied()
     }
 
     /// One dimension's entry, or `None` when the vocabulary does not contain it.
@@ -274,44 +296,70 @@ impl Dictionary {
     /// contributes nothing, and must cost nothing — no range, no request, no failure.
     #[must_use]
     pub fn lookup(&self, dim: u32) -> Option<Entry> {
-        let (mut lo, mut hi) = (0usize, self.count);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let e = self.at(mid)?;
-            match e.dim.cmp(&dim) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(e),
-            }
-        }
-        None
+        self.dims.binary_search(&dim).ok().and_then(|i| self.at(i))
     }
 
     /// Decodes one posting list from exactly the bytes its entry addresses.
     #[must_use]
     pub fn decode_list(&self, entry: &Entry, raw: &[u8]) -> Vec<(u32, f32)> {
-        let n = entry.count as usize;
-        let mut rows = Vec::with_capacity(n);
-        let mut at = 0usize;
-        let mut prev = 0u32;
-        for _ in 0..n {
-            let Some((delta, used)) = get_varint(raw, at) else {
-                return Vec::new();
-            };
-            at += used;
-            prev = prev.wrapping_add(delta as u32);
-            rows.push(prev);
-        }
-        let w = self.encoding.width();
-        let mut out = Vec::with_capacity(n);
-        for (i, row) in rows.into_iter().enumerate() {
-            let Some(b) = raw.get(at + i * w..at + (i + 1) * w) else {
+        read_list(raw, entry.count, self.encoding, entry.max_impact)
+    }
+}
+
+/// One posting list: delta-encoded rows, then the impacts.
+///
+/// ⚠️ Rows first and impacts second, not interleaved, so a decoder that knows the count can
+/// find both halves without a per-posting length. `max` scales `U8` and is ignored by every
+/// other encoding.
+pub fn write_list(out: &mut Vec<u8>, list: &[(u32, f32)], encoding: ImpactEncoding, max: f32) {
+    let mut prev = 0u32;
+    for (row, _) in list {
+        put_varint(out, u64::from(row.wrapping_sub(prev)));
+        prev = *row;
+    }
+    for (_, w) in list {
+        put_impact(out, *w, max, encoding);
+    }
+}
+
+/// The inverse of [`write_list`], from exactly the bytes the list occupies.
+#[must_use]
+pub fn read_list(raw: &[u8], count: u32, encoding: ImpactEncoding, max: f32) -> Vec<(u32, f32)> {
+    let n = count as usize;
+    let mut rows = Vec::with_capacity(n);
+    let mut at = 0usize;
+    let mut prev = 0u32;
+    for _ in 0..n {
+        let Some((delta, used)) = get_varint(raw, at) else {
+            return Vec::new();
+        };
+        at += used;
+        prev = prev.wrapping_add(delta as u32);
+        rows.push(prev);
+    }
+    let mut out = Vec::with_capacity(n);
+    if encoding == ImpactEncoding::Varint {
+        for row in rows {
+            let Some((v, used)) = get_varint(raw, at) else {
                 return out;
             };
-            out.push((row, read_impact(b, entry.max_impact, self.encoding)));
+            at += used;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "exact to 2^24, which is what the encoding promises"
+            )]
+            out.push((row, v as f32));
         }
-        out
+        return out;
     }
+    let w = encoding.width();
+    for (i, row) in rows.into_iter().enumerate() {
+        let Some(b) = raw.get(at + i * w..at + (i + 1) * w) else {
+            return out;
+        };
+        out.push((row, read_impact(b, max, encoding)));
+    }
+    out
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -354,6 +402,12 @@ fn put_impact(out: &mut Vec<u8>, w: f32, max: f32, encoding: ImpactEncoding) {
         }
         ImpactEncoding::F16 => out.extend_from_slice(&f32_to_f16(w).to_le_bytes()),
         ImpactEncoding::F32 => out.extend_from_slice(&w.to_le_bytes()),
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "a varint impact is a count; a negative one is not representable and is \
+                      clamped rather than wrapped"
+        )]
+        ImpactEncoding::Varint => put_varint(out, w.max(0.0).round() as u64),
     }
 }
 
@@ -370,6 +424,9 @@ fn read_impact(b: &[u8], max: f32, encoding: ImpactEncoding) -> f32 {
             .get(..4)
             .and_then(|x| x.try_into().ok())
             .map_or(0.0, f32::from_le_bytes),
+        // Unreachable: `read_list` decodes varints itself, because they have no width to
+        // slice by. Answering 0.0 rather than panicking keeps the function total.
+        ImpactEncoding::Varint => 0.0,
     }
 }
 

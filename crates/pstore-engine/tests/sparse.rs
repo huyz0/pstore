@@ -212,3 +212,138 @@ async fn a_reaped_sparse_segment_takes_its_dictionary_with_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// M5c.1 — full text through the same path. The failures are the same shape as
+// sparse's, which is the point: one codec, one sidecar rule, one fold.
+// ---------------------------------------------------------------------------
+
+use pstore_format::{Value, text};
+
+fn texted(i: usize) -> Document {
+    let mut d = hybrid(i);
+    d.attrs.insert(
+        text::DEFAULT_TEXT_FIELD.to_owned(),
+        Value::Str(format!("document {i} about quarterly revenue and the fox")),
+    );
+    d
+}
+
+#[tokio::test]
+async fn a_text_field_survives_a_compaction() {
+    // ⚠️ Postings cannot be inverted back into text, so a merge that had only the postings
+    // would rewrite every document as a bag of words. The string lives in the attributes and
+    // the fold RE-ANALYZES it -- which means the test worth writing is that the postings of
+    // the merged segment are the postings of the merged text, not that the text survived.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(510);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    let want: Vec<Document> = (0..24).map(texted).collect();
+    for batch in want.chunks(12) {
+        e.write("txt", batch.to_vec()).await.unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    e.compact("txt").await.unwrap();
+
+    let merged = e.scan("txt", None).await.unwrap();
+    assert_eq!(merged.len(), 24);
+    for w in &want {
+        let g = merged.iter().find(|g| g.id == w.id).expect("row lost");
+        assert_eq!(
+            g.attrs.get(text::DEFAULT_TEXT_FIELD),
+            w.attrs.get(text::DEFAULT_TEXT_FIELD),
+            "{}'s text did not survive the merge",
+            w.id
+        );
+    }
+
+    // The merged segment's own postings, re-analyzed rather than copied.
+    let head = e.head_for_test().await;
+    let refs = head.indexes.get("txt").unwrap();
+    assert_eq!(refs.len(), 1, "the fixture did not merge to one segment");
+    let seg = Key::new(&refs[0].key);
+    let raw = store
+        .get(&text::dict_key(&seg))
+        .await
+        .expect("no term dictionary beside the merged segment");
+    let dict = text::TermDict::decode(&raw).expect("the sidecar is not a term dictionary");
+    let e_rev = dict.lookup("revenue").expect("\"revenue\" is not indexed");
+    assert_eq!(
+        e_rev.df, 24,
+        "every document says \"revenue\"; df says {}",
+        e_rev.df
+    );
+    assert!(dict.lookup("aardvark").is_none());
+}
+
+#[tokio::test]
+async fn a_reaped_text_segment_takes_its_dictionary_with_it() {
+    // The same rule as the sparse sidecar, and the same reason: a `.tdict` is reachable only
+    // by derivation from its segment, so one left behind can never be named again.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(511);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    for batch in 0..2 {
+        e.write("txt", (batch * 6..batch * 6 + 6).map(texted).collect())
+            .await
+            .unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    let before: Vec<Key> = e
+        .head_for_test()
+        .await
+        .indexes
+        .get("txt")
+        .unwrap()
+        .iter()
+        .map(|r| Key::new(&r.key))
+        .collect();
+    e.compact("txt").await.unwrap();
+    for _ in 0..3 {
+        e.write("other", vec![Document::new("x", vec![1.0])])
+            .await
+            .unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    e.gc(1).await.unwrap();
+    for seg in &before {
+        assert!(
+            store.get(&text::dict_key(seg)).await.is_err(),
+            "the term dictionary of {} outlived it",
+            seg.as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_text_index_and_a_sparse_index_share_a_segment_without_sharing_a_term_space() {
+    // ⚠️ OQ-127's answer, exercised. `texted` documents carry BOTH a sparse field and a text
+    // field; the two must land in different sections with different sidecars, or a numeric
+    // dimension and a string term add into one list and every score is the sum of two
+    // unrelated signals.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(512);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    e.write("both", (0..10).map(texted).collect())
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    let head = e.head_for_test().await;
+    let seg = Key::new(&head.indexes.get("both").unwrap()[0].key);
+    assert!(store.get(&sparse::dict_key(&seg)).await.is_ok());
+    assert!(store.get(&text::dict_key(&seg)).await.is_ok());
+    assert_ne!(sparse::dict_key(&seg), text::dict_key(&seg));
+
+    let out = e.scan("both", None).await.unwrap();
+    assert_eq!(out.len(), 10);
+    assert!(matches!(
+        out[4].vectors.get(FIELD),
+        Some(VectorField::Sparse(_))
+    ));
+    assert!(out[4].attrs.contains_key(text::DEFAULT_TEXT_FIELD));
+}

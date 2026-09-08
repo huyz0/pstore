@@ -201,6 +201,43 @@ fn the_dictionary_scales_with_terms_not_documents() {
 }
 
 #[test]
+fn the_dictionary_names_every_dimension_the_corpus_used_and_no_other() {
+    // ⚠️ `dims()` is what a caller enumerates a vocabulary with, and a truncated or invented
+    // list is not a failure anywhere -- a query still answers, from a vocabulary that is not
+    // the corpus's. Mutation testing reached `dims -> once(1)` and every other test passed:
+    // a one-element list is sorted, and looking up the element it contains works.
+    let docs = covering_corpus(80, 40, 3);
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    let want: std::collections::BTreeSet<u32> = (0..40).collect();
+    assert_eq!(
+        dict.dims().collect::<std::collections::BTreeSet<_>>(),
+        want,
+        "the dictionary does not enumerate the corpus's vocabulary"
+    );
+    assert_eq!(dict.dims().count(), dict.len());
+}
+
+#[test]
+fn a_dimension_between_two_entries_is_not_found() {
+    // ⚠️ The binary search's terminating condition, which no boundary test reaches: an absent
+    // dimension ABOVE every entry converges past the end and answers `None` whatever the
+    // comparison is. One in a GAP is where `lo < hi` and `lo <= hi` differ -- the second
+    // never narrows and never terminates.
+    let docs: Vec<Document> = (0..6).map(|i| doc(i, vec![(i as u32 * 10, 0.5)])).collect();
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    assert_eq!(dict.len(), 6);
+    for present in [0u32, 10, 20, 30, 40, 50] {
+        assert_eq!(dict.lookup(present).map(|e| e.dim), Some(present));
+    }
+    for gap in [3u32, 11, 25, 39, 49] {
+        assert!(dict.lookup(gap).is_none(), "dimension {gap} was invented");
+    }
+    assert!(dict.lookup(51).is_none());
+}
+
+#[test]
 fn the_dictionary_is_sorted_and_fixed_width_so_a_lookup_is_a_search() {
     // A dictionary is scanned only if it is not searchable. At 30,000 terms a scan per query
     // term is the difference between a lookup and a pass over 600 KB.

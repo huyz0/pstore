@@ -227,6 +227,24 @@ impl<S: BlobStore> Engine<S> {
                 .await?;
             w = w.with_section(pstore_format::Section::SparsePostings, p.section);
         }
+        // ⚠️ Re-analyzed from the attribute, never copied from the inputs' postings — those
+        // cannot be inverted back into text, because order, duplicates and dropped tokens are
+        // gone. A merge that copied them would rewrite every document as a bag of words.
+        let text = pstore_format::text::build(docs, pstore_format::text::DEFAULT_TEXT_FIELD);
+        if !text.postings.is_empty() {
+            self.store
+                .put(
+                    &pstore_format::text::dict_key(key),
+                    bytes::Bytes::from(text.dictionary),
+                )
+                .await?;
+            w = w
+                .with_section(pstore_format::Section::TextPostings, text.postings)
+                .with_section(
+                    pstore_format::Section::Fieldnorms,
+                    pstore_format::text::encode_norms(&text.fieldnorms),
+                );
+        }
         self.store
             .put(
                 key,
@@ -503,15 +521,16 @@ impl<S: BlobStore> Engine<S> {
                 // anywhere in the commit path and deleting live data.
                 .filter(|k| !live.contains(k.as_str()))
                 .map(|k| Key::new(k.clone()))
-                // ⚠️ And the sparse dictionary beside it. The graveyard records segments;
-                // a sidecar is reachable only by derivation from one, so a segment reaped
-                // without its dictionary leaves an object nothing can ever name again. The
-                // delete is unconditional because the alternative is a HEAD request per key
-                // to find out — which would make GC cost a request per segment to save a
-                // key in a batch that is already one request per thousand.
+                // ⚠️ And the sidecars beside it. The graveyard records segments; a sidecar
+                // is reachable only by derivation from one, so a segment reaped without its
+                // dictionaries leaves objects nothing can ever name again. The deletes are
+                // unconditional because the alternative is a HEAD request per key to find
+                // out — which would make GC cost a request per segment to save two keys in a
+                // batch that is already one request per thousand.
                 .flat_map(|k| {
-                    let dict = pstore_format::sparse::dict_key(&k);
-                    [k, dict]
+                    let sparse = pstore_format::sparse::dict_key(&k);
+                    let text = pstore_format::text::dict_key(&k);
+                    [k, sparse, text]
                 })
                 .collect();
 

@@ -19,6 +19,7 @@ mod codec;
 mod docs;
 mod reader;
 pub mod sparse;
+pub mod text;
 mod writer;
 
 pub use docs::{decode_docs, decode_rows, encode_docs, encode_rows};
@@ -74,6 +75,15 @@ pub enum Section {
     FieldRaBitQ = 10,
     /// int8 codes of the second and later fields.
     FieldSq8 = 11,
+    /// Full-text postings: per term, rows as delta varints and an exact term frequency.
+    ///
+    /// ⚠️ A **separate** section from [`Self::SparsePostings`], and OQ-127 answered: a sparse
+    /// dimension is a `u32` a model emits, a BM25 term is a string an analyzer produced, and
+    /// sharing one space lets them collide. A collision does not fail — it *adds* two
+    /// unrelated signals into one posting list.
+    TextPostings = 12,
+    /// One `u32` token count per row, for BM25's length normalisation.
+    Fieldnorms = 13,
 }
 
 /// How a vector field is laid out in a segment.
