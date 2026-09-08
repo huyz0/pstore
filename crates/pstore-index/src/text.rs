@@ -51,7 +51,11 @@ impl Stats {
         out
     }
 
-    /// Average document length. Zero for an empty corpus, which makes the norm `k1·(1−b)`.
+    /// Average document length, or **zero** for an empty corpus.
+    ///
+    /// ⚠️ Zero is not a divisor. `search` drops the length term entirely when this is zero,
+    /// so the norm becomes `k1·(1−b)` — a defined score rather than a NaN, which would sort
+    /// unpredictably against every other row.
     #[must_use]
     pub fn avgdl(&self) -> f32 {
         if self.doc_count == 0 {
@@ -212,7 +216,15 @@ impl TextIndex {
                 for (row, tf) in self.dict.decode_list(e, buf) {
                     let len =
                         pstore_format::text::norm_at(&norms, row as usize).unwrap_or(0) as f32;
-                    let norm = K1 * (1.0 - B + B * len / if avgdl > 0.0 { avgdl } else { 1.0 });
+                    // ⚠️ The length term is DROPPED when there is no average, not divided by
+                    // one: substituting 1.0 makes the norm depend on raw document length in a
+                    // corpus that has no scale, which is a different score rather than a
+                    // degenerate one.
+                    let norm = if avgdl > 0.0 {
+                        K1 * (1.0 - B + B * len / avgdl)
+                    } else {
+                        K1 * (1.0 - B)
+                    };
                     let tf = tf as f32;
                     *scores.entry(row).or_insert(0.0) += idf * (tf * (K1 + 1.0)) / (tf + norm);
                 }

@@ -149,6 +149,28 @@ pub struct TenantView<S> {
     tenant: TenantId,
 }
 
+impl<S: crate::BlobStore> TenantView<S> {
+    /// Records a suffix read as the absolute range it actually moved.
+    ///
+    /// ⚠️ A suffix is the one read whose span is not known until it returns, and the footer
+    /// is ALWAYS read as a suffix — so leaving it unresolved makes the one section every
+    /// query touches the one section nothing can attribute. Both the hinted and unhinted
+    /// paths go through here; the hinted one did not, which made `Segment::open` invisible to
+    /// `ranges()` and `bytes_in()`.
+    ///
+    /// ⚠️ **Only while recording.** Resolving costs a `head`, and `store.rs` forbids one on a
+    /// cold open in as many words: "`head` is billed as a read, so requiring one would double
+    /// the cost of every cold open and put a HEAD on the hot path the design forbids." Off
+    /// the recording path this returns without asking.
+    async fn resolve_suffix(&self, key: &Key, len: u64) {
+        if self.lock().ranges.is_none() {
+            return;
+        }
+        let end = self.inner.head(key).await.unwrap_or(len);
+        self.note_range(key, end.saturating_sub(len)..end);
+    }
+}
+
 impl<S> TenantView<S> {
     /// Billed **before** the call, so a failure is counted too: AWS charges for failed
     /// conditional requests, which is exactly what makes a CAS retry storm expensive.
@@ -227,12 +249,7 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         if let Ok(b) = &out {
             let len = b.len() as u64;
             self.bill_bytes(OpClass::Read, len);
-            // ⚠️ Resolved to the absolute range it actually moved. A suffix is the one
-            // read whose span is not known until it returns, and the footer is ALWAYS read
-            // as a suffix -- so leaving it unresolved would make the one section every
-            // query touches the one section nothing can attribute.
-            let end = self.inner.head(key).await.unwrap_or(len);
-            self.note_range(key, end.saturating_sub(len)..end);
+            self.resolve_suffix(key, len).await;
         }
         out
     }
@@ -312,15 +329,7 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         if let Ok(b) = &out {
             let len = b.len() as u64;
             self.bill_bytes(OpClass::Read, len);
-            // ⚠️ Resolved, exactly as the unhinted `get_suffix` above does — and it was not,
-            // which made the footer invisible to `ranges()` and `bytes_in()`. Every segment
-            // is opened through the HINTED path (`Segment::open` asks for `Class::Meta`), so
-            // the one read this decorator's own comment calls "the one section every query
-            // touches" was the one read it could not attribute. Found by a criterion that
-            // needed to count how many times a hybrid query opened its segment and measured
-            // **zero**.
-            let end = self.inner.head(key).await.unwrap_or(len);
-            self.note_range(key, end.saturating_sub(len)..end);
+            self.resolve_suffix(key, len).await;
         }
         out
     }

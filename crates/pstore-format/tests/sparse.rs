@@ -796,3 +796,119 @@ fn f16_saturates_rather_than_wrapping() {
     );
     assert!(got[4].1.is_infinite() && got[4].1.is_sign_negative());
 }
+
+#[test]
+fn a_term_whose_every_impact_is_zero_decodes_to_zero() {
+    // ⚠️ The scale is the term's largest magnitude, so a term all of whose impacts are zero
+    // has a scale of zero -- and `w / max` is then a division by zero producing infinity or a
+    // NaN, which clamps to some arbitrary code and decodes as an arbitrary weight. A learned
+    // sparse model emitting an exact zero is not exotic; it is what a pruned dimension is.
+    let docs: Vec<Document> = (0..5).map(|i| doc(i, vec![(4, 0.0)])).collect();
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    let e = dict.lookup(4).unwrap();
+    assert_eq!(e.max_impact, 0.0);
+    let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
+    assert_eq!(got.len(), 5);
+    for (row, w) in &got {
+        assert_eq!(*w, 0.0, "row {row} decoded a zero impact as {w}");
+    }
+}
+
+/// Every binary16 code's value, computed from the IEEE definition rather than from the code
+/// under test: sign, a 5-bit exponent biased by 15, a 10-bit significand with an implicit
+/// leading one above the subnormal range.
+fn f16_table() -> Vec<(f32, u16)> {
+    let mut out: Vec<(f32, u16)> = Vec::with_capacity(1 << 16);
+    for bits in 0u32..(1 << 16) {
+        let bits = bits as u16;
+        let sign = if bits & 0x8000 == 0 { 1.0f32 } else { -1.0 };
+        let exp = i32::from((bits >> 10) & 0x1f);
+        let mant = f32::from(bits & 0x3ff);
+        let v = if exp == 0 {
+            sign * mant * 2f32.powi(-24)
+        } else if exp == 0x1f {
+            continue; // infinities and NaNs are not "nearest" to any finite value
+        } else {
+            sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+        };
+        out.push((v, bits));
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
+}
+
+/// The binary16 value(s) nearest `x`.
+///
+/// ⚠️ Returns **both** neighbours on an exact tie. `x` at the midpoint of two representable
+/// values has two equally correct answers, and IEEE round-to-nearest-even picks one of them —
+/// so a test that insisted on the lower would be asserting a tie-break rule rather than
+/// nearness. Distances in `f64`, because the two candidates differ in the last bit of an
+/// `f32` and subtracting them there is where the answer would be lost.
+fn nearest_f16(table: &[(f32, u16)], x: f32) -> Vec<f32> {
+    let i = table.partition_point(|(v, _)| *v < x);
+    let hi = table[i.min(table.len() - 1)].0;
+    let lo = table[i.saturating_sub(1)].0;
+    let (dh, dl) = (
+        (f64::from(hi) - f64::from(x)).abs(),
+        (f64::from(lo) - f64::from(x)).abs(),
+    );
+    if dh == dl {
+        vec![lo, hi]
+    } else if dh < dl {
+        vec![hi]
+    } else {
+        vec![lo]
+    }
+}
+
+#[test]
+fn f16_encodes_the_nearest_representable_value() {
+    // ⚠️ **Differential, against the IEEE definition rather than against itself.** The
+    // conversion is forty lines of hand-rolled bit arithmetic, and mutation testing showed
+    // what that costs: eighteen mutants inside it survived every example-based test, because
+    // a handful of chosen values cannot reach a shift, a mask and a carry each. `tdd` names
+    // this tier for exactly this shape of code.
+    let table = f16_table();
+    let mut checked = 0usize;
+    let mut rng: u64 = 0x243f_6a88_85a3_08d3;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    // A sweep across every exponent binary16 can hold, plus the subnormal range and the
+    // rounding boundaries between adjacent codes.
+    let mut values: Vec<f32> = Vec::new();
+    for (v, _) in &table {
+        values.push(*v);
+        values.push(v * 1.000_2);
+        values.push(v * 0.999_8);
+    }
+    for _ in 0..4_000 {
+        let e = (next() % 40) as i32 - 25;
+        let m = (next() % 2_000_000) as f32 / 1_000_000.0 - 1.0;
+        values.push(m * 2f32.powi(e));
+    }
+
+    for x in values {
+        if !x.is_finite() || x.abs() > 65_504.0 {
+            continue;
+        }
+        let docs = vec![doc(0, vec![(1, x)])];
+        let p = sparse::build(&docs, FIELD, ImpactEncoding::F16);
+        let dict = Dictionary::decode(&p.dictionary).unwrap();
+        let e = dict.lookup(1).unwrap();
+        let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize])[0].1;
+        let want = nearest_f16(&table, x);
+        // Value equality, not bit equality: +0 and -0 are the same impact, and a tie between
+        // them is not a defect. Everything else is compared exactly.
+        assert!(
+            want.contains(&got),
+            "{x:e} encoded to {got:e}, but the nearest binary16 value(s) are {want:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 100_000, "only {checked} values were checked");
+}

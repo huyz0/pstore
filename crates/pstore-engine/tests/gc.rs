@@ -135,8 +135,24 @@ async fn a_dereferenced_object_survives_the_retention_window() {
         e.flush().await.unwrap();
         e.fold().await.unwrap();
     }
+    // ⚠️ Counted against the graveyard's OWN keys, not against the delete batch. GC also
+    // derives each reaped segment's sidecars, and briefly counted those too -- which padded
+    // this number threefold and let a `>=` assertion pass on objects that never existed.
+    let horizon = e.head_for_test().await.epoch.0.saturating_sub(1);
+    let due: usize = e
+        .head_for_test()
+        .await
+        .graveyard
+        .range(..=horizon)
+        .map(|(_, keys)| keys.len())
+        .sum();
     let reaped = e.gc(1).await.unwrap();
-    assert!(reaped >= 4, "only {reaped} objects reaped past the window");
+    assert_eq!(
+        reaped, due,
+        "GC reported {reaped} objects reaped against {due} keys in the graveyard past the \
+         window"
+    );
+    assert!(reaped >= held.len());
     for k in &held {
         assert!(
             store.head(k).await.is_err(),

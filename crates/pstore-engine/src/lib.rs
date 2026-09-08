@@ -521,25 +521,28 @@ impl<S: BlobStore> Engine<S> {
                 // anywhere in the commit path and deleting live data.
                 .filter(|k| !live.contains(k.as_str()))
                 .map(|k| Key::new(k.clone()))
-                // ⚠️ And the sidecars beside it. The graveyard records segments; a sidecar
-                // is reachable only by derivation from one, so a segment reaped without its
-                // dictionaries leaves objects nothing can ever name again. The deletes are
-                // unconditional because the alternative is a HEAD request per key to find
-                // out — which would make GC cost a request per segment to save two keys in a
-                // batch that is already one request per thousand.
-                .flat_map(|k| {
-                    let sparse = pstore_format::sparse::dict_key(&k);
-                    let text = pstore_format::text::dict_key(&k);
-                    [k, sparse, text]
-                })
                 .collect();
+            // ⚠️ And the sidecars beside each SEGMENT. The graveyard records segments and
+            // bundles alike; a sidecar is reachable only by derivation from a segment, so one
+            // reaped without its dictionaries leaves objects nothing can ever name again. The
+            // deletes are unconditional for a segment because the alternative is a HEAD
+            // request per key to find out — but a bundle never has one, and deriving them for
+            // every key would triple the batch and inflate the reaped count with objects that
+            // never existed.
+            let mut batch = doomed.clone();
+            for k in &doomed {
+                if k.as_str().ends_with(".seg") {
+                    batch.push(pstore_format::sparse::dict_key(k));
+                    batch.push(pstore_format::text::dict_key(k));
+                }
+            }
 
             // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
             // Pruning first and then failing to delete loses the only record that these
             // objects exist, and they leak with nothing left to find them by. Deleting
             // first and then failing to prune costs a repeated delete on the next pass,
             // which is idempotent.
-            self.store.delete_batch(&doomed).await?;
+            self.store.delete_batch(&batch).await?;
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();

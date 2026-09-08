@@ -157,10 +157,23 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 query,
                 limit: *limit,
             }),
-            Prefetch::Text { query, limit, .. } => Ok(Self::Text {
+            // ⚠️ The field is CHECKED, not ignored. A segment has one text field, so a
+            // request naming another would otherwise be answered with the `text` field's
+            // ranking and nothing anywhere would say so — D-73's failure at field
+            // granularity. Both sibling legs already refuse an unknown field name.
+            Prefetch::Text {
+                field,
                 query,
-                limit: *limit,
-            }),
+                limit,
+            } => {
+                if field != pstore_format::text::DEFAULT_TEXT_FIELD {
+                    return Err(QueryError::Format(FormatError::UnknownField));
+                }
+                Ok(Self::Text {
+                    query,
+                    limit: *limit,
+                })
+            }
             Prefetch::Trigram { .. } => Err(QueryError::Unimplemented("trigram")),
         }
     }

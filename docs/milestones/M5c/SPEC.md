@@ -173,6 +173,12 @@ measure the rounds this crate issues, exactly as M5a's renamed depth test does.
 - **Byte cost is unbounded in the query's own terms**, and without stopwords a common term's
   list is a large fraction of the section. This is where OQ-45 stops being optional; criterion
   7 measures the over-read, not the appetite.
+- ⚠️ **The fieldnorms section is read whole, every query**, and criterion 7's bound is scoped
+  to `TextPostings` — so the dominant byte cost of a *small* text query sits outside every
+  assertion here. 4 bytes × every row: 80 KB at gate scale against a few KB of postings, 4 MB
+  at a million rows. Deliberate, because fetching only the candidates' norms is a
+  data-dependent second round the budget forbids; bounding it needs a fieldnorm block index,
+  which is OQ-45's neighbour and is not built.
 - **The dictionary grows with the vocabulary**, and English prose has a long tail. Criterion 9
   measures the scaling; nothing caps it.
 

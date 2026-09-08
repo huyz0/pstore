@@ -483,3 +483,41 @@ async fn the_opened_index_reports_the_vocabulary_it_scores_from() {
     assert_eq!(idx.list_bytes(&q), by_hand);
     assert_eq!(idx.list_bytes(&["aardvark".to_owned()]), 0);
 }
+
+#[tokio::test]
+async fn an_empty_corpus_scores_without_a_length_term() {
+    // ⚠️ The degenerate case, scored rather than divided. With no average document length the
+    // norm is `k1(1-b)`; substituting 1.0 for the average instead would make the score depend
+    // on raw document length in a corpus that has no scale -- a different answer, not a
+    // degenerate one, and a NaN if the substitution were forgotten entirely.
+    let docs = corpus(50, 40, 10, 5);
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let key = put(&store, &docs, "t/idx/deg.seg").await;
+    let idx = TextIndex::open(&store, &key).await.unwrap();
+    let q = queries(&docs, 2)[0].clone();
+
+    let empty = Stats {
+        doc_count: 0,
+        total_tokens: 0,
+        df: idx.summary().df,
+    };
+    let hits = idx.search(&store, &key, &q, &empty, 5).await.unwrap();
+    assert!(
+        !hits.is_empty(),
+        "an empty corpus's statistics returned nothing"
+    );
+    for (_, s) in &hits {
+        assert!(s.is_finite(), "a score was {s}");
+    }
+    // Every row with the same term count scores the same, because length no longer
+    // discriminates.
+    let real = idx
+        .search(&store, &key, &q, &idx.summary(), 5)
+        .await
+        .unwrap();
+    assert_ne!(
+        hits.iter().map(|(_, s)| s.to_bits()).collect::<Vec<_>>(),
+        real.iter().map(|(_, s)| s.to_bits()).collect::<Vec<_>>(),
+        "the degenerate norm scored identically to the real one"
+    );
+}

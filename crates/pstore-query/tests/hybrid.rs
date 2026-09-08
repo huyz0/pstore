@@ -493,3 +493,50 @@ async fn a_dense_and_a_sparse_query_are_unaffected_by_a_text_field() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_text_leg_naming_another_field_is_refused() {
+    // ⚠️ D-73's failure at field granularity. A segment carries one text field, so a request
+    // naming a different one would be answered with `text`'s ranking and nothing anywhere
+    // would say so -- a plausible answer to a question nobody asked. Both sibling legs already
+    // refuse an unknown field name; this one used to drop it.
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let docs = corpus(600);
+    let (seg, cen) = put_with_text(&store, &docs).await;
+    let wrong = query(
+        &store,
+        &seg,
+        &cen,
+        &[Prefetch::Text {
+            field: "body".to_owned(),
+            query: "revenue".to_owned(),
+            limit: 10,
+        }],
+        Fusion::default(),
+        10,
+    )
+    .await;
+    assert!(
+        wrong.is_err(),
+        "a text leg naming a field the segment does not have returned {} hits",
+        wrong.map(|h| h.len()).unwrap_or(0)
+    );
+    // The field it does have still works.
+    assert!(
+        !query(
+            &store,
+            &seg,
+            &cen,
+            &[Prefetch::Text {
+                field: text::DEFAULT_TEXT_FIELD.to_owned(),
+                query: "revenue".to_owned(),
+                limit: 10,
+            }],
+            Fusion::default(),
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+}

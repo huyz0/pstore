@@ -25,9 +25,16 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
    which measures each leg alone and both together. Observed red by awaiting the legs in
    sequence: **3 rounds against 2 and 2 alone**.
 6. **An unimplemented retriever is refused by name** — `an_unimplemented_retriever_is_refused`
-   asserts the error names `"text"`; `a_refused_retriever_costs_no_requests` asserts it is
-   refused before any I/O. ⚠️ Structural after the coverage pass: the type that reaches the
-   runner has no `Text` variant, so there is one refusal rather than two matching arms.
+   and `a_refused_retriever_costs_no_requests`, which asserts it is refused before any I/O.
+   ⚠️ **Amended after M5c.** This criterion was written against `Prefetch::Text`, which M5c
+   implemented; the shape's unimplemented occupant is now `Prefetch::Trigram`, the test asserts
+   the error names `"trigram"`, and `Runnable` gained a `Text` variant. **The mechanism is
+   unchanged** — the type that reaches the runner still cannot express an unimplemented
+   retriever, so there is one refusal rather than two matching arms — and D-73's point is that
+   the shape carries retrievers that do not exist yet, so as long as one does not, this
+   criterion has something to be about. Recorded rather than silently re-pointed:
+   `check-verified.py` only checks that a named test *resolves*, which is exactly the drift a
+   ledger exists to catch.
 7. **An empty leg is not an error** — `an_empty_leg_is_not_an_error`: a sparse leg matching
    nothing leaves the dense leg's hits intact, and a query whose every leg matches nothing
    returns an empty ranking rather than failing.
