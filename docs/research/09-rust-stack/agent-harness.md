@@ -209,17 +209,33 @@ What that decomposes into, and what was done:
 
 Three rules that are not about speed:
 
-1. ⚠️ **Never run another `cargo` command while a sweep is going.** Timeouts are wall-clock, so
-   contention manufactures false results: the M5 sweep reported **1 timeout with the machine to
-   itself and 17 with a `cargo test` beside it**, and every one of the 17 was a mutant that
-   cannot hang — `fuse -> vec![]`, `query -> Ok(vec![])`.
+1. ⚠️ **A timeout is not a kill, and the auto-timeout had no headroom.** `cargo-mutants` sets
+   the limit from the baseline; this suite's baseline is ~20 s and the limit came out at
+   **20 s**, so every mutant that *survived* — which by definition runs the suite to
+   completion — was cut off and filed as a **timeout instead of a miss**. Measured: 18
+   "timeouts" in one file, 14 of them the `| -> ^` pairs that are provably equivalent and
+   therefore cannot fail a test. The score was inflated, which is the worst direction for a
+   gate to be wrong in. `scripts/mutants.sh` sets `--minimum-test-timeout 300`.
+
+   ⚠️ **This corrects what was first written here.** Seeing 1 timeout and then 17, I recorded
+   contention as the cause and the rule as "never run `cargo` beside a sweep". The rule is
+   still worth keeping — headroom that small is easy to exhaust — but it was **not** what
+   happened: identical runs at `-j 5` and `-j 8` produced the identical 18. The tell was
+   `Dictionary::is_empty -> true` among them, a mutant that cannot hang. A plausible cause
+   written down as a measured one is exactly the failure this file exists to make expensive.
 2. ⚠️ **`--in-diff` cannot see a test-only change.** The diff is matched against the code under
    test, so a commit that rewrites the suite passes in seconds. That is what the nightly full
    sweep is for, and it is the reason the incremental job is not the only job.
-3. ⚠️ **Record equivalent mutants where the code is.** M5 found three — `|` against `^` over
-   disjoint bit fields, `+ 128` against `- 128` in a `u8`, and a guard whose only reachable
-   input makes both branches agree. A score short by three with no explanation is a score the
-   next agent re-derives from scratch.
+3. ⚠️ **Record equivalent mutants where the code is.** M5 found sixteen — fourteen `|` against
+   `^` over the disjoint bit fields of a binary16, `+ 128` against `- 128` in a `u8`, and a
+   guard whose only reachable input makes both branches agree. A score short by sixteen with no
+   explanation is a score the next agent re-derives from scratch.
+
+   ⚠️ And **prove equivalence before claiming it**. Three more mutants in the same function
+   looked like the same class and were not: they were the round-to-nearest tie term, and
+   chasing them found the codec rounding ties *up* while its comment said round-to-nearest. A
+   tie is the only input that distinguishes the two rules, and a random sweep never lands on
+   one — the differential test now includes ~32,000 exact midpoints.
 
 What is *not* available: **mutant schemata** — compiling every mutant into one binary switched
 at runtime, which is where the large speedups in the literature come from. `cargo-mutants`

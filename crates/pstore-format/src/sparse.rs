@@ -436,14 +436,16 @@ fn read_impact(b: &[u8], max: f32, encoding: ImpactEncoding) -> f32 {
     }
 }
 
-/// IEEE binary16, round-to-nearest, hand-rolled.
+/// IEEE binary16, **round-to-nearest-even**, hand-rolled.
 ///
 /// ⚠️ **Every `|` here has an equivalent `^` mutant**, and that is a property of the format
 /// rather than a gap in the tests: sign, exponent and significand occupy disjoint bits, so OR
 /// and XOR agree on every input that can reach them. `f16_encodes_the_nearest_representable_value`
 /// covers the rest — it enumerates all 65,536 codes from the IEEE definition and checks
-/// 200,000 inputs against them, which is what killed the shift, mask and carry mutants that a
-/// handful of chosen values could not reach.
+/// 200,000 inputs against them, **exact midpoints included**, which is what killed the shift,
+/// mask and carry mutants that a handful of chosen values could not reach. The midpoints are
+/// the ones that took longest to get right: a tie is the only input that can tell
+/// round-half-to-even from round-half-up, and the random sweep never lands on one.
 ///
 /// ⚠️ A crate would do this; `half` is a dependency for forty lines of bit arithmetic that
 /// `f16_round_trips_within_its_precision` pins directly. Subnormals and overflow are the two
@@ -473,11 +475,17 @@ fn f32_to_f16(x: f32) -> u16 {
         let m = mant | 0x0080_0000;
         let shift = (14 - e) as u32;
         let half = 1u32 << (shift - 1);
-        let v = (m + half + ((m >> shift) & 1)) >> shift;
+        // ⚠️ `half - 1 + lsb`, not `half + lsb`. Round-half-to-**even** needs the tie to be
+        // decided by the retained bit; adding `half` alone rounds every tie up and makes the
+        // `& 1` term vestigial. Mutation testing is what found it: three mutants of that term
+        // survived, because a tie was the only input that could tell them apart and the
+        // differential test accepted either neighbour there.
+        let v = (m + half - 1 + ((m >> shift) & 1)) >> shift;
         return sign | v as u16;
     }
     let half = 0x0000_1000u32;
-    let rounded = mant + half + ((mant >> 13) & 1);
+    // ⚠️ Round-half-to-even, and the `- 1` is what makes it so. See the subnormal path above.
+    let rounded = mant + half - 1 + ((mant >> 13) & 1);
     // Rounding can carry into the exponent, which is why it is added before the shift.
     let e = e + ((rounded >> 23) & 1) as i32;
     if e >= 0x1f {

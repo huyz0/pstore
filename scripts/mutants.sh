@@ -21,10 +21,16 @@
 # *test* code produces no mutants and passes in seconds while having materially changed the
 # test suite's strength. The nightly `--all` run is what covers that.
 #
-# ⚠️ **Never run another `cargo` command while a sweep is going.** Timeouts are wall-clock,
-# and contention turns them into false results: the M5 sweep reported 1 timeout while it had
-# the machine and 17 once a `cargo test` was running beside it. Every one of the 17 was a
-# mutant that cannot hang -- `fuse -> vec![]`, `query -> Ok(vec![])`.
+# ⚠️ **A timeout is not a kill, and cargo-mutants' auto-timeout is too tight here.** It sets
+# the limit from the baseline, and this suite's baseline is ~20 s -- so the limit came out at
+# 20 s and every mutant that SURVIVED, running the suite to completion, was cut off and
+# reported as a timeout instead. Measured: 18 "timeouts" in `sparse.rs`, 14 of them the
+# `| -> ^` pairs that are provably equivalent and therefore cannot fail a test. A gate that
+# reports a result it did not measure is worse than one that reports nothing, so the floor is
+# set explicitly below.
+#
+# ⚠️ **Never run another `cargo` command while a sweep is going.** With headroom this small,
+# contention alone can push a passing run past the limit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -59,7 +65,11 @@ JOBS=${MUTANTS_JOBS:-$(( $(nproc) / 4 ))}
 args=()
 case "${1:-}" in
     --all)   shift ;;
-    --file)  shift; for f in "$@"; do args+=(--file "$f"); done; set -- ;;
+    # Both spellings: `--file a b c` and `--file a --file b --file c`. The second is what
+    # `cargo mutants` itself takes, so typing it here is the natural mistake -- and the loop
+    # used to turn the literal `--file` tokens into paths, which cargo-mutants reports as
+    # "a value is required for '--file'" rather than as anything a reader can act on.
+    --file)  shift; for f in "$@"; do [[ "$f" == "--file" ]] || args+=(--file "$f"); done; set -- ;;
     --check) shift; args+=(-F "$1"); shift ;;
     --shard) shift; args+=(--shard "$1"); shift ;;
     *)
@@ -82,4 +92,7 @@ flags=$(linker_flags)
 [[ -n "$flags" ]] && export RUSTFLAGS="${RUSTFLAGS:-} $flags"
 
 echo "# jobs=$JOBS tmpdir=$TMPDIR linker=${flags:-default}" >&2
-exec cargo mutants -j "$JOBS" --no-shuffle "${args[@]}" "$@"
+# ⚠️ Headroom over the baseline, not a multiple of it. A genuinely hung mutant -- `put_varint`
+# with its loop condition flipped is one -- takes the full 300 s and is still caught; a
+# survivor finishes in the baseline's 20 s and is reported honestly as MISSED.
+exec cargo mutants -j "$JOBS" --minimum-test-timeout 300 --no-shuffle "${args[@]}" "$@"

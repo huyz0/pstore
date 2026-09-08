@@ -838,27 +838,29 @@ fn f16_table() -> Vec<(f32, u16)> {
     out
 }
 
-/// The binary16 value(s) nearest `x`.
+/// The binary16 value nearest `x`, **ties to even**.
 ///
-/// ⚠️ Returns **both** neighbours on an exact tie. `x` at the midpoint of two representable
-/// values has two equally correct answers, and IEEE round-to-nearest-even picks one of them —
-/// so a test that insisted on the lower would be asserting a tie-break rule rather than
-/// nearness. Distances in `f64`, because the two candidates differ in the last bit of an
-/// `f32` and subtracting them there is where the answer would be lost.
-fn nearest_f16(table: &[(f32, u16)], x: f32) -> Vec<f32> {
+/// ⚠️ The tie rule is asserted, not tolerated. An earlier version returned both neighbours on
+/// an exact tie, on the reasoning that either is equally near — and three mutants of the
+/// tie-breaking term survived, because a tie was the only input that could tell them apart.
+/// A codec whose behaviour at the midpoint is unspecified is a codec that drifts. Distances in
+/// `f64`, because the two candidates differ in the last bit of an `f32` and subtracting them
+/// there is where the answer would be lost.
+fn nearest_f16(table: &[(f32, u16)], x: f32) -> f32 {
     let i = table.partition_point(|(v, _)| *v < x);
-    let hi = table[i.min(table.len() - 1)].0;
-    let lo = table[i.saturating_sub(1)].0;
+    let (hi, hb) = table[i.min(table.len() - 1)];
+    let (lo, _) = table[i.saturating_sub(1)];
     let (dh, dl) = (
         (f64::from(hi) - f64::from(x)).abs(),
         (f64::from(lo) - f64::from(x)).abs(),
     );
     if dh == dl {
-        vec![lo, hi]
+        // Even significand wins, which is what IEEE round-to-nearest-even means.
+        if hb & 1 == 0 { hi } else { lo }
     } else if dh < dl {
-        vec![hi]
+        hi
     } else {
-        vec![lo]
+        lo
     }
 }
 
@@ -891,6 +893,20 @@ fn f16_encodes_the_nearest_representable_value() {
         let m = (next() % 2_000_000) as f32 / 1_000_000.0 - 1.0;
         values.push(m * 2f32.powi(e));
     }
+    // ⚠️ **Exact midpoints, both ranges.** A tie is the only input that can distinguish
+    // round-half-to-even from round-half-up, and the random sweep above essentially never
+    // lands on one — two mutants of the subnormal tie term survived until these were added.
+    // Subnormals step by 2^-24, normals by 2^(e-10).
+    for k in 0..1_024u32 {
+        values.push((k as f32 + 0.5) * 2f32.powi(-24));
+        values.push(-((k as f32 + 0.5) * 2f32.powi(-24)));
+    }
+    for e in -14..16i32 {
+        for k in 0..1_024u32 {
+            let step = 2f32.powi(e - 10);
+            values.push(2f32.powi(e) + (k as f32 + 0.5) * step);
+        }
+    }
 
     for x in values {
         if !x.is_finite() || x.abs() > 65_504.0 {
@@ -903,10 +919,10 @@ fn f16_encodes_the_nearest_representable_value() {
         let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize])[0].1;
         let want = nearest_f16(&table, x);
         // Value equality, not bit equality: +0 and -0 are the same impact, and a tie between
-        // them is not a defect. Everything else is compared exactly.
+        // them is not a defect. Everything else is compared exactly, ties included.
         assert!(
-            want.contains(&got),
-            "{x:e} encoded to {got:e}, but the nearest binary16 value(s) are {want:?}"
+            got == want,
+            "{x:e} encoded to {got:e}, but the nearest binary16 value is {want:e}"
         );
         checked += 1;
     }
