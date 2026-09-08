@@ -14,7 +14,9 @@ index section (cached)". That section is bounded by `INDEX_BUDGET` = 8 KiB − f
 bytes**, and `try_finish` *refuses* a segment that exceeds it (`writer.rs:180`) rather than
 opening it slowly. A SPLADE-sized 30,000-term vocabulary at 12 bytes an entry is 360 KB —
 **44× the budget** — so the letter of that row does not make the open slow, it makes the
-segment **unwritable**.
+segment **unwritable**. ⚠️ **Measured at 720,015 bytes, 88×**: the shipped entry is 24 bytes,
+not 12, because a list needs its byte length *and* its posting count *and* its scale. The
+argument survives its own arithmetic being off by two, which is why it is stated as measured.
 
 So the dictionary is a **sibling immutable object**, `Pinned`, fetched in parallel with the
 footer — what M3 does with the centroid table, for the same reason, and a section could not
@@ -59,7 +61,7 @@ Stated here so no criterion can be satisfied by choosing them afterwards.
 | Rank-agreement floor | mean top-10 overlap **≥ 0.95** and top-1 agreement **≥ 0.90** over 200 queries | Chosen before measuring. Below it, the shipped default is f16, not u8. |
 | Byte bound, sparse query | bytes fetched **inside the `SparsePostings` span** ≤ **1.2×** the sum of the query terms' posting-list lengths | Catches a whole-section read, which is the failure that still returns the right answer. Scoped to the span because the dictionary and footer are 100× the postings at fixture scale, and unscoped the bound refuses a correct implementation. |
 | `coalesce_gap` for criteria 8 and 9 | **256 bytes** | ⚠️ Pinned, because it decides the result. The defaults are 64 KiB (`memory.rs:81`) and 1 MiB (`object_store_backend.rs:49`), and on a 2 MB section either merges most of it — so the whole-section read the criterion exists to catch becomes the measured behaviour. |
-| Criterion 11's queries | 200 queries, each the sparse field of a **randomly chosen document** of the exactness corpus | ⚠️ Pinned because it decides the answer: rank agreement under quantization is far more forgiving for uniformly drawn dimensions than for frequency-drawn ones, and the implementation must not get to pick. |
+| Criterion 13's queries | 200 queries, each the sparse field of a **randomly chosen document** of the exactness corpus | ⚠️ Pinned because it decides the answer: rank agreement under quantization is far more forgiving for uniformly drawn dimensions than for frequency-drawn ones, and the implementation must not get to pick. |
 
 ## Delta
 
@@ -142,7 +144,7 @@ it is a dense-field question, sparse fields are never clustered, and nothing her
 | 6 | `a_sparse_field_survives_a_compaction` | `scan` returning documents without their sparse field, which merges to nothing |
 | 7 | `the_candidate_set_is_exact` | `truncate` on a posting list; dropping the query's last term |
 | 8 | `f32_impacts_rank_exactly_like_brute_force` | `min` instead of `+=` in the accumulator; scoring `q·q` |
-| 9 | `a_sparse_query_costs_three_rounds_from_head` | fetching the dictionary after the footer instead of beside it |
+| 9 | `a_sparse_query_costs_two_round_trips_beyond_head` ⚠️ renamed: the test measures the two rounds that belong to the index, as M3's equivalent does; HEAD is the engine's and is not in this crate | fetching the dictionary after the footer instead of beside it |
 | 10 | `the_postings_fetch_is_one_round` | a `get_range` awaited per term in a loop |
 | 11 | `a_query_fetches_only_its_own_lists` | reading the whole section and filtering in memory |
 | 12 | `an_unknown_dimension_costs_nothing` | `UnknownField` returned; an all-absent query erroring rather than returning nothing |
@@ -182,6 +184,12 @@ that are far apart (`store.rs:109`), so a 32-term query is up to 32 requests in 
 | Id | Commit |
 |---|---|
 | **M5a.1** | `pstore_format::sparse`: the codec, the section, the `Fields` row, the derived dictionary key, and the refusal that replaces M3b's |
-| **M5a.2** | The engine: a sparse field survives write → fold → compaction, and `check_storable` stops refusing |
+| **M5a.2** | The engine: a sparse field survives write → fold → compaction, and `check_storable` narrows |
 | **M5a.3** | `SparseIndex::open`/`search` — exact candidates, exact f32 ranking, depth, requests and bytes |
 | **M5a.4** | OQ-126: the encoding harness, the numbers, and the default they select |
+
+⚠️ **Landed as two commits, not four.** M5a.1 and M5a.2 are one property: a format that can
+hold a sparse field while the fold cannot write one is a state that exists only to satisfy a
+task boundary, and it has to be guarded by a temporary refusal that the next commit deletes.
+M5a.3 and M5a.4 are one property too — the measurement selects the default the retriever
+ships with, and splitting them means committing a default nothing has measured.
