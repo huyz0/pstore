@@ -179,14 +179,26 @@ restart still flushes every cache; and the cross-AZ probe mesh (D-82) and blob h
 (D-83) as running subsystems — the gray-failure *decisions* ship, their transports need a
 query path and a real multi-AZ deployment.
 
-### M5a — Sparse vectors and hybrid (2 weeks)
-- Sparse/learned-sparse retrieval over the generic-impact posting lists built in M3.
-- RRF fusion; exercise the `prefetch[]` + `fusion` path.
+### M5a — Sparse vectors (2 weeks)
+- Sparse/learned-sparse retrieval: the generic-impact posting lists D-72 reserved, built for
+  real. ⚠️ The lists M3 built are the **dense** index's; the inverted index did not exist.
 - **Before BM25 deliberately:** sparse search is *exact*, so it is a much smaller subsystem and
   gives a real hybrid story for a fraction of the work
   ([`../06-indexing/modalities-and-sequencing.md`](../06-indexing/modalities-and-sequencing.md) §7).
 
-### M5b — Full-text (4–5 weeks)
+> ⚠️ **Split into M5a and M5b, and full-text renumbered to M5c.** Fusion was going to ride
+> along with sparse. It is six commits of layout, engine and retrieval before a line of ranking
+> exists, and the corpus's own sequencing argument — sparse first *because* it is small —
+> applies again one level down. See [`docs/milestones/M5a/SPEC.md`](../../milestones/M5a/SPEC.md).
+
+### M5b — `prefetch[]`, `fusion`, and RRF (3 days)
+- The D-73 request shape as Rust types, with the retriever it does not have yet refused **by
+  name** rather than dropped.
+- RRF at `k = 60` (D-27); weighted fusion named and not defaulted.
+- The claim worth testing: two legs cost the **max** of their depths, not the sum.
+  → [`docs/milestones/M5b/SPEC.md`](../../milestones/M5b/SPEC.md)
+
+### M5c — Full-text (4–5 weeks)
 - Tantivy behind a `BlobStore`-backed `Directory`; block-max metadata in the index section.
 - BM25, two-pass IDF, trigram regex.
 - MS MARCO quality evaluation; NDCG/MRR as CI gates.
