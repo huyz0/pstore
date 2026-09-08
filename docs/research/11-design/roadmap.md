@@ -179,6 +179,46 @@ restart still flushes every cache; and the cross-AZ probe mesh (D-82) and blob h
 (D-83) as running subsystems — the gray-failure *decisions* ship, their transports need a
 query path and a real multi-AZ deployment.
 
+### M5 — Retrieval beyond dense
+
+> ⚠️ **COMPLETE**, across three milestones each with a `VERIFIED.md`: M5a (sparse postings and
+> the impact encoding), M5b (`prefetch[]` + `fusion`), M5c (BM25 and two-pass IDF).
+>
+> Four things went differently from this plan, and each is recorded where it happened:
+>
+> * **M5 was two milestones; it is three.** Fusion was going to ride along with sparse, and
+>   spec review returned four blocking findings against that shape. A change that cannot
+>   survive two review rounds is one that gets amended mid-implementation.
+> * **D-14 is declined** — full-text is native, not Tantivy behind a `Directory`. M5a had
+>   already built the posting codec, the impact payload, the sidecar pattern and the compaction
+>   round trip, so what was left was what D-72 says is left: a scorer plus a tokenizer.
+>   **[C-11](../06-indexing/full-text-search.md) is the first correction banner here recorded
+>   as an argument rather than a measurement**, and says what would overturn it.
+> * **The corpus's term-dictionary placement does not survive its own arithmetic.** A
+>   SPLADE-sized vocabulary in the index section is 88× `INDEX_BUDGET`, and `try_finish`
+>   *refuses* an over-wide segment — so the letter of it does not make the open slow, it makes
+>   the segment unwritable. [C-10](../06-indexing/full-text-search.md).
+> * **Two open questions came back with numbers**, and one of them contradicted its own
+>   milestone's assumption. OQ-126: u8 impacts are 2.08× smaller than f32 at 0.9910 top-10
+>   agreement, so u8 ships. OQ-64: per-segment IDF returns a different **top-1** from global
+>   IDF on **27 of 37** queries when two segments are unlike each other.
+
+**Exit:** met.
+
+| Exit criterion | Status |
+|---|---|
+| Sparse retrieval over generic-impact postings | **met** — exact candidates, exact f32 ranking ([M5a](../../milestones/M5a/VERIFIED.md)) |
+| `prefetch[]` + `fusion` exercised (D-73) | **met** — three legs, one open, depth is the max not the sum ([M5b](../../milestones/M5b/VERIFIED.md), [M5c](../../milestones/M5c/VERIFIED.md)) |
+| BM25 with two-pass IDF (D-30) | **met** — agrees with an independent implementation to 1e-4; global IDF changes the top-1 ([M5c](../../milestones/M5c/VERIFIED.md)) |
+| Ranking quality as a CI gate (D-31) | **met** — `scripts/ndcg.sh`, which also scores a control ranker and fails if that clears the floor |
+| MS MARCO evaluation | ⚠️ **NOT-RUN** — no network and no dataset here. Blocked on data, exactly as M3's 100M-vector scale is |
+
+⚠️ **Not built, and named rather than omitted:** block-max pruning (OQ-45), which
+`modalities-and-sequencing.md` §6 lists as a **prerequisite** for deferring FTS safely —
+segments are immutable, so every segment M5c writes is permanently unprunable; a **stable
+cross-segment identity** and the multi-segment caller that two-pass IDF is built for; a query
+parser, language analyzers, phrase queries, positions and trigram regex.
+
 ### M5a — Sparse vectors (2 weeks)
 - Sparse/learned-sparse retrieval: the generic-impact posting lists D-72 reserved, built for
   real. ⚠️ The lists M3 built are the **dense** index's; the inverted index did not exist.
@@ -199,6 +239,7 @@ query path and a real multi-AZ deployment.
   → [`docs/milestones/M5b/SPEC.md`](../../milestones/M5b/SPEC.md)
 
 ### M5c — Full-text (4–5 weeks)
+→ [`docs/milestones/M5c/SPEC.md`](../../milestones/M5c/SPEC.md)
 - Tantivy behind a `BlobStore`-backed `Directory`; block-max metadata in the index section.
 - BM25, two-pass IDF, trigram regex.
 - MS MARCO quality evaluation; NDCG/MRR as CI gates.

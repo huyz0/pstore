@@ -35,11 +35,11 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-26 | Our segment format vs. Lance for random access and scan — should we adopt rather than build? | `05/file-format-and-layout` |
 | OQ-35 | Two-index design (SPANN cold / DiskANN warm) — measure before rejecting permanently | `06/vector-index-survey` |
 | ~~OQ-39~~ | RaBitQ vs BBQ vs int8 on our target embedding families and dimensions. **ANSWERED structurally (M3, C-5): keep RaBitQ (rotation is +5.7 points), no binary scheme rescues rung 0, int4 query is a free throughput option. Open only for real embedding families.** | `06/quantization` |
-| OQ-43 | Tantivy-over-`Directory` request amplification for a realistic multi-term query | `06/full-text-search` |
+| OQ-43 | Tantivy-over-`Directory` request amplification for a realistic multi-term query. ⚠️ **Now the thing that would overturn [C-11](../06-indexing/full-text-search.md)**, which declines D-14 on an argument rather than a measurement — measuring this means building what is being declined. | `06/full-text-search` |
 | OQ-46 | Selectivity thresholds for filter plan switching (YFCC + synthetic correlated) | `06/filtering` |
 | OQ-50 | Recall lost to segment fragmentation (probing `p` lists across 10 segments vs 1) | `06/incremental-maintenance` |
 | ~~OQ-54~~ | **CLOSED favourably** — foyer has admission/reinsertion filters, S3-FIFO + LRU-with-priority-pool, restart recovery, reserved space, and device IOPS/throughput throttling (the endurance enforcement point). Ours to build: class→region mapping, per-tenant accounting, watermarks. | `07/disk-space-management` §7 |
-| OQ-64 | Ranking error from per-shard IDF vs. global DF maintenance | `08/hybrid-and-ranking` |
+| ~~OQ-64~~ | Ranking error from per-shard IDF vs. global DF maintenance. **ANSWERED with a number (M5c): per-segment IDF returns a different top-1 from global IDF on 27 of 37 queries — 73% — when two segments are unlike each other, and 0 of 100 when the query's discriminating term is common to both. Two-pass IDF ships; the summaries ride in the dictionary sidecar and cost no round trip.** | `08/hybrid-and-ranking` |
 | OQ-66 | Rust SWIM implementation with Lifeguard — `chitchat` (Quickwit) vs `foca` | `09/crate-survey` |
 | OQ-72 | Realistic multi-tenant index-size/query-rate distribution for synthetic benchmarks | `10/evaluation-methodology` |
 | OQ-86 | Optimal bundle size `B` — cuts PUTs but raises single-index read amplification and `durable` ack latency | `05/batching-and-visibility` |
@@ -63,7 +63,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-117 | Measured working-set fraction `f` on real query traces — everything about R rests on f ≈ 0.1, which is folklore not data | `07/storage-to-cache-ratio` |
 | OQ-116 | Adaptive concurrency + the blob-store congestion controller are two interacting limiters in one request path; can they oscillate? | `09/cpu-management` |
 | OQ-112 | Foreground/background core split: what floor does compaction need to keep segment counts bounded? | `09/cpu-management` |
-| OQ-127 | Should sparse postings share a term space with BM25, or use a parallel index? | `06/modalities-and-sequencing` |
+| ~~OQ-127~~ | Should sparse postings share a term space with BM25, or use a parallel index? **ANSWERED (M5c): parallel.** A sparse dimension is a `u32` a model emits; a BM25 term is a string an analyzer produced. Sharing a space lets them collide, and a collision does not fail — it *adds* two unrelated signals into one posting list. Separate sections, sidecars and codecs sharing one list format. | `06/modalities-and-sequencing` |
 | OQ-104 | Real per-query memory profile by plan type — 24 MB is derived, not measured, and it sets the pool size and admission model | `09/memory-management` |
 | OQ-107 | jemalloc tuning (`dirty_decay_ms`, `muzzy_decay_ms`, `retain`) against measured RSS, given the documented gap between settings and behaviour | `09/memory-management` |
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
@@ -155,7 +155,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-123` should routing hints be signed separately so a proxy can use them? ·
 `OQ-124` cross-region sessions — reserve token space now ·
 `OQ-125` does `session`-as-default surprise users expecting `strong`? ·
-`OQ-126` impact payload encoding (u8/f16/varint) and its effect on R ·
+~~`OQ-126`~~ impact payload encoding — **ANSWERED (M5a): u8 is 2.08× smaller than f32 (1.78 MB vs 3.70 MB on a 30,000-term corpus) at 0.9910 top-10 agreement and 1.0000 top-1; f16 is 1.53× smaller and exact to 4 places. u8 ships; varint carries BM25's exact term frequencies.** ·
 `OQ-128` multi-vector storage layout: interleaved or separate section (refines OQ-65) ·
 `OQ-129` does accepting sparse vectors as input match how customers actually work? ·
 `OQ-130` coalescing interval for epoch hint → revalidation ·
