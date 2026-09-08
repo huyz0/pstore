@@ -159,6 +159,13 @@ pub struct Built {
     pub centroids: Option<Centroids>,
     /// Documents in the order they were written, which is list order when clustered.
     pub order: Vec<usize>,
+    /// The sparse dictionary sidecar, when a sparse field was built alongside.
+    ///
+    /// ⚠️ Built here rather than by the caller because the postings address **segment rows**,
+    /// and the segment's row order is decided by the clustering a few lines above. A caller
+    /// transposing the unreordered documents would produce a posting list that is internally
+    /// consistent and points at the wrong documents.
+    pub dictionary: Option<Vec<u8>>,
 }
 
 /// Builds a segment and, above the threshold, its clustered index.
@@ -193,6 +200,20 @@ fn fit(d: &Document, field: &str, dim: usize) -> Vec<f32> {
 /// well-formed instruction without saying which.
 #[must_use]
 pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
+    build_hybrid(docs, params, field, None)
+}
+
+/// Builds a segment carrying a dense field **and** a sparse one.
+///
+/// ⚠️ One function, because the two are not independent: the dense clustering decides the
+/// segment's row order and the sparse postings address those rows.
+#[must_use]
+pub fn build_hybrid(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+) -> Built {
     let dim = docs
         .iter()
         .find_map(|d| d.field(field).first().map(Vec::len))
@@ -261,6 +282,19 @@ pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
             sq8::write_to(&sq8::encode(&v), &mut eights);
         }
     }
+    // ⚠️ Transposed over the documents **in segment row order**, not in input order.
+    let sparse = sparse_field.map(|name| {
+        let rows: Vec<Document> = order.iter().filter_map(|r| docs.get(*r).cloned()).collect();
+        pstore_format::sparse::build(&rows, name, pstore_format::sparse::DEFAULT_ENCODING)
+    });
+    let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
+    let mut w = w
+        .with_section(Section::RaBitQ, rabitq)
+        .with_section(Section::Sq8, eights);
+    if let Some(p) = sparse {
+        w = w.with_section(Section::SparsePostings, p.section);
+    }
+
     Built {
         // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
         // document through `d.vector()`, so anything the format cannot store was lost
@@ -268,12 +302,10 @@ pub fn build_field(docs: &[Document], params: Params, field: &str) -> Built {
         // The refusal belongs where documents ENTER — `Engine::write` — and until M3b.3 the
         // check lives in `SegmentWriter::try_finish` for callers that construct segments
         // directly.
-        segment: w
-            .with_section(Section::RaBitQ, rabitq)
-            .with_section(Section::Sq8, eights)
-            .finish(),
+        segment: w.finish(),
         centroids,
         order,
+        dictionary,
     }
 }
 
@@ -339,6 +371,23 @@ impl VecIndex {
             centroids: cen.ok().and_then(|b| Centroids::decode(b.as_ref())),
             dim,
         })
+    }
+
+    /// An index over an **already-open** segment.
+    ///
+    /// ⚠️ Exists so a hybrid query opens the segment once. Two retrievers each calling `open`
+    /// is one extra suffix read and one extra `Meta` admission — and with a cache in the
+    /// stack it is invisible, because singleflight collapses the identical concurrent reads
+    /// and the request counter reports the right answer for the wrong code.
+    #[must_use]
+    pub fn from_parts(segment: Segment, centroids: Option<&[u8]>, dim: usize) -> Self {
+        Self {
+            segment,
+            // A missing or unreadable centroid table is not an error: it is how an index
+            // below the threshold says "scan me exactly" (D-10).
+            centroids: centroids.and_then(Centroids::decode),
+            dim,
+        }
     }
 
     /// Whether this index has a clustered structure, or is scanned exactly.

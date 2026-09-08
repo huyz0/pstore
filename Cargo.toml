@@ -19,6 +19,7 @@ members = [
     "crates/pstore-gossip",
     "crates/pstore-cache",
     # Layer 4 - serving
+    "crates/pstore-query",
     "crates/pstore-node",
     # Layer 1 - substrate
     # "crates/pstore-blob",      # nothing above may touch object_store directly
@@ -28,7 +29,6 @@ members = [
     # "crates/pstore-engine",    # correctness core; Invariant I1 proven here
     # Layer 3 - retrieval
     # Layer 4 - serving
-    # "crates/pstore-query",
     # "crates/pstore-server",
     # Test infrastructure - never shipped
     # "crates/pstore-testkit",

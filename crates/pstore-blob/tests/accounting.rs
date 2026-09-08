@@ -151,3 +151,36 @@ async fn ranges_are_recorded_so_bytes_can_be_attributed_to_a_section() {
     assert_eq!(s.bytes_in(&k("seg"), 0..1000), 100);
     assert_eq!(s.bytes_in(&k("seg"), 1000..4096), 142);
 }
+
+#[tokio::test]
+async fn a_hinted_suffix_read_is_attributed_like_an_unhinted_one() {
+    // ⚠️ It was not. `get_suffix` resolved its span to absolute bytes so the footer could be
+    // attributed to a section; `get_suffix_as` — added when reads gained a cache class — did
+    // not, and `Segment::open` uses the hinted one. The result was that the single read every
+    // query on every segment performs was invisible to `ranges()` and `bytes_in()`, which are
+    // the tools every byte and section assertion in this project is built on. Found by a test
+    // trying to count how many times a hybrid query opened its segment, which measured zero.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(4242);
+    let v = s.as_tenant(t);
+    let key = Key::new("obj");
+    v.put(&key, bytes::Bytes::from(vec![7u8; 5_000]))
+        .await
+        .unwrap();
+
+    s.record_ranges();
+    v.get_suffix(&key, 100).await.unwrap();
+    v.get_suffix_as(&key, 100, pstore_blob::Class::Meta)
+        .await
+        .unwrap();
+    let seen: Vec<_> = s.ranges().into_iter().filter(|(k, _)| *k == key).collect();
+    assert_eq!(
+        seen.len(),
+        2,
+        "a hinted suffix read was not recorded: {seen:?}"
+    );
+    for (_, r) in &seen {
+        assert_eq!(*r, 4_900..5_000, "a suffix resolved to the wrong span");
+    }
+    assert_eq!(s.bytes_in(&key, 4_900..5_000), 200);
+}

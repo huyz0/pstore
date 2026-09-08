@@ -310,7 +310,17 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         self.bill(OpClass::Read);
         let out = self.inner.get_suffix_as(key, n, class).await;
         if let Ok(b) = &out {
-            self.bill_bytes(OpClass::Read, b.len() as u64);
+            let len = b.len() as u64;
+            self.bill_bytes(OpClass::Read, len);
+            // ⚠️ Resolved, exactly as the unhinted `get_suffix` above does — and it was not,
+            // which made the footer invisible to `ranges()` and `bytes_in()`. Every segment
+            // is opened through the HINTED path (`Segment::open` asks for `Class::Meta`), so
+            // the one read this decorator's own comment calls "the one section every query
+            // touches" was the one read it could not attribute. Found by a criterion that
+            // needed to count how many times a hybrid query opened its segment and measured
+            // **zero**.
+            let end = self.inner.head(key).await.unwrap_or(len);
+            self.note_range(key, end.saturating_sub(len)..end);
         }
         out
     }

@@ -1109,6 +1109,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-query"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "pstore-blob",
+ "pstore-format",
+ "pstore-index",
+ "pstore-testkit",
+ "pstore-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-testkit"
 version = "0.1.0"
 dependencies = [
