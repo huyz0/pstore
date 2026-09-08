@@ -72,8 +72,39 @@ measurement selects the default the retriever ships with).
     `DEFAULT_ENCODING` stays u8 — selected by the measurement, not assumed by it. The test
     asserts the floor **and** that the constant still matches what cleared it.
 14. **Gates** — `./scripts/gates.sh` green (8/8); `./scripts/coverage.sh --fail-under-regions 95`
-    at **95.28% regions**, 97.09% lines, 95.45% functions; `cargo deny check` clean; mutation
-    recorded below.
+    at **95.28% regions**, 97.09% lines, 95.45% functions; `cargo deny check` clean; mutation **411 of 411 non-equivalent viable mutants**, below.
+
+
+## Mutation
+
+`./scripts/mutants.sh --file …` over M5's six new modules, **469 mutants in 42 minutes**:
+**410 caught, 1 killed by timeout, 42 unviable, 16 missed** — 411 of 427 viable, and every
+one of the 16 is a **proven equivalent mutant**, recorded beside the code it lives in.
+
+| module | caught | missed | unviable |
+|---|---|---|---|
+| `pstore-format/src/sparse.rs` | 227 (+1 timeout) | 16 | 8 |
+| `pstore-format/src/text.rs` | 80 | 0 | 4 |
+| `pstore-index/src/sparse.rs` | 19 | 0 | 13 |
+| `pstore-index/src/text.rs` | 69 | 0 | 12 |
+| `pstore-query/src/fuse.rs` | 9 | 0 | 1 |
+| `pstore-query/src/run.rs` | 6 | 0 | 4 |
+
+The 16: fourteen `|` against `^` over the **disjoint** sign, exponent and significand bits of
+a binary16 — OR and XOR agree on every input that can reach them — and two in `put_impact`
+(`max > 0.0` against `>= 0.0`, whose only reachable input is a term of all-zero impacts where
+`0.0 / 0.0` casts to the same byte; `+ 128` against `- 128`, which differ by 256 in a `u8`).
+**Excluding them, 411 of 411.**
+
+⚠️ **The one timeout is a kill, not a gap**: `put_varint` with its loop condition flipped does
+not terminate. It is the reason the floor is 300 s rather than off.
+
+⚠️ **The first sweep's numbers were wrong in the flattering direction**, and the correction is
+the point. `cargo-mutants` auto-set the limit to **20 s against a 20-second baseline**, so
+every *surviving* mutant — which by definition runs the suite to completion — was cut off and
+filed as a timeout. Three of those looked like the equivalence class above and were not: they
+were the round-to-nearest tie term, and chasing them found the codec rounding ties **up** while
+its comment claimed round-to-nearest. Both paths are IEEE round-half-to-even now.
 
 ## What was measured and is not a claim about production
 
