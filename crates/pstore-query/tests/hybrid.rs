@@ -16,7 +16,7 @@
 //! wrong is the request count and the depth, so that is what is asserted.
 
 use pstore_blob::{Accounted, BlobStore, Key, MemoryStore, OpClass};
-use pstore_format::{DEFAULT_FIELD, Document, Impact, VectorField, sparse};
+use pstore_format::{DEFAULT_FIELD, Document, Impact, Value, VectorField, sparse, text};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
 use pstore_query::{Fusion, Prefetch, QueryError, query};
@@ -45,6 +45,10 @@ fn hybrid_doc(i: usize) -> Document {
             (50 + (i as u32 % 7), Impact::new(0.4)),
         ]),
     );
+    d.attrs.insert(
+        text::DEFAULT_TEXT_FIELD.to_owned(),
+        Value::Str(format!("document {i} quarterly revenue w{}", i % 29)),
+    );
     d
 }
 
@@ -71,6 +75,65 @@ async fn put<S: BlobStore>(store: &S, docs: &[Document]) -> (Key, Key) {
             &sparse::dict_key(&seg),
             bytes::Bytes::from(built.dictionary.expect("no dictionary was built")),
         )
+        .await
+        .unwrap();
+    (seg, cen)
+}
+
+/// The same segment, plus a text index over the `text` attribute.
+async fn put_with_text<S: BlobStore>(store: &S, docs: &[Document]) -> (Key, Key) {
+    let dense = vec_index::build_hybrid(docs, params(), DEFAULT_FIELD, Some(SPARSE));
+    let txt = text::build(docs, text::DEFAULT_TEXT_FIELD);
+    // ⚠️ Rebuilt over the documents in SEGMENT ROW ORDER, which clustering chose. The dense
+    // builder returns that order; handing the text builder the input order would produce
+    // postings that are internally consistent and point at the wrong documents.
+    let rows: Vec<Document> = dense
+        .order
+        .iter()
+        .filter_map(|r| docs.get(*r).cloned())
+        .collect();
+    let txt = if rows.len() == docs.len() {
+        text::build(&rows, text::DEFAULT_TEXT_FIELD)
+    } else {
+        txt
+    };
+    let (seg, cen) = (Key::new(SEG), Key::new(CEN));
+    let mut w = pstore_format::SegmentWriter::new(64);
+    for r in &rows {
+        w.push(r.clone());
+    }
+    store
+        .put(
+            &seg,
+            w.with_section(
+                pstore_format::Section::SparsePostings,
+                sparse::build(&rows, SPARSE, sparse::DEFAULT_ENCODING).section,
+            )
+            .with_section(pstore_format::Section::TextPostings, txt.postings.clone())
+            .with_section(
+                pstore_format::Section::Fieldnorms,
+                text::encode_norms(&txt.fieldnorms),
+            )
+            .try_finish()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    if let Some(c) = &dense.centroids {
+        store
+            .put(&cen, bytes::Bytes::from(c.encode()))
+            .await
+            .unwrap();
+    }
+    store
+        .put(
+            &sparse::dict_key(&seg),
+            bytes::Bytes::from(sparse::build(&rows, SPARSE, sparse::DEFAULT_ENCODING).dictionary),
+        )
+        .await
+        .unwrap();
+    store
+        .put(&text::dict_key(&seg), bytes::Bytes::from(txt.dictionary))
         .await
         .unwrap();
     (seg, cen)
@@ -176,15 +239,20 @@ async fn an_unimplemented_retriever_is_refused() {
     let store = MemoryStore::with_coalesce_gap(GAP);
     let docs = corpus(600);
     let (seg, cen) = put(&store, &docs).await;
+    // ⚠️ The occupant has changed and the mechanism has not. In M5b this was `Text`; M5c
+    // implemented it, so the shape's unimplemented retriever is now `Trigram`, which
+    // `full-text-search.md` names as "the same inverted machinery". D-73's point is that the
+    // shape carries retrievers that do not exist yet — so as long as one does not, this test
+    // has something to be about.
     let mut l = legs(&docs);
-    l.push(Prefetch::Text {
+    l.push(Prefetch::Trigram {
         field: "body".to_owned(),
-        query: "quarterly revenue".to_owned(),
+        pattern: "quarterly.*revenue".to_owned(),
         limit: 20,
     });
     match query(&store, &seg, &cen, &l, Fusion::default(), 10).await {
-        Err(QueryError::Unimplemented(which)) => assert_eq!(which, "text"),
-        other => panic!("a text prefetch was not refused by name: {other:?}"),
+        Err(QueryError::Unimplemented(which)) => assert_eq!(which, "trigram"),
+        other => panic!("a trigram prefetch was not refused by name: {other:?}"),
     }
 }
 
@@ -202,9 +270,9 @@ async fn a_refused_retriever_costs_no_requests() {
         &view,
         &seg,
         &cen,
-        &[Prefetch::Text {
+        &[Prefetch::Trigram {
             field: "body".to_owned(),
-            query: "x".to_owned(),
+            pattern: "x".to_owned(),
             limit: 5,
         }],
         Fusion::default(),
@@ -323,5 +391,89 @@ async fn a_dense_query_is_unaffected_by_the_sparse_field_beside_it() {
         with_sparse.iter().map(|h| h.row).collect::<Vec<_>>(),
         without.iter().map(|h| h.row).collect::<Vec<_>>(),
         "a sparse field beside the dense one changed the dense answer"
+    );
+}
+
+#[tokio::test]
+async fn a_three_leg_query_is_no_deeper_than_its_deepest_leg() {
+    // ⚠️ M5c criterion 11. Three retrievers, one open, one round of ranges. The failure this
+    // catches returns the same ranking at three times the depth, and no functional assertion
+    // can tell.
+    let inner = MemoryStore::with_coalesce_gap(GAP);
+    let docs = corpus(600);
+    let (seg, cen) = put_with_text(&inner, &docs).await;
+    let s = DepthCounting::new(inner);
+
+    let mut l = legs(&docs);
+    l.push(Prefetch::Text {
+        field: text::DEFAULT_TEXT_FIELD.to_owned(),
+        query: "quarterly revenue".to_owned(),
+        limit: 20,
+    });
+
+    s.reset();
+    let three = query(&s, &seg, &cen, &l, Fusion::default(), 10)
+        .await
+        .unwrap();
+    let depth_three = s.depth();
+    assert!(!three.is_empty(), "the three-leg query returned nothing");
+
+    s.reset();
+    query(&s, &seg, &cen, &l[2..], Fusion::default(), 10)
+        .await
+        .unwrap();
+    let text_only = s.depth();
+
+    assert_eq!(
+        depth_three, text_only,
+        "three legs cost {depth_three} rounds against {text_only} for the text leg alone"
+    );
+    assert_eq!(
+        depth_three, 2,
+        "a three-leg query cost {depth_three} rounds"
+    );
+}
+
+#[tokio::test]
+async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
+    // The D-73 shape is unchanged: `query` is still a `String`, analyzed at query time. What
+    // changed is that it runs.
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let docs = corpus(600);
+    let (seg, cen) = put_with_text(&store, &docs).await;
+    let hits = query(
+        &store,
+        &seg,
+        &cen,
+        &[Prefetch::Text {
+            field: text::DEFAULT_TEXT_FIELD.to_owned(),
+            query: "Quarterly, REVENUE".to_owned(),
+            limit: 10,
+        }],
+        Fusion::default(),
+        10,
+    )
+    .await
+    .expect("a text leg was refused");
+    assert!(!hits.is_empty(), "the analyzer did not lowercase the query");
+
+    // A segment with no term dictionary is an error naming the sidecar, not an empty answer.
+    let (bare, bare_cen) = put(&store, &docs).await;
+    assert!(
+        query(
+            &store,
+            &bare,
+            &bare_cen,
+            &[Prefetch::Text {
+                field: text::DEFAULT_TEXT_FIELD.to_owned(),
+                query: "revenue".to_owned(),
+                limit: 10,
+            }],
+            Fusion::default(),
+            10,
+        )
+        .await
+        .is_err(),
+        "a text leg over a segment with no text answered instead of failing"
     );
 }

@@ -69,7 +69,15 @@ const MAGIC: &[u8; 8] = b"PSTORETD";
 const VERSION: u16 = 1;
 /// term_at(4) term_len(2) offset(4) bytes(4) count(4) df(4).
 const ENTRY: usize = 22;
-const HEADER: usize = 8 + 2 + 4 + 4;
+/// MAGIC(8) VERSION(2) terms(4) blob_len(4) rows(4) total_tokens(8).
+///
+/// ⚠️ `rows` and `total_tokens` are the **corpus summary** D-30 needs, and they live here
+/// rather than being derived from the fieldnorms section on purpose: the sidecar is fetched
+/// beside the footer, so a query that needs global statistics gets this segment's
+/// contribution in the round that was happening anyway. Deriving them from the fieldnorms
+/// would put a fetch between the open and the score, and two-pass IDF would cost a round
+/// trip — which is exactly what D-30 says it does not.
+const HEADER: usize = 8 + 2 + 4 + 4 + 4 + 8;
 
 /// Where a segment's term dictionary lives, **derived** from the segment's own key.
 ///
@@ -147,6 +155,14 @@ pub fn build(docs: &[Document], field: &str) -> Built {
     dictionary.extend_from_slice(&VERSION.to_le_bytes());
     dictionary.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     dictionary.extend_from_slice(&(terms.len() as u32).to_le_bytes());
+    dictionary.extend_from_slice(&(fieldnorms.len() as u32).to_le_bytes());
+    dictionary.extend_from_slice(
+        &fieldnorms
+            .iter()
+            .map(|n| u64::from(*n))
+            .sum::<u64>()
+            .to_le_bytes(),
+    );
     for (term_at, term_len, e, df) in &entries {
         dictionary.extend_from_slice(&term_at.to_le_bytes());
         dictionary.extend_from_slice(&term_len.to_le_bytes());
@@ -180,9 +196,10 @@ pub struct TermEntry {
 /// The term dictionary: sorted terms, fixed-width entries, and a blob of term bytes.
 #[derive(Debug, Clone)]
 pub struct TermDict {
-    raw: bytes::Bytes,
     terms: Vec<String>,
     entries: Vec<TermEntry>,
+    rows: u32,
+    total_tokens: u64,
 }
 
 impl TermDict {
@@ -195,6 +212,8 @@ impl TermDict {
         }
         let count = u32::from_le_bytes(raw.get(10..14)?.try_into().ok()?) as usize;
         let terms_len = u32::from_le_bytes(raw.get(14..18)?.try_into().ok()?) as usize;
+        let rows = u32::from_le_bytes(raw.get(18..22)?.try_into().ok()?);
+        let total_tokens = u64::from_le_bytes(raw.get(22..30)?.try_into().ok()?);
         // ⚠️ Length checked up front. A truncated table decoded lazily answers some lookups
         // and silently loses the terms past the cut.
         if raw.len() != HEADER + count * ENTRY + terms_len {
@@ -225,10 +244,23 @@ impl TermDict {
             return None;
         }
         Some(Self {
-            raw: bytes::Bytes::copy_from_slice(raw),
             terms,
             entries,
+            rows,
+            total_tokens,
         })
+    }
+
+    /// Documents this segment holds, text or not — the `N` of IDF's numerator.
+    #[must_use]
+    pub fn doc_count(&self) -> u32 {
+        self.rows
+    }
+
+    /// Tokens across every document, so `avgdl` is a sum rather than a scan.
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
     }
 
     /// Distinct terms.
@@ -241,12 +273,6 @@ impl TermDict {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
-    }
-
-    /// Bytes the dictionary occupies, for a size assertion that does not re-encode it.
-    #[must_use]
-    pub fn encoded_len(&self) -> usize {
-        self.raw.len()
     }
 
     /// Every term, ascending.

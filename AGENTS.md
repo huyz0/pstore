@@ -85,6 +85,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `scripts/build-index.py --check` | the generated regions in `AGENTS.md` are current, and the Gates table matches what CI runs |
 | `scripts/check-verified.py` | every acceptance criterion has an evidence line, and every test it names resolves (OQ-167) |
 | `scripts/recall.sh` | recall@10 above its floor (D-35). Runs outside `cargo test`, so `cargo mutants` does not rebuild a gate-scale corpus once per mutant |
+| `scripts/ndcg.sh` | ranking quality above its floor (D-31) — **and a control ranker below it**, so a judged set we generated cannot pass everything |
 | `git config core.hooksPath scripts/githooks` | **run once per clone.** Refuses a commit whose tree is red — the rule AGENTS.md already states, moved from an instruction to a predicate |
 <!-- index:gates:end -->
 

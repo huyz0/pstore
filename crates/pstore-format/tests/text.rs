@@ -231,3 +231,48 @@ async fn a_text_segment_carries_its_postings_and_norms_but_no_field_row() {
     s.put(&plain, w2.try_finish().unwrap()).await.unwrap();
     assert!(!Segment::open(&s, &plain).await.unwrap().has_text());
 }
+
+#[test]
+fn a_dictionary_from_another_format_or_an_unsorted_one_is_refused() {
+    // ⚠️ Two failures with no symptom. A sidecar from a different writer decodes term offsets
+    // into a blob that is not a term blob; an unsorted table cannot be binary-searched, and
+    // searching it anyway answers "absent" for terms that are present — a silent recall loss
+    // rather than an error.
+    let mut wrong_magic = text::build(&corpus(), text::DEFAULT_TEXT_FIELD).dictionary;
+    wrong_magic[..8].copy_from_slice(b"NOTATERM");
+    assert!(TermDict::decode(&wrong_magic).is_none());
+
+    let mut wrong_version = text::build(&corpus(), text::DEFAULT_TEXT_FIELD).dictionary;
+    wrong_version[8] = 9;
+    assert!(TermDict::decode(&wrong_version).is_none());
+
+    // Swap the first two entries' term pointers, which unsorts the table without changing
+    // its length.
+    let mut unsorted = text::build(&corpus(), text::DEFAULT_TEXT_FIELD).dictionary;
+    let (a, b) = (18 + 8, 18 + 8 + 22);
+    let first: Vec<u8> = unsorted[a..a + 6].to_vec();
+    let second: Vec<u8> = unsorted[b..b + 6].to_vec();
+    unsorted[a..a + 6].copy_from_slice(&second);
+    unsorted[b..b + 6].copy_from_slice(&first);
+    assert!(
+        TermDict::decode(&unsorted).is_none(),
+        "an unsorted term dictionary decoded, and every lookup past the swap would miss"
+    );
+}
+
+#[test]
+fn a_corpus_with_no_text_has_an_empty_dictionary() {
+    // Distinguishable from a corpus that has terms: a dictionary reporting entries it does
+    // not have addresses byte ranges outside the section.
+    let docs: Vec<Document> = (0..4)
+        .map(|i| Document::new(format!("d{i}"), vec![1.0, 0.0]))
+        .collect();
+    let built = text::build(&docs, text::DEFAULT_TEXT_FIELD);
+    let dict = TermDict::decode(&built.dictionary).unwrap();
+    assert!(dict.is_empty());
+    assert_eq!(dict.len(), 0);
+    assert_eq!(dict.doc_count(), 4);
+    assert_eq!(dict.total_tokens(), 0);
+    assert!(built.postings.is_empty());
+    assert!(dict.lookup("anything").is_none());
+}

@@ -82,6 +82,29 @@ from a local-disk engine, where they are usually interleaved.
 > one-object/one-suffix-GET contract. Revisit a native implementation only if the
 > `Directory` indirection costs us round trips we can't recover.
 
+> **C-11 — D-14 declined. M5c. ⚠️ An argument, not a measurement.** D-14's premise is that the
+> alternative is "months of work and a large correctness surface (tokenization, scoring,
+> phrase queries, positions)". **M5a removed most of it**: the posting codec, the impact
+> payload, the dictionary sidecar, the section plumbing and the compaction round trip already
+> exist and are gated, so what is left is what D-72 says is left — "a scorer plus a tokenizer".
+> M5c is ~400 lines of `pstore_format::text` and `pstore_index::text`, and its BM25 agrees with
+> an independent implementation of the formula to 1e-4.
+>
+> ⚠️ **Every other correction banner here is labelled *measured*; this one cannot be.**
+> Measuring `Directory`-over-`BlobStore` request amplification (OQ-43) means building the
+> thing being declined. What would overturn C-11 is exactly that: a `Directory`
+> implementation whose cold multi-term query stays inside three sequential round trips.
+>
+> **What is given up, and the last one is structural.** No query parser, no language
+> analyzers, no phrase queries, no positions, no regex — all *deferrable*, addable to later
+> segments. **Block-max metadata is not.** D-13 calls it "the single most important FTS layout
+> decision for object storage" and
+> [`modalities-and-sequencing.md`](modalities-and-sequencing.md) §6 lists it as a
+> **prerequisite** for deferring FTS safely. Segments are immutable, so every segment M5c
+> writes is permanently unprunable, and the retrofit costs a new section id plus a compaction
+> pass over the whole corpus. Evidence:
+> [`M5c/SPEC.md`](../../milestones/M5c/SPEC.md) and its `VERIFIED.md`.
+
 Risks to watch: Tantivy's `Directory` assumes cheap `atomic_read`/small reads; a naive
 implementation will produce request storms. The `Directory` must aggressively coalesce and
 must prefetch the hotcache-equivalent up front. Quickwit solved this; study their approach.

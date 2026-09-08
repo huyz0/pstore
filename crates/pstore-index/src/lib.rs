@@ -10,4 +10,5 @@ pub mod rabitq;
 pub mod search;
 pub mod sparse;
 pub mod sq8;
+pub mod text;
 pub mod vec_index;

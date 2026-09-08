@@ -357,8 +357,33 @@ fn an_encodings_width_is_what_it_writes() {
         (ImpactEncoding::U8, 1),
         (ImpactEncoding::F16, 2),
         (ImpactEncoding::F32, 4),
+        // ⚠️ **0 means variable.** A caller that sliced by this width would read every varint
+        // impact from offset zero; `read_list` decodes them sequentially instead, which is
+        // why the width is a promise the encoding does not make rather than a lie it tells.
+        (ImpactEncoding::Varint, 0),
     ] {
         assert_eq!(enc.width(), w);
+        if w == 0 {
+            let docs: Vec<Document> = (0..4).map(|i| doc(i, vec![(1, 3.0)])).collect();
+            let p = sparse::build(&docs, FIELD, enc);
+            let dict = Dictionary::decode(&p.dictionary).unwrap();
+            let e = dict.lookup(1).unwrap();
+            let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
+            assert_eq!(
+                got.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+                [3.0, 3.0, 3.0, 3.0],
+                "a varint impact did not round-trip exactly"
+            );
+            // 4 one-byte row deltas + 4 one-byte impacts.
+            assert_eq!(e.bytes, 8);
+            // A truncated varint impact stops the list rather than inventing rows.
+            assert!(
+                dict.decode_list(&e, &p.section[e.offset as usize..][..5])
+                    .len()
+                    < 4
+            );
+            continue;
+        }
         let docs: Vec<Document> = (0..4).map(|i| doc(i, vec![(1, 0.5)])).collect();
         let p = sparse::build(&docs, FIELD, enc);
         let dict = Dictionary::decode(&p.dictionary).unwrap();
@@ -649,6 +674,18 @@ fn a_dictionary_with_an_unknown_encoding_is_refused() {
     let mut p = sparse::build(&corpus(10, 20, 3), FIELD, ImpactEncoding::U8);
     p.dictionary[10] = 9;
     assert!(Dictionary::decode(&p.dictionary).is_none());
+
+    let mut unsorted = sparse::build(&covering_corpus(20, 8, 3), FIELD, ImpactEncoding::U8);
+    // Swap two entries' dimension fields, which unsorts the table without changing its length.
+    let (a, b) = (15, 15 + 24);
+    let first: Vec<u8> = unsorted.dictionary[a..a + 4].to_vec();
+    let second: Vec<u8> = unsorted.dictionary[b..b + 4].to_vec();
+    unsorted.dictionary[a..a + 4].copy_from_slice(&second);
+    unsorted.dictionary[b..b + 4].copy_from_slice(&first);
+    assert!(
+        Dictionary::decode(&unsorted.dictionary).is_none(),
+        "an unsorted dictionary decoded, and every lookup past the swap would miss"
+    );
 
     let mut wrong_version = sparse::build(&corpus(10, 20, 3), FIELD, ImpactEncoding::U8);
     wrong_version.dictionary[8] = 7;

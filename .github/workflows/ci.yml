@@ -70,6 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/recall.sh
+      - run: ./scripts/ndcg.sh
 
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
   # Only the second one makes 95% mean something (D-111). Changed files per PR;

@@ -4,6 +4,7 @@ use crate::fuse::{Fusion, Hit, fuse};
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{FormatError, Segment};
 use pstore_index::sparse::SparseIndex;
+use pstore_index::text::{Stats, TextIndex};
 use pstore_index::vec_index::{self, VecIndex};
 
 /// One retriever's request (D-73).
@@ -29,16 +30,31 @@ pub enum Prefetch {
         /// Rows this leg contributes at most.
         limit: usize,
     },
-    /// Full-text — **in the shape, not in the engine**.
+    /// BM25 over the segment's text field.
     ///
-    /// ⚠️ Present so a caller's request does not have to change when the retriever arrives
-    /// (D-73), and refused by name when executed. Dropping it silently would answer with a
-    /// plausible ranking computed from fewer retrievers than were asked for.
+    /// ⚠️ `query` is a **`String`**, analyzed at query time. D-73's premise is that the
+    /// request shape is the hardest thing to change, so the variant that shipped in M5b
+    /// before the retriever existed is the variant that runs now — unchanged.
     Text {
         /// The field to search.
         field: String,
         /// The query text.
         query: String,
+        /// Rows this leg would contribute.
+        limit: usize,
+    },
+    /// Trigram regex — **in the shape, not in the engine**.
+    ///
+    /// ⚠️ Present so a caller's request does not have to change when the retriever arrives
+    /// (D-73), and refused **by name** when executed. Dropping it silently would answer with a
+    /// plausible ranking computed from fewer retrievers than were asked for, and nothing
+    /// anywhere would say so. `full-text-search.md` names trigram as "the same inverted
+    /// machinery", which is why it is the shape's next occupant rather than an invention.
+    Trigram {
+        /// The field to search.
+        field: String,
+        /// The pattern to match.
+        pattern: String,
         /// Rows this leg would contribute.
         limit: usize,
     },
@@ -60,6 +76,7 @@ struct Opened {
     segment: Segment,
     centroids: Option<bytes::Bytes>,
     dictionary: Option<bytes::Bytes>,
+    terms: Option<bytes::Bytes>,
 }
 
 /// Runs every leg over one segment and fuses the answers.
@@ -97,10 +114,11 @@ pub async fn query<S: BlobStore>(
 }
 
 /// A leg this build can actually run.
-///
-/// ⚠️ There is no `Text` here, and that is the point: the shape ships with a retriever that
-/// does not exist (D-73), so the type that reaches the runner must not be able to express it.
 enum Runnable<'a> {
+    Text {
+        query: &'a str,
+        limit: usize,
+    },
     Dense {
         field: &'a str,
         query: &'a [f32],
@@ -139,7 +157,11 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 query,
                 limit: *limit,
             }),
-            Prefetch::Text { .. } => Err(QueryError::Unimplemented("text")),
+            Prefetch::Text { query, limit, .. } => Ok(Self::Text {
+                query,
+                limit: *limit,
+            }),
+            Prefetch::Trigram { .. } => Err(QueryError::Unimplemented("trigram")),
         }
     }
 }
@@ -155,15 +177,20 @@ async fn open<S: BlobStore>(
     let wants_sparse = prefetch
         .iter()
         .any(|p| matches!(p, Prefetch::Sparse { .. }));
+    let wants_text = prefetch.iter().any(|p| matches!(p, Prefetch::Text { .. }));
     // ⚠️ Three futures, one round. Every key is derived and none depends on another's
     // contents, so awaiting them in sequence would cost a round trip per modality — which is
     // exactly what `prefetch[]` must not turn into.
-    let (segment, cen, dict) = futures_util::future::join3(
+    let (segment, cen, dict, terms) = futures_util::future::join4(
         Segment::open(store, key),
         maybe(store, wants_dense.then(|| centroids.clone())),
         maybe(
             store,
             wants_sparse.then(|| pstore_format::sparse::dict_key(key)),
+        ),
+        maybe(
+            store,
+            wants_text.then(|| pstore_format::text::dict_key(key)),
         ),
     )
     .await;
@@ -171,6 +198,7 @@ async fn open<S: BlobStore>(
         segment: segment?,
         centroids: cen,
         dictionary: dict,
+        terms,
     })
 }
 
@@ -194,6 +222,23 @@ async fn leg<S: BlobStore>(
     r: &Runnable<'_>,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
+        Runnable::Text { query, limit } => {
+            let raw = opened.terms.as_ref().ok_or(FormatError::Corrupt(
+                "a text leg over a segment with no term dictionary sidecar",
+            ))?;
+            let idx = TextIndex::from_segment(&opened.segment, raw.as_ref())?;
+            // ⚠️ **This segment's summary is the corpus**, because a query runs over one
+            // segment. That is D-30's statistics half applied to the case that exists; the
+            // caller that merges summaries across segments with `Stats::merge` is the thing
+            // M5a, M5b and M5c all hand forward, and it is named rather than faked here.
+            let stats: Stats = idx.summary();
+            let terms = pstore_format::text::analyze(query);
+            let hits = idx.search(store, key, &terms, &stats, *limit).await?;
+            Ok(hits
+                .into_iter()
+                .map(|(row, score)| Hit { row, score })
+                .collect())
+        }
         Runnable::Dense {
             field,
             query,
