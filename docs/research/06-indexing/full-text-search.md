@@ -17,12 +17,28 @@ Elasticsearch**.
 
 | Structure | Purpose | Where it lives |
 |---|---|---|
-| **Term dictionary (FST)** | term → posting-list offset; compact, fast prefix lookup | Segment index section (cached) |
+| **Term dictionary (FST)** | term → posting-list offset; compact, fast prefix lookup | ⚠️ **C-10** — a sibling immutable object, not the index section |
 | **Posting lists** | doc ids + term freqs, block-compressed | Data section, ranged GET |
 | **Skip lists** | metadata per 128-doc block, seek without scanning | Beginning of the postings data |
 | **Block-max metadata** | `fieldnorm_id` + `max_term_freq` per block ⇒ max BM25 contribution | With the skip data |
 | **Fieldnorms** | doc length for BM25 | Columnar, cached |
 | **Fast fields** | columnar numerics for filter/sort/aggregate | Data section |
+
+> **C-10 — the term dictionary's home, corrected. M5a, measured.** The row above puts it in the
+> segment index section, which is bounded by `INDEX_BUDGET` = `SUFFIX_FETCH` − footer =
+> **8,150 bytes** so that it arrives with the footer in one suffix read. A SPLADE-sized 30,000
+> term vocabulary at 12 bytes an entry is **360 KB — 44× that budget**, and `try_finish`
+> *refuses* an over-wide segment rather than opening it slowly: the letter of this row does not
+> make the open expensive, it makes the segment **unwritable**.
+>
+> The dictionary is therefore a **sibling immutable object** whose key is derived from the
+> segment's (`<segment>.sdict`), fetched in parallel with the footer and cached `Pinned` —
+> which is what M3 already does with the centroid table, and which a section could not be,
+> because a section has no cache class of its own. The row's *intent* — cached, fetched before
+> the postings, never interleaved with them — is met exactly.
+>
+> ⚠️ **D-13 is untouched.** It governs block-max/skip metadata, which M5a does not add. Evidence:
+> [`M5a/SPEC.md`](../../milestones/M5a/SPEC.md) and its `VERIFIED.md`.
 
 Tantivy's format is directly usable as a reference: FST term dictionary, skip lists written
 at the head of the postings when `doc_freq >= 128`, VInt encoding below that (avoiding

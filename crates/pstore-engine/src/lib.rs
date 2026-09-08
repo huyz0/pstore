@@ -198,6 +198,45 @@ impl<S: BlobStore> Engine<S> {
         ))
     }
 
+    /// Writes one segment, and the sparse dictionary beside it when there is one.
+    ///
+    /// ⚠️ **One place.** Fold and compaction both seal segments, and a sparse field written
+    /// by one and not the other is an index whose rows lose a field the first time they are
+    /// merged — with every test that only folds still passing.
+    ///
+    /// ⚠️ `try_finish`, not `finish`. `finish` is lossy for anything the format cannot hold
+    /// and the fold used it, so a document the writer could not store was written as nothing
+    /// and reported as durable. That is the same failure `check_storable` guards the door
+    /// against, at the other end of the same path.
+    async fn seal(&self, key: &Key, docs: &[Document]) -> Result<(), EngineError> {
+        let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
+        for d in docs {
+            w.push(d.clone());
+        }
+        if let Some(field) = sparse_field_of(docs) {
+            let p =
+                pstore_format::sparse::build(docs, &field, pstore_format::sparse::DEFAULT_ENCODING);
+            // ⚠️ The dictionary FIRST, and before the segment is named by HEAD. A segment
+            // whose sidecar is not there yet reads as a segment whose sparse field cannot be
+            // reconstructed — postings intact, and unreachable.
+            self.store
+                .put(
+                    &pstore_format::sparse::dict_key(key),
+                    bytes::Bytes::from(p.dictionary),
+                )
+                .await?;
+            w = w.with_section(pstore_format::Section::SparsePostings, p.section);
+        }
+        self.store
+            .put(
+                key,
+                w.try_finish()
+                    .map_err(|e| EngineError::Format(e.to_string()))?,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Buffers documents. **Visible immediately**; durable at the next [`Self::flush`].
     pub async fn write(&self, index: &str, docs: Vec<Document>) -> Result<(), EngineError> {
         // ⚠️ Refused at the DOOR, not at the fold. The document model expresses named,
@@ -374,11 +413,7 @@ impl<S: BlobStore> Engine<S> {
             // neighbours' rows.
             for (idx, docs) in &by_index {
                 let seg_key = self.segment_key(next.epoch, idx);
-                let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
-                for d in docs {
-                    w.push(d.clone());
-                }
-                self.store.put(&seg_key, w.finish()).await?;
+                self.seal(&seg_key, docs).await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -468,6 +503,16 @@ impl<S: BlobStore> Engine<S> {
                 // anywhere in the commit path and deleting live data.
                 .filter(|k| !live.contains(k.as_str()))
                 .map(|k| Key::new(k.clone()))
+                // ⚠️ And the sparse dictionary beside it. The graveyard records segments;
+                // a sidecar is reachable only by derivation from one, so a segment reaped
+                // without its dictionary leaves an object nothing can ever name again. The
+                // delete is unconditional because the alternative is a HEAD request per key
+                // to find out — which would make GC cost a request per segment to save a
+                // key in a batch that is already one request per thousand.
+                .flat_map(|k| {
+                    let dict = pstore_format::sparse::dict_key(&k);
+                    [k, dict]
+                })
                 .collect();
 
             // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
@@ -580,13 +625,10 @@ impl<S: BlobStore> Engine<S> {
         let rows: Vec<Document> = scanned.into_iter().flatten().collect();
 
         let out_key = self.compacted_key(at.head.epoch.next(), index);
-        let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
-        for d in &rows {
-            w.push(d.clone());
-        }
-        // The single W. Written BEFORE the commit and never rewritten on a retry: a
-        // rebase changes which HEAD we condition on, not what we merged.
-        self.store.put(&out_key, w.finish()).await?;
+        // The single W (two, for an index with a sparse field). Written BEFORE the commit and
+        // never rewritten on a retry: a rebase changes which HEAD we condition on, not what
+        // we merged.
+        self.seal(&out_key, &rows).await?;
         let out = SegmentRef {
             key: out_key.as_str().to_owned(),
             rows: rows.len() as u32,
@@ -729,4 +771,22 @@ impl<S: BlobStore> Engine<S> {
         };
         head::commit(&*self.store, self.tenant, &stale, &next).await
     }
+}
+
+/// The one sparse field a batch of documents carries, if any.
+///
+/// ⚠️ Returns the **first in name order** so a segment is deterministic. A second sparse
+/// field needs its own section id pair, the way `FieldVectors` mirrors `Vectors`; until then
+/// it would silently share the first one's postings, which is a merge of two fields into one.
+fn sparse_field_of(docs: &[Document]) -> Option<String> {
+    let mut names: Vec<&str> = docs
+        .iter()
+        .flat_map(|d| {
+            d.vectors.iter().filter_map(|(n, f)| {
+                matches!(f, pstore_format::VectorField::Sparse(_)).then_some(n.as_str())
+            })
+        })
+        .collect();
+    names.sort_unstable();
+    names.first().map(|s| (*s).to_owned())
 }

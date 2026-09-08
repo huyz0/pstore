@@ -140,6 +140,9 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     use pstore_blob::{BlobStore, Key, MemoryStore};
     use pstore_format::{Segment, SegmentWriter};
 
+    // ⚠️ M5a.1 narrowed this refusal rather than deleting it: what is refused is no longer
+    // "a sparse field" but "a sparse field whose postings were never attached", which is the
+    // same silent-drop condition stated precisely. `tests/sparse.rs` owns that case.
     let mut w = SegmentWriter::new(8);
     w.push(Document {
         id: "d".to_owned(),
@@ -151,8 +154,8 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     });
     let err = w.try_finish().unwrap_err();
     assert!(
-        format!("{err}").contains("M5a"),
-        "a sparse field was refused without naming what would support it: {err}"
+        format!("{err}").contains("SparsePostings"),
+        "a sparse field was refused without naming what is missing: {err}"
     );
 
     // Named and plural fields are stored now, not refused.

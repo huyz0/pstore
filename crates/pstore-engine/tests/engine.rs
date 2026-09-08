@@ -392,25 +392,44 @@ async fn a_corrupt_bundle_fails_the_fold_rather_than_losing_rows() {
 async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     // ⚠️ Refused on `write`, not discovered at `fold`. A document accepted here and found
     // unstorable later is a write the caller believes is durable and which never appears.
-    // Sparse is what remains unstorable; named and plural fields are stored as of M3b.3.
+    //
+    // ⚠️ The example has moved twice, and the movement is the point. It was "any named
+    // field" until M3b.3 stored those, then "any sparse field" until M5a.2 stored one. What
+    // is left is a SECOND sparse field: the segment addresses postings through a single
+    // section id, so the writer would take the first field in name order and write the
+    // second as nothing. Narrowing this check has always meant making the loss impossible,
+    // never making the check quieter.
     let s = Arc::new(MemoryStore::new());
     let e = Engine::new(Arc::clone(&s), TenantId(77), pstore_types::LaneId(0));
 
-    let mut sparse = pstore_format::Document::new("d", vec![1.0]);
-    sparse.vectors.clear();
-    sparse.vectors.insert(
-        "s".to_owned(),
-        pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
-    );
+    let mut two = pstore_format::Document::new("d", vec![1.0]);
+    for name in ["s1", "s2"] {
+        two.vectors.insert(
+            name.to_owned(),
+            pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
+        );
+    }
     assert!(
-        e.write("idx", vec![sparse]).await.is_err(),
-        "a sparse field was accepted, and it has no layout to be stored in"
+        e.write("idx", vec![two]).await.is_err(),
+        "a second sparse field was accepted, and it has no section id to be stored in"
     );
+
     // Nothing was buffered by a refused write: a rejected batch must not half-land.
     assert!(e.pending_for_test().await.is_empty());
+
+    // One sparse field is stored now, not refused — M5a.2.
+    let mut one = pstore_format::Document::new("d2", vec![1.0]);
+    one.vectors.insert(
+        "s1".to_owned(),
+        pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
+    );
+    e.write("idx", vec![one]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    assert_eq!(e.scan("idx", None).await.unwrap().len(), 1);
 
     e.write("idx", vec![doc("ok", 1)]).await.unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();
-    assert_eq!(e.scan("idx", None).await.unwrap().len(), 1);
+    assert_eq!(e.scan("idx", None).await.unwrap().len(), 2);
 }

@@ -190,6 +190,20 @@ impl Segment {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// The segment's sparse field, if it has one.
+    ///
+    /// ⚠️ At most one in M5a: a second would need its own section id pair, the way
+    /// `FieldVectors` mirrors `Vectors`, and one sparse field is what fusion needs. The
+    /// **first** in name order is returned rather than an arbitrary one, so a segment that
+    /// somehow carries two behaves deterministically instead of differently per read.
+    #[must_use]
+    pub fn sparse_field(&self) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|f| f.kind == 1)
+            .map(|f| f.name.as_str())
+    }
+
     /// Where one field's `kind` section lives.
     #[must_use]
     pub fn field_section(&self, name: &str, kind: Section) -> Option<std::ops::Range<u64>> {
@@ -252,6 +266,13 @@ impl Segment {
             .field_layout(name)
             .ok_or(FormatError::UnknownField)?
             .clone();
+        // ⚠️ A sparse field's layout row points at `SparsePostings`, so asking for its
+        // "vectors" here would fetch postings and decode them as f32 — garbage, silently, in
+        // the shape of a dense field. Sparse is reconstructed by `scan`, which has the
+        // dictionary; there is nothing dense to return.
+        if f.kind == 1 {
+            return Ok(vec![Vec::new(); self.rows as usize]);
+        }
         let Some(span) = self.field_section(name, Section::Vectors) else {
             return Ok(vec![Vec::new(); self.rows as usize]);
         };
@@ -472,11 +493,49 @@ impl Segment {
                 all.push(lo..lo + (b.rows as usize * per_row) as u64);
             }
         }
+        // ⚠️ The postings ride in the SAME call, and the dictionary sidecar is joined with
+        // it rather than awaited after. Both are addressed without reading anything first —
+        // the span comes from the field's layout row, the key by derivation — so fetching
+        // them in sequence would turn every scan of a sparse segment into three rounds for
+        // no reason a caller could see.
+        let sparse_name = self.sparse_field().map(str::to_owned);
+        let postings_at = sparse_name.as_ref().and_then(|n| {
+            let span = self.field_section(n, Section::SparsePostings)?;
+            all.push(span);
+            Some(all.len() - 1)
+        });
         // ⚠️ One call, so blocks and vector rows go out TOGETHER. They are different
         // sections of the same object, both spans are known before either is issued, and
         // awaiting one before the other would make every scan a two-hop read for no reason
         // a caller could see. Width is free; depth is not.
-        let bufs = store.get_ranges(key, &all).await?;
+        let (bufs, dict_raw) = if postings_at.is_some() {
+            let (b, d) = futures_util::future::join(
+                store.get_ranges(key, &all),
+                store.get_immutable(&crate::sparse::dict_key(key), pstore_blob::Class::Pinned),
+            )
+            .await;
+            (b?, d.ok())
+        } else {
+            (store.get_ranges(key, &all).await?, None)
+        };
+        // Row -> its `(dimension, impact)` pairs. Empty unless this segment carries a sparse
+        // field AND its dictionary was reachable; a missing sidecar is a read that cannot
+        // reconstruct, and returning the field as *absent* would be the silent loss this
+        // whole path exists to prevent.
+        let sparse_rows: Vec<Vec<(u32, crate::Impact)>> = match (&postings_at, &dict_raw) {
+            (Some(at), Some(raw)) => {
+                let dict = crate::sparse::Dictionary::decode(raw)
+                    .ok_or(FormatError::Corrupt("sparse dictionary"))?;
+                let section = bufs.get(*at).ok_or(FormatError::Truncated)?;
+                crate::sparse::transpose(&dict, section, self.rows as usize)
+            }
+            (Some(_), None) => {
+                return Err(FormatError::Corrupt(
+                    "a segment carries a sparse field but its dictionary sidecar is missing",
+                ));
+            }
+            _ => Vec::new(),
+        };
 
         // ⚠️ Every field, not just the first. `scan` returns whole documents, and a
         // document that comes back missing a field it was written with is silent loss at
@@ -491,6 +550,9 @@ impl Segment {
         } else {
             let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::new();
             for f in &self.fields {
+                if f.kind == 1 {
+                    continue;
+                }
                 m.push((
                     f.name.clone(),
                     self.field_vectors(store, key, &f.name).await?,
@@ -528,6 +590,15 @@ impl Segment {
                         doc.vectors
                             .insert(name.clone(), crate::VectorField::Dense(v.clone()));
                     }
+                }
+                if let Some(name) = &sparse_name
+                    && let Some(pairs) = sparse_rows.get(start + r)
+                {
+                    // ⚠️ Overwrites whatever the `extra` loop left, which for a sparse field
+                    // is an empty dense vector: a field present-but-empty is not the same
+                    // document as the one that was written.
+                    doc.vectors
+                        .insert(name.clone(), crate::VectorField::Sparse(pairs.clone()));
                 }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);

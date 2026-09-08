@@ -175,6 +175,21 @@ impl SegmentWriter {
         for d in &self.docs {
             crate::check_storable(d)?;
         }
+        // ⚠️ The refusal M3b's `check_storable` arm becomes, narrowed rather than deleted.
+        // Its lesson was never "sparse is unsupported"; it was that a writer which accepts a
+        // document and stores nothing of it is the bug. The postings are built a layer up and
+        // handed over, so a writer that was not handed them is in exactly that state.
+        if self.docs.iter().any(has_sparse)
+            && !self
+                .extra
+                .iter()
+                .any(|(s, b)| *s == Section::SparsePostings && !b.is_empty())
+        {
+            return Err(FormatError::Unsupported(
+                "a sparse field was pushed but no SparsePostings section was attached: build \
+                 it with `pstore_format::sparse::build` and pass it to `with_section`",
+            ));
+        }
         // Sealing is the only way to learn how big the meta region came out, so the width
         // check reads the result rather than predicting it from the inputs.
         let (bytes, fits) = self.seal_segment();
@@ -231,7 +246,29 @@ impl SegmentWriter {
         let mut out = self.body;
         let mut dir: Vec<(Section, u64, u64)> = Vec::new();
         let mut fields: Vec<crate::FieldLayout> = Vec::new();
-        for (fi, name) in names.iter().enumerate() {
+        // ⚠️ Counted over DENSE fields only. Field 0 keeps the legacy section ids and names
+        // are sorted, so counting sparse fields here would let one named `body_sparse` take
+        // slot 0 from a dense `vector`: ids 2/3/4 would never be written, and a search over
+        // the dense field would return zero rows with nothing reporting an error. Whether a
+        // hybrid segment worked would depend on how two field names happen to sort.
+        let mut fi = 0usize;
+        for name in &names {
+            if is_sparse(&docs, name) {
+                // The postings themselves are attached by whoever built them — the format
+                // stores them, it does not invert the documents here. What the segment owes
+                // the field is a row saying where to look.
+                fields.push(crate::FieldLayout {
+                    name: name.clone(),
+                    kind: 1,
+                    metric: 0,
+                    dims: 0,
+                    per_row: 0,
+                    vectors: Section::SparsePostings as u16,
+                    rabitq: 0,
+                    sq8: 0,
+                });
+                continue;
+            }
             let vectors_id = if fi == 0 {
                 Section::Vectors
             } else {
@@ -244,6 +281,7 @@ impl SegmentWriter {
             if dims == 0 {
                 continue;
             }
+            fi += 1;
             // Fixed width when every row holds exactly one vector, which is the dense case
             // and the one worth keeping cheap.
             let per_row = if docs.iter().all(|d| d.field(name).len() == 1) {
@@ -282,12 +320,12 @@ impl SegmentWriter {
                 dims: dims as u32,
                 per_row,
                 vectors: vectors_id as u16,
-                rabitq: if fi == 0 {
+                rabitq: if fi == 1 {
                     Section::RaBitQ as u16
                 } else {
                     Section::FieldRaBitQ as u16
                 },
-                sq8: if fi == 0 {
+                sq8: if fi == 1 {
                     Section::Sq8 as u16
                 } else {
                     Section::FieldSq8 as u16
@@ -404,4 +442,21 @@ impl SegmentWriter {
         );
         (Bytes::from(out.0), fits)
     }
+}
+
+/// Whether any document carries `name` as a sparse field.
+///
+/// ⚠️ Asked per field rather than per document: a name used densely by one document and
+/// sparsely by another is a schema the format cannot represent, and taking the first answer
+/// silently picks a layout for the rest.
+fn is_sparse(docs: &[Document], name: &str) -> bool {
+    docs.iter()
+        .any(|d| matches!(d.vectors.get(name), Some(crate::VectorField::Sparse(_))))
+}
+
+/// Whether a document carries any sparse field at all.
+fn has_sparse(d: &Document) -> bool {
+    d.vectors
+        .values()
+        .any(|f| matches!(f, crate::VectorField::Sparse(_)))
 }

@@ -18,6 +18,7 @@
 mod codec;
 mod docs;
 mod reader;
+pub mod sparse;
 mod writer;
 
 pub use docs::{decode_docs, decode_rows, encode_docs, encode_rows};
@@ -146,16 +147,27 @@ pub enum Value {
 /// are sealed. A write acknowledged and then found unstorable at fold time is a write the
 /// caller believes is durable and which will never appear.
 pub fn check_storable(d: &Document) -> Result<(), FormatError> {
-    // ⚠️ Narrowed to sparse alone once M3b.3 made named and plural fields storable. It was
-    // briefly much wider, as a stopgap: the model gained those shapes before the layout did,
-    // and in between a document carrying one was written as *nothing*. The refusal is what
-    // turned silent loss into a loud failure; the fix was to make it unnecessary.
-    for field in d.vectors.values() {
-        if matches!(field, VectorField::Sparse(_)) {
-            return Err(FormatError::Unsupported(
-                "sparse vector fields are not stored yet (M5a)",
-            ));
-        }
+    // ⚠️ Empty, and deliberately still here. It was briefly much wider, as a stopgap: the
+    // model gained named, plural and sparse fields before the layout did, and in between a
+    // document carrying one was written as *nothing*. M3b.3 made the first two storable and
+    // M5a.1 the third, so there is nothing left this format cannot hold.
+    //
+    // Kept as the door, not deleted, because the refusal belongs where documents ENTER —
+    // and there is still one shape the layout cannot hold. A segment addresses its postings
+    // through a single `SparsePostings` id; a second sparse field would need its own id pair,
+    // the way `FieldVectors` mirrors `Vectors`. Without this, the writer takes the first
+    // field in name order and the second is written as **nothing**, which is precisely the
+    // silent loss this function exists to make loud.
+    if d.vectors
+        .values()
+        .filter(|f| matches!(f, VectorField::Sparse(_)))
+        .count()
+        > 1
+    {
+        return Err(FormatError::Unsupported(
+            "a document may carry at most one sparse field: a second needs its own section \
+             id pair (deferred by M5a)",
+        ));
     }
     Ok(())
 }
