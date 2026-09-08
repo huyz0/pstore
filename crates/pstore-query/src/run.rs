@@ -80,19 +80,68 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
-    // Refused BEFORE any I/O. A request naming a retriever we cannot run is not a request we
-    // half-answer.
-    for p in prefetch {
-        if let Prefetch::Text { .. } = p {
-            return Err(QueryError::Unimplemented("text"));
-        }
-    }
+    // ⚠️ Refused BEFORE any I/O, and refused **once**. Converting to a type with no `Text`
+    // variant is what makes that structural: a second refusal inside the runner would be a
+    // second place to get it wrong, and an arm that falls through to `Ok(vec![])` is exactly
+    // the failure this milestone exists to prevent.
+    let runnable = prefetch
+        .iter()
+        .map(Runnable::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let opened = open(store, key, centroids, prefetch).await?;
     let legs =
-        futures_util::future::try_join_all(prefetch.iter().map(|p| leg(store, key, &opened, p)))
+        futures_util::future::try_join_all(runnable.iter().map(|r| leg(store, key, &opened, r)))
             .await?;
     Ok(fuse(&legs, fusion, top_k))
+}
+
+/// A leg this build can actually run.
+///
+/// ⚠️ There is no `Text` here, and that is the point: the shape ships with a retriever that
+/// does not exist (D-73), so the type that reaches the runner must not be able to express it.
+enum Runnable<'a> {
+    Dense {
+        field: &'a str,
+        query: &'a [f32],
+        limit: usize,
+        tune: vec_index::Query,
+    },
+    Sparse {
+        field: &'a str,
+        query: &'a [(u32, f32)],
+        limit: usize,
+    },
+}
+
+impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
+    type Error = QueryError;
+
+    fn try_from(p: &'a Prefetch) -> Result<Self, QueryError> {
+        match p {
+            Prefetch::Dense {
+                field,
+                query,
+                limit,
+                tune,
+            } => Ok(Self::Dense {
+                field,
+                query,
+                limit: *limit,
+                tune: *tune,
+            }),
+            Prefetch::Sparse {
+                field,
+                query,
+                limit,
+            } => Ok(Self::Sparse {
+                field,
+                query,
+                limit: *limit,
+            }),
+            Prefetch::Text { .. } => Err(QueryError::Unimplemented("text")),
+        }
+    }
 }
 
 /// The open round: the footer and every sidecar any leg needs, together.
@@ -142,11 +191,10 @@ async fn leg<S: BlobStore>(
     store: &S,
     key: &Key,
     opened: &Opened,
-    p: &Prefetch,
+    r: &Runnable<'_>,
 ) -> Result<Vec<Hit>, QueryError> {
-    match p {
-        Prefetch::Text { .. } => Err(QueryError::Unimplemented("text")),
-        Prefetch::Dense {
+    match r {
+        Runnable::Dense {
             field,
             query,
             limit,
@@ -171,7 +219,7 @@ async fn leg<S: BlobStore>(
                 .map(|(row, score)| Hit { row, score })
                 .collect())
         }
-        Prefetch::Sparse {
+        Runnable::Sparse {
             field,
             query,
             limit,

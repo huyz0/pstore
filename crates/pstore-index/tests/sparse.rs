@@ -425,3 +425,57 @@ async fn impact_encodings_are_measured() {
         "the shipped default no longer matches the encoding this measurement clears"
     );
 }
+
+#[tokio::test]
+async fn a_dense_field_asked_for_sparsely_is_an_error() {
+    // ⚠️ Not zero hits. A dense field opened as sparse would address the dense vectors as a
+    // postings section and score whatever they decoded to -- and returning nothing instead
+    // reads exactly like a sparse field with no matches, which a caller cannot tell from a
+    // typo in a field name.
+    let mut docs = corpus(50, 100, 3);
+    for (i, d) in docs.iter_mut().enumerate() {
+        d.vectors
+            .insert("dense".to_owned(), VectorField::dense(vec![i as f32, 1.0]));
+    }
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let key = put(&store, &docs, ImpactEncoding::U8).await;
+    assert!(
+        SparseIndex::open(&store, &key, "dense").await.is_err(),
+        "a dense field opened as a sparse one"
+    );
+    assert!(SparseIndex::open(&store, &key, FIELD).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_missing_dictionary_is_an_error_not_an_empty_vocabulary() {
+    // ⚠️ Unlike the centroid table, whose absence MEANS something (D-10: scan exactly), a
+    // missing dictionary leaves the postings an undelimited byte string. An empty vocabulary
+    // would answer every query with nothing, which is a correct-looking answer.
+    let docs = corpus(50, 100, 3);
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let key = put(&store, &docs, ImpactEncoding::U8).await;
+    store.delete_batch(&[sparse::dict_key(&key)]).await.unwrap();
+    assert!(SparseIndex::open(&store, &key, FIELD).await.is_err());
+}
+
+#[tokio::test]
+async fn the_opened_index_reports_the_vocabulary_it_will_search() {
+    // The dictionary a query is answered from, exposed so a caller can see the vocabulary
+    // rather than infer it from empty results -- and so `list_bytes` has something to be
+    // checked against.
+    let docs = corpus(500, 200, 4);
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let key = put(&store, &docs, ImpactEncoding::U8).await;
+    let idx = SparseIndex::open(&store, &key, FIELD).await.unwrap();
+    let dict = idx.dictionary();
+    assert!(!dict.is_empty());
+    assert_eq!(dict.encoding(), ImpactEncoding::U8);
+    let q = &queries(&docs, 4)[0];
+    let by_hand: u64 = q
+        .iter()
+        .filter_map(|(d, _)| dict.lookup(*d))
+        .map(|e| u64::from(e.bytes))
+        .sum();
+    assert_eq!(idx.list_bytes(q), by_hand);
+    assert_eq!(idx.list_bytes(&[(900_000, 1.0)]), 0);
+}

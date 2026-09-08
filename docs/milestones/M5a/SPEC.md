@@ -131,6 +131,8 @@ it is a dense-field question, sparse fields are never clustered, and nothing her
 13. **OQ-126, both halves**: section bytes under u8, f16 and f32, and top-10 rank agreement of
     u8 and f16 against f32 over the pinned queries, reported against the pinned floor. The
     shipped default is the cheapest encoding that clears it.
+14. Region coverage ≥95% on shipped crates, mutation ≥80% on the new modules, full gate set
+    green.
 
 ## Test plan
 
@@ -149,6 +151,7 @@ it is a dense-field question, sparse fields are never clustered, and nothing her
 | 11 | `a_query_fetches_only_its_own_lists` | reading the whole section and filtering in memory |
 | 12 | `an_unknown_dimension_costs_nothing` | `UnknownField` returned; an all-absent query erroring rather than returning nothing |
 | 13 | `impact_encodings_are_measured` (bounds asserted, numbers reported) | relaxing the floor to whatever was measured |
+| 14 | `./scripts/coverage.sh --fail-under-regions 95`, `cargo mutants` | a new module that runs in tests without being constrained by them |
 
 ## RA budget
 

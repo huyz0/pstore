@@ -591,3 +591,119 @@ fn term_max(docs: &[Document], dim: u32) -> f32 {
         .filter(|(x, _)| *x == dim)
         .fold(0.0f32, |m, (_, w)| m.max(w.get().abs()))
 }
+
+#[test]
+fn a_dictionary_reports_the_encoding_it_was_built_with() {
+    // ⚠️ The width the decoder slices impacts by. A dictionary that reported the wrong one
+    // would read each impact from the middle of its neighbour — no error, no truncation,
+    // just scores drawn from the wrong bytes.
+    let docs = corpus(20, 30, 3);
+    for enc in [ImpactEncoding::U8, ImpactEncoding::F16, ImpactEncoding::F32] {
+        let p = sparse::build(&docs, FIELD, enc);
+        assert_eq!(Dictionary::decode(&p.dictionary).unwrap().encoding(), enc);
+    }
+}
+
+#[test]
+fn a_dictionary_with_an_unknown_encoding_is_refused() {
+    // Forward compatibility runs the other way for a SIDECAR than for a segment: a segment
+    // skips sections it does not know, but a dictionary written by a newer encoder describes
+    // every posting in the section. Guessing a width here would decode the whole field wrong.
+    let mut p = sparse::build(&corpus(10, 20, 3), FIELD, ImpactEncoding::U8);
+    p.dictionary[10] = 9;
+    assert!(Dictionary::decode(&p.dictionary).is_none());
+
+    let mut wrong_version = sparse::build(&corpus(10, 20, 3), FIELD, ImpactEncoding::U8);
+    wrong_version.dictionary[8] = 7;
+    assert!(
+        Dictionary::decode(&wrong_version.dictionary).is_none(),
+        "a dictionary from a future version decoded"
+    );
+}
+
+#[test]
+fn a_field_with_no_postings_has_an_empty_dictionary() {
+    // ⚠️ Distinguishable from a field that has postings. A dictionary that reported entries
+    // it does not have addresses byte ranges outside the section.
+    let docs: Vec<Document> = (0..5)
+        .map(|i| Document::new(format!("d{i}"), vec![1.0]))
+        .collect();
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    assert!(dict.is_empty());
+    assert_eq!(dict.len(), 0);
+    assert!(p.section.is_empty());
+    assert!(dict.lookup(0).is_none());
+}
+
+#[test]
+fn a_truncated_posting_list_decodes_to_nothing_rather_than_to_rows() {
+    // ⚠️ Rows are deltas, so a list cut short does not decode to *fewer* rows — it decodes to
+    // rows built from whatever bytes follow, pointing at real documents. Refusing is the only
+    // safe answer, and returning a short list would look like a correct answer.
+    let p = sparse::build(&corpus(40, 10, 4), FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    let e = dict.lookup(dict.dims().next().unwrap()).unwrap();
+    let full = &p.section[e.offset as usize..][..e.bytes as usize];
+    assert!(!dict.decode_list(&e, full).is_empty());
+
+    // Cut inside the impacts: the rows decode, the impacts do not.
+    let cut = &full[..full.len() - 1];
+    assert!(dict.decode_list(&e, cut).len() < e.count as usize);
+    // Cut inside the row deltas: nothing at all.
+    assert!(dict.decode_list(&e, &full[..1]).is_empty());
+    assert!(dict.decode_list(&e, &[]).is_empty());
+    // A varint that never terminates must not loop or wrap.
+    assert!(dict.decode_list(&e, &[0xff; 32]).is_empty());
+}
+
+#[test]
+fn transpose_refuses_a_section_that_does_not_hold_its_own_postings() {
+    // A truncated section reaching `scan` would otherwise reconstruct documents from the
+    // bytes that happened to be there, and a compaction would write them out.
+    let docs = corpus(30, 25, 4);
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    let full = sparse::transpose(&dict, &p.section, docs.len());
+    assert!(full.iter().all(|r| !r.is_empty()));
+    let short = sparse::transpose(&dict, &p.section[..p.section.len() / 3], docs.len());
+    assert!(
+        short.iter().map(Vec::len).sum::<usize>() < full.iter().map(Vec::len).sum::<usize>(),
+        "a truncated section reconstructed every posting"
+    );
+    // A row count smaller than the postings address must drop, never panic or wrap.
+    assert_eq!(sparse::transpose(&dict, &p.section, 0).len(), 0);
+}
+
+#[test]
+fn f16_saturates_rather_than_wrapping() {
+    // ⚠️ Both directions of overflow, because both are silent. A value above binary16's range
+    // must become infinity, not wrap to a small positive number that ranks first; a NaN must
+    // stay a NaN rather than becoming the largest finite impact.
+    let weights: Vec<f32> = vec![
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        // Just below the maximum, and rounds UP past it: the carry-into-the-exponent case.
+        65_520.0,
+        -65_520.0,
+    ];
+    let docs: Vec<Document> = weights
+        .iter()
+        .enumerate()
+        .map(|(i, w)| doc(i, vec![(0, *w)]))
+        .collect();
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::F16);
+    let dict = Dictionary::decode(&p.dictionary).unwrap();
+    let e = dict.lookup(0).unwrap();
+    let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
+    assert!(got[0].1.is_infinite() && got[0].1.is_sign_positive());
+    assert!(got[1].1.is_infinite() && got[1].1.is_sign_negative());
+    assert!(got[2].1.is_nan(), "a NaN became {}", got[2].1);
+    assert!(
+        got[3].1.is_infinite() && got[3].1.is_sign_positive(),
+        "65520 rounded to {} instead of saturating",
+        got[3].1
+    );
+    assert!(got[4].1.is_infinite() && got[4].1.is_sign_negative());
+}
