@@ -159,6 +159,8 @@ pub struct Built {
     pub centroids: Option<Centroids>,
     /// Documents in the order they were written, which is list order when clustered.
     pub order: Vec<usize>,
+    /// The term dictionary sidecar, when a text field was built alongside.
+    pub text_dictionary: Option<Vec<u8>>,
     /// The sparse dictionary sidecar, when a sparse field was built alongside.
     ///
     /// ⚠️ Built here rather than by the caller because the postings address **segment rows**,
@@ -213,6 +215,23 @@ pub fn build_hybrid(
     params: Params,
     field: &str,
     sparse_field: Option<&str>,
+) -> Built {
+    build_all(docs, params, field, sparse_field, None)
+}
+
+/// Builds a segment carrying a dense field, a sparse one, and a text one.
+///
+/// ⚠️ One function, because none of the three is independent: the dense clustering decides the
+/// segment's row order, and both the sparse postings and the text postings **and fieldnorms**
+/// address those rows. Three builders called separately over the input order produce three
+/// internally consistent indexes that point at three different documents.
+#[must_use]
+pub fn build_all(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+    text_field: Option<&str>,
 ) -> Built {
     let dim = docs
         .iter()
@@ -283,16 +302,26 @@ pub fn build_hybrid(
         }
     }
     // ⚠️ Transposed over the documents **in segment row order**, not in input order.
+    let rows: Vec<Document> = order.iter().filter_map(|r| docs.get(*r).cloned()).collect();
     let sparse = sparse_field.map(|name| {
-        let rows: Vec<Document> = order.iter().filter_map(|r| docs.get(*r).cloned()).collect();
         pstore_format::sparse::build(&rows, name, pstore_format::sparse::DEFAULT_ENCODING)
     });
+    let text = text_field.map(|name| pstore_format::text::build(&rows, name));
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
+    let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
     let mut w = w
         .with_section(Section::RaBitQ, rabitq)
         .with_section(Section::Sq8, eights);
     if let Some(p) = sparse {
         w = w.with_section(Section::SparsePostings, p.section);
+    }
+    if let Some(t) = text {
+        w = w
+            .with_section(Section::TextPostings, t.postings)
+            .with_section(
+                Section::Fieldnorms,
+                pstore_format::text::encode_norms(&t.fieldnorms),
+            );
     }
 
     Built {
@@ -306,6 +335,7 @@ pub fn build_hybrid(
         centroids,
         order,
         dictionary,
+        text_dictionary,
     }
 }
 

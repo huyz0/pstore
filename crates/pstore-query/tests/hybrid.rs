@@ -81,45 +81,21 @@ async fn put<S: BlobStore>(store: &S, docs: &[Document]) -> (Key, Key) {
 }
 
 /// The same segment, plus a text index over the `text` attribute.
+///
+/// ⚠️ Built by **one** builder. Three indexes assembled separately over the input order are
+/// three internally consistent structures pointing at three different documents, because the
+/// dense clustering is what decides the segment's row order.
 async fn put_with_text<S: BlobStore>(store: &S, docs: &[Document]) -> (Key, Key) {
-    let dense = vec_index::build_hybrid(docs, params(), DEFAULT_FIELD, Some(SPARSE));
-    let txt = text::build(docs, text::DEFAULT_TEXT_FIELD);
-    // ⚠️ Rebuilt over the documents in SEGMENT ROW ORDER, which clustering chose. The dense
-    // builder returns that order; handing the text builder the input order would produce
-    // postings that are internally consistent and point at the wrong documents.
-    let rows: Vec<Document> = dense
-        .order
-        .iter()
-        .filter_map(|r| docs.get(*r).cloned())
-        .collect();
-    let txt = if rows.len() == docs.len() {
-        text::build(&rows, text::DEFAULT_TEXT_FIELD)
-    } else {
-        txt
-    };
+    let built = vec_index::build_all(
+        docs,
+        params(),
+        DEFAULT_FIELD,
+        Some(SPARSE),
+        Some(text::DEFAULT_TEXT_FIELD),
+    );
     let (seg, cen) = (Key::new(SEG), Key::new(CEN));
-    let mut w = pstore_format::SegmentWriter::new(64);
-    for r in &rows {
-        w.push(r.clone());
-    }
-    store
-        .put(
-            &seg,
-            w.with_section(
-                pstore_format::Section::SparsePostings,
-                sparse::build(&rows, SPARSE, sparse::DEFAULT_ENCODING).section,
-            )
-            .with_section(pstore_format::Section::TextPostings, txt.postings.clone())
-            .with_section(
-                pstore_format::Section::Fieldnorms,
-                text::encode_norms(&txt.fieldnorms),
-            )
-            .try_finish()
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    if let Some(c) = &dense.centroids {
+    store.put(&seg, built.segment).await.unwrap();
+    if let Some(c) = &built.centroids {
         store
             .put(&cen, bytes::Bytes::from(c.encode()))
             .await
@@ -128,12 +104,15 @@ async fn put_with_text<S: BlobStore>(store: &S, docs: &[Document]) -> (Key, Key)
     store
         .put(
             &sparse::dict_key(&seg),
-            bytes::Bytes::from(sparse::build(&rows, SPARSE, sparse::DEFAULT_ENCODING).dictionary),
+            bytes::Bytes::from(built.dictionary.expect("no sparse dictionary")),
         )
         .await
         .unwrap();
     store
-        .put(&text::dict_key(&seg), bytes::Bytes::from(txt.dictionary))
+        .put(
+            &text::dict_key(&seg),
+            bytes::Bytes::from(built.text_dictionary.expect("no term dictionary")),
+        )
         .await
         .unwrap();
     (seg, cen)
@@ -476,4 +455,41 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
         .is_err(),
         "a text leg over a segment with no text answered instead of failing"
     );
+}
+
+#[tokio::test]
+async fn a_dense_and_a_sparse_query_are_unaffected_by_a_text_field() {
+    // ⚠️ M5c criterion 3, and the reason a text field has no `Fields` row. A row for it would
+    // send its postings to `decode_field`, which reads them as f32 -- so the dense field's
+    // section ids, the `simple` fast path in `scan`, and every field the reader enumerates
+    // would all shift. The failure is silent: a dense query over a segment that also carries
+    // text would return zero rows or the wrong ones, and only a comparison against the same
+    // corpus WITHOUT text can see it.
+    let docs = corpus(600);
+    let with_text = MemoryStore::with_coalesce_gap(GAP);
+    let (seg_t, cen_t) = put_with_text(&with_text, &docs).await;
+    let without = MemoryStore::with_coalesce_gap(GAP);
+    let (seg_p, cen_p) = put(&without, &docs).await;
+
+    for (n, leg) in legs(&docs).into_iter().enumerate() {
+        let one = std::slice::from_ref(&leg);
+        let a = query(&with_text, &seg_t, &cen_t, one, Fusion::default(), 10)
+            .await
+            .unwrap();
+        let b = query(&without, &seg_p, &cen_p, one, Fusion::default(), 10)
+            .await
+            .unwrap();
+        assert!(
+            !a.is_empty(),
+            "leg {n} returned nothing beside a text field"
+        );
+        assert_eq!(
+            a.iter().map(|h| h.row).collect::<Vec<_>>(),
+            b.iter().map(|h| h.row).collect::<Vec<_>>(),
+            "leg {n}'s rows changed when a text field shared the segment"
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.score, y.score, "leg {n}'s scores changed");
+        }
+    }
 }
