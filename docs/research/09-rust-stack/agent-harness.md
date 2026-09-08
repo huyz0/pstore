@@ -188,3 +188,44 @@ harness's own honesty rule applies to itself.
 - `opensearch-bin-ingester` — `AGENTS.md`, `.agents/skills/`, `scripts/review.sh`,
   `.harness/review/` (round counts and packet sizes measured directly)
 - [Agent Skills specification](https://agent-skills.org)
+
+## Mutation testing in an agent loop — measured, M5
+
+⚠️ **Mutation is the only gate that catches the characteristic failure of agent-written
+tests**: a test that executes code without constraining it. Coverage cannot see it, review
+often does not, and `cargo mutants` always does. That makes it the highest-value gate here —
+and worthless if it is too slow to run in the loop, which is what it was.
+
+Measured on the M5 sweep: **462 mutants against a 200-second workspace suite ≈ 25 CPU-hours.**
+What that decomposes into, and what was done:
+
+| Cost | Fix | Measured |
+|---|---|---|
+| The suite is the multiplier, and gate-scale fixtures lived in it | Move them out, as `recall.sh` already said to — `scripts/depth.sh` | Suite **200 s → 70 s**; the worst binary 36 s → 9.9 s |
+| A rebuild and relink per mutant, with debug symbols | `[profile.mutants] debug = "none"` | Also shrinks `target/` enough for the per-job copies to fit a ramdisk |
+| Full sweeps run by hand because the flags are long | `scripts/mutants.sh` — **`--in-diff` is the bare command** | Tens of mutants for an ordinary commit instead of 462 |
+| A hypothesis about one function costs a whole sweep | `scripts/mutants.sh --check REGEX` | Seconds |
+| One machine, one sweep | `--shard k/n` across a CI matrix, nightly | No runtime coordination between shards |
+
+Three rules that are not about speed:
+
+1. ⚠️ **Never run another `cargo` command while a sweep is going.** Timeouts are wall-clock, so
+   contention manufactures false results: the M5 sweep reported **1 timeout with the machine to
+   itself and 17 with a `cargo test` beside it**, and every one of the 17 was a mutant that
+   cannot hang — `fuse -> vec![]`, `query -> Ok(vec![])`.
+2. ⚠️ **`--in-diff` cannot see a test-only change.** The diff is matched against the code under
+   test, so a commit that rewrites the suite passes in seconds. That is what the nightly full
+   sweep is for, and it is the reason the incremental job is not the only job.
+3. ⚠️ **Record equivalent mutants where the code is.** M5 found three — `|` against `^` over
+   disjoint bit fields, `+ 128` against `- 128` in a `u8`, and a guard whose only reachable
+   input makes both branches agree. A score short by three with no explanation is a score the
+   next agent re-derives from scratch.
+
+What is *not* available: **mutant schemata** — compiling every mutant into one binary switched
+at runtime, which is where the large speedups in the literature come from. `cargo-mutants`
+rebuilds per mutant by design, and schemata would need compiler support we do not have. Named
+so it is not re-investigated.
+
+This answers **OQ-158**. Per-crate scheduling was the hypothesis; it was not the answer. The
+answer is that the suite's slowest fixtures and the build profile dominate, and the default
+invocation should be incremental.

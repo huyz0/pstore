@@ -79,13 +79,14 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `cargo test` / `cargo nextest run` | tests |
 | `cargo llvm-cov --fail-under-lines 95` | engineering-standards D-110 |
 | `scripts/coverage.sh --fail-under-regions 95` | the **region** floor on the crates that ship; the test-only set is derived from the dependency graph, not named |
-| `cargo mutants` | D-111 — the gate that makes coverage mean something |
+| `scripts/mutants.sh` | D-111 — the gate that makes coverage mean something. **Incremental by default**: a full sweep is 462 mutants × a 70-second suite, so the bare command tests only what this branch changed, and the full sweep is nightly and sharded |
 | `cargo deny check` | licences, advisories, and the `object_store` ban outside `pstore-blob` |
 | `scripts/check-links.sh` | every relative markdown link resolves |
 | `scripts/build-index.py --check` | the generated regions in `AGENTS.md` are current, and the Gates table matches what CI runs |
 | `scripts/check-verified.py` | every acceptance criterion has an evidence line, and every test it names resolves (OQ-167) |
 | `scripts/recall.sh` | recall@10 above its floor (D-35). Runs outside `cargo test`, so `cargo mutants` does not rebuild a gate-scale corpus once per mutant |
 | `scripts/ndcg.sh` | ranking quality above its floor (D-31) — **and a control ranker below it**, so a judged set we generated cannot pass everything |
+| `scripts/depth.sh` | round-trip depth and query bytes **at gate scale** (20,000 rows). Outside `cargo test` for the same reason `recall.sh` is: a sweep reruns the suite once per mutant |
 | `git config core.hooksPath scripts/githooks` | **run once per clone.** Refuses a commit whose tree is red — the rule AGENTS.md already states, moved from an instruction to a predicate |
 <!-- index:gates:end -->
 

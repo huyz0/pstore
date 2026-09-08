@@ -40,17 +40,21 @@ measurement selects the default the retriever ships with).
    brute-force oracle.
 8. **f32 impacts rank exactly like brute force** — `f32_impacts_rank_exactly_like_brute_force`,
    same 200 queries, order and scores.
-9. **Depth is exactly 2 beyond the open, 3 from `HEAD`** —
-   `a_sparse_query_costs_two_round_trips_beyond_head`, on the gate corpus (20,000 rows,
-   30,000 dimensions). ⚠️ **Renamed from the spec's `a_sparse_query_costs_three_rounds_from_head`**:
+9. **Depth is exactly 2 beyond the open, 3 from `HEAD`** — at gate scale (20,000 rows,
+   30,000 dimensions) by `./scripts/depth.sh`, and as a shape by
+   `a_sparse_query_costs_two_round_trips_beyond_head` in the suite. ⚠️ **Split after M5**:
+   `cargo mutants` reruns the suite once per mutant, so a gate-scale fixture inside it costs
+   hours across a sweep — the rule `recall.sh` already stated and this milestone ignored. ⚠️ **Renamed from the spec's `a_sparse_query_costs_three_rounds_from_head`**:
    HEAD is the engine's round and is not in this crate, so the test measures the two rounds
    that are, exactly as M3's equivalent does. Drift recorded rather than hidden.
 10. **One round beyond open whatever the term count** —
     `the_postings_fetch_is_one_round_whatever_the_term_count`, a query of every dimension the
     fixture's 200 sample queries mention (>100 terms), at `coalesce_gap = 256`. `List == 0`
     asserted by `a_query_fetches_only_its_own_lists`.
-11. **Bytes are ≤1.2× the query's own lists** — `a_query_fetches_only_its_own_lists`, scoped to
-    the `SparsePostings` span via `Accounted::bytes_in`. ⚠️ Observed red: replacing the
+11. **Bytes are ≤1.2× the query's own lists** — `./scripts/depth.sh` at gate scale
+    (**6,358 bytes moved against 6,358 in the query's own lists**) and
+    `a_query_fetches_only_its_own_lists` as a shape, scoped to the `SparsePostings` span via
+    `Accounted::bytes_in`. ⚠️ Observed red: replacing the
     per-entry ranges with the whole span fails this and two others.
 12. **An unknown dimension costs nothing** — `an_unknown_dimension_costs_nothing`: an absent
     term does not change the answer, and a query of only absent terms returns empty with the

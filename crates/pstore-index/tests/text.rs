@@ -195,9 +195,14 @@ async fn a_text_query_costs_two_round_trips_beyond_head() {
     // ⚠️ Criterion 6, at the index layer. The dictionary rides beside the footer, and the
     // postings ride with the fieldnorms -- so global statistics cost no round of their own,
     // which is the whole of D-30's claim.
-    let docs = corpus(20_000, 30_000, 120, 0xbeef);
+    //
+    // ⚠️ **The SHAPE here, the SCALE in `scripts/depth.sh`.** This fixture is small enough
+    // that a sweep can afford it 462 times; the 20,000-document version that the criterion is
+    // actually stated at lives in `pstore-index/examples/depth.rs`, because `cargo mutants`
+    // reruns the suite once per mutant and it cost 36 seconds each time.
+    let docs = corpus(600, 800, 30, 0xbeef);
     let inner = MemoryStore::with_coalesce_gap(GAP);
-    let key = put(&inner, &docs, "t/idx/gate.seg").await;
+    let key = put(&inner, &docs, "t/idx/shape.seg").await;
     let s = DepthCounting::new(inner);
 
     s.reset();
@@ -220,12 +225,12 @@ async fn a_text_query_costs_two_round_trips_beyond_head() {
 #[tokio::test]
 async fn a_text_query_fetches_only_its_own_lists() {
     // ⚠️ Criterion 7. Reading the whole section and filtering in memory ranks identically and
-    // moves the whole index over the wire.
-    let docs = corpus(20_000, 30_000, 120, 0xbeef);
+    // moves the whole index over the wire. Shape here, scale in `scripts/depth.sh`.
+    let docs = corpus(600, 800, 30, 0xbeef);
     let acct = Accounted::new(MemoryStore::with_coalesce_gap(GAP));
     let t = TenantId(31);
     let view = acct.as_tenant(t);
-    let key = put(&view, &docs, "t/idx/gate.seg").await;
+    let key = put(&view, &docs, "t/idx/shape.seg").await;
     let idx = TextIndex::open(&view, &key).await.unwrap();
     let stats = idx.summary();
 
@@ -496,19 +501,33 @@ async fn an_empty_corpus_scores_without_a_length_term() {
     let idx = TextIndex::open(&store, &key).await.unwrap();
     let q = queries(&docs, 2)[0].clone();
 
-    let empty = Stats {
-        doc_count: 0,
+    // ⚠️ A real document count with **no tokens**, which is what makes `avgdl` zero without
+    // also making IDF nonsense. `doc_count: 0` beside a non-empty `df` is self-contradictory:
+    // IDF goes negative and the test would be asserting the behaviour of impossible input.
+    let no_lengths = Stats {
+        doc_count: idx.summary().doc_count,
         total_tokens: 0,
         df: idx.summary().df,
     };
-    let hits = idx.search(&store, &key, &q, &empty, 5).await.unwrap();
+    let hits = idx.search(&store, &key, &q, &no_lengths, 5).await.unwrap();
     assert!(
         !hits.is_empty(),
-        "an empty corpus's statistics returned nothing"
+        "statistics with no average length returned nothing"
     );
     for (_, s) in &hits {
-        assert!(s.is_finite(), "a score was {s}");
+        // ⚠️ **Positive**, not merely finite. Dividing by a zero average gives an infinite
+        // norm and therefore a score of exactly 0.0 for every row -- finite, non-empty, and
+        // different from the real ranking, so all three of the weaker assertions hold while
+        // the scorer has stopped scoring. Mutation testing found that gap.
+        assert!(s.is_finite() && *s > 0.0, "a score was {s}");
     }
+    // And the norm really is `k1(1-b)`: with no length term, two documents differing only in
+    // length must score identically for the same term frequency.
+    let flat: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
+    assert!(
+        flat.iter().any(|s| (s - flat[0]).abs() > f32::EPSILON) || flat.len() == 1,
+        "every score collapsed to the same value, which is what an infinite norm looks like"
+    );
     // Every row with the same term count scores the same, because length no longer
     // discriminates.
     let real = idx

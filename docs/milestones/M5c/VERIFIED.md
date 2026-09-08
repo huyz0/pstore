@@ -34,13 +34,16 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
    with both segments', and the global answer is the one an oracle over the union gives. The
    test also asserts the *local* answer is wrong, so a fixture that happened to agree would
    fail rather than pass silently.
-6. **Global statistics cost no round trip** — `a_text_query_costs_two_round_trips_beyond_head`
-   on the 20,000-document gate corpus: the dictionary rides beside the footer (`depth == 1` to
-   open) and the postings ride with the fieldnorms (`depth == 1` to search).
+6. **Global statistics cost no round trip** — `./scripts/depth.sh` on the 20,000-document
+   gate corpus, and `a_text_query_costs_two_round_trips_beyond_head` as a shape in the suite:
+   the dictionary rides beside the footer (`depth == 1` to open) and the postings ride with the
+   fieldnorms (`depth == 1` to search). ⚠️ **Moved out of `cargo test` after M5** — it was the
+   slowest binary in the workspace at 36 s, which a mutation sweep pays 462 times.
    `statistics_are_a_property_of_the_corpus_not_of_a_query` pins that a summary comes from the
    dictionary alone and that merging is addition.
 7. **Bytes are ≤1.2× the query's own lists**, scoped to the `TextPostings` span via
-   `Accounted::bytes_in`, and `List == 0` — `a_text_query_fetches_only_its_own_lists`, at the
+   `Accounted::bytes_in`, and `List == 0` — `./scripts/depth.sh` at gate scale (**2,024 bytes
+   moved against 2,024**) and `a_text_query_fetches_only_its_own_lists` as a shape, at the
    pinned `coalesce_gap = 256`.
 8. **An unknown term costs nothing** — `an_unknown_term_costs_nothing`: an absent term does not
    change the answer, and a query of only absent terms returns empty with the read counter

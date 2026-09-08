@@ -174,7 +174,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-155` run `ceph/s3-tests` against our fake in CI, recording unimplemented ops as expected failures? ·
 `OQ-156` can one fake serve GCS/Azure behind a translation layer, or are generations vs ETags too different? ·
 `OQ-157` is 100% region coverage on `pstore-engine` realistic, or does the CAS-retry surface make the last few percent brittle? ·
-`OQ-158` `cargo-mutants` runtime on a workspace this size; per-crate scheduling needed? ·
+~~`OQ-158`~~ `cargo-mutants` runtime — **ANSWERED (M5): not per-crate scheduling.** 462 mutants x a 200 s suite = 25 CPU-hours, and the suite was the multiplier: gate-scale fixtures inside `cargo test` took it to 200 s, and moving them to `scripts/depth.sh` took it to 70 s. With `[profile.mutants] debug = "none"`, a ramdisk, and `--in-diff` as the DEFAULT local invocation (`scripts/mutants.sh`), an ordinary commit costs tens of mutants rather than 462; the full sweep is nightly and sharded. See `09/agent-harness`. ·
 `OQ-159` where exactly is the generics/`dyn` boundary — monomorphizing `BlobStore` through the engine could hurt compile times on a capped box ·
 `OQ-160` should `pstore-types` exist, or do newtypes belong with their owning layer? (junk-drawer risk) ·
 `OQ-165` at what change size does a spec stop paying for itself? milestone granularity may be too coarse ·

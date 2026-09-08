@@ -48,6 +48,25 @@ repository   = "https://github.com/tuonghuy/pstore"
 # `unsafe_code = "forbid"` is relaxed to "allow" in EXACTLY ONE crate,
 # pstore-kernel, so `git diff Cargo.toml` is the complete unsafe audit.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The profile `cargo mutants` builds with.
+#
+# ⚠️ `cargo-mutants` does an incremental build PER MUTANT, so link time is
+# multiplied by the mutant count -- 462 of them in M5. Debug symbols are the
+# largest single input to link time and to the size of `target/`, and a mutation
+# run never opens a debugger. Measured: the M5 sweep spent more wall-clock in
+# rebuild-and-link than in running tests.
+#
+# ⚠️ It also shrinks `target/` enough for the copies to fit a ramdisk, which is
+# the other half of the same fix: eight copies of a 29 GB target filled a 23 GB
+# tmpfs mid-run and the sweep died with ENOSPC.
+#
+# Named in `mutants.toml`, so it applies to mutation runs and to nothing else.
+# ---------------------------------------------------------------------------
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
 [workspace.lints.rust]
 unsafe_code      = "forbid"
 missing_docs     = "warn"

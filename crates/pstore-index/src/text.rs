@@ -211,7 +211,7 @@ impl TextIndex {
                 // an IDF that is not comparable with any other segment's. Falling back to the
                 // entry's own df is what a single-segment caller does, and it is the same
                 // number then.
-                let df = f32::from(0u8) + *stats.df.get(term).unwrap_or(&e.df) as f32;
+                let df = *stats.df.get(term).unwrap_or(&e.df) as f32;
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 for (row, tf) in self.dict.decode_list(e, buf) {
                     let len =

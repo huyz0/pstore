@@ -2,7 +2,13 @@
 # The same commands run locally via `docker compose run dev <cmd>` -- see dev/README.md.
 # Gates and rationale: docs/research/09-rust-stack/engineering-standards.md
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # ⚠️ The full mutation sweep, nightly. `--in-diff` on a PR cannot see a commit that only
+  # changed test code, because the diff is matched against the code under test.
+  schedule:
+    - cron: "0 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,10 +77,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/recall.sh
       - run: ./scripts/ndcg.sh
+      # The depth and byte gates at the scale their criteria are stated at. In this job and
+      # not the unit suite, because `cargo mutants` reruns the suite once per mutant and the
+      # 20,000-document fixture cost 36 seconds each time -- four and a half hours across a
+      # sweep.
+      - run: ./scripts/depth.sh
 
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
-  # Only the second one makes 95% mean something (D-111). Changed files per PR;
-  # the full workspace run is nightly, because it is expensive.
+  # Only the second one makes 95% mean something (D-111).
+  #
+  # ⚠️ Two jobs, because `--in-diff` and a full sweep answer different questions. The diff is
+  # matched against the code UNDER TEST, so a commit that changes only *test* code produces
+  # no mutants and passes in seconds while having materially changed the suite's strength.
+  # That is what the nightly sweep is for.
   mutants:
     runs-on: ubuntu-latest
     steps:
@@ -83,9 +98,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
-      - run: cargo mutants --in-diff <(git diff origin/${{ github.base_ref || 'main' }}...HEAD) --no-shuffle -j2
+      - run: ./scripts/mutants.sh
         if: github.event_name == 'pull_request'
-        shell: bash
+
+  # The full sweep, sharded. Shards need no runtime coordination -- each one discovers every
+  # mutant and selects its own subset -- so this is a matrix and nothing else.
+  mutants-full:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-mutants
+      # ⚠️ Every shard must be run with the same denominator or the results are meaningless:
+      # they do not compare notes, they each filter the same enumeration.
+      - run: ./scripts/mutants.sh --shard ${{ matrix.shard }}/8
 
   # unsafe lives in exactly one crate (D-109). This job is the audit trail:
   # `unsafe_code = "forbid"` at the workspace root makes a stray unsafe block a

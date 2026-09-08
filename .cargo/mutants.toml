@@ -9,3 +9,15 @@
 #
 # Costs wall-clock. Buys a score that means what it says.
 test_workspace = true
+
+# ⚠️ Debug symbols off. `cargo-mutants` rebuilds and relinks once per mutant, so link time
+# is multiplied by the mutant count -- 462 of them in M5. A mutation run never opens a
+# debugger, and the smaller `target/` is what lets the per-job copies fit a ramdisk: eight
+# copies of a 29 GB target filled a 23 GB tmpfs mid-sweep and it died with ENOSPC.
+# The profile itself is in the workspace root, which is where cargo profiles live.
+profile = "mutants"
+
+# ⚠️ No doctests. Every doctest example becomes its own test binary, which is among the
+# slowest things `cargo test` does. This workspace has none today; stated explicitly so
+# adding one does not silently multiply every sweep.
+additional_cargo_test_args = ["--all-targets"]

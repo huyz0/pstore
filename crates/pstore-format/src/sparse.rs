@@ -392,6 +392,12 @@ fn get_varint(raw: &[u8], at: usize) -> Option<(u64, usize)> {
     clippy::cast_possible_truncation,
     reason = "the quantization is the point; the bound is asserted"
 )]
+/// ⚠️ **Two mutants here are equivalent, and both are recorded rather than chased.**
+/// `max > 0.0` against `max >= 0.0`: the only input that reaches the difference is a term
+/// whose largest magnitude is zero, which means every impact in it is zero, and `0.0 / 0.0`
+/// casts to `0` — the same byte the guard produces. `+ 128` against `- 128`: the value is in
+/// `-127..=127` and the two differ by 256, which is nothing in a `u8`. A mutation score short
+/// by two with no explanation is a score the next reader re-investigates.
 fn put_impact(out: &mut Vec<u8>, w: f32, max: f32, encoding: ImpactEncoding) {
     match encoding {
         ImpactEncoding::U8 => {
@@ -431,6 +437,13 @@ fn read_impact(b: &[u8], max: f32, encoding: ImpactEncoding) -> f32 {
 }
 
 /// IEEE binary16, round-to-nearest, hand-rolled.
+///
+/// ⚠️ **Every `|` here has an equivalent `^` mutant**, and that is a property of the format
+/// rather than a gap in the tests: sign, exponent and significand occupy disjoint bits, so OR
+/// and XOR agree on every input that can reach them. `f16_encodes_the_nearest_representable_value`
+/// covers the rest — it enumerates all 65,536 codes from the IEEE definition and checks
+/// 200,000 inputs against them, which is what killed the shift, mask and carry mutants that a
+/// handful of chosen values could not reach.
 ///
 /// ⚠️ A crate would do this; `half` is a dependency for forty lines of bit arithmetic that
 /// `f16_round_trips_within_its_precision` pins directly. Subnormals and overflow are the two

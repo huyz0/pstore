@@ -189,12 +189,15 @@ async fn f32_impacts_rank_exactly_like_brute_force() {
     }
 }
 
-/// The gate corpus: 20,000 rows over a SPLADE-sized 30,000-dimension vocabulary.
+/// The **shape** of the gate corpus, at a size a mutation sweep can afford 462 times.
 ///
-/// ⚠️ Pinned by the spec, and the size the whole sidecar deviation exists for: a fixture with
-/// a 50-term vocabulary would open in one round no matter where the dictionary lived.
+/// ⚠️ The criterion is stated at 20,000 rows over a SPLADE-sized 30,000-dimension vocabulary,
+/// and that version runs in `scripts/depth.sh` — a fixture with a small vocabulary would open
+/// in one round no matter where the dictionary lived, so scale is what the deviation C-10
+/// argues for. What stays here is enough rows and enough terms that the *code path* is the
+/// clustered, multi-list one; `cargo mutants` reruns this suite once per mutant.
 fn gate_corpus() -> Vec<Document> {
-    corpus(20_000, 30_000, 32)
+    corpus(2_000, 3_000, 32)
 }
 
 #[tokio::test]
