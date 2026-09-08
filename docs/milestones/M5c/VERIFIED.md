@@ -28,6 +28,11 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
    code with the index. ⚠️ The oracle's first version was `O(N²)` — df recomputed per document
    — and took **119 s**; hoisting it made the test 5.25 s. A slow oracle gets deleted, and a
    deleted oracle is how a scorer stops being checked against anything.
+   ⚠️ **Its corpus had uniform document lengths until after M5.** BM25's norm is
+   `k1(1 − b + b·len/avgdl)`, so when every document is the same length that bracket is
+   exactly **1.0** — and `k1 * 1.0` equals `k1 / 1.0`. The entire length-normalisation half of
+   the formula, and `b` with it, was invisible to a 200-query oracle comparison. Found by the
+   incremental mutation path in six minutes; lengths now vary 0.5×–1.5×.
 5. **Global IDF changes the top result** — `global_idf_changes_the_top_result`. On the pinned
    fixture (`common` in 900 of segment A's 1,000 documents and 10 of segment B's, `rare` in 200
    of B's), scoring B with B's own frequencies returns a **different top-1** from scoring it

@@ -33,8 +33,14 @@ fn doc(id: usize, body: &str) -> Document {
     d
 }
 
-/// A Zipf-skewed corpus: a uniform vocabulary makes every IDF the same and hides the term
-/// that decides the ranking.
+/// A Zipf-skewed corpus with **varying document lengths**.
+///
+/// ⚠️ Both halves are load-bearing, and the second was missing until mutation testing found
+/// it. A uniform vocabulary makes every IDF the same and hides the term that decides the
+/// ranking. Uniform *lengths* are worse: BM25's norm is `k1(1 − b + b·len/avgdl)`, so when
+/// every document is the same length that bracket is exactly **1.0** for every row — and
+/// `k1 * 1.0` equals `k1 / 1.0`. The entire length-normalisation half of the formula, and the
+/// `b` parameter with it, was invisible to an oracle comparison over 200 queries.
 fn corpus(rows: usize, vocab: usize, len: usize, seed: u64) -> Vec<Document> {
     let mut rng = seed | 1;
     let mut next = move || {
@@ -45,7 +51,9 @@ fn corpus(rows: usize, vocab: usize, len: usize, seed: u64) -> Vec<Document> {
     };
     (0..rows)
         .map(|i| {
-            let body: Vec<String> = (0..len)
+            // 0.4x to 1.6x the nominal length, so `len / avgdl` is never 1.
+            let this = len / 2 + (next() % (len as u64 + 1)) as usize;
+            let body: Vec<String> = (0..this.max(1))
                 .map(|_| {
                     #[expect(clippy::cast_precision_loss, reason = "a fixture, not a metric")]
                     let u = (next() % 1_000_000) as f64 / 1_000_000.0;
@@ -307,7 +315,20 @@ async fn statistics_are_a_property_of_the_corpus_not_of_a_query() {
     let idx = TextIndex::open(&store, &key).await.unwrap();
     let s = idx.summary();
     assert_eq!(s.doc_count, 300);
-    assert_eq!(s.total_tokens, 300 * 15);
+    // ⚠️ Counted from the corpus, not from `300 * 15`: documents vary in length on purpose,
+    // because a corpus where they do not makes BM25's length normalisation invisible.
+    let tokens: u64 = docs
+        .iter()
+        .map(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
+            Some(Value::Str(b)) => text::analyze(b).len() as u64,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(s.total_tokens, tokens);
+    assert!(
+        tokens != 300 * 15,
+        "the fixture's documents are all one length"
+    );
     let df = s.df.get("t0").copied().unwrap_or(0);
     let by_hand = docs
         .iter()
@@ -321,7 +342,7 @@ async fn statistics_are_a_property_of_the_corpus_not_of_a_query() {
     // Merging two summaries is addition, which is what makes two-pass IDF cheap.
     let merged = Stats::merge([s.clone(), s.clone()]);
     assert_eq!(merged.doc_count, 600);
-    assert_eq!(merged.total_tokens, 300 * 15 * 2);
+    assert_eq!(merged.total_tokens, tokens * 2);
     assert_eq!(merged.df.get("t0"), Some(&(by_hand * 2)));
 }
 
@@ -521,13 +542,38 @@ async fn an_empty_corpus_scores_without_a_length_term() {
         // the scorer has stopped scoring. Mutation testing found that gap.
         assert!(s.is_finite() && *s > 0.0, "a score was {s}");
     }
-    // And the norm really is `k1(1-b)`: with no length term, two documents differing only in
-    // length must score identically for the same term frequency.
-    let flat: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
-    assert!(
-        flat.iter().any(|s| (s - flat[0]).abs() > f32::EPSILON) || flat.len() == 1,
-        "every score collapsed to the same value, which is what an infinite norm looks like"
-    );
+    // ⚠️ The norm's VALUE, computed here rather than trusted. "Positive and different from
+    // the real ranking" is satisfied by `k1 + (1-b)`, `k1 / (1-b)` and several other
+    // arithmetic slips -- mutation testing found four of them surviving, all in a branch only
+    // this test reaches. A degenerate branch nothing pins is a branch that is not tested.
+    let expected_norm = K1 * (1.0 - B);
+    let bodies: Vec<Vec<String>> = docs
+        .iter()
+        .map(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
+            Some(Value::Str(t)) => text::analyze(t),
+            _ => Vec::new(),
+        })
+        .collect();
+    let n = docs.len() as f32;
+    for (row, got) in &hits {
+        let mut want = 0.0f32;
+        for term in &q {
+            let tf = bodies[*row].iter().filter(|t| *t == term).count() as f32;
+            if tf == 0.0 {
+                continue;
+            }
+            let df = bodies
+                .iter()
+                .filter(|b| b.iter().any(|t| t == term))
+                .count() as f32;
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            want += idf * (tf * (K1 + 1.0)) / (tf + expected_norm);
+        }
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "row {row} scored {got} against {want} for a norm of exactly k1(1-b)"
+        );
+    }
     // Every row with the same term count scores the same, because length no longer
     // discriminates.
     let real = idx
