@@ -31,18 +31,27 @@
 #
 # ⚠️ **Never run another `cargo` command while a sweep is going.** With headroom this small,
 # contention alone can push a passing run past the limit.
+# ⚠️ **This project's rule is that local builds and tests run in the container**
+# (`dev/README.md`: "WSL2 host, everything containerized and resource-capped"), where the
+# compose file caps `dev` at 6 CPUs and 8 GB so a runaway OOMs one container rather than the
+# VM. A sweep is the heaviest thing here and the least excusable place to skip it:
+#
+#   docker compose -f dev/docker-compose.yml exec dev scripts/mutants.sh
+#
+# The caps below are the fallback for when it is run on the host anyway. They are a fallback,
+# not a substitute -- the container is the only one of the three ceilings this script controls.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# ⚠️ A ramdisk if one has room, and the check is not decoration: cargo-mutants copies the
-# tree per job, and eight copies of `target/` filled a 23 GB tmpfs mid-run and died with
-# ENOSPC. `debug = "none"` (see `.cargo/mutants.toml`) is what makes them fit at all.
+# ⚠️ **Build directories go on DISK, never tmpfs, and this is a WSL2 rule with teeth.**
+# On WSL2 `/tmp` is a tmpfs, which means it is RAM. An earlier version of this script picked
+# it whenever `df /tmp` showed room -- but that "free space" is free *memory*, and filling it
+# with 1.5 GB build directories while N `rustc` processes are also asking for memory is how
+# the VM dies. **It killed this machine twice.** Opt in with `MUTANTS_TMPDIR` on a host where
+# /tmp is real storage; the default is the disk-backed cache.
 pick_tmpdir() {
-    local need free
-    need=$(( $(du -sm target 2>/dev/null | cut -f1 || echo 4096) ))
-    free=$(df -Pm /tmp | awk 'NR==2 {print $4}')
-    if [[ -n "$free" && "$free" -gt $(( need * (JOBS + 1) )) ]]; then
-        mkdir -p /tmp/pstore-mutants && echo /tmp/pstore-mutants
+    if [[ -n "${MUTANTS_TMPDIR:-}" ]]; then
+        mkdir -p "$MUTANTS_TMPDIR" && echo "$MUTANTS_TMPDIR"
     else
         mkdir -p "${HOME}/.cache/pstore-mutants" && echo "${HOME}/.cache/pstore-mutants"
     fi
@@ -59,17 +68,45 @@ linker_flags() {
     fi
 }
 
-JOBS=${MUTANTS_JOBS:-$(( $(nproc) / 4 ))}
+# ⚠️ **Jobs are capped by MEMORY, not by cores**, because memory is what fails. Each job is a
+# `cargo` that builds and links, and linking is the peak -- `dev/cargo-config.sample.toml` says
+# so in its first line. Budget ~4 GB a job and never exceed half the cores.
+#
+# ⚠️ And each job's cargo is itself capped, because without `.cargo/config.toml` a `cargo build`
+# fans out to every core: 8 jobs x 20 internal build jobs is 160 concurrent rustc invocations
+# on a machine with no `.wslconfig` ceiling. That is what took this VM down, twice.
+mem_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 8)
+by_mem=$(( mem_gb / 4 ))
+by_cpu=$(( $(nproc) / 2 ))
+JOBS=${MUTANTS_JOBS:-$(( by_mem < by_cpu ? by_mem : by_cpu ))}
 [[ "$JOBS" -lt 1 ]] && JOBS=1
+[[ "$JOBS" -gt 8 ]] && JOBS=8
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 args=()
+scope=()
 case "${1:-}" in
     --all)   shift ;;
     # Both spellings: `--file a b c` and `--file a --file b --file c`. The second is what
     # `cargo mutants` itself takes, so typing it here is the natural mistake -- and the loop
     # used to turn the literal `--file` tokens into paths, which cargo-mutants reports as
     # "a value is required for '--file'" rather than as anything a reader can act on.
-    --file)  shift; for f in "$@"; do [[ "$f" == "--file" ]] || args+=(--file "$f"); done; set -- ;;
+    --file)
+        shift
+        files=()
+        for f in "$@"; do [[ "$f" == "--file" ]] || { args+=(--file "$f"); files+=("$f"); }; done
+        set --
+        # ⚠️ Only the packages whose tests could possibly catch a mutant in those files --
+        # the reverse-dependency closure, dev-dependencies included. `test_workspace = true`
+        # exists because a decorator's tests can live in another crate; "every package" is
+        # not the fix for that, "every package that could see it" is. Nothing in
+        # `pstore-gossip` can catch a mutant in `pstore-format`, and its tests cost 7.5 s on
+        # every one of them.
+        while read -r pkg; do
+            [[ -n "$pkg" ]] && scope+=(--test-package "$pkg")
+        done < <(./scripts/mutants-scope.py "${files[@]}" 2>/dev/null || true)
+        [[ ${#scope[@]} -gt 0 ]] && args+=(--test-workspace=false "${scope[@]}")
+        ;;
     --check) shift; args+=(-F "$1"); shift ;;
     --shard) shift; args+=(--shard "$1"); shift ;;
     *)
@@ -91,7 +128,7 @@ export TMPDIR="${TMPDIR:-$(pick_tmpdir)}"
 flags=$(linker_flags)
 [[ -n "$flags" ]] && export RUSTFLAGS="${RUSTFLAGS:-} $flags"
 
-echo "# jobs=$JOBS tmpdir=$TMPDIR linker=${flags:-default}" >&2
+echo "# jobs=$JOBS cargo-build-jobs=$CARGO_BUILD_JOBS tmpdir=$TMPDIR linker=${flags:-default}" >&2
 # ⚠️ Headroom over the baseline, not a multiple of it. A genuinely hung mutant -- `put_varint`
 # with its loop condition flipped is one -- takes the full 300 s and is still caught; a
 # survivor finishes in the baseline's 20 s and is reported honestly as MISSED.

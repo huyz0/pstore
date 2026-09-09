@@ -143,6 +143,7 @@ jobs:
       - uses: actions/checkout@v4
       # Rungs 3 and 5 of the gate-design ladder: predicates over files in the tree,
       # so no agent is asked to check them.
+      - run: ./scripts/check-dev-env.sh
       - run: ./scripts/check-links.sh
       - run: ./scripts/build-index.py --check
       # The round counter is the mechanism that bounds review, so it is tested --

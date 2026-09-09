@@ -9,6 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 run() { printf '%-42s' "$1"; shift; if "$@" >/tmp/pstore-gate.log 2>&1; then echo "PASS"; else echo "FAIL"; tail -25 /tmp/pstore-gate.log; exit 1; fi; }
 
+# ⚠️ First, because the others are what it protects: without the build ceilings a
+# `cargo test --workspace` on an uncapped WSL2 VM is how this machine died, twice.
+run "scripts/check-dev-env.sh"     ./scripts/check-dev-env.sh
 run "cargo fmt --check"            cargo fmt --all --check
 run "cargo clippy -D warnings"     cargo clippy --all-targets --all-features -- -D warnings
 run "cargo test"                   cargo test --workspace --all-features --quiet

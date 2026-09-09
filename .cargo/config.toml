@@ -1,0 +1,28 @@
+# ⚠️ **This file is the difference between a build and a dead VM**, and it was missing.
+# `dev/cargo-config.sample.toml` has said so since the environment was set up — "build
+# memory, not build speed, is what kills WSL2; linking is the peak" — and step 2 of
+# `dev/README.md` is to copy it. It had not been copied on this machine, so every `cargo
+# build` fanned out to all 20 cores with full debug info, under a WSL2 VM whose
+# `.wslconfig` ceiling had also not been applied. A mutation sweep on top of that took the
+# machine down twice.
+#
+# ⚠️ Derived from the sample, **minus the linker section**: neither `clang` nor `mold` is
+# installed here, and a config naming a linker that does not exist turns every build into a
+# link error. Copy those lines from the sample once they are.
+
+[build]
+jobs = 6                                  # cap below core count; more jobs = more peak RAM
+
+[profile.dev]
+debug = 1                                 # full debug info is a large memory contributor
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = 1
+
+# Release-ish profile for local benchmarking. ⚠️ Numbers measured under WSL2 are RELATIVE
+# only (did this change help?), never absolute — D-104.
+[profile.bench]
+inherits = "release"
+debug = 1
+codegen-units = 1                         # slower build, faster code, lower LLVM parallel RAM

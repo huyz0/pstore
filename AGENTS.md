@@ -74,6 +74,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 <!-- index:gates:start -->
 | Command | Enforces |
 |---|---|
+| `scripts/check-dev-env.sh` | the local build ceilings exist. ⚠️ `dev/README.md` step 2 said "copy the cargo config" and it had never been done here, so every build used all 20 cores — a mutation sweep on top of that killed the WSL2 VM twice. Rung 3 replacing an instruction that says "remember to" |
 | `cargo fmt --check` | formatting |
 | `cargo clippy --all-targets -- -D warnings` | the workspace lint set, including `unsafe_code = "forbid"` |
 | `cargo test` / `cargo nextest run` | tests |
