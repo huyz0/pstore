@@ -174,6 +174,25 @@ impl Roster {
     /// Returns `Lost` when another node refolded first. The caller **rebases** — reads the
     /// newer roster and merges — rather than retrying the same bytes, because overwriting
     /// would drop whatever members the winner had just recorded.
+    ///
+    /// ## ⚠️ Why this CAS is *not* guarded by `Capabilities::admits_durable_writes`
+    ///
+    /// M7a made every conditional write in `pstore-engine` and `pstore-catalog` refuse on a
+    /// backend whose recorded profile says it cannot fence. This one deliberately does not,
+    /// and the argument is here rather than only in that milestone's spec, because a reader
+    /// of this function is where it is needed:
+    ///
+    /// * **The roster only ever grows.** [`Self::merged`] is a union and nothing removes a
+    ///   member, so a CAS that fails to fence costs a *delay* in seeing a node, never a wrong
+    ///   membership. `a_broken_cas_delays_convergence_it_does_not_lose_a_member` pins that
+    ///   against a store that ignores the precondition outright.
+    /// * **Gossip is the source of truth**; this object is its seed. A stale seed converges
+    ///   on the next round. Tenant data has no such second channel, which is why the
+    ///   engine's and the catalog's CAS *are* guarded.
+    /// * **Refusing here would prevent the cluster from forming at all** on a divergent
+    ///   backend — where the engine already refuses every commit. A fleet that cannot gossip
+    ///   is harder to diagnose than one that gossips and cannot write, and the second is what
+    ///   the guard is for.
     pub async fn refold<S: BlobStore>(
         store: &S,
         cell: &Cell,

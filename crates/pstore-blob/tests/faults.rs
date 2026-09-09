@@ -15,6 +15,7 @@ use bytes::Bytes;
 use pstore_blob::{
     BlobError, BlobStore, CasError, Congested, Faults, Faulty, Key, MemoryStore, Precondition,
 };
+use std::time::Duration;
 
 fn k(s: &str) -> Key {
     Key::new(s)
@@ -402,4 +403,136 @@ async fn slow_down_first_n_covers_exactly_the_first_n_operations() {
     }
     // The fourth is past the window, so it reaches the store and gets an honest 404.
     assert!(matches!(s.get(&k("a")).await, Err(BlobError::NotFound(_))));
+}
+
+// ---------------------------------------------------------------------------
+// Latency — M0a criterion 4's fourth kind, and M0a.10 carried forward.
+//
+// ⚠️ `start_paused` is what makes these free. Tokio auto-advances virtual time while the
+// runtime is idle, so a 30 ms round trip costs the suite nothing and `elapsed()` still
+// reports 30 ms. Latency that made the suite slow would be latency nobody turned on.
+// ---------------------------------------------------------------------------
+
+fn with_latency(min_ms: u64, max_ms: u64) -> Faults {
+    Faults {
+        latency_min: Duration::from_millis(min_ms),
+        latency_max: Duration::from_millis(max_ms),
+        ..Faults::none()
+    }
+}
+
+async fn drive(s: &Faulty<MemoryStore>, n: usize) -> Vec<Result<Bytes, BlobError>> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        let k = Key::new(format!("k/{i}"));
+        let _ = s.put(&k, Bytes::from_static(b"x")).await;
+        out.push(s.get(&k).await);
+    }
+    out
+}
+
+#[tokio::test(start_paused = true)]
+async fn latency_is_injected_inside_its_bounds() {
+    let s = Faulty::new(MemoryStore::new(), 7, with_latency(10, 30));
+    let t = tokio::time::Instant::now();
+    let _ = s.get(&Key::new("absent")).await;
+    let one = t.elapsed();
+    assert!(
+        one >= Duration::from_millis(10) && one <= Duration::from_millis(30),
+        "a single operation took {one:?}, outside [10ms, 30ms]"
+    );
+
+    // Ten operations cost at least ten minimums: the delay is per operation, not per store.
+    let t = tokio::time::Instant::now();
+    drive(&s, 5).await;
+    assert!(
+        t.elapsed() >= Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_latency_sleeps_not_at_all() {
+    // Not "is fast": exactly zero virtual time, over twenty operations.
+    //
+    // ⚠️ This does **not** distinguish `sleep(ZERO)` from no sleep at all, and the
+    // difference is not observable from outside: a sleep whose deadline has already passed
+    // is `Ready` on its first poll. Removing the `is_zero()` guard in `Faulty::delay` is
+    // therefore a **provably equivalent mutant**, and it survives — recorded rather than
+    // chased. The guard stays because it skips a timer registration per operation on every
+    // real runtime in the suite, which is an efficiency argument, not a semantic one.
+    let s = Faulty::new(MemoryStore::new(), 7, Faults::none());
+    let t = tokio::time::Instant::now();
+    drive(&s, 20).await;
+    assert_eq!(t.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_same_seed_reproduces_the_same_delays() {
+    let run = || async {
+        let s = Faulty::new(MemoryStore::new(), 99, with_latency(1, 50));
+        let mut marks = Vec::new();
+        let t = tokio::time::Instant::now();
+        for i in 0..8 {
+            let _ = s.get(&Key::new(format!("k/{i}"))).await;
+            marks.push(t.elapsed());
+        }
+        marks
+    };
+    let (a, b) = (run().await, run().await);
+    assert_eq!(a, b);
+    // And it is actually varying, or "identical" would be satisfied by a constant.
+    let gaps: Vec<_> = a.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        gaps.windows(2).any(|w| w[0] != w[1]),
+        "delays never varied: {gaps:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn latency_is_independent_of_which_operations_fail() {
+    // ⚠️ **The criterion's own word.** M0a criterion 4 asks for 412, 409, 503 and latency
+    // "independently". Drawing the delay from the fault stream would make turning latency on
+    // silently change *which* operations fail -- and every other test here would still pass,
+    // because each one varies only one thing at a time.
+    let faults = Faults {
+        read_error: 0.3,
+        write_error: 0.3,
+        cas_lost: 0.2,
+        ..Faults::none()
+    };
+    let quiet = Faulty::new(MemoryStore::new(), 4242, faults);
+    let slow = Faulty::new(
+        MemoryStore::new(),
+        4242,
+        Faults {
+            latency_min: Duration::from_millis(5),
+            latency_max: Duration::from_millis(40),
+            ..faults
+        },
+    );
+
+    let a = drive(&quiet, 30).await;
+    let b = drive(&slow, 30).await;
+    let shape = |r: &[Result<Bytes, BlobError>]| {
+        r.iter()
+            .map(|x| x.as_ref().err().map(std::string::ToString::to_string))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shape(&a), shape(&b), "latency changed the failure sequence");
+    assert!(
+        shape(&a).iter().any(Option::is_some),
+        "the fixture injected no faults at all, so it proves nothing"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_inverted_range_delays_by_the_minimum() {
+    // max < min is a caller error with no good answer; the useful one is the floor, not a
+    // panic in a test helper and not silently no delay at all.
+    let s = Faulty::new(MemoryStore::new(), 1, with_latency(25, 5));
+    let t = tokio::time::Instant::now();
+    let _ = s.get(&Key::new("absent")).await;
+    assert_eq!(t.elapsed(), Duration::from_millis(25));
 }

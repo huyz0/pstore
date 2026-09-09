@@ -588,7 +588,17 @@ impl<S: BlobStore> Engine<S> {
             // objects exist, and they leak with nothing left to find them by. Deleting
             // first and then failing to prune costs a repeated delete on the next pass,
             // which is idempotent.
-            self.store.delete_batch(&batch).await?;
+            //
+            // ⚠️ **Chunked at the backend's cap, which is read and never assumed.**
+            // `BlobStore::delete_batch` is documented "capped at `max_batch_delete`" and both
+            // implementations enforce it, while this list is the graveyard's and has no bound
+            // at all — so a tenant with more dead objects than one batch holds could not be
+            // collected on any backend. S3 takes 1000 per request and Azure 256; a constant
+            // here would be wrong on one of them.
+            let cap = self.store.capabilities().max_batch_delete.max(1);
+            for chunk in batch.chunks(cap) {
+                self.store.delete_batch(chunk).await?;
+            }
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();

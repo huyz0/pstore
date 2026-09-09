@@ -27,15 +27,23 @@ Gate: `scripts/check-verified.py`.
    so "merging" cannot be claimed without the saving being real. Mutations verified
    killed: never merging; merging unconditionally; returning the merged buffer rather
    than each range's slice.
-4. **PARTIAL.** `same_seed_reproduces_the_same_failures`, `a_zero_rate_injects_nothing`,
+4. **Met**, latency included — ⚠️ **closed later than the rest of this ledger; see below.**
+   `same_seed_reproduces_the_same_failures`, `a_zero_rate_injects_nothing`,
    `each_fault_kind_is_injected_independently`,
-   `an_injected_write_fault_does_not_reach_the_backend`.
-   `cargo test -p pstore-blob --test faults`. Determinism, and independent injection of
-   412, 409, 503 and read/write errors, are demonstrated.
-   ⚠️ **`NOT-RUN` for latency injection.** The criterion says "412, 409, 503 **and
-   latency**"; `Faults` has no latency field and none was written. Nothing here injects a
-   delay, so the round-trip-depth and timeout behaviour this was meant to enable is not
-   exercised. Carried as **M0a.10**, and the criterion is not met as written.
+   `an_injected_write_fault_does_not_reach_the_backend` for 412, 409, 503 and read/write
+   errors; `latency_is_injected_inside_its_bounds`, `zero_latency_sleeps_not_at_all`,
+   `the_same_seed_reproduces_the_same_delays`, `an_inverted_range_delays_by_the_minimum` and
+   `latency_is_independent_of_which_operations_fail` for the fourth kind.
+   `cargo test -p pstore-blob --test faults`.
+   ⚠️ **"Independently" is the load-bearing word, and it needed a second random stream.**
+   The delay is drawn from a SplitMix64 stream of its own, so turning latency on cannot change
+   *which* operations fail. Observed red by drawing it from the fault stream instead: the two
+   30-operation failure sequences diverge from the third operation on, and **every other test
+   in the file still passes**, because each one varies only a single fault kind at a time.
+   Observed red also by removing the sleep, and by inverting the `max(lo)` clamp.
+   ⚠️ Removing the `is_zero()` guard in `Faulty::delay` is a **proven equivalent mutant** and
+   survives: a sleep whose deadline has passed is `Ready` on its first poll, so it is not
+   observable from outside. Recorded beside the test.
 5. `slowdown_reduces_concurrency_then_recovers`, `retries_are_bounded`,
    `a_transient_slowdown_is_retried_and_succeeds`, `every_method_retries_a_transient_slowdown`,
    `a_non_slowdown_error_is_not_retried`, `a_cas_failure_is_never_retried_by_the_transport`,
@@ -119,7 +127,7 @@ Completing it is M0b's first task, and it is one command.
 
 | ID | Task |
 |---|---|
-| M0a.10 | Latency injection in `Faults` — criterion 4 is not met without it |
+| ~~M0a.10~~ | ~~Latency injection in `Faults`~~ — **DONE.** Criterion 4 above is now met as written; the delay is a real `tokio::time::sleep`, free under `start_paused` because the runtime auto-advances while idle |
 | M0a.11 | Mutation score 76.8% vs the 80% target. The 46 survivors are mostly (a) conformance probe *guards* — detecting a backend that returns the wrong bytes needs a deliberately-corrupting store, the same pattern as `TagStyle::ContentHash`; and (b) FNV mixing in `next_tag`, where `^=`→`&=` preserves the property under test and is arguably equivalent |
 | M0a.12 | `delete_batch` via `DeleteObjects` rather than one request per key |
 | M0a.13 | Run the conformance suite against MinIO, Azurite and fake-gcs-server from the compose stack |

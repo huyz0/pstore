@@ -28,6 +28,22 @@ pub struct Faults {
     /// Deterministically `503` the first *n* operations, then stop. For testing that a
     /// transient stressor is survived rather than that a permanent one terminates.
     pub slow_down_first_n: u32,
+    /// Shortest delay before an operation is dispatched. Zero disables the delay entirely.
+    ///
+    /// ⚠️ **A real `tokio::time::sleep`, drawn from a stream of its own.** Two consequences,
+    /// and both are the point:
+    ///
+    /// * Under `#[tokio::test(start_paused = true)]` the runtime auto-advances while idle, so
+    ///   a 30 ms round trip costs a test nothing. Latency that made the suite slow would be
+    ///   latency nobody turned on.
+    /// * The draw comes from a **separate** SplitMix64 stream, so turning latency on cannot
+    ///   change *which* operations fail. M0a's criterion 4 says "412, 409, 503 **and**
+    ///   latency … independently", and sharing one stream would make that sentence false in
+    ///   a way no functional test would notice.
+    pub latency_min: std::time::Duration,
+    /// Longest delay. Clamped up to `latency_min`, so an inverted pair delays by exactly
+    /// `latency_min` rather than panicking or silently disabling the delay.
+    pub latency_max: std::time::Duration,
 }
 
 impl Faults {
@@ -44,19 +60,51 @@ struct Inner {
     /// SplitMix64. Written out rather than pulled in so that determinism is visible in
     /// the source and cannot drift with a dependency's version.
     seed: u64,
+    /// The **latency** stream, deliberately separate. Derived from `seed` so one number
+    /// still reproduces a whole run, and never advanced by a fault draw so the two are
+    /// independent in fact and not just in intent.
+    lat_seed: u64,
     faults: Faults,
     ops: u32,
 }
 
+/// One SplitMix64 step. Shared by both streams so they cannot drift apart in behaviour.
+fn split_mix(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // 53 bits of mantissa: the same value on every platform.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "53 bits is exactly what an f64 mantissa holds"
+    )]
+    {
+        ((z >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+}
+
 impl Inner {
     fn next_f64(&mut self) -> f64 {
-        self.seed = self.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        // 53 bits of mantissa: the same value on every platform.
-        ((z >> 11) as f64) / ((1u64 << 53) as f64)
+        split_mix(&mut self.seed)
+    }
+
+    fn next_delay(&mut self) -> std::time::Duration {
+        let (lo, hi) = (self.faults.latency_min, self.faults.latency_max);
+        let hi = hi.max(lo);
+        if hi.is_zero() {
+            return std::time::Duration::ZERO;
+        }
+        let r = split_mix(&mut self.lat_seed);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            reason = "a span of nanoseconds scaled by a value in [0, 1)"
+        )]
+        let span = ((hi - lo).as_nanos() as f64 * r) as u64;
+        lo + std::time::Duration::from_nanos(span)
     }
 }
 
@@ -74,6 +122,9 @@ impl<S: crate::BlobStore> Faulty<S> {
             inner: Arc::new(inner),
             state: Arc::new(Mutex::new(Inner {
                 seed,
+                // A fixed, arbitrary decorrelation constant. One `seed` still reproduces the
+                // whole run; the two streams simply never advance each other.
+                lat_seed: seed ^ 0x2545_F491_4F6C_DD1D,
                 faults,
                 ops: 0,
             })),
@@ -98,6 +149,18 @@ impl<S: crate::BlobStore> Faulty<S> {
         st.ops = st.ops.saturating_add(1);
         let (f, ops) = (st.faults, st.ops);
         (f, st.next_f64(), ops)
+    }
+
+    /// Waits the operation's injected delay, if any.
+    ///
+    /// ⚠️ Drawn and awaited **before** the fault roll, so a failed operation costs its
+    /// latency too — a backend that refuses instantly is a backend whose timeouts can never
+    /// fire, and the retry paths this store exists to exercise are timeout paths.
+    async fn delay(&self) {
+        let d = self.lock().next_delay();
+        if !d.is_zero() {
+            tokio::time::sleep(d).await;
+        }
     }
 
     fn read_fault(&self) -> Option<BlobError> {
@@ -144,6 +207,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get(key).await,
@@ -151,6 +215,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Bytes, BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_range(key, range).await,
@@ -158,6 +223,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, pstore_types::CasTag), BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_with_tag(key).await,
@@ -165,6 +231,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_suffix(key, n).await,
@@ -172,10 +239,12 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+        self.delay().await;
         self.inner.get_tag(key).await
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.head(key).await,
@@ -183,6 +252,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+        self.delay().await;
         match self.write_fault() {
             Some(e) => Err(e),
             None => self.inner.put(key, body).await,
@@ -195,6 +265,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        self.delay().await;
         // ⚠️ The fault is decided BEFORE the backend is touched. Failing after mutating
         // would make the store diverge from what the caller was told, and every later
         // assertion would be against a fiction.
@@ -205,6 +276,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+        self.delay().await;
         match self.write_fault() {
             Some(e) => Err(e),
             None => self.inner.delete_batch(keys).await,
@@ -212,6 +284,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
     }
 
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.list_unrestricted(prefix).await,
@@ -227,6 +300,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
         // then admitted as `Bulk` -- D-21 off, with every test still green.
 
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_range_as(key, range, class).await,
@@ -242,6 +316,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
         // then admitted as `Bulk` -- D-21 off, with every test still green.
 
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_suffix_as(key, n, class).await,
@@ -252,6 +327,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         // ⚠️ Forwards the class. Inheriting the trait default drops it, and the read is
         // then admitted as `Bulk` -- D-21 off, with every test still green.
 
+        self.delay().await;
         match self.read_fault() {
             Some(e) => Err(e),
             None => self.inner.get_immutable(key, class).await,

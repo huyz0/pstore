@@ -154,12 +154,18 @@ checking less than it says.
 - **The `delete_batch` fix does not help GCS.** `object_store` 0.14.1 maps GCS's `delete_stream`
   to one request per location — the JSON API it uses has no bulk delete — so GC's request rate
   still scales with objects there. In the spec's RA budget, and unfixed.
-- **`Engine::gc` builds an unbounded batch** and so fails above `max_batch_delete` on every
-  backend. Pre-existing — `MemoryStore` has always refused over-cap — and made *uniform* rather
-  than worse by criterion 10. It is a task, not a discovery.
-- **`pstore-cluster`'s roster CAS is unguarded.** Cluster state is derived and re-converges by
-  gossip; tenant state does not. Deliberate, and the argument is in the spec rather than left
-  to be inferred from silence.
+- ~~**`Engine::gc` builds an unbounded batch**~~ **DONE**, after this ledger: `gc` chunks at
+  `max_batch_delete`, read from `Capabilities` rather than assumed, since S3 takes 1000 per
+  request and Azure 256. `gc_never_exceeds_the_backends_delete_cap`,
+  `a_graveyard_within_the_cap_is_still_one_batch`, and
+  `a_cap_of_zero_is_an_error_and_never_a_panic` — the last because `slice::chunks(0)` panics
+  and the chunk size comes from a recorded profile.
+- ~~**`pstore-cluster`'s roster CAS is unguarded.**~~ **Settled**, after this ledger: it stays
+  unguarded, and the argument now lives on `Roster::refold` where a reader of that function
+  will meet it rather than only in a spec they will not open. It is also pinned by
+  `a_broken_cas_delays_convergence_it_does_not_lose_a_member`, against a store that ignores the
+  precondition outright — the roster only ever unions members, so a CAS that fails to fence
+  costs a delay and never a wrong membership. Red when `merged` replaces instead of unioning.
 - **Four of six `Capabilities` fields are declared, not measured**, and the matrix marks each
   one. `coalesce_gap` is `G*` — OQ-2, blocked on real clouds.
 - **The two gate findings above.** Neither the coverage classifier nor `pstore-blob`'s crate

@@ -15,6 +15,7 @@
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
 use pstore_cluster::{Cell, Roster, RosterError};
+use pstore_testkit::broken::{Broken, Defect};
 use pstore_testkit::flaky::Flaky;
 use pstore_types::TenantId;
 use std::sync::Arc;
@@ -187,4 +188,39 @@ async fn the_roster_key_is_derived_not_discovered() {
     assert_ne!(Roster::key(&a), Roster::key(&Cell::new("c2", "az-a")));
     assert_ne!(Roster::key(&a), Roster::key(&Cell::new("c1", "az-b")));
     assert!(Roster::key(&a).as_str().ends_with("/ROSTER"));
+}
+
+#[tokio::test]
+async fn a_broken_cas_delays_convergence_it_does_not_lose_a_member() {
+    // ⚠️ **The test the roster's exemption from M7a's fencing guard rests on.** Every
+    // conditional write in `pstore-engine` and `pstore-catalog` now refuses on a backend that
+    // cannot fence; this one does not, and the reason is that losing the race here is
+    // recoverable and losing it there is not.
+    //
+    // `IgnoresCreateIfAbsent` is MinIO's documented defect: the second create succeeds and
+    // overwrites. So node A's members really are gone from the object -- and the claim is
+    // only that the *next* refold from a merged view brings them back, because the roster is
+    // a union and never a replacement.
+    let s = Broken::new(Defect::IgnoresCreateIfAbsent);
+    let a = Roster::from_nodes(["a".into()]);
+    let b = Roster::from_nodes(["b".into()]);
+
+    Roster::refold(&s, &cell(), &a, None).await.unwrap();
+    // No fencing: this lands even though the object already exists.
+    Roster::refold(&s, &cell(), &b, None).await.unwrap();
+    let (stored, tag) = Roster::read(&s, &cell()).await.unwrap();
+    assert_eq!(
+        stored.nodes().len(),
+        1,
+        "the fixture must actually have lost a member, or it proves nothing"
+    );
+
+    // One round of gossip later, A refolds from what it knows merged with what it reads.
+    Roster::refold(&s, &cell(), &stored.merged(&a), tag)
+        .await
+        .unwrap();
+    let (converged, _) = Roster::read(&s, &cell()).await.unwrap();
+    let mut ids: Vec<_> = converged.nodes().iter().map(ToString::to_string).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a".to_owned(), "b".to_owned()]);
 }

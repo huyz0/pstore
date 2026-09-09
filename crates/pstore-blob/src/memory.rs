@@ -67,6 +67,19 @@ impl MemoryStore {
         s
     }
 
+    /// A backend that refuses delete batches larger than `n`.
+    ///
+    /// ⚠️ Exists because the cap is `Capabilities`' to state and a caller's to read: S3 takes
+    /// 1000 per request and Azure 256, and code that knows a number instead of asking for one
+    /// is code that is wrong on one of them. A small `n` is what makes the boundary reachable
+    /// in a test without building a thousand objects.
+    #[must_use]
+    pub fn with_max_batch_delete(n: usize) -> Self {
+        let mut s = Self::new();
+        s.caps.max_batch_delete = n;
+        s
+    }
+
     /// A backend with the chosen tag semantics, for exercising the ABA hazard.
     #[must_use]
     pub fn with_tag_style(tag_style: TagStyle) -> Self {
