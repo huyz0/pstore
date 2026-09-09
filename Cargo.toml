@@ -18,6 +18,7 @@ members = [
     "crates/pstore-cluster",
     "crates/pstore-gossip",
     "crates/pstore-cache",
+    "crates/pstore-catalog",
     # Layer 4 - serving
     "crates/pstore-query",
     "crates/pstore-node",

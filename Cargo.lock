@@ -1033,6 +1033,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-catalog"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "pstore-blob",
+ "pstore-testkit",
+ "pstore-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-cluster"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name        = "pstore-catalog"
+version     = "0.1.0"
+description = "The sharded tenant catalog: derived bucket keys, pending changes carried in each bucket's CAS'd pointer, and enumeration in one parallel round with no LIST."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pstore-blob  = { path = "../pstore-blob" }
+pstore-types = { path = "../pstore-types" }
+thiserror    = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+pstore-testkit = { path = "../pstore-testkit" }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

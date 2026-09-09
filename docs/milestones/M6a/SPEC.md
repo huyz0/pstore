@@ -72,7 +72,9 @@ rate.
   one of its HEAD epochs. `epoch` is what orders two records for one tenant without a clock.
 - `Root { epoch, width }` at `cat/root`, CAS'd. Read to learn the width, and **absent means
   never widened** — the reader gets `DEFAULT_WIDTH` and the request that found nothing still
-  counts against the cold-enumeration depth. Nothing in this milestone writes it.
+  counts against the cold-enumeration depth. `write_root` exists and is CAS'd, but nothing in
+  the serving path calls it and its rebase arm is unexercised: a reader that is *told* the
+  width proves nothing about one that reads it, so a test needs to put a root there.
 - `BucketHead { run_epoch, digest, pending: Vec<TenantRecord> }` at `{bucket:04x}/cat/b/HEAD`,
   CAS'd — `width` independent registers, one per bucket.
 - `{bucket:04x}/cat/b/{run_epoch:020}-{digest:016x}` — the immutable sorted run. ⚠️ **The
@@ -121,9 +123,9 @@ HTTP or admin surface**.
    an identical run and could not observe this.
 10. `pending.len() ≤ MAX_PENDING` after **any** sequence of appends: the append that would
     exceed it folds inline first.
-11. The newest `epoch` wins for a tenant, and a `Deleted` tombstone hides it from enumeration
-    without being dropped from the run — a tombstone dropped at fold time un-deletes the tenant
-    at the next enumeration.
+11. The newest `epoch` wins for a tenant **wherever two records meet** — both in the run and
+    both still pending — and a `Deleted` tombstone hides it from enumeration without being
+    dropped from the run, since a tombstone dropped at fold time un-deletes the tenant.
 12. Nothing depends on `pstore-catalog`: `grep -l pstore-catalog crates/*/Cargo.toml` names only
     its own manifest, so no hot path can reach it.
 13. A read refused for any reason **other than absence** surfaces as an error: enumeration over
@@ -147,7 +149,7 @@ HTTP or admin surface**.
 | 8 | `racing_appenders_both_land` | `put` for `put_conditional`; a rebase that overwrites instead of re-adding |
 | 9 | `racing_folders_lose_no_record` | the loser publishing its own run over the winner's, dropping what the winner had drained |
 | 10 | `pending_is_bounded_by_an_inline_fold` | the cap checked after the push, or not at all |
-| 11 | `the_newest_epoch_wins`, `a_tombstone_hides_a_tenant_without_being_dropped` | `>` for `>=` on the epoch merge; the tombstone filtered at fold time rather than at read time |
+| 11 | `the_newest_epoch_wins`, `a_tombstone_hides_a_tenant_without_being_dropped`, `an_older_epoch_does_not_overwrite_a_newer_pending_one`, `a_stale_live_record_does_not_resurrect_a_pending_tombstone` | `>` for `>=` on the epoch merge; the tombstone filtered at fold time rather than at read time; **a second precedence rule in the appender** — the one the first implementation had |
 | 13 | `a_refused_read_is_an_error_not_a_shorter_answer` | `Err(_) => None` where only `NotFound` should be, which is how a throttled enumeration under-reports and returns `Ok` |
 | 14 | `an_observe_moves_fewer_bytes_than_a_fold` | `MAX_PENDING` raised to the point where the pointer costs what the run costs, which is C-12's argument quietly deleted |
 
@@ -183,8 +185,10 @@ the ≤3 budget is for user-facing paths — but only `fold` uses that licence.
   and nothing in this repository could catch it.
 - **`observe`'s change check is per appender instance**, so the rate is lifecycle events ×
   appender instances: a fleet-wide restart re-records every tenant each surviving appender
-  touches once. Harmless — the merge is idempotent by `(tenant, epoch)` — but it is the same
-  concentration shape as the bulk import above, arriving at the same registers.
+  touches once, and it does so *unconditionally*, since the check compares the index set and
+  not the epoch. Safe only because every place records combine goes through one epoch rule —
+  code review found the appender applying a second one and losing to a stale writer. The rate
+  is still the bulk-import shape, arriving at the same registers.
 - **Splitting is unbuilt and `width` is a parameter**, so the shape invites someone to pass a
   different number and expect it to work. It reassigns every tenant, and nothing refuses it.
   `{bucket:04x}` is fixed-width up to 65,536 buckets; past that the split changes the key

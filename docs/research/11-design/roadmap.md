@@ -251,6 +251,35 @@ parser, language analyzers, phrase queries, positions and trigram regex.
 
 **Exit:** 1M indexes, open latency unaffected by index count, zero LISTs on any hot path.
 
+> ⚠️ **Split into M6a and M6b**, on the same grounds M5 was: the three bullets share a subject
+> and nothing else. Metering is a `pstore-blob` decorator with no catalog in it; the workload
+> needs the catalog to exist before it can measure anything.
+
+#### M6a — The catalog
+→ [`docs/milestones/M6a/SPEC.md`](../../milestones/M6a/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M6a/VERIFIED.md)
+
+**Done.** `pstore-catalog`: derived bucket keys, a CAS'd pointer per bucket carrying pending
+records, immutable runs named by epoch **and content digest**, enumeration in **two rounds**
+(pointers, then runs) at a request count that is a function of width and not of tenants, and
+**zero LIST** anywhere in the lifecycle. 85 of 85 viable mutants caught.
+
+⚠️ **[C-12](../03-metadata-consistency/catalog-without-master.md) — the per-lane change log is
+not built and its "lanes again" reuse could not have worked.** The engine's lanes are
+node-scoped, so a reader needs a registry object to learn which exist: a second mutable object
+per bucket and a third sequential round in every enumeration. Pending records in the bucket's
+own pointer cost a CAS on the append path — affordable only because an append is a
+tenant-lifecycle event, which `Appender::observe` is what enforces — and save `LOG_LANES ×
+window` probes per bucket on every enumeration, 524,288 requests at `DEFAULT_WIDTH` against
+16,384.
+
+⚠️ **Not measured at 1M.** The invariant is measured at 2,000 tenants; 1M is arithmetic on it.
+OQ-8 (`num_buckets` and the split threshold) stays open, and bucket splitting is unbuilt.
+
+#### M6b — Quotas and metering
+Not started. Design rule 13, built on the per-tenant counters `pstore-blob`'s `Accounted`
+already keeps, plus the billing rollup over catalog buckets that M6a makes possible.
+
 ### M7 — Production hardening (ongoing)
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
