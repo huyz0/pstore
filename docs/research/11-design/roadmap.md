@@ -281,6 +281,27 @@ Not started. Design rule 13, built on the per-tenant counters `pstore-blob`'s `A
 already keeps, plus the billing rollup over catalog buckets that M6a makes possible.
 
 ### M7 — Production hardening (ongoing)
+
+> ⚠️ **"Ongoing" is not a milestone.** Four bullets and no exit criterion, which the first
+> non-negotiable in `AGENTS.md` refuses. Each bullet gets its own spec; **M7a** is the first.
+
+#### M7a — The capability matrix, measured
+→ [`docs/milestones/M7a/SPEC.md`](../../milestones/M7a/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7a/VERIFIED.md) ·
+[`docs/profiles/capability-matrix.md`](../../profiles/capability-matrix.md)
+
+**Done.** D-100 honoured for the two primitives a probe can settle: `scripts/conformance.sh`
+runs the ten-probe suite against MinIO, Azurite and fake-gcs-server and checks the matrix back
+in, `--check` fails when a backend changes under us, and a backend whose profile cannot fence
+is now **refused** at every door and at every CAS in `pstore-engine` and `pstore-catalog` —
+a rule three documents stated and nothing enforced. Closes M0a.12 and M0a.13.
+
+⚠️ **Two corrections came out of measuring rather than reading**, which is the whole argument
+for a measured matrix: [C-13](../09-rust-stack/dev-and-test-environment.md) — MinIO's
+`If-None-Match: *` works now, and the reason to distrust it is ABA instead — and
+[C-14](../02-object-storage/request-efficiency-patterns.md) — **Azure has no suffix range at
+all**, so Pattern 6's cold open is 3 round trips there, not 2.
+
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
 - Observability, SLOs, chaos testing, Jepsen-style verification.

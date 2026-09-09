@@ -151,3 +151,35 @@ pub async fn tail<S: BlobStore>(
     }
     Err(EngineError::LaneTooLong(lane))
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ The ceiling exists so a corrupt object cannot make a reader allocate wildly, and a
+    /// ceiling is only ever wrong at its own edge — so both sides of it are asserted.
+    /// Mutation found this: `>` against `>=`, and `/` against `%`, all survived a test that
+    /// only tried a small buffer, because every one of them still refuses nothing at that
+    /// size. `%` in particular is silent — the multiple-of-8 check above guarantees a
+    /// remainder of zero, so the guard would never refuse anything at all.
+    #[test]
+    fn the_lane_ceiling_refuses_one_past_it_and_accepts_the_last_legal_object() {
+        let full: Vec<u8> = (0..MAX_LANES as u64)
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        assert_eq!(decode(&full).unwrap().len(), MAX_LANES);
+
+        let mut over = full.clone();
+        over.extend_from_slice(&(MAX_LANES as u64).to_le_bytes());
+        assert!(decode(&over).is_err(), "one lane past the ceiling decoded");
+
+        // And the other half of the same guard: a length that is not a whole number of ids.
+        assert!(decode(&full[..full.len() - 1]).is_err());
+    }
+}

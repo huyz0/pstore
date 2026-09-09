@@ -145,6 +145,30 @@ async fn a_commit_reached_past_the_doors_is_refused() {
 }
 
 #[tokio::test]
+async fn a_lane_registration_on_a_divergent_backend_is_refused() {
+    // ⚠️ **The only test that can see this guard.** `lanes::register`'s one caller in the
+    // engine is `flush`, which has already refused at its own door — so deleting the guard
+    // leaves the whole suite green, and a mutation sweep cannot see it either, because its
+    // mutants replace the body and the conforming-store tests kill those. Reached directly,
+    // the way a second caller added later would reach it.
+    let store = Claims::divergent_cas("wildcard ignored");
+    let err = pstore_engine::lanes::register(&store, T, LaneId(3))
+        .await
+        .expect_err("a lane registration must refuse");
+    let msg = refusal(err);
+    assert!(msg.contains("emulator-under-test"), "{msg}");
+
+    // And it wrote nothing: the registry is a CAS'd object, so a half-registered lane is a
+    // lane whose writes are unrecoverable.
+    assert!(
+        pstore_engine::lanes::live(&Claims::conforming(), T)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn a_conforming_backend_is_untouched() {
     // Criterion 9 in miniature; the real defence is the rest of the workspace suite.
     let e = Engine::new(Arc::new(Claims::conforming()), T, LaneId(0));

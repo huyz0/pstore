@@ -37,6 +37,25 @@ The third one turns out to be the interesting one, and not for the reason you'd 
 > underpins index creation, write-once lane objects, and advisory claims — is the *most* poorly
 > supported operation across S3-compatible servers, and it is the one we lean on hardest.
 
+> **C-13 — MinIO's wildcard works now, and T-1's premise is half wrong. M7a. Measured.**
+> The table above says MinIO "does not support the `*` wildcard" and that `If-None-Match: *`
+> "does not prevent a second write". Probed against
+> `minio/minio:RELEASE.2025-04-22T22-12-26Z` — the version this repo pins — **both
+> `create_if_absent` and `compare_and_swap` are `Supported`**: the second create is refused,
+> as S3 does it. minio#20346 has evidently been fixed since the table was written.
+>
+> ⚠️ **T-1's conclusion survives its premise, for a different reason.** MinIO fails
+> `aba_resistance`: its ETags are content-derived, so writing `v1 → v2 → v1` returns a tag
+> equal to the first and a paused writer's CAS lands against a world that changed and changed
+> back. Our HEAD carries a nonce precisely so that this cannot bite
+> ([`head.rs`](../../../crates/pstore-engine/src/head.rs)) — which means MinIO is usable
+> *because of a design decision taken before it was measured*, not because it is faithful.
+>
+> **What this changes:** "use `pstore-fake-s3`, treat MinIO as a third-party compatibility
+> check" is still right, and the reason is now ABA rather than the wildcard. Evidence:
+> [`docs/profiles/capability-matrix.md`](../../profiles/capability-matrix.md),
+> [`M7a/VERIFIED.md`](../../milestones/M7a/VERIFIED.md).
+
 This is not a reason to stop; it is a reason to change what each test layer is *for*.
 
 ## 3. Three test layers, three different jobs

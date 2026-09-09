@@ -114,6 +114,36 @@ from the end so a single `Range: -N` suffix GET bootstraps everything.
 **Result:** cold open of a data object = **1 GET** (suffix) + **1 GET** (the actual block),
 = 2 `Rseq`, never more.
 
+> **C-14 — the suffix GET does not reach Azure, and Azurite answers it with a 500. M7a.**
+> `Range: bytes=-N` is the primitive this pattern rests on, and
+> [`api-semantics.md`](api-semantics.md) calls it "supported by S3, GCS and Azure alike".
+> Three separate observations, kept apart because they say different things:
+>
+> 1. **Measured, client.** `object_store` 0.14.1 refuses a suffix range **before building a
+>    request** (`src/azure/client.rs:1176`, comment dated 2024-01-02), so the conformance
+>    suite's `suffix_read` row for Azurite is the *client's* refusal and would read the same
+>    with the emulator stopped. ⚠️ **The first version of this banner presented that row as a
+>    fact about the service** — in the milestone whose thesis is measured-not-declared. Caught
+>    in code review.
+> 2. **Measured, emulator.** `scripts/conformance.sh --azure-suffix` asks Azurite 3.34.0
+>    directly, past the client: `bytes=0-99 -> 206`, `bytes=-1 -> **500**`. So the primitive is
+>    absent there too, and absent *badly* — a 500 is not a refusal a client can act on. It is a
+>    named mode of the script rather than a shell history, because this banner rests on it and
+>    the conformance suite structurally cannot make this measurement.
+> 3. **Documented, service.** The Blob REST API specifies `bytes=startByte-endByte`; there is
+>    no suffix form. Not measured here — no Azure account (M0b).
+>
+> ⚠️ **The consequence holds on all three readings**, because our adapter goes through
+> `object_store`: on Azure a cold open becomes `head` → range → block, so **3 `Rseq`, not 2**,
+> and `head` is billed as a read — the cost
+> [Pattern 7](#pattern-7-negative-caching-and-existence-proofs) forbids on a hot path. The ways
+> out are a footer at a *known absolute* offset (a format change), carrying object length in
+> the manifest (which already names every segment), or accepting 3 on Azure alone.
+>
+> **Not fixed here.** M7a measured it; choosing among those three is a design decision with its
+> own spec. Evidence: [`docs/profiles/capability-matrix.md`](../../profiles/capability-matrix.md),
+> [`M7a/VERIFIED.md`](../../milestones/M7a/VERIFIED.md).
+
 ## Pattern 7: Negative caching and existence proofs
 
 Never HEAD to check existence on the hot path — the manifest already proves what exists.

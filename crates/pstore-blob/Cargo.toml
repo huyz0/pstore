@@ -30,3 +30,15 @@ object_store = { version = "0.14.1", default-features = false }
 
 [features]
 object_store = ["dep:object_store"]
+# ⚠️ The emulator-integration feature `dev/README.md` has always named and nothing has ever
+# provided. It pulls the three cloud clients in; `scripts/conformance.sh` is what runs them.
+compat = [
+    "object_store",
+    "object_store/aws",
+    "object_store/gcp",
+    "object_store/azure",
+]
+
+[[example]]
+name = "probe"
+required-features = ["compat"]

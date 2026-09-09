@@ -167,6 +167,26 @@ async fn an_over_cap_batch_is_refused_by_both_implementations() {
 }
 
 #[tokio::test]
+async fn a_batch_of_exactly_the_cap_is_accepted() {
+    // ⚠️ The boundary, on both implementations. `>` and `>=` differ on exactly one input --
+    // a batch of precisely `max_batch_delete` -- so a test that only tries `cap + 1` leaves
+    // the comparison free to be either, and the wrong one refuses a legal batch that
+    // `Engine::gc` will eventually build.
+    let (counting, s, _) = seeded(0).await;
+    let cap = s.capabilities().max_batch_delete;
+    let exactly: Vec<Key> = (0..cap).map(|i| Key::new(format!("k/{i:05}"))).collect();
+
+    s.delete_batch(&exactly)
+        .await
+        .expect("a full batch is legal");
+    assert_eq!(counting.batches(), vec![cap]);
+    MemoryStore::new()
+        .delete_batch(&exactly)
+        .await
+        .expect("a full batch is legal on MemoryStore too");
+}
+
+#[tokio::test]
 async fn an_empty_batch_costs_nothing() {
     let (counting, s, _) = seeded(0).await;
     s.delete_batch(&[]).await.unwrap();

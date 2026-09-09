@@ -25,8 +25,8 @@ research behind it: [`../docs/research/09-rust-stack/dev-and-test-environment.md
 |---|---|---|
 | **In-process fault-injecting store** | `cargo test` | **Correctness of our logic.** Exact, assertable semantics; no HTTP. |
 | **`pstore-fake-s3`** (ours, on `s3s`) | `cargo test --features integration` | **Correctness of our client**: wire, XML, error mapping. Correct `If-None-Match: *`, and the only place 409 vs 412 is testable. |
-| Emulators (MinIO/Azurite/fake-gcs) | `cargo test --features compat` | Third-party plumbing sanity — a compatibility check, not the default target |
-| Conformance suite | `cargo test -p pstore-conformance` | Records what each backend actually does |
+| Emulators (MinIO/Azurite/fake-gcs) | `scripts/conformance.sh` | Third-party plumbing sanity — a compatibility check, not the default target. Writes [`docs/profiles/capability-matrix.md`](../docs/profiles/capability-matrix.md); `--check` fails if a backend has changed under us. ⚠️ Outside `cargo test` because it needs the containers |
+| Conformance suite | `cargo test -p pstore-testkit --test conformance` (local stores) · `scripts/conformance.sh` (emulators) | Records what each backend actually does. ⚠️ It lives in `pstore-testkit::conformance`; there is no `pstore-conformance` crate and there never was |
 | Real clouds | **deferred — milestone M0b** | Economics: latency, CAS contention, cost |
 
 ## Running the 100-node fleet on WSL2

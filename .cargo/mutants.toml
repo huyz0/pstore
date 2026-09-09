@@ -21,3 +21,13 @@ profile = "mutants"
 # slowest things `cargo test` does. This workspace has none today; stated explicitly so
 # adding one does not silently multiply every sweep.
 additional_cargo_test_args = ["--all-targets"]
+
+# ⚠️ **Feature-gated code must be built, or its mutants are false negatives.**
+# `pstore-blob`'s `object_store` adapter is behind a feature, and without this a sweep
+# reports every mutant in it as MISSED -- for the uninteresting reason that nothing compiled
+# it, which reads in the output exactly like a weak test. Found in M7a, where two such
+# "survivors" turned out to be code the sweep had never run.
+#
+# `object_store` and not `compat`: `compat` pulls the aws, gcp and azure clients into every
+# one of the N per-mutant builds, and those add nothing a mutant of ours can be caught by.
+additional_cargo_args = ["--features", "pstore-blob/object_store"]
