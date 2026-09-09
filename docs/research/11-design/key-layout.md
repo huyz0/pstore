@@ -62,6 +62,19 @@ at the front (rule 5), one mutable pointer (rule 1), and everything else immutab
     └── roster/{gen:020}                             immutable snapshot
 ```
 
+> **C-12 — the catalog subtree, corrected. M6a.** The `cat/` lines above and the census row
+> below are superseded by
+> [`../03-metadata-consistency/catalog-without-master.md`](../03-metadata-consistency/catalog-without-master.md)'s
+> C-12. There is **no** `log/{lane}/{seq}` subtree: pending changes live inside the bucket's
+> own CAS'd pointer, so the shape is `{bucket:04x}/cat/b/HEAD` (MUTABLE · CAS ·
+> `{run_epoch, digest, pending[]}`) and `{bucket:04x}/cat/b/{run_epoch:020}-{digest:016x}`
+> (immutable run, **named by content digest as well as epoch** so two folders racing on one
+> bucket cannot publish different runs at the same key). `cat/root` carries `{epoch, width}`
+> only and changes on a width change, as the census says; the census's *other* claim — that the
+> per-bucket pointer changes at fold rate, ~1/min — is what C-12 relaxes: it now takes every
+> append as well, at tenant-lifecycle rate. `{bucket:04x}` is fixed-width to 65,536 buckets.
+> Evidence: [`../../milestones/M6a/SPEC.md`](../../milestones/M6a/SPEC.md).
+
 ## Mutable-object census
 
 The whole system's mutable state, enumerated:

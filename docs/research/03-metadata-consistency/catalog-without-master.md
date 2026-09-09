@@ -72,6 +72,29 @@ An index creation must not rewrite a whole catalog bucket. So catalog updates ar
 This is the same shape as the main storage engine (immutable runs + lanes + CAS'd pointer),
 which is deliberate: **one mechanism, used three times** (data, catalog, cluster state).
 
+> **C-12 — the change log is unnecessary, and "lanes again" would not have carried. M6a.
+> ⚠️ An argument, not a measurement.** The premise above is right: an index creation must not
+> rewrite a whole catalog bucket. It does not follow that pending changes need their own object
+> space. Carrying them **inside the bucket's CAS'd pointer** bounds the write by a cap
+> (`MAX_PENDING`, 8 records ≈ 10 KB) rather than by occupancy (~61 records ≈ 73 KB at
+> `DEFAULT_WIDTH`), and deletes a lane id space, sequence allocation, forward probing and a
+> probe window.
+>
+> **The reuse could not have worked as written.** The engine's lanes are **node**-scoped, so
+> their id space is unbounded and a reader cannot learn which lanes exist without a registry
+> object — `pstore-engine`'s `lanes::register` / `lanes::live`. That is a second mutable object
+> per bucket *and* a third sequential round in every enumeration. §5's own hazard table is what
+> the design here follows instead: the per-bucket pointer is the independent register, and
+> `cat/root` changes only on a width change.
+>
+> **What it costs**, stated because it is not free: a CAS on the append path, which lanes exist
+> to avoid. Affordable only because a catalog append is a **tenant-lifecycle** event and not a
+> commit. What the log would have cost in exchange is paid on every enumeration forever —
+> `LOG_LANES × window` derived probes per bucket, 524,288 requests at `DEFAULT_WIDTH` against
+> 16,384. What would overturn C-12 is a creation rate that makes one bucket's pointer contend
+> at the ~5 CAS/s per-key ceiling. Evidence:
+> [`M6a/SPEC.md`](../../milestones/M6a/SPEC.md) and its `VERIFIED.md`.
+
 > **Revision at 1M × 50.** Make the catalog **tenant-scoped**: 1M tenant records of ~10 KB
 > (each listing that tenant's ~50 indexes) = 10 GB, over 16,384 fixed-width buckets = 640 KB
 > per bucket, still one parallel round at ~$0.007. Cheaper than 50M index records and better
