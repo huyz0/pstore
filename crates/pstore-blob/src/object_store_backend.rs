@@ -10,6 +10,7 @@ use crate::{BlobError, Capabilities, CasError, Key, Precondition, PutOutcome, Su
 use bytes::Bytes;
 // `ObjectStoreExt` is not decoration: `get`, `get_range` and `head` live there rather
 // than on the base trait, so `Arc<dyn ObjectStore>` alone does not have them.
+use futures_util::StreamExt;
 use object_store::{
     Attributes, ObjectStore, ObjectStoreExt, PutMode, PutOptions, TagSet, UpdateVersion, path::Path,
 };
@@ -198,15 +199,37 @@ impl crate::BlobStore for ObjectStoreBackend {
     }
 
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
-        // One request per key. ⚠️ S3 offers DeleteObjects for 1000 at a time and this
-        // does not use it, so GC costs 1000x what it should. Recorded rather than fixed:
-        // it needs `delete_stream`, which needs the futures machinery, and M0a's job here
-        // is to learn whether the trait fits — not to optimise an unverified adapter.
-        for key in keys {
-            self.inner
-                .delete(&Self::path(key))
-                .await
-                .map_err(Self::map_err)?;
+        // ⚠️ **One call, not one per key.** The loop this replaces made GC's request rate
+        // scale with *objects*, which is an AGENTS.md "Never" — S3 deletes 1000 at a time
+        // and `delete_stream` is where `object_store` exposes that. M0a recorded the cost
+        // (1000x) and left it; M0a.12, closed here.
+        //
+        // ⚠️ **Over-cap is refused, not chunked**, because `MemoryStore` already refuses it
+        // and `BlobStore::delete_batch` is documented "capped at `max_batch_delete`".
+        // Chunking here would make one trait method error on one implementation and succeed
+        // on the other, and `Engine::gc` builds an unbounded batch — so the difference would
+        // surface as a backend-dependent GC, invisible to every test, since they all run on
+        // `MemoryStore`.
+        if keys.len() > self.caps.max_batch_delete {
+            return Err(BlobError::Other(format!(
+                "batch of {} exceeds the backend's limit of {}",
+                keys.len(),
+                self.caps.max_batch_delete
+            )));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<Result<Path, object_store::Error>> =
+            keys.iter().map(|k| Ok(Self::path(k))).collect();
+        let stream = futures_util::stream::iter(paths).boxed();
+        // ⚠️ Drained, not dropped. `delete_stream` is lazy: a stream that is never polled
+        // deletes nothing and returns no error, so GC would report success having reaped
+        // nothing — the graveyard entry is pruned and the objects leak with nothing left to
+        // name them by.
+        let mut out = self.inner.delete_stream(stream);
+        while let Some(r) = out.next().await {
+            r.map_err(Self::map_err)?;
         }
         Ok(())
     }

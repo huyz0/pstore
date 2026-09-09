@@ -24,6 +24,9 @@ pstore-testkit = { path = "../pstore-testkit" }
 pstore-types = { path = "../pstore-types" }
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
+async-trait = "0.1"
+object_store = { version = "0.14.1", default-features = false }
 
 [features]
 object_store = ["dep:object_store"]
