@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod broken;
+pub mod claims;
 pub mod conformance;
 pub mod depth;
 pub mod flaky;

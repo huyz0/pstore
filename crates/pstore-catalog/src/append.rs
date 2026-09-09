@@ -65,6 +65,7 @@ impl<S: BlobStore> Appender<S> {
     /// # Errors
     /// If the store refuses, an object is malformed, or the bucket stays contended.
     pub async fn record(&self, rec: &TenantRecord) -> Result<(), CatalogError> {
+        crate::require_fencing(self.store.as_ref())?;
         let bucket = bucket_of(rec.tenant, self.width);
         for _ in 0..MAX_CAS_ATTEMPTS {
             let (mut head, tag) = read_head(self.store.as_ref(), bucket).await?;

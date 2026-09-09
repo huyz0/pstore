@@ -117,6 +117,38 @@ pub struct Capabilities {
     pub coalesce_gap: u64,
 }
 
+impl Capabilities {
+    /// Whether this backend may be trusted with a write a caller will be told is durable.
+    ///
+    /// ⚠️ **`Supported` on both primitives, or nothing.** `Divergent` is the dangerous
+    /// answer, not the safe one: it means the primitive is *present* — the call returns
+    /// success — and wrong, which is precisely how MinIO accepts `If-None-Match: *` and
+    /// then lets a second create through. Reading "present" as "usable" is the failure this
+    /// predicate exists to make impossible, so the check is on `Supported` itself rather
+    /// than on the absence of `Unsupported`.
+    ///
+    /// `create_if_absent` counts as well as `cas`, because the two are used for different
+    /// things and losing either loses correctness: `cas` fences a committer against a world
+    /// that moved, `create_if_absent` is what makes a create idempotent and a lane object
+    /// write-once.
+    #[must_use]
+    pub fn admits_durable_writes(&self) -> bool {
+        self.cas == Support::Supported && self.create_if_absent == Support::Supported
+    }
+
+    /// Which primitive is not `Supported`, for an error a reader can act on.
+    #[must_use]
+    pub fn first_divergence(&self) -> Option<(&'static str, &Support)> {
+        if self.cas != Support::Supported {
+            Some(("compare_and_swap", &self.cas))
+        } else if self.create_if_absent != Support::Supported {
+            Some(("create_if_absent", &self.create_if_absent))
+        } else {
+            None
+        }
+    }
+}
+
 /// How well a backend supports a primitive, as observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Support {

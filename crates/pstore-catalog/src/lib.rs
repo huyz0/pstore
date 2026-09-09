@@ -65,6 +65,25 @@ pub use record::{State, TenantRecord};
 /// first, so a folder that never runs is a cost problem and never a correctness one.
 pub const MAX_PENDING: usize = 8;
 
+/// Refuses a backend whose recorded profile says it cannot fence.
+///
+/// One predicate, shared with `pstore-engine`'s guard by way of
+/// [`pstore_blob::Capabilities::first_divergence`] — the policy is per crate, the observation
+/// is not.
+pub(crate) fn require_fencing<S: pstore_blob::BlobStore + ?Sized>(
+    store: &S,
+) -> Result<(), CatalogError> {
+    let caps = store.capabilities();
+    match caps.first_divergence() {
+        None => Ok(()),
+        Some((primitive, observed)) => Err(CatalogError::BackendCannotFence {
+            backend: caps.backend.clone(),
+            primitive,
+            observed: format!("{observed:?}"),
+        }),
+    }
+}
+
 /// How many times a CAS is rebased before giving up.
 ///
 /// Bounded rather than `loop`: the exit condition is "no one else won this round", and a
@@ -94,6 +113,24 @@ pub enum CatalogError {
     /// is not a bucket, and `Contended(0, _)` would be indistinguishable from bucket zero.
     #[error("cat/root changed under this writer")]
     RootContended,
+    /// The backend's recorded profile says it cannot fence.
+    ///
+    /// ⚠️ The catalog is **tenant** state and does not re-converge the way cluster state
+    /// does, and `Appender::record`'s create-if-absent on a fresh bucket pointer is exactly
+    /// the primitive MinIO is documented to accept and ignore. Refused at the door for the
+    /// same reason `pstore-engine` refuses there: a backend that cannot fence returns
+    /// *success*, so the only moment to catch it is before the write.
+    #[error(
+        "backend {backend} cannot fence: {primitive} is {observed} - refusing to write the catalog"
+    )]
+    BackendCannotFence {
+        /// The profile's backend label.
+        backend: String,
+        /// Which primitive is not `Supported`.
+        primitive: &'static str,
+        /// What was observed of it.
+        observed: String,
+    },
     /// The stored width is not one this key format can express.
     #[error("root names width {0}, which is not in 1..={MAX_WIDTH}")]
     BadWidth(u32),

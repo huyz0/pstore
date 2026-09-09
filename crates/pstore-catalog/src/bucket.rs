@@ -110,6 +110,7 @@ pub async fn write_root<S: BlobStore>(
     root: Root,
     previous: Option<CasTag>,
 ) -> Result<(), CatalogError> {
+    crate::require_fencing(store)?;
     match store
         .put_conditional(
             &keys::root_key(),
@@ -266,6 +267,7 @@ where
 /// # Errors
 /// If the store refuses, an object is malformed, or the bucket stays contended.
 pub async fn fold<S: BlobStore>(store: &S, bucket: u32) -> Result<bool, CatalogError> {
+    crate::require_fencing(store)?;
     for _ in 0..MAX_CAS_ATTEMPTS {
         let (head, tag) = read_head(store, bucket).await?;
         // A bucket with nothing pending has nothing to publish -- and a bucket whose pointer

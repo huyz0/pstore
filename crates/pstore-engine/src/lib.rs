@@ -55,6 +55,25 @@ pub enum EngineError {
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
+    /// The backend's recorded profile says it cannot fence, so nothing may be told it is
+    /// durable.
+    ///
+    /// ⚠️ The one error here that is **policy rather than failure**: nothing went wrong, and
+    /// that is the point. A backend whose CAS is `Divergent` returns *success* on a write
+    /// that did not fence, so the only moment this can be caught is before the write. Names
+    /// the backend and the primitive, because "unsupported backend" leaves an operator with
+    /// nothing to do.
+    #[error(
+        "backend {backend} cannot fence: {primitive} is {observed} - refusing to write anything that would be reported durable"
+    )]
+    BackendCannotFence {
+        /// The profile's backend label.
+        backend: String,
+        /// Which primitive is not `Supported`.
+        primitive: &'static str,
+        /// What was observed of it.
+        observed: String,
+    },
     /// A lane's tail could not be found within the probe bound.
     ///
     /// Not "the lane is too long" in practice — it means the store kept answering, which
@@ -72,6 +91,30 @@ impl From<pstore_blob::BlobError> for EngineError {
 impl From<pstore_format::FormatError> for EngineError {
     fn from(e: pstore_format::FormatError) -> Self {
         Self::Format(e.to_string())
+    }
+}
+
+/// Refuses a backend whose recorded profile says it cannot fence.
+///
+/// ⚠️ **Called at the doors *and* at the CAS**, which is the same pair `write` already forms
+/// with `check_storable` at the door and `try_finish` at the far end. The door call is what
+/// makes the refusal cost zero requests — `gc` in particular `delete_batch`es before it
+/// commits, so a guard only at the CAS would let it destroy objects and then refuse. The CAS
+/// call is what stops a path added later from committing around the doors.
+///
+/// The corpus says "fail loudly at startup". There is no startup object here — `Engine::new`
+/// is infallible across every one of its call sites — so the door is where it lands, which is
+/// strictly earlier than any corruption. `Capabilities::admits_durable_writes` is public so a
+/// server, when one exists, can refuse sooner.
+pub(crate) fn require_fencing<S: BlobStore + ?Sized>(store: &S) -> Result<(), EngineError> {
+    let caps = store.capabilities();
+    match caps.first_divergence() {
+        None => Ok(()),
+        Some((primitive, observed)) => Err(EngineError::BackendCannotFence {
+            backend: caps.backend.clone(),
+            primitive,
+            observed: format!("{observed:?}"),
+        }),
     }
 }
 
@@ -292,6 +335,7 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// `RA = 1 W` for the batch, and for every index in it.
     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
+        require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
         let pending = {
             let mut m = self.mem();
@@ -377,6 +421,7 @@ impl<S: BlobStore> Engine<S> {
     /// copy would make the WAL write-only: the objects would be paid for and never read,
     /// and a process that restarted could not recover a single acknowledged write.
     pub async fn fold(&self) -> Result<Epoch, EngineError> {
+        require_fencing(&*self.store)?;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
             let live = lanes::live(&*self.store, self.tenant).await?;
@@ -491,6 +536,7 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// Returns how many objects were reaped.
     pub async fn gc(&self, retention: u64) -> Result<usize, EngineError> {
+        require_fencing(&*self.store)?;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
             // Everything dereferenced at an epoch this old is beyond the reach of any
@@ -623,6 +669,7 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// `RA = n Rpar + 1 W + 1 commit`, for any *n*.
     pub async fn compact(&self, index: &str) -> Result<Option<Epoch>, EngineError> {
+        require_fencing(&*self.store)?;
         let at = head::read(&*self.store, self.tenant).await?;
         let inputs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
         if inputs.len() < 2 {

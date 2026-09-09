@@ -72,6 +72,7 @@ pub async fn register<S: BlobStore>(
     tenant: TenantId,
     lane: LaneId,
 ) -> Result<(), EngineError> {
+    crate::require_fencing(store)?;
     let k = key(tenant);
     for _ in 0..16 {
         let (current, pre) = match store.get_with_tag(&k).await {

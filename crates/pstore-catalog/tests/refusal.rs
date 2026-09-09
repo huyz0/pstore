@@ -177,3 +177,53 @@ async fn a_refused_root_read_is_an_error_not_the_default_width() {
     let store = Flaky::refusing_reads();
     assert!(read_root(&store).await.is_err());
 }
+
+#[tokio::test]
+async fn a_catalog_write_on_a_divergent_backend_is_refused() {
+    // ⚠️ M7a criterion 8. The sentence that argues `pstore-cluster`'s roster CAS out of the
+    // guard — cluster state re-converges by gossip — argues the opposite way here: the
+    // catalog is tenant state, and the create-if-absent on a fresh bucket pointer is exactly
+    // the primitive MinIO accepts and ignores.
+    let acc = pstore_blob::Accounted::new(pstore_testkit::claims::Claims::divergent_cas(
+        "wildcard ignored",
+    ));
+    let bill = TenantId(0);
+    let store = Arc::new(acc.as_tenant(bill));
+    let app = Appender::new(Arc::clone(&store), one());
+
+    for e in [
+        app.record(&TenantRecord::live(TenantId(1), Epoch(1), &[]))
+            .await
+            .expect_err("record must refuse"),
+        app.observe(&TenantRecord::live(TenantId(1), Epoch(1), &[]))
+            .await
+            .expect_err("observe must refuse"),
+        fold(store.as_ref(), 0).await.expect_err("fold must refuse"),
+        pstore_catalog::write_root(
+            store.as_ref(),
+            pstore_catalog::Root {
+                epoch: Epoch(1),
+                width: one(),
+            },
+            None,
+        )
+        .await
+        .expect_err("write_root must refuse"),
+    ] {
+        let msg = e.to_string();
+        assert!(
+            matches!(e, CatalogError::BackendCannotFence { .. }),
+            "expected a fencing refusal, got {msg}"
+        );
+        assert!(msg.contains("compare_and_swap"), "{msg}");
+    }
+
+    for class in [
+        pstore_blob::OpClass::Read,
+        pstore_blob::OpClass::Write,
+        pstore_blob::OpClass::Delete,
+        pstore_blob::OpClass::List,
+    ] {
+        assert_eq!(acc.total(class), 0, "{class:?} issued by a refused write");
+    }
+}

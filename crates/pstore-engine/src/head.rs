@@ -205,6 +205,7 @@ pub(crate) async fn commit<S: BlobStore>(
     at: &HeadAt,
     next: &Head,
 ) -> Result<Epoch, EngineError> {
+    crate::require_fencing(store)?;
     let pre = match &at.tag {
         Some(t) => Precondition::Match(t.clone()),
         None => Precondition::NotExists,
