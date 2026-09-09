@@ -2,7 +2,26 @@ FROM rust:1.90-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev clang mold git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# ⚠️ Cap the build's own parallelism, including this image's. `cargo install` fans out to
+# every core by default, and on WSL2 an uncapped build is what takes the VM down -- the image
+# that exists to contain that must not be built without it.
+ENV CARGO_BUILD_JOBS=4
+
 # sccache: rebuilds must not re-link the world (matters most in CI, where
 # Docker layer caches are often unavailable).
 RUN cargo install sccache --locked && cargo install cargo-chef --locked
+# The mutation gate (D-111). In the image because a sweep is the heaviest thing this project
+# runs, and `dev/README.md`'s whole premise is that the heavy things run capped.
+RUN cargo install cargo-mutants --locked
 ENV CARGO_HOME=/usr/local/cargo
+
+# ⚠️ The linker lives HERE, not in the repo's `.cargo/config.toml`. `clang` and `mold` are
+# installed in this image and are not on the WSL2 host, and a config naming an absent linker
+# turns every host build into a link error -- so the repo config carries the memory caps that
+# apply everywhere, and the container adds the linker that only it has. Cargo merges the two,
+# with the repo's taking precedence.
+RUN printf '%s\n' \
+    '[target.x86_64-unknown-linux-gnu]' \
+    'linker = "clang"' \
+    'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+    > /usr/local/cargo/config.toml

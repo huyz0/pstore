@@ -6,3 +6,7 @@ lcov.info
 # `cargo mutants`. Committed by accident via `git add -A`.
 /mutants.out/
 /mutants.out.old/
+
+# Mutation sweep logs, written by the container into the bind mount.
+mutants-container.log
+mutants.out/

@@ -75,7 +75,14 @@ linker_flags() {
 # ⚠️ And each job's cargo is itself capped, because without `.cargo/config.toml` a `cargo build`
 # fans out to every core: 8 jobs x 20 internal build jobs is 160 concurrent rustc invocations
 # on a machine with no `.wslconfig` ceiling. That is what took this VM down, twice.
-mem_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 8)
+# ⚠️ The CGROUP limit first, because `/proc/meminfo` inside a container reports the HOST's
+# memory -- so a container capped at 8 GB would size its jobs against the host's 44 and defeat
+# the cap it was put there for.
+if [[ -r /sys/fs/cgroup/memory.max ]] && [[ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]]; then
+    mem_gb=$(( $(cat /sys/fs/cgroup/memory.max) / 1073741824 ))
+else
+    mem_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 8)
+fi
 by_mem=$(( mem_gb / 4 ))
 by_cpu=$(( $(nproc) / 2 ))
 JOBS=${MUTANTS_JOBS:-$(( by_mem < by_cpu ? by_mem : by_cpu ))}
