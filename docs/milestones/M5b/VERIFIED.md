@@ -47,13 +47,14 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
 
 ## Mutation
 
-`./scripts/mutants.sh --file …` over M5's six new modules, **469 mutants in 42 minutes**:
-**410 caught, 1 killed by timeout, 42 unviable, 16 missed** — 411 of 427 viable, and every
-one of the 16 is a **proven equivalent mutant**, recorded beside the code it lives in.
+`./scripts/mutants.sh --file …` **in the `dev` container** — 6 CPUs and 16 GB, which is where
+`dev/README.md` says the heavy work belongs — over M5's six new modules: **469 mutants,
+411 caught, 42 unviable, 16 missed, zero timeouts**. 411 of 427 viable, and every one of the
+16 is a **proven equivalent mutant**, recorded beside the code it lives in.
 
 | module | caught | missed | unviable |
 |---|---|---|---|
-| `pstore-format/src/sparse.rs` | 227 (+1 timeout) | 16 | 8 |
+| `pstore-format/src/sparse.rs` | 228 | 16 | 8 |
 | `pstore-format/src/text.rs` | 80 | 0 | 4 |
 | `pstore-index/src/sparse.rs` | 19 | 0 | 13 |
 | `pstore-index/src/text.rs` | 69 | 0 | 12 |
@@ -66,8 +67,10 @@ a binary16 — OR and XOR agree on every input that can reach them — and two i
 `0.0 / 0.0` casts to the same byte; `+ 128` against `- 128`, which differ by 256 in a `u8`).
 **Excluding them, 411 of 411.**
 
-⚠️ **The one timeout is a kill, not a gap**: `put_varint` with its loop condition flipped does
-not terminate. It is the reason the floor is 300 s rather than off.
+⚠️ **Zero timeouts, and that number had to be earned.** `put_varint` with its loop condition
+flipped does not terminate, and an earlier host run reported it as a timeout — a kill, but a
+slow one. The floor of 300 s is what keeps a *survivor* from being filed the same way; see
+below.
 
 ⚠️ **The first sweep's numbers were wrong in the flattering direction**, and the correction is
 the point. `cargo-mutants` auto-set the limit to **20 s against a 20-second baseline**, so

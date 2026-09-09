@@ -63,8 +63,14 @@ services:
     depends_on: [minio, azurite, gcs]
     deploy:
       resources:
-        limits: { cpus: '6', memory: 8G }   # < the WSL2 VM ceiling, so a bad
-                                            # build OOMs this container only
+        # ⚠️ Still well under the WSL2 VM ceiling (32 GB in dev/wslconfig.sample), so a bad
+        # build OOMs this container only -- which is the whole point of the nesting.
+        #
+        # Raised from 6 CPUs / 8 GB because a mutation sweep is the heaviest thing here and
+        # 8 GB derives only 2 concurrent jobs, which put a full sweep at 87 minutes.
+        # `scripts/mutants.sh` sizes its jobs from `/sys/fs/cgroup/memory.max`, so this
+        # number is the knob: 16 GB gives 4 jobs.
+        limits: { cpus: '10', memory: 16G }
     command: sleep infinity
 
 volumes:
