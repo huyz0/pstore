@@ -116,6 +116,9 @@ or ship a re-bucketing pass — never update the constants.
 - **Quotas, metering, billing aggregation, and any wiring into the commit path** — M6b. Nothing
   calls `Appender::observe` yet, which is criterion 12 restated: this is a mechanism, and its
   caller is M6b's. The per-tenant counters `Accounted` already keeps are what metering builds on.
+  ⚠️ **Corrected by [M6b](../M6b/SPEC.md): the caller is not M6b's.** M6b is a `BlobStore`
+  decorator and wires nothing into any stack either — the caller is whoever composes a serving
+  stack, and nothing does. Recorded here rather than left as two ledgers disagreeing.
 - **The 1M-tenant measurement.** Criterion 4 measures the invariant at 2,000 tenants over 16
   buckets; what holds at 1M is arithmetic on it, and a cost that turned superlinear only above
   2,000 would not be caught here.

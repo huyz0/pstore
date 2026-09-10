@@ -56,7 +56,7 @@ Three principles, applied in this order:
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 9 | **M6b — quotas and metering** (Design rule 13), the billing rollup over catalog buckets, and the 1M-index workload (OQ-72). The per-tenant counters `Accounted` already keeps are what it builds on, and nothing calls `Appender::observe` yet. | [M6a](M6a/VERIFIED.md) | L |
+| 9 | **[M6b](M6b/SPEC.md) — quotas and metering.** Specced, two review rounds. ⚠️ Three blocking findings in round one, all about shape rather than absence: a reservation counting ranges where `Accounted` counts *coalesced fetches*; a byte quota that cannot be reserved before a transfer whose size is unknowable without a forbidden `head`; and `Usage` in `TenantRecord`, which is unsound in both directions and is now out of scope. The billing rollup and the 1M workload are named as not-this. | [M6a](M6a/VERIFIED.md) | L |
 | 10 | **M6a leftovers** — bucket splitting (OQ-8) and run reaping. Both need a protocol of their own: splitting must keep an old-width reader stale rather than wrong; reaping needs a retention window or a reader mid-enumeration loses the run it is on. | [M6a](M6a/VERIFIED.md) | M |
 
 ## Blocked, and by what
