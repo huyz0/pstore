@@ -107,6 +107,35 @@ pub fn run_key(bucket: u32, run_epoch: Epoch, digest: u64) -> Key {
     ))
 }
 
+/// Everything a bucket owns, for the one path allowed to enumerate.
+///
+/// ⚠️ The bucket's `HEAD` shares this prefix with its runs. That is why a sweeper parses what
+/// it finds rather than assuming, and keeps what it cannot parse.
+#[must_use]
+pub fn bucket_prefix(bucket: u32) -> Key {
+    Key::new(format!("{bucket:04x}/cat/b/"))
+}
+
+/// `(run_epoch, digest)` from a run key, or `None` if it is not one.
+///
+/// ⚠️ **The inverse of [`run_key`], and it must stay that way.** A sweeper decides what to
+/// delete on the strength of this, so a key shape that changes on one side and not the other
+/// silently changes what is deleted. `run_key_round_trips_through_parse` pins the pair.
+#[must_use]
+pub fn parse_run_key(bucket: u32, key: &Key) -> Option<(Epoch, u64)> {
+    let rest = key.as_str().strip_prefix(bucket_prefix(bucket).as_str())?;
+    let (epoch, digest) = rest.split_once('-')?;
+    // Fixed widths, checked: `{:020}` and `{:016x}` are what make byte order epoch order, and
+    // a shorter field means this is some other object that happens to contain a dash.
+    if epoch.len() != 20 || digest.len() != 16 {
+        return None;
+    }
+    Some((
+        Epoch(epoch.parse().ok()?),
+        u64::from_str_radix(digest, 16).ok()?,
+    ))
+}
+
 /// The FNV-1a 64-bit prime, `1099511628211`.
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 
@@ -142,6 +171,33 @@ pub(crate) fn digest(bytes: &[u8]) -> u64 {
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
+
+    #[test]
+    fn run_key_round_trips_through_parse() {
+        // ⚠️ A sweeper deletes on the strength of `parse_run_key`, so a key shape that changes
+        // on one side and not the other silently changes what is deleted. The pair is pinned.
+        for (bucket, epoch, digest) in [
+            (0u32, 0u64, 0u64),
+            (1, 1, 0xdead_beef),
+            (0xffff, u64::MAX, u64::MAX),
+            (7, 9_999_999_999_999_999_999, 0x1234_5678_9abc_def0),
+        ] {
+            let k = run_key(bucket, Epoch(epoch), digest);
+            assert_eq!(
+                parse_run_key(bucket, &k),
+                Some((Epoch(epoch), digest)),
+                "{k:?}"
+            );
+            // ⚠️ And it does not answer for another bucket's key, which would let a sweep of
+            // one bucket delete another's runs.
+            assert_eq!(parse_run_key(bucket.wrapping_add(1), &k), None, "{k:?}");
+        }
+        // Everything else under the prefix is kept, which is the safe default.
+        for other in ["HEAD", "notes.txt", "0000-0000", "not-a-run"] {
+            let k = Key::new(format!("{}{other}", bucket_prefix(3).as_str()));
+            assert_eq!(parse_run_key(3, &k), None, "{other}");
+        }
+    }
     use super::*;
 
     #[test]

@@ -418,6 +418,66 @@ pub async fn reap<S: BlobStore>(
     Err(CatalogError::Contended(bucket, MAX_CAS_ATTEMPTS))
 }
 
+/// Deletes runs in this bucket that **nothing names** — the objects a fold leaves behind when
+/// it writes its run and then loses the head CAS.
+///
+/// ⚠️ **The only LIST in the catalog, and the only path the corpus permits one on.**
+/// `list_unrestricted` is priced like a PUT and returns at most 1000 keys; a sweeper is GC,
+/// which is exactly what that API is reserved for. The cost is one LIST and one batched delete
+/// **per bucket**, and it never scales with tenants.
+///
+/// ⚠️ **An orphan and a run in flight look identical**, and confusing them is far worse than
+/// leaving garbage: an orphan is garbage, and a run a fold is *about to* commit is a bucket's
+/// worth of tenants. The epoch in the key separates them with no clock — a run in flight was
+/// written against the head its writer read, so its `run_epoch` is strictly **greater** than
+/// the head's. Only what the head has already moved past is garbage.
+///
+/// ⚠️ Two folders racing at one epoch produce two runs at `head.run_epoch + 1`; after the
+/// winner commits, the loser's epoch **equals** the head's rather than being less, so it
+/// survives this sweep and the next one collects it. Late, and never early.
+///
+/// ⚠️ **Anything it cannot positively identify is kept** — the bucket's own `HEAD` shares this
+/// prefix, and so would any sibling a later milestone adds. The opposite default, "delete what
+/// I do not recognise", deletes the pointer.
+///
+/// Records nothing and writes no head: an orphan is defined by *absence* from the head, so
+/// there is nothing to write down. That makes it idempotent and safe beside a concurrent fold,
+/// where the worst case is a head one epoch stale and one run fewer reaped.
+///
+/// Returns how many objects it swept.
+///
+/// # Errors
+/// If the store refuses, the head is malformed, or the backend cannot fence.
+pub async fn sweep<S: BlobStore>(store: &S, bucket: u32) -> Result<usize, CatalogError> {
+    crate::require_fencing(store)?;
+    let (head, _) = read_head(store, bucket).await?;
+    let mut named: Vec<(Epoch, u64)> = head.graveyard.clone();
+    if head.run_epoch != Epoch::ZERO {
+        named.push((head.run_epoch, head.digest));
+    }
+
+    let prefix = keys::bucket_prefix(bucket);
+    let doomed: Vec<pstore_blob::Key> = store
+        .list_unrestricted(&prefix)
+        .await?
+        .into_iter()
+        .filter(|k| {
+            // Keep anything that is not a run key this version can read back.
+            let Some((epoch, digest)) = keys::parse_run_key(bucket, k) else {
+                return false;
+            };
+            epoch < head.run_epoch && !named.contains(&(epoch, digest))
+        })
+        .collect();
+
+    let n = doomed.len();
+    let cap = store.capabilities().max_batch_delete.max(1);
+    for chunk in doomed.chunks(cap) {
+        store.delete_batch(chunk).await?;
+    }
+    Ok(n)
+}
+
 /// Drains a bucket's pending records into a new immutable run.
 ///
 /// Optimistic and leaderless: any node may call it, the CAS decides, and a loser rebases onto

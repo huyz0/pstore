@@ -205,6 +205,11 @@ async fn a_catalog_write_on_a_divergent_backend_is_refused() {
         pstore_catalog::reap(store.as_ref(), 0, 0)
             .await
             .expect_err("reap must refuse"),
+        // ⚠️ M6e, and the only door that LISTs: a sweeper on a backend that cannot fence reads
+        // a head it cannot trust and then deletes on the strength of it.
+        pstore_catalog::sweep(store.as_ref(), 0)
+            .await
+            .expect_err("sweep must refuse"),
         pstore_catalog::write_root(
             store.as_ref(),
             pstore_catalog::Root {

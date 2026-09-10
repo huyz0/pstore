@@ -48,9 +48,12 @@ mod keys;
 mod record;
 
 pub use append::Appender;
-pub use bucket::{BucketHead, Root, fold, read_head, read_root, reap, write_root};
+pub use bucket::{BucketHead, Root, fold, read_head, read_root, reap, sweep, write_root};
 pub use enumerate::{Enumeration, Mark, enumerate, enumerate_since};
-pub use keys::{DEFAULT_WIDTH, MAX_WIDTH, Width, bucket_of, head_key, root_key, run_key};
+pub use keys::{
+    DEFAULT_WIDTH, MAX_WIDTH, Width, bucket_of, bucket_prefix, head_key, parse_run_key, root_key,
+    run_key,
+};
 pub use record::{State, TenantRecord};
 
 /// Pending records a bucket pointer may carry before an append folds it inline.
