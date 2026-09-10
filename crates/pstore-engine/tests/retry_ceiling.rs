@@ -27,7 +27,7 @@ use pstore_engine::{Engine, EngineError};
 use pstore_format::Document;
 use pstore_types::{CasTag, LaneId, TenantId};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A correct store whose conditional writes start contending once armed.
 ///
@@ -37,11 +37,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct ArmedContention {
     inner: MemoryStore,
     armed: AtomicBool,
+    refused: AtomicU64,
 }
 
 impl ArmedContention {
     fn arm(&self) {
         self.armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Conditional writes refused since arming.
+    ///
+    /// ⚠️ **Asserting the error kind is not enough**, and the mutation gate said so: a guard
+    /// mutated to `false` gives up on the *first* contention and returns `Contended` — the
+    /// same error this test wanted, from a loop that never retried. `gc`'s guard survived
+    /// three such mutations against a test that checked only the kind.
+    fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 }
 
@@ -78,6 +89,7 @@ impl BlobStore for ArmedContention {
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
         if self.armed.load(Ordering::Relaxed) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
             return Err(CasError::Contended);
         }
         self.inner.put_conditional(key, body, pre).await
@@ -131,6 +143,12 @@ async fn a_compaction_that_keeps_contending_reports_contention_not_a_lost_race()
         "the loop ran out of attempts and reported {err:?} rather than what it actually saw. \
          `Lost` tells the caller to rebase against a HEAD that never moved"
     );
+    assert!(
+        store.refused() > 1,
+        "the compaction gave up after {} refusal(s): it reported the right error from a loop \
+         that never retried, which is what a guard mutated to `false` also does",
+        store.refused()
+    );
 }
 
 #[tokio::test]
@@ -153,6 +171,12 @@ async fn a_fold_that_keeps_contending_reports_contention_not_a_lost_race() {
     assert!(
         matches!(err, EngineError::Contended),
         "the fold loop reported {err:?} rather than what it saw"
+    );
+    assert!(
+        store.refused() > 1,
+        "the fold gave up after {} refusal(s): it reported the right error from a loop \
+         that never retried, which is what a guard mutated to `false` also does",
+        store.refused()
     );
 }
 
@@ -178,5 +202,11 @@ async fn a_gc_that_keeps_contending_reports_contention_not_a_lost_race() {
     assert!(
         matches!(err, EngineError::Contended),
         "the gc loop reported {err:?} rather than what it saw"
+    );
+    assert!(
+        store.refused() > 1,
+        "the gc gave up after {} refusal(s): it reported the right error from a loop \
+         that never retried, which is what a guard mutated to `false` also does",
+        store.refused()
     );
 }

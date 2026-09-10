@@ -520,6 +520,14 @@ impl<S: BlobStore> Engine<S> {
             // bundles this attempt did not read would drop them permanently — and nothing
             // downstream could tell, because the watermark is the only record of what is
             // outstanding.
+            //
+            // ⚠️ The `> 0` is a **size** guard, not a correctness one, and `> -> >=` is a
+            // provably equivalent mutant: both read sites treat an absent watermark as zero
+            // (`unwrap_or(0)` here, `is_some_and(|w| *w > seq.0)` in `head.rs`), so writing
+            // `lane -> 0` is indistinguishable from writing nothing. What it buys is a HEAD
+            // that does not grow a 16-byte entry per idle lane on every fold. Recorded so a
+            // sweep does not spend a round trying to kill it with a test that would only pin
+            // HEAD's encoded length.
             for (lane, _, tail) in &spans {
                 if *tail > 0 {
                     next.watermarks.insert(lane.0, *tail);
