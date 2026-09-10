@@ -157,3 +157,42 @@ async fn three_meta_entries_still_resolve_to_their_own_bytes() {
     assert_eq!(out[7].field("beta"), [vec![2.0, 7.0]]);
     assert!(seg.has_text());
 }
+
+#[tokio::test]
+async fn a_name_without_postings_writes_no_section() {
+    // ⚠️ The guard is on the POSTINGS, not on the caller having passed a name. A segment that
+    // records `["body"]` while carrying no posting list is a segment claiming an index it does
+    // not have, and a reader that trusts `text_fields()` then accepts a query it can only
+    // answer with nothing — which reads exactly like a term that does not occur.
+    //
+    // ⚠️ A second, non-text section is attached deliberately. Without one the guard's
+    // discrimination is untestable: with nothing else in `extra`, `*s == TextPostings` and
+    // `*s != TextPostings` agree, and so do `&&` and `||`. A mutation sweep said so —
+    // `writer.rs:411` survived `== -> !=` and `&& -> ||` until this fixture existed.
+    let docs = corpus("body");
+    let s = MemoryStore::new();
+    let key = Key::new("seg");
+    let mut w = SegmentWriter::new(4);
+    for d in &docs {
+        w.push(d.clone());
+    }
+    let built = text::build(&docs, "body");
+    let bytes = w
+        .with_section(Section::Fieldnorms, text::encode_norms(&built.fieldnorms))
+        .with_text_fields(&["body".to_owned()])
+        .try_finish()
+        .unwrap();
+    s.put(&key, bytes).await.unwrap();
+    let seg = Segment::open(&s, &key).await.unwrap();
+
+    assert!(!seg.has_text());
+    assert!(
+        seg.section(Section::TextFields).is_none(),
+        "a name was recorded for postings that were never attached"
+    );
+    assert!(seg.text_fields().is_empty());
+    assert!(
+        seg.section(Section::Fieldnorms).is_some(),
+        "the fixture's other section vanished, so it is not discriminating anything"
+    );
+}

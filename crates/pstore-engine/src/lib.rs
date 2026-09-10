@@ -754,7 +754,9 @@ impl<S: BlobStore> Engine<S> {
             [one] => one,
             many => {
                 return Err(EngineError::Format(format!(
-                    "cannot merge segments whose text indexes name different attributes:                      {}. Rebuilding over one of them writes no postings for the rows that                      carry the other",
+                    "cannot merge segments whose text indexes name different attributes: \
+                     {}. Rebuilding over one of them writes no postings for the rows that \
+                     carry the other",
                     many.join(", ")
                 )));
             }
