@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 
+# ⚠️ Test infrastructure: never linked into anything that runs, so it is outside the coverage
+# floor. `scripts/coverage.sh` reads this key rather than inferring shipping from the
+# dependency graph — inference put `pstore-engine`, the correctness core, outside the gate.
+[package.metadata.pstore]
+ships = false
+
 [lints]
 workspace = true
 

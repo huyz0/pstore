@@ -36,7 +36,7 @@ Three principles, applied in this order:
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 5 | **`scripts/coverage.sh` excludes `pstore-engine`**, because nothing depends on it outside `[dev-dependencies]` — the composition root does not exist yet. ⚠️ Fixing the classifier changes the workspace number and may put the gate red; that is the point, and it is a decision to take deliberately rather than a side effect. | [M7a](M7a/VERIFIED.md) | M |
+| ~~5~~ | ~~**`scripts/coverage.sh` excludes `pstore-engine`**~~ **DONE.** A crate declares `[package.metadata.pstore] ships = false` instead of the gate inferring it, so the default is *measured* and opting out shows up in a diff. The gate still passes with the correctness core in scope: **95.41%**. | [M7a](M7a/VERIFIED.md) | M |
 
 ## Phase 3 — the format decision that gets dearer every week
 

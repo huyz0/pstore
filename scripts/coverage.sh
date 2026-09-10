@@ -14,22 +14,32 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Every workspace member, and every member named as a NON-dev dependency by any member.
+# Which members SHIP, and therefore belong inside the floor.
+#
+# ⚠️ **A crate declares this; it is not inferred from the dependency graph.** The first
+# version computed it — "a crate nothing depends on outside `[dev-dependencies]` does not
+# ship" — which is sound reasoning and was wrong about the most important crate in the
+# workspace. `pstore-engine` holds the commit protocol and Invariant I1, and it is named only
+# as a **dev**-dependency of `pstore-index`, because the composition root that will depend on
+# it does not exist yet. So the correctness core sat outside the coverage gate, and the line
+# saying so was printed on every run and read by nobody. Found in M7a.
+#
+# Inference gets the default backwards. A new crate that nothing depends on yet is *most*
+# likely to be new code that needs the floor, and it was the case the rule silently excluded.
+# Declaring it inverts that: a crate is measured unless it says otherwise, and saying
+# otherwise is a line in a `Cargo.toml` that shows up in a diff — the same argument
+# `unsafe_code = "forbid"` makes for the `unsafe` audit.
+#
+#     [package.metadata.pstore]
+#     ships = false   # test infrastructure: never linked into anything that runs
 scope=$(cargo metadata --no-deps --format-version 1 | python3 -c '
 import json, sys
 md = json.load(sys.stdin)
-names = {p["name"] for p in md["packages"]}
-# A dependency with kind "dev" carries kind == "dev"; a normal one carries null.
-runtime = set()
-for p in md["packages"]:
-    for d in p["dependencies"]:
-        if d["name"] in names and d.get("kind") != "dev":
-            runtime.add(d["name"])
-# A member is shipped if anything depends on it at runtime, or if nothing depends on it at
-# all but it is not test infrastructure -- i.e. it is a root. Roots are shipped: they are
-# what a binary would link.
-depended = {d["name"] for p in md["packages"] for d in p["dependencies"] if d["name"] in names}
-test_only = sorted(n for n in names if n in depended and n not in runtime)
+test_only = sorted(
+    p["name"]
+    for p in md["packages"]
+    if (p.get("metadata") or {}).get("pstore", {}).get("ships") is False
+)
 
 # Binary ENTRY POINTS are composition roots: they read the environment, open connections and
 # loop, and nothing outside the operating system can call them. `cargo test` cannot reach one,

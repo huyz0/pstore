@@ -137,15 +137,18 @@ checking less than it says.
   had never compiled. Fixed by adding `--features pstore-blob/object_store` to
   `.cargo/mutants.toml`, which is what turned 6 missed into 0. `object_store` and not `compat`,
   because `compat` would pull three cloud clients into all 134 per-mutant builds for nothing.
-- ⚠️ **`scripts/coverage.sh` excludes `pstore-engine`.** Its scope is computed — "a crate that
-  no other crate depends on outside `[dev-dependencies]` does not ship" — and `pstore-engine` is
-  named only as a **dev**-dependency of `pstore-index`, because the composition root that would
-  depend on it does not exist yet. So the correctness core, where the commit protocol and
-  Invariant I1 live, **is not in the coverage gate at all**: `pstore-cache pstore-engine
-  pstore-testkit main.rs` is printed on every run and had not been read. Measured directly for
-  this ledger: `lib.rs` 94.55%, `head.rs` 96.00%, `lanes.rs` 93.29%, `bundle.rs` 90.79%.
-  **Not fixed here** — including it changes the workspace number and may put the gate red, which
-  is a decision with its own change, not a side effect of this one.
+- ⚠️ **`scripts/coverage.sh` excluded `pstore-engine`.** Its scope was *computed* — "a crate
+  that no other crate depends on outside `[dev-dependencies]` does not ship" — and
+  `pstore-engine` is named only as a **dev**-dependency of `pstore-index`, because the
+  composition root that will depend on it does not exist yet. So the correctness core, where
+  the commit protocol and Invariant I1 live, was **not in the coverage gate at all**:
+  `pstore-cache pstore-engine pstore-testkit main.rs` was printed on every run and read by
+  nobody. **Fixed after this ledger**: a crate now *declares* `[package.metadata.pstore] ships
+  = false`, so the default is measured and opting out is a line in a `Cargo.toml` that shows up
+  in a diff — the argument `unsafe_code = "forbid"` already makes for the `unsafe` audit.
+  Inference had the default backwards: a crate nothing depends on yet is most likely to be new
+  code that needs the floor. ⚠️ The gate **still passes** with the core in scope, **95.41%** —
+  it was well tested and simply never counted. Weakest file now in scope: `bundle.rs` 90.79%.
 
 ## What is not built, and named rather than omitted
 
