@@ -62,7 +62,13 @@ project's spec preamble warns about, and it caught this milestone twice.
    `scripts/depth.sh` **depth 1 + 1**, 6,358 and 2,024 bytes exact at 20,000 rows.
 9. **Gates** — `./scripts/gates.sh` green. Coverage: `pstore-query/src/fuse.rs` **100%**
    regions, lines and functions; `run.rs` **96.47%** regions, **100%** functions; workspace
-   **95.42%** via `./scripts/coverage.sh --fail-under-regions 95`.
+   **95.42%** via `./scripts/coverage.sh --fail-under-regions 95`. Mutation, in the `dev`
+   container over both changed modules
+   (`scripts/mutants.sh --file crates/pstore-query/src/fuse.rs crates/pstore-query/src/run.rs`):
+   **21 mutants, 16 caught, 0 missed, 5 unviable**.
+   ⚠️ Run **after** the two fixture rebuilds, not before them — a sweep is a statement about
+   the tree that produced it, and this tree is the third one. The first two would each have
+   reported a survivor.
 
 ## What is not built, and named rather than omitted
 
