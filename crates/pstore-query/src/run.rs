@@ -97,10 +97,14 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
-    // ⚠️ Refused BEFORE any I/O, and refused **once**. Converting to a type with no `Text`
-    // variant is what makes that structural: a second refusal inside the runner would be a
-    // second place to get it wrong, and an arm that falls through to `Ok(vec![])` is exactly
-    // the failure this milestone exists to prevent.
+    // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
+    // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
+    // be written.
+    //
+    // ⚠️ A text leg naming the wrong FIELD is a different question and it moved (M6c.2). It
+    // can only be answered by the segment, so it costs the open round — a real regression on
+    // an error path, taken deliberately: comparing against `DEFAULT_TEXT_FIELD` was free and
+    // was the right answer only while every segment was built over the constant.
     let runnable = prefetch
         .iter()
         .map(Runnable::try_from)
@@ -116,6 +120,7 @@ pub async fn query<S: BlobStore>(
 /// A leg this build can actually run.
 enum Runnable<'a> {
     Text {
+        field: &'a str,
         query: &'a str,
         limit: usize,
     },
@@ -157,23 +162,21 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 query,
                 limit: *limit,
             }),
-            // ⚠️ The field is CHECKED, not ignored. A segment has one text field, so a
-            // request naming another would otherwise be answered with the `text` field's
-            // ranking and nothing anywhere would say so — D-73's failure at field
-            // granularity. Both sibling legs already refuse an unknown field name.
+            // ⚠️ The field is CHECKED, not ignored — but the check is in `leg`, against the
+            // name the SEGMENT carries. A segment has one text field and a request naming
+            // another would otherwise be answered with that field's ranking, with nothing
+            // anywhere saying so — D-73's failure at field granularity. Comparing against
+            // `DEFAULT_TEXT_FIELD` here was the same check while every segment was built over
+            // the constant, and became the failure itself the moment one was not.
             Prefetch::Text {
                 field,
                 query,
                 limit,
-            } => {
-                if field != pstore_format::text::DEFAULT_TEXT_FIELD {
-                    return Err(QueryError::Format(FormatError::UnknownField));
-                }
-                Ok(Self::Text {
-                    query,
-                    limit: *limit,
-                })
-            }
+            } => Ok(Self::Text {
+                field,
+                query,
+                limit: *limit,
+            }),
             Prefetch::Trigram { .. } => Err(QueryError::Unimplemented("trigram")),
         }
     }
@@ -235,7 +238,17 @@ async fn leg<S: BlobStore>(
     r: &Runnable<'_>,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
-        Runnable::Text { query, limit } => {
+        Runnable::Text {
+            field,
+            query,
+            limit,
+        } => {
+            // ⚠️ Refused, never answered from the wrong field. An empty result would be the
+            // kinder-looking failure and the worse one: a caller cannot tell it from a term
+            // that simply does not occur.
+            if !opened.segment.text_fields().iter().any(|f| f == field) {
+                return Err(QueryError::Format(FormatError::UnknownField));
+            }
             let raw = opened.terms.as_ref().ok_or(FormatError::Corrupt(
                 "a text leg over a segment with no term dictionary sidecar",
             ))?;

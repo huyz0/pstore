@@ -322,6 +322,12 @@ pub fn build_all(
                 Section::Fieldnorms,
                 pstore_format::text::encode_norms(&t.fieldnorms),
             );
+        // ⚠️ Recorded, not assumed. `build_all` is already told the attribute; a segment that
+        // does not carry the name leaves every reader comparing against the constant, which
+        // answers a `text` query with this field's ranking and says nothing.
+        if let Some(name) = text_field {
+            w = w.with_text_fields(&[name.to_owned()]);
+        }
     }
 
     Built {
