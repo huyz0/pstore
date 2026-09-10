@@ -24,7 +24,12 @@ the failure read. Command: `cargo test -p pstore-catalog --test sweep`.
    red by flipping the default to "delete what does not parse". Special-casing `HEAD` by name
    would pass half of this and still delete everything a later milestone puts beside it.
    `run_key_round_trips_through_parse` pins the other half: `parse_run_key` is the inverse of
-   `run_key`, refuses another bucket's key, and refuses four near-miss shapes.
+   `run_key`, refuses another bucket's key, and refuses six near-miss shapes.
+   ⚠️ **Two of those six came from the sweep.** The width check is
+   `epoch.len() != 20 || digest.len() != 16`, and `&&` survived — because every near-miss the
+   test had got *both* fields wrong, so the two operators agreed on all of them. A key with a
+   valid 20-digit epoch and a short digest is what separates them, and under `&&` it parses:
+   the sweeper would delete an object that is not a run at all.
 5. **It records nothing and is idempotent** — `a_second_sweep_finds_nothing_and_changes_nothing`:
    the second sweep returns 0 and the head object is byte-identical. An orphan is defined by
    *absence* from the head, so there is nothing to write down — which is also what makes this
@@ -33,7 +38,9 @@ the failure read. Command: `cargo test -p pstore-catalog --test sweep`.
    asserts `BackendCannotFence` **and zero deletes**, and `sweep` is added to `refusal.rs`'s
    existing loop over every guarded door.
 7. **Gates** — `./scripts/gates.sh` green; workspace regions green via
-   `./scripts/coverage.sh --fail-under-regions 95`.
+   `./scripts/coverage.sh --fail-under-regions 95`. Mutation over `keys.rs`, in the `dev`
+   container: **34 mutants, 29 caught, 1 missed, 4 unviable** on the first run — the miss is
+   criterion 4's width check above — and **30 of 30 viable caught** after it.
    ⚠️ **`pstore-catalog` itself measures 94.90% regions, below the 95% this criterion states,
    and it is reported rather than rounded.** The gap is `append.rs` at 88.75%, and it is the
    mutex **poison** branches in the appender's observe path, which degrade to "record

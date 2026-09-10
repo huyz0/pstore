@@ -193,7 +193,20 @@ mod tests {
             assert_eq!(parse_run_key(bucket.wrapping_add(1), &k), None, "{k:?}");
         }
         // Everything else under the prefix is kept, which is the safe default.
-        for other in ["HEAD", "notes.txt", "0000-0000", "not-a-run"] {
+        //
+        // ⚠️ **Both one-sided cases**, because the width check is an `||` and a mutation sweep
+        // found `&&` indistinguishable without them: every near-miss above gets BOTH fields
+        // wrong, so the two operators agree. A key with a valid 20-digit epoch and a short
+        // digest is the one that separates them — and under `&&` it parses, which lets the
+        // sweeper delete an object that is not a run at all.
+        for other in [
+            "HEAD",
+            "notes.txt",
+            "0000-0000",
+            "not-a-run",
+            "00000000000000000001-abcd",
+            "1-0123456789abcdef",
+        ] {
             let k = Key::new(format!("{}{other}", bucket_prefix(3).as_str()));
             assert_eq!(parse_run_key(3, &k), None, "{other}");
         }
