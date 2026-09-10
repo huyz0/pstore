@@ -76,16 +76,19 @@ every segment forever, not the cost of waiting.
 
 ## Where this stands
 
-⚠️ **Every row the original audit carried forward is closed or explicitly blocked.** What is
-left open below — 10b, 12 and 13 — was **found by doing the work**, not carried in:
+⚠️ **Every row the original audit carried forward is closed or explicitly blocked, and so is
+every row the work opened along the way.** What is left is the table below.
 
 | # | Found by | Why it is not done |
 |---|---|---|
 | **10b** | [M6a](M6a/VERIFIED.md), narrowed by [M6d](M6d/VERIFIED.md) | Blocked on a protocol keeping an old-width reader stale rather than wrong, and on a key-format change. M6d removed the write-once-root blocker underneath it. Nothing waits on it at 16,384 buckets. |
-| ~~12~~ | [M5f](M5f/VERIFIED.md) | **Done** — [M5g](M5g/VERIFIED.md). |
 | **14** | [M5g](M5g/VERIFIED.md) | Boundary replication is off in the engine because it writes a row twice, costing r@10 p=2 **0.961 → 0.844**. Recovering it needs list membership that does not duplicate a row — a layout change. |
 | **15** | [M5g](M5g/VERIFIED.md) | `Engine::query` is indexed-but-stale and `Engine::search` is fresh-but-exact. Closing the gap needs something that can score unindexed memtable rows into a `(segment, row)` fusion. |
-| ~~13~~ | [M6d](M6d/VERIFIED.md) | **Done** — [M6e](M6e/VERIFIED.md), and the cost is priced: one LIST per bucket. |
+| **16** | [M6e](M6e/VERIFIED.md) | The appender's lock-poison arms, reachable only by a thread that panics while holding a private lock. S, and the reason `pstore-catalog` reads 94.90% against M6e's own 95% criterion. |
+
+⚠️ **Items 12 and 13 were opened and closed inside the same run of work** — the ANN index at
+fold time ([M5g](M5g/VERIFIED.md)) and the orphan sweeper ([M6e](M6e/VERIFIED.md)). What each
+left behind is above, and each is smaller than what it replaced.
 
 ⚠️ **Two items closed by measuring instead of building** — 6 and 6b, where the pruning the
 format existed for skips **zero bytes**, and this file's own ordering principle 2 had ranked
