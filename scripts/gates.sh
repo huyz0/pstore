@@ -15,9 +15,11 @@ run "scripts/check-dev-env.sh"     ./scripts/check-dev-env.sh
 run "cargo fmt --check"            cargo fmt --all --check
 run "cargo clippy -D warnings"     cargo clippy --all-targets --all-features -- -D warnings
 run "cargo test"                   cargo test --workspace --all-features --quiet
+run "scripts/check-poison.sh"      ./scripts/check-poison.sh
 run "scripts/check-links.sh"       ./scripts/check-links.sh
 run "scripts/build-index.py --check" ./scripts/build-index.py --check
 run "scripts/check-verified.py"    ./scripts/check-verified.py
 run "scripts/selftest-review.sh"   ./scripts/selftest-review.sh
 run "scripts/selftest-check-verified.sh" ./scripts/selftest-check-verified.sh
+run "scripts/check-poison.sh --selftest" ./scripts/check-poison.sh --selftest
 echo "all gates green"

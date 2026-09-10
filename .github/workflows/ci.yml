@@ -144,6 +144,7 @@ jobs:
       # Rungs 3 and 5 of the gate-design ladder: predicates over files in the tree,
       # so no agent is asked to check them.
       - run: ./scripts/check-dev-env.sh
+      - run: ./scripts/check-poison.sh
       - run: ./scripts/check-links.sh
       - run: ./scripts/build-index.py --check
       # The round counter is the mechanism that bounds review, so it is tested --
@@ -155,3 +156,4 @@ jobs:
       # is the only part of it a predicate can catch.
       - run: ./scripts/check-verified.py
       - run: ./scripts/selftest-check-verified.sh
+      - run: ./scripts/check-poison.sh --selftest

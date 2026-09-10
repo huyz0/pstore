@@ -46,17 +46,29 @@ impl<S: BlobStore> Appender<S> {
     /// If the store refuses, an object is malformed, or the bucket stays contended.
     pub async fn observe(&self, rec: &TenantRecord) -> Result<bool, CatalogError> {
         let identity = rec.identity();
+        // ⚠️ **`into_inner`, not a dropped `Result`.** These two locks used to be handled with
+        // `is_ok_and` and `if let Ok(..)`, which read a poisoned lock as "not seen" and then
+        // **skipped the insert** — leaving this appender with no memory of the tenant, so
+        // every later `observe` for it records unconditionally. That turns the lifecycle-rate
+        // append this type's doc says C-12's bounded write depends on into a **commit-rate**
+        // one, silently, against the same registers the trade was measured on.
+        //
+        // Recovering the value is what the other six modules in the tree do, and
+        // `scripts/check-poison.sh` now refuses the form that does not.
         if self
             .seen
             .lock()
-            .is_ok_and(|s| s.get(&rec.tenant) == Some(&identity))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&rec.tenant)
+            == Some(&identity)
         {
             return Ok(false);
         }
         self.record(rec).await?;
-        if let Ok(mut seen) = self.seen.lock() {
-            seen.insert(rec.tenant, identity);
-        }
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(rec.tenant, identity);
         Ok(true)
     }
 

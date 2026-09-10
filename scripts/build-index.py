@@ -89,6 +89,25 @@ for e in sorted(tbl_scripts - ci_scripts):
     stale = True
     print(f"STALE AGENTS.md Gates: the table lists {e}, CI does not run it", file=sys.stderr)
 
+# ⚠️ **And the third set.** This compared CI against the table and nothing against
+# `gates.sh` -- so a gate added to `gates.sh` alone runs locally, never runs in CI, and both
+# sets agree that everything is fine. Found while adding `check-poison.sh`, which is exactly
+# the failure that gate exists to prevent, one level up. `gates.sh` is what a developer runs
+# and `ci.yml` is what merges; they must be the same set.
+gates_sh = (ROOT / "scripts/gates.sh").read_text()
+sh_scripts = {m for m in re.findall(r"\./(scripts/[\w.-]+)", gates_sh) if "selftest-" not in m}
+#
+# ⚠️ **One direction only, and the asymmetry is the point.** Everything `gates.sh` runs must
+# also run in CI -- a gate that only ever runs locally does not gate anything. The converse is
+# false on purpose: `coverage.sh`, `recall.sh`, `ndcg.sh`, `depth.sh` and `mutants.sh` run in
+# CI and are deliberately absent from the fast local script, which is why its header calling
+# itself "every gate" is optimistic. Checking both ways reported those five as drift on the
+# first run.
+for m in sorted(sh_scripts - ci_scripts):
+    stale = True
+    print(f"STALE gates: gates.sh runs {m}, ci.yml does not -- it would never gate a merge",
+          file=sys.stderr)
+
 if CHECK and stale:
     print("FAIL run scripts/build-index.py to refresh", file=sys.stderr)
     sys.exit(1)

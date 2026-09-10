@@ -82,6 +82,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `scripts/coverage.sh --fail-under-regions 95` | the **region** floor on the crates that ship; the test-only set is derived from the dependency graph, not named |
 | `scripts/mutants.sh` | D-111 — the gate that makes coverage mean something. **Incremental by default**: a full sweep is 462 mutants × a 70-second suite, so the bare command tests only what this branch changed, and the full sweep is nightly and sharded |
 | `cargo deny check` | licences, advisories, and the `object_store` ban outside `pstore-blob` |
+| `scripts/check-poison.sh` | shipping code **recovers** a poisoned lock rather than dropping the `Result`. ⚠️ `pstore-catalog`'s appender read a poisoned lock as "not seen" and then skipped the insert that remembers what it wrote — losing its dedupe for that tenant for the life of the process, and turning the lifecycle-rate append C-12's bounded write depends on into a commit-rate one. A coverage number found it two milestones later. Rung 3 |
 | `scripts/check-links.sh` | every relative markdown link resolves |
 | `scripts/build-index.py --check` | the generated regions in `AGENTS.md` are current, and the Gates table matches what CI runs |
 | `scripts/check-verified.py` | every acceptance criterion has an evidence line, and every test it names resolves (OQ-167) |
