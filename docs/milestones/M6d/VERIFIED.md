@@ -10,6 +10,11 @@ the failure read. Command: `cargo test -p pstore-catalog --test reap`.
    the first run is gone, the run the head names is present, and `enumerate` still returns
    both records. ⚠️ The live run is never a graveyard entry, so keeping none of the dead ones
    cannot touch it — and if it could, this is where a bucket of tenants vanishes.
+   ⚠️ **The sweep added a third assertion: the graveyard must SHRINK.** Deleting the
+   `graveyard:` field from the head `reap` writes back survived every test — it deletes the
+   objects and keeps naming them, so the record never converges, stays pinned at its bound,
+   and every later reap re-deletes the same absent keys and **reports work it did not do**.
+   Observed red, together with a second `reap` now required to return 0.
 2. **The window is counted in folds** — `the_retention_window_is_counted_in_folds`: with
    `retention = 2` a superseded run survives the next two folds and goes on the third.
    Observed red by splitting the newest-first graveyard from the wrong end, which reaps
@@ -30,7 +35,9 @@ the failure read. Command: `cargo test -p pstore-catalog --test reap`.
    accident is now pinned.
 6. **A retention wider than the record is refused** —
    `a_retention_wider_than_the_graveyard_is_refused`: `MAX_GRAVEYARD + 1` errors and deletes
-   nothing. Observed red by accepting it. ⚠️ A window of 20 against a record of 8 evicts runs
+   nothing, **and `MAX_GRAVEYARD` itself is accepted**. Observed red by accepting the wider
+   one, and — the sweep's other finding — by widening `>` to `>=`, which refuses the widest
+   window the record can actually keep and turns off a usable knob. ⚠️ A window of 20 against a record of 8 evicts runs
    9 through 20 from the graveyard *while they are still inside the window they were promised*,
    and a run nobody can name is garbage forever. A promise larger than the record is refused
    rather than silently broken.
@@ -60,6 +67,10 @@ the failure read. Command: `cargo test -p pstore-catalog --test reap`.
     workspace green via `./scripts/coverage.sh --fail-under-regions 95`.
     ⚠️ 94.85% before criterion 10's tests and **94.93%** after the first of them — the floor is
     what forced the write-once finding out into the open rather than something noticed later.
+    Mutation, in the `dev` container over the changed module
+    (`scripts/mutants.sh --file crates/pstore-catalog/src/bucket.rs`): **45 mutants, 35 caught,
+    2 missed, 8 unviable** on the first run; both misses were in `reap` and are the two
+    additions recorded under criteria 1 and 6.
 
 ## What is not built, and named rather than omitted
 

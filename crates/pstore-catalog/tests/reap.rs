@@ -74,6 +74,22 @@ async fn a_superseded_run_is_reaped_and_the_live_one_is_not() {
             .len(),
         2
     );
+
+    // ⚠️ The graveyard must SHRINK, and a mutation sweep found nothing asserting it: writing
+    // the head back with the entries intact deletes the objects and keeps naming them, so
+    // every later reap re-deletes the same absent keys and reports work it did not do. The
+    // record never converges and stays pinned at its bound.
+    let (head, _) = read_head(store.as_ref(), 0).await.unwrap();
+    assert!(
+        head.graveyard.is_empty(),
+        "reap deleted the runs and left the head still naming them: {:?}",
+        head.graveyard
+    );
+    assert_eq!(
+        reap(store.as_ref(), 0, 0).await.unwrap(),
+        0,
+        "a second reap found work to do, so the first did not record what it deleted"
+    );
 }
 
 #[tokio::test]
@@ -188,6 +204,16 @@ async fn a_retention_wider_than_the_graveyard_is_refused() {
         store.get(&runs[0]).await.is_ok(),
         "a refused reap deleted anyway"
     );
+
+    // ⚠️ And the boundary itself is ACCEPTED. Refusing `MAX_GRAVEYARD` too would reject the
+    // widest window the record can actually keep — a usable knob turned off. The sweep found
+    // `>` and `>=` indistinguishable until this line existed.
+    assert_eq!(
+        reap(store.as_ref(), 0, MAX_GRAVEYARD).await.unwrap(),
+        0,
+        "the widest window the record can keep was refused"
+    );
+    assert!(store.get(&runs[0]).await.is_ok());
 }
 
 #[tokio::test]
