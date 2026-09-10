@@ -1,0 +1,22 @@
+[package]
+name        = "pstore-meter"
+version     = "0.1.0"
+description = "Per-tenant token buckets over blob requests and bytes, and the decorator that refuses before it dispatches."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pstore-blob  = { path = "../pstore-blob" }
+pstore-types = { path = "../pstore-types" }
+async-trait  = "0.1"
+bytes        = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+pstore-testkit = { path = "../pstore-testkit" }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1105,6 +1105,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pstore-meter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "pstore-blob",
+ "pstore-testkit",
+ "pstore-types",
+ "tokio",
+]
+
+[[package]]
 name = "pstore-node"
 version = "0.1.0"
 dependencies = [
