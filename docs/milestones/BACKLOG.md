@@ -42,7 +42,7 @@ Three principles, applied in this order:
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 6 | **[M5d](M5d/SPEC.md) — the block-max *format*.** Specced, split out of a larger one. Writes the metadata so segments stop accruing unprunable debt; prunes nothing. | [M5c](M5c/VERIFIED.md), C-11 | M |
+| 6 | **[M5d](M5d/SPEC.md) — the block-max *format*.** Specced, built, **reverted, and amended**. ⚠️ Measured at gate scale, the block table grows the dictionary sidecar from 28,030 to 616,994 bytes — **22×** — and that object is fetched `Pinned` and whole on every text query. A dictionary scales with terms; a block table scales with postings. The existing test `the_term_dictionary_scales_with_terms_not_documents` caught it and is right. Needs a place for per-posting metadata that is not fetched whole per query, before anything else. | [M5c](M5c/VERIFIED.md), C-11 | M |
 | 6b | **M5e — the pruning**, unwritten. ⚠️ Two spec-review rounds found a blocking defect in each draft of the pruning half: an upper bound alone cannot prune before a fetch (θ = 0), and a lower bound fixes that for one term but is **unsound for disjunctive multi-term queries**, where a block bounds one term's addend and not a document's score. Corrected, the gain mostly evaporates — the witness term's own maximum exceeds θ, so no other term's blocks are prunable. M5d's spec carries the five questions M5e must answer, including whether the answer is impact-ordered postings instead. | [M5d](M5d/SPEC.md) | L |
 
 ## Phase 4 — the handoffs named by three milestones each

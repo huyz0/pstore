@@ -29,6 +29,39 @@ drops real hits. So what is stored is what the writer actually knows — `tf` an
 extrema, all exact local facts — and the bound is computed at query time from the query's own
 `(k1, b, avg_len)`.
 
+## ⚠️ AMENDED AFTER IMPLEMENTATION — the sidecar is the wrong place, and it is 22× wrong
+
+Criterion 6 said the block table would add "under **25%**" to the dictionary sidecar. Built and
+measured at gate scale — 20,000 documents, 120 tokens each, Zipf-ish over a 30,000-term
+vocabulary — it adds **2,100%**:
+
+| | bytes |
+|---|---|
+| dictionary, v1 | **28,030** |
+| dictionary, v2 with the block table | **616,994** |
+
+The reason is structural and should have been obvious from the two numbers the design already
+had. A dictionary scales with **terms**; a block table scales with **postings**, at 24 bytes
+per 128 of them. 4.5M postings is ~850 KB of metadata against a 28 KB dictionary — and the
+sidecar is fetched `Class::Pinned` and **whole, on every text query**. D-13 says "index
+section (cached, **tiny**)", and tiny is the word this design lost.
+
+⚠️ An existing test was already pinning exactly this property —
+`the_term_dictionary_scales_with_terms_not_documents` — and it went red. **It is right and the
+spec was wrong**; weakening it to land this would have been the "never weaken a test to make a
+check pass" non-negotiable, violated to buy a feature whose benefit two review rounds could not
+establish.
+
+**So M5d is not implemented, and it is not ready to be.** What it needs first is a place for
+per-posting metadata that is *not* fetched whole on every query — a separate object, or a
+section fetched by range against the blocks a query actually wants. That is a layout decision,
+it interacts with M5e's unanswered questions, and inventing it here would be the third
+unreviewed design in a row.
+
+The revert is deliberate: **no segment is worse off**, because the metadata that was never
+written is metadata a compaction pass adds later, and the same argument that made writing it
+urgent also makes writing the *wrong* one costly — it would be in every segment from now on.
+
 ## ⚠️ This milestone writes the metadata and prunes nothing. That is the split, and why
 
 The first two drafts specified the pruning too, and **spec review found a blocking defect in
