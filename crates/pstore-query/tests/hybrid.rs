@@ -19,7 +19,7 @@ use pstore_blob::{Accounted, BlobStore, Key, MemoryStore, OpClass};
 use pstore_format::{DEFAULT_FIELD, Document, Impact, Value, VectorField, sparse, text};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
-use pstore_query::{Fusion, Prefetch, QueryError, query};
+use pstore_query::{Fusion, Prefetch, QueryError, Target, query};
 use pstore_testkit::depth::DepthCounting;
 use pstore_types::TenantId;
 
@@ -30,6 +30,17 @@ const DIM: usize = 8;
 /// ⚠️ Pinned: at the 64 KiB default the coalescer merges a fixture's whole section, and a
 /// request count measured there is a property of the fixture rather than of the code.
 const GAP: u64 = 256;
+
+/// One segment, as the query now takes them.
+///
+/// ⚠️ Paired rather than two arguments: a centroid table belongs to one segment, and a shared
+/// one would give every segment's dense leg another segment's clusters.
+fn one(segment: &Key, centroids: &Key) -> [Target; 1] {
+    [Target {
+        segment: segment.clone(),
+        centroids: centroids.clone(),
+    }]
+}
 
 fn hybrid_doc(i: usize) -> Document {
     let mut d = Document::new(
@@ -155,7 +166,7 @@ async fn a_hybrid_query_opens_the_segment_once() {
     // area, before the meta region.
     let len = view.head(&seg).await.unwrap();
     acct.record_ranges();
-    let hits = query(&view, &seg, &cen, &legs(&docs), Fusion::default(), 10)
+    let hits = query(&view, &one(&seg, &cen), &legs(&docs), Fusion::default(), 10)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "the fixture produced no hits at all");
@@ -184,19 +195,19 @@ async fn a_hybrid_query_is_no_deeper_than_its_deepest_leg() {
 
     let l = legs(&docs);
     s.reset();
-    query(&s, &seg, &cen, &l, Fusion::default(), 10)
+    query(&s, &one(&seg, &cen), &l, Fusion::default(), 10)
         .await
         .unwrap();
     let both = s.depth();
 
     s.reset();
-    query(&s, &seg, &cen, &l[..1], Fusion::default(), 10)
+    query(&s, &one(&seg, &cen), &l[..1], Fusion::default(), 10)
         .await
         .unwrap();
     let dense_only = s.depth();
 
     s.reset();
-    query(&s, &seg, &cen, &l[1..], Fusion::default(), 10)
+    query(&s, &one(&seg, &cen), &l[1..], Fusion::default(), 10)
         .await
         .unwrap();
     let sparse_only = s.depth();
@@ -229,7 +240,7 @@ async fn an_unimplemented_retriever_is_refused() {
         pattern: "quarterly.*revenue".to_owned(),
         limit: 20,
     });
-    match query(&store, &seg, &cen, &l, Fusion::default(), 10).await {
+    match query(&store, &one(&seg, &cen), &l, Fusion::default(), 10).await {
         Err(QueryError::Unimplemented(which)) => assert_eq!(which, "trigram"),
         other => panic!("a trigram prefetch was not refused by name: {other:?}"),
     }
@@ -247,8 +258,7 @@ async fn a_refused_retriever_costs_no_requests() {
     let before = acct.count(t, OpClass::Read);
     let _ = query(
         &view,
-        &seg,
-        &cen,
+        &one(&seg, &cen),
         &[Prefetch::Trigram {
             field: "body".to_owned(),
             pattern: "x".to_owned(),
@@ -279,15 +289,14 @@ async fn an_empty_leg_is_not_an_error() {
         query: vec![(900_000, 1.0)],
         limit: 20,
     };
-    let hits = query(&store, &seg, &cen, &l, Fusion::default(), 10)
+    let hits = query(&store, &one(&seg, &cen), &l, Fusion::default(), 10)
         .await
         .expect("a leg that matched nothing was an error");
     assert!(!hits.is_empty(), "the dense leg's hits were lost with it");
 
     let none = query(
         &store,
-        &seg,
-        &cen,
+        &one(&seg, &cen),
         &[Prefetch::Sparse {
             field: SPARSE.to_owned(),
             query: vec![(900_000, 1.0)],
@@ -314,12 +323,18 @@ async fn a_legs_limit_bounds_only_that_leg() {
     if let Prefetch::Sparse { limit, .. } = &mut l[1] {
         *limit = 2;
     }
-    let hits = query(&store, &seg, &cen, &l, Fusion::default(), 50)
+    let hits = query(&store, &one(&seg, &cen), &l, Fusion::default(), 50)
         .await
         .unwrap();
-    let wide = query(&store, &seg, &cen, &legs(&docs), Fusion::default(), 50)
-        .await
-        .unwrap();
+    let wide = query(
+        &store,
+        &one(&seg, &cen),
+        &legs(&docs),
+        Fusion::default(),
+        50,
+    )
+    .await
+    .unwrap();
     assert!(
         hits.len() < wide.len(),
         "narrowing one leg to 2 did not narrow the fused answer ({} against {})",
@@ -359,10 +374,10 @@ async fn a_dense_query_is_unaffected_by_the_sparse_field_beside_it() {
         .unwrap();
 
     let leg = &legs(&docs)[..1];
-    let with_sparse = query(&store, &seg, &cen, leg, Fusion::default(), 10)
+    let with_sparse = query(&store, &one(&seg, &cen), leg, Fusion::default(), 10)
         .await
         .unwrap();
-    let without = query(&store2, &s2, &c2, leg, Fusion::default(), 10)
+    let without = query(&store2, &one(&s2, &c2), leg, Fusion::default(), 10)
         .await
         .unwrap();
     assert!(!with_sparse.is_empty(), "the dense leg returned nothing");
@@ -391,14 +406,14 @@ async fn a_three_leg_query_is_no_deeper_than_its_deepest_leg() {
     });
 
     s.reset();
-    let three = query(&s, &seg, &cen, &l, Fusion::default(), 10)
+    let three = query(&s, &one(&seg, &cen), &l, Fusion::default(), 10)
         .await
         .unwrap();
     let depth_three = s.depth();
     assert!(!three.is_empty(), "the three-leg query returned nothing");
 
     s.reset();
-    query(&s, &seg, &cen, &l[2..], Fusion::default(), 10)
+    query(&s, &one(&seg, &cen), &l[2..], Fusion::default(), 10)
         .await
         .unwrap();
     let text_only = s.depth();
@@ -422,8 +437,7 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
     let (seg, cen) = put_with_text(&store, &docs).await;
     let hits = query(
         &store,
-        &seg,
-        &cen,
+        &one(&seg, &cen),
         &[Prefetch::Text {
             field: text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "Quarterly, REVENUE".to_owned(),
@@ -441,8 +455,7 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
     assert!(
         query(
             &store,
-            &bare,
-            &bare_cen,
+            &one(&bare, &bare_cen),
             &[Prefetch::Text {
                 field: text::DEFAULT_TEXT_FIELD.to_owned(),
                 query: "revenue".to_owned(),
@@ -472,11 +485,17 @@ async fn a_dense_and_a_sparse_query_are_unaffected_by_a_text_field() {
     let (seg_p, cen_p) = put(&without, &docs).await;
 
     for (n, leg) in legs(&docs).into_iter().enumerate() {
-        let one = std::slice::from_ref(&leg);
-        let a = query(&with_text, &seg_t, &cen_t, one, Fusion::default(), 10)
-            .await
-            .unwrap();
-        let b = query(&without, &seg_p, &cen_p, one, Fusion::default(), 10)
+        let only = std::slice::from_ref(&leg);
+        let a = query(
+            &with_text,
+            &one(&seg_t, &cen_t),
+            only,
+            Fusion::default(),
+            10,
+        )
+        .await
+        .unwrap();
+        let b = query(&without, &one(&seg_p, &cen_p), only, Fusion::default(), 10)
             .await
             .unwrap();
         assert!(
@@ -505,8 +524,7 @@ async fn a_text_leg_naming_another_field_is_refused() {
     let (seg, cen) = put_with_text(&store, &docs).await;
     let wrong = query(
         &store,
-        &seg,
-        &cen,
+        &one(&seg, &cen),
         &[Prefetch::Text {
             field: "body".to_owned(),
             query: "revenue".to_owned(),
@@ -525,8 +543,7 @@ async fn a_text_leg_naming_another_field_is_refused() {
     assert!(
         !query(
             &store,
-            &seg,
-            &cen,
+            &one(&seg, &cen),
             &[Prefetch::Text {
                 field: text::DEFAULT_TEXT_FIELD.to_owned(),
                 query: "revenue".to_owned(),

@@ -71,6 +71,21 @@ pub enum QueryError {
     Format(#[from] FormatError),
 }
 
+/// One segment and the centroid table that belongs to it.
+///
+/// ⚠️ **Paired, never a shared centroids key.** A centroid table records *that* segment's
+/// cluster assignments, so pointing every segment's dense leg at one table returns another
+/// segment's clusters applied to these rows — a wrong candidate set that still answers.
+/// `VecIndex::open` already takes the two together, which is where the pairing belongs.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// The segment object.
+    pub segment: Key,
+    /// Its centroid table. Absent in the store is not an error: D-10 reads that as "scan me
+    /// exactly".
+    pub centroids: Key,
+}
+
 /// Which sidecars a query needs, derived from the legs.
 struct Opened {
     segment: Segment,
@@ -91,8 +106,7 @@ struct Opened {
 /// further round each, concurrently.
 pub async fn query<S: BlobStore>(
     store: &S,
-    key: &Key,
-    centroids: &Key,
+    targets: &[Target],
     prefetch: &[Prefetch],
     fusion: Fusion,
     top_k: usize,
@@ -110,10 +124,71 @@ pub async fn query<S: BlobStore>(
         .map(Runnable::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let opened = open(store, key, centroids, prefetch).await?;
-    let legs =
-        futures_util::future::try_join_all(runnable.iter().map(|r| leg(store, key, &opened, r)))
+    // ⚠️ Every segment and every sidecar in ONE round. `Engine::scan`'s comment already made
+    // this argument with a measurement: a loop over segment refs "turns a ten-segment index
+    // into a twenty-one-hop query", which is six times the whole latency budget. Width is
+    // free; depth is not.
+    let opened =
+        futures_util::future::try_join_all(targets.iter().map(|t| open(store, t, prefetch)))
             .await?;
+
+    // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
+    // summaries ride in the term dictionaries the open round already fetched. That is what
+    // D-30's two-pass IDF must not cost, and per-segment IDF is wrong exactly when the
+    // query's discriminating term is the one whose frequency differs between segments.
+    //
+    // ⚠️ A segment with no text index contributes nothing, and that is correct rather than an
+    // omission: it holds no documents containing the field, so it is not part of BM25's
+    // corpus.
+    //
+    // ⚠️ The other case — postings present, dictionary unreadable — would drop the segment
+    // out of `doc_count` and every `df`, scoring the whole query against a corpus one segment
+    // too small. It cannot produce a wrong ANSWER, because that segment's own text leg fails
+    // on the same missing sidecar and `try_join_all` fails the query with it. A guard here
+    // was written first and removed: no test could distinguish it, and the mutation gate said
+    // so. `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` pins the property
+    // wherever it is enforced.
+    let stats: &Stats = &Stats::merge(opened.iter().filter_map(|o| {
+        let raw = o.terms.as_ref()?;
+        TextIndex::from_segment(&o.segment, raw.as_ref())
+            .ok()
+            .map(|idx| idx.summary())
+    }));
+
+    // ⚠️ N x R futures, still one round: no leg's ranges depend on another's contents.
+    let per_segment =
+        futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().flat_map(
+            |(i, (o, t))| {
+                runnable.iter().enumerate().map(move |(j, r)| async move {
+                    leg(store, &t.segment, o, r, i, stats)
+                        .await
+                        .map(|hits| (j, hits))
+                })
+            },
+        ))
+        .await?;
+
+    // ⚠️ Regrouped by RETRIEVER, not by segment, and each retriever's union re-ranked before
+    // it is fused. `fuse` reads a leg's position in the vec as its rank, so concatenating
+    // segment answers unsorted would hand segment 0's hits ranks 1..n and segment 1's
+    // ranks n+1.., ranking a whole segment above another for no reason. Fusing per segment
+    // and merging is the other wrong shape: RRF is blind to score magnitude, so the top hit
+    // of every segment would earn the same 1/(k+1) however much worse it is.
+    let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); runnable.len()];
+    for (j, hits) in per_segment {
+        if let Some(leg) = legs.get_mut(j) {
+            leg.extend(hits);
+        }
+    }
+    for leg in &mut legs {
+        // Every retriever in this build ranks higher-is-better; ties break on the pair, the
+        // same rule `fuse` itself applies, so the union's order is not a new convention.
+        leg.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
+        });
+    }
     Ok(fuse(&legs, fusion, top_k))
 }
 
@@ -185,10 +260,10 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
 /// The open round: the footer and every sidecar any leg needs, together.
 async fn open<S: BlobStore>(
     store: &S,
-    key: &Key,
-    centroids: &Key,
+    target: &Target,
     prefetch: &[Prefetch],
 ) -> Result<Opened, QueryError> {
+    let (key, centroids) = (&target.segment, &target.centroids);
     let wants_dense = prefetch.iter().any(|p| matches!(p, Prefetch::Dense { .. }));
     let wants_sparse = prefetch
         .iter()
@@ -236,6 +311,8 @@ async fn leg<S: BlobStore>(
     key: &Key,
     opened: &Opened,
     r: &Runnable<'_>,
+    segment: usize,
+    stats: &Stats,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
         Runnable::Text {
@@ -253,17 +330,17 @@ async fn leg<S: BlobStore>(
                 "a text leg over a segment with no term dictionary sidecar",
             ))?;
             let idx = TextIndex::from_segment(&opened.segment, raw.as_ref())?;
-            // ⚠️ **This segment's summary is the corpus**, because a query runs over one
-            // segment. That is D-30's statistics half applied to the case that exists; the
-            // caller that merges summaries across segments with `Stats::merge` is the thing
-            // M5a, M5b and M5c all hand forward, and it is named rather than faked here.
-            let stats: Stats = idx.summary();
+            // ⚠️ The statistics are the CALLER's, summed across every segment in the query,
+            // not this segment's own summary. That caller is what M5a, M5b and M5c each
+            // handed forward by name, and scoring against a per-segment summary is wrong
+            // exactly when the query's discriminating term is the one whose frequency
+            // differs between segments — which M5c measured.
             let terms = pstore_format::text::analyze(query);
-            let hits = idx.search(store, key, &terms, &stats, *limit).await?;
+            let hits = idx.search(store, key, &terms, stats, *limit).await?;
             Ok(hits
                 .into_iter()
                 .map(|(row, score)| Hit {
-                    segment: 0,
+                    segment,
                     row,
                     score,
                 })
@@ -292,7 +369,7 @@ async fn leg<S: BlobStore>(
             Ok(hits
                 .into_iter()
                 .map(|(row, score)| Hit {
-                    segment: 0,
+                    segment,
                     row,
                     score,
                 })
@@ -311,7 +388,7 @@ async fn leg<S: BlobStore>(
             Ok(hits
                 .into_iter()
                 .map(|(row, score)| Hit {
-                    segment: 0,
+                    segment,
                     row,
                     score,
                 })

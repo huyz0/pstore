@@ -46,13 +46,16 @@ Two more, each a confidently wrong ranking rather than a failure:
   - merges the term dictionaries' summaries with `Stats::merge` **before** any leg runs. The
     summaries arrive in the open round, so global statistics cost no round trip — which is what
     D-30 says two-pass IDF must not.
-    ⚠️ **A segment that carries `TextPostings` and whose dictionary did not arrive is an
-    error.** `open` fetches sidecars through `maybe`, which swallows the failure because a
-    missing *centroid* table legitimately means "scan exactly" (D-10). Applied to a term
-    dictionary across N segments that becomes silent corruption of a **global** number: the
-    segment drops out of `doc_count` and every `df`, and the whole query is scored against
-    statistics for a smaller corpus. One segment's absent sidecar must fail the query, not
-    quietly change everyone's IDF.
+    ⚠️ **A segment that carries `TextPostings` and whose dictionary did not arrive must fail
+    the query.** `open` fetches sidecars through `maybe`, which swallows the failure because a
+    missing *centroid* table legitimately means "scan exactly" (D-10); applied to a term
+    dictionary across N segments that would drop the segment out of `doc_count` and every
+    `df`, scoring the whole query against a smaller corpus.
+    ⚠️ **AMENDED after implementation: no new guard is needed, and the one written first was
+    removed.** That segment's own text leg already fails on the same missing sidecar and
+    `try_join_all` fails the query with it, so no wrong answer can be returned. A guard in
+    `open` was added, and **no mutation of it could be caught** — the gate said so. Criterion 5
+    pins the property; the leg-level refusal is what enforces it.
     ⚠️ A segment with **no** text index contributes nothing to `Stats`, and that is correct
     rather than an omission: it holds no documents containing the field, so it is not part of
     BM25's corpus. Stated so it is not later "fixed".
@@ -73,49 +76,63 @@ full `scan`. Building the index at fold time is a milestone of its own. Named as
 1. ⚠️ **Rows from different segments never merge.** Two segments, a hit at row 5 in each: the
    result carries **two** hits with their own scores, not one with the sum. Observed red
    against today's `fuse`, which merges them.
-2. **Global statistics, computed once.** Over a two-segment corpus whose segments give a term
-   different document frequencies, the multi-segment query's ranked **document ids** equal
-   those of the same documents held in a single segment, and **differ** from the same query
-   scored with per-segment statistics. ⚠️ Both halves: equality alone passes over a fixture
-   where the statistics happen to agree, which is the trap M5c's own ledger records finding.
-   ⚠️ Compared by **document id, not by row**, and the test asserts the top-k scores are
-   pairwise distinct. Rows differ between the two layouts by construction, and a tie broken by
-   `(segment, row)` in one arrangement and by `row` in the other would make the criterion fail
-   on a fixture where nothing is wrong.
-3. ⚠️ **Fusion happens once.** A fixture where fusing per segment and merging gives a
-   different order from fusing the union: the query returns the union's order. The per-segment
-   order is asserted to differ, so the test cannot pass by the two being equal.
-4. **Depth is 2 over N segments, not 2N.** Asserted with `DepthCounting` at N = 4: the open
+2. **Global statistics, computed once.** Over a two-segment corpus whose halves disagree about
+   **both** corpus-wide inputs to BM25 — how common a term is, and how long a document is —
+   the multi-segment query's ranked **document ids** equal those of the same documents held in
+   a single segment.
+   ⚠️ Compared by **document id, not by row**: the two layouts number rows differently by
+   construction, so a row comparison would fail where nothing is wrong.
+   ⚠️ **And the fixture must be able to fail.** Equality alone passes wherever per-segment
+   statistics happen to agree with the global ones — the trap M5c's ledger records finding, and
+   the trap this milestone fell into: the first fixture disagreed only about `df`, and the
+   per-segment mutation **survived**. The rebuilt fixture disagrees about `avgdl` too, so the
+   global order puts a short document of segment A first and segment B's single hit last, and
+   the per-segment order puts B's first. Both positions are asserted.
+3. ⚠️ **Fusion happens once, over the union.** Two retrievers over two segments: the fused
+   scores are not all equal, which is what fusing per segment and merging produces — RRF is
+   blind to score magnitude, so every segment's top hit would earn the same `1/(k+1)`.
+4. ⚠️ **Each retriever's union is re-ranked before it is fused.** A fixture whose **best** hit
+   is in the second segment: the top hit is that document. `fuse` reads a leg's position as its
+   rank, so an unsorted concatenation ranks segment 0's hits above segment 1's — and with one
+   retriever the final order *is* the leg's input order, so nothing downstream repairs it.
+   ⚠️ Added after the mutation sweep, which is where it belongs in the record: on a fixture
+   where segment A holds every good hit, score order and concatenation order agree and the
+   missing sort is invisible.
+5. **Depth is 2 over N segments, not 2N.** Asserted with `DepthCounting` at N = 4: the open
    round and the legs round, **and equal to the depth the same query costs over one segment**,
    which is the form that does not depend on the fixture. ⚠️ The constant 2 rests on every
    segment's meta region fitting its suffix read — a segment over `INDEX_BUDGET` costs a second
    read at open, and `try_finish` refuses one, so the fixture cannot silently violate it.
    Requests scale with segments and bytes, which is what the rule permits; **depth does not**.
-5. ⚠️ **A missing term dictionary fails the query.** A two-segment fixture where one
-   segment's sidecar is deleted returns an error naming the segment — not a ranking computed
-   from the other segment's statistics. Observed red by letting `Stats::merge` run over the
-   summaries that did arrive, which answers confidently with a corpus one segment too small.
-6. **Zero LIST**, asserted on the request-class counter.
-7. **One segment is unchanged.** The existing `hybrid` and text suites are green with no
-   fixture edits beyond `Hit`'s new field, `scripts/ndcg.sh` and `scripts/depth.sh` hold, and
-   every hit of a one-segment query carries `segment == 0`.
-8. Region coverage ≥95% on the changed crates, mutation ≥80% on the changed modules, the full
+6. **A missing term dictionary fails the query**, rather than scoring against a corpus one
+   segment too small. ⚠️ **No new code enforces this**, and that is the finding: the text leg
+   already refuses on the same missing sidecar and `try_join_all` fails the query with it. A
+   guard added in `open` could be mutated away with every test still green, so it was removed
+   rather than left as code nothing constrains.
+7. **Zero LIST**, asserted on the request-class counter.
+8. **One segment is unchanged.** The existing `hybrid` and text suites are green with no
+   fixture edits beyond `Hit`'s new field and the paired `Target`, `scripts/ndcg.sh` and
+   `scripts/depth.sh` hold, and every hit of a one-segment query carries `segment == 0`.
+9. Region coverage ≥95% on the changed crates, mutation ≥80% on the changed modules, the full
    gate set green.
 
 ## Test plan
 
 | # | Test | The mutation it kills |
 |---|---|---|
-| 1 | `two_segments_with_the_same_row_are_two_hits` | `fuse` keyed on `row` alone — the defect that exists today, and every single-segment test passes with it |
-| 2 | `global_statistics_change_the_ranking_across_segments` | `Stats::merge` skipped and each segment scored against its own dictionary; also a merge that takes the first segment's summary rather than the sum |
-| 3 | `fusion_happens_once_over_the_union` | fusing per segment and summing — which gives the top hit of every segment the same RRF credit |
-| 4 | `four_segments_cost_one_open_round_and_one_leg_round` | the segment loop awaited in sequence, which is functionally identical and 4× the depth |
-| 4b | `each_segments_dense_leg_reads_its_own_centroids` | one shared centroid table, which returns another segment's clusters applied to these rows and still answers |
-| 5 | `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` | the `maybe`-shaped skip carried over to dictionaries, which changes a global statistic silently — the one failure mode this whole milestone is about, one level down |
-| 7 | `a_one_segment_query_is_unchanged` | `segment` defaulted to something other than 0, or the union path taken for N = 1 with a different tie-break |
-| 8 | the existing `hybrid`, text, `ndcg` and `depth` suites | a tie-break that now depends on segment ordinal before score, which reorders every existing answer |
+| 1 | `two_segments_with_the_same_row_are_two_hits`, `ties_break_on_the_pair_and_the_segment_comes_first` | `fuse` keyed on `row` alone — the defect that exists today, and every single-segment test passes with it. Both **observed red**. |
+| 2 | `global_statistics_change_the_ranking_across_segments` | each segment scored against `idx.summary()` instead of the merged statistics. ⚠️ **Survived the first fixture** and is killed by the rebuilt one. |
+| 3 | `fusion_happens_once_over_the_union` | per-segment fusion, which flattens every segment's top hit to the same RRF credit |
+| 4 | `each_retrievers_union_is_ranked_before_it_is_fused` | the union re-sort removed. ⚠️ **Survived every earlier fixture**, because they all put the good hits in segment A. |
+| 5 | `four_segments_cost_one_open_round_and_one_leg_round` | the segment loop awaited in sequence, which is functionally identical and 4× the depth. **Observed red.** |
+| 6 | `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` | ⚠️ **nothing** — the leg's existing refusal covers it, and the guard written for it was removable with every test green. Recorded, not hidden. |
+| 7 | `a_multi_segment_query_does_not_list` | a LIST introduced by the fan-out |
+| 8 | `a_one_segment_query_is_unchanged` | `segment` defaulted to something other than 0 |
+| 9 | the existing `hybrid`, text, `fusion`, `ndcg` and `depth` suites | a tie-break that now depends on segment ordinal before score, which reorders every existing answer |
 
-⚠️ Criteria 1–3 are the milestone. Criterion 4 is what keeps it from being a loop.
+⚠️ Criteria 1–4 are the milestone, and **two of the four mutations survived their first
+fixture**. Both are recorded above rather than quietly fixed: a fixture that cannot fail is the
+failure mode this project's own spec preamble warns about, and it caught this milestone twice.
 
 ## RA budget
 

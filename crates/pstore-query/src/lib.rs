@@ -16,4 +16,4 @@ mod fuse;
 mod run;
 
 pub use fuse::{Fusion, Hit, fuse};
-pub use run::{Prefetch, QueryError, query};
+pub use run::{Prefetch, QueryError, Target, query};

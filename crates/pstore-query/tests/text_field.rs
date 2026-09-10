@@ -18,7 +18,7 @@ use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_format::{Document, FormatError, Value, text};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
-use pstore_query::{Fusion, Prefetch, QueryError, query};
+use pstore_query::{Fusion, Prefetch, QueryError, Target, query};
 
 const SEG: &str = "t/idx/text.seg";
 const CEN: &str = "t/idx/text.centroids";
@@ -77,10 +77,13 @@ fn text_leg(field: &str) -> Vec<Prefetch> {
 }
 
 async fn run(store: &MemoryStore, seg: &Key, cen: &Key, field: &str) -> Result<usize, QueryError> {
+    let targets = [Target {
+        segment: seg.clone(),
+        centroids: cen.clone(),
+    }];
     query(
         store,
-        seg,
-        cen,
+        &targets,
         &text_leg(field),
         Fusion::Rrf { k: 60.0 },
         10,
