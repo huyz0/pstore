@@ -262,7 +262,11 @@ async fn leg<S: BlobStore>(
             let hits = idx.search(store, key, &terms, &stats, *limit).await?;
             Ok(hits
                 .into_iter()
-                .map(|(row, score)| Hit { row, score })
+                .map(|(row, score)| Hit {
+                    segment: 0,
+                    row,
+                    score,
+                })
                 .collect())
         }
         Runnable::Dense {
@@ -287,7 +291,11 @@ async fn leg<S: BlobStore>(
                 .await?;
             Ok(hits
                 .into_iter()
-                .map(|(row, score)| Hit { row, score })
+                .map(|(row, score)| Hit {
+                    segment: 0,
+                    row,
+                    score,
+                })
                 .collect())
         }
         Runnable::Sparse {
@@ -302,7 +310,11 @@ async fn leg<S: BlobStore>(
             let hits = idx.search(store, key, query, *limit).await?;
             Ok(hits
                 .into_iter()
-                .map(|(row, score)| Hit { row, score })
+                .map(|(row, score)| Hit {
+                    segment: 0,
+                    row,
+                    score,
+                })
                 .collect())
         }
     }

@@ -16,6 +16,9 @@ fn leg(rows: &[usize]) -> Vec<Hit> {
     rows.iter()
         .enumerate()
         .map(|(i, r)| Hit {
+            // One segment: this file is the ranking rule on its own, and the cross-segment
+            // identity is `fusion_identity.rs`.
+            segment: 0,
             row: *r,
             // Deliberately descending and deliberately ignored: RRF reads RANK, and a
             // fusion that quietly read this instead would rank identically on any fixture
