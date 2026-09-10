@@ -13,6 +13,11 @@ workspace = true
 [dependencies]
 pstore-blob   = { path = "../pstore-blob" }
 pstore-format = { path = "../pstore-format" }
+# ⚠️ The engine is the composition point, so it sits ABOVE the index and the query path rather
+# than beside them. `pstore-index` used to dev-depend on `pstore-engine` for one test; that
+# test asserts an engine property and moved with this dependency (M5g).
+pstore-index  = { path = "../pstore-index" }
+pstore-query  = { path = "../pstore-query" }
 pstore-types  = { path = "../pstore-types" }
 bytes         = "1"
 thiserror     = "2"

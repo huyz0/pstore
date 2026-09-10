@@ -219,6 +219,47 @@ pub fn build_hybrid(
     build_all(docs, params, field, sparse_field, None)
 }
 
+/// The key of a segment's centroid table.
+///
+/// ⚠️ Derived, never discovered — the third instance of a convention `text::dict_key`
+/// (`.tdict`) and `sparse::dict_key` (`.sdict`) already set. Absent in the store is not an
+/// error: D-10 reads that as "this index is below the exact-scan threshold, scan me exactly".
+#[must_use]
+pub fn centroid_key(segment: &Key) -> Key {
+    Key::new(format!("{}.cen", segment.as_str()))
+}
+
+/// [`build_all`], refusing what the format cannot store instead of writing it as nothing.
+///
+/// ⚠️ **The fold needs this and a test fixture does not.** `build_all` uses `finish`, and its
+/// comment is right for its own caller: a fixture that has already read every document wants
+/// the lossy form, and a width error reported there is reported at the wrong layer. But
+/// `Engine::seal`'s comment records the opposite lesson from the other end — *"`finish` is
+/// lossy for anything the format cannot hold and the fold used it, so a document the writer
+/// could not store was written as nothing and reported as durable"*. The refusal this keeps is
+/// `try_finish`'s **index-budget** one, "too wide to open in one round trip", which
+/// `check_storable` at the write door knows nothing about.
+///
+/// # Errors
+/// If the segment cannot be stored faithfully or would not open in one round trip.
+pub fn try_build_all(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+    text_field: Option<&str>,
+) -> Result<Built, pstore_format::FormatError> {
+    let (w, centroids, order, dictionary, text_dictionary) =
+        assemble(docs, params, field, sparse_field, text_field);
+    Ok(Built {
+        segment: w.try_finish()?,
+        centroids,
+        order,
+        dictionary,
+        text_dictionary,
+    })
+}
+
 /// Builds a segment carrying a dense field, a sparse one, and a text one.
 ///
 /// ⚠️ One function, because none of the three is independent: the dense clustering decides the
@@ -233,6 +274,41 @@ pub fn build_all(
     sparse_field: Option<&str>,
     text_field: Option<&str>,
 ) -> Built {
+    let (w, centroids, order, dictionary, text_dictionary) =
+        assemble(docs, params, field, sparse_field, text_field);
+    Built {
+        // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
+        // document through `d.vector()`, so anything the format cannot store was lost before
+        // this point. Refusing here would report the right error at the wrong layer. The
+        // caller that needs the refusal is the FOLD, and it has `try_build_all`.
+        segment: w.finish(),
+        centroids,
+        order,
+        dictionary,
+        text_dictionary,
+    }
+}
+
+/// Everything both builders share: the clustering, the codes, and the sidecars — stopping one
+/// step short of sealing, because that step is the only thing they disagree about.
+#[expect(
+    clippy::type_complexity,
+    reason = "the tuple exists so the two builders cannot drift; naming it would be a struct \
+              that is `Built` minus the one field they differ on"
+)]
+fn assemble(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+    text_field: Option<&str>,
+) -> (
+    SegmentWriter,
+    Option<Centroids>,
+    Vec<usize>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+) {
     let dim = docs
         .iter()
         .find_map(|d| d.field(field).first().map(Vec::len))
@@ -330,19 +406,7 @@ pub fn build_all(
         }
     }
 
-    Built {
-        // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
-        // document through `d.vector()`, so anything the format cannot store was lost
-        // before this point. Refusing here would report the right error at the wrong layer.
-        // The refusal belongs where documents ENTER — `Engine::write` — and until M3b.3 the
-        // check lives in `SegmentWriter::try_finish` for callers that construct segments
-        // directly.
-        segment: w.finish(),
-        centroids,
-        order,
-        dictionary,
-        text_dictionary,
-    }
+    (w, centroids, order, dictionary, text_dictionary)
 }
 
 /// An opened index: the segment's directory and the centroid table, both in memory.

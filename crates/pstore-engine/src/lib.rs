@@ -9,7 +9,7 @@ pub use bundle::Entry;
 pub use head::{Head, HeadAt, SegmentRef};
 
 use pstore_blob::{BlobStore, Key};
-use pstore_format::{Document, Filter, Segment, SegmentWriter};
+use pstore_format::{Document, Filter, Segment};
 use pstore_types::{Epoch, LaneId, Seq, TenantId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -24,10 +24,6 @@ pub fn bundle_key(tenant: TenantId, lane: LaneId, seq: Seq) -> Key {
     ))
 }
 
-/// Rows per block in a folded segment. Small enough that zone maps prune usefully, large
-/// enough that a scan is not one request per handful of rows.
-const ROWS_PER_BLOCK: usize = 64;
-
 /// How many times a commit rebases before giving up.
 ///
 /// Bounded on purpose: a commit that cannot land after this many rebases is reporting
@@ -37,6 +33,14 @@ const MAX_COMMIT_ATTEMPTS: u32 = 24;
 /// Why an engine operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EngineError {
+    /// A query over the segments HEAD names.
+    ///
+    /// ⚠️ A string, like [`Self::Format`] beside it, because `EngineError` is `Clone + Eq` and
+    /// `QueryError` is neither. A caller that needs the typed error calls `pstore_query::query`
+    /// directly — which is public, and is what this method composes.
+    #[error("query: {0}")]
+    Query(String),
+
     /// Another committer won. **Rebase and retry.**
     #[error("commit lost: another writer won")]
     Lost,
@@ -149,6 +153,14 @@ pub struct Engine<S> {
     /// hold, because the thing it excludes should never happen.
     flushing: tokio::sync::Mutex<()>,
     committed: Mutex<Epoch>,
+    /// What the dense index is built with.
+    ///
+    /// ⚠️ **`exact_scan_threshold` is the load-bearing one.** Below it nothing is clustered,
+    /// no centroid object is written, and the segment's row order is the order documents were
+    /// written in — which is every fold at the sizes anything is tested at. Above it rows are
+    /// written in **list order**, so a probe is one contiguous ranged read, and the row order
+    /// is therefore no longer the write order.
+    params: pstore_index::cluster::Params,
     /// The attribute this writer's text index is built over.
     ///
     /// ⚠️ **Used by `fold` and never by `compact`.** A compaction re-analyzes the original
@@ -220,8 +232,20 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(Seq::ZERO),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
+            params: pstore_index::cluster::Params::default(),
             text_field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
         }
+    }
+
+    /// Builds this writer's dense index with `params` rather than the defaults.
+    ///
+    /// Exists so a test can reach the clustered path without writing 25,000 rows, and so a
+    /// deployment can tune list size without a rebuild. Per **engine**, not per index —
+    /// per-index parameters are the schema question M6c deferred.
+    #[must_use]
+    pub fn with_index_params(mut self, params: pstore_index::cluster::Params) -> Self {
+        self.params = params;
+        self
     }
 
     /// Builds this writer's text index over `name` rather than the default.
@@ -263,69 +287,89 @@ impl<S: BlobStore> Engine<S> {
         ))
     }
 
-    /// Writes one segment, and the sparse dictionary beside it when there is one.
+    /// Writes one segment, its dense index, and every sidecar the index needs.
     ///
-    /// ⚠️ **One place.** Fold and compaction both seal segments, and a sparse field written
-    /// by one and not the other is an index whose rows lose a field the first time they are
-    /// merged — with every test that only folds still passing.
+    /// ⚠️ **One place.** Fold and compaction both seal segments, and a field written by one
+    /// and not the other is an index whose rows lose it the first time they are merged — with
+    /// every test that only folds still passing.
     ///
-    /// ⚠️ `try_finish`, not `finish`. `finish` is lossy for anything the format cannot hold
-    /// and the fold used it, so a document the writer could not store was written as nothing
-    /// and reported as durable. That is the same failure `check_storable` guards the door
-    /// against, at the other end of the same path.
+    /// ⚠️ **One builder, not three.** `try_build_all` builds the dense clustering, the sparse
+    /// postings and the text postings together because none of them is independent: the
+    /// clustering decides the segment's **row order**, and the other two address those rows.
+    /// Three builders called over the input order produce three internally consistent indexes
+    /// pointing at three different documents.
+    ///
+    /// ⚠️ `try_build_all`, not `build_all`. `build_all` seals with `finish`, which is lossy
+    /// for anything the format cannot hold — and the fold used exactly that, so a document the
+    /// writer could not store was written as nothing and reported as durable. The refusal this
+    /// keeps is `try_finish`'s **index-budget** one, which `check_storable` at the write door
+    /// knows nothing about.
     async fn seal(
         &self,
         key: &Key,
         docs: &[Document],
         text_field: &str,
     ) -> Result<(), EngineError> {
-        let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
-        for d in docs {
-            w.push(d.clone());
-        }
-        if let Some(field) = sparse_field_of(docs) {
-            let p =
-                pstore_format::sparse::build(docs, &field, pstore_format::sparse::DEFAULT_ENCODING);
-            // ⚠️ The dictionary FIRST, and before the segment is named by HEAD. A segment
-            // whose sidecar is not there yet reads as a segment whose sparse field cannot be
-            // reconstructed — postings intact, and unreachable.
-            self.store
-                .put(
-                    &pstore_format::sparse::dict_key(key),
-                    bytes::Bytes::from(p.dictionary),
-                )
-                .await?;
-            w = w.with_section(pstore_format::Section::SparsePostings, p.section);
-        }
-        // ⚠️ Re-analyzed from the attribute, never copied from the inputs' postings — those
-        // cannot be inverted back into text, because order, duplicates and dropped tokens are
-        // gone. A merge that copied them would rewrite every document as a bag of words.
-        let text = pstore_format::text::build(docs, text_field);
-        if !text.postings.is_empty() {
-            self.store
-                .put(
-                    &pstore_format::text::dict_key(key),
-                    bytes::Bytes::from(text.dictionary),
-                )
-                .await?;
-            // ⚠️ Recorded, so the next reader is told rather than comparing against a
-            // constant — and so the next COMPACTION re-analyzes the attribute this segment
-            // was actually built over.
-            w = w
-                .with_section(pstore_format::Section::TextPostings, text.postings)
-                .with_section(
-                    pstore_format::Section::Fieldnorms,
-                    pstore_format::text::encode_norms(&text.fieldnorms),
-                )
-                .with_text_fields(&[text_field.to_owned()]);
-        }
-        self.store
-            .put(
-                key,
-                w.try_finish()
-                    .map_err(|e| EngineError::Format(e.to_string()))?,
+        let sparse = sparse_field_of(docs);
+        let wants_text = docs.iter().any(|d| {
+            matches!(
+                d.attrs.get(text_field),
+                Some(pstore_format::Value::Str(s)) if !s.is_empty()
             )
-            .await?;
+        });
+        // ⚠️ **`replicas: 0`, always, and this is a correctness clamp rather than a tuning
+        // choice.** Boundary replication puts a vector into a second posting list, and rows
+        // are written in list order — so a replicated document is written to the segment
+        // TWICE. That is harmless for a read-only fixture and wrong for a durable segment:
+        // `Engine::scan` promises every row "exactly once", and a compaction re-seals what it
+        // scanned, so the duplication compounds on every merge. Measured on the first attempt
+        // here: 400 documents folded and merged came back as **431 rows**.
+        //
+        // ⚠️ The cost is real and is recorded rather than hidden — M3's own table measures
+        // r@10 at p=2 as 0.961 with `1 x 0.10` replication against **0.844** without. Getting
+        // it back needs list membership that does not duplicate a row, which is a layout
+        // change and its own milestone.
+        let params = pstore_index::cluster::Params {
+            replicas: 0,
+            ..self.params
+        };
+        let built = pstore_index::vec_index::try_build_all(
+            docs,
+            params,
+            pstore_format::DEFAULT_FIELD,
+            sparse.as_deref(),
+            wants_text.then_some(text_field),
+        )
+        .map_err(|e| EngineError::Format(e.to_string()))?;
+
+        // ⚠️ Every sidecar FIRST, and before the segment is named by HEAD. A segment whose
+        // sidecar is not there yet reads as a segment whose field cannot be reconstructed —
+        // postings intact, and unreachable.
+        //
+        // ⚠️ Written only when there is something in it. `Built` carries a dictionary whenever
+        // the field was named, and an object per fold for an index that has no postings is a
+        // request and an object that never reads back.
+        if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
+            self.store
+                .put(&pstore_format::sparse::dict_key(key), bytes::Bytes::from(d))
+                .await?;
+        }
+        if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
+            self.store
+                .put(&pstore_format::text::dict_key(key), bytes::Bytes::from(d))
+                .await?;
+        }
+        // ⚠️ Absent is not an error: D-10 reads a missing centroid table as "this index is
+        // below the exact-scan threshold, scan me exactly".
+        if let Some(c) = &built.centroids {
+            self.store
+                .put(
+                    &pstore_index::vec_index::centroid_key(key),
+                    bytes::Bytes::from(c.encode()),
+                )
+                .await?;
+        }
+        self.store.put(key, built.segment).await?;
         Ok(())
     }
 
@@ -873,6 +917,52 @@ impl<S: BlobStore> Engine<S> {
             }
         }
         Ok(out)
+    }
+
+    /// Runs `prefetch` over every segment HEAD names for `index`, fused into one answer.
+    ///
+    /// ⚠️ **Indexed, and stale.** This reads the segments the last fold published; rows
+    /// written since live in the memtable, which has no index, no segment and no row ordinal,
+    /// so they cannot enter a `(segment, row)` fusion. [`Self::scan`] and [`Self::search`] see
+    /// them and are exact instead. A caller must choose, and neither name says so — the gap is
+    /// the memtable's, and closing it needs something that can score unindexed rows into the
+    /// same fusion.
+    ///
+    /// ⚠️ `Hit.segment` indexes HEAD's segment list **for this call**. A fold or a compaction
+    /// between two calls renumbers it, which is why M5f scoped that identity to a snapshot.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read, or a segment or sidecar cannot be.
+    pub async fn query(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+    ) -> Result<Vec<pstore_query::Hit>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
+        // absent means "below the exact-scan threshold" rather than missing (D-10).
+        let targets: Vec<pstore_query::Target> = at
+            .head
+            .indexes
+            .get(index)
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                let segment = Key::new(r.key.clone());
+                pstore_query::Target {
+                    centroids: pstore_index::vec_index::centroid_key(&segment),
+                    segment,
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        pstore_query::query(&*self.store, &targets, prefetch, fusion, top_k)
+            .await
+            .map_err(|e| EngineError::Query(e.to_string()))
     }
 
     /// Exact k-nearest neighbours across everything the index contains.
