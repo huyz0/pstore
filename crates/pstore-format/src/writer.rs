@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 pub struct SegmentWriter {
     index_budget: usize,
     write_fields: bool,
+    write_text_fields: bool,
+    text_fields: Vec<String>,
     rows_per_block: usize,
     /// Opaque, fixed-width payloads supplied by a higher layer.
     ///
@@ -53,6 +55,8 @@ impl SegmentWriter {
         Self {
             index_budget: INDEX_BUDGET,
             write_fields: true,
+            write_text_fields: true,
+            text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
             extra: Vec::new(),
             raw_extra: Vec::new(),
@@ -95,6 +99,30 @@ impl SegmentWriter {
     #[must_use]
     pub fn with_raw_section(mut self, id: u16, bytes: Vec<u8>) -> Self {
         self.raw_extra.push((id, bytes));
+        self
+    }
+
+    /// Names the attribute(s) this segment's text index was built over.
+    ///
+    /// ⚠️ Recorded **whenever a text index exists**, including for the default name. A rule
+    /// that skipped the section for `"text"` would leave the common path untested and make
+    /// absence mean two different things in a newly written segment; absence is reserved for
+    /// segments written before the section existed.
+    #[must_use]
+    pub fn with_text_fields(mut self, names: &[String]) -> Self {
+        self.text_fields = names.to_vec();
+        self
+    }
+
+    /// Emits a segment with **no** `TextFields` section, as one written before it existed.
+    ///
+    /// The sibling of [`Self::without_fields_section_for_test`] and for the same reason:
+    /// forward compatibility that cannot be constructed cannot be tested, and segments are
+    /// immutable, so pre-M6c segments outlive every reader that meets them.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_text_fields_section_for_test(mut self) -> Self {
+        self.write_text_fields = false;
         self
     }
 
@@ -373,13 +401,44 @@ impl SegmentWriter {
             t.0
         };
 
+        // ⚠️ Recorded only when the segment actually carries postings. A name without a
+        // posting list is a segment claiming a text index it does not have, and every reader
+        // that trusts `text_fields()` would then accept a query it can only answer with
+        // nothing.
+        let has_text = self
+            .extra
+            .iter()
+            .any(|(s, b)| *s == Section::TextPostings && !b.is_empty());
+        let text_bytes = if self.text_fields.is_empty() || !self.write_text_fields || !has_text {
+            Vec::new()
+        } else {
+            let mut t = Enc::default();
+            t.u32(self.text_fields.len() as u32);
+            for n in &self.text_fields {
+                t.bytes(n.as_bytes());
+            }
+            t.0
+        };
+
         let meta_offset = out.len() as u64;
-        // Both of these live inside the meta region, so their offsets are not known until
-        // the directory's own length is. Pushed last, in this order, and patched below.
+        // These live inside the meta region, so their offsets are not known until the
+        // directory's own length is. Pushed last, in this order, and patched below.
+        //
+        // ⚠️ A LIST, not a pair of hardcoded cases. This loop used to special-case "one entry
+        // or two", and the comment below explains why a wrong slot corrupts silently rather
+        // than failing — so a third meta-region section is exactly how that happens. Adding
+        // one is now appending to `inline`.
+        let mut inline: Vec<(Section, &[u8])> = Vec::new();
         if !fields_bytes.is_empty() {
-            dir.push((Section::Fields, 0, fields_bytes.len() as u64));
+            inline.push((Section::Fields, &fields_bytes));
         }
-        dir.push((Section::Blocks, 0, idx.len() as u64));
+        if !text_bytes.is_empty() {
+            inline.push((Section::TextFields, &text_bytes));
+        }
+        inline.push((Section::Blocks, &idx.0));
+        for (section, bytes) in &inline {
+            dir.push((*section, 0, bytes.len() as u64));
+        }
         let mut meta = Enc::default();
         meta.u32((dir.len() + raw_dir.len()) as u32);
         for (section, offset, len) in &dir {
@@ -402,20 +461,16 @@ impl SegmentWriter {
         // slot and corrupt silently rather than fail.
         const ENTRY: usize = 2 + 8 + 8;
         let mut at = meta_offset + meta.len() as u64;
-        let patched = if fields_bytes.is_empty() { 1 } else { 2 };
-        for n in 0..patched {
-            let entry = 4 + (dir.len() - patched + n) * ENTRY + 2;
+        for (n, (_, bytes)) in inline.iter().enumerate() {
+            let entry = 4 + (dir.len() - inline.len() + n) * ENTRY + 2;
             if let Some(slot) = meta.0.get_mut(entry..entry + 8) {
                 slot.copy_from_slice(&at.to_le_bytes());
             }
-            at += if patched == 2 && n == 0 {
-                fields_bytes.len() as u64
-            } else {
-                0
-            };
+            at += bytes.len() as u64;
         }
-        meta.raw(&fields_bytes);
-        meta.raw(&idx.0);
+        for (_, bytes) in &inline {
+            meta.raw(bytes);
+        }
 
         // ⚠️ The meta region must fit the one suffix read that opens a segment. The fitting
         // loop above can only shrink the BLOCK index; the directory and the Fields table

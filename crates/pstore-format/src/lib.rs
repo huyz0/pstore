@@ -84,6 +84,16 @@ pub enum Section {
     TextPostings = 12,
     /// One `u32` token count per row, for BM25's length normalisation.
     Fieldnorms = 13,
+    /// Which attribute(s) the text index was built over: a `u32` count, then that many names.
+    ///
+    /// ⚠️ **Not a [`Self::Fields`] row**, for the reason `text.rs` already records: that table
+    /// describes vector fields, and a text row in it is handed to `decode_field`, which reads
+    /// postings as `f32` and returns a dense field of noise.
+    ///
+    /// ⚠️ **Absence means `"text"`**, never "no text field". Every segment written before this
+    /// section existed was built over [`text::DEFAULT_TEXT_FIELD`], and reading absence as
+    /// empty would turn off the text index of all of them.
+    TextFields = 14,
 }
 
 /// How a vector field is laid out in a segment.

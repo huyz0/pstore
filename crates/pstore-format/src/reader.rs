@@ -17,6 +17,7 @@ pub struct Segment {
     sections: BTreeMap<u16, std::ops::Range<u64>>,
     /// The vector fields this segment carries.
     fields: Vec<crate::FieldLayout>,
+    text_fields: Vec<String>,
 }
 
 impl Segment {
@@ -122,8 +123,10 @@ impl Segment {
             rows,
             sections,
             fields: Vec::new(),
+            text_fields: Vec::new(),
         };
         seg.fields = seg.decode_fields(&idx_bytes, meta_offset)?;
+        seg.text_fields = seg.decode_text_fields(&idx_bytes, meta_offset)?;
         Ok(seg)
     }
 
@@ -176,6 +179,48 @@ impl Segment {
             });
         }
         Ok(out)
+    }
+
+    /// Parses the `TextFields` table, or reads absence as the pre-M6c default.
+    ///
+    /// ⚠️ **Absence is not "no text field".** Every segment written before this section
+    /// existed was built over [`crate::text::DEFAULT_TEXT_FIELD`], and reading absence as
+    /// empty would refuse every text query against every one of them — which is all of them.
+    /// A segment carrying no postings at all is the other case, and that one *is* empty.
+    fn decode_text_fields(
+        &self,
+        meta: &[u8],
+        meta_offset: u64,
+    ) -> Result<Vec<String>, FormatError> {
+        let Some(span) = self.section(Section::TextFields) else {
+            return Ok(if self.section(Section::TextPostings).is_some() {
+                vec![crate::text::DEFAULT_TEXT_FIELD.to_owned()]
+            } else {
+                Vec::new()
+            });
+        };
+        let lo = span.start.checked_sub(meta_offset).unwrap_or(u64::MAX) as usize;
+        let raw = meta
+            .get(lo..lo + (span.end - span.start) as usize)
+            .ok_or(FormatError::Truncated)?;
+        let mut d = Dec::new(raw);
+        let n = d.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1 << 12));
+        for _ in 0..n {
+            out.push(d.string()?);
+        }
+        Ok(out)
+    }
+
+    /// Which attribute(s) this segment's text index was built over.
+    ///
+    /// ⚠️ **Ask this rather than assuming `"text"`.** A reader that compares a requested field
+    /// against the constant is right only while every segment is built over the constant, and
+    /// once one is not, it answers the wrong field's ranking with nothing saying so — D-73 at
+    /// field granularity.
+    #[must_use]
+    pub fn text_fields(&self) -> &[String] {
+        &self.text_fields
     }
 
     /// Every vector field this segment carries.
