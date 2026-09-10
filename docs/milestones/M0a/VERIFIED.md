@@ -123,11 +123,46 @@ records profiles for the in-process store and for `object_store::InMemory` — b
 emulator or real cloud has been probed, so the matrix has two rows and both are local.
 Completing it is M0b's first task, and it is one command.
 
+## M0a.11, closed — and what the survivors actually were
+
+The carried-forward note guessed the 46 survivors were mostly equivalent. Two were not, and
+both were closed by testing a property nobody had written down rather than by adding coverage:
+
+- **`next_tag`'s FNV mixing** was called "arguably equivalent". It is not. Every existing tag
+  test asked whether *equal content yields an equal tag*, which a constant function satisfies —
+  so `^=` → `|=` (saturating toward all-ones) and `&=` (collapsing to zero) both survived. The
+  property that carries the weight is the other one: **different content yields a different
+  tag**, because a collision is a CAS that should have been rejected and was not.
+  `distinct_content_gets_distinct_tags` and `a_colliding_tag_would_admit_a_cas_that_should_lose`.
+- **Nothing pinned the fault stream to its seed.** `same_seed_reproduces_the_same_failures`
+  compares two runs in one process, which *any* deterministic function satisfies including a
+  weakened one — so the SplitMix64 mixing steps survived. Determinism from a seed is a
+  contract: a scenario that reproduced a bug last month has to reproduce it today, on another
+  machine. `the_fault_stream_is_pinned_to_its_seed` and `the_latency_stream_is_pinned_to_its_seed`
+  pin both streams. ⚠️ **If those fail, the fix is never to update the constant** — it is to
+  restore the generator, or to accept that every recorded repro seed in the project is void.
+
+⚠️ **Nine survivors remain, and each is argued rather than waved at.**
+
+- `Faults::none` → `Default::default()`: **provably equivalent**, `none()` *is* `Self::default()`.
+- `z ^= z >> 31` → `|=`, the **final** mix step: not equivalent in principle, **not observable
+  through this crate**. `z >> 31` sets only bits 0..32, of which just 11..32 survive the
+  `>> 11` — landing in the bottom bits of a 53-bit mantissa, a relative difference under 1e-9
+  (`0.1330796686614273` against `0.13307966872339372`). Every consumer either thresholds the
+  draw against a rate or turns it into a `tokio` sleep, and tokio's virtual clock quantises to
+  **milliseconds**, measured. The first two mix steps feed a multiply, change the high bits,
+  and *are* killed.
+- Seven `<` → `<=` on the rate comparisons: differ only when the draw exactly equals the rate,
+  which for a 53-bit uniform draw is a `2^-53` event. ⚠️ The one exception, `<` → `==` on the
+  write path's `slow_down`, is **not** equivalent — draws are in `[0, 1)`, so at rate 1.0 the
+  mutant stops injecting entirely — and `a_rate_of_one_fires_on_every_kind` kills it, along
+  with the same shape on both CAS rates. The existing rate-of-one test covered reads only.
+
 ## Carried forward
 
 | ID | Task |
 |---|---|
 | ~~M0a.10~~ | ~~Latency injection in `Faults`~~ — **DONE.** Criterion 4 above is now met as written; the delay is a real `tokio::time::sleep`, free under `start_paused` because the runtime auto-advances while idle |
-| M0a.11 | Mutation score 76.8% vs the 80% target. The 46 survivors are mostly (a) conformance probe *guards* — detecting a backend that returns the wrong bytes needs a deliberately-corrupting store, the same pattern as `TagStyle::ContentHash`; and (b) FNV mixing in `next_tag`, where `^=`→`&=` preserves the property under test and is arguably equivalent |
+| ~~M0a.11~~ | ~~Mutation score 76.8% vs the 80% target~~ — **DONE: 206 of 215 viable caught, 95.8%** over all eight `pstore-blob` modules (285 mutants, 70 unviable, 0 timeouts, in the `dev` container). Region coverage went 94.31% → **97.99%** in the same pass. ⚠️ The prediction that the survivors were "arguably equivalent" was **half right, and the wrong half was the expensive one** — see below |
 | M0a.12 | `delete_batch` via `DeleteObjects` rather than one request per key |
 | M0a.13 | Run the conformance suite against MinIO, Azurite and fake-gcs-server from the compose stack |

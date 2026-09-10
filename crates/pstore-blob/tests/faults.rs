@@ -536,3 +536,127 @@ async fn an_inverted_range_delays_by_the_minimum() {
     let _ = s.get(&Key::new("absent")).await;
     assert_eq!(t.elapsed(), Duration::from_millis(25));
 }
+
+// ---------------------------------------------------------------------------
+// The generator itself, pinned.
+//
+// ⚠️ **M0a.11's survivors were all here, and a same-process comparison cannot catch them.**
+// `same_seed_reproduces_the_same_failures` runs the same seed twice and compares — which
+// *any* deterministic function satisfies, including a badly weakened one. Mutation testing
+// said so: `^` for `|`, `>>` for `<<` through SplitMix64's mixing steps all survived.
+//
+// Determinism from a seed is a **contract, not an implementation detail**: a scenario that
+// reproduced a bug last month has to reproduce it today, and on another machine. So the
+// sequence is pinned. **If this fails, the fix is never to update the constant** — it is to
+// restore the generator, or to accept that every recorded repro seed in the project is void.
+// ---------------------------------------------------------------------------
+
+/// Which of `n` reads failed, as a string of `.` and `x`, for a seed and a rate.
+async fn failure_shape(seed: u64, rate: f64, n: usize) -> String {
+    let s = Faulty::new(
+        MemoryStore::new(),
+        seed,
+        Faults {
+            read_error: rate,
+            ..Faults::none()
+        },
+    );
+    let k = Key::new("k");
+    s.put(&k, Bytes::from_static(b"v")).await.unwrap();
+    let mut out = String::new();
+    for _ in 0..n {
+        out.push(if s.get(&k).await.is_err() { 'x' } else { '.' });
+    }
+    out
+}
+
+#[tokio::test]
+async fn the_fault_stream_is_pinned_to_its_seed() {
+    assert_eq!(
+        failure_shape(12_345, 0.5, 40).await,
+        "xxx.xxxx.xx...x...xxxxxxxxxxx...x.xxxx.."
+    );
+    // A different seed is a different sequence, or "pinned" would be satisfied by a constant.
+    assert_ne!(
+        failure_shape(12_346, 0.5, 40).await,
+        failure_shape(12_345, 0.5, 40).await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_latency_stream_is_pinned_to_its_seed() {
+    // ⚠️ The second stream needs its own golden values. It is derived from the same seed by
+    // a fixed constant, so a change to either the mixer or that constant re-randomises every
+    // recorded scenario -- and the fault shape above would not notice, which is the whole
+    // reason the two streams are separate.
+    let s = Faulty::new(MemoryStore::new(), 12_345, with_latency(0, 100));
+    let mut ms = Vec::new();
+    let mut last = tokio::time::Instant::now();
+    for _ in 0..8 {
+        let _ = s.get(&Key::new("absent")).await;
+        let now = tokio::time::Instant::now();
+        ms.push((now - last).as_millis());
+        last = now;
+    }
+    assert_eq!(ms, vec![84, 1, 58, 90, 50, 83, 32, 22]);
+}
+
+#[tokio::test]
+async fn a_rate_of_one_fires_on_every_kind() {
+    // ⚠️ Aimed at a specific surviving mutant: `r < f.slow_down` on the **write** path
+    // mutated to `r == f.slow_down`. Draws are in `[0, 1)`, so `< 1.0` is always true and
+    // `== 1.0` is never true -- the store would silently stop injecting slowdowns at the one
+    // rate that means "always". `a_fault_rate_of_one_injects_on_every_call_and_zero_on_none`
+    // covers the read path only.
+    let always = |f: Faults| Faulty::new(MemoryStore::new(), 5, f);
+    let k = Key::new("k");
+
+    let s = always(Faults {
+        slow_down: 1.0,
+        ..Faults::none()
+    });
+    for _ in 0..8 {
+        assert!(matches!(s.get(&k).await, Err(BlobError::SlowDown)));
+        assert!(matches!(
+            s.put(&k, Bytes::from_static(b"v")).await,
+            Err(BlobError::SlowDown)
+        ));
+    }
+
+    let s = always(Faults {
+        write_error: 1.0,
+        ..Faults::none()
+    });
+    for _ in 0..8 {
+        assert!(matches!(
+            s.put(&k, Bytes::from_static(b"v")).await,
+            Err(BlobError::Other(_))
+        ));
+    }
+
+    for (f, want_lost) in [
+        (
+            Faults {
+                cas_lost: 1.0,
+                ..Faults::none()
+            },
+            true,
+        ),
+        (
+            Faults {
+                cas_contended: 1.0,
+                ..Faults::none()
+            },
+            false,
+        ),
+    ] {
+        let s = always(f);
+        for _ in 0..8 {
+            let e = s
+                .put_conditional(&k, Bytes::from_static(b"v"), Precondition::NotExists)
+                .await
+                .expect_err("a rate of one must always refuse");
+            assert_eq!(matches!(e, CasError::Lost), want_lost, "{e:?}");
+        }
+    }
+}

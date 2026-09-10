@@ -30,7 +30,7 @@ Three principles, applied in this order:
 | ~~1~~ | ~~**M0a.10** — latency injection in `Faults`~~ **DONE.** M0a criterion 4 is now met as written, and the second random stream is what makes "independently" true rather than merely intended. | [M0a](M0a/VERIFIED.md) | S |
 | ~~2~~ | ~~**`Engine::gc` chunks its delete batch**~~ **DONE.** Chunked at the capability, not a constant; a cap of zero errors rather than panicking. | [M7a](M7a/VERIFIED.md) | S |
 | ~~3~~ | ~~**The roster CAS**~~ **DONE — stays unguarded, and now says why in the code.** The roster only unions, so a CAS that fails to fence delays convergence rather than losing a member; pinned by a test against a store that ignores the precondition. | [M7a](M7a/VERIFIED.md) | S |
-| 4 | **M0a.11 + `pstore-blob` coverage** — the crate is 94.31% regions and its mutation score was last measured at 76.8%. The deficit is `congestion.rs` and `faulty.rs`, which task 1 touches anyway. | [M0a](M0a/VERIFIED.md), [M7a](M7a/VERIFIED.md) | M |
+| ~~4~~ | ~~**M0a.11 + `pstore-blob` coverage**~~ **DONE.** Coverage 94.31% → **97.99%**, mutation 76.8% → **95.8%** (206/215 viable). The coverage gap turned out to be the class-forwarding methods, whose own comments say dropping the class silently disables D-21 — and nothing tested it. | [M0a](M0a/VERIFIED.md), [M7a](M7a/VERIFIED.md) | M |
 
 ## Phase 2 — the gate that cannot see the correctness core
 
