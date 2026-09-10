@@ -149,6 +149,14 @@ pub struct Engine<S> {
     /// hold, because the thing it excludes should never happen.
     flushing: tokio::sync::Mutex<()>,
     committed: Mutex<Epoch>,
+    /// The attribute this writer's text index is built over.
+    ///
+    /// ⚠️ **Used by `fold` and never by `compact`.** A compaction re-analyzes the original
+    /// attribute — postings cannot be inverted back into text — so a handle left on the
+    /// default merging a `body` index would rebuild it over `"text"`, find no strings, and
+    /// write no postings. The merged segment would carry every row and no text index, with
+    /// nothing reporting an error. `compact` takes the name from its inputs instead.
+    text_field: String,
 }
 
 /// The ABA guard: a value that never repeats for two different commits.
@@ -212,7 +220,21 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(Seq::ZERO),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
+            text_field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
         }
+    }
+
+    /// Builds this writer's text index over `name` rather than the default.
+    ///
+    /// ⚠️ **The format and engine half of a schema, not the schema.** Nothing tenant-facing
+    /// sets this, and there is no way to change it on an index that already has segments —
+    /// those are the write-side policy questions and they need the server that does not
+    /// exist. What this buys is that a segment built over `body` says so, and every reader
+    /// is told rather than assuming.
+    #[must_use]
+    pub fn with_text_field(mut self, name: &str) -> Self {
+        self.text_field = name.to_owned();
+        self
     }
 
     fn mem(&self) -> std::sync::MutexGuard<'_, Memtable> {
@@ -251,7 +273,12 @@ impl<S: BlobStore> Engine<S> {
     /// and the fold used it, so a document the writer could not store was written as nothing
     /// and reported as durable. That is the same failure `check_storable` guards the door
     /// against, at the other end of the same path.
-    async fn seal(&self, key: &Key, docs: &[Document]) -> Result<(), EngineError> {
+    async fn seal(
+        &self,
+        key: &Key,
+        docs: &[Document],
+        text_field: &str,
+    ) -> Result<(), EngineError> {
         let mut w = SegmentWriter::new(ROWS_PER_BLOCK);
         for d in docs {
             w.push(d.clone());
@@ -273,7 +300,7 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ Re-analyzed from the attribute, never copied from the inputs' postings — those
         // cannot be inverted back into text, because order, duplicates and dropped tokens are
         // gone. A merge that copied them would rewrite every document as a bag of words.
-        let text = pstore_format::text::build(docs, pstore_format::text::DEFAULT_TEXT_FIELD);
+        let text = pstore_format::text::build(docs, text_field);
         if !text.postings.is_empty() {
             self.store
                 .put(
@@ -281,12 +308,16 @@ impl<S: BlobStore> Engine<S> {
                     bytes::Bytes::from(text.dictionary),
                 )
                 .await?;
+            // ⚠️ Recorded, so the next reader is told rather than comparing against a
+            // constant — and so the next COMPACTION re-analyzes the attribute this segment
+            // was actually built over.
             w = w
                 .with_section(pstore_format::Section::TextPostings, text.postings)
                 .with_section(
                     pstore_format::Section::Fieldnorms,
                     pstore_format::text::encode_norms(&text.fieldnorms),
-                );
+                )
+                .with_text_fields(&[text_field.to_owned()]);
         }
         self.store
             .put(
@@ -476,7 +507,7 @@ impl<S: BlobStore> Engine<S> {
             // neighbours' rows.
             for (idx, docs) in &by_index {
                 let seg_key = self.segment_key(next.epoch, idx);
-                self.seal(&seg_key, docs).await?;
+                self.seal(&seg_key, docs, &self.text_field).await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -703,11 +734,37 @@ impl<S: BlobStore> Engine<S> {
         // have. A merge that reorders is a merge that changes the answer.
         let rows: Vec<Document> = scanned.into_iter().flatten().collect();
 
+        // ⚠️ From the INPUTS, never from this handle. A compaction re-analyzes the original
+        // attribute, so a handle on the default merging a `body` index would rebuild it over
+        // `"text"` and write no postings at all — a text index destroyed by a merge, every
+        // row intact, nothing reporting an error.
+        //
+        // ⚠️ Disagreement is REFUSED, not resolved. Picking one input's name rebuilds the
+        // other's rows over an attribute they do not carry, which is the same silent
+        // destruction one segment at a time. Nothing can produce disagreeing inputs today;
+        // that is what makes now the cheap time to shut the door.
+        let mut named: Vec<&str> = opened
+            .iter()
+            .flat_map(|s| s.text_fields().iter().map(String::as_str))
+            .collect();
+        named.sort_unstable();
+        named.dedup();
+        let text_field = match named.as_slice() {
+            [] => pstore_format::text::DEFAULT_TEXT_FIELD,
+            [one] => one,
+            many => {
+                return Err(EngineError::Format(format!(
+                    "cannot merge segments whose text indexes name different attributes:                      {}. Rebuilding over one of them writes no postings for the rows that                      carry the other",
+                    many.join(", ")
+                )));
+            }
+        };
+
         let out_key = self.compacted_key(at.head.epoch.next(), index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit and
         // never rewritten on a retry: a rebase changes which HEAD we condition on, not what
         // we merged.
-        self.seal(&out_key, &rows).await?;
+        self.seal(&out_key, &rows, text_field).await?;
         let out = SegmentRef {
             key: out_key.as_str().to_owned(),
             rows: rows.len() as u32,
