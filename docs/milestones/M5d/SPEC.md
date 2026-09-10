@@ -1,5 +1,10 @@
 # M5d — The block-max **format**, and the version rule the reader does not follow
 
+⚠️ **CLOSED, and over the `spec` skill's 200-line cap on purpose.** That cap governs a spec
+being written; this one carries two post-implementation amendments and the measurements behind
+them, and deleting the reasoning would leave the conclusion unsupported. The delta it specifies
+is the part above the first amendment banner.
+
 **Serves:** **D-13** ("block-max/skip metadata goes in the **index section**; posting payloads
 go in the **data section** … the single most important FTS layout decision for object
 storage"), **OQ-45**, and **C-11**, which recorded the omission rather than leaving it open.
@@ -262,3 +267,63 @@ Not a task list — the questions the two blocking findings leave open.
 5. **Or is the answer impact-ordered postings?** The other half of OQ-45. Pre-fetch-only
    decisions plus exact-score preservation is a tight box, and impact ordering is the layout
    that escapes it.
+
+## ⚠️ SECOND AMENDMENT — questions 2, 3 and 5 are answered, and the answer closes M5d
+
+Question 2 asked whether the byte saving needs measuring before it is promised. It did, it was,
+and it is **zero**: [`blockmax.rs`](../../../crates/pstore-index/examples/blockmax.rs) evaluates
+the sound skip condition over the same 20,000-document corpus `scripts/depth.sh` uses, and
+skips **0 bytes in all 18 configurations** — widths 1, 2 and 3 × `top_k` 1, 10 and 100 ×
+whether or not every term carries a block table.
+
+| width | k | Σ_{i≠t} U_i^max | θ pre-fetch | θ true | sound | oracle |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 0.000 | 3.997 | 5.028 | **0.00%** | 62.78% |
+| 1 | 10 | 0.000 | 4.020 | 4.269 | **0.00%** | 24.72% |
+| 1 | 100 | 0.000 | 3.969 | 4.004 | **0.00%** | 0.00% |
+| 2 | 1 | 10.303 | 4.553 | 8.063 | **0.00%** | 5.22% |
+| 2 | 10 | 10.603 | 4.588 | 5.413 | **0.00%** | 0.05% |
+| 3 | 1 | 31.671 | 4.729 | 9.391 | **0.00%** | 0.00% |
+| 3 | 10 | 31.322 | 4.696 | 6.944 | **0.00%** | 0.00% |
+
+Every term tabled — the *favourable* case, since an untabled term takes the loose
+`idf·(k1+1)`; the mixed rows are worse. **oracle** is the same condition with θ from the true
+top-k, which no pre-fetch decision can know: the ceiling on what any pruning could reach.
+
+**Question 3 — on what corpus?** This one, and the width-1 oracle at **62.78%** is what says it
+is not degenerate: the block bounds discriminate perfectly well, and the condition still cannot
+use them. ⚠️ The single-term row is the **harness's own control**, in `ndcg.rs`'s sense: at one
+term `Σ_{i≠t} U_i^max` vanishes and the condition reduces to textbook MaxScore, which must
+prune. A harness reporting 0% there would be broken, and a zero at widths 2 and 3 would be
+unreadable without it.
+
+**Question 2, answered precisely.** The constraint changes with width, and both answers are
+bad:
+
+- **At one term the binding constraint is θ.** θ pre-fetch is 3.997 against a true 5.028 at
+  `k = 1` — 20% low, and that gap costs the entire 62.78%. This is blocking finding 1 with a
+  number on it: the pre-fetch witness is *close*, and close is worth nothing.
+- **At two or more the binding constraint is the disjunctive sum, and no θ rescues it.**
+  `Σ_{i≠t} U_i^max` is 10.303 and 31.671 against a true θ of 8.063 and 9.391 — the other terms'
+  bounds alone exceed the k-th best score *before* the block's own upper is added. The oracle
+  column collapses with it. ⚠️ And it gets **worse** with more terms, which is the opposite of
+  how a pruning method should scale.
+
+**Question 5 — is the answer impact-ordered postings?** By elimination, yes or nothing. The
+doc-ordered shape is closed by measurement, not by caution.
+
+## ⚠️ What this does to the urgency, which was the whole argument for M5d
+
+"Every segment written before this lands is permanently unprunable" was true and is now
+irrelevant: the metadata would have been written into every segment forever to enable a skip
+that never fires. **The cost that rose with time was the cost of a mistake**, and the revert
+avoided it. `modalities-and-sequencing.md` §6's listing of block-max as a prerequisite for
+deferring FTS is what C-15 corrects.
+
+⚠️ **M5d's spec reserved C-15 for a claim about the sidecar's location** (D-13's "index
+section" vs a sibling object). That claim was never published, because the milestone reverted
+before it could be. **C-15 now names this finding instead**, on the same document.
+
+**M5d and M5e are closed as not-to-be-built in this shape.** What replaces them is not a
+smaller version of the same thing: it is OQ-45's other half, and it needs the eval set M5's
+MS MARCO exit is blocked on before anyone chooses a layout.

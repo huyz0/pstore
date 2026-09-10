@@ -16,9 +16,13 @@ Three principles, applied in this order:
    criterion 4 says "412, 409, 503 **and latency**" and the ledger says `NOT-RUN` for latency.
    That is a milestone reporting itself incomplete, and closing it costs less than arguing
    about what to do next.
-2. **A cost that rises with time outranks one that does not.** Block-max pruning is the only
-   item here that gets *more* expensive every week: segments are immutable, so every segment
+2. **A cost that rises with time outranks one that does not.** Block-max pruning was the only
+   item here that got *more* expensive every week: segments are immutable, so every segment
    written before the retrofit is permanently unprunable ([C-11](../research/06-indexing/full-text-search.md)).
+   ⚠️ **Overturned by measurement** — [C-15](../research/06-indexing/full-text-search.md): the
+   pruning skips zero bytes, so the rising cost was the cost of a *mistake*, and the principle
+   ranked first the one item that should never have been built. The principle itself survives;
+   what it needed was a number before it was applied, which is exactly what item 6b now has.
 3. **A gate that measures less than it claims outranks the code it fails to measure.** If
    `scripts/coverage.sh` cannot see `pstore-engine`, every coverage number quoted about the
    correctness core has been meaningless, including this session's.
@@ -38,12 +42,18 @@ Three principles, applied in this order:
 |---|---|---|---|
 | ~~5~~ | ~~**`scripts/coverage.sh` excludes `pstore-engine`**~~ **DONE.** A crate declares `[package.metadata.pstore] ships = false` instead of the gate inferring it, so the default is *measured* and opting out shows up in a diff. The gate still passes with the correctness core in scope: **95.41%**. | [M7a](M7a/VERIFIED.md) | M |
 
-## Phase 3 — the format decision that gets dearer every week
+## Phase 3 — ~~the format decision that gets dearer every week~~, closed by measuring it
+
+⚠️ **This phase's premise was wrong, and the measurement is in item 6b.** Block-max metadata
+was urgent because segments are immutable, so every week's segments were permanently
+unprunable. Measured, the pruning it enables skips **zero bytes** at every query width and
+every `top_k` — so what was rising with time was the cost of writing the wrong metadata into
+every segment forever, not the cost of waiting.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 6 | **[M5d](M5d/SPEC.md) — the block-max *format*.** Specced, built, **reverted, and amended**. ⚠️ Measured at gate scale, the block table grows the dictionary sidecar from 28,030 to 616,994 bytes — **22×** — and that object is fetched `Pinned` and whole on every text query. A dictionary scales with terms; a block table scales with postings. The existing test `the_term_dictionary_scales_with_terms_not_documents` caught it and is right. Needs a place for per-posting metadata that is not fetched whole per query, before anything else. | [M5c](M5c/VERIFIED.md), C-11 | M |
-| 6b | **M5e — the pruning**, unwritten. ⚠️ Two spec-review rounds found a blocking defect in each draft of the pruning half: an upper bound alone cannot prune before a fetch (θ = 0), and a lower bound fixes that for one term but is **unsound for disjunctive multi-term queries**, where a block bounds one term's addend and not a document's score. Corrected, the gain mostly evaporates — the witness term's own maximum exceeds θ, so no other term's blocks are prunable. M5d's spec carries the five questions M5e must answer, including whether the answer is impact-ordered postings instead. | [M5d](M5d/SPEC.md) | L |
+| ~~6~~ | **[M5d](M5d/SPEC.md) — the block-max *format*. CLOSED as not-to-be-built.** Specced, built, **reverted, amended twice**. ⚠️ Measured at gate scale, the block table grows the dictionary sidecar from 28,030 to 616,994 bytes — **22×** — and that object is fetched `Pinned` and whole on every text query. A dictionary scales with terms; a block table scales with postings. The existing test `the_term_dictionary_scales_with_terms_not_documents` caught it and is right. ⚠️ The layout question it was blocked on turned out not to matter: item 6b's measurement shows the pruning that metadata exists for skips **zero bytes** in this system's disjunctive scorer, at every width and every `top_k`. The metadata would have gone into every segment forever to enable a skip that never fires — so "every segment written before this lands is permanently unprunable", which was the entire urgency argument and this file's ordering principle 2, was **the cost of a mistake rather than of a delay.** The revert avoided it. | [M5c](M5c/VERIFIED.md), C-11, [C-15](../research/06-indexing/full-text-search.md) | M |
+| ~~6b~~ | **M5e — the pruning. CLOSED by measurement, and it was never written.** ⚠️ Two spec-review rounds found a blocking defect in each draft of the pruning half: an upper bound alone cannot prune before a fetch (θ = 0), and a lower bound fixes that for one term but is **unsound for disjunctive multi-term queries**, where a block bounds one term's addend and not a document's score. Corrected, the gain mostly evaporates — the witness term's own maximum exceeds θ, so no other term's blocks are prunable. ⚠️ Questions 2, 3 and 5 are now **answered with a number**: the sound condition skips **0 bytes in all 18 measured configurations** — widths 1/2/3 × `top_k` 1/10/100 × mixed and all-tabled. At one term the constraint is θ (pre-fetch 3.997 against a true 5.028, and that 20% gap costs the whole 62.78% an oracle would reach); at two or more it is `Σ_{i≠t} U_i^max`, which is **10.3** and **31.7** against a true θ of 8.06 and 9.39 — the other terms' bounds alone exceed the k-th best score, so the oracle collapses too and no better witness helps. It gets worse as terms are added. Recorded as [C-15](../research/06-indexing/full-text-search.md); harness in [`blockmax.rs`](../../crates/pstore-index/examples/blockmax.rs). What replaces it is OQ-45's other half, impact-ordered postings, which needs the eval set M5's MS MARCO exit is blocked on. | [M5d](M5d/SPEC.md) | L |
 
 ## Phase 4 — the handoffs named by three milestones each
 

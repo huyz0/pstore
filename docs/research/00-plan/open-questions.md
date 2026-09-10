@@ -102,8 +102,8 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-40` oversample factor per rerank rung ·
 `OQ-41` 1-bit quantization at 3072d / Matryoshka ·
 `OQ-42` opt-in PQ for customers who benchmark it better ·
-`OQ-44` hoisting block-max metadata out of Tantivy's format ·
-`OQ-45` impact-ordered vs doc-ordered postings ·
+~~`OQ-44`~~ **closed** — do not hoist it: the pruning it feeds skips **0 bytes** at every query width and `top_k` measured ([C-15](../06-indexing/full-text-search.md)) ·
+`OQ-45` impact-ordered vs doc-ordered postings — ⚠️ **now the only escape, not a comparison**: doc-ordered is closed by C-15, and choosing still needs the eval set M5's MS MARCO exit is blocked on ·
 `OQ-47` when to materialize filter bitmaps ·
 `OQ-48` partitioned indexes vs many indexes ·
 `OQ-49` `p_effective` explosion on anti-correlated filters ·

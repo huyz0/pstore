@@ -40,6 +40,60 @@ Elasticsearch**.
 > ⚠️ **D-13 is untouched.** It governs block-max/skip metadata, which M5a does not add. Evidence:
 > [`M5a/SPEC.md`](../../milestones/M5a/SPEC.md) and its `VERIFIED.md`.
 
+> **C-15 — block-max prunes nothing in this system's shape. Measured, and it is 0 of 18
+> configurations.** D-13 calls block-max/skip metadata "the single most important FTS layout
+> decision for object storage", and the row above and C-11 both treat writing it as urgent
+> because segments are immutable. The sound skip condition was measured against the 20,000
+> document corpus `scripts/depth.sh` uses, and it skips **zero bytes** at every query width,
+> every `top_k`, and whether or not every term carries a block table.
+>
+> `TextIndex::search` is **disjunctive** — it sums each term's contribution over the union of
+> rows — so a block's upper bound bounds *one term's addend*, never a document's score. The
+> sound condition for a block β of term t is `upper_t(β) + Σ_{i≠t} U_i^max < θ`, and the
+> reason it never holds splits cleanly by query width:
+>
+> | width | k | Σ_{i≠t} U_i^max | θ pre-fetch | θ true | sound | oracle |
+> |---|---|---|---|---|---|---|
+> | 1 | 1 | 0.000 | 3.997 | 5.028 | **0.00%** | 62.78% |
+> | 1 | 10 | 0.000 | 4.020 | 4.269 | **0.00%** | 24.72% |
+> | 2 | 1 | 10.303 | 4.553 | 8.063 | **0.00%** | 5.22% |
+> | 2 | 10 | 10.603 | 4.588 | 5.413 | **0.00%** | 0.05% |
+> | 3 | 1 | 31.671 | 4.729 | 9.391 | **0.00%** | 0.00% |
+> | 3 | 10 | 31.322 | 4.696 | 6.944 | **0.00%** | 0.00% |
+>
+> (Every term tabled, which is the *favourable* case; the mixed rows are worse. "oracle" is the
+> same condition with θ taken from the true top-k, which no pre-fetch decision can know — it is
+> the ceiling on what any pruning could reach, and it is reported so a zero cannot be misread.)
+>
+> ⚠️ **At one term the constraint is θ, and at two or more it is the disjunctive sum.** With one
+> term the sum vanishes and the condition reduces to textbook MaxScore — an oracle θ reaches
+> **62.78%**, and the pre-fetch witness, 20% below it, reaches nothing. That is the first
+> blocking finding in [`M5d/SPEC.md`](../../milestones/M5d/SPEC.md) with a number on it. At two
+> and three terms `Σ_{i≠t} U_i^max` is **10.3** and **31.7** against a true θ of 8.06 and 9.39,
+> so the other terms' bounds alone exceed the k-th best score before the block's own upper is
+> added — and no improvement to θ rescues that, which is why the oracle column also collapses.
+> It gets **worse** as terms are added, the opposite of how a pruning method should scale.
+>
+> ⚠️ **The layout half of D-13 is untouched.** "Skip metadata in a cached place, posting
+> payloads in the data section" remains right, and C-10's correction to *which* cached place
+> stands. What is corrected is the **importance**: for this scorer, at the two- and three-term
+> widths this system serves, the metadata would be written into every segment forever to enable
+> a skip that never fires.
+>
+> ⚠️ These are byte counts and score comparisons, not latencies — deterministic and
+> machine-independent, so non-negotiable 7's WSL2 caveat does not apply. What *is* provisional
+> is the **corpus**: Zipf-ish and generated, because MS MARCO is blocked on network. The
+> width-1 oracle at 62.78% is what says the corpus is not degenerate — the block bounds do
+> discriminate, and the condition still cannot use them.
+>
+> What would overturn C-15: **impact-ordered postings** (the other half of OQ-45), which is the
+> layout that escapes pre-fetch-only decisions; a conjunctive or WAND-pivot scorer, where a
+> document's score is bounded rather than summed; or a real corpus whose per-block `tf` and
+> fieldnorm ranges are far less uniform than a generated one's. The harness takes all three.
+>
+> Evidence: [`crates/pstore-index/examples/blockmax.rs`](../../../crates/pstore-index/examples/blockmax.rs),
+> run with `cargo run --release -p pstore-index --example blockmax`.
+
 Tantivy's format is directly usable as a reference: FST term dictionary, skip lists written
 at the head of the postings when `doc_freq >= 128`, VInt encoding below that (avoiding
 skip-list overhead for the long tail of rare terms), and block-max data enabling
