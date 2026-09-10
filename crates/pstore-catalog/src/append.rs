@@ -1,10 +1,10 @@
 //! Recording a tenant, at tenant-lifecycle rate rather than at commit rate.
 
-use crate::bucket::{Publish, merge, publish, read_head};
+use crate::bucket::{Publish, merge, publish, read_head, write_head};
 use crate::keys::{Width, bucket_of};
 use crate::record::TenantRecord;
 use crate::{CatalogError, MAX_CAS_ATTEMPTS, MAX_PENDING};
-use pstore_blob::{BlobStore, CasError};
+use pstore_blob::BlobStore;
 use pstore_types::TenantId;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -100,28 +100,5 @@ impl<S: BlobStore> Appender<S> {
             }
         }
         Err(CatalogError::Contended(bucket, MAX_CAS_ATTEMPTS))
-    }
-}
-
-async fn write_head<S: BlobStore>(
-    store: &S,
-    bucket: u32,
-    head: &crate::BucketHead,
-    tag: Option<pstore_types::CasTag>,
-) -> Result<Publish, CatalogError> {
-    match store
-        .put_conditional(
-            &crate::keys::head_key(bucket),
-            head.encode().into(),
-            match tag {
-                Some(t) => pstore_blob::Precondition::Match(t),
-                None => pstore_blob::Precondition::NotExists,
-            },
-        )
-        .await
-    {
-        Ok(_) => Ok(Publish::Landed),
-        Err(CasError::Lost | CasError::Contended) => Ok(Publish::Rebase),
-        Err(CasError::Io(e)) => Err(pstore_blob::BlobError::Other(e).into()),
     }
 }

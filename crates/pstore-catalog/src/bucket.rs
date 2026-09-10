@@ -29,6 +29,17 @@ pub struct BucketHead {
     pub digest: u64,
     /// Recorded but not yet in a run. Bounded by [`crate::MAX_PENDING`].
     pub pending: Vec<TenantRecord>,
+    /// Runs this bucket has superseded, **newest first**, bounded by
+    /// [`crate::MAX_GRAVEYARD`].
+    ///
+    /// ⚠️ **A run's key is derived, not remembered.** `run_key(bucket, run_epoch, digest)`
+    /// needs a content digest, and this head carries only the digest of the run it *names* —
+    /// so an old run's key cannot be computed from anything that survives, and garbage nobody
+    /// can name is garbage forever. This is the record that makes reaping possible at all.
+    ///
+    /// ⚠️ Encoded **after** `pending`, so a head written before this field existed decodes
+    /// with an empty graveyard rather than failing.
+    pub graveyard: Vec<(Epoch, u64)>,
 }
 
 impl BucketHead {
@@ -43,15 +54,61 @@ impl BucketHead {
         out.extend_from_slice(&self.run_epoch.0.to_le_bytes());
         out.extend_from_slice(&self.digest.to_le_bytes());
         out.extend_from_slice(&encode_records(&self.pending));
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bounded by MAX_GRAVEYARD, which is 8"
+        )]
+        out.extend_from_slice(&(self.graveyard.len() as u32).to_le_bytes());
+        for (epoch, digest) in &self.graveyard {
+            out.extend_from_slice(&epoch.0.to_le_bytes());
+            out.extend_from_slice(&digest.to_le_bytes());
+        }
         out
+    }
+
+    /// The encoding, for a test that has to build a head this version would not write.
+    ///
+    /// Forward compatibility that cannot be constructed cannot be tested, and heads written
+    /// before the graveyard existed outlive every reader that meets them.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encode_for_test(&self) -> Vec<u8> {
+        self.encode()
+    }
+
+    /// Records `(epoch, digest)` as superseded, newest first, deduplicated and bounded.
+    ///
+    /// ⚠️ **Deduplicated because `publish` is retried.** Two attempts against the same head
+    /// each supersede the same run, and a duplicate spends a slot inside a bound whose whole
+    /// job is to keep this object small.
+    fn bury(&mut self, epoch: Epoch, digest: u64) {
+        if epoch == Epoch::ZERO || self.graveyard.contains(&(epoch, digest)) {
+            return;
+        }
+        self.graveyard.insert(0, (epoch, digest));
+        self.graveyard.truncate(crate::MAX_GRAVEYARD);
     }
 
     pub(crate) fn decode(buf: &[u8], what: &str) -> Result<Self, CatalogError> {
         let mut c = Cur { b: buf, i: 0, what };
+        let run_epoch = Epoch(c.u64()?);
+        let digest = c.u64()?;
+        let pending = decode_records(&mut c)?;
+        // ⚠️ Absent, not empty, for a head written before the field existed — and absence
+        // means "nothing recorded as superseded", which is the safe reading: a reap finds
+        // nothing rather than deleting something it cannot name.
+        let mut graveyard = Vec::new();
+        if c.i < buf.len() {
+            let n = c.u32()?;
+            for _ in 0..n {
+                graveyard.push((Epoch(c.u64()?), c.u64()?));
+            }
+        }
         Ok(Self {
-            run_epoch: Epoch(c.u64()?),
-            digest: c.u64()?,
-            pending: decode_records(&mut c)?,
+            run_epoch,
+            digest,
+            pending,
+            graveyard,
         })
     }
 }
@@ -63,15 +120,22 @@ fn encode_root(r: Root) -> Vec<u8> {
     out
 }
 
-/// Reads the deployment shape.
+/// Reads the deployment shape, and the tag its next write must be conditioned on.
+///
+/// ⚠️ **The tag is why this returns a pair.** It did not, and `write_root`'s `Some(previous)`
+/// arm was therefore unreachable through the public API: a caller could only ever pass `None`,
+/// which is create-if-absent and fails the moment the root exists. So the width could be set
+/// once and **never changed** — which is a concrete blocker under OQ-8's protocol question,
+/// one layer below it. Found by the region floor, which is what a coverage floor is for.
+///
 ///
 /// ⚠️ **Absent means "never widened", not "broken".** A deployment that has only ever run at
 /// the default width has never had a reason to write this object, so the common case is a
 /// 404 — and it still costs the request, which is why a cold enumeration is one round deeper
 /// than a warm one.
-pub async fn read_root<S: BlobStore>(store: &S) -> Result<Root, CatalogError> {
-    match store.get(&keys::root_key()).await {
-        Ok(bytes) => {
+pub async fn read_root<S: BlobStore>(store: &S) -> Result<(Root, Option<CasTag>), CatalogError> {
+    match store.get_with_tag(&keys::root_key()).await {
+        Ok((bytes, tag)) => {
             let mut c = Cur {
                 b: &bytes,
                 i: 0,
@@ -80,12 +144,17 @@ pub async fn read_root<S: BlobStore>(store: &S) -> Result<Root, CatalogError> {
             let epoch = Epoch(c.u64()?);
             let raw = c.u32()?;
             let width = Width::new(raw).ok_or(CatalogError::BadWidth(raw))?;
-            Ok(Root { epoch, width })
+            Ok((Root { epoch, width }, Some(tag)))
         }
-        Err(BlobError::NotFound(_)) => Ok(Root {
-            epoch: Epoch::ZERO,
-            width: Width::default(),
-        }),
+        // ⚠️ No tag, and that is the create-if-absent case rather than an error: a deployment
+        // at the default width has never had a reason to write this object.
+        Err(BlobError::NotFound(_)) => Ok((
+            Root {
+                epoch: Epoch::ZERO,
+                width: Width::default(),
+            },
+            None,
+        )),
         Err(e) => Err(e.into()),
     }
 }
@@ -196,11 +265,15 @@ pub(crate) async fn publish<S: BlobStore>(
     let current = read_run(store, bucket, head).await?;
     let merged = merge(current, head.pending.iter().chain(extra));
     let body = encode_records(&merged);
-    let next = BucketHead {
+    let mut next = BucketHead {
         run_epoch: head.run_epoch.next(),
         digest: keys::digest(&body),
         pending: Vec::new(),
+        graveyard: head.graveyard.clone(),
     };
+    // ⚠️ Recorded BEFORE the new head is written, and it is the only chance: once this head
+    // lands, the run it superseded has no key anyone can derive.
+    next.bury(head.run_epoch, head.digest);
     let run = keys::run_key(bucket, next.run_epoch, next.digest);
     // Conditional on absence: with the digest in the key, an object already there has the
     // content we were about to write, so losing this race is success.
@@ -259,6 +332,92 @@ where
     by_tenant.into_values().collect()
 }
 
+pub(crate) async fn write_head<S: BlobStore>(
+    store: &S,
+    bucket: u32,
+    head: &crate::BucketHead,
+    tag: Option<pstore_types::CasTag>,
+) -> Result<Publish, CatalogError> {
+    match store
+        .put_conditional(
+            &crate::keys::head_key(bucket),
+            head.encode().into(),
+            match tag {
+                Some(t) => pstore_blob::Precondition::Match(t),
+                None => pstore_blob::Precondition::NotExists,
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(Publish::Landed),
+        Err(CasError::Lost | CasError::Contended) => Ok(Publish::Rebase),
+        Err(CasError::Io(e)) => Err(pstore_blob::BlobError::Other(e).into()),
+    }
+}
+
+/// Deletes the runs this bucket superseded, keeping the newest `retention` of them.
+///
+/// ⚠️ **`retention` is a count of kept superseded runs, not epoch arithmetic.** The graveyard
+/// is newest-first, so "keep the newest `retention`" needs no comparison — and the arithmetic
+/// form invites an off-by-one whose failure mode is reaping a run a reader is on.
+///
+/// ⚠️ **Refused above [`crate::MAX_GRAVEYARD`].** A window of 20 against a record of 8 evicts
+/// runs 9 through 20 from the graveyard *while they are still inside the window they were
+/// promised*, turning them into permanently unreachable garbage. A promise larger than the
+/// record is refused rather than silently broken.
+///
+/// ⚠️ **Deletes before it commits**, which is the mirror of `Engine::gc`'s ordering argument.
+/// Deleting and then losing the head CAS leaves entries naming absent objects, and the next
+/// reap re-deletes them harmlessly — `delete_batch` on a missing key is not an error.
+/// CAS-then-delete leaves objects with **no record**, and their keys cannot be derived from
+/// anything that survives.
+///
+/// Returns how many objects it reaped.
+pub async fn reap<S: BlobStore>(
+    store: &S,
+    bucket: u32,
+    retention: usize,
+) -> Result<usize, CatalogError> {
+    crate::require_fencing(store)?;
+    if retention > crate::MAX_GRAVEYARD {
+        return Err(CatalogError::Corrupt(format!(
+            "a retention of {retention} superseded runs is wider than the graveyard's \
+             {} entries, so the oldest would be evicted while still inside its window",
+            crate::MAX_GRAVEYARD
+        )));
+    }
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let (head, tag) = read_head(store, bucket).await?;
+        let Some(tag) = tag else { return Ok(0) };
+        if head.graveyard.len() <= retention {
+            return Ok(0);
+        }
+        let (keep, doomed) = head.graveyard.split_at(retention);
+        let keys: Vec<pstore_blob::Key> = doomed
+            .iter()
+            .map(|(epoch, digest)| keys::run_key(bucket, *epoch, *digest))
+            .collect();
+        let n = keys.len();
+        // Chunked at the backend's cap, the way `Engine::gc` learned to: a batch wider than
+        // the profile allows is refused by the backend, not silently truncated.
+        let cap = store.capabilities().max_batch_delete.max(1);
+        for chunk in keys.chunks(cap) {
+            store.delete_batch(chunk).await?;
+        }
+        let next = BucketHead {
+            graveyard: keep.to_vec(),
+            ..head
+        };
+        if matches!(
+            write_head(store, bucket, &next, Some(tag)).await?,
+            Publish::Landed
+        ) {
+            return Ok(n);
+        }
+    }
+    Err(CatalogError::Contended(bucket, MAX_CAS_ATTEMPTS))
+}
+
 /// Drains a bucket's pending records into a new immutable run.
 ///
 /// Optimistic and leaderless: any node may call it, the CAS decides, and a loser rebases onto
@@ -308,10 +467,27 @@ mod tests {
             run_epoch: Epoch(3),
             digest: 0xdead_beef,
             pending: vec![live(1, 2)],
+            graveyard: vec![(Epoch(2), 0xf00d), (Epoch(1), 0xbeef)],
         };
         let buf = h.encode();
         assert_eq!(BucketHead::decode(&buf, "t").unwrap(), h);
+        // ⚠️ Every cut except the boundary where `pending` ends and the graveyard begins:
+        // that one is a pre-M6d head, which decodes with an empty graveyard rather than
+        // failing, and it is the whole of the additive promise.
+        let old = BucketHead {
+            graveyard: Vec::new(),
+            ..h.clone()
+        };
+        let seam = old.encode().len() - 4;
         for cut in 0..buf.len() {
+            if cut == seam {
+                assert_eq!(
+                    BucketHead::decode(&buf[..cut], "t").unwrap(),
+                    old,
+                    "a head with no graveyard field must decode as an empty graveyard"
+                );
+                continue;
+            }
             assert!(BucketHead::decode(&buf[..cut], "t").is_err(), "cut {cut}");
         }
     }
@@ -323,6 +499,7 @@ mod tests {
             run_epoch: Epoch(1),
             digest: 0,
             pending: vec![],
+            graveyard: vec![],
         };
         assert!(h.run(3).is_some());
     }

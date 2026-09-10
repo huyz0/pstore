@@ -48,7 +48,7 @@ mod keys;
 mod record;
 
 pub use append::Appender;
-pub use bucket::{BucketHead, Root, fold, read_head, read_root, write_root};
+pub use bucket::{BucketHead, Root, fold, read_head, read_root, reap, write_root};
 pub use enumerate::{Enumeration, Mark, enumerate, enumerate_since};
 pub use keys::{DEFAULT_WIDTH, MAX_WIDTH, Width, bucket_of, head_key, root_key, run_key};
 pub use record::{State, TenantRecord};
@@ -64,6 +64,19 @@ pub use record::{State, TenantRecord};
 /// It also bounds the pointer **structurally**: the append that would exceed the cap folds
 /// first, so a folder that never runs is a cost problem and never a correctness one.
 pub const MAX_PENDING: usize = 8;
+
+/// How many superseded runs a bucket head records.
+///
+/// ⚠️ **Bounded for the same reason [`MAX_PENDING`] is, one field over**: this object is CAS'd
+/// on **every** append and every fold, and an unbounded list of `(epoch, digest)` pairs grows
+/// the hottest small object in the catalog forever. At 16 bytes an entry the record costs at
+/// most 128 bytes.
+///
+/// ⚠️ It also caps the retention window `reap` will honour: a promise to keep 20 superseded
+/// runs against a record of 8 evicts the oldest 12 *while they are still inside the window*,
+/// and a run nobody can name is garbage forever. `reap` refuses the wider promise rather than
+/// silently breaking it.
+pub const MAX_GRAVEYARD: usize = 8;
 
 /// Refuses a backend whose recorded profile says it cannot fence.
 ///

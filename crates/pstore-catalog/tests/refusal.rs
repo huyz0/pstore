@@ -199,6 +199,12 @@ async fn a_catalog_write_on_a_divergent_backend_is_refused() {
             .await
             .expect_err("observe must refuse"),
         fold(store.as_ref(), 0).await.expect_err("fold must refuse"),
+        // ⚠️ M6d, and the reason bites harder here than at any other door: a reaper on a
+        // backend that cannot fence deletes objects and then fails to record that it did,
+        // which is exactly the unreachable garbage the graveyard exists to prevent.
+        pstore_catalog::reap(store.as_ref(), 0, 0)
+            .await
+            .expect_err("reap must refuse"),
         pstore_catalog::write_root(
             store.as_ref(),
             pstore_catalog::Root {

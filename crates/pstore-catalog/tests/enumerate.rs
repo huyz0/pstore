@@ -55,7 +55,7 @@ async fn enumeration_is_two_rounds_deep() {
 
     // Cold: the root is one round more, and it is a round even when the object is absent.
     store.reset();
-    let root = read_root(store.as_ref()).await.unwrap();
+    let (root, _) = read_root(store.as_ref()).await.unwrap();
     enumerate(store.as_ref(), root.width).await.unwrap();
     assert_eq!(store.depth(), 3);
 }
@@ -78,7 +78,7 @@ async fn a_reader_takes_the_width_from_the_root() {
 
     // A reader that reached for `DEFAULT_WIDTH` instead would read 16,384 buckets that are
     // not where anything is, and report an empty catalog with every count still "correct".
-    let root = read_root(store.as_ref()).await.unwrap();
+    let (root, _) = read_root(store.as_ref()).await.unwrap();
     assert_eq!(root.width, w);
     assert_eq!(
         enumerate(store.as_ref(), root.width)
