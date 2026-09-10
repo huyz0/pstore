@@ -70,7 +70,8 @@ the failure read. Command: `cargo test -p pstore-catalog --test reap`.
     Mutation, in the `dev` container over the changed module
     (`scripts/mutants.sh --file crates/pstore-catalog/src/bucket.rs`): **45 mutants, 35 caught,
     2 missed, 8 unviable** on the first run; both misses were in `reap` and are the two
-    additions recorded under criteria 1 and 6.
+    additions recorded under criteria 1 and 6. Re-swept after them: **45 mutants, 37 caught,
+    0 missed, 8 unviable**.
 
 ## What is not built, and named rather than omitted
 
