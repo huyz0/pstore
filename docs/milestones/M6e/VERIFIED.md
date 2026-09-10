@@ -41,8 +41,11 @@ the failure read. Command: `cargo test -p pstore-catalog --test sweep`.
    `./scripts/coverage.sh --fail-under-regions 95`. Mutation over `keys.rs`, in the `dev`
    container: **34 mutants, 29 caught, 1 missed, 4 unviable** on the first run — the miss is
    criterion 4's width check above — and **30 of 30 viable caught** after it. Over `sweep`
-   itself: **50 mutants, 43 caught, 5 missed, 2 unviable**; four of those five predate this
-   milestone entirely, and the fifth is recorded below.
+   itself: **50 mutants, 43 caught, 5 missed, 2 unviable** on the first run, and **49 mutants,
+   43 caught, 4 missed, 2 unviable** after the removal below — the four are the
+   engine's stale-commit test helper, one in `pstore-node` and two in `pstore-testkit`, all of
+   which predate this milestone and survive every sweep in this session. **Nothing in `sweep` or
+   `keys.rs` survives.**
    ⚠️ **The fifth was dead code, and it was removed rather than tested.** `sweep` pushed the
    head's own run into the `named` keep-set, and `!=` mutated to `==` could not be
    distinguished from it: the live run's epoch **equals** the head's, and the filter already
