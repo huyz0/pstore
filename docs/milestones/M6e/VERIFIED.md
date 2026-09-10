@@ -40,7 +40,15 @@ the failure read. Command: `cargo test -p pstore-catalog --test sweep`.
 7. **Gates** — `./scripts/gates.sh` green; workspace regions green via
    `./scripts/coverage.sh --fail-under-regions 95`. Mutation over `keys.rs`, in the `dev`
    container: **34 mutants, 29 caught, 1 missed, 4 unviable** on the first run — the miss is
-   criterion 4's width check above — and **30 of 30 viable caught** after it.
+   criterion 4's width check above — and **30 of 30 viable caught** after it. Over `sweep`
+   itself: **50 mutants, 43 caught, 5 missed, 2 unviable**; four of those five predate this
+   milestone entirely, and the fifth is recorded below.
+   ⚠️ **The fifth was dead code, and it was removed rather than tested.** `sweep` pushed the
+   head's own run into the `named` keep-set, and `!=` mutated to `==` could not be
+   distinguished from it: the live run's epoch **equals** the head's, and the filter already
+   keeps everything not strictly below that. The graveyard's entries are the ones genuinely
+   below it, which is why they need naming and the live run does not. What protects the live
+   run is criterion 2's strict comparison, not the push.
    ⚠️ **`pstore-catalog` itself measures 94.90% regions, below the 95% this criterion states,
    and it is reported rather than rounded.** The gap is `append.rs` at 88.75%, and it is the
    mutex **poison** branches in the appender's observe path, which degrade to "record

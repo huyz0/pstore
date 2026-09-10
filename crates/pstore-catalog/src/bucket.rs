@@ -451,10 +451,13 @@ pub async fn reap<S: BlobStore>(
 pub async fn sweep<S: BlobStore>(store: &S, bucket: u32) -> Result<usize, CatalogError> {
     crate::require_fencing(store)?;
     let (head, _) = read_head(store, bucket).await?;
-    let mut named: Vec<(Epoch, u64)> = head.graveyard.clone();
-    if head.run_epoch != Epoch::ZERO {
-        named.push((head.run_epoch, head.digest));
-    }
+    // ⚠️ The graveyard only. The head's OWN run needs no entry here: its epoch equals
+    // `head.run_epoch`, and the filter below keeps anything not strictly below that. A push
+    // for it was written first and removed — a mutation sweep could not distinguish it from
+    // its own absence, and `a_run_in_flight_survives_the_sweep` is what actually protects the
+    // live run by pinning the comparison as strict. The graveyard's entries ARE below the
+    // head's epoch, which is why they need naming and this does not.
+    let named: Vec<(Epoch, u64)> = head.graveyard.clone();
 
     let prefix = keys::bucket_prefix(bucket);
     let doomed: Vec<pstore_blob::Key> = store
