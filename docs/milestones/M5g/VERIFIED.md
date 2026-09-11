@@ -38,10 +38,16 @@ the failure read. Commands: `cargo test -p pstore-engine --test dense_index`,
    only the first segment ref. ⚠️ The first fixture could not fail: `(i + j) % 13` repeats
    every 13 documents, so both segments held identical vectors and the tie-break `(segment,
    row)` hid whether segment 1 was read at all. Component 0 now rises with the index.
-8. ⚠️ **`Engine::query` does not see unfolded rows, by test** —
-   `an_unfolded_row_is_visible_to_scan_and_not_to_query`, pinned in both directions and then
-   shown to arrive after a fold. Indexed **or** fresh, not both, and neither method name says
-   so.
+8. ⚠️ **`Engine::query` did not see unfolded rows, and said so by test** — **SUPERSEDED by
+   [M5h](../M5h/VERIFIED.md), and recorded rather than quietly rewritten.** This criterion was
+   met as written: the limit was pinned in both directions and then shown to resolve after a
+   fold. M5h closed it — the memtable is now sealed into a segment that lives only in memory
+   and queried alongside HEAD's — so the test that asserted the limit now asserts the
+   agreement, as `an_unfolded_row_reaches_both_scan_and_query`, and
+   `an_unfolded_row_reaches_the_indexed_query` is its counterpart on the new side. ⚠️ The test
+   was **amended, not deleted**: a behaviour change recorded by a test disappearing is a
+   behaviour change nobody can find later. `scripts/check-verified.py` is what caught this
+   ledger still naming the old identifier.
 9. ⚠️ **The centroid table is actually reached** — `a_query_probes_rather_than_scanning`.
    **Observed red, and it is the finding that matters most here:** pointing `centroid_key` at a
    nonexistent object survived every result assertion, because a missing table is how D-10 says

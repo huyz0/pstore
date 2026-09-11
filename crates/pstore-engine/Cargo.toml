@@ -18,6 +18,8 @@ pstore-format = { path = "../pstore-format" }
 # test asserts an engine property and moved with this dependency (M5g).
 pstore-index  = { path = "../pstore-index" }
 pstore-query  = { path = "../pstore-query" }
+# `Split` implements `BlobStore`, which is an `async_trait`.
+async-trait   = "0.1.92"
 pstore-types  = { path = "../pstore-types" }
 bytes         = "1"
 thiserror     = "2"

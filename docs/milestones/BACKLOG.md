@@ -83,12 +83,15 @@ every row the work opened along the way.** What is left is the table below.
 |---|---|---|
 | **10b** | [M6a](M6a/VERIFIED.md), narrowed by [M6d](M6d/VERIFIED.md) | Blocked on a protocol keeping an old-width reader stale rather than wrong, and on a key-format change. M6d removed the write-once-root blocker underneath it. Nothing waits on it at 16,384 buckets. |
 | **14** | [M5g](M5g/VERIFIED.md) | Boundary replication is off in the engine because it writes a row twice, costing r@10 p=2 **0.961 → 0.844**. Recovering it needs list membership that does not duplicate a row — a layout change. |
-| **15** | [M5g](M5g/VERIFIED.md) | `Engine::query` is indexed-but-stale and `Engine::search` is fresh-but-exact. Closing the gap needs something that can score unindexed memtable rows into a `(segment, row)` fusion. |
+| ~~15~~ | [M5g](M5g/VERIFIED.md) | **Done** — [M5h](M5h/VERIFIED.md). The memtable became a segment, so there is one BM25, one dense path and one fusion rather than a second scorer for each. |
 | ~~16~~ | [M6e](M6e/VERIFIED.md) | **Done** — [M6f](M6f/VERIFIED.md). It was a behaviour bug, not a coverage row. |
 
-⚠️ **Items 12 and 13 were opened and closed inside the same run of work** — the ANN index at
-fold time ([M5g](M5g/VERIFIED.md)) and the orphan sweeper ([M6e](M6e/VERIFIED.md)). What each
-left behind is above, and each is smaller than what it replaced.
+⚠️ **Items 12, 13, 15 and 16 were opened and closed inside the same run of work** — the ANN index at
+fold time ([M5g](M5g/VERIFIED.md)), the orphan sweeper ([M6e](M6e/VERIFIED.md)), the freshness
+layer in the indexed path ([M5h](M5h/VERIFIED.md)) and the poisoned lock
+([M6f](M6f/VERIFIED.md)). What each left behind is above, and each is smaller than what it
+replaced. ⚠️ **Item 14 is the only row left that is not blocked**, and it is the recall the
+engine gave up to keep `Engine::scan`'s "exactly once" promise.
 
 ⚠️ **Two items closed by measuring instead of building** — 6 and 6b, where the pruning the
 format existed for skips **zero bytes**, and this file's own ordering principle 2 had ranked

@@ -132,6 +132,154 @@ struct Memtable {
     pending: BTreeMap<String, Vec<Document>>,
     /// Flushed to a bundle, durable, still not folded into a segment.
     durable: BTreeMap<String, Vec<Document>>,
+    /// Bumped whenever either map changes, so a cached fresh segment knows it is stale.
+    ///
+    /// ⚠️ `flush` moves rows from `pending` to `durable` without changing what they are, so it
+    /// invalidates needlessly. Bumping on it anyway is the safe direction and is cheaper than
+    /// reasoning about which mutations matter.
+    generation: u64,
+}
+
+/// Two stores behind one `BlobStore`: the tenant's durable one, and the private in-memory one
+/// holding the fresh segment.
+///
+/// ⚠️ **Routed by key prefix, not by trying both.** Trying the fresh store first and falling
+/// back would turn every miss into two requests against the tenant's store, and trying the
+/// durable one first would let a fresh key 404 before it was ever looked for. The fresh
+/// segment's keys all begin `mem/`, which no derived tenant key does — they begin with the
+/// tenant's four hex digits.
+#[derive(Debug)]
+struct Split<S> {
+    durable: Arc<S>,
+    fresh: Option<Arc<pstore_blob::MemoryStore>>,
+}
+
+impl<S: BlobStore> Split<S> {
+    fn is_fresh(key: &Key) -> bool {
+        key.as_str().starts_with("mem/")
+    }
+}
+
+macro_rules! split_to {
+    ($self:ident, $key:expr, $call:ident ( $($arg:expr),* )) => {
+        match (&$self.fresh, Split::<S>::is_fresh($key)) {
+            (Some(f), true) => f.$call($($arg),*).await,
+            _ => $self.durable.$call($($arg),*).await,
+        }
+    };
+}
+
+#[async_trait::async_trait]
+impl<S: BlobStore> BlobStore for Split<S> {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.durable.capabilities()
+    }
+    async fn get(&self, key: &Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get(key))
+    }
+    async fn get_range(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get_range(key, range))
+    }
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get_suffix(key, n))
+    }
+    async fn get_with_tag(
+        &self,
+        key: &Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        split_to!(self, key, get_with_tag(key))
+    }
+    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+        split_to!(self, key, get_tag(key))
+    }
+    async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {
+        split_to!(self, key, head(key))
+    }
+    async fn put(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        split_to!(self, key, put(key, body))
+    }
+    async fn put_conditional(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        split_to!(self, key, put_conditional(key, body, pre))
+    }
+    async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
+        self.durable.delete_batch(keys).await
+    }
+    async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, pstore_blob::BlobError> {
+        self.durable.list_unrestricted(prefix).await
+    }
+    // ⚠️ The classed reads are defaulted on the trait and every decorator must forward them, or
+    // the class is dropped and D-21 is disabled with every test still passing.
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get_range_as(key, range, class))
+    }
+    async fn get_suffix_as(
+        &self,
+        key: &Key,
+        n: u64,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get_suffix_as(key, n, class))
+    }
+    async fn get_immutable(
+        &self,
+        key: &Key,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        split_to!(self, key, get_immutable(key, class))
+    }
+}
+
+/// One index's memtable, sealed into a segment that lives only in memory.
+#[derive(Debug)]
+struct Fresh {
+    /// The memtable generation this was built from.
+    generation: u64,
+    /// Which index it holds.
+    index: String,
+    /// The private store the segment and its sidecars live in.
+    store: Arc<pstore_blob::MemoryStore>,
+    /// Where in that store.
+    target: pstore_query::Target,
+    /// The documents, in the segment's row order — which the clustering decides, so it is not
+    /// the order they were written in.
+    rows: Vec<Document>,
+}
+
+/// What [`Engine::query`] returns: hits, plus the documents behind the fresh ordinal.
+///
+/// ⚠️ **A struct rather than a bare `Vec<Hit>`**, because `Hit { segment: unfolded_at, .. }`
+/// indexes **nothing in HEAD**. A caller resolving it against the segment list would name a
+/// different document, plausibly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    /// The fused ranking. Every `segment` below [`Self::unfolded_at`] indexes HEAD's segment
+    /// list for the index queried.
+    pub hits: Vec<pstore_query::Hit>,
+    /// The unfolded documents, in the row order [`Self::unfolded_at`]'s hits index.
+    pub unfolded: Vec<Document>,
+    /// The ordinal the freshness layer occupies — one past HEAD's last segment.
+    ///
+    /// ⚠️ When nothing is unfolded no fresh segment is built at all, so no hit carries this
+    /// and [`Self::unfolded`] is empty. An empty segment would occupy an ordinal for nothing.
+    pub unfolded_at: usize,
 }
 
 /// One writer's view of one tenant.
@@ -153,6 +301,18 @@ pub struct Engine<S> {
     /// hold, because the thing it excludes should never happen.
     flushing: tokio::sync::Mutex<()>,
     committed: Mutex<Epoch>,
+    /// The memtable sealed into an in-memory segment, and the generation it was built from.
+    ///
+    /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
+    /// one BM25, one dense path, one sparse path, one fusion and one `(segment, row)` space.
+    /// Scoring raw documents instead would have meant a second implementation of each that
+    /// must agree with the first exactly — the hazard `Hit`'s own doc names about inventing an
+    /// identity twice.
+    ///
+    /// ⚠️ Cached on the generation counter so the cost lands on `write` and `flush` rather
+    /// than on every query, and held in a **private** `MemoryStore` so sealing it costs the
+    /// tenant's store nothing.
+    fresh: tokio::sync::Mutex<Option<Fresh>>,
     /// What the dense index is built with.
     ///
     /// ⚠️ **`exact_scan_threshold` is the load-bearing one.** Below it nothing is clustered,
@@ -232,6 +392,7 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(Seq::ZERO),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
+            fresh: tokio::sync::Mutex::new(None),
             params: pstore_index::cluster::Params::default(),
             text_field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
         }
@@ -383,11 +544,9 @@ impl<S: BlobStore> Engine<S> {
         for d in &docs {
             pstore_format::check_storable(d).map_err(|e| EngineError::Format(e.to_string()))?;
         }
-        self.mem()
-            .pending
-            .entry(index.to_owned())
-            .or_default()
-            .extend(docs);
+        let mut m = self.mem();
+        m.generation += 1;
+        m.pending.entry(index.to_owned()).or_default().extend(docs);
         Ok(())
     }
 
@@ -414,6 +573,7 @@ impl<S: BlobStore> Engine<S> {
         let _lane = self.flushing.lock().await;
         let pending = {
             let mut m = self.mem();
+            m.generation += 1;
             if m.pending.is_empty() {
                 return Ok(None);
             }
@@ -463,6 +623,7 @@ impl<S: BlobStore> Engine<S> {
         // Only now does it move from pending to durable: a write that failed to land must
         // not be reported as durable, and must stay visible so it is not lost.
         let mut m = self.mem();
+        m.generation += 1;
         for (idx, docs) in pending {
             m.durable.entry(idx).or_default().extend(docs);
         }
@@ -476,6 +637,7 @@ impl<S: BlobStore> Engine<S> {
     /// because the caller's retry would have no way to know what to retry.
     fn restore(&self, pending: BTreeMap<String, Vec<Document>>) {
         let mut m = self.mem();
+        m.generation += 1;
         for (idx, mut docs) in pending {
             let slot = m.pending.entry(idx).or_default();
             // Older rows first: they were written first, and a later write to the same id
@@ -587,7 +749,10 @@ impl<S: BlobStore> Engine<S> {
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
-                    self.mem().durable.clear();
+                    let mut m = self.mem();
+                    m.generation += 1;
+                    m.durable.clear();
+                    drop(m);
                     *self
                         .committed
                         .lock()
@@ -919,31 +1084,127 @@ impl<S: BlobStore> Engine<S> {
         Ok(out)
     }
 
-    /// Runs `prefetch` over every segment HEAD names for `index`, fused into one answer.
+    /// Seals this index's unfolded rows into a segment that lives only in memory.
     ///
-    /// ⚠️ **Indexed, and stale.** This reads the segments the last fold published; rows
-    /// written since live in the memtable, which has no index, no segment and no row ordinal,
-    /// so they cannot enter a `(segment, row)` fusion. [`Self::scan`] and [`Self::search`] see
-    /// them and are exact instead. A caller must choose, and neither name says so — the gap is
-    /// the memtable's, and closing it needs something that can score unindexed rows into the
-    /// same fusion.
+    /// ⚠️ Returns `None` when nothing is unfolded — an **empty** fresh segment would occupy an
+    /// ordinal for nothing, and every other ordinal is a number a caller resolves against HEAD.
     ///
-    /// ⚠️ `Hit.segment` indexes HEAD's segment list **for this call**. A fold or a compaction
-    /// between two calls renumbers it, which is why M5f scoped that identity to a snapshot.
+    /// ⚠️ A refusal here **fails the query**. Falling back to the folded-only answer would be
+    /// silently returning the stale result this exists to remove, which is worse than an error
+    /// a caller can see.
+    async fn fresh_target(&self, index: &str) -> Result<Option<pstore_query::Target>, EngineError> {
+        let (generation, rows) = {
+            let m = self.mem();
+            let mut rows: Vec<Document> = Vec::new();
+            for src in [&m.durable, &m.pending] {
+                rows.extend(src.get(index).into_iter().flatten().cloned());
+            }
+            (m.generation, rows)
+        };
+        let mut slot = self.fresh.lock().await;
+        if let Some(f) = slot.as_ref()
+            && f.generation == generation
+            && f.index == index
+        {
+            return Ok(Some(f.target.clone()));
+        }
+        if rows.is_empty() {
+            *slot = None;
+            return Ok(None);
+        }
+
+        let store = Arc::new(pstore_blob::MemoryStore::new());
+        let key = Key::new(format!("mem/{index}.seg"));
+        // The same builder a fold uses, so the fresh half and the folded half are scored by
+        // the same code rather than by two that must agree.
+        let sparse = sparse_field_of(&rows);
+        let wants_text = rows.iter().any(|d| {
+            matches!(
+                d.attrs.get(self.text_field.as_str()),
+                Some(pstore_format::Value::Str(s)) if !s.is_empty()
+            )
+        });
+        let built = pstore_index::vec_index::try_build_all(
+            &rows,
+            pstore_index::cluster::Params {
+                replicas: 0,
+                ..self.params
+            },
+            pstore_format::DEFAULT_FIELD,
+            sparse.as_deref(),
+            wants_text.then_some(self.text_field.as_str()),
+        )
+        .map_err(|e| EngineError::Format(e.to_string()))?;
+
+        if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
+            store
+                .put(
+                    &pstore_format::sparse::dict_key(&key),
+                    bytes::Bytes::from(d),
+                )
+                .await?;
+        }
+        if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
+            store
+                .put(&pstore_format::text::dict_key(&key), bytes::Bytes::from(d))
+                .await?;
+        }
+        if let Some(c) = &built.centroids {
+            store
+                .put(
+                    &pstore_index::vec_index::centroid_key(&key),
+                    bytes::Bytes::from(c.encode()),
+                )
+                .await?;
+        }
+        store.put(&key, built.segment).await?;
+
+        let target = pstore_query::Target {
+            centroids: pstore_index::vec_index::centroid_key(&key),
+            segment: key,
+        };
+        // In the segment's row order, which the clustering decides — not the order written.
+        let ordered: Vec<Document> = built
+            .order
+            .iter()
+            .filter_map(|r| rows.get(*r).cloned())
+            .collect();
+        *slot = Some(Fresh {
+            generation,
+            index: index.to_owned(),
+            store,
+            target: target.clone(),
+            rows: ordered,
+        });
+        Ok(Some(target))
+    }
+
+    /// Runs `prefetch` over every segment HEAD names for `index` **and over the rows not yet
+    /// folded**, fused into one answer.
+    ///
+    /// ⚠️ **The freshness layer is in the answer.** `Memtable`'s doc promises that "visibility
+    /// does not wait on the fold"; until M5h this method was the one read path that did wait.
+    /// The unfolded rows are sealed into a segment that lives only in memory and queried
+    /// alongside HEAD's, so one BM25, one dense path and one fusion cover both halves.
+    ///
+    /// ⚠️ Hits at [`Answer::unfolded_at`] index [`Answer::unfolded`], **not** HEAD's segment
+    /// list. Every other ordinal indexes HEAD's, for this call only: a fold or a compaction
+    /// between two calls renumbers them, which is why M5f scoped that identity to a snapshot.
     ///
     /// # Errors
-    /// If HEAD cannot be read, or a segment or sidecar cannot be.
+    /// If HEAD cannot be read, a segment or sidecar cannot be, or the unfolded rows cannot be
+    /// sealed — the last fails the query rather than quietly answering without them.
     pub async fn query(
         &self,
         index: &str,
         prefetch: &[pstore_query::Prefetch],
         fusion: pstore_query::Fusion,
         top_k: usize,
-    ) -> Result<Vec<pstore_query::Hit>, EngineError> {
+    ) -> Result<Answer, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
-        let targets: Vec<pstore_query::Target> = at
+        let mut targets: Vec<pstore_query::Target> = at
             .head
             .indexes
             .get(index)
@@ -957,12 +1218,60 @@ impl<S: BlobStore> Engine<S> {
                 }
             })
             .collect();
-        if targets.is_empty() {
-            return Ok(Vec::new());
+        let unfolded_at = targets.len();
+
+        let fresh = self.fresh_target(index).await?;
+        let held = self.fresh.lock().await;
+        let (unfolded, fresh_store) = match (&fresh, held.as_ref()) {
+            (Some(_), Some(f)) => (f.rows.clone(), Some(Arc::clone(&f.store))),
+            _ => (Vec::new(), None),
+        };
+        drop(held);
+        if let Some(t) = fresh {
+            targets.push(t);
         }
-        pstore_query::query(&*self.store, &targets, prefetch, fusion, top_k)
+        if targets.is_empty() {
+            return Ok(Answer {
+                hits: Vec::new(),
+                unfolded,
+                unfolded_at,
+            });
+        }
+
+        // ⚠️ Two stores, one query: the folded segments live in the tenant's and the fresh one
+        // in a private `MemoryStore`, so sealing it costs the tenant's store nothing. `Split`
+        // routes each key to the one that holds it.
+        let store = Split {
+            durable: Arc::clone(&self.store),
+            fresh: fresh_store,
+        };
+        let hits = pstore_query::query(&store, &targets, prefetch, fusion, top_k)
             .await
-            .map_err(|e| EngineError::Query(e.to_string()))
+            .map_err(|e| EngineError::Query(e.to_string()))?;
+        Ok(Answer {
+            hits,
+            unfolded,
+            unfolded_at,
+        })
+    }
+
+    /// Every folded segment's rows, in row order, for a test that resolves a hit.
+    ///
+    /// # Errors
+    /// If HEAD, a segment or its blocks cannot be read.
+    #[doc(hidden)]
+    pub async fn segment_rows_for_test(
+        &self,
+        index: &str,
+    ) -> Result<Vec<Vec<Document>>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        let mut out = Vec::new();
+        for r in at.head.indexes.get(index).into_iter().flatten() {
+            let k = Key::new(r.key.clone());
+            let seg = pstore_format::Segment::open(&*self.store, &k).await?;
+            out.push(seg.scan(&*self.store, &k, None).await?);
+        }
+        Ok(out)
     }
 
     /// Exact k-nearest neighbours across everything the index contains.

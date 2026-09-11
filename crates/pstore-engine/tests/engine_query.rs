@@ -9,11 +9,10 @@
 
 //! `Engine::query` — M5g.2, the indexed read path from a tenant id.
 //!
-//! ⚠️ **It is indexed and stale; `Engine::search` is fresh and exact.** A caller must choose,
-//! and neither name says so. The gap is the memtable's: unfolded rows live in memory with no
-//! index, no segment and no row ordinal, so they cannot enter a `(segment, row)` fusion.
-//! `an_unfolded_row_is_visible_to_scan_and_not_to_query` pins the limit so it is stated rather
-//! than discovered.
+//! ⚠️ **It was indexed and stale, and M5h closed that.** The memtable is now sealed into a
+//! segment that lives only in memory and queried alongside HEAD's, so `query` and `scan` agree
+//! about an unfolded row. The test that pinned the old limit is amended in
+//! `fresh_query.rs` rather than deleted -- it now asserts the agreement it used to deny.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
 use pstore_engine::Engine;
@@ -75,10 +74,10 @@ async fn a_query_answers_from_head_over_every_segment() {
         .await
         .unwrap();
     assert!(
-        !one.is_empty(),
+        !one.hits.is_empty(),
         "an indexed query over one segment found nothing"
     );
-    assert!(one.iter().all(|h| h.segment == 0));
+    assert!(one.hits.iter().all(|h| h.segment == 0));
 
     // ⚠️ A second fold changes the answer, which is what "from HEAD" means: the query reads
     // the segment list rather than remembering one.
@@ -90,16 +89,18 @@ async fn a_query_answers_from_head_over_every_segment() {
         .await
         .unwrap();
     assert!(
-        two.iter().any(|h| h.segment == 1),
+        two.hits.iter().any(|h| h.segment == 1),
         "the second segment contributed nothing, so only one was queried: {two:?}"
     );
     assert_eq!(acct.count(t, OpClass::List), 0, "an indexed query listed");
 }
 
 #[tokio::test]
-async fn an_unfolded_row_is_visible_to_scan_and_not_to_query() {
-    // ⚠️ The stated limit, pinned in both directions so it cannot change quietly. Freshness is
-    // `scan`'s and `search`'s; the index is `query`'s.
+async fn an_unfolded_row_reaches_both_scan_and_query() {
+    // ⚠️ **Amended by M5h, not deleted.** This asserted the opposite — that an unfolded row was
+    // visible to `scan` and NOT to `query` — which was the stated limit until the memtable
+    // became a segment. It now asserts the agreement it used to deny, so the change of
+    // behaviour is recorded here rather than by a test quietly disappearing.
     let store = Arc::new(MemoryStore::new());
     let t = TenantId(711);
     let e = Engine::new(Arc::clone(&store), t, LaneId(1)).with_index_params(params());
@@ -107,7 +108,6 @@ async fn an_unfolded_row_is_visible_to_scan_and_not_to_query() {
     e.flush().await.unwrap();
     e.fold().await.unwrap();
 
-    // Written and not folded: it is durable, and it is in no segment.
     e.write("idx", vec![doc(9_999)]).await.unwrap();
     e.flush().await.unwrap();
 
@@ -119,31 +119,15 @@ async fn an_unfolded_row_is_visible_to_scan_and_not_to_query() {
             .any(|d| d.id == "d09999"),
         "the freshness layer stopped working"
     );
-    let hits = e
+    let a = e
         .query("idx", &dense(9_999), Fusion::default(), 10)
         .await
         .unwrap();
-    let rows = e.scan("idx", None).await.unwrap();
     assert!(
-        !hits.is_empty(),
-        "the indexed query found nothing at all, so it cannot say anything about freshness"
-    );
-    assert!(
-        !hits
+        a.hits
             .iter()
-            .any(|h| rows.get(h.row).is_some_and(|d| d.id == "d09999")),
-        "an unfolded row reached the indexed query, which cannot be right -- it has no segment"
-    );
-
-    // And after a fold it is there.
-    e.fold().await.unwrap();
-    let after = e
-        .query("idx", &dense(9_999), Fusion::default(), 10)
-        .await
-        .unwrap();
-    assert!(
-        after.iter().any(|h| h.segment == 1),
-        "the folded row still did not reach the query"
+            .any(|h| h.segment == a.unfolded_at && a.unfolded[h.row].id == "d09999"),
+        "the unfolded row did not reach the indexed query"
     );
 }
 
@@ -168,7 +152,7 @@ async fn a_query_probes_rather_than_scanning() {
         .await
         .unwrap();
     let probed_bytes = acct.bytes(t, OpClass::Read) - before;
-    assert!(!probed.is_empty());
+    assert!(!probed.hits.is_empty());
 
     // The same query with the centroid table gone: same answers, whole-section read.
     let head = e.head_for_test().await;
@@ -187,8 +171,8 @@ async fn a_query_probes_rather_than_scanning() {
     let scanned_bytes = acct.bytes(t, OpClass::Read) - before;
 
     assert_eq!(
-        probed.iter().map(|h| h.row).collect::<Vec<_>>(),
-        scanned.iter().map(|h| h.row).collect::<Vec<_>>(),
+        probed.hits.iter().map(|h| h.row).collect::<Vec<_>>(),
+        scanned.hits.iter().map(|h| h.row).collect::<Vec<_>>(),
         "the fixture's probe and scan disagree, so the byte comparison is not like for like"
     );
     assert!(
