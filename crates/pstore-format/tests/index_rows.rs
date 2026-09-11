@@ -36,13 +36,13 @@ async fn build(docs: &[Document], index_rows: Option<&[u32]>) -> (MemoryStore, K
     for d in docs {
         w.push(d.clone());
     }
-    // Full-precision vectors, one per INDEX row — the duplication a probe reads.
+    // ⚠️ Full-precision vectors, one per **DATA** row. `Vectors` is the section that must NOT
+    // duplicate: 1,536 bytes a row at 384d against 64 for the 1-bit code, so duplicating it
+    // spends exactly the storage replication is meant to save. The 1-bit and int8 codes are
+    // the ones that stride by the index row count.
     let mut vectors = Vec::new();
-    let order: Vec<u32> = index_rows
-        .map(<[u32]>::to_vec)
-        .unwrap_or_else(|| (0..docs.len() as u32).collect());
-    for r in &order {
-        for v in docs[*r as usize].vector() {
+    for d in docs {
+        for v in d.vector() {
             vectors.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -75,13 +75,16 @@ async fn every_row_decodes_to_its_own_vector() {
         "the codes do not cover the replicas"
     );
 
-    let want: Vec<usize> = (0..order.len()).collect();
+    // ⚠️ `Vectors` strides by DATA rows, so every data row must decode to its own document —
+    // asserted against the INPUT vectors, never against the segment's own other reads, since
+    // a stride taken from the wrong count is self-consistent and wrong.
+    let want: Vec<usize> = (0..docs.len()).collect();
     let got = seg.vector_rows(&s, &key, &want).await.unwrap();
-    for (slot, data_row) in order.iter().enumerate() {
+    for (row, d) in docs.iter().enumerate() {
         assert_eq!(
-            got.get(&slot).map(Vec::as_slice),
-            Some(docs[*data_row as usize].vector()),
-            "index row {slot} decoded as something other than document {data_row}"
+            got.get(&row).map(Vec::as_slice),
+            Some(d.vector()),
+            "data row {row} decoded as something other than its own document"
         );
     }
 }

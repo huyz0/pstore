@@ -373,20 +373,28 @@ impl Segment {
     }
 
     /// Bytes per row in the vectors section, or 0 if there is none.
+    /// ⚠️ **`row_count`, not `index_row_count`.** `Vectors` is full precision — 1,536 bytes a
+    /// row at 384d against 64 for the 1-bit code — so it is the one section replication must
+    /// **not** duplicate. The codes stride by the index row count and this does not, which is
+    /// the whole reason the two counts are separate rather than one renaming of the other.
     fn vector_row_len(&self) -> usize {
-        match (self.section(Section::Vectors), self.index_row_count()) {
-            (Some(span), rows) if rows > 0 => (span.end - span.start) as usize / rows,
+        match (self.section(Section::Vectors), self.rows) {
+            (Some(span), rows) if rows > 0 => (span.end - span.start) as usize / rows as usize,
             _ => 0,
         }
     }
 
-    /// How many rows the **code** sections cover, which is ≥ [`Self::row_count`].
+    /// How many rows the **1-bit and int8 code** sections cover, which is ≥ [`Self::row_count`].
     ///
     /// ⚠️ **Derived from the section's length, so it costs no request.** A boundary vector's
     /// codes appear once per posting list it belongs to while its document appears once, so
-    /// every fixed-width code section strides by this and the blocks stride by `row_count`.
-    /// Taking the wrong one reads every row after the first at an offset and decodes without
-    /// complaint.
+    /// `RaBitQ` and `Sq8` stride by this while the blocks **and `Vectors`** stride by
+    /// `row_count`. Taking the wrong one reads every row after the first at an offset and
+    /// decodes without complaint.
+    ///
+    /// ⚠️ `Vectors` is deliberately on the other side of that line: at 1,536 bytes a row
+    /// against 64 for the code, duplicating it would spend the storage this design exists to
+    /// avoid.
     #[must_use]
     pub fn index_row_count(&self) -> usize {
         self.section(Section::IndexRows)

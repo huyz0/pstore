@@ -337,6 +337,22 @@ fn assemble(
         )
     };
 
+    // ⚠️ **Two row spaces.** `order` is list order and repeats a boundary vector once per list
+    // it was replicated into; `primary` is each document once, in the order it first appears.
+    // Codes stride by `order`, blocks and both sidecars by `primary`, and `index_rows` maps
+    // one to the other. Writing the blocks over `order` is what made 400 documents come back
+    // as 431 rows and compound on every merge.
+    let mut primary: Vec<usize> = Vec::with_capacity(order.len());
+    let mut slot_of: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut index_rows: Vec<u32> = Vec::with_capacity(order.len());
+    for row in &order {
+        let slot = *slot_of.entry(*row).or_insert_with(|| {
+            primary.push(*row);
+            (primary.len() - 1) as u32
+        });
+        index_rows.push(slot);
+    }
+
     let mut w = SegmentWriter::new(64);
     let mut rabitq = Vec::new();
     let mut eights = Vec::new();
@@ -354,9 +370,13 @@ fn assemble(
         }
     }
     let zero = vec![0.0f32; dim];
+    for row in &primary {
+        if let Some(d) = docs.get(*row) {
+            w.push(d.clone());
+        }
+    }
     for row in &order {
         let Some(d) = docs.get(*row) else { continue };
-        w.push(d.clone());
         if dim > 0 {
             let cen = centroids
                 .as_ref()
@@ -377,16 +397,29 @@ fn assemble(
             sq8::write_to(&sq8::encode(&v), &mut eights);
         }
     }
-    // ⚠️ Transposed over the documents **in segment row order**, not in input order.
-    let rows: Vec<Document> = order.iter().filter_map(|r| docs.get(*r).cloned()).collect();
+    // ⚠️ Transposed over the documents **in segment row order**, not in input order — and over
+    // `primary`, not `order`. Over `order` a replicated document is counted twice in
+    // `doc_count` and in every one of its terms' `df`, which is a corpus scored against
+    // statistics that say it is bigger than it is. Live since M3 and caught by nothing: the
+    // recall gate builds no text field and the ndcg gate does not replicate.
+    let rows: Vec<Document> = primary
+        .iter()
+        .filter_map(|r| docs.get(*r).cloned())
+        .collect();
     let sparse = sparse_field.map(|name| {
         pstore_format::sparse::build(&rows, name, pstore_format::sparse::DEFAULT_ENCODING)
     });
     let text = text_field.map(|name| pstore_format::text::build(&rows, name));
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
     let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
+    // ⚠️ **Between `RaBitQ` and `Sq8`, and the order is load-bearing.** Body sections are laid
+    // out in attachment order, and the coalescer merges nearby ranges — so with the mapping
+    // *after* `Sq8`, a rung-0 query fetching rabitq and the mapping bridges straight across
+    // `Sq8` and drags in the int8 bytes rung 0 exists to avoid. Measured: 44,784 of them, by
+    // `a_rung_zero_query_reads_no_int8_or_float_bytes`.
     let mut w = w
         .with_section(Section::RaBitQ, rabitq)
+        .with_index_rows(&index_rows)
         .with_section(Section::Sq8, eights);
     if let Some(p) = sparse {
         w = w.with_section(Section::SparsePostings, p.section);
@@ -406,7 +439,8 @@ fn assemble(
         }
     }
 
-    (w, centroids, order, dictionary, text_dictionary)
+    // `order` as the caller sees it is the DATA row order: what `scan` returns.
+    (w, centroids, primary, dictionary, text_dictionary)
 }
 
 /// An opened index: the segment's directory and the centroid table, both in memory.
@@ -580,7 +614,35 @@ impl VecIndex {
                 ranges.push(sq8_span.start + first * per..sq8_span.start + (first + len) * per);
             }
         }
+        // ⚠️ The index-row mapping rides in the SAME call, one range per probed list. It is
+        // only needed when the segment has two row spaces, and fetching it separately would
+        // cost a fourth round trip for 4 bytes a row.
+        let map_span = self.segment.section(Section::IndexRows);
+        if let Some(m) = &map_span {
+            for (_, first, len) in &rows {
+                ranges.push(m.start + first * 4..m.start + (first + len) * 4);
+            }
+        }
         let bufs = store.get_ranges(key, &ranges).await?;
+        // Index row -> data row, for the probed rows only.
+        let mut data_row: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        if map_span.is_some() {
+            let base = rows.len() * if want_sq8 { 2 } else { 1 };
+            for (n, (_, first, len)) in rows.iter().enumerate() {
+                let Some(buf) = bufs.get(base + n) else {
+                    continue;
+                };
+                for i in 0..*len as usize {
+                    let Some(raw) = buf.get(i * 4..(i + 1) * 4) else {
+                        continue;
+                    };
+                    if let Ok(b) = <[u8; 4]>::try_from(raw) {
+                        data_row.insert(*first as usize + i, u32::from_le_bytes(b) as usize);
+                    }
+                }
+            }
+        }
 
         let Ok(prepared) = quantizer.prepare(query) else {
             return Err(pstore_format::FormatError::DimensionMismatch {
@@ -616,9 +678,21 @@ impl VecIndex {
             }
         }
 
+        // ⚠️ **Deduplicated by DATA row, before the ladder.** A vector replicated into two
+        // lists is scored once per probed list it sits in, so without this it occupies two
+        // slots of one top-k and displaces a real neighbour. Before the ladder rather than
+        // after, because the rerank rungs read `Sq8` and `Vectors` at INDEX rows — mapping
+        // early would send them to the wrong offsets — and deduplicating after `k` has been
+        // truncated returns fewer than `k`.
+        if !data_row.is_empty() {
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            scored.retain(|(row, _)| seen.insert(*data_row.get(row).unwrap_or(row)));
+        }
+
         let ladder = Ladder::new(q.k, q.oversample);
         let top = ladder.rung0(scored);
-        Ok(match q.rerank {
+        let ranked: Vec<(usize, f32)> = match q.rerank {
             Rerank::None => top.into_iter().take(q.k).collect(),
             Rerank::Fast => {
                 let per = sq8::record_len(self.dim);
@@ -647,15 +721,29 @@ impl VecIndex {
                 // hundred of them costs the segment's entire bandwidth -- 60x the bytes at
                 // gate scale -- and it shipped that way, because the byte ceiling was
                 // asserted only at the default rerank mode.
-                let rows: Vec<usize> = top.iter().map(|(r, _)| *r).collect();
+                // ⚠️ Mapped to DATA rows first: `Vectors` is the one code-adjacent section
+                // that strides by `row_count`, because at 1,536 bytes a row duplicating it
+                // would spend exactly the storage replication is supposed to save.
+                let rows: Vec<usize> = top
+                    .iter()
+                    .map(|(r, _)| data_row.get(r).copied().unwrap_or(*r))
+                    .collect();
                 let vectors = self.segment.vector_rows(store, key, &rows).await?;
                 ladder.rung2(&top, |row| {
                     vectors
-                        .get(&row)
+                        .get(data_row.get(&row).unwrap_or(&row))
                         .map_or(f32::NEG_INFINITY, |v| dot(v, query))
                 })
             }
-        })
+        };
+        // ⚠️ **Index rows become data rows only here, at the return.** Everything above reads
+        // `RaBitQ`, `Sq8` and `Vectors`, all of which stride by the index row count; mapping
+        // any earlier sends them to the wrong offsets. The mapping is injective after the
+        // deduplication above, so this cannot collapse two hits into one.
+        Ok(ranked
+            .into_iter()
+            .map(|(row, score)| (data_row.get(&row).copied().unwrap_or(row), score))
+            .collect())
     }
 }
 
