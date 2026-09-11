@@ -94,6 +94,18 @@ pub enum Section {
     /// section existed was built over [`text::DEFAULT_TEXT_FIELD`], and reading absence as
     /// empty would turn off the text index of all of them.
     TextFields = 14,
+    /// For each **index** row, the **data** row it names: `u32`, little-endian.
+    ///
+    /// ⚠️ **Two row spaces, and only one of them is the document.** A boundary vector belongs
+    /// to two posting lists, so its codes appear twice and the document must appear once —
+    /// otherwise `Engine::scan`'s "exactly once" breaks and a compaction re-seals the
+    /// duplicates. The code sections therefore stride by the **index** row count and the
+    /// blocks by [`Segment::row_count`], and this maps one to the other.
+    ///
+    /// ⚠️ **Absent means they are the same space**, which is every segment written before this
+    /// and every segment built without replication. It is written only when a row is actually
+    /// duplicated, so an unreplicated segment's bytes do not move.
+    IndexRows = 15,
 }
 
 /// How a vector field is laid out in a segment.

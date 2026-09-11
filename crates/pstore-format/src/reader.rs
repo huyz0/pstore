@@ -374,10 +374,49 @@ impl Segment {
 
     /// Bytes per row in the vectors section, or 0 if there is none.
     fn vector_row_len(&self) -> usize {
-        match (self.section(Section::Vectors), self.rows) {
-            (Some(span), rows) if rows > 0 => (span.end - span.start) as usize / rows as usize,
+        match (self.section(Section::Vectors), self.index_row_count()) {
+            (Some(span), rows) if rows > 0 => (span.end - span.start) as usize / rows,
             _ => 0,
         }
+    }
+
+    /// How many rows the **code** sections cover, which is ≥ [`Self::row_count`].
+    ///
+    /// ⚠️ **Derived from the section's length, so it costs no request.** A boundary vector's
+    /// codes appear once per posting list it belongs to while its document appears once, so
+    /// every fixed-width code section strides by this and the blocks stride by `row_count`.
+    /// Taking the wrong one reads every row after the first at an offset and decodes without
+    /// complaint.
+    #[must_use]
+    pub fn index_row_count(&self) -> usize {
+        self.section(Section::IndexRows)
+            .map_or(self.rows as usize, |s| (s.end - s.start) as usize / 4)
+    }
+
+    /// Which data row each index row names.
+    ///
+    /// ⚠️ In the **body**, not the meta region, so this is a fetch — the mapping is 4 bytes a
+    /// row and only a probe's rows are ever needed, which is why `index_row_count` is derived
+    /// from the directory instead.
+    ///
+    /// # Errors
+    /// If the store refuses or the section is truncated.
+    pub async fn index_rows<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+    ) -> Result<Vec<u32>, FormatError> {
+        let Some(span) = self.section(Section::IndexRows) else {
+            // Absent means the two spaces are the same one.
+            return Ok((0..self.rows).collect());
+        };
+        let raw = store
+            .get_range_as(key, span, pstore_blob::Class::Meta)
+            .await?;
+        Ok(raw
+            .chunks_exact(4)
+            .filter_map(|c| c.try_into().ok().map(u32::from_le_bytes))
+            .collect())
     }
 
     /// The full-precision vectors for **specific rows**.

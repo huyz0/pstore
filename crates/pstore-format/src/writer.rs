@@ -102,6 +102,23 @@ impl SegmentWriter {
         self
     }
 
+    /// Records which data row each **index** row names.
+    ///
+    /// ⚠️ **Written only when a row is actually duplicated.** An identity mapping says nothing
+    /// a reader cannot derive, and writing it would change the bytes of every segment that
+    /// does not replicate — for a feature nobody enabled.
+    #[must_use]
+    pub fn with_index_rows(self, rows: &[u32]) -> Self {
+        if rows.iter().enumerate().all(|(i, r)| *r as usize == i) {
+            return self;
+        }
+        let mut out = Vec::with_capacity(rows.len() * 4);
+        for r in rows {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        self.with_section(Section::IndexRows, out)
+    }
+
     /// Names the attribute(s) this segment's text index was built over.
     ///
     /// ⚠️ Recorded **whenever a text index exists**, including for the default name. A rule
