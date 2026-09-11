@@ -239,6 +239,73 @@ fn main() {
         ..Params::default()
     };
 
+    // ⚠️ **Item 14's question, and it is a cost question rather than a recall one.** M5g
+    // clamped `replicas: 0` in the engine because a replicated vector is written to the
+    // segment twice, which breaks `Engine::scan`'s "exactly once" -- at a measured cost of
+    // r@10 p=2 0.961 -> 0.844. Recovering it needs list membership that does not duplicate a
+    // row, which is format surgery.
+    //
+    // But replication is only ONE way to buy recall at small `p`; probing more lists is the
+    // other, and it needs no format change at all. So before building anything: for a target
+    // recall, is it cheaper in **bytes per query** to replicate, or to probe wider?
+    //
+    //   cargo run --release -p pstore-index --example recall -- --replicas
+    if std::env::args().any(|a| a == "--replicas") {
+        // ⚠️ **Both corpora.** The clustered one is a Gaussian mixture, which is the case
+        // clustering handles best -- `Query::default()`'s own comment warns that taking a
+        // number from the flattering case is fitting a default to the generator. Replication
+        // exists for vectors sitting between centroids, so uniform data is where it should
+        // earn its keep if anywhere.
+        for c in [Corpus::clustered(n, dim, 40, 1), Corpus::uniform(n, dim, 2)] {
+            println!(
+                "# {} x {dim}d {} corpus, k=10, rerank=int8, over=32",
+                c.vectors.len(),
+                c.name
+            );
+            println!(
+                "{:>9} {:>7} {:>5} {:>9} {:>10} {:>9}",
+                "replicas", "bound", "p", "index x", "recall@10", "MB/query"
+            );
+            // The unreplicated index's entry count is the denominator: "index x" is what
+            // replication costs in stored codes, which is a per-segment byte cost forever.
+            let base: usize = build(
+                &c,
+                Params {
+                    replicas: 0,
+                    ..params
+                },
+            )
+            .clustering
+            .lists()
+            .iter()
+            .map(Vec::len)
+            .sum();
+            for (replicas, boundary) in [(0usize, 0.0f32), (1, 0.05), (1, 0.10), (2, 0.10)] {
+                let idx = build(
+                    &c,
+                    Params {
+                        replicas,
+                        boundary,
+                        ..params
+                    },
+                );
+                let entries: usize = idx.clustering.lists().iter().map(Vec::len).sum();
+                let size = entries as f64 / base as f64;
+                for p in [2usize, 4, 8, 16] {
+                    let (recall, cands) = measure(&c, &idx, 10, p, 32, Rerank::Int8);
+                    // Rung 0 reads the 1-bit codes of every candidate, then int8 for the same
+                    // set: the bytes a query actually moves, which is what the cost model prices.
+                    let rung0 = cands * (dim.next_power_of_two() / 8 + 8) as f64;
+                    let mb = (rung0 + cands * (dim + 8) as f64) / 1e6;
+                    println!(
+                        "{replicas:>9} {boundary:>7.2} {p:>5} {size:>9.2} {recall:>10.4} {mb:>9.3}"
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     if sweep {
         // ⚠️ The point of the sweep: rung-0 oversample costs NO bytes and NO round trips.
         // Every candidate it keeps was already scored from posting lists the query fetched
