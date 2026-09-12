@@ -418,3 +418,58 @@ async fn a_splits_halves_are_reassigned_to_their_own_centroids() {
          not reassigned"
     );
 }
+
+#[tokio::test]
+async fn the_work_report_counts_what_actually_happened() {
+    // ⚠️ **`Work` is the spike's OUTPUT.** `examples/lire.rs` reads it to answer OQ-51 — the
+    // whole point of the module is to report cost, and the fields' own doc says so: "the
+    // number the whole claim rests on". A counter that never increments answers the open
+    // question with a zero, and nothing here asserted any of them was non-zero: a sweep found
+    // `inserted += 1` and `reassigned += moves.len()` both indistinguishable from `*=`, which
+    // pins them at 0 forever because they start there.
+    let corpus = corpus(3_000, 12, 17);
+    let seed: Vec<Vec<f32>> = corpus[..2_500].to_vec();
+    let rows: Vec<usize> = (2_500..3_000).collect();
+    let mut c = Clustering::build(&seed, params());
+    let w = lire::maintain(&mut c, &corpus, &rows, params(), Scope::Touched);
+
+    assert_eq!(
+        w.inserted,
+        rows.len(),
+        "every row handed in was appended, or the count is not counting"
+    );
+    assert!(w.splits > 0, "a 20% batch split nothing");
+    assert!(
+        w.examined > 0,
+        "nothing was examined, so nothing was reassigned either"
+    );
+    assert!(
+        w.reassigned > 0,
+        "no vector changed list after {} splits — the churn counter is stuck at zero",
+        w.splits
+    );
+    // ⚠️ Reassigned counts vectors that MOVED; examined counts vectors looked at to find
+    // them. One cannot exceed the other, and a counter incrementing the wrong variable
+    // shows up here rather than as a plausible pair of numbers.
+    assert!(
+        w.reassigned <= w.examined,
+        "reassigned {} of {} examined",
+        w.reassigned,
+        w.examined
+    );
+    // ⚠️ **Two mutations here are invisible and the reason is structural, not a weak test.**
+    // Inverting `bisect`'s side test sends every vector to the *farther* of the two new
+    // centroids — and the reassignment that follows a split, which marks both halves dirty,
+    // puts them all back. Inverting the reassignment's own `best != li` makes it move only
+    // vectors already in the right place — and `bisect` had already placed them well. On the
+    // split path the two repair each other, so neither can be seen from the outcome. Measured,
+    // recorded, and not chased: catching them needs a clustering perturbed independently of a
+    // split, which is a different fixture than any of these.
+    //
+    // And the totals are consistent with the clustering that came out.
+    assert_eq!(
+        c.lists().iter().map(Vec::len).sum::<usize>(),
+        corpus.len(),
+        "the report does not describe the clustering it produced"
+    );
+}
