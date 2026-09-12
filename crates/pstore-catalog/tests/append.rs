@@ -21,6 +21,21 @@ fn indexes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("index-{i:04}")).collect()
 }
 
+/// ⚠️ Writes the deployment's root before a census. `enumerate` refuses a width the root does
+/// not name, and an **absent** root means "never widened" — the default width. A fixture at
+/// width 1 with no root models a deployment that cannot exist.
+async fn rooted<S: pstore_blob::BlobStore>(store: &S, width: Width) {
+    let _ = pstore_catalog::write_root(
+        store,
+        pstore_catalog::Root {
+            epoch: pstore_types::Epoch(1),
+            width,
+        },
+        None,
+    )
+    .await;
+}
+
 fn one() -> Width {
     Width::new(1).expect("one bucket")
 }
@@ -126,6 +141,7 @@ async fn pending_is_bounded_by_an_inline_fold() {
     }
 
     // The inline folds are what kept it bounded, and they must not have lost anything.
+    rooted(store.as_ref(), one()).await;
     let all = pstore_catalog::enumerate(store.as_ref(), one())
         .await
         .unwrap();

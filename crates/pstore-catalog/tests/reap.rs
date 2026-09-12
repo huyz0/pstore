@@ -27,6 +27,21 @@ use pstore_testkit::flaky::Flaky;
 use pstore_types::{Epoch, TenantId};
 use std::sync::Arc;
 
+/// ⚠️ Writes the deployment's root before a census. `enumerate` refuses a width the root does
+/// not name, and an **absent** root means "never widened" — the default width. A fixture at
+/// width 1 with no root models a deployment that cannot exist.
+async fn rooted<S: pstore_blob::BlobStore>(store: &S, width: Width) {
+    let _ = pstore_catalog::write_root(
+        store,
+        pstore_catalog::Root {
+            epoch: pstore_types::Epoch(1),
+            width,
+        },
+        None,
+    )
+    .await;
+}
+
 fn one() -> Width {
     Width::new(1).expect("width 1")
 }
@@ -66,6 +81,7 @@ async fn a_superseded_run_is_reaped_and_the_live_one_is_not() {
     // ⚠️ The live run is never a graveyard entry, so keeping none of the dead ones cannot
     // touch it -- and if it could, this is where the catalog loses a bucket of tenants.
     assert!(store.get(&runs[1]).await.is_ok(), "the LIVE run was reaped");
+    rooted(store.as_ref(), one()).await;
     assert_eq!(
         enumerate(store.as_ref(), one())
             .await
@@ -163,6 +179,7 @@ async fn reaping_does_not_list() {
     let view = Arc::new(acct.as_tenant(t));
     folds(&view, 2).await;
     reap(view.as_ref(), 0, 0).await.unwrap();
+    rooted(view.as_ref(), one()).await;
     enumerate(view.as_ref(), one()).await.unwrap();
     assert_eq!(acct.count(t, OpClass::List), 0, "the reap path listed");
 }
@@ -239,6 +256,7 @@ async fn a_head_written_before_the_graveyard_decodes_and_reaps_nothing() {
         0,
         "a head with no graveyard reaped something"
     );
+    rooted(store.as_ref(), one()).await;
     assert_eq!(
         enumerate(store.as_ref(), one())
             .await

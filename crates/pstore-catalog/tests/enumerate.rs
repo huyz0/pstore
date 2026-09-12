@@ -23,7 +23,22 @@ fn width(n: u32) -> Width {
 }
 
 /// `n` tenants, every bucket folded, so a deployment's cost is its shape and not its history.
+///
+/// ⚠️ Writes the root too. Since M6g a census is refused at a width the root does not name,
+/// and an **absent** root means "never widened" — the default width. A fixture at width 8 with
+/// no root models a deployment that cannot exist: a second process would read the root, get
+/// the default, and be reading a different shape.
 async fn seed<S: pstore_blob::BlobStore>(store: Arc<S>, w: Width, n: u128) {
+    // Tolerant: a test that wrote its own root already named this width.
+    let _ = pstore_catalog::write_root(
+        store.as_ref(),
+        pstore_catalog::Root {
+            epoch: Epoch(1),
+            width: w,
+        },
+        None,
+    )
+    .await;
     let app = Appender::new(Arc::clone(&store), w);
     for i in 0..n {
         app.observe(&TenantRecord::live(
@@ -51,13 +66,24 @@ async fn enumeration_is_two_rounds_deep() {
     // ⚠️ Every pointer together, then every run together. A loop that awaits each bucket
     // before issuing the next returns the identical answer at depth `1 + width`, and no
     // functional assertion anywhere can see the difference.
-    assert_eq!(store.depth(), 2, "requests: {}", store.requests());
+    //
+    // ⚠️ **3, not 2, since M6g.** The third is the closing root read that refuses a census
+    // gathered at a width the deployment has left — a split landing mid-pass leaves an answer
+    // that is neither shape's, and returning it is a census that is quietly short. The
+    // number is tightened here rather than loosened: it is exact, and the round it pays for
+    // is named.
+    assert_eq!(store.depth(), 3, "requests: {}", store.requests());
 
     // Cold: the root is one round more, and it is a round even when the object is absent.
+    //
+    // ⚠️ **4 since M6g**, and the shape is worth naming: the caller reads the root to learn
+    // the width, and `enumerate` reads it again at the end to refuse a census gathered at a
+    // width the deployment has left. Two reads of the same tiny object, and the second is
+    // what makes the first trustworthy — between them the shape can move.
     store.reset();
     let (root, _) = read_root(store.as_ref()).await.unwrap();
     enumerate(store.as_ref(), root.width).await.unwrap();
-    assert_eq!(store.depth(), 3);
+    assert_eq!(store.depth(), 4);
 }
 
 #[tokio::test]
@@ -108,10 +134,14 @@ async fn enumeration_requests_do_not_scale_with_tenants() {
         assert_eq!(acc.total(OpClass::List), 0);
         counts.push(acc.total(OpClass::Read) - before);
     }
-    // width pointers + width runs, at 100 tenants and at 2,000 alike. A single request
-    // anywhere in the read path that is per-record breaks this and nothing else notices.
+    // width pointers + width runs + one root, at 100 tenants and at 2,000 alike. A single
+    // request anywhere in the read path that is per-record breaks this and nothing else
+    // notices.
+    //
+    // ⚠️ The `+ 1` is M6g's closing root read. What this test is about — that the count does
+    // not scale with **tenants** — is unchanged, and the constant is still exact.
     assert_eq!(counts[0], counts[1]);
-    assert_eq!(counts[0], u64::from(w.get()) * 2);
+    assert_eq!(counts[0], u64::from(w.get()) * 2 + 1);
 }
 
 #[tokio::test]

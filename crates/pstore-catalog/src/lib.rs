@@ -48,7 +48,9 @@ mod keys;
 mod record;
 
 pub use append::Appender;
-pub use bucket::{BucketHead, Root, fold, read_head, read_root, reap, sweep, write_root};
+pub use bucket::{
+    BucketHead, Root, fold, read_head, read_root, read_run_for_test, reap, split, sweep, write_root,
+};
 pub use enumerate::{Enumeration, Mark, enumerate, enumerate_since};
 pub use keys::{
     DEFAULT_WIDTH, MAX_WIDTH, Width, bucket_of, bucket_prefix, head_key, parse_run_key, root_key,
@@ -150,4 +152,17 @@ pub enum CatalogError {
     /// The stored width is not one this key format can express.
     #[error("root names width {0}, which is not in 1..={MAX_WIDTH}")]
     BadWidth(u32),
+    /// A census was gathered at a width the deployment no longer has.
+    ///
+    /// ⚠️ Covers both shapes of the same failure: a split landing **during** the census, and a
+    /// caller whose width was already behind when it started. Either way some buckets were
+    /// read against a shape that is not the deployment's, and the answer is neither one's.
+    /// Refusing costs a retry; returning it is a census that is quietly short.
+    #[error("census gathered at width {enumerated}, but the deployment is at {current}; retry")]
+    WidthMoved {
+        /// The width the census used.
+        enumerated: u32,
+        /// The width the root names now.
+        current: u32,
+    },
 }

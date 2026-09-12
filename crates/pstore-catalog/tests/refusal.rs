@@ -20,6 +20,21 @@ use pstore_testkit::flaky::Flaky;
 use pstore_types::{Epoch, TenantId};
 use std::sync::Arc;
 
+/// ⚠️ Writes the deployment's root before a census. `enumerate` refuses a width the root does
+/// not name, and an **absent** root means "never widened" — the default width. A fixture at
+/// width 1 with no root models a deployment that cannot exist.
+async fn rooted<S: pstore_blob::BlobStore>(store: &S, width: Width) {
+    let _ = pstore_catalog::write_root(
+        store,
+        pstore_catalog::Root {
+            epoch: pstore_types::Epoch(1),
+            width,
+        },
+        None,
+    )
+    .await;
+}
+
 fn one() -> Width {
     Width::new(1).expect("one bucket")
 }
@@ -119,6 +134,7 @@ async fn a_refused_run_write_leaves_the_pointer_alone() {
     assert!(fold(&store, 0).await.is_err());
     assert_eq!(store.failures(), 1);
     // The pointer still names no run, and the record is still pending, so nothing was lost.
+    rooted(&store, one()).await;
     let out = enumerate(&store, one()).await.unwrap();
     assert_eq!(out.records.len(), 1);
     let (head, _) = read_head(&store, 0).await.unwrap();
@@ -133,6 +149,7 @@ async fn a_refused_pointer_cas_leaves_an_orphan_run_and_no_loss() {
     let store = primed(2).await;
     assert!(fold(&store, 0).await.is_err());
     assert_eq!(store.failures(), 1);
+    rooted(&store, one()).await;
     let out = enumerate(&store, one()).await.unwrap();
     assert_eq!(out.records.len(), 1);
 }
@@ -148,6 +165,7 @@ async fn a_pointer_to_a_run_that_is_gone_is_an_error() {
     let run = head.run(0).expect("a run was folded");
     store.delete_batch(&[run]).await.unwrap();
 
+    rooted(store.as_ref(), one()).await;
     let err = enumerate(store.as_ref(), one())
         .await
         .expect_err("a missing run must not read as an empty bucket");
@@ -166,6 +184,7 @@ async fn a_refused_run_read_is_an_error() {
         .unwrap();
     fold(store.as_ref(), 0).await.unwrap();
 
+    rooted(store.as_ref(), w).await;
     assert!(enumerate(store.as_ref(), w).await.is_err());
     assert_eq!(store.failures(), 1, "no read was actually refused");
 }
@@ -210,6 +229,11 @@ async fn a_catalog_write_on_a_divergent_backend_is_refused() {
         pstore_catalog::sweep(store.as_ref(), 0)
             .await
             .expect_err("sweep must refuse"),
+        // ⚠️ M6g: a split rewrites the deployment's shape, and one that cannot fence would
+        // publish a width whose buckets it could not prove it wrote.
+        pstore_catalog::split(store.as_ref())
+            .await
+            .expect_err("split must refuse"),
         pstore_catalog::write_root(
             store.as_ref(),
             pstore_catalog::Root {

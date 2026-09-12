@@ -12,6 +12,21 @@ use pstore_catalog::{Appender, TenantRecord, Width, enumerate, fold, read_head};
 use pstore_types::{Epoch, TenantId};
 use std::sync::Arc;
 
+/// ⚠️ Writes the deployment's root before a census. `enumerate` refuses a width the root does
+/// not name, and an **absent** root means "never widened" — the default width. A fixture at
+/// width 1 with no root models a deployment that cannot exist.
+async fn rooted<S: pstore_blob::BlobStore>(store: &S, width: Width) {
+    let _ = pstore_catalog::write_root(
+        store,
+        pstore_catalog::Root {
+            epoch: pstore_types::Epoch(1),
+            width,
+        },
+        None,
+    )
+    .await;
+}
+
 fn one() -> Width {
     Width::new(1).expect("one bucket")
 }
@@ -21,6 +36,7 @@ fn idx(n: &str) -> Vec<String> {
 }
 
 async fn tenants(store: &MemoryStore) -> Vec<u128> {
+    rooted(store, one()).await;
     enumerate(store, one())
         .await
         .unwrap()
@@ -63,6 +79,7 @@ async fn a_folded_record_appears_once() {
     app.observe(&TenantRecord::live(TenantId(7), Epoch(2), &idx("b")))
         .await
         .unwrap();
+    rooted(store.as_ref(), one()).await;
     let out = enumerate(store.as_ref(), one()).await.unwrap();
     assert_eq!(out.records.len(), 1);
     assert_eq!(out.records[0].indexes, idx("b"));
@@ -126,6 +143,7 @@ async fn an_older_epoch_does_not_overwrite_a_newer_pending_one() {
         .await
         .unwrap();
 
+    rooted(store.as_ref(), one()).await;
     let recs = enumerate(store.as_ref(), one()).await.unwrap().records;
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].epoch, Epoch(9));
@@ -172,6 +190,7 @@ async fn an_older_epoch_does_not_overwrite_a_newer_one() {
         .unwrap();
     fold(store.as_ref(), 0).await.unwrap();
 
+    rooted(store.as_ref(), one()).await;
     let recs = enumerate(store.as_ref(), one()).await.unwrap().records;
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].epoch, Epoch(9));

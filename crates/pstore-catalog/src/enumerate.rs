@@ -102,8 +102,32 @@ pub async fn enumerate_since<S: BlobStore>(
     for head in &pending_only {
         all.extend(head.pending.iter().cloned());
     }
+    // ⚠️ **Merged ACROSS buckets, not only within them.** `merge` was applied per bucket and
+    // the results concatenated, so one tenant appearing in two buckets appeared twice in the
+    // census. That is possible the moment a split has run and the old buckets are unpruned —
+    // the moved records are in `b` and `b + w` both — and it was possible before that for any
+    // record written under a stale width. The spec for M6g claimed this deduplication already
+    // happened; it did not, and `every_tenant_survives_a_split` is what said so.
+    let mut all = merge(Vec::new(), all.iter());
     all.sort_by_key(|r| r.tenant);
     all.retain(|r| r.state == State::Live);
     out.records = all;
+
+    // ⚠️ **Checked at the END, and this is the whole of "stale rather than wrong".** A split
+    // landing mid-census leaves an answer that is neither shape's — some buckets read before
+    // the partition and some after — and a caller whose width was already behind read a shape
+    // the deployment has left. Both are the same failure and both are refused: a census that
+    // is quietly short is the one thing a catalog must not return.
+    //
+    // ⚠️ One GET of a tiny object at the end, not a baseline at the start. The caller read the
+    // root to learn the width it passed, so the "before" is already in its hands; making
+    // `enumerate` read it again would cost a round trip to learn what it was told.
+    let (root, _) = crate::bucket::read_root(store).await?;
+    if root.width != width {
+        return Err(CatalogError::WidthMoved {
+            enumerated: width.get(),
+            current: root.width.get(),
+        });
+    }
     Ok(out)
 }

@@ -216,6 +216,22 @@ pub async fn read_head<S: BlobStore>(
 /// bucket. Derived head keys 404 by design and that branch has to swallow absence; letting
 /// the same branch swallow a missing *run* is how a catalog silently drops a bucket's worth
 /// of tenants.
+/// A bucket's run, for a test that has to look at where a record actually landed.
+///
+/// ⚠️ Enumerating reads every bucket, so a test that used it would pass whether or not the
+/// split moved anything. Reading the bucket directly is what makes the partition assertable.
+///
+/// # Errors
+/// If the store refuses or the run is malformed.
+#[doc(hidden)]
+pub async fn read_run_for_test<S: BlobStore>(
+    store: &S,
+    bucket: u32,
+    head: &BucketHead,
+) -> Result<Vec<TenantRecord>, CatalogError> {
+    read_run(store, bucket, head).await
+}
+
 pub(crate) async fn read_run<S: BlobStore>(
     store: &S,
     bucket: u32,
@@ -481,6 +497,117 @@ pub async fn sweep<S: BlobStore>(store: &S, bucket: u32) -> Result<usize, Catalo
     Ok(n)
 }
 
+/// Doubles the deployment's bucket count.
+///
+/// ⚠️ **Doubling is the only split, and that is what makes it tractable.** `bucket_of` is
+/// `hash(tenant) % width`, and `h % 2w` is either `h % w` or `h % w + w` — so bucket `b` splits
+/// into exactly `b` and `b + w`, and no record ever moves between two *old* buckets. A split is
+/// `w` independent partitions rather than a reshuffle.
+///
+/// ⚠️ **The new buckets are written before the root is flipped**, and the old ones are left
+/// alone. Walk the states: with the buckets written and the root unmoved, an old-width reader
+/// is complete and nobody has the new width. With the root flipped, an old-width reader is
+/// *still* complete — bucket `b` keeps every record — and a new-width reader finds the moved
+/// ones in both `b` and `b + w`, which `merge` deduplicates by tenant. Only **pruning** `b`
+/// makes an old reader wrong, and this does not prune.
+///
+/// ⚠️ The same argument covers a stale-width **writer**, which is the worse case: an appender
+/// holding `w` writes tenant `T` to `b` when the world says `b + w`. Unpruned, a new-width
+/// reader reads `0..2w`, which includes `b`, so the record is found. Pruned, it is lost.
+/// Nothing here bounds how long a stale writer may live, which is exactly why pruning is
+/// absent — and why a split doubles the deployment's bucket objects and reclaims nothing.
+///
+/// ⚠️ **Refused past [`crate::MAX_WIDTH`]**: `{bucket:04x}` holds 65,536, and a fifth hex digit
+/// is a different key space. From the default of 16,384 that allows two doublings.
+///
+/// Returns the new width.
+///
+/// # Errors
+/// If the store refuses, an object is malformed, the width would leave the key format, or the
+/// root moved under it.
+pub async fn split<S: BlobStore>(store: &S) -> Result<Width, CatalogError> {
+    crate::require_fencing(store)?;
+    let (root, tag) = read_root(store).await?;
+    let old = root.width.get();
+    // ⚠️ `Width::new` is the guard, and a `<= MAX_WIDTH` filter beside it was dead: a mutation
+    // sweep could not distinguish removing it from keeping it, because the constructor already
+    // refuses anything past the key format. Removed rather than tested — the same call M5f and
+    // M6e made on their own unreachable guards.
+    let Some(next) = old.checked_mul(2).and_then(Width::new) else {
+        return Err(CatalogError::BadWidth(old.saturating_mul(2)));
+    };
+
+    // Every old bucket's pointer, then every run they name — the same two rounds a census
+    // costs, and for the same reason: the keys are derived, so width is a fan-out and not a
+    // depth.
+    let heads = futures_util::future::try_join_all(root.width.all().map(|b| async move {
+        let (head, _) = read_head(store, b).await?;
+        Ok::<_, CatalogError>((b, head))
+    }))
+    .await?;
+    let runs = futures_util::future::try_join_all(
+        heads
+            .iter()
+            .map(|(b, head)| async move { read_run(store, *b, head).await }),
+    )
+    .await?;
+
+    for ((b, head), run) in heads.iter().zip(runs) {
+        // ⚠️ Pending as well as the run: a record recorded and not yet folded is as much a
+        // tenant as one in a run, and leaving it behind would strand it in a bucket the new
+        // width never reads for that tenant.
+        let moving: Vec<TenantRecord> = run
+            .into_iter()
+            .chain(head.pending.iter().cloned())
+            .filter(|r| keys::bucket_of(r.tenant, next) != *b)
+            .collect();
+        if moving.is_empty() {
+            continue;
+        }
+        let sibling = b + old;
+        let body = encode_records(&merge(Vec::new(), moving.iter()));
+        let digest = keys::digest(&body);
+        let run_key = keys::run_key(sibling, Epoch(1), digest);
+        // Conditional on absence, as `publish` is: the digest is in the key, so an object
+        // already there holds exactly these bytes and losing the race is success.
+        match store
+            .put_conditional(&run_key, body.into(), Precondition::NotExists)
+            .await
+        {
+            Ok(_) | Err(CasError::Lost) => {}
+            Err(CasError::Contended) => return Err(CatalogError::Contended(sibling, 1)),
+            Err(CasError::Io(e)) => return Err(BlobError::Other(e).into()),
+        }
+        let (_, sibling_tag) = read_head(store, sibling).await?;
+        let head = BucketHead {
+            run_epoch: Epoch(1),
+            digest,
+            pending: Vec::new(),
+            graveyard: Vec::new(),
+        };
+        if !matches!(
+            write_head(store, sibling, &head, sibling_tag).await?,
+            Publish::Landed
+        ) {
+            return Err(CatalogError::Contended(sibling, 1));
+        }
+    }
+
+    // ⚠️ **Last, and conditional on the root we read.** Flipping first would publish a width
+    // whose buckets do not exist yet, which is a census that is genuinely short rather than
+    // merely stale.
+    write_root(
+        store,
+        Root {
+            epoch: root.epoch.next(),
+            width: next,
+        },
+        tag,
+    )
+    .await?;
+    Ok(next)
+}
+
 /// Drains a bucket's pending records into a new immutable run.
 ///
 /// Optimistic and leaderless: any node may call it, the CAS decides, and a loser rebases onto
@@ -621,6 +748,19 @@ mod tests {
             Publish::Rebase
         ));
 
+        // ⚠️ The root, because a census is refused at a width the deployment does not name —
+        // and an ABSENT root means "never widened", which is the default width. A fixture at
+        // width 1 with no root models a deployment that cannot exist.
+        write_root(
+            store.as_ref(),
+            Root {
+                epoch: Epoch(1),
+                width,
+            },
+            None,
+        )
+        .await
+        .unwrap();
         let out = crate::enumerate(store.as_ref(), width).await.unwrap();
         let ids: Vec<_> = out.records.iter().map(|r| r.tenant.0).collect();
         assert_eq!(ids, vec![1, 2], "the loser's run overwrote the winner's");

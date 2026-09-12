@@ -27,6 +27,21 @@ use pstore_catalog::{
 use pstore_types::{Epoch, TenantId};
 use std::sync::Arc;
 
+/// ⚠️ Writes the deployment's root before a census. `enumerate` refuses a width the root does
+/// not name, and an **absent** root means "never widened" — the default width. A fixture at
+/// width 1 with no root models a deployment that cannot exist.
+async fn rooted<S: pstore_blob::BlobStore>(store: &S, width: Width) {
+    let _ = pstore_catalog::write_root(
+        store,
+        pstore_catalog::Root {
+            epoch: pstore_types::Epoch(1),
+            width,
+        },
+        None,
+    )
+    .await;
+}
+
 fn one() -> Width {
     Width::new(1).expect("width 1")
 }
@@ -73,6 +88,7 @@ async fn an_orphan_run_is_swept_and_the_live_one_is_not() {
         store.get(&runs[2]).await.is_ok(),
         "the LIVE run was swept -- this bucket's tenants are gone"
     );
+    rooted(store.as_ref(), one()).await;
     assert_eq!(
         enumerate(store.as_ref(), one())
             .await
@@ -194,6 +210,7 @@ async fn a_sweep_is_one_list_and_never_more() {
         "a sweep costs one LIST per bucket -- more than that scales with something else"
     );
     // ⚠️ And nothing else in the catalog lists at all.
+    rooted(view.as_ref(), one()).await;
     enumerate(view.as_ref(), one()).await.unwrap();
     fold(view.as_ref(), 0).await.unwrap();
     assert_eq!(
