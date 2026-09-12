@@ -393,7 +393,17 @@ impl<S: BlobStore> Engine<S> {
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
-            params: pstore_index::cluster::Params::default(),
+            // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
+            // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
+            // recall on clustered data (0.9810 either way) and costs bytes (0.841 against
+            // 0.769); on uniform data it matches probing wider while costing 1.99x the stored
+            // codes. It earns its keep only at small `p`, which nothing here runs at.
+            // `cargo run --release -p pstore-index --example recall -- --replicas`.
+            params: pstore_index::cluster::Params {
+                replicas: 0,
+                boundary: 0.0,
+                ..pstore_index::cluster::Params::default()
+            },
             text_field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
         }
     }
@@ -478,25 +488,20 @@ impl<S: BlobStore> Engine<S> {
                 Some(pstore_format::Value::Str(s)) if !s.is_empty()
             )
         });
-        // ⚠️ **`replicas: 0`, always, and this is a correctness clamp rather than a tuning
-        // choice.** Boundary replication puts a vector into a second posting list, and rows
-        // are written in list order — so a replicated document is written to the segment
-        // TWICE. That is harmless for a read-only fixture and wrong for a durable segment:
-        // `Engine::scan` promises every row "exactly once", and a compaction re-seals what it
-        // scanned, so the duplication compounds on every merge. Measured on the first attempt
-        // here: 400 documents folded and merged came back as **431 rows**.
+        // ⚠️ **The `replicas: 0` clamp is gone (M3c).** It was a correctness clamp, not a
+        // tuning choice: rows were written in list order, so a replicated vector was written
+        // to the segment TWICE — 400 documents folded and merged came back as 431 rows, and
+        // it compounded on every merge against `Engine::scan`'s "exactly once". The codes and
+        // the documents now live in separate row spaces, so replication duplicates the former
+        // and not the latter.
         //
-        // ⚠️ The cost is real and is recorded rather than hidden — M3's own table measures
-        // r@10 at p=2 as 0.961 with `1 x 0.10` replication against **0.844** without. Getting
-        // it back needs list membership that does not duplicate a row, which is a layout
-        // change and its own milestone.
-        let params = pstore_index::cluster::Params {
-            replicas: 0,
-            ..self.params
-        };
+        // ⚠️ **This turns nothing on.** `Engine::new` still defaults to `replicas: 0`, because
+        // at the default probe width of 8 replication buys **0.0000** recall and costs bytes
+        // (0.841 MB against 0.769). What it buys is query bytes at small `p` — 0.9610 @ 0.288
+        // MB at p=2 — and lowering `p` is a decision with its own measurement.
         let built = pstore_index::vec_index::try_build_all(
             docs,
-            params,
+            self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
             wants_text.then_some(text_field),
@@ -1126,10 +1131,7 @@ impl<S: BlobStore> Engine<S> {
         });
         let built = pstore_index::vec_index::try_build_all(
             &rows,
-            pstore_index::cluster::Params {
-                replicas: 0,
-                ..self.params
-            },
+            self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
             wants_text.then_some(self.text_field.as_str()),

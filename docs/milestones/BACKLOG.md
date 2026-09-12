@@ -82,7 +82,7 @@ every row the work opened along the way.** What is left is the table below.
 | # | Found by | Why it is not done |
 |---|---|---|
 | **10b** | [M6a](M6a/VERIFIED.md), narrowed by [M6d](M6d/VERIFIED.md) | Blocked on a protocol keeping an old-width reader stale rather than wrong, and on a key-format change. M6d removed the write-once-root blocker underneath it. Nothing waits on it at 16,384 buckets. |
-| **14** | [M5g](M5g/VERIFIED.md) | ⚠️ **Premise corrected by measurement; conclusion unchanged.** It is **not** a recall loss — that 0.961 → 0.844 compared two different probe widths. Measured on both corpora (`cargo run --release -p pstore-index --example recall -- --replicas`), at the engine's default **p=8 replication buys 0.0000 recall** (0.9810 either way) and *costs* bytes (0.841 vs 0.769 MB). What it actually buys is **query bytes at small p**: 0.9610 @ **0.288 MB** at p=2 against 0.9680 @ 0.429 MB unreplicated at p=4 — ~33% fewer bytes at equal-ish recall, for 1.65× stored codes. `cost-model.md` prices a node on scan bytes and `Params::default()`'s own comment states the principle — *"storage is the cheap resource and query bytes are the scarce one"* — so the trade is worth taking and the layout change is worth building. |
+| ~~14~~ | [M5g](M5g/VERIFIED.md) | **Done** — [M3c](M3c/VERIFIED.md). ⚠️ **Premise corrected by measurement first.** It is **not** a recall loss — that 0.961 → 0.844 compared two different probe widths. Measured on both corpora (`cargo run --release -p pstore-index --example recall -- --replicas`), at the engine's default **p=8 replication buys 0.0000 recall** (0.9810 either way) and *costs* bytes (0.841 vs 0.769 MB). What it actually buys is **query bytes at small p**: 0.9610 @ **0.288 MB** at p=2 against 0.9680 @ 0.429 MB unreplicated at p=4 — ~33% fewer bytes at equal-ish recall, for 1.65× stored codes. `cost-model.md` prices a node on scan bytes and `Params::default()`'s own comment states the principle — *"storage is the cheap resource and query bytes are the scarce one"* — so the layout change was worth building: `Section::IndexRows` splits the code rows from the document rows, and the engine's clamp is now a *measured* `replicas: 0` default rather than a correctness workaround. ⚠️ It also fixed a defect live since M3 — the sidecars were built over the expanded rows, so a replicated document was counted twice in `doc_count` and in every term's `df`. ⚠️ **Nothing is turned on**: the byte saving needs a lower `p`, which is its own decision. |
 | ~~15~~ | [M5g](M5g/VERIFIED.md) | **Done** — [M5h](M5h/VERIFIED.md). The memtable became a segment, so there is one BM25, one dense path and one fusion rather than a second scorer for each. |
 | ~~16~~ | [M6e](M6e/VERIFIED.md) | **Done** — [M6f](M6f/VERIFIED.md). It was a behaviour bug, not a coverage row. |
 
@@ -90,8 +90,8 @@ every row the work opened along the way.** What is left is the table below.
 fold time ([M5g](M5g/VERIFIED.md)), the orphan sweeper ([M6e](M6e/VERIFIED.md)), the freshness
 layer in the indexed path ([M5h](M5h/VERIFIED.md)) and the poisoned lock
 ([M6f](M6f/VERIFIED.md)). What each left behind is above, and each is smaller than what it
-replaced. ⚠️ **Item 14 is the only row left that is not blocked.** Its premise was wrong and its
-conclusion survives: what the engine gave up is **query bytes**, not recall.
+replaced. ⚠️ **Nothing unblocked is left.** 10b is blocked on a protocol; what remains of 14 is the
+`p` decision, which needs a measurement on a corpus that is not this one.
 
 ⚠️ **Two items closed by measuring instead of building** — 6 and 6b, where the pruning the
 format existed for skips **zero bytes**, and this file's own ordering principle 2 had ranked
