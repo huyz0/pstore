@@ -76,28 +76,24 @@ every segment forever, not the cost of waiting.
 
 ## Where this stands
 
-⚠️ **Every row the original audit carried forward is closed or explicitly blocked, and so is
-every row the work opened along the way.** What is left is the table below.
+⚠️ **Nothing carried forward is open, and nothing the work opened is open either.** Every row
+above and every row those rows created is closed — by building it, or by measuring it and
+deciding not to. What remains is the **Blocked** table below, and not one of its entries is
+blocked on effort.
 
-| # | Found by | Why it is not done |
+⚠️ **Four rows were closed by measuring instead of building**, which is the part worth keeping:
+
+| # | What the row claimed | What the measurement said |
 |---|---|---|
-| ~~10b~~ | [M6a](M6a/VERIFIED.md), narrowed by [M6d](M6d/VERIFIED.md) | **Done** — [M6g](M6g/VERIFIED.md). |
-| ~~18~~ | a sweep run for [M6g](M6g/VERIFIED.md) whose regex over-matched | ⚠️ **`pstore-index/src/lire.rs` has almost no mutation coverage**: 8 missed and 2 timeouts in `split_pass` and `Bounds::with_split_factor`, nearly every arithmetic operator among them. It is explicitly *"a spike for OQ-51, not a shipped path"* and deliberately unwired from `vec_index`, so this is not the correctness core — but a spike whose arithmetic nothing constrains can give a **wrong answer to the open question it exists to settle**, which misinforms a design decision rather than a query. **DONE.** `min` was asserted nowhere — `target_list_size / 4` was indistinguishable from `% 4` (nothing ever merges) and `* 4` (everything merges on the first pass), both silent. The degenerate-bisect guard was untested too: `maintenance_survives_the_degenerate_cases` builds 400 identical vectors, but at `target_list_size: 50` they spread across lists under the split bound, so `split_pass` never ran and the assertion was **vacuous**. ⚠️ The spike's **output** is now pinned: `Work`'s counters are what `examples/lire.rs` reads to answer OQ-51, and `inserted += 1` and `reassigned += moves.len()` were both indistinguishable from `*=`, which holds them at zero forever. ⚠️ Three mutations are left as **measured-inert**, not chased: a phantom dirty index leaves misplaced vectors at **82 of 3,000 — identical to baseline** — and inverting either `bisect`'s side test or the reassignment's `best != li` is invisible because **on the split path the two repair each other**. Full-file sweeps: **215 mutants, 197 caught before the work and 199 after** — 93.4% of viable, above the 80% floor. The residue is `split_pass`'s loop bounds and `maintain_with`'s comparison boundaries. | [M6g](M6g/VERIFIED.md) | S |
-| ~~17~~ | [M6g](M6g/VERIFIED.md) | **Done** — [M6h](M6h/VERIFIED.md), and M6g had the blocker wrong. The stale-width *reader* was already refused by M6g's own census check, and `bucket_of` has two shipped callers so nothing looks a tenant up by derived key. What was left is the *writer*, and it needs a rule about **content** — a record may leave a bucket only when its owner holds a copy at least as new — not a bound on time, which nothing could have provided. So it is a **re-partition**, not a prune: deleting everything a bucket does not own reclaims the same duplicates and loses live records. |
-| ~~14~~ | [M5g](M5g/VERIFIED.md) | **Done** — [M3c](M3c/VERIFIED.md). ⚠️ **Premise corrected by measurement first.** It is **not** a recall loss — that 0.961 → 0.844 compared two different probe widths. Measured on both corpora (`cargo run --release -p pstore-index --example recall -- --replicas`), at the engine's default **p=8 replication buys 0.0000 recall** (0.9810 either way) and *costs* bytes (0.841 vs 0.769 MB). What it actually buys is **query bytes at small p**: 0.9610 @ **0.288 MB** at p=2 against 0.9680 @ 0.429 MB unreplicated at p=4 — ~33% fewer bytes at equal-ish recall, for 1.65× stored codes. `cost-model.md` prices a node on scan bytes and `Params::default()`'s own comment states the principle — *"storage is the cheap resource and query bytes are the scarce one"* — so the layout change was worth building: `Section::IndexRows` splits the code rows from the document rows, and the engine's clamp is now a *measured* `replicas: 0` default rather than a correctness workaround. ⚠️ It also fixed a defect live since M3 — the sidecars were built over the expanded rows, so a replicated document was counted twice in `doc_count` and in every term's `df`. ⚠️ **Nothing is turned on**: the byte saving needs a lower `p`, which is its own decision. |
-| ~~15~~ | [M5g](M5g/VERIFIED.md) | **Done** — [M5h](M5h/VERIFIED.md). The memtable became a segment, so there is one BM25, one dense path and one fusion rather than a second scorer for each. |
-| ~~16~~ | [M6e](M6e/VERIFIED.md) | **Done** — [M6f](M6f/VERIFIED.md). It was a behaviour bug, not a coverage row. |
+| 6, 6b | Block-max pruning gets dearer every week | It skips **zero bytes** in 18 configurations. The metadata would have gone into every segment forever for a skip that never fires — so the rising cost was the cost of a *mistake*. [C-15](../research/06-indexing/full-text-search.md) |
+| 14 | The engine gave up r@10 **0.961 → 0.844** | That compared two probe widths. At the default `p=8` replication buys **0.0000** recall and costs bytes. It buys *query bytes at small `p`* — a different argument, which still justified building it. |
+| 17 | Pruning needs a bound on stale-process lifetime | It needs a rule about **content**, not time, and [M6g](M6g/VERIFIED.md)'s own census check had already removed the reader half of the problem. |
+| 18 | The LIRE spike has almost no mutation coverage | It had **197 of 215**. What was actually missing was the merge bound and the `Work` counters — the spike's own answer to OQ-51. |
 
-⚠️ **Items 12, 13, 15 and 16 were opened and closed inside the same run of work** — the ANN index at
-fold time ([M5g](M5g/VERIFIED.md)), the orphan sweeper ([M6e](M6e/VERIFIED.md)), the freshness
-layer in the indexed path ([M5h](M5h/VERIFIED.md)) and the poisoned lock
-([M6f](M6f/VERIFIED.md)). What each left behind is above, and each is smaller than what it
-replaced. ⚠️ **Nothing unblocked is left.** 10b is blocked on a protocol; what remains of 14 is the
-`p` decision, which needs a measurement on a corpus that is not this one.
-
-⚠️ **Two items closed by measuring instead of building** — 6 and 6b, where the pruning the
-format existed for skips **zero bytes**, and this file's own ordering principle 2 had ranked
-them first. A backlog is only as good as its willingness to delete a row.
+⚠️ **And one row was a false finding of mine**, retracted in [M6g](M6g/VERIFIED.md)'s ledger: a
+sweep I reported as having "measured nothing" had tested 14 catalog mutants and caught them
+all. `cargo mutants` prints only the **missed** mutants by file, so an empty grep is the good
+outcome — confirming coverage needs `--list` with the same filter.
 
 ## Blocked, and by what
 
