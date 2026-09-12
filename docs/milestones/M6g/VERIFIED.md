@@ -49,13 +49,16 @@ the failure read. Command: `cargo test -p pstore-catalog --test split`.
     mutants, 18 caught, 4 missed** — and **none of the four is in `pstore-catalog`**. They are
     the engine's stale-commit test helper, one in `pstore-node`, and two in `pstore-testkit`,
     all of which predate this milestone and survive every sweep in this session.
-    ⚠️ **The first sweep run for this milestone measured nothing and looked clean.** Its regex
-    was `split|enumerate_since|gather`, which matched three unrelated functions elsewhere in
-    the tree — the faulty store's mixer and two of the LIRE spike's — and produced **zero**
-    catalog mutants, so
-    "nothing missed" was a statement about other modules. Recorded because a sweep that
-    examines the wrong code and passes is worth exactly as much as one never run, and it is
-    indistinguishable from the real thing in its own output.
+    ⚠️ **CORRECTION.** An earlier version of this line claimed the first sweep run for this
+    milestone "measured nothing and looked clean". **That was wrong, and it is corrected here
+    rather than deleted.** The first sweep used the regex `split|enumerate_since|gather`; I
+    grepped its output for `pstore-catalog`, found none, and concluded it had skipped this
+    milestone's code. It had not — `cargo mutants` prints only **missed** mutants by file, so
+    zero catalog lines meant zero catalog mutants *missed*, which is the good outcome. That
+    regex selects **14 catalog mutants of its 66**, and every one was caught. Both sweeps were
+    valid; the narrower one above is simply the one scoped to this milestone.
+    ⚠️ The lesson is the one this project keeps relearning about its own gates: a summary read
+    the wrong way is indistinguishable from a real finding, and I published it as one.
     ⚠️ It did surface something real, now backlog item 18: `pstore-index/src/lire.rs` has 8
     missed and 2 timeouts across its split routines. That module is explicitly a spike for
     OQ-51 and is not wired into the dense index, so it is not the correctness core — but a

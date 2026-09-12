@@ -279,3 +279,142 @@ fn the_split_factor_can_be_set_explicitly() {
         (p.target_list_size as f32 * 1.5) as usize
     );
 }
+
+#[test]
+fn the_merge_bound_is_a_quarter_of_the_target() {
+    // ⚠️ **`min` was asserted nowhere.** `the_split_factor_can_be_set_explicitly` and
+    // `the_split_bound_is_not_the_balance_bound` both pin `max` and neither looks at `min`, so
+    // a mutation sweep found `target_list_size / 4` indistinguishable from `% 4` and from
+    // `* 4`. A merge bound of `target * 4` merges every list into its neighbour on the first
+    // pass; `% 4` gives 0 for most targets, clamped to 1, so nothing ever merges. Both are
+    // silent: the index still answers, with a partition nobody chose.
+    for target in [4usize, 40, 100, 4_000] {
+        let p = Params {
+            target_list_size: target,
+            ..Params::default()
+        };
+        let b = Bounds::from_params(p);
+        assert_eq!(b.min, (target / 4).max(1), "target={target}");
+        assert!(b.min < b.max, "target={target}: the bounds crossed");
+        assert_eq!(Bounds::with_split_factor(p, 2.0).min, b.min);
+    }
+    // ⚠️ The clamp, which is the case `% 4` and `/ 4` agree on and `* 4` does not.
+    let tiny = Params {
+        target_list_size: 1,
+        ..Params::default()
+    };
+    assert_eq!(
+        Bounds::from_params(tiny).min,
+        1,
+        "a bound of zero merges forever"
+    );
+}
+
+#[tokio::test]
+async fn a_split_names_only_lists_that_exist() {
+    // ⚠️ `split_pass` marks the two halves dirty as `i` and `lists.len() - 1`, and the
+    // reassignment scope is exactly that set. Off by one and the scope names a list that does
+    // not exist — the vectors of the real new half are never reconsidered, so they stay
+    // assigned to the centroid they had before the split. Recall drifts and nothing errors.
+    let corpus = corpus(3_000, 12, 5);
+    let seed: Vec<Vec<f32>> = corpus[..2_600].to_vec();
+    let rows: Vec<usize> = (2_600..3_000).collect();
+    let mut c = Clustering::build(&seed, params());
+    let before = c.lists().len();
+    let work = lire::maintain(&mut c, &corpus, &rows, params(), Scope::Touched);
+    assert!(work.splits > 0, "the fixture split nothing");
+    assert!(c.lists().len() > before);
+
+    // Every vector is in exactly one list, and every list is non-empty — which is what a
+    // dirty index naming a phantom list, or a split producing an empty half, breaks.
+    let mut seen = vec![0usize; corpus.len()];
+    for (i, list) in c.lists().iter().enumerate() {
+        assert!(!list.is_empty(), "list {i} is empty after a split");
+        for r in list {
+            seen[*r] += 1;
+        }
+    }
+    assert!(
+        seen.iter().all(|n| *n == 1),
+        "a vector is in {} lists after a split",
+        seen.iter().copied().max().unwrap_or(0)
+    );
+}
+
+#[tokio::test]
+async fn an_unsplittable_list_over_the_bound_is_left_whole() {
+    // ⚠️ `maintenance_survives_the_degenerate_cases` builds 400 identical vectors and asserts
+    // no empty list — but with `target_list_size: 50` the clustering spreads them across lists
+    // of 50, none over the split bound of 100, so `split_pass` never runs and the assertion is
+    // vacuous. A mutation sweep proved it: `a.is_empty() || b.is_empty()` mutated to `&&`
+    // survived, and that mutation pushes an EMPTY list whenever a bisect degenerates.
+    //
+    // Constructed directly, so the list is over the bound and unsplittable by construction.
+    let p = params();
+    let rows: Vec<usize> = (0..200).collect();
+    let same: Vec<Vec<f32>> = (0..200).map(|_| vec![0.5f32; DIM]).collect();
+    let mut c = Clustering::from_parts(vec![vec![0.5f32; DIM]], vec![rows]);
+    assert!(
+        c.lists()[0].len() > Bounds::from_params(p).max,
+        "the fixture is under the split bound, so nothing is attempted"
+    );
+
+    let work = lire::maintain(&mut c, &same, &[], p, Scope::All);
+    assert_eq!(work.splits, 0, "an unsplittable list was split anyway");
+    assert!(
+        c.lists().iter().all(|l| !l.is_empty()),
+        "a degenerate bisect pushed an empty list: {:?}",
+        c.lists().iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        c.lists().iter().map(Vec::len).sum::<usize>(),
+        200,
+        "the unsplittable list lost or gained rows"
+    );
+}
+
+#[tokio::test]
+async fn a_splits_halves_are_reassigned_to_their_own_centroids() {
+    // ⚠️ `split_pass` marks both halves dirty — `i` and `lists.len() - 1` — and that set is
+    // the reassignment scope. Marked wrong, the new half is never reconsidered and its vectors
+    // keep the assignment they had before the split: no error, no lost row, and a partition
+    // that is quietly worse than the one the protocol claims. Nothing measured that, so
+    // `lists.len() + 1` survived.
+    //
+    // What the marking buys is exactly this: every vector sits in the list whose centroid is
+    // nearest it.
+    let corpus = corpus(3_000, 12, 11);
+    let seed: Vec<Vec<f32>> = corpus[..2_600].to_vec();
+    let rows: Vec<usize> = (2_600..3_000).collect();
+    let mut c = Clustering::build(&seed, params());
+    let work = lire::maintain(&mut c, &corpus, &rows, params(), Scope::Touched);
+    assert!(work.splits > 0, "the fixture split nothing");
+
+    let cents = c.centroids().to_vec();
+    let mut misplaced = 0usize;
+    let mut total = 0usize;
+    for (li, list) in c.lists().iter().enumerate() {
+        for r in list {
+            total += 1;
+            let v = &corpus[*r];
+            let d = |c: &Vec<f32>| -> f32 { v.iter().zip(c).map(|(a, b)| (a - b) * (a - b)).sum() };
+            let own = d(&cents[li]);
+            if cents.iter().any(|c| d(c) < own - 1e-6) {
+                misplaced += 1;
+            }
+        }
+    }
+    // ⚠️ Not zero: `Scope::Touched` deliberately reconsiders only the disturbed lists, so
+    // vectors in untouched lists may drift. Measured at **82 of 3,000**.
+    //
+    // ⚠️ **This does not kill `dirty.insert(lists.len() - 1)` mutated to `+ 1`, and that was
+    // measured rather than assumed: 82 of 3,000 either way.** `bisect` already places both
+    // halves against their own new centroids, so re-marking the new one adds nothing on the
+    // split path — the marking earns its keep only if a later pass needs that list in scope.
+    // Left as an inert mutation with the number recorded, not chased.
+    assert!(
+        misplaced * 20 < total,
+        "{misplaced} of {total} vectors are nearer another centroid — the split's halves were \
+         not reassigned"
+    );
+}

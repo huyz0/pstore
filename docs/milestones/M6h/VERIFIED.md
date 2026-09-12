@@ -32,7 +32,16 @@ the failure read. Command: `cargo test -p pstore-catalog --test repartition`.
 8. **A backend that cannot fence is refused** —
    `a_repartition_on_a_divergent_backend_is_refused` asserts the error **and zero writes**, and
    `repartition` is added to `refusal.rs`'s existing loop over every guarded door.
-9. **Gates** — `./scripts/gates.sh` green.
+9. **Gates** — `./scripts/gates.sh` green. Mutation over `repartition` and its rewrite helper,
+   in the `dev` container: **18 mutants, 14 caught, 4 missed** — the four are the engine's
+   stale-commit test helper, one in `pstore-node` and two in `pstore-testkit`, all of which
+   predate this milestone and survive every sweep in this session. Nothing in `pstore-catalog`
+   survives.
+   ⚠️ **Read carefully, because I read it wrong once.** `cargo mutants` prints only the
+   **missed** mutants by file, so grepping its output for a crate and finding nothing means
+   nothing was *missed* — not that nothing was tested. Confirming a sweep covered what it was
+   meant to needs `cargo mutants --list` with the same filter, which is how the false finding
+   recorded against [M6g](../M6g/VERIFIED.md) was caught.
 
 ⚠️ **Two passes, and one mutation showed why.** Collapsing them into a single pass fails four
 of the eight tests: a bucket can both gain and shed, so there is no ordering of single writes
