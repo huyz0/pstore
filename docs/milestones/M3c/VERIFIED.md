@@ -50,7 +50,30 @@ the failure read. Commands: `cargo test -p pstore-format --test index_rows` and
    **not** duplicate. `RaBitQ` and `Sq8` stride by the index row count; `Vectors` and the
    blocks stride by `row_count`. The M3c.1 test encoded the opposite and was corrected, not
    weakened: it still asserts every row decodes to its own document.
-8. **Gates** — `./scripts/gates.sh` green, `./scripts/recall.sh` PASS.
+8. **Gates** — `./scripts/gates.sh` green, `./scripts/recall.sh` PASS. Mutation over
+   `vec_index.rs`, in the `dev` container: **220 mutants, 109 caught, 5 missed, 106 unviable**
+   — 95.6% of viable, above the 80% floor.
+   ⚠️ **One of the five was real, and it named a hole this milestone did not create.** Nothing
+   in `cargo test` asserted *which documents* a clustered search returns: every other test in
+   `persisted.rs` asserts round trips, byte spans or hit counts, and the only assertion about
+   ranking lives in `scripts/recall.sh`, which runs **outside** the suite so a sweep does not
+   rebuild 20,000 vectors per mutant. `cargo mutants` runs the suite, so it could not see any
+   of it. `a_clustered_query_returns_the_documents_it_should` closes that with brute-force
+   ground truth over a few hundred vectors, and it kills the mutant — the posting-list byte
+   range `first * code_len` turned into `first + code_len`.
+   ⚠️ **Two are measurably inert on any fixture the suite can afford**, and are recorded rather
+   than chased: the `home` loop's `first..first + len`, which decides the centroid each
+   residual is coded against, and `rung1`'s buffer bound `row < first + len`. Mutating the
+   first makes every row code against the **origin** instead of its centroid, and in-suite
+   recall@10 is **0.9870 either way** — measured, not assumed. Residual coding earns its
+   accuracy on hard corpora, and the fixture the suite can afford is seven tight groups in
+   twelve dimensions. Catching them needs the gate-scale corpus `recall.sh` runs, and that is
+   outside the suite deliberately.
+   `a_clustered_index_keeps_its_recall_in_suite` is kept anyway: it asserts ranking quality
+   the suite never asserted, with a floor well under the measurement so it fails on a defect
+   rather than on drift.
+   ⚠️ The remaining two — the `dim > 0` guard widened on a `usize`, and the sibling of the byte
+   range — are **not** claimed as analysed here.
 
 ## What is not built, and named rather than omitted
 

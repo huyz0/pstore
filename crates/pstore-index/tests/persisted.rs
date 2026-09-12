@@ -581,3 +581,186 @@ async fn a_ragged_dimension_does_not_shift_every_later_row() {
         "one ragged row shifted the stride: searching for d{target} returned {ids:?}"
     );
 }
+
+#[tokio::test]
+async fn a_clustered_query_returns_the_documents_it_should() {
+    // ⚠️ **The correctness of the search path was invisible to the mutation gate.** Every
+    // other test here asserts round trips, byte spans or hit *counts*; the only thing that
+    // asserted *which* documents come back is `scripts/recall.sh`, which runs outside
+    // `cargo test` so that a sweep does not rebuild a 20,000-vector corpus once per mutant.
+    // `cargo mutants` runs the suite, so it could not see any of it — four survivors in
+    // `vec_index.rs` were all this one hole:
+    //
+    //   * the posting-list byte range, `first * code_len`, mutated to `+` and to `/`
+    //   * the buffer-selection bound `row < first + len` widened to `<=`
+    //   * the `home` loop's `first..first + len`, which decides the centroid each row's
+    //     residual is coded against — mutated, every row codes against the origin
+    //
+    // Each of those returns a plausible ranking of the wrong documents. This is the cheap
+    // in-suite counterpart to the gate: a few hundred vectors, ground truth by brute force,
+    // and the claim is exactness at the top rather than a recall floor.
+    let s = MemoryStore::new();
+    let docs = corpus(TEST_THRESHOLD + 300, 12, 7);
+    let built = put(&s, &docs).await;
+    assert!(
+        built.centroids.as_ref().is_some_and(|c| c.spans.len() > 1),
+        "the fixture built one list or none, so no probe arithmetic is exercised"
+    );
+    let key = Key::new(SEG);
+    let idx = VecIndex::open(&s, &key, &Key::new(CEN), DIM).await.unwrap();
+
+    for probe in [4usize, 16] {
+        for q in [3usize, 97, 200, 431] {
+            let query = docs[q].vector();
+            // Ground truth by brute force over the same vectors, which is what makes this a
+            // test of the index rather than of itself.
+            let mut truth: Vec<(usize, f32)> = docs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    (
+                        i,
+                        d.vector()
+                            .iter()
+                            .zip(query)
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>(),
+                    )
+                })
+                .collect();
+            truth.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+            let hits = idx
+                .search(
+                    &s,
+                    &key,
+                    query,
+                    Query {
+                        k: 5,
+                        p: probe,
+                        rerank: Rerank::Exact,
+                        ..Query::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 5, "p={probe} q={q}");
+            // ⚠️ The nearest neighbour of a document is the document, so the top hit is known
+            // exactly and does not depend on the generator's spread.
+            // ⚠️ **Hits name ROWS, and rows are in cluster order, not input order.** The
+            // first version of this test compared a row against a document index and failed
+            // on correct code — which is the same confusion `Hit`'s own doc warns about, one
+            // layer down. `built.order` is the map.
+            let named: Vec<usize> = hits.iter().map(|(r, _)| built.order[*r]).collect();
+            assert_eq!(
+                named[0], q,
+                "p={probe}: a query for document {q}'s own vector returned {} first",
+                named[0]
+            );
+            // And every hit is genuinely among the true nearest: `exact` rerank scores the
+            // survivors with full precision, so the ones it keeps must be real neighbours.
+            let near: Vec<usize> = truth.iter().take(40).map(|(i, _)| *i).collect();
+            for d in &named {
+                assert!(
+                    near.contains(d),
+                    "p={probe} q={q}: document {d} is not among the 40 true nearest"
+                );
+            }
+
+            // ⚠️ **Every rung, at an oversample tight enough that rung 0 has to be right.**
+            // With `exact` and oversample 32 the first rung keeps a third of this corpus, so
+            // a mutation that codes every residual against the ORIGIN instead of its centroid
+            // — `first..first * len` in the `home` loop — is rescued by the full-precision
+            // rerank and survives. And `fast`'s buffer-selection bound is only reached by
+            // `Rerank::Fast`, so `exact` alone never exercises it.
+            for rerank in [Rerank::None, Rerank::Fast, Rerank::Exact] {
+                let hits = idx
+                    .search(
+                        &s,
+                        &key,
+                        query,
+                        Query {
+                            k: 10,
+                            p: probe,
+                            oversample: 4,
+                            rerank,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let named: Vec<usize> = hits.iter().map(|(r, _)| built.order[*r]).collect();
+                assert!(
+                    named.contains(&q),
+                    "p={probe} {rerank:?}: a query for document {q}'s own vector did not \
+                     return it at all: {named:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_clustered_index_keeps_its_recall_in_suite() {
+    // ⚠️ **The mutation gate can only see what `cargo test` asserts.** Ranking *quality* was
+    // asserted only by `scripts/recall.sh`, which runs outside the suite so a sweep does not
+    // rebuild 20,000 vectors per mutant — so two survivors in `vec_index.rs` were invisible:
+    // the `home` loop's `first..first + len`, which decides the centroid each residual is
+    // coded against, and `rung1`'s `row < first + len` buffer bound. Neither breaks a single
+    // query; both degrade the ranking across many.
+    //
+    // ⚠️ This is a **smoke test, not the gate**: 500 vectors against the gate's 20,000, and a
+    // floor set well under the measured value so it fails on a defect rather than on drift.
+    let s = MemoryStore::new();
+    let docs = corpus(TEST_THRESHOLD + 300, 12, 7);
+    let built = put(&s, &docs).await;
+    let key = Key::new(SEG);
+    let idx = VecIndex::open(&s, &key, &Key::new(CEN), DIM).await.unwrap();
+
+    let mut found = 0usize;
+    let mut wanted = 0usize;
+    for q in (0..docs.len()).step_by(11) {
+        let query = docs[q].vector();
+        let mut truth: Vec<(usize, f32)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                (
+                    i,
+                    d.vector()
+                        .iter()
+                        .zip(query)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>(),
+                )
+            })
+            .collect();
+        truth.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let want: Vec<usize> = truth.iter().take(10).map(|(i, _)| *i).collect();
+
+        let hits = idx
+            .search(
+                &s,
+                &key,
+                query,
+                Query {
+                    k: 10,
+                    p: 8,
+                    oversample: 8,
+                    rerank: Rerank::Fast,
+                },
+            )
+            .await
+            .unwrap();
+        let named: Vec<usize> = hits.iter().map(|(r, _)| built.order[*r]).collect();
+        found += want.iter().filter(|w| named.contains(w)).count();
+        wanted += want.len();
+    }
+    let recall = found as f64 / wanted as f64;
+    // ⚠️ The floor, not the measurement. `scripts/recall.sh` is where the number lives.
+    assert!(
+        recall >= 0.80,
+        "recall@10 fell to {recall:.4} over {} queries — the ranking is degraded, not merely \
+         different",
+        docs.len().div_ceil(11)
+    );
+}
