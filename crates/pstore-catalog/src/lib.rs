@@ -49,7 +49,8 @@ mod record;
 
 pub use append::Appender;
 pub use bucket::{
-    BucketHead, Root, fold, read_head, read_root, read_run_for_test, reap, split, sweep, write_root,
+    BucketHead, Root, fold, read_head, read_root, read_run_for_test, reap, repartition, split,
+    sweep, write_root,
 };
 pub use enumerate::{Enumeration, Mark, enumerate, enumerate_since};
 pub use keys::{

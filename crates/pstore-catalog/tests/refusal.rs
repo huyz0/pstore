@@ -234,6 +234,11 @@ async fn a_catalog_write_on_a_divergent_backend_is_refused() {
         pstore_catalog::split(store.as_ref())
             .await
             .expect_err("split must refuse"),
+        // ⚠️ M6h: a re-partition moves live records between buckets, so one that cannot fence
+        // could drop a record from a bucket without proving it landed in the other.
+        pstore_catalog::repartition(store.as_ref())
+            .await
+            .expect_err("repartition must refuse"),
         pstore_catalog::write_root(
             store.as_ref(),
             pstore_catalog::Root {

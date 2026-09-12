@@ -497,6 +497,131 @@ pub async fn sweep<S: BlobStore>(store: &S, bucket: u32) -> Result<usize, Catalo
     Ok(n)
 }
 
+/// Rewrites every bucket that holds a record it does not own at the current width.
+///
+/// ⚠️ **A re-partition, not a prune, and the difference is a live record.** A stale-width
+/// appender puts tenant `T` into `b` when the current width says `b + w`, and that copy may be
+/// the **only** one or the **newest** one. So a record may leave a bucket only when its owner
+/// holds a copy at least as new; otherwise it is *moved*. Deleting everything a bucket does
+/// not own reclaims the same duplicates and loses those records.
+///
+/// ⚠️ **Two passes, because one cannot be ordered.** A bucket can both gain and shed, and a
+/// cycle of gains and sheds has no ordering of single writes that never leaves a record in
+/// neither place. Pass one writes every bucket that **gains**; pass two writes every bucket
+/// that **sheds**. Between them a record is in two buckets, which is the state this operation
+/// starts from and which a census already tolerates — so a crash between passes leaves the
+/// input state and a re-run finishes it.
+///
+/// ⚠️ **Run and pending together.** A record recorded and not yet folded is as much a tenant as
+/// one in a run, so a drifted bucket is rewritten as a fresh run holding everything it owns
+/// with pending emptied. Leaving pending alone would strand a moved record in the head of a
+/// bucket that no longer owns it.
+///
+/// Safe only because **every read is a census**: `bucket_of` has two shipped callers, the
+/// split's predicate and the appender, so nothing looks a tenant up by derived key and a
+/// record in transit is still enumerated. ⚠️ Adding a per-tenant read path would invalidate
+/// that argument.
+///
+/// Returns how many records moved.
+///
+/// # Errors
+/// If the store refuses, an object is malformed, or the backend cannot fence.
+pub async fn repartition<S: BlobStore>(store: &S) -> Result<usize, CatalogError> {
+    crate::require_fencing(store)?;
+    let (root, _) = read_root(store).await?;
+    let width = root.width;
+
+    let heads = futures_util::future::try_join_all(width.all().map(|b| async move {
+        let (head, tag) = read_head(store, b).await?;
+        Ok::<_, CatalogError>((b, head, tag))
+    }))
+    .await?;
+    let runs = futures_util::future::try_join_all(
+        heads
+            .iter()
+            .map(|(b, head, _)| async move { read_run(store, *b, head).await }),
+    )
+    .await?;
+
+    // What each bucket holds now, and what it should hold.
+    let mut holds: BTreeMap<u32, Vec<TenantRecord>> = BTreeMap::new();
+    let mut arrivals: BTreeMap<u32, Vec<TenantRecord>> = BTreeMap::new();
+    let mut sheds: BTreeMap<u32, Vec<TenantRecord>> = BTreeMap::new();
+    for ((b, head, _), run) in heads.iter().zip(runs) {
+        let all: Vec<TenantRecord> = run
+            .into_iter()
+            .chain(head.pending.iter().cloned())
+            .collect();
+        for r in all {
+            let owner = keys::bucket_of(r.tenant, width);
+            if owner == *b {
+                holds.entry(*b).or_default().push(r);
+            } else {
+                arrivals.entry(owner).or_default().push(r.clone());
+                sheds.entry(*b).or_default().push(r);
+            }
+        }
+    }
+    let moved: usize = sheds.values().map(Vec::len).sum();
+    if moved == 0 {
+        return Ok(0);
+    }
+
+    // ⚠️ Pass one: the gainers, each with what it already owns plus what is arriving. Nothing
+    // is dropped yet, so no record is ever in neither bucket.
+    for (b, incoming) in &arrivals {
+        let kept = holds.get(b).cloned().unwrap_or_default();
+        rewrite(store, *b, merge(kept, incoming.iter())).await?;
+    }
+    // Pass two: the shedders, each with only what it owns.
+    for b in sheds.keys() {
+        if arrivals.contains_key(b) {
+            // Already written above with its arrivals, and that write dropped what it sheds.
+            continue;
+        }
+        let kept = holds.get(b).cloned().unwrap_or_default();
+        rewrite(store, *b, merge(Vec::new(), kept.iter())).await?;
+    }
+    Ok(moved)
+}
+
+/// Replaces a bucket's contents with `records`, as a fresh run and empty pending.
+async fn rewrite<S: BlobStore>(
+    store: &S,
+    bucket: u32,
+    records: Vec<TenantRecord>,
+) -> Result<(), CatalogError> {
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let (head, tag) = read_head(store, bucket).await?;
+        let body = encode_records(&records);
+        let digest = keys::digest(&body);
+        let next_epoch = head.run_epoch.next();
+        let run = keys::run_key(bucket, next_epoch, digest);
+        match store
+            .put_conditional(&run, body.clone().into(), Precondition::NotExists)
+            .await
+        {
+            Ok(_) | Err(CasError::Lost) => {}
+            Err(CasError::Contended) => continue,
+            Err(CasError::Io(e)) => return Err(BlobError::Other(e).into()),
+        }
+        let mut next = BucketHead {
+            run_epoch: next_epoch,
+            digest,
+            pending: Vec::new(),
+            graveyard: head.graveyard.clone(),
+        };
+        next.bury(head.run_epoch, head.digest);
+        if matches!(
+            write_head(store, bucket, &next, tag).await?,
+            Publish::Landed
+        ) {
+            return Ok(());
+        }
+    }
+    Err(CatalogError::Contended(bucket, MAX_CAS_ATTEMPTS))
+}
+
 /// Doubles the deployment's bucket count.
 ///
 /// ⚠️ **Doubling is the only split, and that is what makes it tractable.** `bucket_of` is
