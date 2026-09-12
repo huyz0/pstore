@@ -113,7 +113,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-56` class-aware admission vs S3-FIFO/W-TinyLFU (see also OQ-101) ·
 ~~`OQ-57`~~ **closed** — warm classes 1–4 only; bulk warming exceeds the endurance budget ·
 `OQ-58` cache retention after placement loss ·
-`OQ-59` balance cost of AZ-aware LRH ·
+~~`OQ-59`~~ **closed** — AZ-aware placement costs essentially nothing in balance: a cell *is* a ring, so the only variable is `N`, and imbalance is flat across 100–900 nodes (1.268 / 1.333 / 1.338 mean, trial spread ±0.1 wider than the gap). [M4e](../../milestones/M4e/VERIFIED.md) criterion 7 ·
 `OQ-60` speculative RT-A fetch waste ·
 `OQ-61` cache-aware cost model design ·
 `OQ-62` two-level fan-out shape ·

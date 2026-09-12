@@ -215,3 +215,50 @@ fn imbalance_at_cell_scale_stays_bounded() {
         );
     }
 }
+
+#[test]
+fn a_duplicate_node_id_is_not_placed_twice() {
+    // ⚠️ **Found while probing OQ-59's reasoning, not while looking for this.** `from_nodes`
+    // does `nodes.sort()` and then `nodes.dedup()`, and `dedup` removes only **consecutive**
+    // duplicates — so without the sort, an id repeated non-adjacently survives into the ring
+    // twice and takes double the load of its peers, forever and silently. Removing the sort
+    // was caught by nothing.
+    //
+    // A roster is decoded from a blob written by other nodes, so a repeated id is not a
+    // hypothetical: it is one gossip merge away.
+    use pstore_cluster::Placement;
+
+    let with_dupes = Roster::from_nodes(
+        [
+            "10.0.0.3:7946",
+            "10.0.0.1:7946",
+            "10.0.0.3:7946",
+            "10.0.0.2:7946",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    assert_eq!(
+        with_dupes.nodes().len(),
+        3,
+        "a non-adjacent duplicate survived deduplication: {:?}",
+        with_dupes.nodes()
+    );
+    assert_eq!(
+        with_dupes.ring().len(),
+        3,
+        "the ring holds a node twice, so it takes double the load of its peers"
+    );
+
+    // And it places like the roster that never had the duplicate.
+    let clean = Roster::from_nodes(
+        ["10.0.0.1:7946", "10.0.0.2:7946", "10.0.0.3:7946"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    let (a, b) = (Placement::new(&with_dupes), Placement::new(&clean));
+    for i in 0..200 {
+        let key = format!("t/idx{i}/s0");
+        assert_eq!(a.place(&key, 2), b.place(&key, 2), "{key}");
+    }
+}

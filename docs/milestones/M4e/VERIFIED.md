@@ -135,8 +135,21 @@ equally. Restated over what actually needs pinning: how a cell's roster is *buil
 
 ## Not run
 
-**OQ-59** — the balance cost of AZ-aware LRH. Deferred to phase 2 rather than answered badly:
-review showed the effect (0.026 on the mean) is an order of magnitude smaller than the spread
-across node-naming trials (0.28), so one sample per configuration measures ring-position luck.
-It also conflates the AZ constraint with per-ring `N`, and therefore with `window()`, which
-pulls the other way. Any number reported here would have been `provisional` and wrong.
+⚠️ **This entry was stale and contradicted criterion 7 of this same ledger.** It described the
+state *before* the measurement was redesigned — the first attempt compared one 900-node ring
+against three 300-node rings, and review found the effect (0.026 on the mean) an order of
+magnitude smaller than the spread across node-naming trials (0.28), so one sample per
+configuration measured ring-position luck. That is all true, and it is why the harness was
+rewritten to measure imbalance against `N` with eight trials.
+
+**OQ-59 is answered by criterion 7.** The entry is kept rather than deleted because a ledger
+that said both things at once is worth being able to find: the contradiction stood from M4e
+until it was noticed while auditing what was still doable on this machine.
+
+⚠️ **And criterion 7's load-bearing step is now a test.** Its argument is "`place` has no AZ
+term, so a 300-node cell *is* a 300-node ring" — which holds only if a cell's placement depends
+on nothing but its own roster. Probing that turned up a different gap and the test written for
+it is `a_duplicate_node_id_is_not_placed_twice`: `from_nodes` sorts before deduplicating, and
+`dedup` removes only **consecutive** duplicates, so without the sort a repeated id enters the
+ring twice and takes double the load of its peers — silently, forever, and caught by nothing.
+A roster is decoded from a blob other nodes wrote, so a repeated id is one gossip merge away.
