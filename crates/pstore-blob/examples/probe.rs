@@ -178,6 +178,28 @@ async fn main() {
                 println!("**UNREACHABLE** — {why}");
                 println!();
                 println!("No probe ran. This is recorded as an absence, never as a pass.");
+                // ⚠️ **Absence is not ignorance here, and the matrix must not imply it is.**
+                // OQ-153 asked the emulator directly over the JSON upload path, which is the
+                // one route `object_store`'s XML client cannot take, and the answer is worse
+                // than unreachable: `ifGenerationMatch` is **accepted and ignored**.
+                if name.contains("gcs") {
+                    println!();
+                    println!(
+                        "⚠️ **But the question was answered another way, and the answer is a \
+                         no.** `scripts/conformance.sh --gcs-precondition` asks over the JSON \
+                         upload path — the one route this client cannot take — and \
+                         `ifGenerationMatch` is **accepted and ignored**: create-if-absent \
+                         against an existing object returns 200 and overwrites, as does a \
+                         compare-and-swap on a stale generation. Measured identically on \
+                         1.52 and 1.55."
+                    );
+                    println!();
+                    println!(
+                        "⚠️ That is the worst shape a precondition can have — MinIO's wildcard \
+                         had it (C-13) — because a CAS built on it reports success and loses \
+                         the write. **Do not use this emulator as a CAS target.**"
+                    );
+                }
             }
             Outcome::Probed(r) => {
                 if !r.conforms() {

@@ -5,6 +5,8 @@
 #   scripts/conformance.sh                probe, and rewrite docs/profiles/capability-matrix.md
 #   scripts/conformance.sh --check        probe, and FAIL if the checked-in matrix disagrees
 #   scripts/conformance.sh --azure-suffix ask Azurite for a suffix range directly (C-14)
+#   scripts/conformance.sh --gcs-precondition  ask fake-gcs-server whether it honours
+#                                         `ifGenerationMatch` at all (OQ-153)
 #
 # ⚠️ **Outside `cargo test`**, for the reason `recall.sh` and `depth.sh` are: it needs three
 # containers, and a suite that cannot run without Docker is a suite that stops running. It is
@@ -94,6 +96,67 @@ azure_suffix_probe() {
         echo "$range -> $code"
     done
 }
+
+# ---------------------------------------------------------------------------
+# OQ-153, and it is not reachable through `object_store`: its GCS client writes with the XML
+# API (`PUT /{bucket}/{object}`), and fake-gcs-server routes that path to its JSON upload
+# handler and answers `400 invalid uploadType`. So no request ever carries a precondition and
+# the probe reports the backend UNREACHABLE, which says nothing about the question.
+#
+# ⚠️ This asks the emulator **directly, over the JSON upload path**, which is the one exit
+# OQ-153 named that does not need a different client or a newer image. Three cases, and the
+# first two are the whole question:
+#
+#   ifGenerationMatch=0 on an object that EXISTS   -> must be 412
+#   ifGenerationMatch=<stale> on a live object     -> must be 412
+#   ifGenerationMatch=<current>                    -> must be 200
+#
+#   scripts/conformance.sh --gcs-precondition
+gcs_precondition_probe() {
+    local o="conformance/oq153/canary" bad=0
+    local up="$GCS/upload/storage/v1/b/${PSTORE_GCS_BUCKET:-pstore}/o?uploadType=media"
+    curl -s -o /dev/null -X POST --data 'v1' "$up&name=$o&ifGenerationMatch=0"
+
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data 'v2' \
+        "$up&name=$o&ifGenerationMatch=0")
+    echo "create-if-absent on an existing object: $code (must be 412)"
+    [[ "$code" == "412" ]] || bad=1
+
+    local gen
+    gen=$(curl -s "$GCS/storage/v1/b/${PSTORE_GCS_BUCKET:-pstore}/o/${o//\//%2F}" \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("generation",0))')
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data 'v3' \
+        "$up&name=$o&ifGenerationMatch=1")
+    echo "compare-and-swap on a stale generation: $code (must be 412)"
+    [[ "$code" == "412" ]] || bad=1
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data 'v4' \
+        "$up&name=$o&ifGenerationMatch=$gen")
+    echo "compare-and-swap on the current generation $gen: $code (must be 200)"
+    [[ "$code" == "200" ]] || bad=1
+
+    local body; body=$(curl -s "$GCS/${PSTORE_GCS_BUCKET:-pstore}/$o")
+    echo "body after all four writes: $body"
+    if [[ "$bad" == "1" ]]; then
+        cat >&2 <<'MSG'
+
+⚠️ fake-gcs-server ACCEPTS `ifGenerationMatch` and IGNORES it. That is the worst shape a
+precondition can have -- the same one MinIO's wildcard had (C-13) -- because a CAS built on it
+reports success and loses the write. A backend that refused the parameter would at least be
+detectable.
+MSG
+        exit 1
+    fi
+    echo "fake-gcs-server honours ifGenerationMatch"
+}
+
+if [[ "${1:-}" == "--gcs-precondition" ]]; then
+    up
+    make_gcs_bucket
+    gcs_precondition_probe
+    exit 0
+fi
 
 if [[ "${1:-}" == "--azure-suffix" ]]; then
     up

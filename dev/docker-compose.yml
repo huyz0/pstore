@@ -36,7 +36,7 @@ services:
   # ---- GCS. Generation preconditions are our cleanest CAS story on paper;
   # OQ-153 asks whether this emulator is actually faithful to them.
   gcs:
-    image: fsouza/fake-gcs-server:1.52
+    image: fsouza/fake-gcs-server:1.55
     command: -scheme http -host 0.0.0.0 -port 4443 -public-host localhost:4443
     ports: ["4443:4443"]
     <<: *caps
