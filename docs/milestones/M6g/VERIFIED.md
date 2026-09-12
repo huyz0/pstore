@@ -44,7 +44,22 @@ the failure read. Command: `cargo test -p pstore-catalog --test split`.
 10. **A backend that cannot fence is refused** —
     `a_catalog_write_on_a_divergent_backend_is_refused`, with `split` added to that existing
     loop over every guarded door rather than as a second fixture.
-11. **Gates** — `./scripts/gates.sh` green.
+11. **Gates** — `./scripts/gates.sh` green. Mutation over this milestone's functions, in the
+    `dev` container (`scripts/mutants.sh --check 'bucket::split|enumerate_since'`): **22
+    mutants, 18 caught, 4 missed** — and **none of the four is in `pstore-catalog`**. They are
+    the engine's stale-commit test helper, one in `pstore-node`, and two in `pstore-testkit`,
+    all of which predate this milestone and survive every sweep in this session.
+    ⚠️ **The first sweep run for this milestone measured nothing and looked clean.** Its regex
+    was `split|enumerate_since|gather`, which matched three unrelated functions elsewhere in
+    the tree — the faulty store's mixer and two of the LIRE spike's — and produced **zero**
+    catalog mutants, so
+    "nothing missed" was a statement about other modules. Recorded because a sweep that
+    examines the wrong code and passes is worth exactly as much as one never run, and it is
+    indistinguishable from the real thing in its own output.
+    ⚠️ It did surface something real, now backlog item 18: `pstore-index/src/lire.rs` has 8
+    missed and 2 timeouts across its split routines. That module is explicitly a spike for
+    OQ-51 and is not wired into the dense index, so it is not the correctness core — but a
+    spike whose arithmetic nothing constrains can answer its open question wrongly.
 
 ## What is not built, and named rather than omitted
 
