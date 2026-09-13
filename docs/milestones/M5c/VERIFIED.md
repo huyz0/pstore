@@ -73,6 +73,10 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
     That is the point: what the gate demonstrates is that the corpus **discriminates**, because
     the control with IDF removed falls to 0.5441 and misses the floor. Absolute quality is
     criterion 4's job. MS MARCO is `NOT-RUN`, blocked on data rather than effort.
+    ⚠️ **Corrected by [M5i](../M5i/VERIFIED.md): it was blocked on neither.** The corpus is
+    fetchable from here and 1.06 GB. Run, absolute quality is **MRR@10 0.1775** against a
+    published BM25 reference of ≈0.18 — and merged statistics are worth **+0.0083 MRR@10**
+    over per-shard ones, which is this criterion's global-IDF effect sized on real text.
 11. **Three legs, one open, no deeper than the deepest** —
     `a_three_leg_query_is_no_deeper_than_its_deepest_leg`: 2 rounds for dense + sparse + text,
     the same as the text leg alone. `a_text_leg_is_no_longer_refused_and_still_names_what_is_missing`
