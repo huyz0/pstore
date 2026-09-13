@@ -128,6 +128,10 @@ and error rate). **Partially met for the capability half**: the suite exists, ru
 records profiles for the in-process store and for `object_store::InMemory` — but no
 emulator or real cloud has been probed, so the matrix has two rows and both are local.
 Completing it is M0b's first task, and it is one command.
+⚠️ **Stale since [M7a](../M7a/VERIFIED.md): emulators have been probed.**
+`scripts/conformance.sh` runs the ten-probe suite against MinIO, Azurite and fake-gcs-server
+and checks the matrix back in, and measuring produced two corrections nobody would have read
+their way to. What is still local-only is **real cloud**, which is M0b and blocked on accounts.
 ⚠️ The threshold half is amended by [M0c](../M0c/VERIFIED.md), which ran the latency and
 refusal axes this line called "reusable" — reusable, and until then not reused.
 
