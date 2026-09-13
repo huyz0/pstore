@@ -118,6 +118,18 @@ pub enum CasFailure {
     Contended,
 }
 
+/// How many times a CAS is rebased before giving up.
+///
+/// Bounded rather than `loop`: the exit condition is "no one else won this round", and a
+/// backend that is permanently contended would otherwise spin forever on a path a caller
+/// waits on.
+///
+/// ⚠️ **Here rather than in the crate that enforces it**, because a second crate now has to
+/// agree with it. `pstore-testkit`'s sensitivity sweep models the caller that gives up, and a
+/// matching `16` with a comment beside it would drift the first time this number moved — the
+/// sweep would then report a threshold for a budget nobody has. M0c.
+pub const MAX_CAS_ATTEMPTS: u32 = 16;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "assertions in tests may panic")]
 mod tests {

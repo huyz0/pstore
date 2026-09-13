@@ -69,6 +69,12 @@ Gate: `scripts/check-verified.py`.
    1 writer 1.00 attempts/commit, 128 writers 10.95, success falling 100% → 9.1%.
    ⚠️ **PROVISIONAL**: our protocol against an in-process store, not S3. The shape is the
    deliverable; the position of the real operating point is M0b.
+   ⚠️ **Amended by [M0c](../M0c/VERIFIED.md): the cost stands, the completion was never
+   measured.** This curve was taken with a loop that retries **forever**, while the caller it
+   models — `Appender::record` — gives up after 16 attempts. Re-run with that budget, 128
+   writers abandon **255–436 of 1,024 commits** across three runs: a quarter to two-fifths of
+   them would have failed. The 10.95 is reproducible (10.96–17.41 observed); what it never
+   said is how many commits never landed, because with no budget none could fail.
 8. `./scripts/gates.sh` — all eight green. `cargo llvm-cov --workspace --all-features`
    → **95.43%** region coverage (floor is 95%). Unsafe audit:
    `grep -rlE '^\s*unsafe_code\s*=\s*"(allow|warn)"' --include=Cargo.toml .` returns
@@ -122,6 +128,8 @@ and error rate). **Partially met for the capability half**: the suite exists, ru
 records profiles for the in-process store and for `object_store::InMemory` — but no
 emulator or real cloud has been probed, so the matrix has two rows and both are local.
 Completing it is M0b's first task, and it is one command.
+⚠️ The threshold half is amended by [M0c](../M0c/VERIFIED.md), which ran the latency and
+refusal axes this line called "reusable" — reusable, and until then not reused.
 
 ## M0a.11, closed — and what the survivors actually were
 

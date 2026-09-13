@@ -1161,6 +1161,7 @@ dependencies = [
  "futures-util",
  "pstore-blob",
  "pstore-types",
+ "thiserror",
  "tokio",
 ]
 

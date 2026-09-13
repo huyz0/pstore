@@ -13,20 +13,52 @@ use pstore_blob::MemoryStore;
 use pstore_testkit::sweep;
 use std::sync::Arc;
 
+/// A zeroed point, so a test naming three fields is not also naming the six it does not care
+/// about. M0c added the configuration a point was taken under; none of it matters here.
+fn empty_point() -> sweep::Point {
+    sweep::Point {
+        writers: 0,
+        commits_each: 0,
+        attempts: 0,
+        commits: 0,
+        lost: 0,
+        abandoned: 0,
+        latency_min: std::time::Duration::ZERO,
+        latency_max: std::time::Duration::ZERO,
+        cas_error_rate: 0.0,
+        elapsed: std::time::Duration::ZERO,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweep_reports_a_curve_not_a_point() {
     let s = Arc::new(MemoryStore::new());
-    let points = sweep::contention_sweep(Arc::clone(&s), &[1, 2, 8, 32], 4).await;
+    let points = sweep::contention_sweep(Arc::clone(&s), &[1, 2, 8, 32], 4)
+        .await
+        .unwrap();
     assert_eq!(
         points.len(),
         4,
         "a sweep is several points; one number is a guess"
     );
 
-    // Every writer must land every commit it was asked for. A protocol that livelocks
-    // would hang here rather than report a low rate, which is itself the finding.
+    // Every commit asked for is accounted: landed, or given up on after the budget.
+    //
+    // ⚠️ **This asserted `commits == writers * commits_each` until M0c**, which was a product
+    // of the inputs rather than a fact about the run — true only while nothing could abandon
+    // a commit. Since the loop stops at `MAX_CAS_ATTEMPTS`, as its caller does, a tail commit
+    // at 32 writers can legitimately be abandoned and that assertion would fail
+    // nondeterministically. The conservation law is what is actually true, and it is
+    // **stronger**: a miscount in either field breaks it, and the product could not see one.
     for p in &points {
-        assert_eq!(p.commits, (p.writers * p.commits_each) as u64);
+        assert_eq!(
+            p.commits + p.abandoned,
+            (p.writers * p.commits_each) as u64,
+            "{} landed + {} abandoned != {} asked",
+            p.commits,
+            p.abandoned,
+            p.writers * p.commits_each
+        );
         assert!(
             p.attempts >= p.commits,
             "attempts cannot be fewer than commits"
@@ -64,9 +96,13 @@ async fn sweep_reports_a_curve_not_a_point() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_writer_never_contends() {
     let s = Arc::new(MemoryStore::new());
-    let p = sweep::contention_point(s, pstore_blob::Key::new("solo"), 1, 20).await;
+    let p = sweep::contention_point(s, pstore_blob::Key::new("solo"), 1, 20)
+        .await
+        .unwrap();
     assert_eq!(p.attempts, 20);
     assert_eq!(p.attempts, p.commits, "every attempt landed");
+    // ⚠️ The uncontended case is where the give-up budget must change nothing at all.
+    assert_eq!(p.abandoned, 0, "a solo writer was given up on");
     assert!(
         (p.success_rate() - 1.0).abs() < f64::EPSILON,
         "100%, not 20 or 400"
@@ -83,17 +119,12 @@ async fn a_point_with_no_commits_is_infinite_not_a_divide_by_zero() {
         attempts: 9,
         commits: 0,
         lost: 9,
+        ..empty_point()
     };
     assert!(p.attempts_per_commit().is_infinite());
     // A ratio of exactly zero, so an epsilon comparison rather than `==` on a float.
     assert!(p.success_rate().abs() < f64::EPSILON);
-    let empty = sweep::Point {
-        writers: 0,
-        commits_each: 0,
-        attempts: 0,
-        commits: 0,
-        lost: 0,
-    };
+    let empty = empty_point();
     assert!(
         empty.success_rate().abs() < f64::EPSILON,
         "no attempts is 0%, not NaN"
@@ -105,7 +136,7 @@ async fn the_rendered_table_carries_its_own_caveat() {
     // A number that travels without its caveat becomes a fact. This one is our protocol
     // against our own store, and the table has to say so wherever it is pasted.
     let s = Arc::new(MemoryStore::new());
-    let out = sweep::render(&sweep::contention_sweep(s, &[1, 4], 2).await);
+    let out = sweep::render(&sweep::contention_sweep(s, &[1, 4], 2).await.unwrap());
     assert!(out.contains("attempts/commit"));
     assert!(
         out.contains("PROVISIONAL"),

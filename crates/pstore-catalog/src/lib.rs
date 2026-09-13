@@ -103,12 +103,12 @@ pub(crate) fn require_fencing<S: pstore_blob::BlobStore + ?Sized>(
     }
 }
 
-/// How many times a CAS is rebased before giving up.
+/// How many times a CAS is rebased before giving up. Defined in `pstore-types` since M0c,
+/// because the sensitivity sweep models this exact budget and a second copy would drift.
 ///
-/// Bounded rather than `loop`: the exit condition is "no one else won this round", and a
-/// backend that is permanently contended would otherwise spin forever on a path a caller
-/// waits on.
-const MAX_CAS_ATTEMPTS: u32 = 16;
+/// ⚠️ `pub(crate)`: moving it did not widen this crate's public surface. Every caller is
+/// internal, and `pstore-testkit` takes it from `pstore-types` directly.
+pub(crate) use pstore_types::MAX_CAS_ATTEMPTS;
 
 /// What can go wrong.
 #[derive(Debug, thiserror::Error)]

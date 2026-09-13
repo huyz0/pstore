@@ -22,7 +22,8 @@ pstore-types = { path = "../pstore-types" }
 bytes        = "1"
 tokio        = { version = "1", features = ["sync", "time", "rt", "macros"] }
 async-trait = "0.1.92"
+thiserror    = "2"
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

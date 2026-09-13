@@ -101,6 +101,10 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | 20 | **The `Split` decorator's HEAD-size forwarding is unasserted.** Replacing it with a constant survives the suite — found by M6i's sweep, and **not M6i's to fix**: the decorator routes fresh-segment reads by key prefix and nothing anywhere asks it for an object's size, so the mutant is currently inert. It stops being inert the moment a caller does. | [M6i](M6i/VERIFIED.md) | S |
 
+| 21 | ⚠️ **A failed read is indistinguishable from an absent object, everywhere.** `BlobStore::get_tag` returns `Option<CasTag>`, so the commit protocol's rebase step cannot tell "the probe failed" from "nothing is there" — and it treats the second as a reason to give up on the commit. Measured in [M0c](M0c/VERIFIED.md): with `read_error`, `write_error` and `slow_down` all at 0.9, a commit point is byte-identical to a clean one. **503 cannot be injected into a conditional write at all**, which is the most realistic error a CAS path meets at scale, so the refusal axis can only ever cover 412 and 409. Making `get_tag` fallible is a trait change touching every backend and every caller — worth doing, not worth doing quietly. | [M0c](M0c/VERIFIED.md) | M |
+
+| 22 | ⚠️ **`scripts/review.sh`'s round counter is keyed on the branch name and never resets**, so on a long-lived `main` it accumulates rounds across unrelated tasks. Observed during [M0c](M0c/VERIFIED.md): it reported "round 4 of hard budget 4" for a change whose review had not started, and computed its "delta since round 3" against a sha four commits stale — handing the reviewer an already-committed diff instead of the staged one. The next change on `main` will be **refused at round 5** for rounds spent on other work. ⚠️ The budget itself is right and is why the loop terminates; what is wrong is what it counts. Key it on the staged tree, or reset it when HEAD moves. | [M0c](M0c/VERIFIED.md) | S |
+
 ## Blocked, and by what
 
 ⚠️ **Named rather than omitted, and none of these is blocked on effort.**
