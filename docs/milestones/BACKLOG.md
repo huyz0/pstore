@@ -99,6 +99,8 @@ sweep I reported as having "measured nothing" had tested 14 catalog mutants and 
 all. `cargo mutants` prints only the **missed** mutants by file, so an empty grep is the good
 outcome — confirming coverage needs `--list` with the same filter.
 
+| 20 | **The `Split` decorator's HEAD-size forwarding is unasserted.** Replacing it with a constant survives the suite — found by M6i's sweep, and **not M6i's to fix**: the decorator routes fresh-segment reads by key prefix and nothing anywhere asks it for an object's size, so the mutant is currently inert. It stops being inert the moment a caller does. | [M6i](M6i/VERIFIED.md) | S |
+
 ## Blocked, and by what
 
 ⚠️ **Named rather than omitted, and none of these is blocked on effort.**

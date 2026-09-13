@@ -2,10 +2,10 @@
 
 One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-verified.py`.
 
-⚠️ **Criteria 1–8 are measurements, so their evidence is a number and the command that
-produced it** — `./scripts/scale.sh`, one run, quoted rather than paraphrased. The two tests
-this milestone adds are in `cargo test -p pstore-engine --test open_cost`, and each "observed
-red" below is a mutation applied to the shipped code, the test run, and the failure read.
+⚠️ **Criteria 1–8 are measurements**, so their evidence is a number and the command that
+produced it — `./scripts/scale.sh`, one run, quoted rather than paraphrased. The two tests are
+in `cargo test -p pstore-engine --test open_cost`, and each "observed red" below is a mutation
+applied to the shipped code, the test run, and the failure read.
 
 1. **1M tenants exist and are enumerated** — `./scripts/scale.sh`: 1,000,000 tenants ×
    50 index names at the default width, seeded in 65.8s, folded across 16,384 buckets in
@@ -71,11 +71,19 @@ red" below is a mutation applied to the shipped code, the test run, and the fail
   currently *flat* — and that trade needs its own spec and its own measurement. What changes
   today is that a later layout argues with a number instead of rediscovering one.
 - ⚠️ **This does not answer OQ-72**, and the spec was amended to stop implying it did. OQ-72
-  asks for a **power-law** generator of index sizes and query rates; this workload is uniform,
-  N tenants × exactly 50 names. It answers the roadmap's exit criterion, which is a different
-  question that happened to be filed near it.
+  wants a **power-law** generator of index sizes and query rates; this workload is uniform,
+  N tenants × exactly 50 names. It answers the roadmap's exit criterion, filed near it.
 - **No real object storage.** A `MemoryStore` gives exact request counts and exact bytes, which
   is what the criterion is about. Latency under throttling at 1M tenants is M0b's, and blocked.
+- ⚠️ **Mutation, and what it did and did not cover.** In the dev container,
+  `scripts/mutants.sh --check 'head'` selected 70 mutants: **57 caught, 8 missed, 5 unviable**
+  — 87.7% of viable, above the 80% floor. ⚠️ **Confirmed with `--list` under the same filter**
+  rather than inferred from an empty grep: the sweep prints only what it missed, and this
+  project has published a false finding from exactly that mistake. Every `head.rs` mutant was
+  selected and every one caught, including replacing the manifest's encoding with an empty
+  vector and its whole-object read with a default. ⚠️ **One miss is shipped code and is not
+  this milestone's** — the `Split` decorator's HEAD-size forwarding survives being replaced by
+  a constant — and is a backlog row rather than something chased here.
 - ⚠️ **Not a gate**, and not in `gates.sh`. The catalog arm peaks at 9.28 GB and the pair takes
   about 90 seconds; a CI runner that must hold 9 GB is a different problem from measuring this
   once. The two tests it produced *are* in `cargo test`, at a fixture size that costs nothing.
