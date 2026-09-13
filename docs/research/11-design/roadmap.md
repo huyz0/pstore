@@ -251,6 +251,16 @@ parser, language analyzers, phrase queries, positions and trigram regex.
 
 **Exit:** 1M indexes, open latency unaffected by index count, zero LISTs on any hot path.
 
+| Exit criterion | Status |
+|---|---|
+| 1M indexes | **met** — 1,000,000 tenants × 50 index names seeded, folded and enumerated ([M6i](../../milestones/M6i/VERIFIED.md)) |
+| Zero LISTs on any hot path | **met** — the request-class counter reads 0 after seeding, folding, the census, and every open |
+| Open latency unaffected by index count | ⚠️ **met across tenants, NOT met within one tenant.** Round trips are flat everywhere — 3 reads at 1 index and at 5,000, at 1 tenant and at 1,000,000. **Bytes are not**: HEAD is one object read whole, so a tenant pays ~**106 bytes per index it owns** on every open of every *other* index, and at 5,000 indexes 98.6% of an open is manifest. Measured, pinned by a test, and deliberately not fixed here ([M6i](../../milestones/M6i/VERIFIED.md)) |
+| Enumeration cost independent of tenants | **met** — 32,769 reads at 200,000 tenants and at 1,000,000, both exactly `2 × width + 1` |
+
+⚠️ **So M6's exit is not fully met**, and the unmet half is a byte cost with a number rather
+than an unknown. `provisional`: WSL2, a `MemoryStore`, one run.
+
 > ⚠️ **Split into M6a and M6b**, on the same grounds M5 was: the three bullets share a subject
 > and nothing else. Metering is a `pstore-blob` decorator with no catalog in it; the workload
 > needs the catalog to exist before it can measure anything.
@@ -273,12 +283,21 @@ tenant-lifecycle event, which `Appender::observe` is what enforces — and save 
 window` probes per bucket on every enumeration, 524,288 requests at `DEFAULT_WIDTH` against
 16,384.
 
-⚠️ **Not measured at 1M.** The invariant is measured at 2,000 tenants; 1M is arithmetic on it.
+⚠️ ~~**Not measured at 1M.** The invariant is measured at 2,000 tenants; 1M is arithmetic on
+it.~~ **Measured since [M6i](../../milestones/M6i/VERIFIED.md)**: 32,769 reads at 1,000,000
+tenants, the same as at 200,000.
 OQ-8 (`num_buckets` and the split threshold) stays open, and bucket splitting is unbuilt.
 
 #### M6b — Quotas and metering
 Not started. Design rule 13, built on the per-tenant counters `pstore-blob`'s `Accounted`
 already keeps, plus the billing rollup over catalog buckets that M6a makes possible.
+
+#### M6i — One million indexes, measured
+→ [`docs/milestones/M6i/SPEC.md`](../../milestones/M6i/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M6i/VERIFIED.md)
+
+**Done, and it scores the exit table above rather than claiming it.** `scripts/scale.sh` — not
+a gate, because the catalog arm peaks at 9.28 GB.
 
 ### M7 — Production hardening (ongoing)
 

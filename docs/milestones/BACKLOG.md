@@ -76,10 +76,14 @@ every segment forever, not the cost of waiting.
 
 ## Where this stands
 
-⚠️ **Nothing carried forward is open, and nothing the work opened is open either.** Every row
-above and every row those rows created is closed — by building it, or by measuring it and
-deciding not to. What remains is the **Blocked** table below, and not one of its entries is
-blocked on effort.
+⚠️ **Nothing carried forward is open.** Every row above and every row those rows created is
+closed — by building it, or by measuring it and deciding not to. What remains is the
+**Blocked** table below, of which no entry is blocked on effort, and **one row that a
+measurement opened**:
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 19 | ⚠️ **An open pays ~106 bytes of HEAD per index its tenant owns.** `Head.indexes` is one object read whole, so every index a tenant has is bytes on every open of every *other* index: 7,903 bytes at 1 index, 537,797 at 5,000, where **98.6%** of the open is manifest. Round trips are flat — 3 at every size — so this is a byte cost, not a depth cost, and it is the half of M6's exit criterion that is **not met**. ⚠️ **Not obviously worth fixing**: sharding HEAD per index trades bytes for round trips, and depth is the budget that is currently flat and precious. Needs a spec that argues the trade with the ~50-index shape a real tenant has, not the 5,000 that makes the number dramatic. `an_open_reads_the_whole_head_including_the_indexes_it_is_not_opening` pins the **relationship** — that open bytes grow exactly with HEAD bytes, per index rather than by a constant — and deliberately not the number: a layout that cut 106 bytes to 40 passes it silently. The number lives in the ledger, and a layout change has to face it there. | [M6i](M6i/VERIFIED.md) | M |
 
 ⚠️ **Four rows were closed by measuring instead of building**, which is the part worth keeping:
 
