@@ -285,12 +285,19 @@ window` probes per bucket on every enumeration, 524,288 requests at `DEFAULT_WID
 
 ⚠️ ~~**Not measured at 1M.** The invariant is measured at 2,000 tenants; 1M is arithmetic on
 it.~~ **Measured since [M6i](../../milestones/M6i/VERIFIED.md)**: 32,769 reads at 1,000,000
-tenants, the same as at 200,000.
-OQ-8 (`num_buckets` and the split threshold) stays open, and bucket splitting is unbuilt.
+tenants, the same as at 200,000. ⚠️ And ~~bucket splitting is unbuilt~~ — **it is built**:
+[M6g](../../milestones/M6g/VERIFIED.md) splits a bucket and
+[M6h](../../milestones/M6h/VERIFIED.md) re-partitions a catalog that has drifted, both of them
+after this line was written. OQ-8's remaining half is the **threshold** — what should trigger a
+split — not whether one can happen.
 
 #### M6b — Quotas and metering
-Not started. Design rule 13, built on the per-tenant counters `pstore-blob`'s `Accounted`
-already keeps, plus the billing rollup over catalog buckets that M6a makes possible.
+→ [`docs/milestones/M6b/SPEC.md`](../../milestones/M6b/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M6b/VERIFIED.md)
+
+~~Not started.~~ **Done.** Design rule 13, built on the per-tenant counters `pstore-blob`'s
+`Accounted` already keeps: a quota that **refuses** rather than merely counts, and that is
+transparent when unlimited.
 
 #### M6i — One million indexes, measured
 → [`docs/milestones/M6i/SPEC.md`](../../milestones/M6i/SPEC.md) ·
