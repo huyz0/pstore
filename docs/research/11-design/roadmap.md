@@ -211,7 +211,7 @@ query path and a real multi-AZ deployment.
 | `prefetch[]` + `fusion` exercised (D-73) | **met** — three legs, one open, depth is the max not the sum ([M5b](../../milestones/M5b/VERIFIED.md), [M5c](../../milestones/M5c/VERIFIED.md)) |
 | BM25 with two-pass IDF (D-30) | **met** — agrees with an independent implementation to 1e-4; global IDF changes the top-1 ([M5c](../../milestones/M5c/VERIFIED.md)) |
 | Ranking quality as a CI gate (D-31) | **met** — `scripts/ndcg.sh`, which also scores a control ranker and fails if that clears the floor |
-| MS MARCO evaluation | ⚠️ **NOT-RUN** — no network and no dataset here. Blocked on data, exactly as M3's 100M-vector scale is |
+| MS MARCO evaluation | **met** — MRR@10 **0.1775**, NDCG@10 **0.2241** over 6,980 dev-small queries against 8,841,823 passages in 23 shards, versus the published BM25 reference of ≈0.18 ([M5i](../../milestones/M5i/VERIFIED.md)). ⚠️ `provisional`: WSL2, one run. ⚠️ This row read "no network and no dataset here" and **both halves were false when re-tested** — one range request to the official corpus settled it |
 
 ⚠️ **Not built, and named rather than omitted:** block-max pruning (OQ-45), which
 `modalities-and-sequencing.md` §6 lists as a **prerequisite** for deferring FTS safely —
