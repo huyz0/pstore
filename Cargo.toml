@@ -41,7 +41,7 @@ members = [
 edition      = "2024"
 rust-version = "1.90"
 license      = "Apache-2.0"
-repository   = "https://github.com/tuonghuy/pstore"
+repository   = "https://github.com/huyz0/pstore"
 
 # ---------------------------------------------------------------------------
 # Compiler-enforced invariants (D-109). Every crate opts in with:
