@@ -111,6 +111,21 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
+    Ok(run(store, targets, prefetch, fusion, top_k).await?.0)
+}
+
+/// The ranking **and the segments it was computed over**, still open.
+///
+/// ⚠️ Separated from [`query`] for one reason: an id lives in a block of a segment this
+/// function has already opened, and a caller that re-opens it pays a round trip per segment
+/// for something already in hand.
+async fn run<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<(Vec<Hit>, Vec<Opened>), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
     // be written.
@@ -189,7 +204,78 @@ pub async fn query<S: BlobStore>(
                 .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
         });
     }
-    Ok(fuse(&legs, fusion, top_k))
+    Ok((fuse(&legs, fusion, top_k), opened))
+}
+
+/// The ranking, **and the id of every hit**, in one more round than the ranking alone.
+///
+/// ⚠️ **Why this is here and not in the caller.** Resolving a hit needs the block that holds
+/// its row, and only this function still has the opened segments: a caller doing it would
+/// re-open each one — `Segment::open` then `ids_at`, two data-dependent rounds **per
+/// segment**, serially. Measured that way at eight segments: **19 sequential round trips**
+/// for one query, against a budget of three. Here it is a single fan-out round whatever the
+/// segment count, because the opens already happened and no block's address depends on
+/// another's contents.
+///
+/// ⚠️ **It is still a fourth round, and D-34 allows three.** The ranking is three; carrying
+/// the ids costs one more, because a payload's address cannot be known before the ranking
+/// exists. The way to three is a format change — ids fetched alongside the vectors the leg
+/// already reads — and that is a decision about what a segment stores, recorded in the
+/// backlog rather than made here.
+///
+/// # Errors
+/// As [`query`], plus a block that cannot be read or decoded.
+pub async fn query_ids<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<Vec<(Hit, Option<String>)>, QueryError> {
+    let (hits, opened) = run(store, targets, prefetch, fusion, top_k).await?;
+    resolve_ids(store, targets, &opened, &hits).await
+}
+
+/// The ids for `hits`, one fan-out round over the segments that carry them.
+async fn resolve_ids<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    opened: &[Opened],
+    hits: &[Hit],
+) -> Result<Vec<(Hit, Option<String>)>, QueryError> {
+    let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for h in hits {
+        rows_per_segment.entry(h.segment).or_default().push(h.row);
+    }
+    // ⚠️ One round: every segment's blocks are fetched together. Serially this is where the
+    // depth went from 3 to 3 + 2N.
+    let resolved = futures_util::future::try_join_all(rows_per_segment.iter().map(
+        |(segment, rows)| async move {
+            // ⚠️ The segment is **already open** — `run` opened every one of them in its
+            // first round. Re-opening here is what made depth `3 + 2N`.
+            let (Some(t), Some(o)) = (targets.get(*segment), opened.get(*segment)) else {
+                return Ok::<_, QueryError>((*segment, Vec::new()));
+            };
+            let ids = o.segment.ids_at(store, &t.segment, rows).await?;
+            Ok((*segment, rows.iter().copied().zip(ids).collect::<Vec<_>>()))
+        },
+    ))
+    .await?;
+
+    let mut by_hit: std::collections::BTreeMap<(usize, usize), String> =
+        std::collections::BTreeMap::new();
+    for (segment, pairs) in resolved {
+        for (row, id) in pairs {
+            if let Some(id) = id {
+                by_hit.insert((segment, row), id);
+            }
+        }
+    }
+    Ok(hits
+        .iter()
+        .map(|h| (*h, by_hit.get(&(h.segment, h.row)).cloned()))
+        .collect())
 }
 
 /// A leg this build can actually run.
@@ -352,11 +438,29 @@ async fn leg<S: BlobStore>(
             limit,
             tune,
         } => {
+            // ⚠️ **The dimension comes from the SEGMENT, never from the query.** Passing
+            // `query.len()` here let the index take its idea of the dimension from the
+            // caller, so a two-dimensional query over a four-dimensional segment came back
+            // with scored, ranked, plausible rows and a `200`. The exact path has always
+            // refused it (`Segment::search` compares against the row it read); the
+            // approximate one did not, and the two disagreeing is worse than either.
+            // Found through the API in M7c.
+            let dim = opened
+                .segment
+                .field_layout(field)
+                .map_or(query.len(), |f| f.dims as usize);
             let idx = VecIndex::from_parts(
                 opened.segment.clone(),
                 opened.centroids.as_ref().map(AsRef::as_ref),
-                query.len(),
+                dim,
             );
+            if dim != query.len() {
+                return Err(pstore_format::FormatError::DimensionMismatch {
+                    expected: dim,
+                    got: query.len(),
+                }
+                .into());
+            }
             let hits = idx
                 .search_field(
                     store,

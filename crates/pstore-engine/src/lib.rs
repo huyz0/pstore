@@ -78,6 +78,20 @@ pub enum EngineError {
         /// What was observed of it.
         observed: String,
     },
+    /// The query vector's dimension is not the indexed field's.
+    ///
+    /// ⚠️ **Typed, and the only query failure that is**, because it is the one a *client*
+    /// causes and can fix. Everything else `pstore_query` reports is a corrupt object or an
+    /// unimplemented retriever, which is ours. Added in M7c: the server had no way to answer
+    /// a wrong-sized vector with anything but `500 internal`, which tells a caller its
+    /// request was unsound when in fact it was merely wrong in a nameable way.
+    #[error("the query vector has {got} dimensions and the field has {expected}")]
+    DimensionMismatch {
+        /// What the segment's field layout records.
+        expected: usize,
+        /// What the query carried.
+        got: usize,
+    },
     /// A lane's tail could not be found within the probe bound.
     ///
     /// Not "the lane is too long" in practice — it means the store kept answering, which
@@ -283,6 +297,36 @@ pub struct Answer {
     /// ⚠️ When nothing is unfolded no fresh segment is built at all, so no hit carries this
     /// and [`Self::unfolded`] is empty. An empty segment would occupy an ordinal for nothing.
     pub unfolded_at: usize,
+    /// The id of every hit, in `hits` order. `None` only if the row vanished under us.
+    ///
+    /// ⚠️ **Carried, because resolving it later costs round trips that the budget does not
+    /// have.** A caller re-opening each segment to look a row up pays two data-dependent
+    /// rounds per segment — measured at **19 sequential round trips** for an eight-segment
+    /// index, against D-34's three. Resolved inside the query, it is one fan-out round
+    /// however many segments there are.
+    pub ids: Vec<Option<String>>,
+    /// The segments HEAD named for this index **when the answer was computed**, in the order
+    /// every `Hit::segment` below [`Self::unfolded_at`] indexes.
+    ///
+    /// ⚠️ **Carried rather than re-read, and that is a request-count property, not a
+    /// convenience.** Resolving hits against a second read of HEAD would cost a round trip
+    /// *and* race a fold: between the two reads the segment list can be renumbered, so hit
+    /// 3 would name a different document — plausibly, and with nothing to notice it. It is
+    /// also what lets a caller tell "this index does not exist" from "it matched nothing",
+    /// without asking again.
+    pub segments: Vec<SegmentRef>,
+}
+
+/// What HEAD knows about one index, without reading a single segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Segments the index is made of.
+    pub segments: u64,
+    /// Rows across those segments. ⚠️ **Folded rows only** — the freshness layer is a
+    /// property of one process and is reported separately, by `pending_indexes`.
+    pub documents: u64,
+    /// The epoch HEAD was at when this was read.
+    pub epoch: Epoch,
 }
 
 /// One writer's view of one tenant.
@@ -553,9 +597,103 @@ impl<S: BlobStore> Engine<S> {
             pstore_format::check_storable(d).map_err(|e| EngineError::Format(e.to_string()))?;
         }
         let mut m = self.mem();
+        // ⚠️ **One index, one width**, checked against the rows this process already holds
+        // for it — buffered or flushed-but-unfolded. Costs no request, because the answer is
+        // in memory or it is not knowable for free at all.
+        //
+        // ⚠️ Found through the API: a four-dimensional document and a two-dimensional one,
+        // written in **separate batches**, were both accepted, and the short one then
+        // outranked an exact match. A per-batch check is the case that never mattered.
+        //
+        // ⚠️ What this cannot see is a process that has just started, or an index whose rows
+        // have all been folded: the width then lives in the segment, and reading it would put
+        // a blob request on the write path. That case is **loud at query time** instead — the
+        // dense leg takes its dimension from the segment's field layout and refuses a query
+        // that does not match. Silent wrongness is what had to go; a refusal one step later
+        // is a cost.
+        let known = m
+            .pending
+            .get(index)
+            .and_then(|rows| rows.first())
+            .or_else(|| m.durable.get(index).and_then(|rows| rows.first()))
+            .map(|d| d.vector().len());
+        if let Some(expected) = known
+            && let Some(odd) = docs.iter().find(|d| d.vector().len() != expected)
+        {
+            return Err(EngineError::DimensionMismatch {
+                expected,
+                got: odd.vector().len(),
+            });
+        }
         m.generation += 1;
         m.pending.entry(index.to_owned()).or_default().extend(docs);
         Ok(())
+    }
+
+    /// The indexes this process holds unfolded rows for, in name order.
+    ///
+    /// ⚠️ **Not the same question as [`Self::indexes`], and a caller needs both.** HEAD names
+    /// what is folded; this names what is written and queryable through the freshness layer
+    /// but not yet in any segment. An index exists if either says so — deciding on HEAD alone
+    /// would report a `404` for a document the very next query returns.
+    ///
+    /// It is a property of **this process**: another writer's memtable is invisible here, and
+    /// that is the honest answer rather than a limitation, because nothing durable records it.
+    pub async fn pending_indexes(&self) -> Vec<String> {
+        let m = self.mem();
+        let mut names: Vec<String> = m.pending.keys().chain(m.durable.keys()).cloned().collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Every index HEAD names for this tenant, in name order. **One read, no LIST.**
+    ///
+    /// # Errors
+    /// If HEAD cannot be read. An absent HEAD is an empty list, not an error: a tenant that
+    /// has never committed owns no indexes, which is a fact rather than a failure.
+    pub async fn indexes(&self) -> Result<Vec<String>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        Ok(at.head.indexes.into_keys().collect())
+    }
+
+    /// Segment count, document count and epoch for one index, or `None` if HEAD does not
+    /// name it. **One read**, and never a walk of the segments: `SegmentRef` already carries
+    /// its row count, so counting documents costs nothing beyond the manifest.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn index_stats(&self, index: &str) -> Result<Option<IndexStats>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        Ok(at.head.indexes.get(index).map(|refs| IndexStats {
+            segments: refs.len() as u64,
+            documents: refs.iter().map(|r| u64::from(r.rows)).sum(),
+            epoch: at.head.epoch,
+        }))
+    }
+
+    /// Turns an [`Answer`]'s hits into `(id, score)` pairs. **Issues no requests.**
+    ///
+    /// ⚠️ The ids were resolved inside the query, in the round that had the segments open.
+    /// This was a method that re-opened every segment and read a block from each, serially —
+    /// two data-dependent rounds per segment on top of the query's three, which at eight
+    /// segments is 19. Code review measured it; the fix is that the work moved rather than
+    /// that it got faster.
+    #[must_use]
+    pub fn resolve(&self, answer: &Answer) -> Vec<(String, f32)> {
+        answer
+            .hits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let id = if h.segment == answer.unfolded_at {
+                    answer.unfolded.get(h.row).map(|d| d.id.clone())
+                } else {
+                    answer.ids.get(i).cloned().flatten()
+                };
+                id.map(|id| (id, h.score))
+            })
+            .collect()
     }
 
     /// The ids currently buffered and not yet acknowledged.
@@ -1209,12 +1347,9 @@ impl<S: BlobStore> Engine<S> {
         let at = head::read(&*self.store, self.tenant).await?;
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
-        let mut targets: Vec<pstore_query::Target> = at
-            .head
-            .indexes
-            .get(index)
-            .into_iter()
-            .flatten()
+        let refs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
+        let mut targets: Vec<pstore_query::Target> = refs
+            .iter()
             .map(|r| {
                 let segment = Key::new(r.key.clone());
                 pstore_query::Target {
@@ -1238,8 +1373,10 @@ impl<S: BlobStore> Engine<S> {
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
+                ids: Vec::new(),
                 unfolded,
                 unfolded_at,
+                segments: refs,
             });
         }
 
@@ -1250,13 +1387,21 @@ impl<S: BlobStore> Engine<S> {
             durable: Arc::clone(&self.store),
             fresh: fresh_store,
         };
-        let hits = pstore_query::query(&store, &targets, prefetch, fusion, top_k)
+        let resolved = pstore_query::query_ids(&store, &targets, prefetch, fusion, top_k)
             .await
-            .map_err(|e| EngineError::Query(e.to_string()))?;
+            .map_err(|e| match e {
+                pstore_query::QueryError::Format(
+                    pstore_format::FormatError::DimensionMismatch { expected, got },
+                ) => EngineError::DimensionMismatch { expected, got },
+                other => EngineError::Query(other.to_string()),
+            })?;
+        let (hits, ids) = resolved.into_iter().unzip();
         Ok(Answer {
             hits,
+            ids,
             unfolded,
             unfolded_at,
+            segments: refs,
         })
     }
 

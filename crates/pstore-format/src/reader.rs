@@ -712,6 +712,70 @@ impl Segment {
         Ok(out)
     }
 
+    /// The ids of specific rows, reading **only the blocks that hold them**.
+    ///
+    /// ⚠️ **This exists so that resolving a search hit does not read a segment.** A query
+    /// answers with `(segment, row)` pairs, and the only other way to turn a row ordinal into
+    /// an id is `scan`, which fetches every block the filter does not prune plus every
+    /// vector — a read that scales with **documents**, which is one of `AGENTS.md`'s Nevers.
+    /// Here the block holding a row is arithmetic on metadata already in hand, the blocks are
+    /// fetched in one coalesced round however many there are, and no vector section is
+    /// touched at all: an id lives in the block payload.
+    ///
+    /// Returns one entry per requested row, in request order. A row the segment does not
+    /// have is `None` — never another row's id, which would be a wrong search result with
+    /// nothing to notice it.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn ids_at<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        rows: &[usize],
+    ) -> Result<Vec<Option<String>>, FormatError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The absolute row each block starts at. Blocks are contiguous and in order.
+        let mut base = Vec::with_capacity(self.blocks.len());
+        let mut running = 0usize;
+        for b in &self.blocks {
+            base.push(running);
+            running += b.rows as usize;
+        }
+        let block_of = |row: usize| -> Option<usize> {
+            self.blocks.iter().enumerate().position(|(i, b)| {
+                let start = base.get(i).copied().unwrap_or(0);
+                row >= start && row < start + b.rows as usize
+            })
+        };
+
+        let mut wanted: Vec<usize> = rows.iter().filter_map(|r| block_of(*r)).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Ok(rows.iter().map(|_| None).collect());
+        }
+        let ranges: Vec<std::ops::Range<u64>> = wanted
+            .iter()
+            .filter_map(|i| self.blocks.get(*i))
+            .map(|b| b.offset..b.offset + u64::from(b.len))
+            .collect();
+        let bufs = store.get_ranges(key, &ranges).await?;
+
+        // Row -> id, for the rows the fetched blocks happen to carry.
+        let mut found: BTreeMap<usize, String> = BTreeMap::new();
+        for (n, block) in wanted.iter().enumerate() {
+            let Some(buf) = bufs.get(n) else { continue };
+            let start = base.get(*block).copied().unwrap_or(0);
+            for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
+                found.insert(start + r, doc.id);
+            }
+        }
+        Ok(rows.iter().map(|r| found.get(r).cloned()).collect())
+    }
+
     /// Exact k-nearest-neighbour search by squared L2, over the rows a filter selects.
     ///
     /// Brute force, deliberately (D-10): below a few hundred thousand vectors it is
