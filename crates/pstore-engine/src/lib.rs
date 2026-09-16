@@ -1340,3 +1340,51 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
     names.sort_unstable();
     names.first().map(|s| (*s).to_owned())
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod split_tests {
+    use super::*;
+    use pstore_blob::MemoryStore;
+
+    /// ⚠️ **Backlog row 20.** Every other method of `Split` is routed by a caller that would
+    /// notice the wrong arm; `head` has no caller at all, so replacing its body with a
+    /// constant survived M6i's sweep. The mutant is *inert* until something asks the
+    /// decorator for a size — this is that something, as a test, and the two objects have
+    /// **different lengths** so a constant and a forwarded-to-`durable` mutant both fail.
+    #[tokio::test]
+    async fn the_split_store_routes_head_by_key_prefix() {
+        let durable = Arc::new(MemoryStore::new());
+        let fresh = Arc::new(MemoryStore::new());
+        let d_key = Key::new("0007/seg/0".to_owned());
+        let f_key = Key::new("mem/seg/0".to_owned());
+        durable
+            .put(&d_key, bytes::Bytes::from_static(b"durable-object"))
+            .await
+            .unwrap();
+        fresh
+            .put(&f_key, bytes::Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+
+        let split = Split {
+            durable: Arc::clone(&durable),
+            fresh: Some(Arc::clone(&fresh)),
+        };
+        assert_eq!(split.head(&d_key).await.unwrap(), 14);
+        assert_eq!(split.head(&f_key).await.unwrap(), 5);
+
+        // ⚠️ And with no fresh store the `mem/` key goes to the durable one, which is the
+        // `_` arm of the routing macro: absent there, so it must be an error rather than a
+        // silent zero.
+        let only_durable = Split::<MemoryStore> {
+            durable: Arc::clone(&durable),
+            fresh: None,
+        };
+        assert!(only_durable.head(&f_key).await.is_err());
+    }
+}
