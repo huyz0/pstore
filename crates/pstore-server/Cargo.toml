@@ -1,0 +1,34 @@
+[package]
+name        = "pstore-server"
+version     = "0.1.0"
+description = "The HTTP surface: the index is the noun, every response is honest about what it cost and how fresh it is."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pstore-blob   = { path = "../pstore-blob" }
+pstore-engine = { path = "../pstore-engine" }
+pstore-format = { path = "../pstore-format" }
+pstore-index  = { path = "../pstore-index" }
+pstore-query  = { path = "../pstore-query" }
+pstore-types  = { path = "../pstore-types" }
+# ⚠️ `axum` lives here and nowhere else, by the same argument that confines `object_store`
+# to `pstore-blob`: a transport in a library crate is a transport every crate above it
+# inherits, and the engine must stay callable without one.
+axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+thiserror     = "2"
+tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+
+[dev-dependencies]
+pstore-testkit = { path = "../pstore-testkit" }
+tower         = { version = "0.5", features = ["util"] }
+tokio         = { version = "1", features = ["io-util"] }
+http-body-util = "0.1"
+bytes         = "1"

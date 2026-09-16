@@ -23,6 +23,7 @@ members = [
     # Layer 4 - serving
     "crates/pstore-query",
     "crates/pstore-node",
+    "crates/pstore-server",
     # Layer 1 - substrate
     # "crates/pstore-blob",      # nothing above may touch object_store directly
     # "crates/pstore-kernel",    # the ONLY crate permitted unsafe
@@ -30,8 +31,6 @@ members = [
     # "crates/pstore-format",
     # "crates/pstore-engine",    # correctness core; Invariant I1 proven here
     # Layer 3 - retrieval
-    # Layer 4 - serving
-    # "crates/pstore-server",
     # Test infrastructure - never shipped
     # "crates/pstore-testkit",
     # "crates/pstore-fake-s3",   # standalone: no pstore dependencies
