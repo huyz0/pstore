@@ -339,6 +339,22 @@ for a measured matrix: [C-13](../09-rust-stack/dev-and-test-environment.md) — 
 [C-14](../02-object-storage/request-efficiency-patterns.md) — **Azure has no suffix range at
 all**, so Pattern 6's cold open is 3 round trips there, not 2.
 
+#### M7c — the first door
+→ [`docs/milestones/M7c/SPEC.md`](../../milestones/M7c/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7c/VERIFIED.md)
+
+**Done.** `pstore-server`: the index is the noun, a write is batched or durable and never
+downgraded, every response reports what it cost and how fresh it is, and a tenant is a required
+header that is never defaulted. ⚠️ **The criterion that matters is the second instance**: a
+durable write, folded, read back by a *different* server over the same store with an empty
+memtable — every other criterion is satisfiable by a process holding everything in RAM.
+
+⚠️ **Deliberately not**: authentication, quotas, a scheduler, and the schema — M7c makes the
+caller exist, **M7d** asks it the policy questions [M6c](../../milestones/M6c/VERIFIED.md)
+could not. ⚠️ And it found what only a caller finds: a **wrong-dimension query returned
+scored, ranked results with a `200`**, because the dense leg took the index's dimension from
+the query rather than from the segment.
+
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
 - Observability, SLOs, chaos testing, Jepsen-style verification.
