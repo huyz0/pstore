@@ -54,16 +54,30 @@ fn an_empty_head_round_trips() {
 }
 
 #[test]
-fn a_truncated_head_is_refused_at_every_length() {
+fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     // A partially-decoded HEAD would be a partially-visible index: some segments present,
     // others silently absent, reported as success.
+    //
+    // ⚠️ **Two cuts now decode, and they are named rather than tolerated.** M7d added the
+    // schema and reject sections as OPTIONAL trailing ones, because every HEAD written before
+    // it ends at the graveyard and reading that as corrupt would make every existing store
+    // unreadable. The price is that a HEAD truncated *exactly* at one of those two boundaries
+    // is indistinguishable from an older, complete one. Asserting the count is what keeps this
+    // a stated trade: a third decodable cut means a section stopped being checked.
     let bytes = populated().encode();
-    for cut in 0..bytes.len() {
-        assert!(
-            Head::decode(&bytes[..cut]).is_err(),
-            "decoded a HEAD cut to {cut} bytes"
-        );
-    }
+    let decodable: Vec<usize> = (0..bytes.len())
+        .filter(|cut| Head::decode(&bytes[..*cut]).is_ok())
+        .collect();
+    let no_schemas = encode_without_schemas(&populated()).len();
+    assert_eq!(
+        decodable,
+        vec![no_schemas, no_schemas + 4],
+        "the only decodable truncations must be the two optional-section boundaries"
+    );
+    // And what they decode to is the older HEAD, not a partial one.
+    let at_boundary = Head::decode(&bytes[..no_schemas]).unwrap();
+    assert_eq!(at_boundary.indexes, populated().indexes);
+    assert!(at_boundary.schemas.is_empty());
     assert!(Head::decode(&bytes).is_ok());
 }
 
@@ -103,4 +117,86 @@ fn the_head_key_is_derived_from_the_tenant_alone() {
     assert_ne!(Head::key(TenantId(7)), Head::key(TenantId(8)));
     // Deterministic, so two processes derive the same key without agreeing on anything.
     assert_eq!(Head::key(TenantId(7)), Head::key(TenantId(7)));
+}
+
+/// ⚠️ **M7d.1, and the criterion that breaks a deployment rather than a test.** Every HEAD in
+/// every existing store was written before the schema section existed, so the decoder must
+/// read the end of the buffer at that boundary as "no schemas recorded" — never as a decode
+/// error, and never as a schema of zero, which would refuse every later fold.
+///
+/// Asserted against **bytes built without the section**, not against a round trip through the
+/// new encoder, which would pass however the boundary is handled.
+#[test]
+fn a_head_without_a_schema_section_decodes_as_no_schemas() {
+    let old = encode_without_schemas(&populated());
+    let decoded = Head::decode(&old).expect("a HEAD from the old encoder must still decode");
+    let expected = populated();
+    assert_eq!(decoded.epoch, expected.epoch);
+    assert_eq!(decoded.indexes, expected.indexes);
+    assert_eq!(decoded.watermarks, expected.watermarks);
+    assert!(
+        decoded.schemas.is_empty(),
+        "an absent section is no schemas, not a schema of zero: {:?}",
+        decoded.schemas
+    );
+    assert!(decoded.schema_rejects.is_empty());
+}
+
+#[test]
+fn a_schema_round_trips_with_its_reject_count() {
+    let mut h = populated();
+    h.schemas.insert(
+        "alpha".to_owned(),
+        pstore_engine::IndexSchema {
+            dims: 384,
+            text_field: "body".to_owned(),
+        },
+    );
+    h.schemas.insert(
+        "beta".to_owned(),
+        pstore_engine::IndexSchema {
+            dims: 4,
+            text_field: String::new(),
+        },
+    );
+    h.schema_rejects.insert("alpha".to_owned(), 17);
+    let back = Head::decode(&h.encode()).unwrap();
+    assert_eq!(back, h);
+    // ⚠️ And the section really is trailing: an old decoder reads everything before it, which
+    // is what makes this a compatible addition rather than a format break.
+    assert!(h.encode().starts_with(&encode_without_schemas(&h)));
+}
+
+/// HEAD as the encoder wrote it before M7d: everything up to and including the graveyard.
+fn encode_without_schemas(h: &Head) -> Vec<u8> {
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&h.epoch.0.to_le_bytes());
+    out.extend_from_slice(&h.nonce.to_le_bytes());
+    out.extend_from_slice(&(h.indexes.len() as u32).to_le_bytes());
+    for (name, segs) in &h.indexes {
+        put_str(&mut out, name);
+        out.extend_from_slice(&(segs.len() as u32).to_le_bytes());
+        for s in segs {
+            put_str(&mut out, &s.key);
+            out.extend_from_slice(&s.rows.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(h.watermarks.len() as u32).to_le_bytes());
+    for (lane, seq) in &h.watermarks {
+        out.extend_from_slice(&lane.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+    }
+    out.extend_from_slice(&(h.graveyard.len() as u32).to_le_bytes());
+    for (epoch, keys) in &h.graveyard {
+        out.extend_from_slice(&epoch.to_le_bytes());
+        out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for k in keys {
+            put_str(&mut out, k);
+        }
+    }
+    out
 }

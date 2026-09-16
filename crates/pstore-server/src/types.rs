@@ -129,6 +129,15 @@ pub struct QueryResponse {
     pub meta: QueryMeta,
 }
 
+/// What an index's rows must look like. Inferred by its first fold, immutable afterwards.
+#[derive(Debug, Clone, Serialize)]
+pub struct Schema {
+    /// Components in every vector.
+    pub dims: u32,
+    /// The attribute the text index is built over, or empty if the index carries no text.
+    pub text_field: String,
+}
+
 /// One index, as `GET /v1/indexes/{id}` reports it.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexSummary {
@@ -142,6 +151,12 @@ pub struct IndexSummary {
     pub epoch: u64,
     /// Whether this process holds unfolded rows for it.
     pub unfolded: bool,
+    /// What its rows must look like. `null` until its first fold records it.
+    pub schema: Option<Schema>,
+    /// ⚠️ Rows that were **acknowledged and then discarded** at a fold because they
+    /// contradicted the schema. Reported because a discard nobody can see is indistinguishable
+    /// from a bug — and because the alternative to discarding was stopping the tenant.
+    pub rejected_rows: u64,
     /// What the summary cost.
     pub cost: Cost,
 }

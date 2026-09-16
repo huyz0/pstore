@@ -93,9 +93,13 @@ async fn a_durable_write_costs_its_lane_registration_once_then_one_put() {
         body["cost"]["blob_writes"], 2,
         "first flush: bundle + lane registration"
     );
+    // ⚠️ **2 reads since M7d, and both are once-per-process rather than per-write**: the lane
+    // set, and HEAD for the index schemas. The schema read is what lets a row contradicting
+    // its index be refused before it is durable -- without it the only remaining guard is the
+    // fold, and a fold that refuses stops the tenant.
     assert_eq!(
-        body["cost"]["blob_reads"], 1,
-        "first flush reads the lane set"
+        body["cost"]["blob_reads"], 2,
+        "first flush reads the lane set and the schemas"
     );
     assert_eq!(body["cost"]["blob_lists"], 0);
 

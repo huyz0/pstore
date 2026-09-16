@@ -6,7 +6,7 @@ mod head;
 pub mod lanes;
 
 pub use bundle::Entry;
-pub use head::{Head, HeadAt, SegmentRef};
+pub use head::{Head, HeadAt, IndexSchema, SegmentRef};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{Document, Filter, Segment};
@@ -91,6 +91,22 @@ pub enum EngineError {
         expected: usize,
         /// What the query carried.
         got: usize,
+    },
+    /// The rows contradict the index's recorded schema.
+    ///
+    /// ⚠️ Raised at the **door** and at the **flush**, never at the fold: a fold is
+    /// all-or-nothing across every index in its bundle set, so failing it would stop every
+    /// later fold for the whole tenant. The fold drops and counts instead.
+    #[error("index {index}: {what} is {got}, and the index's schema says {expected}")]
+    SchemaConflict {
+        /// The index whose schema was contradicted.
+        index: String,
+        /// Which fact — `"the vector width"` or `"the text field"`.
+        what: &'static str,
+        /// What the schema records.
+        expected: String,
+        /// What the rows carry.
+        got: String,
     },
     /// A lane's tail could not be found within the probe bound.
     ///
@@ -318,7 +334,7 @@ pub struct Answer {
 }
 
 /// What HEAD knows about one index, without reading a single segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStats {
     /// Segments the index is made of.
     pub segments: u64,
@@ -327,6 +343,12 @@ pub struct IndexStats {
     pub documents: u64,
     /// The epoch HEAD was at when this was read.
     pub epoch: Epoch,
+    /// What its rows must look like, once a fold has recorded it.
+    pub schema: Option<head::IndexSchema>,
+    /// Rows a fold **discarded** because they contradicted that schema. ⚠️ Acknowledged
+    /// writes, dropped rather than allowed to stop the tenant, and reported so the discard
+    /// is visible rather than silent.
+    pub rejected_rows: u64,
 }
 
 /// One writer's view of one tenant.
@@ -339,6 +361,13 @@ pub struct Engine<S> {
     /// Next sequence in this lane. Lanes are single-writer, so this needs no coordination
     /// with anyone — which is the entire point of lanes.
     seq: Mutex<Seq>,
+    /// What the last HEAD this process read said each index's rows must look like.
+    ///
+    /// ⚠️ **An early refusal, never a source of truth.** Another process may have folded
+    /// since, so a stale entry is caught at the flush — which re-reads once per process — and
+    /// the fold is the final authority. Populated by every path that already reads HEAD, so
+    /// consulting it costs nothing.
+    schemas: Mutex<Option<BTreeMap<String, head::IndexSchema>>>,
     /// Serialises this lane's flushes against each other.
     ///
     /// ⚠️ Not contention control — a lane is single-writer by definition. This *enforces*
@@ -437,6 +466,7 @@ impl<S: BlobStore> Engine<S> {
             lane,
             mem: Mutex::new(Memtable::default()),
             seq: Mutex::new(Seq::ZERO),
+            schemas: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
@@ -477,6 +507,114 @@ impl<S: BlobStore> Engine<S> {
     pub fn with_text_field(mut self, name: &str) -> Self {
         self.text_field = name.to_owned();
         self
+    }
+
+    /// Records what a HEAD read said, so the door can refuse without asking again.
+    fn remember_schemas(&self, head: &Head) {
+        let mut cache = self
+            .schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = Some(head.schemas.clone());
+    }
+
+    /// Whether this process has never read a HEAD.
+    ///
+    /// ⚠️ **`None`, not "empty".** A tenant whose indexes have no schema yet reads back an
+    /// empty map, and conflating the two made a process pay the schema read on *every* flush
+    /// until some fold recorded one — measured as 2 requests per batch where the cost model
+    /// says 1. "I have not looked" and "I looked and there was nothing" are different facts.
+    fn schemas_unseen(&self) -> bool {
+        self.schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// The schema this process last saw for `index`, if it has seen HEAD at all.
+    fn cached_schema(&self, index: &str) -> Option<head::IndexSchema> {
+        self.schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()?
+            .get(index)
+            .cloned()
+    }
+
+    /// The width and text field a batch of rows implies, for **recording** a new schema.
+    ///
+    /// ⚠️ **The text field is `None` when no row carries one**, because `seal` builds a text
+    /// index only for rows that do. Recording the process's knob for an index of pure vectors
+    /// would refuse a differently-configured process over a field neither segment has
+    /// postings for — a false conflict on the path that hurts most.
+    ///
+    /// ⚠️ **`first()` is right here and wrong for validation**, which is the distinction code
+    /// review found the hard way: a schema being *recorded* takes the width of the rows that
+    /// created the index, and a schema being *checked* has to look at every row. The two used
+    /// one function, so a wrong-width row that was not first in the batch was sealed into the
+    /// segment undetected — a mixed-width segment, which no later guard can refuse, because a
+    /// segment declares one width and scores every row against it.
+    fn implied(&self, docs: &[Document]) -> (Option<u32>, Option<String>) {
+        let dims = docs.first().map(|d| d.vector().len() as u32);
+        let has_text = docs.iter().any(|d| self.carries_text(d));
+        (dims, has_text.then(|| self.text_field.clone()))
+    }
+
+    /// Whether this row has text in the attribute this process indexes.
+    fn carries_text(&self, doc: &Document) -> bool {
+        matches!(
+            doc.attrs.get(self.text_field.as_str()),
+            Some(pstore_format::Value::Str(s)) if !s.is_empty()
+        )
+    }
+
+    /// Why this row cannot join this index, if it cannot.
+    ///
+    /// ⚠️ **Per row.** The width is a property of the row; the text field is a property of the
+    /// process, but it only matters for rows that carry text, so a vector-only row written by
+    /// a misconfigured process is still perfectly storable.
+    fn row_conflict(
+        &self,
+        index: &str,
+        schema: &head::IndexSchema,
+        doc: &Document,
+    ) -> Option<EngineError> {
+        let dims = doc.vector().len() as u32;
+        if dims != schema.dims {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "the vector width",
+                expected: schema.dims.to_string(),
+                got: dims.to_string(),
+            });
+        }
+        if !schema.text_field.is_empty()
+            && self.text_field != schema.text_field
+            && self.carries_text(doc)
+        {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "the text field",
+                expected: schema.text_field.clone(),
+                got: self.text_field.clone(),
+            });
+        }
+        None
+    }
+
+    /// The first row of `docs` that cannot join `index`, as the error to refuse with.
+    ///
+    /// ⚠️ **Every row, not the first one.** Checking only `docs[0]` let a wrong-width row
+    /// anywhere else in a batch through, and a fold merges every lane's rows for an index into
+    /// one batch whose order is lane order — so "first" is not even the caller's first.
+    fn batch_conflict(
+        &self,
+        index: &str,
+        schema: &head::IndexSchema,
+        docs: &[Document],
+    ) -> Option<EngineError> {
+        docs.iter()
+            .find_map(|d| self.row_conflict(index, schema, d))
     }
 
     fn mem(&self) -> std::sync::MutexGuard<'_, Memtable> {
@@ -611,11 +749,25 @@ impl<S: BlobStore> Engine<S> {
         // dense leg takes its dimension from the segment's field layout and refuses a query
         // that does not match. Silent wrongness is what had to go; a refusal one step later
         // is a cost.
+        // ⚠️ **Rung one of the ladder: the schema this process has already read**, at zero
+        // requests. Cold, it has nothing to compare against and the flush is what refuses.
+        if let Some(schema) = self.cached_schema(index)
+            && let Some(e) = self.batch_conflict(index, &schema, &docs)
+        {
+            return Err(e);
+        }
+        // ⚠️ **Falls back to the batch's own first row**, which closes the case a reviewer
+        // spotted next to the one this ladder was built for: a brand-new index created by a
+        // single mixed-width batch had nothing to compare against — no schema yet, no rows
+        // yet — so it was accepted, the schema recorded the first row's width, and the others
+        // read back at a width they never had. An index's first batch defines its width, so
+        // the rest of that batch must agree with it.
         let known = m
             .pending
             .get(index)
             .and_then(|rows| rows.first())
             .or_else(|| m.durable.get(index).and_then(|rows| rows.first()))
+            .or_else(|| docs.first())
             .map(|d| d.vector().len());
         if let Some(expected) = known
             && let Some(odd) = docs.iter().find(|d| d.vector().len() != expected)
@@ -654,6 +806,9 @@ impl<S: BlobStore> Engine<S> {
     /// has never committed owns no indexes, which is a fact rather than a failure.
     pub async fn indexes(&self) -> Result<Vec<String>, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
+        // Every path that reads HEAD warms the door's schema cache, so the check costs a
+        // request only for a process that has never read one.
+        self.remember_schemas(&at.head);
         Ok(at.head.indexes.into_keys().collect())
     }
 
@@ -665,10 +820,13 @@ impl<S: BlobStore> Engine<S> {
     /// If HEAD cannot be read.
     pub async fn index_stats(&self, index: &str) -> Result<Option<IndexStats>, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
         Ok(at.head.indexes.get(index).map(|refs| IndexStats {
             segments: refs.len() as u64,
             documents: refs.iter().map(|r| u64::from(r.rows)).sum(),
             epoch: at.head.epoch,
+            schema: at.head.schemas.get(index).cloned(),
+            rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
         }))
     }
 
@@ -711,12 +869,45 @@ impl<S: BlobStore> Engine<S> {
             .collect()
     }
 
+    /// Buffers documents **without the schema check**, so a test can build the state the
+    /// fold has to survive: rows that contradict the schema, durable in a lane bundle.
+    ///
+    /// ⚠️ Reachable in production only as a race between two processes that have both never
+    /// read HEAD. That is rare enough to be worth an escape hatch here and not worth a
+    /// fixture that races two engines to produce it unreliably.
+    #[doc(hidden)]
+    pub async fn write_without_schema_check_for_test(&self, index: &str, docs: Vec<Document>) {
+        let mut m = self.mem();
+        m.generation += 1;
+        m.pending.entry(index.to_owned()).or_default().extend(docs);
+    }
+
     /// Writes everything buffered as **one bundle object**, whatever it covers.
     ///
     /// `RA = 1 W` for the batch, and for every index in it.
     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
+        self.flush_inner(true).await
+    }
+
+    /// Flushes **without** the schema check, for a test that needs contradicting rows to be
+    /// durable — the state the fold must survive without stopping the tenant.
+    #[doc(hidden)]
+    pub async fn flush_without_schema_check_for_test(&self) -> Result<Option<Seq>, EngineError> {
+        self.flush_inner(false).await
+    }
+
+    async fn flush_inner(&self, check: bool) -> Result<Option<Seq>, EngineError> {
         require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
+        // ⚠️ **Rung two, and the rung that makes the fold's drop path a race rather than a
+        // routine.** Nothing wrong may become durable, so the schema is read here — **once
+        // per process**, on the first flush, beside the lane registration that already reads.
+        // A read per flush would be a request per write, which is the cost model this design
+        // exists to protect.
+        if check && self.schemas_unseen() {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+        }
         let pending = {
             let mut m = self.mem();
             m.generation += 1;
@@ -725,6 +916,18 @@ impl<S: BlobStore> Engine<S> {
             }
             std::mem::take(&mut m.pending)
         };
+        if check {
+            let refusal = pending.iter().find_map(|(index, docs)| {
+                let schema = self.cached_schema(index)?;
+                self.batch_conflict(index, &schema, docs)
+            });
+            if let Some(e) = refusal {
+                // ⚠️ The rows go back: a refused flush must not swallow what it refused, or
+                // the caller's retry writes nothing.
+                self.restore(pending);
+                return Err(e);
+            }
+        }
         let seq = *self
             .seq
             .lock()
@@ -846,6 +1049,39 @@ impl<S: BlobStore> Engine<S> {
             if by_index.is_empty() {
                 return Ok(at.head.epoch);
             }
+            // ⚠️ Remembered from the HEAD this fold READ, so the door has something to
+            // refuse against; the committed one is remembered below, because a fold that
+            // records a schema is the moment the process learns it.
+            self.remember_schemas(&at.head);
+
+            // ⚠️ **Rung three: drop and count, never stop.** A fold is all-or-nothing across
+            // every index in its bundle set and re-reads the same bundles on every attempt, so
+            // failing here would stop every later fold for this tenant, forever — one
+            // acknowledged row would brick it. Spec review measured that; this is the answer.
+            //
+            // ⚠️ Before `seal`, so a contradiction costs **zero write-class requests** and
+            // cannot orphan an object no HEAD will ever name.
+            let mut rejects: BTreeMap<String, u64> = BTreeMap::new();
+            for (idx, docs) in &mut by_index {
+                let Some(schema) = at.head.schemas.get(idx) else {
+                    continue;
+                };
+                // ⚠️ **Per row, not per index.** Dropping the whole index's rows would
+                // discard every *correct* row any writer had flushed for it in this span —
+                // acknowledged by writers that passed both the door and the flush — and the
+                // watermark advances past their bundles, so a later fold never sees them and
+                // GC reaps them. Code review measured that: one wrong row cost two innocent
+                // ones. The blast radius of a contradiction is the contradicting row.
+                let before = docs.len();
+                docs.retain(|d| self.row_conflict(idx, schema, d).is_none());
+                let dropped = (before - docs.len()) as u64;
+                if dropped > 0 {
+                    rejects.insert(idx.clone(), dropped);
+                }
+            }
+            // An index whose every row was dropped seals nothing, and must not seal an empty
+            // segment either.
+            by_index.retain(|_, docs| !docs.is_empty());
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
@@ -858,6 +1094,20 @@ impl<S: BlobStore> Engine<S> {
             // index's ref point at the whole thing, and a scan would return its
             // neighbours' rows.
             for (idx, docs) in &by_index {
+                // ⚠️ **The only place a schema is created**, and it records what the rows
+                // ARE rather than what this process is configured with: an index of pure
+                // vectors records no text field, so a differently-configured process may
+                // still fold into it.
+                if !next.schemas.contains_key(idx) {
+                    let (dims, text) = self.implied(docs);
+                    next.schemas.insert(
+                        idx.clone(),
+                        head::IndexSchema {
+                            dims: dims.unwrap_or(0),
+                            text_field: text.unwrap_or_default(),
+                        },
+                    );
+                }
                 let seg_key = self.segment_key(next.epoch, idx);
                 self.seal(&seg_key, docs, &self.text_field).await?;
                 next.indexes
@@ -880,6 +1130,11 @@ impl<S: BlobStore> Engine<S> {
             // that does not grow a 16-byte entry per idle lane on every fold. Recorded so a
             // sweep does not spend a round trying to kill it with a test that would only pin
             // HEAD's encoded length.
+            // ⚠️ Counted into the COMMITTED HEAD, because a discard nobody can see is a
+            // discard that is indistinguishable from a bug. The API reports it per index.
+            for (idx, n) in &rejects {
+                *next.schema_rejects.entry(idx.clone()).or_default() += *n;
+            }
             for (lane, _, tail) in &spans {
                 if *tail > 0 {
                     next.watermarks.insert(lane.0, *tail);
@@ -895,6 +1150,10 @@ impl<S: BlobStore> Engine<S> {
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
+                    // A fold that recorded a schema is the moment this process learns it, so
+                    // the door refuses against the committed state rather than the one read
+                    // before the fold.
+                    self.remember_schemas(&next);
                     let mut m = self.mem();
                     m.generation += 1;
                     m.durable.clear();
@@ -1345,6 +1604,7 @@ impl<S: BlobStore> Engine<S> {
         top_k: usize,
     ) -> Result<Answer, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
         let refs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();

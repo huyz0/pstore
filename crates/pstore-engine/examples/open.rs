@@ -176,6 +176,21 @@ async fn by_deployment_size(sizes: &[u32]) {
                     .collect(),
                 watermarks: Default::default(),
                 graveyard: Default::default(),
+                // The filler measures HEAD's SIZE, and a schema is part of it now: a tenant
+                // with 50 indexes carries 50 schema entries, so leaving them out would
+                // measure a HEAD no deployment has.
+                schemas: (0..50)
+                    .map(|j| {
+                        (
+                            format!("t{i:08}-index-{j:07}"),
+                            pstore_engine::IndexSchema {
+                                dims: 8,
+                                text_field: String::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+                schema_rejects: Default::default(),
             };
             store
                 .put(

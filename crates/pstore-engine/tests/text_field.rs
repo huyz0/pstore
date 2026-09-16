@@ -127,18 +127,39 @@ async fn a_compaction_does_not_rebuild_over_the_wrong_field() {
 async fn a_compaction_of_disagreeing_inputs_is_refused() {
     // ⚠️ Refused, not resolved. Picking one input's name rebuilds the other's rows over an
     // attribute they do not carry, which is the same silent destruction one segment at a
-    // time. Nothing changes a field today — that is the schema this milestone defers — so
-    // this is the door being shut before there is a way through it.
+    // time. This is the door being shut before there is a way through it.
+    //
+    // ⚠️ **Since M7d this state cannot be produced by writing at all**: the index's text
+    // field is recorded in HEAD by its first fold, the second process is refused at its
+    // flush, and a fold that somehow saw the rows anyway would DROP them. So the fixture
+    // builds what a **pre-M7d store already contains** — two segments under one index name,
+    // over different attributes — by folding them as separate indexes and then naming both
+    // from one entry in HEAD. That is exactly the shape M7d cannot retroactively fix, and
+    // `compact` is explicitly out of its scope, so this guard is still the only thing between
+    // such a merge and a silent rebuild of one segment's rows over an attribute they lack.
     let store = Arc::new(MemoryStore::new());
     let t = TenantId(623);
-    for (lane, attr) in [(1u64, "body"), (2, text::DEFAULT_TEXT_FIELD)] {
+    let mut refs = Vec::new();
+    for (lane, attr, index) in [
+        (1u64, "body", "idx"),
+        (2, text::DEFAULT_TEXT_FIELD, "legacy"),
+    ] {
         let e = Engine::new(Arc::clone(&store), t, LaneId(lane)).with_text_field(attr);
-        e.write("idx", (0..12).map(|i| doc(i, attr)).collect())
+        e.write(index, (0..12).map(|i| doc(i, attr)).collect())
             .await
             .unwrap();
         e.flush().await.unwrap();
         e.fold().await.unwrap();
+        refs.extend(e.head_for_test().await.indexes[index].clone());
     }
+    let mover = Engine::new(Arc::clone(&store), t, LaneId(9));
+    mover
+        .commit_head_for_test(|h| {
+            h.indexes.insert("idx".to_owned(), refs.clone());
+            h.indexes.remove("legacy");
+        })
+        .await
+        .unwrap();
     assert_eq!(segments(&store, t, "idx").await.len(), 2);
 
     let c = Engine::new(Arc::clone(&store), t, LaneId(3));

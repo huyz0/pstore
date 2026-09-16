@@ -19,6 +19,22 @@ pub struct SegmentRef {
     pub rows: u32,
 }
 
+/// What an index's rows must look like: the two facts the engine already depends on and
+/// could not state.
+///
+/// ⚠️ **Inferred by the first fold, and immutable afterwards.** `api-design.md` says types are
+/// inferred by default and an index is created implicitly by its first write, so nothing
+/// precedes this — and a change that would need a reindex is refused with the migration path
+/// named rather than accepted and half-applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexSchema {
+    /// Components in every vector of the index's dense field.
+    pub dims: u32,
+    /// The attribute the text index is built over. **Empty means the fold that recorded this
+    /// schema saw no text at all**, which is not the same as a field named "".
+    pub text_field: String,
+}
+
 /// A tenant's committed state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Head {
@@ -34,6 +50,16 @@ pub struct Head {
     pub indexes: BTreeMap<String, Vec<SegmentRef>>,
     /// How far each lane has been folded, so a reader knows what it still has to replay.
     pub watermarks: BTreeMap<u64, u64>,
+    /// Per index, what its rows must look like. ⚠️ **A trailing section**: a HEAD written
+    /// before M7d has none, and that is "no schemas recorded", never a schema of zero.
+    pub schemas: BTreeMap<String, IndexSchema>,
+    /// Per index, rows a fold **discarded** because they contradicted the schema.
+    ///
+    /// ⚠️ **Acknowledged writes, dropped**, and counted here precisely so that it is visible.
+    /// The alternative — failing the fold — was measured in spec review: a fold is
+    /// all-or-nothing across every index in the bundle set, so one contradicting row would
+    /// stop every later fold for the whole tenant, forever.
+    pub schema_rejects: BTreeMap<String, u64>,
     /// Keys that **stopped being referenced** at a given epoch, newest last.
     ///
     /// ⚠️ This is what lets GC run with **zero LIST**. A bucket enumeration would tell us
@@ -83,6 +109,20 @@ impl Head {
                 put_str(&mut out, k);
             }
         }
+        // ⚠️ **Trailing, and that is the compatibility mechanism.** Everything above is byte
+        // for byte what the pre-M7d encoder wrote, so an old reader gets the whole of what it
+        // understands and stops.
+        out.extend_from_slice(&(self.schemas.len() as u32).to_le_bytes());
+        for (name, schema) in &self.schemas {
+            put_str(&mut out, name);
+            out.extend_from_slice(&schema.dims.to_le_bytes());
+            put_str(&mut out, &schema.text_field);
+        }
+        out.extend_from_slice(&(self.schema_rejects.len() as u32).to_le_bytes());
+        for (name, n) in &self.schema_rejects {
+            put_str(&mut out, name);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
         out
     }
 
@@ -119,6 +159,35 @@ impl Head {
             }
             h.graveyard.insert(epoch, keys);
         }
+        // ⚠️ **End of buffer here is "no schemas", not a corrupt HEAD.** Every HEAD in every
+        // store predating M7d ends at the graveyard, and reading that as an error makes them
+        // all unreadable — M6c's trap one layer up, where absence read as empty would have
+        // turned off the text index of every segment written before that section existed.
+        //
+        // ⚠️ The price, stated rather than discovered: a HEAD truncated exactly at this
+        // boundary now decodes as valid instead of `CorruptHead`. That is unavoidable for an
+        // optional trailing section, and the section is what keeps every existing HEAD
+        // readable.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            h.schemas.insert(
+                name,
+                IndexSchema {
+                    dims: c.u32()?,
+                    text_field: c.string()?,
+                },
+            );
+        }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            h.schema_rejects.insert(name, c.u64()?);
+        }
         Ok(h)
     }
 
@@ -140,6 +209,10 @@ struct Cur<'a> {
 }
 
 impl Cur<'_> {
+    /// Whether every byte has been consumed. The optional-section boundary test.
+    fn at_end(&self) -> bool {
+        self.i >= self.b.len()
+    }
     fn take(&mut self, n: usize) -> Result<&[u8], EngineError> {
         let end = self.i.checked_add(n).ok_or(EngineError::CorruptHead)?;
         let out = self.b.get(self.i..end).ok_or(EngineError::CorruptHead)?;

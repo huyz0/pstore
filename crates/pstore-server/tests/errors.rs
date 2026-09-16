@@ -132,29 +132,23 @@ async fn a_dimension_mismatch_is_a_client_error_on_both_query_paths() {
         "the refusal must say what the field's dimension is: {body}"
     );
 
-    // ⚠️ **After a fold this process cannot know the width**, and asking would put a blob
-    // request on the write path. So the write is accepted -- and the mistake is **loud at
-    // the next query** rather than a wrong ranking: the dense leg takes its dimension from
-    // each segment's field layout, and the fresh two-dimensional segment refuses a
-    // four-dimensional query. Review's scenario ended with the short vector outranking an
-    // exact match, scored and `200`; it now ends in a refusal.
-    let (status, _) = send(
+    // ⚠️ **This assertion is the one M7d changed, and it changed in the good direction.**
+    // M7c had to accept this write: after a fold the rows are gone from the memtable, the
+    // width lived only in the segment, and reading it would have put a blob request on the
+    // write path. The mistake was caught at the *next query* instead. M7d records the width
+    // in HEAD, this process read HEAD when it folded, and so the write is refused at the
+    // door -- BACKLOG row 27's case, one API call earlier and with nothing durable written.
+    let (status, body) = send(
         &api,
         write(r#"{"documents":[{"id":"later","vector":[9.0,9.0]}]}"#),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a process with no rows for this index cannot know its width for free"
-    );
-    let (status, body) = send(&api, query(r#"{"vector":[1.0,0.5,-0.25,1.0],"top_k":5}"#)).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a mixed-width index answered a query instead of refusing it: {body}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "schema_conflict");
+    // And the index is untouched: the refused row is not in it, and a correct query answers.
+    let (status, body) = send(&api, query(r#"{"vector":[1.0,0.5,-0.25,1.0],"top_k":5}"#)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
 
     // ⚠️ And within one batch, where it is cheapest: a batch whose vectors disagree makes the
     // index's dimension depend on which document happened to be first.

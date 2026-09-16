@@ -355,6 +355,24 @@ could not. ⚠️ And it found what only a caller finds: a **wrong-dimension que
 scored, ranked results with a `200`**, because the dense leg took the index's dimension from
 the query rather than from the segment.
 
+#### M7d — the schema
+→ [`docs/milestones/M7d/SPEC.md`](../../milestones/M7d/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7d/VERIFIED.md)
+
+**Done.** M6c's three questions, answered now that [M7c](../../milestones/M7c/VERIFIED.md) has
+built a caller to ask: **who sets it** — the first fold, by inference, so nothing precedes a
+write; **may it change** — no, and `PATCH` refuses with the migration path named rather than
+404ing; **what a disagreement does** — refused at the door and at the flush, and if it ever
+reaches a fold, **dropped and counted rather than allowed to stop the tenant**.
+
+⚠️ That last clause is the milestone. Spec review measured the first draft: refusing a
+contradicting fold would have stopped every later fold for the whole tenant, forever, because a
+fold is all-or-nothing across its bundle set. One accepted API call would have bricked a tenant.
+
+⚠️ `Head` gains an **optional trailing section**, so every HEAD written before this milestone
+still decodes — with the price asserted rather than tolerated: exactly two truncations now
+decode, and a test enumerates every one to prove there is no third.
+
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
 - Observability, SLOs, chaos testing, Jepsen-style verification.

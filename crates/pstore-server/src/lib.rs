@@ -20,6 +20,7 @@ use pstore_format::Document;
 use pstore_types::{LaneId, TenantId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use types::Schema as SchemaOut;
 
 mod types;
 pub use types::{
@@ -95,6 +96,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}", get(index_summary::<S>))
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
+            .route(
+                "/v1/indexes/{index}/schema",
+                axum::routing::patch(patch_schema),
+            )
             .route("/v1/admin/fold", post(fold_tenant::<S>))
             .with_state(self)
     }
@@ -203,6 +208,13 @@ impl From<EngineError> for ApiError {
             // ⚠️ **A client error, answered as one.** M7c's spec deferred this row because
             // the engine collapsed it into a string and a table that matches on messages is
             // a table no mutation can pin. The typed variant is what made the row possible.
+            // ⚠️ The client wrote rows the index cannot hold. Without this arm it falls
+            // through to `500 internal` -- the exact defect M7c's typed `DimensionMismatch`
+            // was added to fix, repeated one milestone later, which is why M7d's spec made
+            // the error-table arm an acceptance criterion of its own.
+            EngineError::SchemaConflict { .. } => {
+                Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
+            }
             EngineError::DimensionMismatch { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
@@ -386,6 +398,8 @@ async fn index_summary<S: BlobStore + 'static>(
         segments: 0,
         documents: 0,
         epoch: engine.epoch(),
+        schema: None,
+        rejected_rows: 0,
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -393,6 +407,11 @@ async fn index_summary<S: BlobStore + 'static>(
         documents: s.documents,
         epoch: s.epoch.0,
         unfolded,
+        schema: s.schema.map(|sc| SchemaOut {
+            dims: sc.dims,
+            text_field: sc.text_field,
+        }),
+        rejected_rows: s.rejected_rows,
         cost: api.spend(tenant).since(before),
     }))
 }
@@ -415,6 +434,27 @@ async fn list_indexes<S: BlobStore + 'static>(
         indexes: names,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// `PATCH /v1/indexes/{index}/schema` — **refused, with the path named.**
+///
+/// ⚠️ A route that exists and refuses, rather than a `404`: the answer to "may I change this"
+/// is *no, and here is what to do instead*, which is a different statement from "there is no
+/// such thing". `api-design.md` says a schema change needing a reindex must say so.
+async fn patch_schema(Path(index): Path<String>, headers: HeaderMap) -> ApiError {
+    // The tenant is still required, so a caller cannot learn anything by omitting it.
+    if let Err(e) = tenant_of(&headers) {
+        return e;
+    }
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "schema_immutable",
+        format!(
+            "index {index}'s schema is inferred by its first fold and cannot be changed in \
+             place: segments already written cannot be reinterpreted. Write the corrected \
+             documents to a new index and swap the name."
+        ),
+    )
 }
 
 /// `POST /v1/admin/fold` — folds **the header's tenant**, under the same rule as every route.

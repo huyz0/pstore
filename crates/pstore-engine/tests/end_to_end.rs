@@ -105,9 +105,16 @@ async fn the_whole_flow_stays_inside_its_request_budget() {
         // The lane's FIRST flush also registers the lane -- a read of the registry and a
         // CAS to publish -- which is one-off per lane lifetime, not per batch. Stating it
         // rather than resetting the counter after it keeps the cost visible.
+        //
+        // ⚠️ **4 on the first flush since M7d, not 3**, and the extra one is a read of HEAD
+        // for the index schemas. It is once per PROCESS -- the flush that finds an empty
+        // schema cache is the only one that pays -- and it is what makes a row contradicting
+        // its index refusable before it becomes durable. A schema read per flush would be a
+        // request per write, which is the thing this assertion exists to protect: the
+        // steady-state number below is unchanged at 1.
         assert_eq!(
             s.requests(),
-            if batch == 0 { 3 } else { 1 },
+            if batch == 0 { 4 } else { 1 },
             "a batch cost {} requests",
             s.requests()
         );

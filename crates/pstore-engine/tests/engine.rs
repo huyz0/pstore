@@ -428,7 +428,12 @@ async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     e.fold().await.unwrap();
     assert_eq!(e.scan("idx", None).await.unwrap().len(), 1);
 
-    e.write("idx", vec![doc("ok", 1)]).await.unwrap();
+    // ⚠️ One dimension, matching the row above rather than `doc`'s two: since M7d an index
+    // has ONE width, and this fixture's incidental mix would now be refused by a rule that
+    // has nothing to do with what this test is about.
+    e.write("idx", vec![pstore_format::Document::new("ok", vec![2.0])])
+        .await
+        .unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();
     assert_eq!(e.scan("idx", None).await.unwrap().len(), 2);
