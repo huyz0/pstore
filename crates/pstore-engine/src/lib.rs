@@ -193,7 +193,10 @@ impl<S: BlobStore> BlobStore for Split<S> {
     ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
         split_to!(self, key, get_with_tag(key))
     }
-    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+    async fn get_tag(
+        &self,
+        key: &Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
         split_to!(self, key, get_tag(key))
     }
     async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {

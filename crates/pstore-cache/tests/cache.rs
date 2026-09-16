@@ -278,7 +278,10 @@ impl BlobStore for Barriered {
     ) -> Result<(Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
         self.inner.get_with_tag(key).await
     }
-    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+    async fn get_tag(
+        &self,
+        key: &Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
         self.inner.get_tag(key).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
@@ -345,7 +348,7 @@ async fn every_uncached_operation_reaches_the_store_unchanged() {
 
     // CAS, through the decorator: the tag must be the store's, and a stale one must lose.
     let (_, tag) = cache.get_with_tag(&key).await.unwrap();
-    assert_eq!(cache.get_tag(&key).await.as_ref(), Some(&tag));
+    assert_eq!(cache.get_tag(&key).await.unwrap().as_ref(), Some(&tag));
     cache
         .put_conditional(
             &key,

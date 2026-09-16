@@ -157,11 +157,21 @@ pub trait BlobStore: Send + Sync + 'static {
     /// a required method rather than a convenience.
     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError>;
 
-    /// The current CAS tag, or `None` if the object is absent.
+    /// The current CAS tag: `Ok(None)` if the object is absent, `Err` if the probe failed.
     ///
     /// The rebase step of the commit protocol: read the state an attempt will be
     /// conditioned on. Provided in terms of `head`-like access so every backend has it.
-    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag>;
+    ///
+    /// ⚠️ **Fallible, and the three states are distinct.** This returned `Option` until
+    /// M7b, so a refused read was indistinguishable from an absent object to every caller
+    /// in the workspace — and a rebase reads absence as a reason to stop trying. M0c
+    /// measured the consequence: at `read_error` 0.9 a contention point was byte-identical
+    /// to a clean one, because the one read in the loop had no error channel to inject
+    /// into. Backlog row 21.
+    ///
+    /// # Errors
+    /// If the backend refuses the probe. **Absence is not an error.**
+    async fn get_tag(&self, key: &Key) -> Result<Option<pstore_types::CasTag>, BlobError>;
 
     /// Object size without the body. Reserved for GC and repair — **never the hot path**,
     /// where the manifest already proves what exists.

@@ -660,3 +660,53 @@ async fn a_rate_of_one_fires_on_every_kind() {
         }
     }
 }
+
+/// ⚠️ **Backlog row 21, and the load-bearing test of M7b.** `get_tag` returned `Option`
+/// until this milestone, so `Faulty` forwarded it cleanly while every other read consulted
+/// `read_fault`: the one read in the commit loop was the one read faults could not reach.
+///
+/// Asserted through a **stack** — `Congested` over `Accounted` over `Faulty` — and not on
+/// `Faulty` alone, because the way this defect comes back is a decorator swallowing the new
+/// error with `.ok().flatten()` and returning the old `None`.
+#[tokio::test]
+async fn a_refused_probe_is_an_error_and_an_absent_key_is_not() {
+    use pstore_blob::Accounted;
+    use pstore_types::TenantId;
+
+    let clean_acct = Accounted::new(Faulty::new(MemoryStore::new(), 7, Faults::none()));
+    let clean = Congested::new(clean_acct.as_tenant(TenantId(0)), 64);
+    // Absence is not an error, at any depth of decorator.
+    assert_eq!(clean.get_tag(&k("nothing-here")).await.unwrap(), None);
+    clean.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    assert!(clean.get_tag(&k("a")).await.unwrap().is_some());
+
+    // ⚠️ Seeded through a store whose faults are off, then probed through one whose are on:
+    // at `read_error` 1.0 a `put` would fail too, and a test that cannot seed is measuring
+    // its own fixture.
+    let inner = MemoryStore::new();
+    inner.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    let acct = Accounted::new(Faulty::new(
+        inner,
+        7,
+        Faults {
+            read_error: 1.0,
+            ..Faults::none()
+        },
+    ));
+    let refusing = Congested::new(acct.as_tenant(TenantId(0)), 64);
+    let err = refusing
+        .get_tag(&k("a"))
+        .await
+        .expect_err("a probe through a store refusing every read reported an answer");
+    assert!(
+        matches!(err, BlobError::Other(_)),
+        "expected the injected read fault, got {err:?}"
+    );
+    // And the tenant was still billed for the request it made: a probe that failed is a
+    // probe that happened.
+    assert_eq!(
+        acct.count(TenantId(0), pstore_blob::OpClass::Read),
+        1,
+        "a refused probe was not billed as the read it issued"
+    );
+}

@@ -26,6 +26,21 @@ pub enum SweepError {
     /// missing-tag exit and the row would have claimed its commits landed.
     #[error("the key {0} was not seeded, so no attempt could have been conditioned on it")]
     Unseeded(Key),
+    /// The seed probe itself was refused, so whether the key is there is **unknown** —
+    /// which is a different thing from knowing it is not.
+    ///
+    /// ⚠️ Separate from `Unseeded` deliberately. Both abort the point, so collapsing them
+    /// costs nothing at the call site and everything at the read site: "the store refused
+    /// me" and "the seed did not land" have different remedies, and M0c could not tell
+    /// them apart anywhere in the workspace. Backlog row 21.
+    #[error("the seed probe for {key} was refused: {source}")]
+    Probe {
+        /// The key whose tag could not be read.
+        key: Key,
+        /// What the backend refused it with.
+        #[source]
+        source: pstore_blob::BlobError,
+    },
 }
 
 /// One row of a sweep: what happened at one contention level.
@@ -41,6 +56,13 @@ pub struct Point {
     pub commits: u64,
     /// 412s: another writer won, so the loser rebased.
     pub lost: u64,
+    /// Rebases abandoned because the probe was **refused**, not because the key was absent.
+    ///
+    /// ⚠️ **The axis M0c could not reach.** With `get_tag` returning `Option`, a read error
+    /// was invisible to the commit loop: at `read_error` 0.9 a point was byte-identical to a
+    /// clean one, and the ledger recorded that as a finding it could not fix. These are
+    /// counted within `abandoned`, which stays the total, so the two are read together.
+    pub probe_failed: u64,
     /// Commits that spent [`MAX_CAS_ATTEMPTS`] without landing and were given up on.
     ///
     /// ⚠️ **The field that makes `commits` honest.** Before M0c this struct reported
@@ -111,8 +133,10 @@ pub async fn contention_point<S: BlobStore>(
         .put_conditional(&key, Bytes::from_static(b"0"), Precondition::NotExists)
         .await
         .ok();
-    if store.get_tag(&key).await.is_none() {
-        return Err(SweepError::Unseeded(key));
+    match store.get_tag(&key).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(SweepError::Unseeded(key)),
+        Err(source) => return Err(SweepError::Probe { key, source }),
     }
 
     // ⚠️ `tokio::time::Instant`, not `std::time::Instant`. The std clock does not see a
@@ -124,6 +148,7 @@ pub async fn contention_point<S: BlobStore>(
         let (s, k) = (Arc::clone(&store), key.clone());
         tasks.push(tokio::spawn(async move {
             let (mut attempts, mut lost, mut commits, mut abandoned) = (0u64, 0u64, 0u64, 0u64);
+            let mut probe_failed = 0u64;
             for c in 0..commits_each {
                 let mut spent = 0u32;
                 loop {
@@ -133,8 +158,16 @@ pub async fn contention_point<S: BlobStore>(
                     }
                     // Rebase: read the state this attempt will be conditioned on.
                     let tag = match s.get_tag(&k).await {
-                        Some(t) => t,
-                        None => {
+                        Ok(Some(t)) => t,
+                        // The key was seeded before this loop and nothing deletes it, so
+                        // `Ok(None)` here is the store contradicting itself; it is still an
+                        // abandoned rebase, and it is NOT a refused probe.
+                        Ok(None) => {
+                            abandoned += 1;
+                            break;
+                        }
+                        Err(_) => {
+                            probe_failed += 1;
                             abandoned += 1;
                             break;
                         }
@@ -160,17 +193,19 @@ pub async fn contention_point<S: BlobStore>(
                     }
                 }
             }
-            (attempts, lost, commits, abandoned)
+            (attempts, lost, commits, abandoned, probe_failed)
         }));
     }
 
     let (mut attempts, mut lost, mut commits, mut abandoned) = (0u64, 0u64, 0u64, 0u64);
+    let mut probe_failed = 0u64;
     for t in tasks {
-        if let Ok((a, l, c, ab)) = t.await {
+        if let Ok((a, l, c, ab, pf)) = t.await {
             attempts += a;
             lost += l;
             commits += c;
             abandoned += ab;
+            probe_failed += pf;
         }
     }
     Ok(Point {
@@ -183,6 +218,7 @@ pub async fn contention_point<S: BlobStore>(
         commits,
         lost,
         abandoned,
+        probe_failed,
         latency_min: Duration::ZERO,
         latency_max: Duration::ZERO,
         cas_error_rate: 0.0,

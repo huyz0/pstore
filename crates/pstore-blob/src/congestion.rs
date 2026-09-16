@@ -144,7 +144,7 @@ impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
         self.with_retry(|| self.inner.get_suffix(key, n)).await
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+    async fn get_tag(&self, key: &Key) -> Result<Option<pstore_types::CasTag>, BlobError> {
         self.inner.get_tag(key).await
     }
 

@@ -122,7 +122,7 @@ impl<S: pstore_blob::BlobStore> pstore_blob::BlobStore for DepthCounting<S> {
         self.inner.get_suffix(key, n).await
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+    async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
         let _g = self.begin_async().await;
         self.inner.get_tag(key).await
     }

@@ -245,18 +245,23 @@ async fn probe_suffix_read<S: BlobStore>(s: &S, run: u64) -> Support {
 /// able to commit.
 async fn probe_get_tag<S: BlobStore>(s: &S, run: u64) -> Support {
     let key = k(run, "tag");
-    if s.get_tag(&key).await.is_some() {
-        return Support::Divergent("an absent key reported a tag".to_owned());
+    // ⚠️ A probe that FAILED is not a probe that found nothing — `Err` here means the
+    // backend refused the read, which says nothing about whether the key exists.
+    match s.get_tag(&key).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return Support::Divergent("an absent key reported a tag".to_owned()),
+        Err(e) => return Support::Divergent(format!("probing an absent key failed: {e}")),
     }
     let Ok(put) = s.put(&key, Bytes::from_static(b"1")).await else {
         return Support::Unsupported;
     };
     match s.get_tag(&key).await {
-        None => Support::Divergent("an existing key reported no tag".to_owned()),
-        Some(t) if t == put.tag => Support::Supported,
-        Some(_) => {
+        Ok(None) => Support::Divergent("an existing key reported no tag".to_owned()),
+        Ok(Some(t)) if t == put.tag => Support::Supported,
+        Ok(Some(_)) => {
             Support::Divergent("the tag did not match the one the write returned".to_owned())
         }
+        Err(e) => Support::Divergent(format!("probing an existing key failed: {e}")),
     }
 }
 

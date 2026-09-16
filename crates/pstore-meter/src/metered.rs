@@ -207,7 +207,7 @@ impl<S: BlobStore> BlobStore for Metered<S> {
     /// commit protocol**: a quota refusal would become a `Precondition::NotExists` write
     /// against an object that exists, which is a silent wrong answer rather than a refusal.
     /// A hole, named rather than papered over.
-    async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+    async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
         let now = (self.now)();
         let out = self.inner.get_tag(key).await;
         self.settle(OpClass::Read, 1, 0, now);

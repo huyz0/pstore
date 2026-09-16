@@ -35,7 +35,7 @@ async fn the_trait_fits_a_real_object_store_implementation() {
     assert_eq!(&s.get(&k).await.unwrap()[..], b"0123456789");
     assert_eq!(&s.get_range(&k, 2..5).await.unwrap()[..], b"234");
     assert_eq!(s.head(&k).await.unwrap(), 10);
-    assert!(s.get_tag(&k).await.is_some());
+    assert!(s.get_tag(&k).await.unwrap().is_some());
     assert_eq!(
         s.list_unrestricted(&pstore_blob::Key::new("a"))
             .await

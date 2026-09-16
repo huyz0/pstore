@@ -23,6 +23,7 @@ fn empty_point() -> sweep::Point {
         commits: 0,
         lost: 0,
         abandoned: 0,
+        probe_failed: 0,
         latency_min: std::time::Duration::ZERO,
         latency_max: std::time::Duration::ZERO,
         cas_error_rate: 0.0,

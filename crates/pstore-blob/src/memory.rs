@@ -165,11 +165,14 @@ impl crate::BlobStore for MemoryStore {
         Ok(body.slice(start..))
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<CasTag> {
-        self.lock()
+    async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
+        // An in-memory map has no way to refuse a read, so the error arm is unreachable
+        // here by construction — `Faulty` is what exercises it.
+        Ok(self
+            .lock()
             .objects
             .get(key.as_str())
-            .map(|(_, t)| t.clone())
+            .map(|(_, t)| t.clone()))
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

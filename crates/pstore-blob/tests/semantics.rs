@@ -209,11 +209,14 @@ async fn get_tag_reports_the_current_tag_and_none_when_absent() {
     // The rebase step of the commit protocol. Returning None always would make every
     // commit loop give up, and returning a stale tag would break fencing.
     let s = MemoryStore::new();
-    assert!(s.get_tag(&k("t")).await.is_none());
+    assert!(s.get_tag(&k("t")).await.unwrap().is_none());
     let first = s.put(&k("t"), Bytes::from_static(b"1")).await.unwrap();
-    assert_eq!(s.get_tag(&k("t")).await.as_ref(), Some(&first.tag));
+    assert_eq!(s.get_tag(&k("t")).await.unwrap().as_ref(), Some(&first.tag));
     let second = s.put(&k("t"), Bytes::from_static(b"2")).await.unwrap();
-    assert_eq!(s.get_tag(&k("t")).await.as_ref(), Some(&second.tag));
+    assert_eq!(
+        s.get_tag(&k("t")).await.unwrap().as_ref(),
+        Some(&second.tag)
+    );
     assert_ne!(first.tag, second.tag);
 }
 

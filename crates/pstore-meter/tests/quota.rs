@@ -92,7 +92,7 @@ async fn a_tenant_inside_its_quota_is_untouched() {
     assert_eq!(&s.get_range(&k, 8..16).await.unwrap()[..], &[7u8; 8]);
     assert_eq!(s.get_suffix(&k, 4).await.unwrap().len(), 4);
     assert_eq!(s.head(&k).await.unwrap(), 4096);
-    assert!(s.get_tag(&k).await.is_some());
+    assert!(s.get_tag(&k).await.unwrap().is_some());
     assert_eq!(s.get_immutable(&k, Class::Meta).await.unwrap().len(), 4096);
 
     // Six operations, six requests underneath: the meter neither batches nor drops.
@@ -420,7 +420,7 @@ async fn get_tag_is_counted_and_never_refused() {
         "the quota is not exhausted"
     );
     assert!(
-        s.get_tag(&Key::new(KEY)).await.is_some(),
+        s.get_tag(&Key::new(KEY)).await.unwrap().is_some(),
         "get_tag was refused, which reads as 'absent' to a committer"
     );
     assert!(

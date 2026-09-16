@@ -150,13 +150,17 @@ impl crate::BlobStore for ObjectStoreBackend {
             .map_err(Self::map_err)
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<CasTag> {
-        self.inner
-            .head(&Self::path(key))
-            .await
-            .ok()
-            .and_then(|m| m.e_tag)
-            .map(CasTag::new)
+    async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
+        // ⚠️ `.ok()` was here, and it is the defect at its source: a 503 and a missing
+        // object produced the same `None`. Only NotFound is absence; everything else is a
+        // failed probe, and an object with no ETag is a backend that cannot fence — also
+        // absence of a tag, but not absence of the object, so it stays `Ok(None)` and the
+        // CAS that follows is refused by the capability guard rather than here.
+        match self.inner.head(&Self::path(key)).await {
+            Ok(m) => Ok(m.e_tag.map(CasTag::new)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(Self::map_err(e)),
+        }
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

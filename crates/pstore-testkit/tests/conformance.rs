@@ -194,7 +194,7 @@ async fn a_broken_backend_forwards_everything_it_does_not_break() {
     assert_eq!(&s.get_range(&k, 2..5).await.unwrap()[..], b"234");
     assert_eq!(&s.get_suffix(&k, 3).await.unwrap()[..], b"789");
     assert_eq!(s.head(&k).await.unwrap(), 10);
-    assert!(s.get_tag(&k).await.is_some());
+    assert!(s.get_tag(&k).await.unwrap().is_some());
     assert_eq!(s.get_with_tag(&k).await.unwrap().0.len(), 10);
     assert_eq!(s.list_unrestricted(&Key::new("a")).await.unwrap().len(), 1);
     // ...and the one it does break.

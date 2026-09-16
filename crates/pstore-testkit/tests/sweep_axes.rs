@@ -116,16 +116,32 @@ async fn a_point_on_an_unseeded_key_is_refused_not_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reads_and_slow_downs_never_reach_the_commit_loop() {
-    // ⚠️ Pins a gap rather than a behaviour, so a later claim that the axis covers "errors"
-    // has to face it. The loop's only read is `get_tag`, which returns `Option` and therefore
-    // has no error channel at all; `put_conditional` consults only the CAS classes.
+async fn a_point_under_read_errors_reports_the_probes_that_failed() {
+    // ⚠️ **This replaces `reads_and_slow_downs_never_reach_the_commit_loop`, on that test's
+    // own terms.** It pinned a gap — "the loop's only read is `get_tag`, which returns
+    // `Option` and therefore has no error channel at all" — and said in as many words that
+    // if the gap ever closed it should be *replaced rather than deleted*. M7b closed it:
+    // `get_tag` is fallible and `Faulty` injects into it, so a read fault now reaches the
+    // rebase. Backlog row 21.
     //
-    // ⚠️ **One writer, deliberately.** The first version of this test raced two writers and
-    // compared the totals against a clean run -- which compares two samples of a scheduler,
-    // not two fault configurations, and failed against correct code. Uncontended, the
-    // expected point is exact: four attempts, four commits, nothing abandoned.
-    let noisy = seeded(
+    // ⚠️ **One writer, deliberately**, for the reason the replaced test gave: two writers
+    // compare two samples of a scheduler rather than two fault configurations. The clean arm
+    // is still exactly four attempts and four commits, which is what makes the noisy arm's
+    // difference attributable to the faults.
+    let clean = seeded(&Key::new("k"), Faults::none()).await;
+    let c = sweep::contention_point(clean, Key::new("k"), 1, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        (c.attempts, c.commits, c.abandoned, c.lost, c.probe_failed),
+        (4, 4, 0, 0, 0),
+        "a clean run reported a failed probe"
+    );
+
+    // ⚠️ **M0c's exact configuration now refuses the point rather than reporting it**, which
+    // is the first half of the same finding: the seed probe is a read, and at 0.9 it is
+    // refused. Before M7b this configuration returned a row byte-identical to the clean one.
+    let hostile = seeded(
         &Key::new("k"),
         Faults {
             read_error: 0.9,
@@ -135,15 +151,94 @@ async fn reads_and_slow_downs_never_reach_the_commit_loop() {
         },
     )
     .await;
+    assert!(
+        matches!(
+            sweep::contention_point(hostile, Key::new("k"), 1, 4).await,
+            Err(SweepError::Probe { .. })
+        ),
+        "M0c's configuration still produced a point, so the probe has no error channel again"
+    );
+
+    // ⚠️ And at a rate the seed survives, the loop itself reports the refusals. 0.25, and the
+    // ceiling is not arbitrary: the point has to be **taken** to be read, and the seed probe
+    // is itself a read. At seed 11 the first probe is refused at 0.3 and above, so this test
+    // would abort with `Probe` before reaching the loop it measures. `Faulty` is deterministic
+    // per seed, so that is a fixed property of this fixture rather than flakiness -- and a
+    // fault stream that changes turns it into a loud `unwrap` on `Probe`, which is the right
+    // failure.
+    const RATE: f64 = 0.25;
+    let noisy = seeded(
+        &Key::new("k"),
+        Faults {
+            read_error: RATE,
+            ..Faults::none()
+        },
+    )
+    .await;
     let p = sweep::contention_point(noisy, Key::new("k"), 1, 4)
         .await
         .unwrap();
-    assert_eq!(
-        (p.attempts, p.commits, p.abandoned, p.lost),
-        (4, 4, 0, 0),
-        "a read, write or 503 fault reached the loop -- if that is now true, the axis can be \
-         widened and this test should be replaced rather than deleted"
+    // ⚠️ M0c measured a point **byte-identical** to the clean one under injected reads. That
+    // is the finding this milestone exists to close, so the assertion is a difference rather
+    // than a threshold.
+    assert!(
+        p.probe_failed > 0,
+        "at read_error {RATE} no probe was refused -- the point is {p:?}, and if it is still \
+         identical to the clean one the error channel is being swallowed somewhere"
     );
+    // ⚠️ And `probe_failed` is a **subset** of `abandoned`, not a second name for it: a
+    // counter incremented in the `Ok(None)` arm would pass the assertion above and fail here,
+    // because an absent key abandons without a refusal.
+    assert!(
+        p.probe_failed <= p.abandoned,
+        "more refused probes ({}) than abandoned rebases ({})",
+        p.probe_failed,
+        p.abandoned
+    );
+    assert_eq!(
+        p.commits + p.abandoned,
+        4,
+        "the conservation law broke under refused probes: {p:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unseeded_key_and_an_unreadable_one_are_different_errors() {
+    // ⚠️ Both abort the point, so collapsing them costs nothing at the call site — which is
+    // exactly why they were the same thing until M7b. "The seed did not land" and "the store
+    // refused to tell me" have different remedies, and only one of them is about contention.
+    let unreadable = seeded(
+        &Key::new("k"),
+        Faults {
+            read_error: 1.0,
+            ..Faults::none()
+        },
+    )
+    .await;
+    let err = sweep::contention_point(unreadable, Key::new("k"), 2, 2)
+        .await
+        .expect_err("a point was taken through a store that refused every read");
+    assert!(
+        matches!(err, SweepError::Probe { .. }),
+        "a refused seed probe was reported as {err}"
+    );
+
+    // ⚠️ The key is genuinely absent here: `cas_lost` refuses the seeding write and leaves
+    // every READ clean, so the probe answers "nothing is there" rather than failing. Taken
+    // from the test this arm replaces, `a_point_on_an_unseeded_key_is_refused_not_reported`,
+    // because the distinction only means something against a seed that really did not land.
+    let absent = Arc::new(Faulty::new(
+        MemoryStore::new(),
+        11,
+        Faults {
+            cas_lost: 1.0,
+            ..Faults::none()
+        },
+    ));
+    let err = sweep::contention_point(absent, Key::new("never"), 2, 2)
+        .await
+        .expect_err("a point was reported for a key that was never created");
+    assert!(matches!(err, SweepError::Unseeded(_)), "{err}");
 }
 
 #[tokio::test(start_paused = true)]

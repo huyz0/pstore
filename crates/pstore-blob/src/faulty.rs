@@ -238,9 +238,16 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         }
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<pstore_types::CasTag> {
+    async fn get_tag(&self, key: &Key) -> Result<Option<pstore_types::CasTag>, BlobError> {
+        // ⚠️ **The reason row 21 was a trait change and not a refactor.** This forwarded
+        // cleanly while every other read consulted `read_fault`, because there was nowhere
+        // to put the error — so the one read in the commit loop was the one read faults
+        // could not reach, and M0c's refusal axis could only ever cover 412 and 409.
         self.delay().await;
-        self.inner.get_tag(key).await
+        match self.read_fault() {
+            Some(e) => Err(e),
+            None => self.inner.get_tag(key).await,
+        }
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

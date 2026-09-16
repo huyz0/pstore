@@ -83,7 +83,7 @@ impl BlobStore for Broken {
         self.inner.get_with_tag(key).await
     }
 
-    async fn get_tag(&self, key: &Key) -> Option<CasTag> {
+    async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
         self.inner.get_tag(key).await
     }
 
