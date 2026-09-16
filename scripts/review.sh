@@ -26,6 +26,22 @@ mkdir -p "$DIR"
 # which would make round 1 crash rather than count 0. Caught by selftest-review.sh.
 rounds() { local n; n=$(ls "$DIR/${1}.r"*.packet 2>/dev/null | wc -l || true); echo "${n// /}"; }
 
+# ⚠️ The counter is keyed to the HEAD the review STARTED on, and a commit ends a review.
+# Without this the count was keyed on the branch name alone, so on a long-lived `main` it
+# accumulated rounds across unrelated changes -- observed reporting "round 4 of hard budget
+# 4" for a change whose review had not started, which REFUSES a change that has had no
+# rounds at all. Backlog row 22.
+#
+# ⚠️ Deliberately NOT keyed on the staged tree, the other candidate: the staged tree is what
+# CHANGES between rounds, so keying on it would reset the budget on every fix and delete the
+# mechanism. A HEAD that moves mid-review for an unrelated reason -- an amend, a rebase --
+# costs an extra round, which is the failure worth having.
+BASE="$DIR/${TAG}.base"
+HEAD_NOW=$(git rev-parse HEAD 2>/dev/null || echo none)
+if [ -f "$BASE" ] && [ "$(cat "$BASE")" != "$HEAD_NOW" ]; then
+  rm -f "$DIR/${TAG}.r"*.packet "$DIR/${TAG}.r"*.tree "$DIR/${TAG}.r"*.sha "$BASE"
+fi
+
 case "$CMD" in
   rounds) rounds "$TAG"; exit 0 ;;
   context) ;;
@@ -48,6 +64,10 @@ MSG
   exit 1
 fi
 
+echo "$HEAD_NOW" > "$BASE"
+# The staged tree IS what this round reviews, so it is what the next round diffs against.
+# ⚠️ Recorded before the packet, unlike the sha it replaces, which was written after.
+TREE=$(git write-tree 2>/dev/null || echo "")
 PACKET="$DIR/${TAG}.r${N}.packet"
 {
   echo "=== ROUND $N of 2 (hard budget $BUDGET) for '$TAG' ==="
@@ -74,11 +94,14 @@ PACKET="$DIR/${TAG}.r${N}.packet"
     # ⚠️ A verify round gets the DELTA, not the whole diff again. Re-sending the full
     # diff is what made packets in the source project 9,977 lines each, six rounds
     # running -- roughly 700k tokens on a single task.
-    PREV="$DIR/${TAG}.r$((N-1)).sha"
+    # ⚠️ Tree to tree, not sha to worktree. The old form diffed the worktree against the
+    # sha recorded AFTER the previous packet -- which on a moved HEAD is an already-committed
+    # diff, and on an unmoved one is the whole diff again rather than the delta it claims.
+    PREV="$DIR/${TAG}.r$((N-1)).tree"
     echo "=== DELTA SINCE ROUND $((N-1)) (the full diff was reviewed then) ==="
-    [ -f "$PREV" ] && git diff "$(cat "$PREV")" -- . || git diff --cached
+    if [ -s "$PREV" ] && [ -n "$TREE" ]; then git diff "$(cat "$PREV")" "$TREE"; else git diff --cached; fi
   fi
 } > "$PACKET"
-git rev-parse HEAD > "$DIR/${TAG}.r${N}.sha" 2>/dev/null || true
+echo "$TREE" > "$DIR/${TAG}.r${N}.tree"
 cat "$PACKET"
 echo "--- packet: $PACKET ($(wc -l < "$PACKET") lines) ---" >&2
