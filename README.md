@@ -12,9 +12,11 @@ hybrid search — where the blob store is the **only** durable tier, for data *a
 | Local state | RAM + NVMe are pure cache. Nodes own nothing. |
 | Blob API discipline | LIST banned on hot paths; writes batched; reads free. |
 
-**Status: building.** 13 crates, ~44k lines of Rust, 722 tests, 30 milestone ledgers.
-M0a, M1–M5 and M6 are through their exit criteria — with M6's recorded as **partly met**,
-because one half of it was measured and failed. What is done, what is not, and what is
+**Status: building.** 13 crates, ~44k lines of Rust, 725 tests, 31 milestone ledgers.
+M0a, M1–M5, M6 and the first two pieces of M7 are through their exit criteria — with M6's
+recorded as **partly met**, because one half of it was measured and failed, and then measured
+again to decide it is not worth meeting: the byte cost it names is 0.05 ms at the shape a real
+tenant has, against the 30 ms round trip that fixing it would add. What is done, what is not, and what is
 blocked on a cloud account rather than on effort is in
 [the roadmap](docs/research/11-design/roadmap.md) and
 [the backlog](docs/milestones/BACKLOG.md).
