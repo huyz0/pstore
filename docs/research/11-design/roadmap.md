@@ -255,7 +255,7 @@ parser, language analyzers, phrase queries, positions and trigram regex.
 |---|---|
 | 1M indexes | **met** — 1,000,000 tenants × 50 index names seeded, folded and enumerated ([M6i](../../milestones/M6i/VERIFIED.md)) |
 | Zero LISTs on any hot path | **met** — the request-class counter reads 0 after seeding, folding, the census, and every open |
-| Open latency unaffected by index count | ⚠️ **met across tenants, NOT met within one tenant.** Round trips are flat everywhere — 3 reads at 1 index and at 5,000, at 1 tenant and at 1,000,000. **Bytes are not**: HEAD is one object read whole, so a tenant pays ~**106 bytes per index it owns** on every open of every *other* index, and at 5,000 indexes 98.6% of an open is manifest. Measured, pinned by a test, and deliberately not fixed here ([M6i](../../milestones/M6i/VERIFIED.md)) |
+| Open latency unaffected by index count | ⚠️ **met across tenants, NOT met within one tenant.** Round trips are flat everywhere — 3 reads at 1 index and at 5,000, at 1 tenant and at 1,000,000. **Bytes are not**: HEAD is one object read whole, so a tenant pays ~**106 bytes per index it owns** on every open of every *other* index, and at 5,000 indexes 98.6% of an open is manifest. Measured, pinned by a test, and deliberately not fixed here ([M6i](../../milestones/M6i/VERIFIED.md)) — and **deliberately not fixed at all**, since [M7b](../../milestones/M7b/VERIFIED.md) measured the trade: 106 bytes an index is **0.05 ms** at K=50 against the **30 ms** round trip any layout avoiding a whole-manifest read must add, so the crossover is K ≈ 29,677 against a product ceiling of 50 |
 | Enumeration cost independent of tenants | **met** — 32,769 reads at 200,000 tenants and at 1,000,000, both exactly `2 × width + 1` |
 
 ⚠️ **So M6's exit is not fully met**, and the unmet half is a byte cost with a number rather
@@ -321,6 +321,17 @@ runs the ten-probe suite against MinIO, Azurite and fake-gcs-server and checks t
 in, `--check` fails when a backend changes under us, and a backend whose profile cannot fence
 is now **refused** at every door and at every CAS in `pstore-engine` and `pstore-catalog` —
 a rule three documents stated and nothing enforced. Closes M0a.12 and M0a.13.
+
+#### M7b — the four rows the backlog left open
+→ [`docs/milestones/M7b/SPEC.md`](../../milestones/M7b/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7b/VERIFIED.md)
+
+**Done.** Not a subject but a provenance: each row is a previous milestone reporting something
+it found and did not fix, and after this the carried-forward list is empty. `review.sh`'s round
+counter no longer charges a change for rounds spent on another one; `Split::head` has the
+caller that kills its mutant; **`BlobStore::get_tag` is fallible**, so a refused probe is no
+longer indistinguishable from an absent object and M0c's refusal axis reaches the commit loop's
+only read; and row 19 is closed **by measuring the trade rather than by building the layout**.
 
 ⚠️ **Two corrections came out of measuring rather than reading**, which is the whole argument
 for a measured matrix: [C-13](../09-rust-stack/dev-and-test-environment.md) — MinIO's
