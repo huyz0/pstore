@@ -55,6 +55,13 @@ taken under injected read errors is no longer byte-identical to a clean one, whi
 measured and could not fix. `SweepError::Unseeded` keeps its meaning and gains a sibling,
 `SweepError::Probe`, for a seed probe that **errored** rather than found nothing.
 
+⚠️ **Amended after review round 1, as row 23** — the finding is a consequence of this
+milestone's own change, so it is closed here rather than carried. `Congested::get_tag` forwards
+directly while every other read goes through `with_retry`. That was **forced** until now: there
+was no error to retry. It no longer is, so a 503 on the commit loop's only read abandons the
+rebase instead of backing off — and the AIMD limit never learns about the throttle either,
+because only `with_retry` calls `on_slow_down`. The probe joins the other reads.
+
 **Does not change** `put_conditional`, which still cannot carry a 503 — that is an
 `object_store` and fake-backend question, named in M0c and still open.
 
@@ -93,6 +100,11 @@ for this row is a **number and a decision**, in the ledger, as rows 6 and 6b wer
     decision, and `docs/milestones/BACKLOG.md` carries no open row afterwards.
 11. Region coverage ≥95% on the changed crates; the mutants added by the changed modules are
     caught, or named as equivalent with the reason on the line.
+12. **`Congested::get_tag` retries a transient 503 and gives up on a permanent one**: with
+    `slow_down_first_n: 1` the probe **succeeds** and `attempts()` is exactly **2**; at
+    `slow_down: 1.0` it returns `SlowDown` after at most `MAX_ATTEMPTS`, never forever. And
+    one 503 on a probe **halves the concurrency limit** — 32 → 16 — which is the half a
+    direction-only assertion cannot see.
 
 ## Test plan
 
@@ -106,6 +118,7 @@ for this row is a **number and a decision**, in the ledger, as rows 6 and 6b wer
 | 6 | `a_point_under_read_errors_reports_the_probes_that_failed` | `probe_failed` incremented in the `Ok(None)` arm instead of the `Err` arm, which makes it a duplicate of `abandoned` |
 | 7 | `an_unseeded_key_and_an_unreadable_one_are_different_errors` | both mapped to `Unseeded`, which is the defect one level up |
 | 9 | `cargo run --example head_cost`, and the existing `an_open_reads_the_whole_head_including_the_indexes_it_is_not_opening` | an example that prints a constant: the test pins the relationship the example prints |
+| 12 | `a_throttled_probe_is_retried_like_every_other_read` | the direct forward restored, which is silent: the probe still answers, just without backing off or cutting the limit. `attempts() == 2` kills "no retry"; the halved limit kills a retry that does not call `on_slow_down`; the bounded arm kills a retry loop with no ceiling |
 
 ⚠️ **Criterion 5 is the load-bearing one.** `Faulty::get_tag` does not call `read_fault` today
 *because it has nowhere to put the error* — so the signature change is not a refactor; it is the
@@ -147,3 +160,4 @@ leaves `Faulty` forwarding cleanly has done none of the work.
 | M7b.3 | `get_tag` becomes fallible, `Faulty` injects into it, and the sweep counts failed probes |
 | M7b.4 | `head_cost` example, the crossover, and row 19's decision |
 | M7b.5 | The ledger, the backlog, and the roadmap's M6 exit row |
+| M7b.6 | Row 23: the probe backs off like every other read |

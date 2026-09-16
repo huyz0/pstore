@@ -80,12 +80,14 @@ every segment forever, not the cost of waiting.
 Every row above and every row those rows created is closed — by building it, or by measuring
 it and deciding not to. The last four, which M0c and M6i opened and could not close, are
 closed by **[M7b](M7b/SPEC.md)** ([VERIFIED](M7b/VERIFIED.md)). What remains is the **Blocked**
-table below, of which no entry is blocked on effort — and **one row this milestone's own
-review opened**, which is where a minor finding goes rather than into a third round.
+table below, of which no entry is blocked on effort. ⚠️ **Row 23 below was opened by M7b's own
+review and closed by M7b**, in its own commit rather than in the round that found it — which is
+what "a minor is filed, not fixed mid-round" is for. It is kept rather than deleted because the
+row is the record of how it was found.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 23 | ⚠️ **`Congested::get_tag` is the only read that is not retried.** Every other read — `get`, `get_range`, `get_with_tag`, `get_suffix`, `head` — goes through `with_retry`, which backs off on `BlobError::SlowDown`. The probe forwards directly. That was **forced** until [M7b](M7b/VERIFIED.md), because there was no error to retry; now a 503 on the commit loop's only read abandons the rebase instead of backing off, and a 503 is what this project's own prose calls the most realistic error a CAS path meets at scale. ⚠️ **Not a regression** — the old signature could not retry at all — and deliberately not fixed in the milestone that revealed it: the change is on the retry path of every decorated read, which is its own blast radius. `put_conditional` carries a comment saying why it is *not* retried; the probe carries none, and whichever way this is decided it should. | [M7b](M7b/VERIFIED.md) review round 1 | S |
+| ~~23~~ | ⚠️ **`Congested::get_tag` is the only read that is not retried. DONE** ([M7b](M7b/VERIFIED.md) criterion 12). Every other read — `get`, `get_range`, `get_with_tag`, `get_suffix`, `head` — goes through `with_retry`, which backs off on `BlobError::SlowDown`. The probe forwards directly. That was **forced** until [M7b](M7b/VERIFIED.md), because there was no error to retry; now a 503 on the commit loop's only read abandons the rebase instead of backing off, and a 503 is what this project's own prose calls the most realistic error a CAS path meets at scale. ⚠️ **Not a regression** — the old signature could not retry at all — and deliberately not fixed in the milestone that revealed it: the change is on the retry path of every decorated read, which is its own blast radius. `put_conditional` carries a comment saying why it is *not* retried; the probe carries none, and whichever way this is decided it should. ⚠️ **Decided: it is retried.** The probe is a read and a 503 is a normal signal, so it goes through `with_retry` like `get`, `head` and the rest — and the second half of the defect is why the decision is not close: `on_slow_down` is reached only from the retry loop, so a throttled probe left the limit at **full concurrency against a prefix that is shedding**. The comment `put_conditional` carries is now matched by one on the probe saying why it *is* retried. | [M7b](M7b/VERIFIED.md) review round 1 | S |
 
 | # | Task | From | Size |
 |---|---|---|---|

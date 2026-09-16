@@ -94,6 +94,24 @@ was observed by running the new selftest against the **unmodified** `review.sh` 
     were applied by hand against
     `the_split_store_routes_head_by_key_prefix` and read, as criterion 4 records.
 
+12. **The probe backs off like every other read** —
+    `a_throttled_probe_is_retried_like_every_other_read`
+    (`cargo test -p pstore-blob --test faults`). With `slow_down_first_n: 1` the probe
+    succeeds and `attempts()` is **2**; one 503 takes the limit **32 → 16**; at
+    `slow_down: 1.0` it returns `SlowDown` and stops, with `attempts()` between 2 and 5.
+    ⚠️ **Observed red against the code this milestone shipped two commits earlier** — the
+    direct forward — which is the point: the defect is *silent*, because the probe still
+    answers. What differs is the backoff and the cut, so both are asserted. ⚠️ This is row
+    23, opened by this milestone's own review round 1 and closed here rather than carried,
+    because it is a consequence of this milestone's own change: before `get_tag` was
+    fallible, `with_retry` had nothing to inspect and the direct forward was forced.
+    ⚠️ Swept: `docker compose -f dev/docker-compose.yml exec dev scripts/mutants.sh --file
+    crates/pstore-blob/src/congestion.rs` — **25 of 25 viable mutants caught**, 7 unviable,
+    no survivors. ⚠️ Review round 1 also asked for an exact retry count rather than a range,
+    and it is right: `<= 5` against a `MAX_ATTEMPTS` of 4 leaves room to grow the budget 25%
+    with the suite green. This test asserts **4**. The older `retries_are_bounded` still uses
+    the range, and is left alone rather than widened into this change.
+
 ## Drift, recorded
 
 ⚠️ **One test was replaced, on its own terms.**
@@ -120,8 +138,10 @@ left behind by the search for the rate the seed probe survives. Both say 0.25 no
 value was re-run. `check-verified.py` resolves a test *name* and cannot see a constant — the
 reviewer is the only thing that catches this class, which is the argument for the round.
 
-⚠️ **One minor is a backlog row, not a fix** — row 23, `Congested::get_tag` being the only
-read that is not retried on a 503.
+⚠️ **One minor became a backlog row and then a fix.** Row 23 — `Congested::get_tag` being the
+only read not retried on a 503 — was filed rather than fixed in round 2, which is what the
+review skill asks for. It is closed here as criterion 12 and task M7b.6, in its own commit with
+its own red, rather than smuggled into the round that found it.
 
 ⚠️ **`503` still cannot be injected into a conditional write.** Row 21 is closed for the
 *read* half of the commit loop only. `put_conditional` consults the CAS classes alone, so the

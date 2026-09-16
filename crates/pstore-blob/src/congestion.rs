@@ -145,7 +145,13 @@ impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
     }
 
     async fn get_tag(&self, key: &Key) -> Result<Option<pstore_types::CasTag>, BlobError> {
-        self.inner.get_tag(key).await
+        // ⚠️ Retried like every other read, and it is the newest of them: this forwarded
+        // directly until `get_tag` became fallible, because a method returning `Option` has
+        // nothing for `with_retry` to inspect. It is the rebase step of the commit protocol,
+        // so a 503 here abandoned a commit that a single backoff would have landed -- and
+        // `on_slow_down` was never reached, leaving the limit at full concurrency against a
+        // prefix that is shedding. Backlog row 23.
+        self.with_retry(|| self.inner.get_tag(key)).await
     }
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {

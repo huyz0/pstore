@@ -710,3 +710,59 @@ async fn a_refused_probe_is_an_error_and_an_absent_key_is_not() {
         "a refused probe was not billed as the read it issued"
     );
 }
+
+/// ⚠️ **Backlog row 23, opened by M7b's own review.** The probe was the only read that did
+/// not go through `with_retry`, and until `get_tag` became fallible that was forced: there
+/// was no error to retry. Now a 503 on the **commit loop's only read** would abandon the
+/// rebase instead of backing off — and the AIMD limit would never learn about the throttle
+/// either, because `on_slow_down` is reached only from the retry loop.
+///
+/// The direct forward is a *silent* defect: the probe still answers. So this pins the two
+/// things that differ — the retry, and the cut.
+#[tokio::test]
+async fn a_throttled_probe_is_retried_like_every_other_read() {
+    let inner = MemoryStore::new();
+    inner.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    let flaky = Faulty::new(
+        inner,
+        1,
+        Faults {
+            slow_down_first_n: 1,
+            ..Faults::none()
+        },
+    );
+    let s = Congested::new(flaky, 32);
+    assert!(
+        s.get_tag(&k("a")).await.unwrap().is_some(),
+        "a transient 503 on the probe was not retried"
+    );
+    assert_eq!(s.attempts(), 2, "exactly one retry, like `get`");
+    // ⚠️ And the throttle reached the controller. A retry that does not cut the limit
+    // answers this test's first assertion and leaves the client hammering a shedding
+    // prefix at full concurrency.
+    assert_eq!(
+        s.limit(),
+        16,
+        "one 503 on a probe must halve 32, not floor it"
+    );
+
+    // A permanent 503 must still terminate: the retry is bounded, or a transient stressor
+    // becomes a metastable failure.
+    let always = Faulty::new(
+        MemoryStore::new(),
+        1,
+        Faults {
+            slow_down: 1.0,
+            ..Faults::none()
+        },
+    );
+    let s = Congested::new(always, 8);
+    assert!(matches!(
+        s.get_tag(&k("a")).await.unwrap_err(),
+        BlobError::SlowDown
+    ));
+    // ⚠️ The exact count, not a range. `<= 5` -- which the older `retries_are_bounded`
+    // still uses -- leaves a slot of slack above the real bound, so raising
+    // `MAX_ATTEMPTS` from 4 to 5 would grow the retry budget 25% with the suite green.
+    assert_eq!(s.attempts(), 4, "the bound is MAX_ATTEMPTS, exactly");
+}
