@@ -86,6 +86,10 @@ pub struct QueryRequest {
     /// The BM25 leg's query text.
     #[serde(default)]
     pub text: Option<String>,
+    /// Answer as the index stood at this epoch. ⚠️ Bounded by what GC has reaped: below the
+    /// horizon the request is **refused** rather than answered with a short index.
+    #[serde(default)]
+    pub as_of: Option<u64>,
     /// How many results. **Zero is refused**: a query that can return nothing is a request
     /// nobody meant to make.
     #[serde(default = "default_top_k")]
@@ -167,6 +171,21 @@ pub struct IndexList {
     /// Every index HEAD names, **unioned with this process's unfolded ones**, in name order.
     pub indexes: Vec<String>,
     /// What the enumeration cost. Zero LISTs, which is the claim worth reporting.
+    pub cost: Cost,
+}
+
+/// `POST /v1/admin/gc`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GcResponse {
+    /// The epoch the reap committed.
+    pub epoch: u64,
+    /// Objects deleted.
+    pub reaped: usize,
+    /// ⚠️ The oldest epoch `as_of` can still answer. Reported because a caller that has been
+    /// time-travelling needs to learn where its history now ends, and the only alternative to
+    /// telling it is letting it find out by being refused.
+    pub reaped_before: u64,
+    /// What it cost.
     pub cost: Cost,
 }
 

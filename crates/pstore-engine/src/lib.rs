@@ -6,7 +6,7 @@ mod head;
 pub mod lanes;
 
 pub use bundle::Entry;
-pub use head::{Head, HeadAt, IndexSchema, SegmentRef};
+pub use head::{Head, HeadAt, IndexSchema, SegmentRef, TimeTravel};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{Document, Filter, Segment};
@@ -108,6 +108,9 @@ pub enum EngineError {
         /// What the rows carry.
         got: String,
     },
+    /// The epoch asked for cannot be reconstructed.
+    #[error(transparent)]
+    TimeTravel(#[from] head::TimeTravel),
     /// A lane's tail could not be found within the probe bound.
     ///
     /// Not "the lane is too long" in practice — it means the store kept answering, which
@@ -623,6 +626,20 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Records that this engine committed `epoch`.
+    ///
+    /// ⚠️ **Every commit, not just a fold's.** `gc` and `compact` advance HEAD too, and until
+    /// M7e only `fold` wrote this down — so after a reap the engine reported an epoch one
+    /// behind the durable one, and so did every `meta.epoch` a query served from that instance
+    /// until the next fold. Found by code review, measured through the API: a gc that
+    /// committed epoch 6 answered `"epoch": 5`.
+    fn record_commit(&self, epoch: Epoch) {
+        *self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+    }
+
     /// The last epoch this engine committed.
     #[must_use]
     pub fn epoch(&self) -> Epoch {
@@ -797,6 +814,17 @@ impl<S: BlobStore> Engine<S> {
         names.sort_unstable();
         names.dedup();
         names
+    }
+
+    /// The oldest epoch `as_of` can still answer, from the HEAD it reads. **One read.**
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn reap_horizon(&self) -> Result<u64, EngineError> {
+        Ok(head::read(&*self.store, self.tenant)
+            .await?
+            .head
+            .reaped_before)
     }
 
     /// Every index HEAD names for this tenant, in name order. **One read, no LIST.**
@@ -1158,10 +1186,7 @@ impl<S: BlobStore> Engine<S> {
                     m.generation += 1;
                     m.durable.clear();
                     drop(m);
-                    *self
-                        .committed
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+                    self.record_commit(epoch);
                     return Ok(epoch);
                 }
                 Err(EngineError::Lost | EngineError::Contended)
@@ -1256,11 +1281,15 @@ impl<S: BlobStore> Engine<S> {
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
+            next.record_reap(horizon);
             for e in &due {
                 next.graveyard.remove(e);
             }
             match head::commit(&*self.store, self.tenant, &at, &next).await {
-                Ok(_) => return Ok(doomed.len()),
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    return Ok(doomed.len());
+                }
                 Err(EngineError::Lost | EngineError::Contended)
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
@@ -1332,6 +1361,33 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// `RA = n Rpar + 1 W + 1 commit`, for any *n*.
     pub async fn compact(&self, index: &str) -> Result<Option<Epoch>, EngineError> {
+        self.compact_inner(
+            index,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// `compact`, with `interfere` awaited **between the seal and the first commit attempt**,
+    /// so a test can force the retry that used to leave a key stamped with the wrong epoch.
+    ///
+    /// ⚠️ Interfering *before* `compact` proves nothing: the compaction would simply read the
+    /// newer HEAD and derive the right key first time. The window that mattered is the one
+    /// between writing the object and conditioning on the world.
+    #[doc(hidden)]
+    pub async fn compact_with_interference_for_test(
+        &self,
+        index: &str,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Option<Epoch>, EngineError> {
+        self.compact_inner(index, Some(interfere)).await
+    }
+
+    async fn compact_inner(
+        &self,
+        index: &str,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Option<Epoch>, EngineError> {
         require_fencing(&*self.store)?;
         let at = head::read(&*self.store, self.tenant).await?;
         let inputs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
@@ -1384,18 +1440,34 @@ impl<S: BlobStore> Engine<S> {
             }
         };
 
-        let out_key = self.compacted_key(at.head.epoch.next(), index);
-        // The single W (two, for an index with a sparse field). Written BEFORE the commit and
-        // never rewritten on a retry: a rebase changes which HEAD we condition on, not what
-        // we merged.
+        let mut out_key = self.compacted_key(at.head.epoch.next(), index);
+        // The single W (two, for an index with a sparse field). Written BEFORE the commit.
         self.seal(&out_key, &rows, text_field).await?;
-        let out = SegmentRef {
-            key: out_key.as_str().to_owned(),
-            rows: rows.len() as u32,
-        };
+        // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
+        // buried rather than left for M6e's orphan sweeper.
+        let mut stale: Vec<Key> = Vec::new();
+        if let Some(f) = interfere {
+            f.await;
+        }
 
         let mut at = at;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            // ⚠️ **The key is re-derived whenever a retry moves the epoch, and the bytes are
+            // re-PUT at it.** A key used to be derived once and kept, so a compaction that lost
+            // a CAS wrote `N+1` and committed it at `N+2` — and the manifest of `N+1` then
+            // reconstructed as the merged segment AND both its inputs, because a segment's key
+            // epoch is what says when it became live. One extra PUT on a contended compaction,
+            // no rebuild, and the invariant every past epoch depends on holds by construction.
+            let want = self.compacted_key(at.head.epoch.next(), index);
+            if want != out_key {
+                self.seal(&want, &rows, text_field).await?;
+                stale.push(out_key.clone());
+                out_key = want;
+            }
+            let out = SegmentRef {
+                key: out_key.as_str().to_owned(),
+                rows: rows.len() as u32,
+            };
             let current: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
             // ⚠️ The discard condition. If any input is no longer named by HEAD, another
             // compactor published this merge and ours is stale — republishing it would
@@ -1426,9 +1498,23 @@ impl<S: BlobStore> Engine<S> {
                 .entry(next.epoch.0)
                 .or_default()
                 .extend(inputs.iter().map(|i| i.key.clone()));
+            // ⚠️ **Buried under ITS OWN key epoch, not this one.** The graveyard means "was
+            // live, and stopped being referenced here"; a key that was never live has no such
+            // epoch, and burying it at the committing one would put it straight back into the
+            // arm that reconstructs a past manifest — the merge and its inputs, together.
+            for k in &stale {
+                let born = head::key_epoch(k.as_str()).unwrap_or(next.epoch.0);
+                next.graveyard
+                    .entry(born)
+                    .or_default()
+                    .push(k.as_str().to_owned());
+            }
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
-                Ok(epoch) => return Ok(Some(epoch)),
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    return Ok(Some(epoch));
+                }
                 Err(e @ (EngineError::Lost | EngineError::Contended))
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
@@ -1660,6 +1746,70 @@ impl<S: BlobStore> Engine<S> {
             hits,
             ids,
             unfolded,
+            unfolded_at,
+            segments: refs,
+        })
+    }
+
+    /// The same query, against the manifest as it stood at `epoch`.
+    ///
+    /// ⚠️ **No freshness layer.** `query` fuses this process's unfolded rows into every answer,
+    /// and those rows are newer than any past epoch by definition — an `as_of` that fused them
+    /// would be the present wearing a date.
+    ///
+    /// # Errors
+    /// [`EngineError::TimeTravel`] outside the reconstructible window, or as [`Self::query`].
+    pub async fn query_as_of(
+        &self,
+        index: &str,
+        epoch: Epoch,
+        prefetch: &[pstore_query::Prefetch],
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+    ) -> Result<Answer, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
+        let then = at.head.as_of(epoch)?;
+        let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
+        let targets: Vec<pstore_query::Target> = refs
+            .iter()
+            .map(|r| {
+                let segment = Key::new(r.key.clone());
+                pstore_query::Target {
+                    centroids: pstore_index::vec_index::centroid_key(&segment),
+                    segment,
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(Answer {
+                hits: Vec::new(),
+                ids: Vec::new(),
+                unfolded: Vec::new(),
+                unfolded_at: 0,
+                segments: refs,
+            });
+        }
+        // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
+        // freshness layer would occupy, and `resolve` reads a hit carrying it as "look in the
+        // unfolded rows". A past answer has no unfolded rows — but segment **0** is a real
+        // segment, so setting it to zero made every hit in the first segment resolve against
+        // an empty list and vanish. The test found it; the live path has always used this
+        // value for the same reason.
+        let unfolded_at = refs.len();
+        let resolved = pstore_query::query_ids(&*self.store, &targets, prefetch, fusion, top_k)
+            .await
+            .map_err(|e| match e {
+                pstore_query::QueryError::Format(
+                    pstore_format::FormatError::DimensionMismatch { expected, got },
+                ) => EngineError::DimensionMismatch { expected, got },
+                other => EngineError::Query(other.to_string()),
+            })?;
+        let (hits, ids) = resolved.into_iter().unzip();
+        Ok(Answer {
+            hits,
+            ids,
+            unfolded: Vec::new(),
             unfolded_at,
             segments: refs,
         })

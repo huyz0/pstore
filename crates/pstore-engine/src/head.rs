@@ -35,6 +35,31 @@ pub struct IndexSchema {
     pub text_field: String,
 }
 
+/// Why a past epoch cannot be answered.
+///
+/// ⚠️ **A refusal, not a partial index.** Both arms exist because answering anyway would be
+/// worse than not answering: one would report an index missing the segments GC deleted, the
+/// other would report the present wearing a date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TimeTravel {
+    /// The epoch is below the horizon: GC has deleted objects that manifest named.
+    #[error("epoch {asked} is below the reap horizon {horizon}: its objects are gone")]
+    Reaped {
+        /// What the caller asked for.
+        asked: u64,
+        /// The oldest epoch still reconstructible.
+        horizon: u64,
+    },
+    /// The epoch has not happened.
+    #[error("epoch {asked} is ahead of the current epoch {current}")]
+    Future {
+        /// What the caller asked for.
+        asked: u64,
+        /// Where the tenant actually is.
+        current: u64,
+    },
+}
+
 /// A tenant's committed state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Head {
@@ -60,6 +85,10 @@ pub struct Head {
     /// all-or-nothing across every index in the bundle set, so one contradicting row would
     /// stop every later fold for the whole tenant, forever.
     pub schema_rejects: BTreeMap<String, u64>,
+    /// The oldest epoch that can still be reconstructed, because `gc` has deleted everything
+    /// buried at or below it. ⚠️ A third optional trailing section: absent means **zero**, so
+    /// every HEAD written before M7e still decodes and still time-travels to its beginning.
+    pub reaped_before: u64,
     /// Keys that **stopped being referenced** at a given epoch, newest last.
     ///
     /// ⚠️ This is what lets GC run with **zero LIST**. A bucket enumeration would tell us
@@ -123,6 +152,7 @@ impl Head {
             put_str(&mut out, name);
             out.extend_from_slice(&n.to_le_bytes());
         }
+        out.extend_from_slice(&self.reaped_before.to_le_bytes());
         out
     }
 
@@ -188,7 +218,87 @@ impl Head {
             let name = c.string()?;
             h.schema_rejects.insert(name, c.u64()?);
         }
+        if c.at_end() {
+            return Ok(h);
+        }
+        // ⚠️ A bare `u64` with no count in front, so a HEAD truncated one to seven bytes into
+        // it is `CorruptHead` rather than a horizon of zero — `take` gives that for free, and
+        // a horizon read short is a horizon that refuses nothing.
+        h.reaped_before = c.u64()?;
         Ok(h)
+    }
+
+    /// Records that GC has deleted everything buried at or below `horizon`.
+    ///
+    /// ⚠️ **Never lowers it.** `gc`'s horizon is derived from whatever retention its caller
+    /// passed, so a wider retention computes a smaller number; letting it land would reopen a
+    /// window whose objects are already deleted. The sequence cannot occur through `gc` today
+    /// — a pass with nothing due returns before it commits — which is exactly why this is a
+    /// function with its own test rather than a line inside `gc` that nothing can reach.
+    pub fn record_reap(&mut self, horizon: u64) {
+        self.reaped_before = self.reaped_before.max(horizon);
+    }
+
+    /// This manifest as it stood at `epoch`.
+    ///
+    /// ⚠️ **Reconstruction, not an archive.** A segment's key carries the epoch it became live
+    /// at, and the graveyard records the epoch each key stopped being referenced at, so the
+    /// manifest of any past epoch is arithmetic over the current one: **zero extra writes on
+    /// the commit path, zero extra reads here.**
+    ///
+    /// ⚠️ Exact in `indexes` and **nothing else**. The graveyard records keys, not row counts,
+    /// so a resurrected `SegmentRef` carries `rows: 0`; `schemas`, `schema_rejects` and the
+    /// watermarks are the present's. A query reads none of them — the segment footer has the
+    /// truth — which is why this is query-only.
+    ///
+    /// # Errors
+    /// [`TimeTravel::Reaped`] below the horizon, [`TimeTravel::Future`] above the present.
+    pub fn as_of(&self, epoch: Epoch) -> Result<Self, TimeTravel> {
+        if epoch.0 > self.epoch.0 {
+            return Err(TimeTravel::Future {
+                asked: epoch.0,
+                current: self.epoch.0,
+            });
+        }
+        if epoch.0 < self.reaped_before {
+            return Err(TimeTravel::Reaped {
+                asked: epoch.0,
+                horizon: self.reaped_before,
+            });
+        }
+        let mut out = self.clone();
+        out.epoch = epoch;
+        // Live segments born at or before the epoch.
+        for refs in out.indexes.values_mut() {
+            refs.retain(|r| key_epoch(&r.key).is_some_and(|born| born <= epoch.0));
+        }
+        // ⚠️ Plus what was alive then and has since been buried — **buried strictly after the
+        // epoch**, because a key buried AT `E` was already gone from the manifest at `E`.
+        for (buried, keys) in &self.graveyard {
+            if *buried <= epoch.0 {
+                continue;
+            }
+            for key in keys {
+                // ⚠️ The graveyard holds **WAL bundles too**, and a bundle key ends in a
+                // 16-digit zero-padded *sequence number* sitting exactly where a loose parser
+                // would read an epoch. The index comes from the key's own path, so a bundle
+                // simply has no index to belong to.
+                let (Some(index), Some(born)) = (key_index(key), key_epoch(key)) else {
+                    continue;
+                };
+                if born <= epoch.0 {
+                    out.indexes.entry(index).or_default().push(SegmentRef {
+                        key: key.clone(),
+                        rows: 0,
+                    });
+                }
+            }
+        }
+        out.indexes.retain(|_, refs| !refs.is_empty());
+        for refs in out.indexes.values_mut() {
+            refs.sort_by(|a, b| a.key.cmp(&b.key));
+        }
+        Ok(out)
     }
 
     /// Whether this lane's sequence has already been folded into a committed epoch.
@@ -237,6 +347,21 @@ impl Cur<'_> {
         let n = self.u32()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| EngineError::CorruptHead)
     }
+}
+
+/// The epoch a segment key was born at: `…/seg/L0/{epoch:020}-{lane:016x}.seg`.
+pub(crate) fn key_epoch(key: &str) -> Option<u64> {
+    key.rsplit_once('/')?.1.split('-').next()?.parse().ok()
+}
+
+/// The index a segment key belongs to, or `None` if it is not a segment key at all.
+///
+/// ⚠️ The prefix is what separates a segment from a WAL bundle, which lives under `…/wal/` and
+/// whose filename is a sequence number in the same shape as an epoch.
+fn key_index(key: &str) -> Option<String> {
+    let (before, _) = key.split_once("/seg/")?;
+    let (_, index) = before.split_once("/idx/")?;
+    (!index.is_empty()).then(|| index.to_owned())
 }
 
 /// HEAD as it was read, with the tag the next write must be conditioned on.

@@ -10,7 +10,7 @@
 //! to anyone, and M7c's spec says so in one place rather than pretending.
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -19,13 +19,18 @@ use pstore_engine::{Engine, EngineError};
 use pstore_format::Document;
 use pstore_types::{LaneId, TenantId};
 use std::collections::HashMap;
+
+/// Epochs of history kept when a reap does not say. ⚠️ Deliberately generous: the cost of
+/// keeping a graveyard entry is bytes in HEAD, and the cost of reaping one is a caller's
+/// history.
+const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
 mod types;
 pub use types::{
-    Cost, ErrorBody, FoldResponse, IndexList, IndexSummary, QueryMeta, QueryRequest, QueryResponse,
-    ResultRow, WriteRequest, WriteResponse,
+    Cost, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, QueryMeta, QueryRequest,
+    QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
 };
 
 /// Why a server refused to start.
@@ -101,6 +106,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 axum::routing::patch(patch_schema),
             )
             .route("/v1/admin/fold", post(fold_tenant::<S>))
+            .route("/v1/admin/gc", post(gc_tenant::<S>))
             .with_state(self)
     }
 
@@ -212,6 +218,13 @@ impl From<EngineError> for ApiError {
             // through to `500 internal` -- the exact defect M7c's typed `DimensionMismatch`
             // was added to fix, repeated one milestone later, which is why M7d's spec made
             // the error-table arm an acceptance criterion of its own.
+            // ⚠️ A caller asking for an epoch outside the window asked wrongly, and can tell
+            // from the message which bound it crossed. Without this arm it is a `500`.
+            EngineError::TimeTravel(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "time_travel_horizon",
+                e.to_string(),
+            ),
             EngineError::SchemaConflict { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
@@ -336,14 +349,33 @@ async fn query_index<S: BlobStore + 'static>(
     // the query already read -- asking first would double the cost of every query, and
     // resolving afterwards against a second read would race a fold. `Answer::segments` is
     // what carries it.
-    let answer = engine
-        .query(
-            &index,
-            &legs,
-            pstore_query::Fusion::Rrf { k: 60.0 },
-            req.top_k,
-        )
-        .await?;
+    // ⚠️ Time travel is the same query against a manifest reconstructed from the HEAD it
+    // already reads -- no archive, no extra request -- and `meta.epoch` reports which epoch
+    // was served, because a stale answer indistinguishable from a fresh one is worse than no
+    // answer at all.
+    let answer = match req.as_of {
+        Some(epoch) => {
+            engine
+                .query_as_of(
+                    &index,
+                    pstore_types::Epoch(epoch),
+                    &legs,
+                    pstore_query::Fusion::Rrf { k: 60.0 },
+                    req.top_k,
+                )
+                .await?
+        }
+        None => {
+            engine
+                .query(
+                    &index,
+                    &legs,
+                    pstore_query::Fusion::Rrf { k: 60.0 },
+                    req.top_k,
+                )
+                .await?
+        }
+    };
     if answer.segments.is_empty() && answer.unfolded.is_empty() {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -369,7 +401,7 @@ async fn query_index<S: BlobStore + 'static>(
     Ok(axum::Json(QueryResponse {
         results,
         meta: QueryMeta {
-            epoch: engine.epoch().0,
+            epoch: req.as_of.unwrap_or_else(|| engine.epoch().0),
             unfolded_hits,
             cost: api.spend(tenant).since(before),
         },
@@ -432,6 +464,34 @@ async fn list_indexes<S: BlobStore + 'static>(
     names.dedup();
     Ok(axum::Json(IndexList {
         indexes: names,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// `POST /v1/admin/gc?retention=N` — reaps, and reports where history now ends.
+///
+/// ⚠️ **Added by M7e, and the spec is amended rather than the route smuggled in.** Without it
+/// nothing in the server could ever reap: the graveyard would grow without bound and
+/// `reaped_before` would stay zero forever, so the horizon `as_of` is bounded by would be a
+/// bound no deployment could ever reach. A time-travel milestone that cannot move the horizon
+/// has not built the thing it describes.
+async fn gc_tenant<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<axum::Json<GcResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let retention = params
+        .get("retention")
+        .map_or(Ok(DEFAULT_RETENTION), |r| r.parse::<u64>())
+        .map_err(|e| ApiError::bad_request(format!("retention must be a number: {e}")))?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let reaped = engine.gc(retention).await?;
+    Ok(axum::Json(GcResponse {
+        epoch: engine.epoch().0,
+        reaped,
+        reaped_before: engine.reap_horizon().await?,
         cost: api.spend(tenant).since(before),
     }))
 }

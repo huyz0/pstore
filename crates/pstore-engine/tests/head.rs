@@ -58,12 +58,17 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     // A partially-decoded HEAD would be a partially-visible index: some segments present,
     // others silently absent, reported as success.
     //
-    // ⚠️ **Two cuts now decode, and they are named rather than tolerated.** M7d added the
-    // schema and reject sections as OPTIONAL trailing ones, because every HEAD written before
-    // it ends at the graveyard and reading that as corrupt would make every existing store
-    // unreadable. The price is that a HEAD truncated *exactly* at one of those two boundaries
-    // is indistinguishable from an older, complete one. Asserting the count is what keeps this
-    // a stated trade: a third decodable cut means a section stopped being checked.
+    // ⚠️ **Three cuts now decode, and they are named rather than tolerated.** M7d added the
+    // schema and reject sections as OPTIONAL trailing ones and M7e added the reap horizon,
+    // because every HEAD written before each of them ends where it ends and reading that as
+    // corrupt would make every existing store unreadable. The price is that a HEAD truncated
+    // *exactly* at one of those boundaries is indistinguishable from an older, complete one.
+    //
+    // ⚠️ Enumerating **every** cut is what keeps this a stated trade rather than a growing
+    // one: one more decodable offset than there are optional sections means a section stopped
+    // being checked. It also proves what is NOT tolerated -- a HEAD cut one to seven bytes
+    // into the horizon is absent from this list, so a short tail is `CorruptHead` and never a
+    // horizon of zero, which would refuse every time-travel query.
     let bytes = populated().encode();
     let decodable: Vec<usize> = (0..bytes.len())
         .filter(|cut| Head::decode(&bytes[..*cut]).is_ok())
@@ -71,8 +76,8 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     let no_schemas = encode_without_schemas(&populated()).len();
     assert_eq!(
         decodable,
-        vec![no_schemas, no_schemas + 4],
-        "the only decodable truncations must be the two optional-section boundaries"
+        vec![no_schemas, no_schemas + 4, no_schemas + 8],
+        "the only decodable truncations must be the three optional-section boundaries"
     );
     // And what they decode to is the older HEAD, not a partial one.
     let at_boundary = Head::decode(&bytes[..no_schemas]).unwrap();
@@ -199,4 +204,38 @@ fn encode_without_schemas(h: &Head) -> Vec<u8> {
         }
     }
     out
+}
+
+/// ⚠️ M7e's section, on M7d's mechanism: a HEAD written before the horizon existed reads back
+/// with a horizon of **zero**, which is "nothing has been reaped" and therefore refuses
+/// nothing. Decoding it as an error would make every existing store unreadable; decoding a
+/// short tail as zero would be worse, because it would look like a working store that has
+/// silently lost its bound.
+#[test]
+fn a_head_without_a_reaped_marker_decodes_as_zero() {
+    let mut h = populated();
+    h.schemas.insert(
+        "alpha".to_owned(),
+        pstore_engine::IndexSchema {
+            dims: 4,
+            text_field: String::new(),
+        },
+    );
+    h.reaped_before = 77;
+    let full = h.encode();
+    let without = &full[..full.len() - 8];
+    let decoded = Head::decode(without).expect("a HEAD from before the horizon must decode");
+    assert_eq!(decoded.reaped_before, 0);
+    assert_eq!(
+        decoded.schemas, h.schemas,
+        "the sections before it still read"
+    );
+    // And a short tail is refused rather than read as zero.
+    for cut in 1..8 {
+        assert!(
+            Head::decode(&full[..full.len() - cut]).is_err(),
+            "a horizon cut short by {cut} bytes decoded"
+        );
+    }
+    assert_eq!(Head::decode(&full).unwrap().reaped_before, 77);
 }

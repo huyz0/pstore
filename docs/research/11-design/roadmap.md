@@ -373,6 +373,26 @@ fold is all-or-nothing across its bundle set. One accepted API call would have b
 still decodes — with the price asserted rather than tolerated: exactly two truncations now
 decode, and a test enumerates every one to prove there is no third.
 
+#### M7e — time travel
+→ [`docs/milestones/M7e/SPEC.md`](../../milestones/M7e/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7e/VERIFIED.md)
+
+**Done, and it cost nothing.** OQ-82 asked whether epochs should be public; they are, and
+`as_of` turned out to need no version store at all — **a segment's key already carries the
+epoch it was born at, and the graveyard already records every burial**, so a past manifest is
+arithmetic over the present one. Zero extra writes on the commit path, one HEAD read on the
+query, bounded by exactly the retention GC already enforces and refused outside it rather than
+answered short.
+
+⚠️ Making the claim true required repairing the invariant underneath it: `compact` derived its
+output key **once** and committed it later, so a contended compaction stamped a segment with an
+epoch it was not live at — and reconstructing that epoch returned the merge *and* its inputs.
+
+⚠️ **Not built, and argued rather than asserted**: branching (needs a copy-on-write manifest and
+a name that is not a tenant's HEAD), the warm API (needs the NVMe tier D-23 calls mandatory and
+M1.13 blocks on a real device — a warm endpoint over no cache is a lie with a 200), and
+streaming responses (OQ-83, protocol work whose value is RAG UX rather than correctness).
+
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
 - Observability, SLOs, chaos testing, Jepsen-style verification.

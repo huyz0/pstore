@@ -113,6 +113,13 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | ~~22~~ | ⚠️ **`scripts/review.sh`'s round counter is keyed on the branch name and never resets. DONE** ([M7b](M7b/VERIFIED.md)). so on a long-lived `main` it accumulates rounds across unrelated tasks. Observed during [M0c](M0c/VERIFIED.md): it reported "round 4 of hard budget 4" for a change whose review had not started, and computed its "delta since round 3" against a sha four commits stale — handing the reviewer an already-committed diff instead of the staged one. The next change on `main` will be **refused at round 5** for rounds spent on other work. ⚠️ The budget itself is right and is why the loop terminates; what is wrong is what it counts. Key it on the staged tree, or reset it when HEAD moves. ⚠️ **Reset when HEAD moves, and explicitly not keyed on the staged tree** — the staged tree is what *changes* between rounds, so keying on it would reset the budget on every fix and delete the mechanism. `${TAG}.base` records the HEAD the review started on. The delta is now `git write-tree` to `git write-tree`, so round *N* diffs what round *N-1* actually reviewed rather than the worktree against a sha. | [M0c](M0c/VERIFIED.md) | S |
 
+## Opened by M7e
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 30 | ⚠️ **A discarded compaction now orphans one object per retry, not one.** A retry seals the merged rows at a new key (so a segment's key epoch is the epoch it goes live at — the invariant time travel rests on), and a compaction whose inputs vanish under it returns `Ok(None)` having buried nothing. The objects are unreferenced and invisible to `gc`, which works only from the graveyard. ⚠️ It is M6e's orphan sweeper's job and always was; what M7e changed is the **size**, not the kind — and the sweeper is specced but not scheduled by anything. | [M7e](M7e/VERIFIED.md) | S |
+| 31 | ⚠️ **Nothing schedules a reap, so nothing bounds the graveyard.** `POST /v1/admin/gc` exists now and an operator must call it. Until something does, HEAD grows an entry per dereferenced object forever — which also means `reaped_before` stays 0, so `as_of` can reach the beginning of time and the cost of that history is paid by every open. A scheduler belongs with the other timers a server needs and none of which it has. | [M7e](M7e/VERIFIED.md) | M |
+
 ## Opened by M7d
 
 | # | Task | From | Size |
