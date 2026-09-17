@@ -20,7 +20,7 @@ pstore-types  = { path = "../pstore-types" }
 # ⚠️ `axum` lives here and nowhere else, by the same argument that confines `object_store`
 # to `pstore-blob`: a transport in a library crate is a transport every crate above it
 # inherits, and the engine must stay callable without one.
-axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 thiserror     = "2"

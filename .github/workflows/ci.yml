@@ -156,4 +156,6 @@ jobs:
       # is the only part of it a predicate can catch.
       - run: ./scripts/check-verified.py
       - run: ./scripts/selftest-check-verified.sh
+      - run: ./scripts/check-slos.py
+      - run: ./scripts/selftest-check-slos.sh
       - run: ./scripts/check-poison.sh --selftest

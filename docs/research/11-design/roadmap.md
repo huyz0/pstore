@@ -393,6 +393,26 @@ a name that is not a tenant's HEAD), the warm API (needs the NVMe tier D-23 call
 M1.13 blocks on a real device — a warm endpoint over no cache is a lie with a 200), and
 streaming responses (OQ-83, protocol work whose value is RAG UX rather than correctness).
 
+#### M7f — what an operator can see, and what we actually promise
+→ [`docs/milestones/M7f/SPEC.md`](../../milestones/M7f/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7f/VERIFIED.md) · [`slos.md`](slos.md)
+
+**Done.** `GET /metrics` with **no per-tenant label** — four million series is how a metrics
+endpoint takes down what it observes — a chaos suite that drives the **API** against injected
+faults over ten seeds and asserts the only property worth asserting (*every answer is correct
+or a refusal with a code*), and an SLO document whose every row is `enforced` **with a gate
+that exists** or `blocked` **with the blocker named**, checked by `scripts/check-slos.py`
+because that rule is a predicate over files.
+
+⚠️ **Every latency objective is `blocked`**, each naming the measurement that unblocks it. A
+p99 from WSL2 against an in-memory store wearing a production label is exactly what D-104
+exists to forbid, and an SLO document is where that temptation lives.
+
+⚠️ **The quota is not wired**, and the spec's first draft said it would be: spec review priced
+a real `429 rate_limited` at a typed `BlobError` variant, an `EngineError` arm, a header path
+on `ApiError`, a time-to-refill on `Bucket`, and a change to the server's type parameter.
+Three crates below the server, and its own milestone.
+
 - GCS + Azure backends and the `Capabilities` matrix.
 - Time travel, branching, warm API, streaming responses.
 - Observability, SLOs, chaos testing, Jepsen-style verification.

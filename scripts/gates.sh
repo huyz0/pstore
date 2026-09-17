@@ -19,7 +19,9 @@ run "scripts/check-poison.sh"      ./scripts/check-poison.sh
 run "scripts/check-links.sh"       ./scripts/check-links.sh
 run "scripts/build-index.py --check" ./scripts/build-index.py --check
 run "scripts/check-verified.py"    ./scripts/check-verified.py
+run "scripts/check-slos.py"        ./scripts/check-slos.py
 run "scripts/selftest-review.sh"   ./scripts/selftest-review.sh
 run "scripts/selftest-check-verified.sh" ./scripts/selftest-check-verified.sh
+run "scripts/selftest-check-slos.sh" ./scripts/selftest-check-slos.sh
 run "scripts/check-poison.sh --selftest" ./scripts/check-poison.sh --selftest
 echo "all gates green"

@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 55 documents, 48 research questions answered, 168 open
+**Status: research phase complete.** 56 documents, 48 research questions answered, 168 open
 questions logged. Workspace scaffold live: `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`,
 `crates/pstore-types`. Dev scaffold in [`dev/`](../../dev/README.md). Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the

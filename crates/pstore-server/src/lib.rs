@@ -19,6 +19,7 @@ use pstore_engine::{Engine, EngineError};
 use pstore_format::Document;
 use pstore_types::{LaneId, TenantId};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Epochs of history kept when a reap does not say. ⚠️ Deliberately generous: the cost of
 /// keeping a graveyard entry is bytes in HEAD, and the cost of reaping one is a caller's
@@ -66,6 +67,23 @@ pub struct Api<S> {
     store: Accounted<S>,
     lane: LaneId,
     engines: tokio::sync::Mutex<HashMap<TenantId, Arc<Engine<TenantView<S>>>>>,
+    /// What `GET /metrics` reports about this process's own traffic.
+    ///
+    /// ⚠️ **On the `Api`, not in a static.** A process-global counter would make the refusal
+    /// assertions untestable under a parallel test binary — the same argument `Config` already
+    /// makes about reading the environment.
+    http: Mutex<Http>,
+}
+
+/// Per-route and per-refusal counters. ⚠️ **No tenant dimension**: 1M tenants × four request
+/// classes is four million series, which is how a metrics endpoint takes down the thing it
+/// observes. A tenant's own numbers go to that tenant, in every response it gets.
+#[derive(Debug, Default)]
+struct Http {
+    /// `(route, status) -> count`.
+    requests: std::collections::BTreeMap<(String, u16), u64>,
+    /// `code -> count`, for the refusals the error table names.
+    refusals: std::collections::BTreeMap<&'static str, u64>,
 }
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -91,6 +109,7 @@ impl<S: BlobStore + 'static> Api<S> {
             store,
             lane,
             engines: tokio::sync::Mutex::new(HashMap::new()),
+            http: Mutex::new(Http::default()),
         }))
     }
 
@@ -107,6 +126,11 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/admin/fold", post(fold_tenant::<S>))
             .route("/v1/admin/gc", post(gc_tenant::<S>))
+            .route("/metrics", get(metrics::<S>))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self),
+                count_request::<S>,
+            ))
             .with_state(self)
     }
 
@@ -193,8 +217,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let code = self.code;
         let body = ErrorBody::new(self.code, self.message, self.retryable);
-        (self.status, axum::Json(body)).into_response()
+        let mut res = (self.status, axum::Json(body)).into_response();
+        res.extensions_mut().insert(RefusalCode(code));
+        res
     }
 }
 
@@ -252,6 +279,114 @@ impl From<EngineError> for ApiError {
         }
     }
 }
+
+/// Counts every response: its route, its status, and the refusal code it carried.
+///
+/// ⚠️ **The code travels in a response extension**, inserted by `ApiError::into_response`,
+/// because middleware sees a status and a body and the stable code lives in neither. The
+/// alternative is counting inside the error constructor, which needs a process-global.
+async fn count_request<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // ⚠️ A request axum refuses before routing has no matched path, and inventing one would
+    // mean a series per 404 URL — which is unbounded and attacker-controlled.
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| "<unmatched>".to_owned(), |m| m.as_str().to_owned());
+    let res = next.run(req).await;
+    let status = res.status().as_u16();
+    let code = res.extensions().get::<RefusalCode>().map(|c| c.0);
+    let mut http = api
+        .http
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *http.requests.entry((route, status)).or_default() += 1;
+    if let Some(code) = code {
+        *http.refusals.entry(code).or_default() += 1;
+    }
+    res
+}
+
+/// `GET /metrics` — Prometheus text, and **no tenant dimension**.
+///
+/// ⚠️ **Zero blob requests**: every number here is a process-local atomic or map. A metrics
+/// endpoint that reads the store is a load generator pointed at the thing it measures.
+async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Response {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pstore_blob_requests_total Blob requests by class.
+",
+    );
+    out.push_str(
+        "# TYPE pstore_blob_requests_total counter
+",
+    );
+    for (class, name) in [
+        (OpClass::Read, "read"),
+        (OpClass::Write, "write"),
+        (OpClass::List, "list"),
+        (OpClass::Delete, "delete"),
+    ] {
+        out.push_str(&format!(
+            "pstore_blob_requests_total{{class=\"{name}\"}} {}\n",
+            api.store.total(class)
+        ));
+    }
+    let http = api
+        .http
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    out.push_str("# HELP pstore_http_requests_total HTTP responses by route and status.\n");
+    out.push_str("# TYPE pstore_http_requests_total counter\n");
+    for ((route, status), n) in &http.requests {
+        out.push_str(&format!(
+            "pstore_http_requests_total{{route=\"{route}\",status=\"{status}\"}} {n}\n"
+        ));
+    }
+    out.push_str("# HELP pstore_refusals_total Refusals by their stable code.\n");
+    out.push_str("# TYPE pstore_refusals_total counter\n");
+    // ⚠️ Every code the table can produce is emitted, at zero if it has not happened: a series
+    // that appears only once something goes wrong is a series no alert can be written against.
+    for code in REFUSAL_CODES {
+        out.push_str(&format!(
+            "pstore_refusals_total{{code=\"{code}\"}} {}\n",
+            http.refusals.get(code).copied().unwrap_or(0)
+        ));
+    }
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+/// Every stable refusal code the error table can produce.
+///
+/// ⚠️ A list, so `/metrics` can emit a zero for each: an alert on a series that does not exist
+/// until the first failure is an alert that fires late, if at all.
+const REFUSAL_CODES: &[&str] = &[
+    "tenant_required",
+    "bad_request",
+    "unsupported_durability",
+    "index_not_found",
+    "schema_conflict",
+    "schema_immutable",
+    "time_travel_horizon",
+    "version_conflict",
+    "storage_unavailable",
+    "internal",
+];
+
+/// The refusal code, carried out of `IntoResponse` so a layer can count it.
+#[derive(Debug, Clone, Copy)]
+struct RefusalCode(&'static str);
 
 /// Who the caller says it is.
 ///
