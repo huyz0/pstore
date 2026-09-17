@@ -306,10 +306,12 @@ transparent when unlimited.
 **Done, and it scores the exit table above rather than claiming it.** `scripts/scale.sh` — not
 a gate, because the catalog arm peaks at 9.28 GB.
 
-### M7 — Production hardening (ongoing)
+### M7 — Production hardening
 
-> ⚠️ **"Ongoing" is not a milestone.** Four bullets and no exit criterion, which the first
-> non-negotiable in `AGENTS.md` refuses. Each bullet gets its own spec; **M7a** is the first.
+> ⚠️ **"Ongoing" was not a milestone.** Four bullets and no exit criterion, which the first
+> non-negotiable in `AGENTS.md` refuses. Each bullet got its own spec, M7a through M7g, and
+> the four bullets are now either done or **argued deferrals with a backlog row** — which is
+> the only honest way a bullet list closes.
 
 #### M7a — The capability matrix, measured
 → [`docs/milestones/M7a/SPEC.md`](../../milestones/M7a/SPEC.md) ·
@@ -413,10 +415,39 @@ a real `429 rate_limited` at a typed `BlobError` variant, an `EngineError` arm, 
 on `ApiError`, a time-to-refill on `Bucket`, and a change to the server's type parameter.
 Three crates below the server, and its own milestone.
 
-- GCS + Azure backends and the `Capabilities` matrix.
-- Time travel, branching, warm API, streaming responses.
-- Observability, SLOs, chaos testing, Jepsen-style verification.
-- BYOC packaging.
+#### M7g — BYOC packaging, and the first proof across two processes
+→ [`docs/milestones/M7g/SPEC.md`](../../milestones/M7g/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M7g/VERIFIED.md) · [`deploy.md`](../../deploy.md)
+
+**Done, and it is the first configuration in which this repository's claims are testable the
+way a customer meets them**: `scripts/byoc.sh` runs **two server containers against one
+bucket**, and a document written and folded through one is returned by the other — with a
+`404` in between, falsified by aiming it at the writer. Every durability proof before this was
+two `Api`s in one test binary, which is honest about the memtable and says nothing about a
+process boundary.
+
+⚠️ **The refusal is the feature.** A server pointed at a real bucket with `PSTORE_PROFILE`
+unset **exits non-zero**, naming the backend and the primitive: the capability matrix is a
+measurement, and a deployment that has not made it must not accept a `durable` write.
+
+⚠️ **No Azure backend, and the absence is the decision, not an omission.** Every segment open
+is a suffix read and C-14 records suffix ranges as absent on Azure three ways, so a server
+pointed at it would start and then fail every query. `PSTORE_BACKEND` simply has no `azure`
+value; backlog row 32 carries the three exits, all of which need M0b's real account.
+
+#### M7's four bullets, and where each of them ended
+
+| Bullet | Where it went |
+|---|---|
+| GCS + Azure backends and the `Capabilities` matrix | ⚠️ **Half done, and the half that is not is argued.** The matrix is [M7a](../../milestones/M7a/VERIFIED.md), measured. The backends are **refused**: row 32 for Azure's suffix reads, and the matrix's own finding that `fake-gcs-server` accepts `ifGenerationMatch` and ignores it — the worst shape a precondition can have |
+| Time travel, branching, warm API, streaming responses | Time travel is [M7e](../../milestones/M7e/VERIFIED.md), and needs **no version store**: a past manifest is arithmetic over the current HEAD. Branching, the warm API and streaming are **deferred**, each naming a caller that does not exist yet rather than a difficulty |
+| Observability, SLOs, chaos testing, Jepsen-style verification | [M7f](../../milestones/M7f/VERIFIED.md). Jepsen-style verification is deferred: the chaos suite drives the **API** against injected faults over ten seeds, which is the property worth asserting at this size; a linearizability checker needs a cluster this server does not form |
+| BYOC packaging | M7g, above |
+
+⚠️ **Deferred, and named rather than dropped**: quotas and `429` (spec review priced it at
+three crates below the server, so it is its own milestone), authentication, a scheduler,
+tracing, and a Helm chart. The image is also **not hardened** — root, writable filesystem, no
+seccomp profile — which [`deploy.md`](../../deploy.md) states rather than implies.
 
 ## Cross-cutting, from day one
 
