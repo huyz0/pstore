@@ -22,7 +22,13 @@ multiple-versions = "warn"
 # ⚠️ `pstore-node` is the process that must name a real backend — it is a binary, and
 # something has to construct one. It may only CONSTRUCT: everything it does afterwards goes
 # through `BlobStore`, so the ban still holds where it matters, and this list is the audit.
-deny = [{ name = "object_store", wrappers = ["pstore-blob", "pstore-node"] }]
+# ⚠️ `axum` is confined the same way, and until M7g that confinement was a COMMENT in
+# `crates/pstore-server/Cargo.toml` -- which is not a gate. A transport in a library crate is
+# a transport every crate above it inherits, and the engine must stay callable without one.
+deny = [
+    { name = "object_store", wrappers = ["pstore-blob", "pstore-node", "pstore-server"] },
+    { name = "axum", wrappers = ["pstore-server"] },
+]
 
 [sources]
 unknown-registry = "deny"

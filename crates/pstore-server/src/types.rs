@@ -227,3 +227,28 @@ pub struct ErrorDetail {
     /// ⚠️ Derived from the status, so no two rows of the table can disagree.
     pub retryable: bool,
 }
+
+/// A duty this server does **not** perform.
+///
+/// ⚠️ **The list is a constant in code, not a paragraph in a document**, because a document
+/// cannot be compared against anything. `scripts/byoc.sh` asserts that the ids served at
+/// `/v1/admin/duties` are exactly the ids documented under `docs/deploy.md`'s
+/// `## Unscheduled duties` — so a duty added here fails the gate until the deployment
+/// document says what an operator must do instead. A grep for four fixed phrases would have
+/// tested only that the commit which wrote the document also wrote the grep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Duty {
+    /// A stable lower-case token. ⚠️ Lower-case and hyphens only: it is extracted from
+    /// `deploy.md` with a character class, and an id outside it would make the gate match
+    /// nothing and pass.
+    pub id: &'static str,
+    /// What an operator must do instead, in one line.
+    pub instead: &'static str,
+}
+
+/// What `/v1/admin/duties` answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct Duties {
+    /// Every duty, in the order the constant declares them.
+    pub duties: &'static [Duty],
+}

@@ -30,9 +30,38 @@ use types::Schema as SchemaOut;
 
 mod types;
 pub use types::{
-    Cost, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, QueryMeta, QueryRequest,
-    QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
+    Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, QueryMeta,
+    QueryRequest, QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
 };
+
+/// Everything a running server leaves to whoever deploys it.
+///
+/// ⚠️ **Each of these is a way to lose data or to be breached**, which is why they are named
+/// rather than left implicit. A server that folds nothing accumulates WAL bundles forever and
+/// answers every query from the freshness layer; a server that reaps nothing keeps every
+/// buried segment; a server behind no TLS and no authentication is a bucket anyone can write.
+pub const UNSCHEDULED: [Duty; 4] = [
+    Duty {
+        id: "fold",
+        instead: "call POST /v1/admin/fold on a schedule, once per tenant per lane; nothing \
+                  inside the server does, and unfolded bundles are read on every query",
+    },
+    Duty {
+        id: "reap",
+        instead: "call POST /v1/admin/gc on a schedule; buried segments are kept until \
+                  something asks for them to be removed, and they are billed meanwhile",
+    },
+    Duty {
+        id: "tls",
+        instead: "terminate TLS in a reverse proxy in front of this process; the server \
+                  speaks HTTP/1.1 in the clear and will not be given a certificate loader",
+    },
+    Duty {
+        id: "auth",
+        instead: "authenticate and authorize before the request reaches this process; the \
+                  tenant is whatever the X-Pstore-Tenant header says it is",
+    },
+];
 
 /// Why a server refused to start.
 ///
@@ -126,6 +155,7 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/admin/fold", post(fold_tenant::<S>))
             .route("/v1/admin/gc", post(gc_tenant::<S>))
+            .route("/v1/admin/duties", get(duties))
             .route("/metrics", get(metrics::<S>))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&self),
@@ -308,6 +338,17 @@ async fn count_request<S: BlobStore + 'static>(
         *http.refusals.entry(code).or_default() += 1;
     }
     res
+}
+
+/// `GET /v1/admin/duties` — what this server does not do.
+///
+/// ⚠️ **Zero blob requests** — it serves a constant, so a scraper cannot turn an honesty
+/// endpoint into a bill.
+async fn duties() -> Response {
+    axum::Json(Duties {
+        duties: &UNSCHEDULED,
+    })
+    .into_response()
 }
 
 /// `GET /metrics` — Prometheus text, and **no tenant dimension**.
@@ -751,6 +792,80 @@ pub struct Config {
     /// run two servers. Nothing detects the collision today; the backlog names create-if-absent
     /// bundles as the fix and M2's density invariant as why it is not a one-line change.
     pub lane: LaneId,
+    /// Which store to open.
+    pub backend: Backend,
+    /// Which recorded profile the operator says applies to it.
+    pub profile: Profile,
+    /// The S3 endpoint. Required by [`Backend::S3`], ignored by [`Backend::Memory`].
+    pub endpoint: String,
+    /// The bucket, ignored by [`Backend::Memory`].
+    pub bucket: String,
+    /// Static credentials, or `None` to use the provider's own chain.
+    ///
+    /// ⚠️ **`None` is the deployed case, not the odd one.** A BYOC deployment on EC2 or EKS
+    /// authenticates with an instance profile or a service-account role; baking a static key
+    /// in unconditionally means such a deployment cannot authenticate at all, and an operator
+    /// who forgets to set one ships a **dev password** at a real bucket. Both halves must be
+    /// present or neither is used, because half a key pair is not a credential.
+    pub credentials: Option<(String, String)>,
+}
+
+/// Where a server keeps its data.
+///
+/// ⚠️ **There is no `azure` and no `gcs`, and their absence is a decision.** Every segment
+/// open is a suffix read (`Segment::open`), and C-14 records suffix ranges as absent on Azure
+/// three ways — the client refuses them before building a request, Azurite answers `bytes=-1`
+/// with a 500, and the REST API has no suffix form. A server pointed at Azure would start and
+/// then fail every query. `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which
+/// is the worst shape a precondition can have. Neither is offered, so neither can be reached
+/// by an operator who has not read this comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// In-process, durable for exactly as long as the process. The default M7c shipped.
+    #[default]
+    Memory,
+    /// S3 or an S3-compatible endpoint.
+    S3,
+}
+
+/// What the operator says the conformance suite measured about this bucket.
+///
+/// ⚠️ **`Unprobed` is the default and it refuses to serve.** The capability matrix is a
+/// measurement; a deployment that has not made it must not accept a write it will call
+/// durable. Nothing re-probes at runtime — this is the operator's word, which is the same
+/// trade `scripts/conformance.sh --check` already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    /// Not measured here. Both fencing primitives are reported `Divergent`.
+    #[default]
+    Unprobed,
+    /// `scripts/conformance.sh` recorded this backend as `Supported` on CAS and
+    /// create-if-absent.
+    Conforming,
+}
+
+/// The capabilities an S3 backend is opened with under `profile`.
+///
+/// ⚠️ **A function, not a literal in `main.rs`**, because it has a branch and a branch in a
+/// composition root is unreachable from `cargo test` and measured at 0% coverage. Everything
+/// but the two fencing primitives is inherited from `unprobed`. ⚠️ Including
+/// `delete_is_free: false`, which on real S3 is pessimistic — the matrix **declares** it
+/// false for `minio`, and a value this file invented would contradict the checked-in
+/// artifact it is supposed to be quoting.
+#[must_use]
+pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabilities {
+    let base = pstore_blob::Capabilities {
+        backend: format!("s3({endpoint})"),
+        ..pstore_blob::ObjectStoreBackend::unprobed("s3")
+    };
+    match profile {
+        Profile::Unprobed => base,
+        Profile::Conforming => pstore_blob::Capabilities {
+            cas: pstore_blob::Support::Supported,
+            create_if_absent: pstore_blob::Support::Supported,
+            ..base
+        },
+    }
 }
 
 /// Why a process could not read its configuration.
@@ -762,6 +877,26 @@ pub enum ConfigError {
          two servers sharing one lane overwrite each other's bundles silently"
     )]
     Lane,
+    /// `PSTORE_BACKEND` named something this build does not have.
+    ///
+    /// ⚠️ Named rather than defaulted: falling back to `memory` on a typo is a deployment
+    /// that reports success and stores nothing past the process.
+    #[error(
+        "PSTORE_BACKEND={0} is not a backend this build has: memory, s3. Azure and GCS are \
+         deliberately absent -- see docs/deploy.md"
+    )]
+    Backend(String),
+    /// `PSTORE_PROFILE` named something that is not a recorded profile.
+    #[error("PSTORE_PROFILE={0} is not a profile: unprobed, conforming")]
+    Profile(String),
+    /// `PSTORE_BACKEND=s3` with no endpoint.
+    ///
+    /// ⚠️ **Refused here rather than discovered on the first request.** An empty endpoint
+    /// builds a backend named `s3()` that a `conforming` profile then declares able to fence,
+    /// which moves a configuration error out of the one place that validates configuration
+    /// and into request time — the failure mode this whole milestone exists to remove.
+    #[error("PSTORE_S3_ENDPOINT must be set when PSTORE_BACKEND=s3")]
+    Endpoint,
 }
 
 impl Config {
@@ -777,9 +912,28 @@ impl Config {
         let lane = get("PSTORE_LANE")
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or(ConfigError::Lane)?;
+        let backend = match get("PSTORE_BACKEND").as_deref() {
+            None | Some("memory") => Backend::Memory,
+            Some("s3") => Backend::S3,
+            Some(other) => return Err(ConfigError::Backend(other.to_owned())),
+        };
+        let profile = match get("PSTORE_PROFILE").as_deref() {
+            None | Some("unprobed") => Profile::Unprobed,
+            Some("conforming") => Profile::Conforming,
+            Some(other) => return Err(ConfigError::Profile(other.to_owned())),
+        };
+        let endpoint = get("PSTORE_S3_ENDPOINT").unwrap_or_default();
+        if backend == Backend::S3 && endpoint.is_empty() {
+            return Err(ConfigError::Endpoint);
+        }
         Ok(Self {
             bind: get("PSTORE_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_owned()),
             lane: LaneId(lane),
+            backend,
+            profile,
+            endpoint,
+            bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
+            credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
         })
     }
 }

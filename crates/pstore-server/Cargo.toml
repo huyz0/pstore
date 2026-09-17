@@ -11,7 +11,7 @@ repository.workspace   = true
 workspace = true
 
 [dependencies]
-pstore-blob   = { path = "../pstore-blob" }
+pstore-blob   = { path = "../pstore-blob", features = ["object_store"] }
 pstore-engine = { path = "../pstore-engine" }
 pstore-format = { path = "../pstore-format" }
 pstore-index  = { path = "../pstore-index" }
@@ -21,6 +21,10 @@ pstore-types  = { path = "../pstore-types" }
 # to `pstore-blob`: a transport in a library crate is a transport every crate above it
 # inherits, and the engine must stay callable without one.
 axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
+# ⚠️ `aws` only. `pstore-blob`'s `compat` feature would pull `azure` and `gcp` too: the
+# emulator-integration feature for a probe example, not a shipping image's dependency set —
+# and the GCS client is one the capability matrix says must never be a CAS target.
+object_store  = { version = "0.14.1", features = ["aws"] }
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 thiserror     = "2"
