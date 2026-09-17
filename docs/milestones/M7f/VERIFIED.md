@@ -29,8 +29,21 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
    read error takes on that route.
 5. **An acknowledged, folded document is never missing** —
    `an_acknowledged_document_is_never_missing_under_faults`, read back through a **second
-   `Api` over the same backend with an empty memtable**, faults still on. Asserting through the
-   writer would have proved only that its own RAM still held the rows.
+   `Api` over the same backend with an empty memtable**, faults on for the reader.
+   ⚠️ **This evidence line was false when first written, and code review proved it by
+   instrumenting the test.** At `read_error` *and* `slow_down` 0.3, 60% of every individual
+   blob read fails raw and a fold performs many, so **the fold never landed on any of ten
+   seeds** — the `continue` skipped the reader, the query and the assertion, and everything
+   after it was dead code while this line claimed criterion 5 verified. Corrected: the write
+   and fold phase runs with faults **off** (the durability claim is about what reached the
+   store), the reader runs with them **on**, the fold is **asserted** rather than skipped, and
+   `answered > 0` fails the test if no seed ever gets a successful read — because "every
+   successful read was complete" is vacuously true when none succeeds, which is the same hole
+   one layer down. ⚠️ The reader's rate is **0.05, and measured**: at 0.3 no seed answers at
+   all.
+   ⚠️ And `a_successful_query_is_never_short` closes the half neither test had: the other
+   oracle is a **subset** check, so a handler mutated to answer `results: []` with a `200`
+   passed both. Observed red against exactly that mutation, which now fails two tests.
 6. **The SLO document has a gate** — `./scripts/check-slos.py` (24 objectives, every
    `enforced` one naming a gate that exists) and `./scripts/selftest-check-slos.sh`, which
    observes it **refusing**: a ghost test name, a deleted script path, a `blocked` row with no

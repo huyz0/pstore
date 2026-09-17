@@ -148,6 +148,7 @@ If you read nothing else:
 | [key-layout.md](11-design/key-layout.md) | D33 | Every key derivable; **seven kinds of mutable object in the entire system**. Storage-class routing by prefix. |
 | **[session-and-affinity-protocol.md](11-design/session-and-affinity-protocol.md)** | Q38 | One opaque token solves read-your-writes *and* cold-cache routing, because the nodes holding fresh data are the nodes we'd route to for warmth. **`session` becomes the default consistency mode** (as in Cosmos DB): read-your-writes at ~1 ms and 0 blob requests. |
 | [api-design.md](11-design/api-design.md) | D34 | Every tradeoff (consistency, recall, completeness) is a client parameter. Responses report freshness and cost. |
+| [slos.md](11-design/slos.md) | D34, D104 | **Every objective is `enforced` with a gate that exists or `blocked` with its blocker named — there is no third status.** Request counts and round-trip depth are enforced today; **every latency objective is blocked**, because a p99 from WSL2 wearing a production label is what D-104 forbids. `scripts/check-slos.py` is the gate. |
 | [roadmap.md](11-design/roadmap.md) | D35 | Built in descending order of "if this is wrong, the architecture is wrong." M0 measures CAS before anything else. |
 
 ---

@@ -173,43 +173,51 @@ async fn under_injected_faults_every_answer_is_correct_or_a_refusal() {
 
 #[tokio::test]
 async fn an_acknowledged_document_is_never_missing_under_faults() {
-    // ⚠️ **Read back through a SECOND `Api` over the same backend**, whose memtable is empty.
-    // Asserting through the writer would prove only that its own RAM still holds the rows --
-    // which is the case the code already handles. The interesting one is a `200` whose rows
-    // exist nowhere else.
+    // ⚠️ **This test was vacuous when it was written, and code review proved it by
+    // instrumenting it**: at `read_error` 0.3 *and* `slow_down` 0.3, 60% of every individual
+    // blob read fails raw and a fold performs many, so the fold never landed on any of ten
+    // seeds — and the `continue` skipped the reader, the query and the assertion. Everything
+    // after it was dead code while the ledger claimed criterion 5 verified.
+    //
+    // So the phases are explicit now: write and fold with the faults **off**, because the
+    // durability claim is about what reached the store; then turn them back **on** for the
+    // reader, because the claim is that a *successful* read never comes back short. And the
+    // fold is **asserted**, not skipped, so this cannot silently go vacuous again.
+    // ⚠️ How many seeds actually got a **successful** read out of the faulty reader. Asserted
+    // at the end, because "every successful read was complete" is vacuously true when no read
+    // succeeds -- which is the same shape of hole this test already had once.
+    let mut answered = 0;
     for seed in 0..10u64 {
-        let backend = Faulty::new(
-            MemoryStore::new(),
-            seed,
-            Faults {
-                read_error: 0.3,
-                slow_down: 0.3,
-                ..Faults::none()
-            },
-        );
+        let backend = Faulty::new(MemoryStore::new(), seed, Faults::none());
         let writer: Arc<Api<Store>> = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
 
         let mut durable: BTreeSet<String> = BTreeSet::new();
         for i in 0..CORPUS {
-            let (status, _) = send(&writer, write(i)).await;
-            if status.is_success() {
-                durable.insert(format!("d{i}"));
-            }
+            let (status, body) = send(&writer, write(i)).await;
+            assert!(
+                status.is_success(),
+                "seed {seed}: a clean write failed: {body}"
+            );
+            durable.insert(format!("d{i}"));
         }
-        // Fold until it takes, or give up: a fold that never lands is a refusal, not a lie.
-        let mut folded = false;
-        for _ in 0..8 {
-            let (status, _) = send(&writer, fold()).await;
-            if status.is_success() {
-                folded = true;
-                break;
-            }
-        }
-        if !folded || durable.is_empty() {
-            continue;
-        }
+        let (status, body) = send(&writer, fold()).await;
+        assert!(
+            status.is_success(),
+            "seed {seed}: a clean fold failed: {body}"
+        );
 
-        // The faults stay ON for the reader: a refusal is acceptable, a short answer is not.
+        // ⚠️ Faults on, and a reader whose memtable is empty: the only place these documents
+        // can come from is the blob store.
+        //
+        // ⚠️ **0.05, and the number is load-bearing.** At the 0.3 the other test uses, a query
+        // reads enough objects that **no seed in ten ever answers successfully** — measured —
+        // and "every successful read is complete" is vacuously true when nothing succeeds.
+        // That is the same hole this test had before, one layer down. The rate is picked so
+        // that some reads get through, and `answered > 0` below is what keeps it honest.
+        backend.set_faults(Faults {
+            read_error: 0.05,
+            ..Faults::none()
+        });
         let reader: Arc<Api<Store>> = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
         let (status, body) = send(&reader, query(0)).await;
         if !status.is_success() {
@@ -219,12 +227,48 @@ async fn an_acknowledged_document_is_never_missing_under_faults() {
             );
             continue;
         }
+        answered += 1;
         let seen = ids(&body);
         let missing: Vec<&String> = durable.iter().filter(|d| !seen.contains(*d)).collect();
         assert!(
             missing.is_empty(),
             "seed {seed}: documents acknowledged durable and folded are missing from a \
-             successful query: {missing:?}"
+             SUCCESSFUL query: {missing:?}"
         );
     }
+    assert!(
+        answered > 0,
+        "no seed produced a successful read, so the assertion above never ran -- which is \
+         exactly how this test was vacuous the first time"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_query_is_never_short() {
+    // ⚠️ The other half of the same gap. Test one's oracle is a **subset** check -- "never an
+    // id nobody sent" -- which a handler mutated to answer `results: []` with a 200 passes.
+    // Code review named that: the suite asserted "never a wrong id" and never "never a short
+    // answer", which is the failure mode that looks like success.
+    //
+    // With the faults lifted, every row is either folded or in this process's memtable, so a
+    // successful query must return **all** of them. Nothing here is probabilistic.
+    let backend = Faulty::new(MemoryStore::new(), 1, Faults::none());
+    let api: Arc<Api<Store>> = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let mut sent: BTreeSet<String> = BTreeSet::new();
+    for i in 0..CORPUS {
+        let (status, _) = send(&api, write(i)).await;
+        assert!(status.is_success());
+        sent.insert(format!("d{i}"));
+        if i % 5 == 4 {
+            send(&api, fold()).await;
+        }
+    }
+    let (status, body) = send(&api, query(0)).await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(
+        ids(&body),
+        sent,
+        "a successful query came back short: it is missing {:?}",
+        sent.difference(&ids(&body)).collect::<Vec<_>>()
+    );
 }
