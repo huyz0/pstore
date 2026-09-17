@@ -27,6 +27,7 @@ research behind it: [`../docs/research/09-rust-stack/dev-and-test-environment.md
 | **`pstore-fake-s3`** (ours, on `s3s`) | `cargo test --features integration` | **Correctness of our client**: wire, XML, error mapping. Correct `If-None-Match: *`, and the only place 409 vs 412 is testable. |
 | Emulators (MinIO/Azurite/fake-gcs) | `scripts/conformance.sh` | Third-party plumbing sanity — a compatibility check, not the default target. Writes [`docs/profiles/capability-matrix.md`](../docs/profiles/capability-matrix.md); `--check` fails if a backend has changed under us. ⚠️ Outside `cargo test` because it needs the containers |
 | Conformance suite | `cargo test -p pstore-testkit --test conformance` (local stores) · `scripts/conformance.sh` (emulators) | Records what each backend actually does. ⚠️ It lives in `pstore-testkit::conformance`; there is no `pstore-conformance` crate and there never was |
+| **Two containers, one bucket** | `scripts/byoc.sh` | ⚠️ **The only test here that crosses a process boundary.** Builds `dev/Dockerfile.server`, runs two servers on two lanes against one MinIO, and asserts that a document written and folded through one is returned by the other — and returns 404 before the fold. Also the image's refusal arms (unprobed profile, missing lane) and the `docs/deploy.md` gate. ⚠️ Outside `cargo test`, and outside AGENTS.md's Gates table, because it needs Docker and CI has none |
 | Real clouds | **deferred — milestone M0b** | Economics: latency, CAS contention, cost |
 
 ## Running the 100-node fleet on WSL2

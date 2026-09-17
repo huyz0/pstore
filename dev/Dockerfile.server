@@ -1,0 +1,24 @@
+# The server image. Built from the workspace root so the whole source tree is available.
+#   docker build -f dev/Dockerfile.server -t pstore-server .
+# ⚠️ Pinned to the SAME Debian as the runtime stage, for the reason `dev/Dockerfile.node`
+# records: a newer build image links against a newer glibc and every container dies with
+# `GLIBC_2.38 not found`, which reads as a crash loop rather than a packaging mistake.
+FROM rust:1.90-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p pstore-server
+
+FROM debian:bookworm-slim
+# ⚠️ CA roots, because the S3 backend speaks TLS to a real bucket. Without them every request
+# fails certificate verification and it looks like a network problem.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/pstore-server /usr/local/bin/pstore-server
+# ⚠️ NOT the library default of 127.0.0.1:8080, which inside a container is reachable by
+# nothing -- including whatever scrapes /metrics.
+ENV PSTORE_BIND=0.0.0.0:8080
+# ⚠️ `PSTORE_LANE` is deliberately NOT set here. Lanes are single-writer; a default in the
+# image would make "two servers silently overwriting each other's bundles" the normal way to
+# run two containers.
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/pstore-server"]

@@ -1,0 +1,7 @@
+# ⚠️ Without this, `docker build` sends the whole working tree to the daemon as build
+# context -- measured here at **82 GB**, almost all of it `target/`, which made a
+# `scripts/byoc.sh` run time out before the compiler had started. None of it is used: both
+# Dockerfiles `COPY . .` and then build from source inside the image.
+target/
+mutants.out/
+.git/
