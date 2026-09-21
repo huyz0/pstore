@@ -76,7 +76,7 @@ fn credentials_are_used_only_when_both_halves_are_given() {
     let none = Config::from_vars(vars(&[
         ("PSTORE_LANE", "1"),
         ("PSTORE_BACKEND", "s3"),
-        ("PSTORE_S3_ENDPOINT", "http://minio:9000"),
+        ("PSTORE_S3_ENDPOINT", "http://rustfs:9000"),
     ]))
     .unwrap();
     assert_eq!(none.credentials, None, "an unset key must mean the chain");
@@ -84,7 +84,7 @@ fn credentials_are_used_only_when_both_halves_are_given() {
     let half = Config::from_vars(vars(&[
         ("PSTORE_LANE", "1"),
         ("PSTORE_BACKEND", "s3"),
-        ("PSTORE_S3_ENDPOINT", "http://minio:9000"),
+        ("PSTORE_S3_ENDPOINT", "http://rustfs:9000"),
         ("PSTORE_ACCESS_KEY", "who"),
     ]))
     .unwrap();
@@ -93,7 +93,7 @@ fn credentials_are_used_only_when_both_halves_are_given() {
     let both = Config::from_vars(vars(&[
         ("PSTORE_LANE", "1"),
         ("PSTORE_BACKEND", "s3"),
-        ("PSTORE_S3_ENDPOINT", "http://minio:9000"),
+        ("PSTORE_S3_ENDPOINT", "http://rustfs:9000"),
         ("PSTORE_ACCESS_KEY", "who"),
         ("PSTORE_SECRET_KEY", "shh"),
     ]))
@@ -107,13 +107,13 @@ fn s3_is_a_backend_and_conforming_is_a_profile() {
         ("PSTORE_LANE", "1"),
         ("PSTORE_BACKEND", "s3"),
         ("PSTORE_PROFILE", "conforming"),
-        ("PSTORE_S3_ENDPOINT", "http://minio:9000"),
+        ("PSTORE_S3_ENDPOINT", "http://rustfs:9000"),
         ("PSTORE_BUCKET", "pstore"),
     ]))
     .unwrap();
     assert_eq!(c.backend, Backend::S3);
     assert_eq!(c.profile, Profile::Conforming);
-    assert_eq!(c.endpoint, "http://minio:9000");
+    assert_eq!(c.endpoint, "http://rustfs:9000");
     assert_eq!(c.bucket, "pstore");
 }
 
@@ -122,17 +122,17 @@ fn s3_is_a_backend_and_conforming_is_a_profile() {
 /// `Api::new` refuses — which is what makes the image exit non-zero instead of serving.
 #[test]
 fn an_unprobed_s3_profile_cannot_fence_and_a_conforming_one_can() {
-    let unprobed = s3_capabilities("http://minio:9000", Profile::Unprobed);
+    let unprobed = s3_capabilities("http://rustfs:9000", Profile::Unprobed);
     assert!(!unprobed.admits_durable_writes());
     assert!(matches!(unprobed.cas, Support::Divergent(_)));
     assert!(matches!(unprobed.create_if_absent, Support::Divergent(_)));
 
-    let conforming = s3_capabilities("http://minio:9000", Profile::Conforming);
+    let conforming = s3_capabilities("http://rustfs:9000", Profile::Conforming);
     assert!(conforming.admits_durable_writes());
     // ⚠️ The endpoint is in the name, because "which bucket did this refuse about" is the
     // first question an operator asks and `s3` alone does not answer it.
     assert!(
-        conforming.backend.contains("http://minio:9000"),
+        conforming.backend.contains("http://rustfs:9000"),
         "got {}",
         conforming.backend
     );

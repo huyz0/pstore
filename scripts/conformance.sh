@@ -33,22 +33,38 @@ CHECK=0
 # The containers, and the one bucket each needs. Creating them here rather than
 # in the compose file keeps the emulators generic and this script self-contained.
 # ---------------------------------------------------------------------------
+# ⚠️ Asks the endpoint, not compose. Inside the dev container there is no Docker and the
+# stack is already up on the compose network, so "is S3 answering" is the question -- and
+# "does `docker compose ps` list it" was a proxy for it that only held on the host.
 up() {
-    if ! $COMPOSE ps --services --filter status=running 2>/dev/null | grep -q minio; then
+    if ! curl -sf "$S3/health" >/dev/null 2>&1; then
         echo "starting the emulator stack" >&2
-        $COMPOSE up -d minio azurite gcs >/dev/null
+        $COMPOSE up -d rustfs azurite gcs >/dev/null
         # No healthcheck on two of the three, so wait for the ports rather than for compose.
         for _ in $(seq 30); do
-            curl -sf "$S3/minio/health/live" >/dev/null 2>&1 && break
+            curl -sf "$S3/health" >/dev/null 2>&1 && break
             sleep 1
         done
     fi
 }
 
+# A SigV4-signed PUT is all "make a bucket" is. Not `mc`: that is MinIO's client, and
+# `curl --aws-sigv4` is already everywhere this runs.
+#
+# ⚠️ The payload hash is sent explicitly: curl before 8.x does not add it, and S3 refuses the
+# request without it -- `400 missing header: x-amz-content-sha256`, from Debian bookworm's 7.88.
+# ⚠️ And the status is ASSERTED. The first version ended in `|| true`, so that 400 surfaced as
+# a matrix with `rustfs` UNREACHABLE -- `NoSuchBucket` -- which reads as a broken emulator.
+EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 make_s3_bucket() {
-    $COMPOSE exec -T minio sh -c \
-        "mc alias set local http://localhost:9000 ${PSTORE_ACCESS_KEY:-pstore} ${PSTORE_SECRET_KEY:-pstore-dev-secret} >/dev/null && mc mb -p local/$BUCKET >/dev/null" \
-        2>/dev/null || true
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user "${PSTORE_ACCESS_KEY:-pstore}:${PSTORE_SECRET_KEY:-pstore-dev-secret}" \
+        -H "x-amz-content-sha256: $EMPTY_SHA256" -X PUT "$S3/$BUCKET") || true
+    case "$code" in
+        200|409) ;;
+        *) echo "FAIL could not create bucket $BUCKET at $S3: HTTP $code" >&2; exit 1 ;;
+    esac
 }
 
 make_gcs_bucket() {

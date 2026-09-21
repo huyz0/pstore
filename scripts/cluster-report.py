@@ -43,7 +43,7 @@ def containers() -> list[str]:
         ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=pstore-n"],
         capture_output=True, text=True, check=True,
     )
-    return [c for c in out.stdout.split() if c != "pstore-minio"]
+    return [c for c in out.stdout.split() if c != "pstore-rustfs"]
 
 
 def detect(killed_at: str, survivors: int, period_ms: int) -> int:

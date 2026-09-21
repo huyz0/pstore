@@ -32,9 +32,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     services:
-      minio:
-        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-        env: { MINIO_ROOT_USER: pstore, MINIO_ROOT_PASSWORD: pstore-dev-secret }
+      # ⚠️ A service container cannot be given a command, so RustFS finds its data directory
+      # through RUSTFS_VOLUMES -- which it refuses ("Volume not found") unless one is mounted.
+      rustfs:
+        image: rustfs/rustfs:1.0.0
+        env:
+          RUSTFS_ACCESS_KEY: pstore
+          RUSTFS_SECRET_KEY: pstore-dev-secret
+          RUSTFS_VOLUMES: /data
+          RUSTFS_ADDRESS: 0.0.0.0:9000
+          RUSTFS_CONSOLE_ENABLE: "false"
+        volumes: ["rustfs-data:/data"]
         ports: ["9000:9000"]
       azurite:
         image: mcr.microsoft.com/azure-storage/azurite:3.34.0

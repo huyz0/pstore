@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = env("PSTORE_NODE_ID", &fresh_node_id());
     let listen = env("PSTORE_GOSSIP_ADDR", "0.0.0.0:7946");
     let advertise = env("PSTORE_ADVERTISE", &listen);
-    let endpoint = env("PSTORE_S3_ENDPOINT", "http://minio:9000");
+    let endpoint = env("PSTORE_S3_ENDPOINT", "http://rustfs:9000");
     let bucket = env("PSTORE_BUCKET", "pstore");
 
     // Concrete, not `dyn`: `Roster`'s methods are generic over `BlobStore`, which keeps the

@@ -14,18 +14,22 @@
 # NOT in AGENTS.md's Gates table -- `scripts/build-index.py --check` requires that table and
 # CI to be the same set in both directions, and CI has no Docker.
 #
-# ⚠️ Host networking and its own MinIO, following `scripts/cluster.sh`: a plain `docker run`
-# is not on the compose project's network, so `http://minio:9000` would not resolve, and
-# NOTHING in this repository creates a bucket except `conformance.sh`, which reaches MinIO
-# through `compose exec`.
+# ⚠️ Host networking and its own RustFS, following `scripts/cluster.sh`: a plain `docker run`
+# is not on the compose project's network, so `http://rustfs:9000` would not resolve -- and
+# the bucket is made here, with a SigV4-signed `curl`, because nothing else makes it.
 # portable: no -- host networking between containers, and `timeout` is the hang guard that
 # turns a regressed door guard into a failure instead of a gate that never returns.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# ⚠️ Git Bash rewrites an argument that looks like a POSIX path into a Windows one, so the
+# container argument `/data` reached RustFS as `C:/Program Files/Git/data` and it exited
+# "Volume not found" -- a store that never came up, reported as a connection refused. A no-op
+# anywhere but Git Bash.
+export MSYS_NO_PATHCONV=1
 
 IMAGE=pstore-byoc
-MINIO=pstore-byoc-minio
-MINIO_PORT=9210
+STORE=pstore-byoc-rustfs
+STORE_PORT=9210
 A_PORT=8211
 B_PORT=8212
 BUCKET=pstore
@@ -38,8 +42,8 @@ ok()   { printf '   ok   %s\n' "$*"; }
 bad()  { printf '   FAIL %s\n' "$*"; fails=$((fails + 1)); }
 
 cleanup() {
-  [ "$KEEP" = "--keep" ] && { echo "left up: $MINIO, ${IMAGE}-a, ${IMAGE}-b"; return; }
-  docker rm -f "$MINIO" "${IMAGE}-a" "${IMAGE}-b" >/dev/null 2>&1 || true
+  [ "$KEEP" = "--keep" ] && { echo "left up: $STORE, ${IMAGE}-a, ${IMAGE}-b"; return; }
+  docker rm -f "$STORE" "${IMAGE}-a" "${IMAGE}-b" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -73,7 +77,7 @@ server() {
     -e PSTORE_BIND="0.0.0.0:${port}" \
     -e PSTORE_LANE="$lane" \
     -e PSTORE_BACKEND=s3 \
-    -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" \
+    -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${STORE_PORT}" \
     -e PSTORE_BUCKET="$BUCKET" \
     -e PSTORE_ACCESS_KEY=pstore \
     -e PSTORE_SECRET_KEY=pstore-dev-secret \
@@ -91,16 +95,25 @@ wait_up() { # $1 = port
 say "building $IMAGE"
 docker build -f dev/Dockerfile.server -t "$IMAGE" . >/dev/null
 
-say "MinIO on :$MINIO_PORT"
-docker rm -f "$MINIO" >/dev/null 2>&1 || true
-docker run -d --name "$MINIO" --network host \
-  -e MINIO_ROOT_USER=pstore -e MINIO_ROOT_PASSWORD=pstore-dev-secret \
+say "RustFS on :$STORE_PORT"
+docker rm -f "$STORE" >/dev/null 2>&1 || true
+# ⚠️ The console off: it is a second port per instance, and under host networking a second
+# port is a second collision.
+docker run -d --name "$STORE" --network host \
+  -e RUSTFS_ACCESS_KEY=pstore -e RUSTFS_SECRET_KEY=pstore-dev-secret \
+  -e RUSTFS_ADDRESS="0.0.0.0:$STORE_PORT" -e RUSTFS_CONSOLE_ENABLE=false \
   --memory 1g --cpus 2 \
-  minio/minio:RELEASE.2025-04-22T22-12-26Z server /data --address ":$MINIO_PORT" >/dev/null
-sleep 3
-docker run --rm --network host --entrypoint sh minio/mc:latest -c \
-  "mc alias set d http://127.0.0.1:$MINIO_PORT pstore pstore-dev-secret >/dev/null 2>&1 && \
-   mc mb -p d/$BUCKET >/dev/null 2>&1"
+  rustfs/rustfs:1.0.0 /data >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(req "http://127.0.0.1:$STORE_PORT/health" | code)" = "200" ] && break
+  sleep 0.25
+done
+# ⚠️ The status is ASSERTED. The `mc mb ... 2>&1` this replaces discarded its outcome, so a
+# bucket that was never made surfaced three arms later as a server that could not write.
+r=$(req --aws-sigv4 "aws:amz:us-east-1:s3" --user pstore:pstore-dev-secret -X PUT \
+  -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+  "http://127.0.0.1:$STORE_PORT/$BUCKET")
+[ "$(code <<<"$r")" = "200" ] || { bad "could not create bucket $BUCKET: $r"; exit 1; }
 
 # --- Criterion 3: an unprobed profile refuses, and the container EXITS. -----------------
 # ⚠️ `PSTORE_BACKEND=s3` matters: with the default `memory` the profile is Supported and the
@@ -112,14 +125,14 @@ say "criterion 3 — an unprobed profile refuses to serve"
 # for `req`; a foreground `docker run` is the same hazard wearing different clothes.
 out=$(timeout 30 docker run --rm --network host \
   -e PSTORE_LANE=1 -e PSTORE_BACKEND=s3 \
-  -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" "$IMAGE" 2>&1) && code=0 || code=$?
+  -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${STORE_PORT}" "$IMAGE" 2>&1) && code=0 || code=$?
 case "$code" in
   0)   bad "served with an unprobed profile" ;;
   124) bad "did not exit -- it is still serving with an unprobed profile" ;;
   *)   ok "exited $code" ;;
 esac
 case "$out" in
-  *"refusing to serve"*"s3(http://127.0.0.1:${MINIO_PORT})"*) ok "named the backend" ;;
+  *"refusing to serve"*"s3(http://127.0.0.1:${STORE_PORT})"*) ok "named the backend" ;;
   *) bad "did not name the backend: $out" ;;
 esac
 # ⚠️ `cas=Divergent`, not `*cas*`: the loose form passes on any message that happens to

@@ -56,6 +56,22 @@ The third one turns out to be the interesting one, and not for the reason you'd 
 > [`docs/profiles/capability-matrix.md`](../../profiles/capability-matrix.md),
 > [`M7a/VERIFIED.md`](../../milestones/M7a/VERIFIED.md).
 
+> **C-16 — RustFS replaced MinIO, and the table's RustFS row does not describe 1.0.0. M8a.
+> Measured.** The table says RustFS has "ETag quoting mismatches — lenient in responses,
+> strict in requests (#1458)". Probed against `rustfs/rustfs:1.0.0`, its first GA release
+> and the version this repo now pins, RustFS answers the ten-probe suite **row for row as
+> MinIO did**: `create_if_absent` and `compare_and_swap` `Supported` — a quoted ETag in
+> `If-Match` is accepted and a stale one refused with 412 — and `aba_resistance` `Divergent`,
+> because its ETags are MD5s and so content-derived. The HEAD nonce answers that exactly as it
+> did for MinIO, so nothing in the engine moved.
+>
+> ⚠️ **What was learned swapping it, and none of it is about CAS:** a bucket is a SigV4 PUT,
+> and curl before 8.x does not send the `x-amz-content-sha256` S3 requires; RustFS needs its
+> data directory as an argument or a mounted `RUSTFS_VOLUMES`, and Git Bash rewrites the
+> argument `/data` into a Windows path. Evidence:
+> [`docs/profiles/capability-matrix.md`](../../profiles/capability-matrix.md),
+> [`M8a/VERIFIED.md`](../../milestones/M8a/VERIFIED.md).
+
 This is not a reason to stop; it is a reason to change what each test layer is *for*.
 
 ## 3. Three test layers, three different jobs

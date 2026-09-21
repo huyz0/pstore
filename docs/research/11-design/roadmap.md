@@ -449,6 +449,24 @@ three crates below the server, so it is its own milestone), authentication, a sc
 tracing, and a Helm chart. The image is also **not hardened** — root, writable filesystem, no
 seccomp profile — which [`deploy.md`](../../deploy.md) states rather than implies.
 
+### M8 — the substrate, again
+
+#### M8a — RustFS instead of MinIO, and gates that run on three operating systems
+→ [`docs/milestones/M8a/SPEC.md`](../../milestones/M8a/SPEC.md) ·
+[`VERIFIED.md`](../../milestones/M8a/VERIFIED.md)
+
+**Done, with one criterion that only CI can close.** RustFS 1.0.0 replaces MinIO everywhere
+it runs, and it was measured **before** anything changed: row for row the same ten probes,
+ABA included, so the HEAD nonce that made MinIO usable makes RustFS usable ([C-16](../09-rust-stack/dev-and-test-environment.md)).
+And `gates.sh` now runs on Windows and macOS as well as Linux — measured on Windows, it had
+not: every Python gate hit the `python3` Store stub, the tree read as cp1252, an autocrlf
+checkout broke every script, and rustc refused the repo's own `split-debuginfo` on MSVC.
+
+⚠️ `check-portable.sh` keeps it so, and **its first catch was its own file**: created on
+Windows, committed without the exec bit, and runnable on every OS but the ones CI uses. The
+`portable` CI job runs the whole gate on three runners and is **not yet observed green** —
+CI runs on push.
+
 ## Cross-cutting, from day one
 
 | Discipline | Enforcement |

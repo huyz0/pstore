@@ -73,7 +73,7 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_BIND` | `127.0.0.1:8080` | ⚠️ The image sets `0.0.0.0:8080`; the library default is loopback, which inside a container is reachable by nothing. |
 | `PSTORE_BACKEND` | `memory` | `memory` or `s3`. `memory` is durable for exactly as long as the process. |
 | `PSTORE_PROFILE` | `unprobed` | `unprobed` refuses to serve. |
-| `PSTORE_S3_ENDPOINT` | — | e.g. `http://minio:9000`. |
+| `PSTORE_S3_ENDPOINT` | — | e.g. `http://rustfs:9000`. |
 | `PSTORE_BUCKET` | `pstore` | Must exist; the server does not create it. |
 | `PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY` | the provider's credential chain | ⚠️ **Unset is the deployed case**: an instance profile or a service-account role. Both halves or neither — half a pair is ignored. |
 | `PSTORE_REGION` | `us-east-1` | |

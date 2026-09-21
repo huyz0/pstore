@@ -10,17 +10,20 @@ x-caps: &caps
       limits: { cpus: '1', memory: 1G }
 
 services:
-  # ---- S3-compatible. NOTE: MinIO does NOT support `If-None-Match: *`.
-  # The conformance suite records this; do not assume CAS parity with S3.
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z   # pin: CAS behaviour varies
-    command: server /data --console-address ":9001"
+  # ---- S3-compatible. RustFS replaced MinIO in M8a, and measured identically: CAS and
+  # create-if-absent Supported, ABA Divergent (MD5 ETags repeat). The conformance suite
+  # records it in docs/profiles/capability-matrix.md; do not assume CAS parity with S3.
+  rustfs:
+    image: rustfs/rustfs:1.0.0   # pin: CAS behaviour varies, and `conformance.sh --check` notices
+    command: /data
     environment:
-      MINIO_ROOT_USER: pstore
-      MINIO_ROOT_PASSWORD: pstore-dev-secret
-    ports: ["9000:9000", "9001:9001"]
+      RUSTFS_ACCESS_KEY: pstore
+      RUSTFS_SECRET_KEY: pstore-dev-secret
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+    ports: ["9000:9000"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
       interval: 5s
       retries: 12
     <<: *caps
@@ -57,10 +60,10 @@ services:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /sccache
       CARGO_BUILD_JOBS: "6"
-      PSTORE_S3_ENDPOINT: http://minio:9000
+      PSTORE_S3_ENDPOINT: http://rustfs:9000
       PSTORE_AZURE_ENDPOINT: http://azurite:10000
       PSTORE_GCS_ENDPOINT: http://gcs:4443
-    depends_on: [minio, azurite, gcs]
+    depends_on: [rustfs, azurite, gcs]
     deploy:
       resources:
         # ⚠️ Still well under the WSL2 VM ceiling (32 GB in dev/wslconfig.sample), so a bad

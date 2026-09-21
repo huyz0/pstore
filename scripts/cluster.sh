@@ -23,6 +23,11 @@
 # `up` writes and every later invocation reads.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# ⚠️ Git Bash rewrites an argument that looks like a POSIX path into a Windows one, so the
+# container argument `/data` reached RustFS as `C:/Program Files/Git/data` and it exited
+# "Volume not found" -- a store that never came up, reported as a connection refused. A no-op
+# anywhere but Git Bash.
+export MSYS_NO_PATHCONV=1
 
 NET=pstore-cluster
 IMAGE=pstore-node
@@ -45,9 +50,9 @@ count_matching() { # $1 = grep pattern; prints how many containers have at least
     grep -c '^[1-9]'
 }
 # ⚠️ Not 9000. In host networking the store binds a real host port, and 9000 is a common
-# one — a collision surfaces as MinIO exiting with "port is already in use" while the nodes
+# one — a collision surfaces as the store exiting with "port is already in use" while the nodes
 # report only that the roster never answered.
-MINIO_PORT=9400
+STORE_PORT=9400
 
 case "${1:-}" in
 up)
@@ -70,16 +75,24 @@ up)
   # PROCESSES on one loopback, not 100 network peers. Gossip no longer crosses a bridge, so
   # convergence and traffic here are a floor. `--memory` and `--cpus` still apply, so the
   # per-node cost figures are unaffected.
-  # MinIO holds the roster. Only the roster: nodes own nothing, so there is no data to move.
-  docker rm -f pstore-minio >/dev/null 2>&1 || true
-  docker run -d --name pstore-minio --network host \
-    -e MINIO_ROOT_USER=pstore -e MINIO_ROOT_PASSWORD=pstore-dev-secret \
+  # RustFS holds the roster. Only the roster: nodes own nothing, so there is no data to move.
+  # ⚠️ Console off: under host networking it is a second port, and a second collision.
+  docker rm -f pstore-rustfs >/dev/null 2>&1 || true
+  docker run -d --name pstore-rustfs --network host \
+    -e RUSTFS_ACCESS_KEY=pstore -e RUSTFS_SECRET_KEY=pstore-dev-secret \
+    -e RUSTFS_ADDRESS="0.0.0.0:$STORE_PORT" -e RUSTFS_CONSOLE_ENABLE=false \
     --memory 1g --cpus 2 \
-    minio/minio:RELEASE.2025-04-22T22-12-26Z server /data --address ":$MINIO_PORT" >/dev/null
-  sleep 3
-  docker run --rm --network host --entrypoint sh minio/mc:latest -c \
-    "mc alias set d http://127.0.0.1:$MINIO_PORT pstore pstore-dev-secret >/dev/null 2>&1 && \
-     mc mb -p d/pstore >/dev/null 2>&1" || true
+    rustfs/rustfs:1.0.0 /data >/dev/null
+  for _ in $(seq 1 40); do
+    docker run --rm --network host curlimages/curl:8.11.1 -sf --max-time 2 \
+      "http://127.0.0.1:$STORE_PORT/health" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  # A SigV4-signed PUT is all "make a bucket" is; `mc` was MinIO's client.
+  docker run --rm --network host curlimages/curl:8.11.1 -s -o /dev/null --max-time 30 \
+    --aws-sigv4 "aws:amz:us-east-1:s3" --user pstore:pstore-dev-secret \
+    -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+    -X PUT "http://127.0.0.1:$STORE_PORT/pstore" || true
 
   # ⚠️ The period is FIXED unless asked otherwise, and a first draft of this had it scale
   # with the fleet — which would have made the 1,000-node numbers incomparable to the
@@ -114,14 +127,14 @@ up)
       -e PSTORE_GOSSIP="${GOSSIP:-swim}" \
       -e PSTORE_GOSSIP_ADDR="0.0.0.0:$port" \
       -e PSTORE_ADVERTISE="127.0.0.1:$port" \
-      -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$MINIO_PORT" \
+      -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$STORE_PORT" \
       -e PSTORE_BUCKET=pstore \
       -e AWS_ACCESS_KEY_ID=pstore -e AWS_SECRET_ACCESS_KEY=pstore-dev-secret \
       -e AWS_ALLOW_HTTP=true \
       "$IMAGE" >/dev/null
   }
   export -f start_one
-  export IMAGE LOSS PERIOD_MS MINIO_PORT OWNS_S POLL_MS GOSSIP AZ
+  export IMAGE LOSS PERIOD_MS STORE_PORT OWNS_S POLL_MS GOSSIP AZ
 
   # The first few in order and alone: the roster starts empty, so somebody has to create it
   # before a herd arrives to contend for it.
@@ -281,7 +294,7 @@ starve)
   ;;
 
 down)
-  docker rm -f $(docker ps -aq --filter name=pstore-n) pstore-probe pstore-minio >/dev/null 2>&1 || true
+  docker rm -f $(docker ps -aq --filter name=pstore-n) pstore-probe pstore-rustfs >/dev/null 2>&1 || true
   # ⚠️ Remove the NETWORK too, not just the containers. Measured on WSL2: after a few
   # up/down cycles of ~100 containers, the bridge stops giving NEW containers any
   # connectivity while EXISTING ones keep working — a joining node then times out on a

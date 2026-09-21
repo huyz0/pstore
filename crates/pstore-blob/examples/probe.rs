@@ -43,7 +43,7 @@ fn s3() -> Result<Arc<dyn object_store::ObjectStore>, String> {
         .with_region("us-east-1")
         // ⚠️ Already the default in `object_store` 0.14.1, and stated rather than assumed:
         // this mode sends `If-None-Match: *` on the wire with no client-side emulation, so
-        // the create-if-absent probe measures MinIO and not the client. Pinned explicitly
+        // the create-if-absent probe measures the server and not the client. Pinned explicitly
         // because the day the default changes is the day the probe silently starts
         // measuring something else.
         .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
@@ -165,7 +165,7 @@ async fn main() {
     );
 
     for (name, build) in [
-        ("minio", s3 as fn() -> _),
+        ("rustfs", s3 as fn() -> _),
         ("azurite", azure as fn() -> _),
         ("fake-gcs-server", gcs as fn() -> _),
     ] {
