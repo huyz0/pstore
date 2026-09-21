@@ -18,6 +18,8 @@
 # is not on the compose project's network, so `http://minio:9000` would not resolve, and
 # NOTHING in this repository creates a bucket except `conformance.sh`, which reaches MinIO
 # through `compose exec`.
+# portable: no -- host networking between containers, and `timeout` is the hang guard that
+# turns a regressed door guard into a failure instead of a gate that never returns.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

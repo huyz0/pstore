@@ -17,6 +17,7 @@ TAG=${2:-$(git rev-parse --abbrev-ref HEAD)}
 DIR=.harness/review
 BUDGET=${REVIEW_ROUND_BUDGET:-4}
 mkdir -p "$DIR"
+. scripts/lib/py.sh
 
 # ⚠️ The round counter is the mechanism, so it is tested (tests/harness.bats-style
 # check in scripts/selftest-review.sh). In the source project the counter resolved the
@@ -83,7 +84,7 @@ PACKET="$DIR/${TAG}.r${N}.packet"
   echo
   echo "=== GATES THAT ALREADY PASSED (do not re-check these) ==="
   for g in "cargo fmt --check" "cargo clippy --all-targets -- -D warnings" \
-           "cargo test -q" "./scripts/check-links.sh" "./scripts/build-index.py --check"; do
+           "cargo test -q" "./scripts/check-links.sh" "py ./scripts/build-index.py --check"; do
     if eval "$g" >/dev/null 2>&1; then echo "  PASS  $g"; else echo "  FAIL  $g   <-- fix before reviewing"; fi
   done
   echo

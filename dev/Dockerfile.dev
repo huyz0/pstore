@@ -25,3 +25,14 @@ RUN printf '%s\n' \
     'linker = "clang"' \
     'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
     > /usr/local/cargo/config.toml
+
+# ⚠️ Last, so it does not invalidate the `cargo install` layers above, which are unpinned
+# and currently resolve to versions needing a newer rustc than this image's.
+# ⚠️ Here and not in the repo's profile, because rustc refuses it on Windows MSVC. An env var
+# rather than `rustflags` because `mutants.sh` exports `RUSTFLAGS` when mold is present, which
+# hides every config `rustflags` -- and a sweep is the build that took the VM down.
+ENV CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=unpacked
+
+# ⚠️ `gates.sh` runs four Python gates, and this image had no Python -- so the gate the README
+# says runs in this container had only ever passed on a host that happened to have one.
+RUN apt-get update && apt-get install -y --no-install-recommends python3     && rm -rf /var/lib/apt/lists/*

@@ -27,7 +27,7 @@ echo "ok round counter advances, budget refuses the round, override works"
 # checked are about HEAD moving and about the staged tree -- neither of which may be
 # exercised by committing in the repo under review. `review.sh` resolves its root with
 # `cd $(dirname $0)/..`, so a copy of it in $R/scripts makes $R that root.
-R=$T/repo; mkdir -p "$R/scripts"; cp scripts/review.sh "$R/scripts/review.sh"
+R=$T/repo; mkdir -p "$R/scripts/lib"; cp scripts/review.sh "$R/scripts/review.sh"; cp scripts/lib/py.sh "$R/scripts/lib/py.sh"
 git -C "$R" init -q
 git -C "$R" config user.email selftest@pstore.invalid
 git -C "$R" config user.name selftest

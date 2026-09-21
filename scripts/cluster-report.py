@@ -82,7 +82,7 @@ def default_period() -> int:
     report periods nobody used.
     """
     try:
-        return int(pathlib.Path("/tmp/pstore-cluster-period").read_text().strip())
+        return int(pathlib.Path("/tmp/pstore-cluster-period").read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return 200
 

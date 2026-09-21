@@ -3,7 +3,8 @@
 # files in the tree, so an agent must never be asked to check it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python3 - "$@" <<'PY'
+. scripts/lib/py.sh
+py - "$@" <<'PY'
 import re, sys, pathlib
 roots = [pathlib.Path("docs"), pathlib.Path("dev"), pathlib.Path(".agents"),
          pathlib.Path(".claude"), pathlib.Path("README.md"), pathlib.Path("AGENTS.md")]
@@ -12,7 +13,7 @@ for r in roots:
     files += [r] if r.is_file() else list(r.rglob("*.md")) if r.exists() else []
 bad = []
 for f in files:
-    for m in re.finditer(r"\]\((?!https?:|mailto:)([^)#]+)", f.read_text()):
+    for m in re.finditer(r"\]\((?!https?:|mailto:)([^)#]+)", f.read_text(encoding="utf-8")):
         target = (f.parent / m.group(1).strip()).resolve()
         if not target.exists():
             bad.append(f"{f}: {m.group(1).strip()}")

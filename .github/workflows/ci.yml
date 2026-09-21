@@ -159,3 +159,36 @@ jobs:
       - run: ./scripts/check-slos.py
       - run: ./scripts/selftest-check-slos.sh
       - run: ./scripts/check-poison.sh --selftest
+      # Every shell script the gates run is portable, or declares why not -- a grep, and
+      # the `portable` job below is what catches what a grep cannot.
+      - run: ./scripts/check-portable.sh
+      - run: ./scripts/check-portable.sh --selftest
+
+  # The whole local gate, on the three operating systems a contributor might run it on.
+  # ⚠️ For seven milestones it ran on one: on Windows every Python gate failed (`python3` is
+  # the Store stub there) and rustc refused the repo's own `split-debuginfo`, and nothing said
+  # so because nothing ran it there. Required, not `continue-on-error` -- a portability job
+  # allowed to fail is a portability comment.
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: ./scripts/gates.sh
+        if: runner.os != 'macOS'
+      # ⚠️ `/bin` first, so `#!/usr/bin/env bash` finds macOS's own bash 3.2. The runner puts
+      # Homebrew's bash 5 ahead of it, and a job that never meets bash 3.2 tests the one
+      # thing a contributor's Mac does differently not at all.
+      - run: PATH="/bin:$PATH" /bin/bash ./scripts/gates.sh
+        if: runner.os == 'macOS'

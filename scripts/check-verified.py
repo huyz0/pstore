@@ -45,7 +45,7 @@ def known_tests() -> set[str]:
     """Every #[test]-adjacent fn name in the tree."""
     names: set[str] = set()
     for rs in ROOT.rglob("crates/**/*.rs"):
-        lines = rs.read_text().splitlines()
+        lines = rs.read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):
             if not TEST_ATTR.search(line):
                 continue
@@ -88,11 +88,11 @@ def check(milestone: pathlib.Path, tests: set[str]) -> list[str]:
         print(f"  skip {milestone.name}: no VERIFIED.md yet (in progress, not drift)")
         return []
     errs = []
-    crit = ordered_items(spec.read_text(), "Acceptance criteria")
+    crit = ordered_items(spec.read_text(encoding="utf-8"), "Acceptance criteria")
     if not crit:
         errs.append(f"{spec}: no numbered items under '## Acceptance criteria'")
         return errs
-    ev = ordered_items(verified.read_text())
+    ev = ordered_items(verified.read_text(encoding="utf-8"))
 
     for n in crit:
         if n not in ev:

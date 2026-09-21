@@ -1,0 +1,11 @@
+# LF in the working tree on every OS, whatever `core.autocrlf` says.
+#
+# ⚠️ Without this a Windows checkout -- including GitHub's `windows-latest` runner, where
+# autocrlf is on -- turns every `.sh` into `set -euo pipefail\r`, which bash reads as an
+# invalid option, and every generated region `build-index.py --check` compares into a
+# permanent diff. The gates would then be red on Windows for a reason that is not in the tree.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary

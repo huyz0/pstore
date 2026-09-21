@@ -40,6 +40,8 @@
 #
 # The caps below are the fallback for when it is run on the host anyway. They are a fallback,
 # not a substitute -- the container is the only one of the three ceilings this script controls.
+# portable: no -- sized from cgroup memory and `nproc`; it runs in the Linux dev container
+# and on CI's ubuntu runner, never on a developer's bare host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

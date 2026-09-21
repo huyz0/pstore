@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
-pass() { ./scripts/check-slos.py "$1" >/dev/null 2>&1; }
+. scripts/lib/py.sh
+pass() { py ./scripts/check-slos.py "$1" >/dev/null 2>&1; }
 
 # A row that names a real gate passes.
 cat > "$T/good.md" <<'MD'

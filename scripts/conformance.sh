@@ -17,6 +17,7 @@
 # ten probes correctly. It says nothing about S3, GCS or Azure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/py.sh
 
 MATRIX=docs/profiles/capability-matrix.md
 COMPOSE="docker compose -f dev/docker-compose.yml"
@@ -67,7 +68,7 @@ make_azure_container() {
     hexkey=$(printf '%s' "$key" | base64 -d | xxd -p -c 256)
     sig=$(printf 'PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:%s\nx-ms-version:%s\n/%s/%s/%s\nrestype:container' \
             "$date" "$ver" "$acc" "$acc" "$container" \
-          | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$hexkey" -binary | base64 -w0)
+          | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$hexkey" -binary | base64 | tr -d '\n')
     curl -s -o /dev/null -X PUT -H "x-ms-date: $date" -H "x-ms-version: $ver" \
         -H "Authorization: SharedKey $acc:$sig" \
         "$AZ/$acc/$container?restype=container" || true
@@ -89,7 +90,7 @@ azure_suffix_probe() {
         date=$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S GMT')
         sig=$(printf 'GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:%s\nx-ms-range:%s\nx-ms-version:%s\n/%s/%s/%s' \
                 "$date" "$range" "$ver" "$acc" "$acc" "$blob" \
-              | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$hexkey" -binary | base64 -w0)
+              | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$hexkey" -binary | base64 | tr -d '\n')
         code=$(curl -s -o /dev/null -w '%{http_code}' -H "x-ms-date: $date" -H "x-ms-version: $ver" \
                 -H "x-ms-range: $range" -H "Authorization: SharedKey $acc:$sig" \
                 "$AZ/$acc/$blob")
@@ -125,7 +126,7 @@ gcs_precondition_probe() {
 
     local gen
     gen=$(curl -s "$GCS/storage/v1/b/${PSTORE_GCS_BUCKET:-pstore}/o/${o//\//%2F}" \
-        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("generation",0))')
+        | py -c 'import sys,json;print(json.load(sys.stdin).get("generation",0))')
     code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data 'v3' \
         "$up&name=$o&ifGenerationMatch=1")
     echo "compare-and-swap on a stale generation: $code (must be 412)"

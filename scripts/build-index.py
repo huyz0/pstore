@@ -23,7 +23,7 @@ def region(text: str, key: str, body: str) -> str:
 def skills_table(rel_prefix: str) -> str:
     rows = []
     for sk in sorted((ROOT / ".agents/skills").glob("*/SKILL.md")):
-        fm = sk.read_text().split("---")[1]
+        fm = sk.read_text(encoding="utf-8").split("---")[1]
         name = re.search(r"^name:\s*(.+)$", fm, re.M).group(1).strip()
         desc = re.search(r"^description:\s*(.+)$", fm, re.M).group(1).strip()
         # The description's job is to say WHEN, so trim the leading "what it is".
@@ -39,33 +39,33 @@ def corpus_counts() -> dict:
     docs = sorted((ROOT / "docs/research").rglob("*.md"))
     qs, oqs = set(), set()
     for d in docs:
-        t = d.read_text()
+        t = d.read_text(encoding="utf-8")
         qs |= {int(m) for m in re.findall(r"^\*\*Answers:\*\*\s*(?:D\d+,?\s*)?Q(\d+)", t, re.M)}
         oqs |= {int(m) for m in re.findall(r"OQ-(\d+)", t)}
     return {"docs": len(docs), "questions": len(qs), "open": len(oqs), "maxq": max(qs, default=0)}
 
 
 def apply(path: pathlib.Path, new: str) -> bool:
-    old = path.read_text()
+    old = path.read_text(encoding="utf-8")
     if old == new:
         return False
     if CHECK:
         print(f"STALE {path.relative_to(ROOT)}", file=sys.stderr)
         return True
-    path.write_text(new)
+    path.write_bytes(new.encode("utf-8"))  # bytes: `write_text` emits CRLF on Windows
     print(f"wrote {path.relative_to(ROOT)}")
     return True
 
 
 stale = False
 a = ROOT / "AGENTS.md"
-stale |= apply(a, region(a.read_text(), "skills", skills_table(".agents/skills/")))
+stale |= apply(a, region(a.read_text(encoding="utf-8"), "skills", skills_table(".agents/skills/")))
 r = ROOT / ".agents/skills/README.md"
-stale |= apply(r, region(r.read_text(), "skills", skills_table("")))
+stale |= apply(r, region(r.read_text(encoding="utf-8"), "skills", skills_table("")))
 
 c = corpus_counts()
 i = ROOT / "docs/research/INDEX.md"
-txt = i.read_text()
+txt = i.read_text(encoding="utf-8")
 txt = re.sub(r"\*\*Status: research phase complete\.\*\* \d+ documents, \d+ research questions answered, \d+ open\nquestions logged\.",
              f"**Status: research phase complete.** {c['docs']} documents, {c['questions']} research questions answered, {c['open']} open\nquestions logged.", txt)
 txt = re.sub(r"Question IDs \(`Q1`…`Q\d+`\)", f"Question IDs (`Q1`…`Q{c['maxq']}`)", txt)
@@ -77,10 +77,10 @@ stale |= apply(i, txt)
 # stale, and it already had: it named build-index.sh for months after the rename to .py.
 # We cannot generate the descriptions, but we CAN assert that the set of scripts CI runs
 # and the set the table claims are the same set. Rung 3 beating rung 7.
-ci = (ROOT / ".github/workflows/ci.yml").read_text()
+ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 ci_scripts = {m for m in re.findall(r"\./(scripts/[\w.-]+)", ci) if "selftest-" not in m}
 gates_tbl = re.search(r"<!-- index:gates:start -->(.*?)<!-- index:gates:end -->",
-                      (ROOT / "AGENTS.md").read_text(), re.S).group(1)
+                      (ROOT / "AGENTS.md").read_text(encoding="utf-8"), re.S).group(1)
 tbl_scripts = set(re.findall(r"`(scripts/[\w.-]+)", gates_tbl))
 for m in sorted(ci_scripts - tbl_scripts):
     stale = True
@@ -94,7 +94,7 @@ for e in sorted(tbl_scripts - ci_scripts):
 # sets agree that everything is fine. Found while adding `check-poison.sh`, which is exactly
 # the failure that gate exists to prevent, one level up. `gates.sh` is what a developer runs
 # and `ci.yml` is what merges; they must be the same set.
-gates_sh = (ROOT / "scripts/gates.sh").read_text()
+gates_sh = (ROOT / "scripts/gates.sh").read_text(encoding="utf-8")
 sh_scripts = {m for m in re.findall(r"\./(scripts/[\w.-]+)", gates_sh) if "selftest-" not in m}
 #
 # ⚠️ **One direction only, and the asymmetry is the point.** Everything `gates.sh` runs must

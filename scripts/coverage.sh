@@ -13,6 +13,7 @@
 #   scripts/coverage.sh --fail-under-regions 95  the gate
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/py.sh
 
 # Which members SHIP, and therefore belong inside the floor.
 #
@@ -32,7 +33,7 @@ cd "$(dirname "$0")/.."
 #
 #     [package.metadata.pstore]
 #     ships = false   # test infrastructure: never linked into anything that runs
-scope=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+scope=$(cargo metadata --no-deps --format-version 1 | py -c '
 import json, sys
 md = json.load(sys.stdin)
 test_only = sorted(

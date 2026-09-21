@@ -35,7 +35,7 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
         echo "WARN no .wslconfig: the VM may take up to half the host's RAM" >&2
         note "see dev/wslconfig.sample, then: wsl --shutdown"
     elif ! grep -qi '^processors' "$cfg"; then
-        echo "WARN $cfg sets no processor cap; the VM sees $(nproc) cores and ${total}GB" >&2
+        echo "WARN $cfg sets no processor cap; the VM sees $(getconf _NPROCESSORS_ONLN) cores and ${total}GB" >&2
         note "see dev/wslconfig.sample, then: wsl --shutdown"
     fi
 fi

@@ -5,7 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-G=./scripts/check-verified.py
+. scripts/lib/py.sh
+G="py ./scripts/check-verified.py"
 REAL=epoch_orders_and_advances   # a test that actually exists in pstore-types
 pass=0
 

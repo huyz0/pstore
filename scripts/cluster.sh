@@ -19,6 +19,8 @@
 #
 # ⚠️ Runs on HOST networking, not a bridge, because the host ARP table overflows at this
 # fleet size and drops packets silently. dev/README.md has the measurement and the sysctl.
+# portable: no -- a host-network fleet of Linux containers, and a period file in /tmp that
+# `up` writes and every later invocation reads.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

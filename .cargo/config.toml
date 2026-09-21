@@ -15,7 +15,11 @@ jobs = 6                                  # cap below core count; more jobs = mo
 
 [profile.dev]
 debug = 1                                 # full debug info is a large memory contributor
-split-debuginfo = "unpacked"
+# ⚠️ No `split-debuginfo` here: rustc refuses `unpacked` on Windows MSVC ("unstable on this
+# platform"), so setting it in a profile failed every cargo command there. It is a Linux
+# link-memory saving, so it is set where Linux builds happen -- the dev image's
+# `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO`, which a `RUSTFLAGS` cannot hide, and the target table
+# below for a bare Linux host. macOS already defaults to `unpacked`.
 
 [profile.test]
 debug = 1
@@ -26,3 +30,8 @@ debug = 1
 inherits = "release"
 debug = 1
 codegen-units = 1                         # slower build, faster code, lower LLVM parallel RAM
+
+# ⚠️ Ignored whenever `RUSTFLAGS` is set (CI; `mutants.sh` with mold) -- which is why the dev
+# image sets the profile variable instead, and this only covers a bare Linux host.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-Csplit-debuginfo=unpacked"]

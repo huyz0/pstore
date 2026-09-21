@@ -23,7 +23,7 @@ def known_tests() -> set[str]:
     names = set()
     attr = re.compile(r"#\[(?:tokio::|async_std::)?[a-z_:]*test")
     for rs in ROOT.rglob("crates/**/*.rs"):
-        lines = rs.read_text().splitlines()
+        lines = rs.read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):
             if not attr.search(line):
                 continue
@@ -40,7 +40,7 @@ def main() -> int:
         print(f"FAIL {DOC} does not exist")
         return 1
     tests, errs, rows = known_tests(), [], 0
-    for n, line in enumerate(DOC.read_text().splitlines(), 1):
+    for n, line in enumerate(DOC.read_text(encoding="utf-8").splitlines(), 1):
         if not line.startswith("|") or line.startswith("|---"):
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
