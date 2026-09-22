@@ -22,5 +22,7 @@ All coverage runs are in the Linux dev container, with `cargo-llvm-cov` 0.9.1 an
    the raw step (line 70) before the edit and nothing after;
    `grep -n 'fail-under' .github/workflows/ci.yml` shows one step with both floors at 95. A
    one-time check: no gate reruns it.
-5. NOT-RUN: **the CI `coverage` job on the pushed commit.** Red on `6abdfa3` and `25089c7`, at
-   the line step, before this change; this commit is not pushed yet.
+5. **The CI `coverage` job on the pushed commit** — green in CI run 35734267477 on `12d348a`,
+   running `./scripts/coverage.sh --all-features --fail-under-lines 95 --fail-under-regions 95`.
+   Red on `6abdfa3` and `25089c7`, at the line step, before this change. Every other job in
+   that run was green too — the first fully green CI since before M8a.
