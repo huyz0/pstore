@@ -341,3 +341,125 @@ impl<S: crate::BlobStore> crate::BlobStore for Faulty<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryStore;
+
+    /// The unit-interval value `split_mix` derives from one raw 64-bit output.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "53 bits is exactly what an f64 mantissa holds"
+    )]
+    fn unit(z: u64) -> f64 {
+        ((z >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    /// The draw the first operation on a fresh `Faulty` with `seed` will roll.
+    fn first_draw(seed: u64) -> f64 {
+        split_mix(&mut seed.clone())
+    }
+
+    fn faulty(seed: u64, faults: Faults) -> Faulty<MemoryStore> {
+        Faulty::new(MemoryStore::new(), seed, faults)
+    }
+
+    const SEED: u64 = 7;
+
+    /// ⚠️ SplitMix64's **published** outputs from state 0, computed independently of this
+    /// file. The generator is written out so that determinism "cannot drift"; this is what
+    /// makes that sentence checkable. A change to any constant or shift -- or `^=` becoming
+    /// `|=`, which the nightly sweep found nothing noticed -- changes every seeded run.
+    #[test]
+    fn split_mix_matches_the_reference_sequence() {
+        let mut state = 0u64;
+        assert_eq!(
+            split_mix(&mut state).to_bits(),
+            unit(0xE220_A839_7B1D_CDAF).to_bits()
+        );
+        assert_eq!(
+            split_mix(&mut state).to_bits(),
+            unit(0x6E78_9E6A_A1B9_65F4).to_bits()
+        );
+    }
+
+    /// ⚠️ **The premise of an exclusion, under test.** `.cargo/mutants.toml` excludes the
+    /// mutant that replaces `Faults::none` with `Default::default()`, because the two are the
+    /// same function. The exclusion matches the mutant's *name*, so if `none()` ever stopped
+    /// being the default it would silently hide a mutant a test could kill -- and this is the
+    /// assertion that fails instead.
+    #[test]
+    fn no_faults_is_exactly_the_default() {
+        assert_eq!(Faults::none(), Faults::default());
+    }
+
+    /// ⚠️ **A rate `p` fires on `[0, p)`.** So a draw exactly equal to the rate does not fire,
+    /// and a rate of 0.0 never fires even on a draw of 0.0. A seeded draw essentially never
+    /// lands on a rate, which is why six `<` -> `<=` flips survived every existing test; this
+    /// puts the draw on the rate deliberately. Each case also sets the rate one float above
+    /// the draw, which must fire -- so a comparison that never fires fails here too.
+    #[test]
+    fn a_draw_equal_to_the_rate_does_not_fire_and_one_below_it_does() {
+        let r = first_draw(SEED);
+        let above = r.next_up();
+        assert!(r > 0.0, "seed {SEED} draws exactly zero; choose another");
+
+        let slow = |rate| Faults {
+            slow_down: rate,
+            ..Faults::none()
+        };
+        let read = |rate| Faults {
+            read_error: rate,
+            ..Faults::none()
+        };
+        let write = |rate| Faults {
+            write_error: rate,
+            ..Faults::none()
+        };
+        let lost = |rate| Faults {
+            cas_lost: rate,
+            ..Faults::none()
+        };
+        let contended = |rate| Faults {
+            cas_contended: rate,
+            ..Faults::none()
+        };
+
+        // read_fault: `slow_down`, then `slow_down + read_error`.
+        assert!(faulty(SEED, slow(r)).read_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, slow(above)).read_fault(),
+            Some(BlobError::SlowDown)
+        ));
+        assert!(faulty(SEED, read(r)).read_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, read(above)).read_fault(),
+            Some(BlobError::Other(_))
+        ));
+
+        // write_fault: `slow_down`, then `slow_down + write_error`.
+        assert!(faulty(SEED, slow(r)).write_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, slow(above)).write_fault(),
+            Some(BlobError::SlowDown)
+        ));
+        assert!(faulty(SEED, write(r)).write_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, write(above)).write_fault(),
+            Some(BlobError::Other(_))
+        ));
+
+        // cas_fault: `cas_lost`, then `cas_lost + cas_contended`.
+        assert!(faulty(SEED, lost(r)).cas_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, lost(above)).cas_fault(),
+            Some(CasError::Lost)
+        ));
+        assert!(faulty(SEED, contended(r)).cas_fault().is_none());
+        assert!(matches!(
+            faulty(SEED, contended(above)).cas_fault(),
+            Some(CasError::Contended)
+        ));
+    }
+}

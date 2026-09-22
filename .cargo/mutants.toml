@@ -31,3 +31,14 @@ additional_cargo_test_args = ["--all-targets"]
 # `object_store` and not `compat`: `compat` pulls the aws, gcp and azure clients into every
 # one of the N per-mutant builds, and those add nothing a mutant of ours can be caught by.
 additional_cargo_args = ["--features", "pstore-blob/object_store"]
+
+# ⚠️ **Equivalent mutants, excluded by name -- each with its reason, and each premise tested.**
+# D-111's exclusion policy (engineering-standards.md): an exclusion says why and is reviewed
+# like code. A regex keys on the mutant's NAME, so each premise is asserted by a test: if the
+# code stops being equivalent, that test fails rather than this line silently hiding a mutant
+# a test could kill.
+exclude_re = [
+    # `Faults::none()` IS `Self::default()`, so replacing its body with `Default::default()`
+    # changes nothing. Premise: `faulty::tests::no_faults_is_exactly_the_default`. (M8c)
+    'replace Faults::none -> Self with Default::default\(\)',
+]
