@@ -78,8 +78,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `cargo fmt --check` | formatting |
 | `cargo clippy --all-targets -- -D warnings` | the workspace lint set, including `unsafe_code = "forbid"` |
 | `cargo test` / `cargo nextest run` | tests |
-| `cargo llvm-cov --fail-under-lines 95` | engineering-standards D-110 |
-| `scripts/coverage.sh --fail-under-regions 95` | the **region** floor on the crates that ship; the test-only set is derived from the dependency graph, not named |
+| `scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95` | D-110's **line** floor and the **region** floor, one measurement over the crates that ship: a crate opts out with `ships = false`, and binary entry points are excluded. ⚠️ Until M8b the line floor was a raw whole-workspace `cargo llvm-cov` counting both `main.rs` files at 0% -- 93%, red on every push, while the region floor passed over the declared scope |
 | `scripts/mutants.sh` | D-111 — the gate that makes coverage mean something. **Incremental by default**: a full sweep is 462 mutants × a 70-second suite, so the bare command tests only what this branch changed, and the full sweep is nightly and sharded |
 | `cargo deny check` | licences, advisories, and the `object_store` ban outside `pstore-blob` |
 | `scripts/check-poison.sh` | shipping code **recovers** a poisoned lock rather than dropping the `Result`. ⚠️ `pstore-catalog`'s appender read a poisoned lock as "not seen" and then skipped the insert that remembers what it wrote — losing its dedupe for that tenant for the life of the process, and turning the lifecycle-rate append C-12's bounded write depends on into a commit-rate one. A coverage number found it two milestones later. Rung 3 |

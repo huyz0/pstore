@@ -65,14 +65,15 @@ jobs:
         with: { components: llvm-tools-preview }
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Workspace floor is 95% (D-110). Per-crate targets are higher for the
-      # correctness core and are checked in the nightly job.
-      - run: cargo llvm-cov --all-features --workspace --fail-under-lines 95 --lcov --output-path lcov.info
-      # The REGION floor, on the crates that ship. `pstore-testkit` is dev-only, so it is
-      # excluded -- derived from the dependency graph rather than named here, so a future
-      # test-only crate is excluded automatically and a crate that starts shipping is
-      # included the moment something depends on it at runtime.
-      - run: ./scripts/coverage.sh --fail-under-regions 95
+      # The LINE floor (D-110) and the REGION floor, both 95, in one measurement over one
+      # scope: the crates that ship. A crate opts out with `ships = false` in its Cargo.toml
+      # (`pstore-testkit` does), and binary entry points are excluded because `cargo test`
+      # cannot reach a composition root -- see coverage.sh's header.
+      # ⚠️ M8b: the line floor used to be a raw whole-workspace llvm-cov run that counted both
+      # `main.rs` files at 0%, so it sat at 93% and failed on every push while the region
+      # floor, over the declared scope, passed. Two floors disagreeing about what the codebase
+      # is. D-110's per-crate targets are not enforced by anything.
+      - run: ./scripts/coverage.sh --all-features --fail-under-lines 95 --fail-under-regions 95
 
   # Recall is a gate, not a periodic study (D-35): a PR that silently drops recall@10 or
   # adds a round trip must fail the build. Release mode and its own job, because a
