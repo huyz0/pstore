@@ -70,8 +70,11 @@ on push.
     PASS on the final M8a.1 tree, and again on the final M8a.2 tree.
 12. **The `portable` job is defined, and the parity check holds** — `./scripts/build-index.py --check`
     passes with `scripts/gates.sh` and `scripts/check-portable.sh` in the Gates table, and was
-    red before the two rows were added. The job has no `continue-on-error`. NOT-RUN: its green
-    run on `windows-latest` and `macos-latest` — CI runs on push, and pushing is the
-    maintainer's call. Criterion 7's native Windows run is the same command on a Windows
-    host, but a developer's machine, not the runner image; criterion 8 is a proxy for macOS.
-    Neither substitutes for the job.
+    red before the two rows were added. The job has no `continue-on-error`. **Observed green
+    on all three runners** after the push: `portable (ubuntu-latest)`, `portable (windows-latest)`
+    and `portable (macos-latest)` succeeded in CI run 35678970611 on `25089c7`, the last under
+    `/bin/bash` 3.2. That is the evidence criteria 7 and 8 were proxies for.
+    ⚠️ The same run's `coverage` job failed, at `cargo llvm-cov --fail-under-lines 95` — the
+    step that also failed on `6abdfa3`, before M8a, so this milestone did not cause it. And
+    `test`, which failed on `6abdfa3` at "Initialize containers" — the MinIO service never
+    started — passes with RustFS.

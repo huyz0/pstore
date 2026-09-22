@@ -455,7 +455,7 @@ seccomp profile — which [`deploy.md`](../../deploy.md) states rather than impl
 → [`docs/milestones/M8a/SPEC.md`](../../milestones/M8a/SPEC.md) ·
 [`VERIFIED.md`](../../milestones/M8a/VERIFIED.md)
 
-**Done, with one criterion that only CI can close.** RustFS 1.0.0 replaces MinIO everywhere
+**Done.** RustFS 1.0.0 replaces MinIO everywhere
 it runs, and it was measured **before** anything changed: row for row the same ten probes,
 ABA included, so the HEAD nonce that made MinIO usable makes RustFS usable ([C-16](../09-rust-stack/dev-and-test-environment.md)).
 And `gates.sh` now runs on Windows and macOS as well as Linux — measured on Windows, it had
@@ -464,8 +464,8 @@ checkout broke every script, and rustc refused the repo's own `split-debuginfo` 
 
 ⚠️ `check-portable.sh` keeps it so, and **its first catch was its own file**: created on
 Windows, committed without the exec bit, and runnable on every OS but the ones CI uses. The
-`portable` CI job runs the whole gate on three runners and is **not yet observed green** —
-CI runs on push.
+`portable` CI job runs the whole gate on three runners, and was **observed green on all
+three** — macOS under its own bash 3.2.
 
 ## Cross-cutting, from day one
 
