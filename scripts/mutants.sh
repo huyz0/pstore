@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The mutation gate (D-111), with the fast path as the DEFAULT path.
 #
-# ⚠️ A full sweep of this workspace is 462 mutants x a 200-second suite -- 25 CPU-hours.
+# ⚠️ A full sweep of this workspace is **3,401 mutants** (`cargo mutants --list`, 2026-09-22; it
+# was 462 in M5), and one CI shard of 426 takes about two hours -- roughly two minutes of
+# workspace suite per viable mutant.
 # Nobody runs that in a loop, so anyone who has to type the flags runs nothing instead, and
 # the gate that catches "a test which executes code without constraining it" stops running
 # exactly where it is most needed: on code that was just written.
