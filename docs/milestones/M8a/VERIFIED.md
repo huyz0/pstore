@@ -2,10 +2,12 @@
 
 One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-verified.py`.
 
-⚠️ **Where each ran.** This host is Windows with Docker Desktop and **no MSVC linker**, so
-cargo cannot link natively here: every cargo-bearing line ran in the Linux dev container
-(`pstore-dev-dev`), and every Docker line ran from Git Bash on the host. There is no Mac.
-Criterion 12's green run is CI's, and CI runs on push.
+⚠️ **Where each ran.** This host is Windows with Docker Desktop. It had **no MSVC linker**
+while the milestone was built, so every cargo-bearing line below ran in the Linux dev
+container (`pstore-dev-dev`), and every Docker line ran from Git Bash on the host. After the
+close, Visual Studio Build Tools 2022 (17.14.41) was installed and the full gate was run
+natively too — criterion 7. There is no Mac. Criterion 12's green run is CI's, and CI runs
+on push.
 
 1. **The matrix names `rustfs`, and `--check` agrees with a fresh run** —
    `./scripts/conformance.sh --check`, run from the dev image on host networking against the
@@ -46,6 +48,11 @@ Criterion 12's green run is CI's, and CI runs on push.
    on this host, before any change: every Python gate exited 49 (the `python3` Store stub).
    And without the helper, `PYTHONUTF8=0` on the old `check-slos.py` raised
    `UnicodeDecodeError: 'charmap' codec` and the new one passes.
+   **And then all of it, cargo included**: with MSVC Build Tools 17.14.41 installed,
+   `./scripts/gates.sh` run natively from Git Bash on `a86c439` (`CARGO_TARGET_DIR=target/windows`)
+   passed all fifteen gates — fmt, clippy `-D warnings`, the whole workspace's tests, and every
+   script gate. Nothing past M8a.1's fixes was needed: moving `split-debuginfo` out of the
+   profile and forcing LF were what stood between the code and a Windows build.
 8. **The same under bash 3.2 with busybox** — `bash:3.2` (GNU bash 3.2.57, BusyBox 1.37
    userland): the same twelve non-cargo lines of `./scripts/gates.sh`, all PASS. Red first: `check-poison.sh` exited 127 there,
    `env: can't execute 'bash'`, because this very checkout had CRLF endings.
@@ -65,4 +72,6 @@ Criterion 12's green run is CI's, and CI runs on push.
     passes with `scripts/gates.sh` and `scripts/check-portable.sh` in the Gates table, and was
     red before the two rows were added. The job has no `continue-on-error`. NOT-RUN: its green
     run on `windows-latest` and `macos-latest` — CI runs on push, and pushing is the
-    maintainer's call. Criteria 7 and 8 are this host's proxies for it, not substitutes.
+    maintainer's call. Criterion 7's native Windows run is the same command on a Windows
+    host, but a developer's machine, not the runner image; criterion 8 is a proxy for macOS.
+    Neither substitutes for the job.
