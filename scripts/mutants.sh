@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The mutation gate (D-111), with the fast path as the DEFAULT path.
 #
-# ⚠️ A full sweep of this workspace is **3,401 mutants** (`cargo mutants --list`, 2026-09-22; it
-# was 462 in M5), and one CI shard of 426 takes about two hours -- roughly two minutes of
-# workspace suite per viable mutant.
+# ⚠️ A full sweep of this workspace is **3,339 mutants** (`cargo mutants --list` through the
+# entry-point excludes, 2026-09-23; 3,401 before M8c and M8d, 462 in M5), and one CI shard of
+# ~420 takes about two hours -- roughly two minutes of workspace suite per viable mutant.
 # Nobody runs that in a loop, so anyone who has to type the flags runs nothing instead, and
 # the gate that catches "a test which executes code without constraining it" stops running
 # exactly where it is most needed: on code that was just written.
@@ -46,6 +46,7 @@
 # and on CI's ubuntu runner, never on a developer's bare host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/py.sh
 
 # ⚠️ **Build directories go on DISK, never tmpfs, and this is a WSL2 rule with teeth.**
 # On WSL2 `/tmp` is a tmpfs, which means it is RAM. An earlier version of this script picked
@@ -134,6 +135,22 @@ case "${1:-}" in
         args+=(--in-diff "$diff")
         ;;
 esac
+
+# ⚠️ **Binary entry points are never mutated** (M8d): no test runs a binary, so no test can
+# catch a mutant in one, and a sweep that mutates them can never go green. Derived by
+# `scripts/lib/scope.py`, the same derivation `coverage.sh` uses -- but ENTRY POINTS ONLY:
+# `ships = false` crates stay mutated, because they are testable and hold the conformance
+# probes. Captured and checked, never read through `< <(...)`: a silent failure here would put
+# every excluded mutant back and turn the nightly red with no explanation.
+if ! metadata=$(cargo metadata --no-deps --format-version 1) \
+    || ! excludes=$(printf '%s' "$metadata" | py scripts/lib/scope.py mutants); then
+    echo "FAIL could not derive the mutation scope (scripts/lib/scope.py)" >&2
+    exit 1
+fi
+while IFS= read -r glob; do
+    [[ -n "$glob" ]] && args+=(--exclude "$glob")
+done <<< "$excludes"
+echo "# not mutated (entry points): $(printf '%s' "$excludes" | tr '\n' ' ')" >&2
 
 export TMPDIR="${TMPDIR:-$(pick_tmpdir)}"
 flags=$(linker_flags)

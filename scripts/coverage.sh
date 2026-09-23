@@ -33,42 +33,14 @@ cd "$(dirname "$0")/.."
 #
 #     [package.metadata.pstore]
 #     ships = false   # test infrastructure: never linked into anything that runs
-scope=$(cargo metadata --no-deps --format-version 1 | py -c '
-import json, sys
-md = json.load(sys.stdin)
-test_only = sorted(
-    p["name"]
-    for p in md["packages"]
-    if (p.get("metadata") or {}).get("pstore", {}).get("ships") is False
-)
-
-# Binary ENTRY POINTS are composition roots: they read the environment, open connections and
-# loop, and nothing outside the operating system can call them. `cargo test` cannot reach one,
-# so its coverage is structurally zero and drags a real floor down to a number nobody trusts.
 #
-# ⚠️ This is an exclusion of WIRING, never of logic, and it is what makes the rule
-# "`main.rs` wires, `lib.rs` decides" enforceable rather than advisory: logic left in a
-# binary is now INVISIBLE to the gate, so moving it to the library is the only way to get
-# credit for testing it. Measured before that split, the decisions in `pstore-node` -- when to
-# dial a peer, what to publish, how long to retry a join -- sat in `main` at 0% coverage, and
-# two of them were bugs found by a hundred containers instead of by a test.
-#
-# Derived from `cargo metadata`, so a new binary is covered by the rule the day it is added.
-roots = sorted(
-    t["src_path"]
-    for p in md["packages"]
-    for t in p["targets"]
-    if t["kind"] == ["bin"]
-)
-patterns = [t.replace("-", "[-_]") for t in test_only]
-patterns += ["/".join(r.rsplit("/", 3)[-3:]) for r in roots]
-# Two lines: the human-readable names, then the regex llvm-cov needs (paths use either
-# separator depending on where the file came from).
-print(" ".join(test_only + [r.rsplit("/", 3)[-1] for r in roots]))
-print("|".join(patterns))
-')
-test_only_names=$(printf '%s\n' "$scope" | sed -n 1p)
-shipped_filter=$(printf '%s\n' "$scope" | sed -n 2p)
+# ⚠️ The derivation -- which crates declare `ships = false`, and why binary entry points are
+# composition roots whose coverage is structurally zero -- lives in `scripts/lib/scope.py`,
+# shared with `mutants.sh` so the two gates cannot drift apart about what the codebase is
+# (M8b, M8d). Derived from `cargo metadata`, so a new binary is covered the day it is added.
+metadata=$(cargo metadata --no-deps --format-version 1)
+test_only_names=$(printf '%s' "$metadata" | py scripts/lib/scope.py names)
+shipped_filter=$(printf '%s' "$metadata" | py scripts/lib/scope.py llvm-cov)
 
 if [[ "${1:-}" == "--all" ]]; then
     echo "# every workspace member, including test-only crates"
