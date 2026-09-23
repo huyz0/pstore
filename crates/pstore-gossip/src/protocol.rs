@@ -40,6 +40,19 @@ fn suspect_timeout(members: usize) -> u64 {
     SUSPECT_TIMEOUT_MIN.max(3 * u64::from(log2))
 }
 
+/// The hash that turns a period's seed and tick into a peer index.
+///
+/// ⚠️ **Pinned against an independent model** (M8f). Seven mutants in this arithmetic survived
+/// the only test of it, which asked that 60 probes reach at least 5 of 11 peers -- a bound any
+/// hash that is not degenerate meets. A function so the values can be asserted exactly.
+fn mix(seed: u64, tick: u64) -> u64 {
+    let mut h = seed ^ tick.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
 /// How many peers are asked to probe on our behalf when a direct probe fails.
 const INDIRECT_PROBES: usize = 3;
 
@@ -494,10 +507,7 @@ impl Protocol {
         if candidates.is_empty() {
             return None;
         }
-        let mut h = seed ^ self.tick.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
+        let h = mix(seed, self.tick);
         candidates
             .get((h % candidates.len() as u64) as usize)
             .map(|m| (*m).clone())
@@ -511,5 +521,187 @@ impl Protocol {
             .take(INDIRECT_PROBES)
             .map(|m| m.addr.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    //! Exact contracts for the private machinery, where the simulation tests assert bounds.
+    //!
+    //! ⚠️ M8f: the nightly mutation sweep found 15 survivors here. The simulation tests say
+    //! "carried at most 24 times" and "reached at least 5 of 11 peers", and a mutant that
+    //! stays inside a bound passes it. These pin the contract itself.
+    use super::*;
+
+    fn nid(n: u8) -> NodeId {
+        let mut b = [0u8; 16];
+        b[0] = n;
+        b
+    }
+
+    /// Node 0 is this node; `live` are joined, `dead` are joined and declared dead.
+    fn protocol(live: &[u8], dead: &[u8]) -> Protocol {
+        let mut c = Cluster::new(nid(0), "n0".to_owned(), "az-a".to_owned());
+        for &n in live.iter().chain(dead) {
+            c.join(nid(n), format!("n{n}"), "az-a".to_owned());
+        }
+        for &n in dead {
+            c.declare_dead(&nid(n));
+        }
+        Protocol::new(c)
+    }
+
+    #[test]
+    fn the_suspect_timeout_grows_with_the_log_of_the_fleet() {
+        // The floor hides the scaling at small fleets, which is where every simulation runs.
+        assert_eq!(suspect_timeout(1), SUSPECT_TIMEOUT_MIN);
+        assert_eq!(suspect_timeout(1 << 20), 63, "3 x a 21-bit fleet size");
+    }
+
+    #[test]
+    fn a_change_rides_along_exactly_retransmits_times() {
+        let mut p = protocol(&[1], &[]);
+        p.note_update(&nid(1));
+        let carried: Vec<usize> = (0..10).map(|_| p.piggyback().len()).collect();
+        let expected: Vec<usize> = (0..10)
+            .map(|i| usize::from(i < usize::from(RETRANSMITS)))
+            .collect();
+        assert_eq!(
+            carried, expected,
+            "a change must ride exactly {RETRANSMITS} times"
+        );
+    }
+
+    #[test]
+    fn noting_a_member_again_replaces_only_its_own_entry() {
+        let mut p = protocol(&[1, 2], &[]);
+        p.note_update(&nid(1));
+        p.note_update(&nid(2));
+        p.note_update(&nid(1));
+        let pending: Vec<NodeId> = p.updates.iter().map(|(m, _)| m.id).collect();
+        assert_eq!(
+            pending,
+            vec![nid(2), nid(1)],
+            "B must survive A being noted again"
+        );
+    }
+
+    /// Every peer picked over 64 seeds at `tick`, set directly: driving `tick()` would
+    /// suspect and then bury the fixture's peers, since nothing here answers a probe.
+    fn picks(p: &mut Protocol, tick: u64) -> Vec<NodeId> {
+        p.tick = tick;
+        (0..64u64)
+            .filter_map(|s| p.pick_peer(s).map(|m| m.id))
+            .collect()
+    }
+
+    #[test]
+    fn the_dead_are_revisited_on_revisit_ticks_and_whenever_no_one_is_alive() {
+        let (live, dead) = ([1u8, 2, 3], [4u8, 5]);
+        let is = |set: &[u8], id: &NodeId| set.iter().any(|&n| nid(n) == *id);
+
+        let mut p = protocol(&live, &dead);
+        for t in [1, 2, 3, 4, 6] {
+            let got = picks(&mut p, t);
+            assert_eq!(got.len(), 64, "tick {t} picked nobody");
+            assert!(
+                got.iter().all(|id| is(&live, id)),
+                "tick {t} picked outside the live set"
+            );
+        }
+        for t in [5, 10] {
+            let got = picks(&mut p, t);
+            assert_eq!(got.len(), 64, "revisit tick {t} picked nobody");
+            assert!(
+                got.iter().all(|id| is(&dead, id)),
+                "revisit tick {t} picked a live peer"
+            );
+        }
+
+        let mut isolated = protocol(&[], &dead);
+        for t in [1, 2, 3, 4, 5, 6, 10] {
+            let got = picks(&mut isolated, t);
+            assert_eq!(got.len(), 64, "an isolated node picked nobody at tick {t}");
+            assert!(got.iter().all(|id| is(&dead, id)));
+        }
+
+        let mut alone = protocol(&[], &[]);
+        assert!(
+            picks(&mut alone, 1).is_empty(),
+            "a node with no peers picked one"
+        );
+    }
+
+    /// ⚠️ **A suspect that speaks is not buried on the old timer.** Hearing from a peer clears
+    /// its suspicion clock without changing its state -- refuting is the peer's job, prompted
+    /// by the evidence the ack carries -- so a peer that answered must not be declared dead
+    /// when a window that started before it answered runs out. Found by M8f's sweep: with
+    /// `mark_alive` emptied, nothing noticed.
+    #[test]
+    fn a_suspect_that_speaks_is_not_buried_on_the_old_timer() {
+        let mut p = protocol(&[1], &[]);
+        p.cluster.suspect(&nid(1));
+        p.suspected_at.insert(nid(1), 0);
+        let ping = Message::Ping {
+            from: nid(1),
+            seq: 0,
+            checksum: p.cluster.checksum(),
+            updates: Vec::new(),
+        };
+        p.receive("n1", &ping);
+        p.tick = 1_000;
+        p.bury_suspects();
+        assert_ne!(
+            p.cluster.state(&nid(1)),
+            Some(State::Dead),
+            "a suspect that answered was buried on the timer it answered"
+        );
+    }
+
+    #[test]
+    fn indirect_probes_go_to_live_peers_other_than_the_target() {
+        let p = protocol(&[1, 2, 3, 4, 5], &[6]);
+        let helpers = p.helpers(&nid(2));
+        assert_eq!(helpers.len(), INDIRECT_PROBES, "{helpers:?}");
+        for h in &helpers {
+            assert!(
+                ["n1", "n3", "n4", "n5"].contains(&h.as_str()),
+                "{h} is not a live peer other than this node and the target"
+            );
+        }
+        let mut distinct = helpers.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            helpers.len(),
+            "a helper was asked twice: {helpers:?}"
+        );
+    }
+
+    /// ⚠️ Values from an independent model of the same arithmetic, not from this code:
+    ///
+    /// ```text
+    /// M = (1 << 64) - 1
+    /// def mix(s, t):
+    ///     h = (s ^ ((t * 0x9E3779B97F4A7C15) & M)) & M
+    ///     h ^= h >> 33; h = (h * 0xff51afd7ed558ccd) & M; h ^= h >> 33
+    ///     return h
+    /// ```
+    ///
+    /// No zero seed or tick: at `(0, 0)` every mutant of the mixing survives. A deliberate
+    /// change to the selection hash must update these -- that is the point of pinning them.
+    #[test]
+    fn peer_selection_mixing_matches_an_independent_model() {
+        assert_eq!(mix(1, 1), 0x93f0_1a4e_d8b4_cd0f);
+        assert_eq!(mix(42, 5), 0x7742_60bc_98c9_f5c2);
+        assert_eq!(mix(0xDEAD_BEEF, 3), 0xbbd4_8e3b_6581_0b13);
     }
 }

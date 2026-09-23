@@ -215,3 +215,29 @@ fn a_frame_without_a_zone_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_hostile_member_count_is_refused_without_reserving_it() {
+    // ⚠️ A frame claiming `u32::MAX` members and carrying none. The decoder must refuse it --
+    // and must not size anything by the claim first: `Vec::with_capacity(u32::MAX)` of
+    // members is ~343 GB, which aborts the process on Windows and on Linux without
+    // overcommit. ⚠️ Where a reservation that size succeeds lazily (macOS, overcommit=1),
+    // this test cannot see the hazard; it was observed red on Linux (M8f).
+    let mut frame = Message::Sync {
+        from: id(1),
+        members: Vec::new(),
+    }
+    .encode();
+    // The count field is bytes 17..21 (tag, then a 16-byte sender) -- asserted, so a layout
+    // change cannot turn this into a test of nothing.
+    assert_eq!(frame.len(), 21, "an empty Sync is tag + sender + count");
+    assert!(
+        Message::decode(&frame).is_some(),
+        "the untampered frame must decode"
+    );
+    frame[17..21].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(
+        Message::decode(&frame).is_none(),
+        "a frame claiming u32::MAX members decoded"
+    );
+}

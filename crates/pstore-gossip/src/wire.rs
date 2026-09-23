@@ -74,11 +74,17 @@ fn put_member(out: &mut Vec<u8>, m: &Member) {
         // A length that does not fit is a member that cannot be encoded; truncating its
         // address would produce a member nobody can reach, which is worse than refusing to
         // carry it.
-        let len = u32::try_from(field.len()).unwrap_or(0);
+        //
+        // ⚠️ A `match`, not `if len > 0` (M8f): that comparison's `>=` mutant was equivalent for
+        // every field a test can build -- appending an empty field is a no-op -- and differed
+        // only for a field over 4 GiB. Pairing the length with the bytes it describes makes
+        // the two impossible to disagree, with no comparison left to mutate.
+        let (len, bytes) = match u32::try_from(field.len()) {
+            Ok(len) => (len, field),
+            Err(_) => (0, &[][..]),
+        };
         out.extend_from_slice(&len.to_le_bytes());
-        if len > 0 {
-            out.extend_from_slice(field);
-        }
+        out.extend_from_slice(bytes);
     }
 }
 
@@ -145,11 +151,13 @@ impl<'a> Reader<'a> {
 
     fn members(&mut self) -> Option<Vec<Member>> {
         let n = self.u32()? as usize;
-        // ⚠️ Bounded by what is actually left. A hostile or corrupt length would otherwise
-        // reserve gigabytes before the first read fails.
-        if n > self.buf.len() {
-            return None;
-        }
+        // ⚠️ **No length guard, deliberately (M8f).** There was one, `n > buf.len()`, and it
+        // changed nothing: a member is at least 33 bytes, so a count the frame cannot hold fails
+        // on the first member it cannot read, guard or no guard -- and collecting into
+        // `Option<Vec<_>>` starts from a lower size hint of 0, so nothing ever reserved `n`
+        // slots. Its two mutants were equivalent. What the guard was *for* -- a hostile count
+        // must not reserve gigabytes -- is pinned by `a_hostile_member_count_is_refused_without_reserving_it`.
+        // ⚠️ So do not `Vec::with_capacity(n)` here: that test is what fails if you do.
         (0..n).map(|_| self.member()).collect()
     }
 
