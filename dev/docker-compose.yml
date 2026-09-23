@@ -51,6 +51,13 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     working_dir: /work
+    # ⚠️ An init process as PID 1, to reap orphans. Without it the command IS PID 1, and a
+    # mutation sweep's PID 1 is cargo-mutants, which never waits on children it did not spawn:
+    # every orphaned build or test process became a zombie. Measured: 30,627 zombies after
+    # ~20 hours, which exhausted the Docker VM kernel's PID space -- so every fork in EVERY
+    # container failed with EAGAIN, cargo-mutants recorded those failed builds as "unviable"
+    # mutants, and both running sweeps then hung at 0% CPU.
+    init: true
     volumes:
       - ../:/work:cached
       - cargo-target:/work/target
