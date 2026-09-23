@@ -141,3 +141,28 @@ async fn total_loss_stops_the_bytes_but_not_the_node() {
     assert_eq!(sent, 0, "{sent} bytes reached the wire under total loss");
     assert!(dropped > 0, "total loss dropped nothing at all");
 }
+
+#[tokio::test]
+async fn a_member_reports_its_own_zone() {
+    // ⚠️ The zone is what makes a cell's roster a cell's roster: `main` keeps only peers whose
+    // zone matches its own. Pinned through the member's OWN entry, which is deterministic:
+    // two members in different zones do not learn each other's zone today -- a peer first
+    // learned from a seed, dial or probe keeps an empty zone (M8e's ledger records it open).
+    // `contains`, not equality: a reused test port can deliver a stray probe.
+    let port = free_port();
+    let m = swim::start(
+        &format!("127.0.0.1:{port}"),
+        &format!("127.0.0.1:{port}"),
+        "az-q",
+        &[],
+        0.0,
+        FAST,
+    )
+    .await
+    .expect("a member must start on loopback");
+    let zoned = m.members_zoned().await;
+    assert!(
+        zoned.contains(&(m.self_addr(), "az-q".to_owned())),
+        "a member in az-q did not report its own zone: {zoned:?}"
+    );
+}

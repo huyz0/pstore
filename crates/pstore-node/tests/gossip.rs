@@ -122,3 +122,33 @@ async fn traffic_is_counted_from_the_first_round() {
     }
     assert!(moved, "no gossip bytes were counted in 50 periods");
 }
+
+#[tokio::test]
+async fn total_loss_stops_the_bytes_but_not_the_node() {
+    // ⚠️ The chitchat twin of `swim`'s test of the same name, and it exists because M8e's
+    // sweep found `traffic` could be replaced by the constant `(1, 1, 0)` and survive: the only
+    // traffic test asked that sent and received be non-zero and dropped be zero, which a
+    // constant satisfies. Under total loss the answer is the opposite shape -- nothing sent,
+    // something dropped -- so no single constant satisfies both tests.
+    let (pa, pb) = (free_port(), free_port());
+    let a = gossip::start(
+        &format!("node-{pa}"),
+        &format!("127.0.0.1:{pa}"),
+        &format!("127.0.0.1:{pa}"),
+        &[format!("127.0.0.1:{pb}")],
+        1.0,
+        pstore_node::DEFAULT_GOSSIP_PERIOD,
+    )
+    .await
+    .expect("a member must start under total loss");
+    let _b = member(pb, &[]).await;
+    for _ in 0..50 {
+        let (sent, _, dropped) = a.traffic();
+        if dropped > 0 {
+            assert_eq!(sent, 0, "{sent} bytes reached the wire under total loss");
+            return;
+        }
+        tokio::time::sleep(pstore_node::DEFAULT_GOSSIP_PERIOD).await;
+    }
+    panic!("total loss dropped nothing at all");
+}

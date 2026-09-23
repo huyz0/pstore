@@ -274,3 +274,50 @@ fn a_node_without_a_zone_refuses_to_start() {
     );
     assert_eq!(pstore_node::policy::zone(Some("az-b")).unwrap(), "az-b");
 }
+
+/// Set on a child process, never by hand: which half of the check below this run is.
+const ROLE: &str = "PSTORE_TEST_ZONE_FROM_ENV_ROLE";
+
+/// ⚠️ **The wrapper, tested without setting a variable in this process.** `zone_from_env`
+/// reads `PSTORE_AZ` and hands it to `zone`; `zone` is tested above, and the wrapper was not,
+/// because setting a variable in-process is `unsafe` in this edition and `unsafe_code` is
+/// forbidden. A child process is given one instead -- safe code -- so a wrapper that returned a
+/// constant, or read the wrong variable, fails here.
+///
+/// The parent requires each child's success AND `1 passed`: libtest prints a test's name on
+/// failure too, and a filter that matched nothing would run zero tests and exit 0.
+#[test]
+fn zone_from_env_reads_pstore_az() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("set") => {
+            assert_eq!(pstore_node::policy::zone_from_env(), Ok("az-q".to_owned()));
+            return;
+        }
+        Ok("unset") => {
+            assert!(pstore_node::policy::zone_from_env().is_err());
+            return;
+        }
+        _ => {}
+    }
+    for (role, value) in [("set", Some("az-q")), ("unset", None)] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "zone_from_env_reads_pstore_az",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ROLE, role);
+        match value {
+            Some(v) => child.env("PSTORE_AZ", v),
+            None => child.env_remove("PSTORE_AZ"),
+        };
+        let out = child.output().expect("the test binary can re-run itself");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the `{role}` child failed or ran nothing:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

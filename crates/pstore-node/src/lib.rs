@@ -17,6 +17,24 @@ pub mod policy;
 pub mod swim;
 pub mod transport;
 
+/// FNV-1a, 64-bit: the node's one hash, for identities, loss seeds and jitter slots.
+///
+/// ⚠️ **One copy, because three drifted out of testing.** `swim::derive_id`, `gossip::start`
+/// and `policy::jitter` each wrote this loop out, and only `jitter`'s was tested -- so a
+/// mutation to either of the others changed every derived node id or every loss seed and no
+/// test noticed (M8e). Written out rather than pulled in, so a value cannot change with a
+/// dependency's version: every node must derive the same id from a given address, including
+/// in a fleet running mixed versions.
+#[must_use]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 /// The gossip period a node uses unless told otherwise, and therefore the resolution of
 /// every timing it reports.
 ///

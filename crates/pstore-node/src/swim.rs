@@ -4,6 +4,7 @@
 //! that a test cannot reach, and it is deliberately thin for that reason. Anything with a
 //! branch worth being wrong about belongs in `pstore-gossip`, not here.
 
+use crate::transport::Bernoulli;
 use pstore_gossip::{Cluster, Message, NodeId, Protocol};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -117,11 +118,7 @@ impl Member {
 /// for *cache* placement, which is M4d — and M4d is where it has to be fixed, by carrying
 /// identity in the roster rather than by guessing it here.
 fn derive_id(addr: &str) -> Result<NodeId, ()> {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in addr.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
+    let h = crate::fnv1a(addr.as_bytes());
     let mut out = [0u8; 16];
     out[..8].copy_from_slice(&h.to_le_bytes());
     out[8..].copy_from_slice(&h.rotate_left(17).to_le_bytes());
@@ -178,7 +175,7 @@ fn spawn_receiver(
     let (socket, proto, stats) = (Arc::clone(socket), Arc::clone(proto), Arc::clone(stats));
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
-        let mut rng = seed | 1;
+        let mut rng = Bernoulli::new(seed);
         loop {
             let Ok((n, from)) = socket.recv_from(&mut buf).await else {
                 continue;
@@ -203,7 +200,7 @@ fn spawn_ticker(
 ) {
     let (socket, proto, stats) = (Arc::clone(socket), Arc::clone(proto), Arc::clone(stats));
     tokio::spawn(async move {
-        let mut rng = seed | 1;
+        let mut rng = Bernoulli::new(seed);
         let mut round = 0u64;
         loop {
             tokio::time::sleep(period).await;
@@ -218,23 +215,19 @@ fn spawn_ticker(
 ///
 /// ⚠️ Loss is applied to **outbound** only. Dropping inbound would count the bytes before
 /// discarding them and inflate the traffic figure by exactly the loss rate.
+///
+/// ⚠️ **The same `Bernoulli` the chitchat path's `Metered` uses** (M8e). This used to be a
+/// hand-rolled copy of its xorshift, seeded with the `seed | 1` that `Bernoulli`'s own comment
+/// records as lossy -- two generators for one job, and only one of them tested.
 async fn send_all(
     socket: &UdpSocket,
     stats: &Stats,
     out: Vec<(String, Message)>,
     loss: f64,
-    rng: &mut u64,
+    rng: &mut Bernoulli,
 ) {
     for (to, msg) in out {
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a 53-bit mantissa is finer than any loss rate worth injecting"
-        )]
-        let draw = (*rng >> 11) as f64 / (1u64 << 53) as f64;
-        if draw < loss {
+        if rng.fires(loss) {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }

@@ -115,11 +115,7 @@ pub async fn start(
     // hundred nodes one drop pattern — every node dropping the same probe in the same
     // period is a synchronised partition, not 10% loss — and a clock would make a failure
     // unreplayable.
-    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in node_id.as_bytes() {
-        seed ^= u64::from(*b);
-        seed = seed.wrapping_mul(0x100_0000_01b3);
-    }
+    let seed = crate::fnv1a(node_id.as_bytes());
     let transport = Metered::new(UdpTransport, loss, seed);
     let stats = transport.stats();
     let handle = chitchat::spawn_chitchat(config, Vec::new(), &transport).await?;

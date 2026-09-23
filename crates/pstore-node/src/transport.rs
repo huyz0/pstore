@@ -43,12 +43,12 @@ impl Stats {
 /// **reproducible**: the same seed drops the same datagrams, so a convergence failure under
 /// loss can be replayed instead of chased.
 #[derive(Debug)]
-struct Bernoulli {
+pub(crate) struct Bernoulli {
     state: u64,
 }
 
 impl Bernoulli {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         // ⚠️ splitmix64, not `seed | CONST`. OR is **lossy**: it cannot clear a bit, so
         // every seed differing only in bits the constant already sets collapses to the same
         // state — measured, seeds 42 and 43 produced byte-identical drop sequences, and a
@@ -65,15 +65,19 @@ impl Bernoulli {
         }
     }
 
-    /// Whether this trial fires, at probability `p`.
-    fn fires(&mut self, p: f64) -> bool {
+    /// The next draw in `[0, 1)`.
+    fn draw(&mut self) -> f64 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
         // Top 53 bits: the mantissa of an f64, so the quantisation is below any loss rate
         // worth injecting.
-        let u = (self.state >> 11) as f64 / (1u64 << 53) as f64;
-        u < p
+        (self.state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Whether this trial fires, at probability `p`: on a draw in `[0, p)`.
+    pub(crate) fn fires(&mut self, p: f64) -> bool {
+        self.draw() < p
     }
 }
 
@@ -183,6 +187,28 @@ mod tests {
                 "asked for {p} loss and got {got:.4}"
             );
         }
+    }
+
+    /// ⚠️ **A rate `p` fires on `[0, p)`.** So a draw exactly equal to the rate does not fire
+    /// -- which is also what makes a rate of 0.0 never fire. A seeded draw essentially never
+    /// lands on a rate, which is why `<` -> `<=` survived every rate test; this puts it there
+    /// deliberately, and one float above must fire. A fresh generator per case, so each sees
+    /// the same first draw.
+    #[test]
+    fn a_draw_equal_to_the_rate_does_not_fire_and_one_below_it_does() {
+        let u = Bernoulli::new(7).draw();
+        assert!(
+            u > 0.0,
+            "seed 7's first draw is exactly zero; choose another"
+        );
+        assert!(
+            !Bernoulli::new(7).fires(u),
+            "a draw equal to the rate fired"
+        );
+        assert!(
+            Bernoulli::new(7).fires(u.next_up()),
+            "a draw below the rate did not fire"
+        );
     }
 
     #[test]

@@ -113,6 +113,18 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | ~~22~~ | ⚠️ **`scripts/review.sh`'s round counter is keyed on the branch name and never resets. DONE** ([M7b](M7b/VERIFIED.md)). so on a long-lived `main` it accumulates rounds across unrelated tasks. Observed during [M0c](M0c/VERIFIED.md): it reported "round 4 of hard budget 4" for a change whose review had not started, and computed its "delta since round 3" against a sha four commits stale — handing the reviewer an already-committed diff instead of the staged one. The next change on `main` will be **refused at round 5** for rounds spent on other work. ⚠️ The budget itself is right and is why the loop terminates; what is wrong is what it counts. Key it on the staged tree, or reset it when HEAD moves. ⚠️ **Reset when HEAD moves, and explicitly not keyed on the staged tree** — the staged tree is what *changes* between rounds, so keying on it would reset the budget on every fix and delete the mechanism. `${TAG}.base` records the HEAD the review started on. The delta is now `git write-tree` to `git write-tree`, so round *N* diffs what round *N-1* actually reviewed rather than the worktree against a sha. | [M0c](M0c/VERIFIED.md) | S |
 
+## Opened by M8e
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 33 | ⚠️ **SWIM never learns a peer's zone after learning its address, so the peer drops out of its cell's roster.** A peer first learned from a seed, a `dial` or a bare probe is stored with an **empty** zone (`swim.rs`, `protocol.rs`), and the peer's own record — incarnation 0, Alive — never outranks that entry, because `absorb` replaces only at a higher incarnation or a worse state at an equal one, and `Cluster::join` ignores a peer it already knows. Found by M8e's spec review in simulation: two members in `az-a` and `az-b`, loss-free, **still see each other's zone as empty after 200 rounds**, and because the fingerprint covers the zone their views never agree, so they exchange **4 Sync datagrams per round forever**. `main.rs` publishes only peers whose zone matches its own, so such a peer is missing from the roster until something bumps its incarnation. ⚠️ The chitchat path is unaffected. The fix is in `pstore-gossip`'s `absorb` — a record carrying a zone should fill an empty one at equal incarnation — and needs a two-member test that polls for the zone, which M8e deliberately did not write because it would fail. | [M8e](M8e/VERIFIED.md) | M |
+
+## Opened by M8d
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 34 | ⚠️ **`pstore-node/src/main.rs` makes decisions no gate can see.** It decides when to heal (`ticks % heal_every == jitter(...)`), whether to republish (`size != last_size`) and the ownership cadence. Coverage has excluded binary entry points since M5, and since M8d mutation does too, so the nightly's 39 misses there stopped being a signal rather than being fixed. The crate's own rule is "`main.rs` wires, `lib.rs` decides": move each of those decisions into the library, where both gates measure it, until what is left in `main` is wiring. | [M8d](M8d/SPEC.md) | M |
+
 ## Opened by M7e
 
 | # | Task | From | Size |
