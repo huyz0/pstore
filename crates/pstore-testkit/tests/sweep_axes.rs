@@ -347,3 +347,144 @@ async fn each_swept_point_records_the_configuration_it_was_taken_under() {
     // rather than a row of zeroes that claims its commits landed.
     assert!(points.iter().all(|p| p.commits + p.abandoned == 2));
 }
+
+/// A correct store whose `get_tag` answers the seed probe and then reports the key missing.
+///
+/// The store contradicting itself: `contention_point` seeds the key and nothing deletes it,
+/// so `Ok(None)` inside the loop can only come from a backend like this one.
+#[derive(Debug, Default)]
+struct ForgetsAfterTheProbe {
+    inner: MemoryStore,
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for ForgetsAfterTheProbe {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_range(key, range).await
+    }
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_suffix(key, n).await
+    }
+    async fn get_with_tag(
+        &self,
+        key: &Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        let tag = self.inner.get_tag(key).await?;
+        let first = self
+            .probes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0;
+        Ok(tag.filter(|_| first))
+    }
+    async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        pre: Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn each_early_exit_abandons_exactly_one_commit() {
+    // The two exits no other test reaches. `abandoned` is what makes `commits` honest, so
+    // each exit must count exactly one -- and only its own kind.
+
+    // A refused CAS (`Io`). Ordinal 0 is the seed, so the writer's first CAS is refused.
+    let p = sweep::contention_point(
+        Arc::new(pstore_testkit::flaky::Flaky::refusing(&[1])),
+        Key::new("k"),
+        1,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (p.attempts, p.commits, p.lost, p.abandoned, p.probe_failed),
+        (1, 0, 0, 1, 0),
+        "a refused CAS"
+    );
+
+    // A rebase that finds the seeded key missing (`Ok(None)`): abandoned, and NOT a refused
+    // probe, and before any attempt is spent.
+    let p = sweep::contention_point(
+        Arc::new(ForgetsAfterTheProbe::default()),
+        Key::new("k"),
+        1,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (p.attempts, p.commits, p.lost, p.abandoned, p.probe_failed),
+        (0, 0, 0, 1, 0),
+        "a key the store forgot"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_latency_sweep_runs_the_spread_it_records() {
+    // ⚠️ A spread, not a fixed delay. `Faulty` clamps `max` up to `min`, so at `lo == hi`
+    // a sweep that dropped `latency_max` would delay by `lo` anyway and pass. One writer and
+    // four commits is 8 delayed calls (a rebase read and a CAS each; the seed probe is
+    // outside the clock), so the loop costs more than 80 ms and at most 88 -- exactly 80 with
+    // the ceiling dropped, and around half that with the floor dropped. ⚠️ AT MOST 88, not
+    // under it: the paused clock rounds every timer up to a whole millisecond, so each 10.x ms
+    // delay costs exactly 11 and correct code lands on 88.
+    let lo = Duration::from_millis(10);
+    let hi = Duration::from_millis(11);
+    let points = sweep::latency_sweep(&[(lo, hi)], 1, 4, 5).await.unwrap();
+    let p = &points[0];
+    assert_eq!(p.commits, 4);
+    assert!(
+        p.elapsed > 8 * lo && p.elapsed <= 8 * hi,
+        "8 calls at [10, 11) ms took {:?}",
+        p.elapsed
+    );
+}
+
+#[tokio::test]
+async fn a_cas_error_sweep_runs_the_rate_it_records() {
+    // At a 100% 412 rate nothing lands and the whole budget is spent on the one commit. A
+    // sweep that recorded the rate without injecting it would land the commit first try.
+    let points = sweep::cas_error_sweep(&[1.0], 1, 1, 5).await.unwrap();
+    let p = &points[0];
+    assert_eq!(
+        (p.commits, p.lost, p.abandoned),
+        (0, u64::from(MAX_CAS_ATTEMPTS), 1)
+    );
+}

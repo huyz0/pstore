@@ -170,6 +170,32 @@ async fn the_suite_detects_each_defect_a_real_backend_actually_has() {
 }
 
 #[tokio::test]
+async fn a_broken_backend_carries_its_defect_on_the_class_carrying_reads() {
+    use pstore_blob::{Class, Key};
+    use pstore_testkit::broken::{Broken, Defect};
+    // The engine reads through `get_range_as` and `get_suffix_as`, not the un-hinted pair,
+    // so a defect present only on the un-hinted pair is a defect the engine never meets.
+    let k = Key::new("a/b");
+    let body = bytes::Bytes::from_static(b"0123456789");
+
+    let short = Broken::new(Defect::ShortReadsPastTheEnd);
+    short.put(&k, body.clone()).await.unwrap();
+    assert_eq!(
+        &short.get_range_as(&k, 8..20, Class::Meta).await.unwrap()[..],
+        b"89",
+        "an overrunning range must come back truncated, not refused"
+    );
+
+    let whole = Broken::new(Defect::SuffixReturnsEverything);
+    whole.put(&k, body).await.unwrap();
+    assert_eq!(
+        &whole.get_suffix_as(&k, 3, Class::Meta).await.unwrap()[..],
+        b"0123456789",
+        "a suffix read must return the whole object"
+    );
+}
+
+#[tokio::test]
 async fn a_broken_backend_still_declares_itself_healthy() {
     use pstore_testkit::broken::{Broken, Defect};
     // The gap the whole module exists to demonstrate.
@@ -203,4 +229,145 @@ async fn a_broken_backend_forwards_everything_it_does_not_break() {
         s.get(&k).await.is_ok(),
         "the defect is that deletes do nothing"
     );
+}
+
+/// A backend that answers wrongly in a way a length check alone cannot see.
+///
+/// `Broken`'s defects are the ones real backends have, and each fails its probe on
+/// something coarse -- an error where bytes were due, a whole object for a suffix. These
+/// lies pass everything coarse and fail only the exact comparison each probe ends in, so
+/// they are what tells a probe that COMPARES from one that merely gets an answer.
+#[derive(Debug)]
+enum Lie {
+    /// A range read off by one byte: the right length, the wrong bytes.
+    ShiftedRange,
+    /// Every coalesced slice one byte too long, but still three of them.
+    LongSlices,
+    /// A suffix never longer than 8 bytes, so a short one is right and an oversized one
+    /// comes back truncated rather than as the whole object.
+    ClampedSuffix,
+    /// A write that returns a tag from before a second, hidden write.
+    StaleTag,
+}
+
+#[derive(Debug)]
+struct Liar {
+    inner: MemoryStore,
+    lie: Lie,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for Liar {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &pstore_blob::Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &pstore_blob::Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        match self.lie {
+            Lie::ShiftedRange => {
+                self.inner
+                    .get_range(key, range.start + 1..range.end + 1)
+                    .await
+            }
+            _ => self.inner.get_range(key, range).await,
+        }
+    }
+    async fn get_ranges(
+        &self,
+        key: &pstore_blob::Key,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>, pstore_blob::BlobError> {
+        let body = self.inner.get(key).await?;
+        let extra = u64::from(matches!(self.lie, Lie::LongSlices));
+        Ok(ranges
+            .iter()
+            .map(|r| {
+                let end = (r.end + extra).min(body.len() as u64);
+                body.slice(r.start as usize..end as usize)
+            })
+            .collect())
+    }
+    async fn get_suffix(
+        &self,
+        key: &pstore_blob::Key,
+        n: u64,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        match self.lie {
+            Lie::ClampedSuffix => self.inner.get_suffix(key, n.min(8)).await,
+            _ => self.inner.get_suffix(key, n).await,
+        }
+    }
+    async fn get_with_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        self.inner.get_tag(key).await
+    }
+    async fn head(&self, key: &pstore_blob::Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        let first = self.inner.put(key, body.clone()).await?;
+        if matches!(self.lie, Lie::StaleTag) {
+            self.inner.put(key, body).await?;
+        }
+        Ok(first)
+    }
+    async fn put_conditional(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[pstore_blob::Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(
+        &self,
+        prefix: &pstore_blob::Key,
+    ) -> Result<Vec<pstore_blob::Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn each_probe_compares_the_answer_and_not_just_its_shape() {
+    let cases = [
+        (Lie::ShiftedRange, "ranged_read"),
+        (Lie::LongSlices, "coalesced_read"),
+        (Lie::ClampedSuffix, "suffix_read"),
+        (Lie::StaleTag, "get_tag"),
+    ];
+    for (i, (lie, probe)) in cases.into_iter().enumerate() {
+        let s = Liar {
+            inner: MemoryStore::new(),
+            lie,
+        };
+        let r = conformance::run(&s, 960 + i as u64).await;
+        let p = r.probes.iter().find(|p| p.name == probe).unwrap();
+        assert!(
+            matches!(p.outcome, Support::Divergent(_)),
+            "{:?} passed {probe}: {:?}",
+            s.lie,
+            p.outcome
+        );
+    }
 }

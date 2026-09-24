@@ -148,3 +148,41 @@ async fn the_rendered_table_carries_its_own_caveat() {
         "it must name where the real number comes from"
     );
 }
+
+#[test]
+fn a_row_is_flagged_exactly_when_it_reaches_the_budget() {
+    // The flag is `abandoned > 0 || attempts/commit >= MAX_CAS_ATTEMPTS`, and each side
+    // flags alone. The rows are rendered one at a time so a flag cannot come from a
+    // neighbour.
+    const FLAG: &str = "<- at the give-up budget";
+    let budget = u64::from(sweep::MAX_CAS_ATTEMPTS);
+    let flagged = |p: &sweep::Point| sweep::render(std::slice::from_ref(p)).contains(FLAG);
+
+    let abandoned_cheaply = sweep::Point {
+        attempts: 1,
+        commits: 1,
+        abandoned: 1,
+        ..empty_point()
+    };
+    assert!(
+        flagged(&abandoned_cheaply),
+        "an abandoned commit is at the budget whatever its ratio"
+    );
+
+    let exactly_at_the_budget = sweep::Point {
+        attempts: budget,
+        commits: 1,
+        ..empty_point()
+    };
+    assert!(
+        flagged(&exactly_at_the_budget),
+        "{budget} attempts for one commit IS the budget"
+    );
+
+    let clean = sweep::Point {
+        attempts: 1,
+        commits: 1,
+        ..empty_point()
+    };
+    assert!(!flagged(&clean), "a clean row was flagged");
+}

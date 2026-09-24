@@ -228,6 +228,47 @@ async fn a_gate_does_not_hold_writers_after_its_quota() {
     .unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_lone_writer_at_an_armed_gate_waits_it_out_and_is_not_a_race() {
+    // The gate's failure mode, which no other test reaches: its racers never come. The
+    // first `n` writers are HELD -- so one of two waits the whole timeout (the paused clock
+    // advances it) -- and `raced()` must then say so. Without this, a gate that let the
+    // first `n` straight through, or a `raced()` that always answered yes, passes every
+    // test above: "one winner" is equally satisfied by a race and by a writer alone.
+    let s = Gated::new(2);
+    s.arm();
+    let started = tokio::time::Instant::now();
+    s.put_conditional(
+        &k("alone"),
+        Bytes::from_static(b"x"),
+        Precondition::NotExists,
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(5),
+        "a lone writer was not held at the barrier ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        !s.raced(),
+        "a writer that raced nobody was reported as a race"
+    );
+}
+
+#[tokio::test]
+async fn claims_hands_back_the_objects_it_holds() {
+    // `store()` exists so a differently-profiled `Claims` can re-probe the SAME objects. A
+    // fresh `MemoryStore` would be a re-probe of an empty world.
+    use pstore_testkit::claims::Claims;
+    let c = Claims::conforming();
+    c.put(&k("kept"), Bytes::from_static(b"v")).await.unwrap();
+    assert_eq!(
+        c.store().get(&k("kept")).await.unwrap(),
+        Bytes::from_static(b"v")
+    );
+}
+
 #[tokio::test]
 async fn an_injected_error_says_it_was_injected() {
     // A test that fails on an injected fault should say so in its own output rather than

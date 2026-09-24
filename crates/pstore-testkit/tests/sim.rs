@@ -116,6 +116,24 @@ async fn a_compare_and_swap_is_not_a_violation() {
 }
 
 #[tokio::test]
+async fn keys_written_counts_distinct_keys() {
+    // The denominator a caller checks before trusting an empty violation list. Asserted
+    // only at 1 above -- which is also what a constant `1` returns.
+    let a = Auditing::new(MemoryStore::new());
+    assert_eq!(a.keys_written(), 0);
+    for key in ["a", "b", "a"] {
+        a.put_conditional(
+            &Key::new(key),
+            Bytes::from_static(b"1"),
+            Precondition::NotExists,
+        )
+        .await
+        .ok();
+    }
+    assert_eq!(a.keys_written(), 2);
+}
+
+#[tokio::test]
 async fn a_reaped_key_may_be_written_again() {
     // GC is what makes a key free. Treating the next write as a mutation would make the
     // auditor and the collector permanently incompatible.

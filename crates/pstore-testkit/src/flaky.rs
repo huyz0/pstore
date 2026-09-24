@@ -128,10 +128,10 @@ impl Flaky {
     /// A store whose reads all fail.
     #[must_use]
     pub fn refusing_reads() -> Self {
+        // Only `reads_fail`: every other field, the read ordinals included, is what
+        // `refusing(&[])` already sets, and restating them was two equivalent mutants (M8i).
         Self {
             reads_fail: true,
-            reads_fail_at: Vec::new(),
-            reads_seen: AtomicU64::new(0),
             ..Self::refusing(&[])
         }
     }
@@ -287,5 +287,45 @@ impl BlobStore for Flaky {
 
         self.read_gate()?;
         self.inner.get_immutable(key, class).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 32 bits `refuse` keeps (`>> 32`) of SplitMix64's first eight outputs from state 0,
+    /// from an independent Python model of the published algorithm. The first two are the
+    /// published `0xE220A8397B1DCDAF` and `0x6E789E6AA1B965F4`.
+    const DRAWS_FROM_ZERO: [u64; 8] = [
+        0xE220_A839,
+        0x6E78_9E6A,
+        0x06C4_5D18,
+        0xF88B_B8A8,
+        0x1B39_896A,
+        0x53CB_9F0C,
+        0x2C82_9ABE,
+        0xC584_133A,
+    ];
+
+    #[test]
+    fn a_rate_refuses_below_it_and_not_at_it_on_every_pinned_draw() {
+        // Two stores in lockstep from one seed, so both see draw `d` on the same call: one
+        // at exactly `d` must not refuse, one at `d + 1` must. That pins the edge and, over
+        // eight draws, the 32 bits of each draw that escape the mixer.
+        let (mut at, mut above) = (Flaky::new(0, 0.0), Flaky::new(0, 0.0));
+        for (i, d) in DRAWS_FROM_ZERO.into_iter().enumerate() {
+            // `rate == 0` short-circuits without drawing, so every pinned draw is non-zero.
+            at.rate = d;
+            above.rate = d + 1;
+            assert!(
+                !at.refuse(),
+                "draw {i}: a rate equal to the draw {d:#x} refused"
+            );
+            assert!(
+                above.refuse(),
+                "draw {i}: a rate just above the draw {d:#x} did not"
+            );
+        }
     }
 }
