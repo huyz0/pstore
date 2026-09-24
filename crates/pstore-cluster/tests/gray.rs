@@ -168,3 +168,81 @@ fn a_node_evicts_on_others_evidence_and_not_its_own() {
     );
     assert!(!gray::should_self_evict(true, Verdict::Healthy));
 }
+
+#[test]
+fn outliers_need_three_zones_but_not_exactly_three() {
+    // ⚠️ Every other test uses exactly three zones, so `samples.len() < 3` -> `>` survived: it
+    // only differs above and below three. Four zones with one degraded names it; two zones
+    // with one degraded names nobody, because with two, whichever is worse is always "the
+    // outlier".
+    let four = vec![
+        zone("az-a", 0.999, 100.0, 0.20),
+        zone("az-b", 0.999, 100.0, 0.20),
+        zone("az-c", 0.999, 100.0, 0.20),
+        zone("az-d", 0.999, 1_000.0, 0.20),
+    ];
+    assert_eq!(gray::outliers(&four, gray::DEFAULT_MARGIN), vec!["az-d"]);
+    let two = vec![
+        zone("az-a", 0.999, 100.0, 0.20),
+        zone("az-b", 0.999, 1_000.0, 0.20),
+    ];
+    assert!(gray::outliers(&two, gray::DEFAULT_MARGIN).is_empty());
+}
+
+/// ⚠️ The three strict comparisons, pinned AT the edge -- M8h's sweep found each one's
+/// non-strict twin surviving, because no test put a value exactly on a threshold. Values are
+/// chosen so the arithmetic is exact in f64: `100 * (1 + 0.5) == 150`, `0.999 - 0.05 == 0.949`
+/// (the success margin is private, so its 0.05 is repeated here), and `0.80` is the survivor
+/// headroom.
+#[test]
+fn a_zone_exactly_at_the_latency_threshold_is_not_an_outlier() {
+    let at = |lat: f64| {
+        vec![
+            zone("az-a", 0.999, 100.0, 0.20),
+            zone("az-b", 0.999, 100.0, 0.20),
+            zone("az-c", 0.999, lat, 0.20),
+        ]
+    };
+    assert!(gray::outliers(&at(150.0), gray::DEFAULT_MARGIN).is_empty());
+    assert_eq!(
+        gray::outliers(&at(150.0f64.next_up()), gray::DEFAULT_MARGIN),
+        vec!["az-c"]
+    );
+}
+
+#[test]
+fn a_zone_exactly_at_the_success_margin_is_not_an_outlier() {
+    let at = |ok: f64| {
+        vec![
+            zone("az-a", 0.999, 100.0, 0.20),
+            zone("az-b", 0.999, 100.0, 0.20),
+            zone("az-c", ok, 100.0, 0.20),
+        ]
+    };
+    assert!(gray::outliers(&at(0.949), gray::DEFAULT_MARGIN).is_empty());
+    assert_eq!(
+        gray::outliers(&at(0.949f64.next_down()), gray::DEFAULT_MARGIN),
+        vec!["az-c"]
+    );
+}
+
+#[test]
+fn a_survivor_exactly_at_the_headroom_blocks_a_drain() {
+    // One bad zone of three (so the majority guard does not fire), idle (so it is not load):
+    // the survivors' headroom decides, and a survivor exactly at it cannot take the share.
+    let with = |survivor: f64| {
+        vec![
+            zone("az-a", 0.999, 100.0, survivor),
+            zone("az-b", 0.999, 100.0, 0.30),
+            zone("az-c", 0.999, 1_000.0, 0.20),
+        ]
+    };
+    assert_eq!(
+        gray::verdict(&with(0.80), "az-c", gray::DEFAULT_MARGIN),
+        Verdict::Shed
+    );
+    assert_eq!(
+        gray::verdict(&with(0.80f64.next_down()), "az-c", gray::DEFAULT_MARGIN),
+        Verdict::Drain
+    );
+}

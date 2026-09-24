@@ -225,6 +225,8 @@ fn a_small_fleet_places_on_everyone_it_has() {
     assert_eq!(got.len(), 2);
     assert_ne!(got[0], got[1], "a node was repeated to pad the list");
     assert!(Placement::new(&nodes(0)).place("k", R).is_empty());
+    // Asking for nobody gets nobody -- no longer by an early return (M8h), so asserted.
+    assert!(Placement::new(&nodes(5)).place("k", 0).is_empty());
 }
 
 #[test]

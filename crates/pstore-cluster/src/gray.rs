@@ -180,3 +180,21 @@ pub fn verdict(samples: &[ZoneHealth], zone: &str, margin: f64) -> Verdict {
 pub fn should_self_evict(blob_reachable: bool, my_zone: Verdict) -> bool {
     !blob_reachable || my_zone == Verdict::Drain
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ Every fleet test reaches `median` through three zones, so the baseline it computes is
+    /// always two values: the odd branch, the index arithmetic and the midpoint were never told
+    /// apart, and M8h's sweep found seven mutants of it surviving.
+    #[test]
+    fn the_median_of_odd_and_even_and_empty_slices() {
+        let m = |v: &[f64]| median(&mut v.to_vec());
+        assert_eq!(m(&[3.0, 1.0, 2.0]).to_bits(), 2.0f64.to_bits());
+        assert_eq!(m(&[4.0, 1.0, 3.0, 2.0]).to_bits(), 2.5f64.to_bits());
+        assert_eq!(m(&[5.0]).to_bits(), 5.0f64.to_bits());
+        assert_eq!(m(&[5.0, 1.0, 4.0, 2.0, 3.0]).to_bits(), 3.0f64.to_bits());
+        assert_eq!(m(&[]).to_bits(), 0.0f64.to_bits());
+    }
+}

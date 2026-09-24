@@ -34,11 +34,19 @@ additional_cargo_args = ["--features", "pstore-blob/object_store"]
 
 # ⚠️ **Equivalent mutants, excluded by name -- each with its reason, and each premise tested.**
 # D-111's exclusion policy (engineering-standards.md): an exclusion says why and is reviewed
-# like code. A regex keys on the mutant's NAME, so each premise is asserted by a test: if the
+# like code. A regex keys on the mutant's NAME, so where a premise can be tested it is: if the
 # code stops being equivalent, that test fails rather than this line silently hiding a mutant
-# a test could kill.
+# a test could kill. Where it cannot (M8h's), the entry says so and names line and column.
 exclude_re = [
     # `Faults::none()` IS `Self::default()`, so replacing its body with `Default::default()`
     # changes nothing. Premise: `faulty::tests::no_faults_is_exactly_the_default`. (M8c)
     'replace Faults::none -> Self with Default::default\(\)',
+    # ⚠️ NOT a proven equivalence, and no test backs it -- the one exclusion here without a
+    # premise test. `place`'s ring search (`*p < pos`) differs from `<=` only when a key's 64-bit
+    # hash EQUALS a node's ring position. FNV-1a does collide between ordinary UTF-8 strings, so
+    # such a key exists, but finding one is a ~2^32 birthday search, and what the test would pin
+    # -- which node a key sitting exactly on a ring position starts its window at -- is a
+    # tie-break no real key reaches. Named by LINE AND COLUMN on purpose: an edit that moves it
+    # makes it reappear as MISSED, rather than silently hiding a new `<`-to-`<=` in `place`. (M8h)
+    'pstore-cluster/src/placement\.rs:77:54: replace < with <= in Placement',
 ]

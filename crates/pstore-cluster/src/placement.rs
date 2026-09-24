@@ -68,15 +68,18 @@ impl<'a> Placement<'a> {
     #[must_use]
     pub fn place(&self, key: &str, r: usize) -> Vec<&'a str> {
         let ring = self.roster.ring();
-        if ring.is_empty() || r == 0 {
-            return Vec::new();
-        }
+        // ⚠️ No early return for an empty ring or `r == 0` (M8h): both already fall out as an
+        // empty list -- `window(0)` is 0, so an empty ring iterates nothing, and `take(0)` plus the
+        // relax loop's own guard return nothing for `r == 0`. Once the ring search lost its
+        // redundant `%`, this guard became redundant too, and its `||` mutant equivalent.
         let pos = hash(&[key.as_bytes()]);
-        // First node clockwise of the key. The ring is sorted, so this is a binary search;
-        // wrapping to 0 is what makes it a ring rather than a line.
-        let start = ring.partition_point(|(p, _)| *p < pos) % ring.len();
+        // First node clockwise of the key. The ring is sorted, so this is a binary search.
+        let start = ring.partition_point(|(p, _)| *p < pos);
         let window = window(ring.len());
 
+        // ⚠️ The wrap is HERE, and only here: `% ring.len()` is what makes it a ring rather than a
+        // line, and `start` may be `ring.len()`. A second `%` on `start` itself was redundant --
+        // its `+` mutant was equivalent, and M8h deleted it rather than excluding it.
         let mut ranked: Vec<(u64, &'a str)> = (0..window)
             .filter_map(|i| ring.get((start + i) % ring.len()))
             .map(|(_, id)| (hash(&[key.as_bytes(), id.as_bytes()]), id.as_str()))
@@ -95,14 +98,15 @@ impl<'a> Placement<'a> {
         // them anyway: a short placement list silently under-replicates, and nothing
         // downstream reports it. An overloaded node serving a request is a slow answer; no
         // node serving it is no answer.
-        if out.len() < r.min(window) {
-            for (_, id) in &ranked {
-                if out.len() >= r.min(window) {
-                    break;
-                }
-                if !out.contains(id) {
-                    out.push(id);
-                }
+        //
+        // ⚠️ No outer `if out.len() < r.min(window)`: the loop's own guard makes it redundant --
+        // its `<=` mutant was equivalent, and M8h deleted it rather than excluding it.
+        for (_, id) in &ranked {
+            if out.len() >= r.min(window) {
+                break;
+            }
+            if !out.contains(id) {
+                out.push(id);
             }
         }
         out
@@ -160,6 +164,17 @@ fn hash(parts: &[&[u8]]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠️ Values from an independent model of FNV-1a with a `0xff` part separator and the full
+    /// murmur3 finaliser, compared on ALL 64 bits. The last finaliser step changes only the low
+    /// 31 bits, and every comparison `place` makes is decided by the high bits -- so its `|=`
+    /// mutant passed the golden placement test, and M8h's sweep found it surviving.
+    #[test]
+    fn the_hash_matches_an_independent_model() {
+        assert_eq!(hash(&[b"ring", b"n1"]), 0x8eba_09a8_eac0_750a);
+        assert_eq!(hash(&[b"idx0/s0", b"10.0.0.1:7946"]), 0x057c_0ebc_93b3_0547);
+        assert_eq!(hash(&[b"a"]), 0x82a2_a958_a9be_ce5b);
+    }
 
     #[test]
     fn parts_are_separated() {
