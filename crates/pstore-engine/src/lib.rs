@@ -167,10 +167,26 @@ struct Memtable {
     durable: BTreeMap<String, Vec<Document>>,
     /// Bumped whenever either map changes, so a cached fresh segment knows it is stale.
     ///
-    /// ⚠️ `flush` moves rows from `pending` to `durable` without changing what they are, so it
-    /// invalidates needlessly. Bumping on it anyway is the safe direction and is cheaper than
-    /// reasoning about which mutations matter.
+    /// ⚠️ `flush` moves rows from `pending` to `durable` without changing what they are -- but
+    /// while the bundle PUT is in flight they are in NEITHER map (BACKLOG row 35), so a query in
+    /// that window caches a fresh segment without them, and the bump after the flush is what
+    /// stops that segment being served afterwards. Not needless while that gap exists; M8g
+    /// deferred these bumps' surviving mutants to its fix.
     generation: u64,
+}
+
+impl Memtable {
+    /// Buffers rows, and moves the generation so a cached fresh segment knows it is stale.
+    ///
+    /// ⚠️ One step shared by `write` and its test-only twin (M8g): each used to carry its own
+    /// copy of the bump, so a mutant in the twin could survive while the real one was tested.
+    fn buffer(&mut self, index: &str, docs: Vec<Document>) {
+        self.generation += 1;
+        self.pending
+            .entry(index.to_owned())
+            .or_default()
+            .extend(docs);
+    }
 }
 
 /// Two stores behind one `BlobStore`: the tenant's durable one, and the private in-memory one
@@ -794,8 +810,7 @@ impl<S: BlobStore> Engine<S> {
                 got: odd.vector().len(),
             });
         }
-        m.generation += 1;
-        m.pending.entry(index.to_owned()).or_default().extend(docs);
+        m.buffer(index, docs);
         Ok(())
     }
 
@@ -905,9 +920,7 @@ impl<S: BlobStore> Engine<S> {
     /// fixture that races two engines to produce it unreliably.
     #[doc(hidden)]
     pub async fn write_without_schema_check_for_test(&self, index: &str, docs: Vec<Document>) {
-        let mut m = self.mem();
-        m.generation += 1;
-        m.pending.entry(index.to_owned()).or_default().extend(docs);
+        self.mem().buffer(index, docs);
     }
 
     /// Writes everything buffered as **one bundle object**, whatever it covers.
@@ -1151,13 +1164,13 @@ impl<S: BlobStore> Engine<S> {
             // downstream could tell, because the watermark is the only record of what is
             // outstanding.
             //
-            // ⚠️ The `> 0` is a **size** guard, not a correctness one, and `> -> >=` is a
-            // provably equivalent mutant: both read sites treat an absent watermark as zero
-            // (`unwrap_or(0)` here, `is_some_and(|w| *w > seq.0)` in `head.rs`), so writing
-            // `lane -> 0` is indistinguishable from writing nothing. What it buys is a HEAD
-            // that does not grow a 16-byte entry per idle lane on every fold. Recorded so a
-            // sweep does not spend a round trying to kill it with a test that would only pin
-            // HEAD's encoded length.
+            // ⚠️ The `> 0` is a **size** guard, not a correctness one: both read sites treat an
+            // absent watermark as zero (`unwrap_or(0)` here, `is_some_and(|w| *w > seq.0)` in
+            // `head.rs`), so for READS `lane -> 0` is indistinguishable from nothing. What it
+            // buys is a HEAD that does not grow a 16-byte entry per idle lane on every fold --
+            // and that is observable in the committed HEAD, so `> -> >=` is not equivalent.
+            // This comment used to call it provably equivalent; since M8g it is pinned by
+            // `a_lane_with_nothing_to_fold_gets_no_watermark`.
             // ⚠️ Counted into the COMMITTED HEAD, because a discard nobody can see is a
             // discard that is indistinguishable from a bug. The API reports it per index.
             for (idx, n) in &rejects {
@@ -1870,11 +1883,10 @@ impl<S: BlobStore> Engine<S> {
             head: Head::default(),
             tag: None,
         };
-        let next = Head {
-            epoch: Epoch(1),
-            ..Head::default()
-        };
-        head::commit(&*self.store, self.tenant, &stale, &next).await
+        // ⚠️ The next head's contents are irrelevant: `commit` returns its epoch only on
+        // success, and every caller asserts refusal. An `epoch: Epoch(1)` here was an equivalent
+        // mutant -- deleting it changed nothing any test could see (M8g).
+        head::commit(&*self.store, self.tenant, &stale, &Head::default()).await
     }
 }
 
@@ -1905,6 +1917,79 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
 mod split_tests {
     use super::*;
     use pstore_blob::MemoryStore;
+
+    /// ⚠️ The rest of `Split`'s routing, which only `head` had a test for (M7b). Reads route by
+    /// key prefix; deletes and listings are the durable store's, because the fresh store is
+    /// rebuilt from the memtable and has nothing worth deleting or listing. M8g's sweep found
+    /// `get`, `get_suffix`, `delete_batch` and `list_unrestricted` replaceable by constants.
+    #[tokio::test]
+    async fn the_split_store_routes_reads_by_prefix_and_deletes_and_lists_durably() {
+        let durable = Arc::new(MemoryStore::new());
+        let fresh = Arc::new(MemoryStore::new());
+        let d_key = Key::new("0007/seg/0".to_owned());
+        let f_key = Key::new("mem/seg/0".to_owned());
+        durable
+            .put(&d_key, bytes::Bytes::from_static(b"durable-object"))
+            .await
+            .unwrap();
+        fresh
+            .put(&f_key, bytes::Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+        let split = Split {
+            durable: Arc::clone(&durable),
+            fresh: Some(Arc::clone(&fresh)),
+        };
+
+        assert_eq!(&split.get(&d_key).await.unwrap()[..], b"durable-object");
+        assert_eq!(&split.get(&f_key).await.unwrap()[..], b"fresh");
+        assert_eq!(&split.get_suffix(&d_key, 6).await.unwrap()[..], b"object");
+        assert_eq!(&split.get_suffix(&f_key, 3).await.unwrap()[..], b"esh");
+        assert_eq!(
+            split.get_tag(&d_key).await.unwrap(),
+            durable.get_tag(&d_key).await.unwrap()
+        );
+        assert_eq!(
+            split.get_tag(&f_key).await.unwrap(),
+            fresh.get_tag(&f_key).await.unwrap()
+        );
+        assert!(split.get_tag(&d_key).await.unwrap().is_some());
+
+        let listed = split
+            .list_unrestricted(&Key::new("0007/".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            vec![d_key.clone()],
+            "the durable store is the one listed"
+        );
+
+        split
+            .delete_batch(std::slice::from_ref(&d_key))
+            .await
+            .unwrap();
+        assert!(
+            durable.get(&d_key).await.is_err(),
+            "a delete through the split did not reach the durable store"
+        );
+    }
+
+    /// ⚠️ A retry that does not wait is the livelock the jitter exists to prevent -- and
+    /// `backoff` emptied survived every test (M8g). Under a paused clock the sleep advances
+    /// time in whole milliseconds, so the bound is `[delay, delay + 1ms)`, not equality.
+    #[tokio::test(start_paused = true)]
+    async fn backoff_waits_the_delay_it_computes() {
+        let lane = LaneId(3);
+        let delay = backoff_delay(lane, 3);
+        let start = tokio::time::Instant::now();
+        backoff(lane, 3).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= delay && waited < delay + std::time::Duration::from_millis(1),
+            "backoff waited {waited:?} for a delay of {delay:?}"
+        );
+    }
 
     /// ⚠️ **Backlog row 20.** Every other method of `Split` is routed by a caller that would
     /// notice the wrong arm; `head` has no caller at all, so replacing its body with a

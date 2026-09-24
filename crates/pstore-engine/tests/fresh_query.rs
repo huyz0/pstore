@@ -390,3 +390,58 @@ async fn the_statistics_include_the_unfolded_rows() {
          folded half was scored with"
     );
 }
+
+#[tokio::test]
+async fn a_query_after_a_second_write_sees_it() {
+    // ⚠️ The fresh segment is cached by the memtable's generation, and a write must move it.
+    // M8g's sweep found `generation += 1` -> `*= 1` in `write` surviving: the generation stays
+    // 0, so the query after the second write is served the segment built before it.
+    let store = Arc::new(MemoryStore::new());
+    let e =
+        Engine::new(Arc::clone(&store), TenantId(801), LaneId(1)).with_index_params(params(100));
+    e.write("idx", vec![doc(1)]).await.unwrap();
+    let first = e
+        .query("idx", &dense(1, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert!(first.unfolded.iter().any(|d| d.id == "d00001"));
+
+    e.write("idx", vec![doc(2)]).await.unwrap();
+    let second = e
+        .query("idx", &dense(2, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    let unfolded: Vec<&str> = second.unfolded.iter().map(|d| d.id.as_str()).collect();
+    assert!(
+        unfolded.contains(&"d00002"),
+        "a query after a second write was served the stale fresh segment: {unfolded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_query_on_one_index_is_not_served_another_indexs_fresh_rows() {
+    // ⚠️ One cached fresh segment, keyed by generation AND index. M8g's sweep found the index
+    // half (`f.index == index` -> `!=`) surviving: with no write between two queries the
+    // generation matches, so a query on `b` is served `a`'s segment and `a`'s rows.
+    let store = Arc::new(MemoryStore::new());
+    let e =
+        Engine::new(Arc::clone(&store), TenantId(802), LaneId(1)).with_index_params(params(100));
+    e.write("a", (1..4).map(doc).collect()).await.unwrap();
+    e.write("b", (100..103).map(doc).collect()).await.unwrap();
+
+    e.query("a", &dense(1, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    let b = e
+        .query("b", &dense(100, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    let unfolded: Vec<&str> = b.unfolded.iter().map(|d| d.id.as_str()).collect();
+    assert!(
+        !unfolded.is_empty()
+            && unfolded
+                .iter()
+                .all(|id| ["d00100", "d00101", "d00102"].contains(id)),
+        "a query on `b` was answered from another index's fresh rows: {unfolded:?}"
+    );
+}

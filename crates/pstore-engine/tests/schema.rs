@@ -373,3 +373,30 @@ async fn a_brand_new_index_cannot_be_created_mixed_width() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_conforming_fold_records_no_rejects() {
+    // ⚠️ The reject count is recorded only when something was dropped. M8g's sweep found
+    // `dropped > 0` -> `>=` surviving: every fold over an index with a schema would then commit
+    // `schema_rejects[idx] = 0` into HEAD. The first fold records the schema; the second is the
+    // one that checks against it.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("docs", vec![doc("a", 4)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.write("docs", vec![doc("b", 4)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    let head = committed(&*store).await;
+    assert!(
+        head.schemas.contains_key("docs"),
+        "the index has no schema to check against"
+    );
+    assert!(
+        head.schema_rejects.is_empty(),
+        "a fold that dropped nothing recorded rejects: {:?}",
+        head.schema_rejects
+    );
+}

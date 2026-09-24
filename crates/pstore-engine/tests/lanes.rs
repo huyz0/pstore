@@ -163,3 +163,29 @@ async fn a_probe_window_grows_so_a_long_lane_costs_few_round_trips() {
         s.depth()
     );
 }
+
+#[tokio::test]
+async fn a_lane_with_nothing_to_fold_gets_no_watermark() {
+    // ⚠️ A watermark of 0 reads exactly like no watermark, so this guard is a SIZE guard: a
+    // HEAD that grows a 16-byte entry per idle lane on every fold is one every open pays for.
+    // M8g pins it -- `tail > 0` -> `>=` survived -- where a comment had called the mutant
+    // equivalent. Lane 1 has a bundle so the fold commits; lane 9 is registered with none.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(903);
+    lanes::register(&*store, t, LaneId(9)).await.unwrap();
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    e.write("idx", vec![doc("a", 1)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    let head = e.head_for_test().await;
+    assert!(
+        head.watermarks.contains_key(&1),
+        "lane 1 folded, so it has a watermark"
+    );
+    assert!(
+        !head.watermarks.contains_key(&9),
+        "an idle lane was given a zero watermark: {:?}",
+        head.watermarks
+    );
+}

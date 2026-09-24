@@ -347,3 +347,31 @@ async fn a_text_index_and_a_sparse_index_share_a_segment_without_sharing_a_term_
     ));
     assert!(out[4].attrs.contains_key(text::DEFAULT_TEXT_FIELD));
 }
+
+#[tokio::test]
+async fn a_sparse_leg_reaches_unfolded_rows() {
+    // ⚠️ Every other test here folds first. The fresh segment is built by `fresh_target`, which
+    // stores the dictionary sidecar only when it is non-empty -- and M8g's sweep found that
+    // filter's `!` deletable: the dictionary is then never stored, and a sparse leg over
+    // unfolded rows fails, which no test asked.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), TenantId(502), LaneId(1));
+    let docs: Vec<Document> = (0..6).map(hybrid).collect();
+    e.write("idx", docs.clone()).await.unwrap();
+
+    let leg = vec![pstore_query::Prefetch::Sparse {
+        field: FIELD.to_owned(),
+        query: sparse_of(&docs[3]),
+        limit: 5,
+    }];
+    let a = e
+        .query("idx", &leg, pstore_query::Fusion::default(), 5)
+        .await
+        .expect("a sparse leg over unfolded rows must run");
+    assert!(
+        a.hits
+            .iter()
+            .any(|h| h.segment == a.unfolded_at && a.unfolded[h.row].id == docs[3].id),
+        "the unfolded row the sparse query names was not returned"
+    );
+}
