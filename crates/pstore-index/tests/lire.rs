@@ -312,10 +312,12 @@ fn the_merge_bound_is_a_quarter_of_the_target() {
 
 #[tokio::test]
 async fn a_split_names_only_lists_that_exist() {
-    // ⚠️ `split_pass` marks the two halves dirty as `i` and `lists.len() - 1`, and the
-    // reassignment scope is exactly that set. Off by one and the scope names a list that does
-    // not exist — the vectors of the real new half are never reconsidered, so they stay
-    // assigned to the centroid they had before the split. Recall drifts and nothing errors.
+    // A split rewrites list `i` in place and pushes the other half. Off by one and a half is
+    // lost, duplicated or left empty -- recall drifts and nothing errors.
+    //
+    // ⚠️ This comment once said `split_pass` marked both halves dirty and that set was the
+    // reassignment scope. It was not: the scope is recomputed from centroid movement after the
+    // merges, and the set was written and never read. M8j deleted it.
     let corpus = corpus(3_000, 12, 5);
     let seed: Vec<Vec<f32>> = corpus[..2_600].to_vec();
     let rows: Vec<usize> = (2_600..3_000).collect();
@@ -375,14 +377,9 @@ async fn an_unsplittable_list_over_the_bound_is_left_whole() {
 
 #[tokio::test]
 async fn a_splits_halves_are_reassigned_to_their_own_centroids() {
-    // ⚠️ `split_pass` marks both halves dirty — `i` and `lists.len() - 1` — and that set is
-    // the reassignment scope. Marked wrong, the new half is never reconsidered and its vectors
-    // keep the assignment they had before the split: no error, no lost row, and a partition
-    // that is quietly worse than the one the protocol claims. Nothing measured that, so
-    // `lists.len() + 1` survived.
-    //
-    // What the marking buys is exactly this: every vector sits in the list whose centroid is
-    // nearest it.
+    // After a split, every vector should sit in the list whose centroid is nearest it -- or
+    // the partition is quietly worse than the one the protocol claims, with no error and no
+    // lost row.
     let corpus = corpus(3_000, 12, 11);
     let seed: Vec<Vec<f32>> = corpus[..2_600].to_vec();
     let rows: Vec<usize> = (2_600..3_000).collect();
@@ -407,11 +404,9 @@ async fn a_splits_halves_are_reassigned_to_their_own_centroids() {
     // ⚠️ Not zero: `Scope::Touched` deliberately reconsiders only the disturbed lists, so
     // vectors in untouched lists may drift. Measured at **82 of 3,000**.
     //
-    // ⚠️ **This does not kill `dirty.insert(lists.len() - 1)` mutated to `+ 1`, and that was
-    // measured rather than assumed: 82 of 3,000 either way.** `bisect` already places both
-    // halves against their own new centroids, so re-marking the new one adds nothing on the
-    // split path — the marking earns its keep only if a later pass needs that list in scope.
-    // Left as an inert mutation with the number recorded, not chased.
+    // ⚠️ `dirty.insert(lists.len() - 1)` mutated to `+ 1` measured 82 of 3,000 either way,
+    // and was recorded here as inert and not chased. It was inert because the set was never
+    // READ -- the scope is `dirty_now`, from centroid movement -- and M8j deleted it.
     assert!(
         misplaced * 20 < total,
         "{misplaced} of {total} vectors are nearer another centroid — the split's halves were \
@@ -457,16 +452,11 @@ async fn the_work_report_counts_what_actually_happened() {
         w.reassigned,
         w.examined
     );
-    // ⚠️ **Two mutations here are invisible and the reason is structural, not a weak test.**
-    // Confirmed by a full-file sweep after this test existed: 215 mutants, 199 caught, and
-    // `bisect`'s side test is still among the twelve that are not.
-    // Inverting `bisect`'s side test sends every vector to the *farther* of the two new
-    // centroids — and the reassignment that follows a split, which marks both halves dirty,
-    // puts them all back. Inverting the reassignment's own `best != li` makes it move only
-    // vectors already in the right place — and `bisect` had already placed them well. On the
-    // split path the two repair each other, so neither can be seen from the outcome. Measured,
-    // recorded, and not chased: catching them needs a clustering perturbed independently of a
-    // split, which is a different fixture than any of these.
+    // ⚠️ Inverting `bisect`'s side test, or the reassignment's own `best != li`, cannot be
+    // seen from THIS fixture: on the split path `bisect` places vectors well and the two
+    // inversions leave outcomes this test does not distinguish. M8j catches both elsewhere,
+    // with fixtures built for them: `bisect` pinned against a model of the documented
+    // algorithm, and a clustering with one row deliberately misplaced.
     //
     // And the totals are consistent with the clustering that came out.
     assert_eq!(
@@ -474,4 +464,76 @@ async fn the_work_report_counts_what_actually_happened() {
         corpus.len(),
         "the report does not describe the clustering it produced"
     );
+}
+
+#[tokio::test]
+async fn a_list_at_the_split_bound_is_left_whole_and_one_past_it_is_split() {
+    // The bound is "split ABOVE `max`" (`Bounds::max`'s own doc), and nothing reached it
+    // exactly: every fixture overshoots it by hundreds of rows.
+    let bounds = Bounds { max: 3, min: 1 };
+    let line = |n: usize| -> Vec<Vec<f32>> { (0..n).map(|i| vec![i as f32, 0.0]).collect() };
+    for (n, splits) in [(3usize, 0usize), (4, 1)] {
+        let corpus = line(n);
+        let mut c = Clustering::from_parts(vec![vec![1.0, 0.0]], vec![(0..n).collect()]);
+        let w = lire::maintain_with(&mut c, &corpus, &[], params(), Scope::All, bounds);
+        assert_eq!(w.splits, splits, "a list of {n} rows against a bound of 3");
+    }
+}
+
+/// `Scope::Touched` over two single-row lists whose centroids start at the origin and far
+/// away, the first row at `(2^-10, y)`. Returns what the pass examined.
+fn examined_after_moving_to(y: f32) -> usize {
+    let corpus = vec![vec![0.000_976_562_5, y], vec![10.0, 10.0]];
+    let mut c = Clustering::from_parts(
+        vec![vec![0.0, 0.0], vec![10.0, 10.0]],
+        vec![vec![0], vec![1]],
+    );
+    let w = lire::maintain_with(
+        &mut c,
+        &corpus,
+        &[],
+        params(),
+        Scope::Touched,
+        Bounds { max: 10, min: 1 },
+    );
+    w.examined
+}
+
+#[tokio::test]
+async fn a_centroid_that_moves_exactly_the_threshold_is_not_disturbed() {
+    // `(2^-10, 0.031607694923877716)` is EXACTLY `SPLIT_DISTURBANCE` (1e-3) from the origin
+    // in f32, summed in `dist2`'s order -- found by searching an f32 model; no 1-D value
+    // squares to it. Recentring the single-row list moves its centroid there.
+    // Exact bits, not a decimal: the test is about one specific float.
+    let at = f32::from_bits(0x3D01_7712);
+    assert_eq!(
+        examined_after_moving_to(at),
+        0,
+        "a move of exactly the threshold disturbed the list"
+    );
+    // One float further, the list is disturbed -- and so is its nearest neighbour, which a
+    // moved centroid can pull vectors from. Both single-row lists are examined.
+    assert_eq!(
+        examined_after_moving_to(at.next_up()),
+        2,
+        "a moved list, or its neighbour, was not re-examined"
+    );
+}
+
+#[tokio::test]
+async fn reassignment_moves_a_row_to_the_list_it_is_nearest() {
+    // Recentred, the first list sits at 4.5 and the second at 10: row 1 (at 9) is nearer
+    // the second, and a full-scope pass must move it there -- once.
+    let corpus = vec![vec![0.0], vec![9.0], vec![10.0]];
+    let mut c = Clustering::from_parts(vec![vec![0.0], vec![10.0]], vec![vec![0, 1], vec![2]]);
+    let w = lire::maintain_with(
+        &mut c,
+        &corpus,
+        &[],
+        params(),
+        Scope::All,
+        Bounds { max: 10, min: 1 },
+    );
+    assert_eq!(c.lists(), &[vec![0], vec![1, 2]]);
+    assert_eq!(w.reassigned, 1);
 }

@@ -35,35 +35,30 @@ const REASSIGN_ROUNDS: usize = 8;
 const SPLIT_DISTURBANCE: f32 = 1e-3;
 
 /// One split pass over every list that exceeds `bounds.max`.
+///
+/// Lists pushed during the pass are visited in it too, because the loop re-reads the length.
 fn split_pass(
     corpus: &[Vec<f32>],
     lists: &mut Vec<Vec<usize>>,
     centroids: &mut Vec<Vec<f32>>,
-    dirty: &mut std::collections::BTreeSet<usize>,
     work: &mut Work,
     bounds: Bounds,
 ) {
     let mut i = 0;
-    while i < lists.len() {
-        if lists.get(i).is_some_and(|l| l.len() > bounds.max) {
-            let Some(rows) = lists.get(i).cloned() else {
-                i += 1;
-                continue;
-            };
-            let (a, b, ca, cb) = bisect(corpus, &rows);
-            if a.is_empty() || b.is_empty() {
-                i += 1;
-                continue;
+    while let Some(list) = lists.get(i) {
+        if list.len() > bounds.max {
+            let (a, b, ca, cb) = bisect(corpus, list);
+            // An unsplittable list -- identical vectors -- is left whole rather than split
+            // into itself and nothing.
+            if !a.is_empty() && !b.is_empty() {
+                if let (Some(list), Some(cen)) = (lists.get_mut(i), centroids.get_mut(i)) {
+                    *list = a;
+                    *cen = ca;
+                }
+                lists.push(b);
+                centroids.push(cb);
+                work.splits += 1;
             }
-            if let (Some(list), Some(cen)) = (lists.get_mut(i), centroids.get_mut(i)) {
-                *list = a;
-                *cen = ca;
-            }
-            lists.push(b);
-            centroids.push(cb);
-            dirty.insert(i);
-            dirty.insert(lists.len() - 1);
-            work.splits += 1;
         }
         i += 1;
     }
@@ -176,10 +171,6 @@ pub fn maintain_with(
 
     let mut centroids = clustering.centroids().to_vec();
     let mut lists = clustering.lists().to_vec();
-    // Lists an edit disturbed. A vector's nearest centroid can only have changed if a
-    // centroid near it moved, so this is the set LIRE re-examines -- and the reason it is
-    // cheaper than a rebuild rather than a rebuild in instalments.
-    let mut dirty: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     if centroids.is_empty() {
         return work;
     }
@@ -211,19 +202,13 @@ pub fn maintain_with(
     // Bounded rather than `loop`: each round at least halves the largest list, so the bound
     // is log2 of the corpus, and an unbounded rewrite loop is a liveness bug however sound
     // the arithmetic.
+    //
+    // ⚠️ No early exit on "nothing exceeds the bound". A pass that splits nothing changes
+    // nothing, so the spare passes cost a scan of list lengths; and the early exit was a copy
+    // of `split_pass`'s own test that hid it -- a mutant of the pass's bound never ran for a
+    // list of exactly `max`, because the copy never called the pass (M8j).
     for _ in 0..SPLIT_ROUNDS {
-        let over = lists.iter().any(|l| l.len() > bounds.max);
-        if !over {
-            break;
-        }
-        split_pass(
-            corpus,
-            &mut lists,
-            &mut centroids,
-            &mut dirty,
-            &mut work,
-            bounds,
-        );
+        split_pass(corpus, &mut lists, &mut centroids, &mut work, bounds);
     }
     // Merge starved lists into their nearest neighbour. Done after splitting so a list that
     // was starved only because its neighbour was about to split is not merged away first.
@@ -256,7 +241,6 @@ pub fn maintain_with(
         if let Some(k) = keep.get_mut(i) {
             *k = false;
         }
-        dirty.insert(target);
         work.merges += 1;
     }
     let (mut centroids, mut lists) = (
@@ -460,4 +444,21 @@ fn bisect(corpus: &[Vec<f32>], rows: &[usize]) -> (Vec<usize>, Vec<usize>, Vec<f
 
 fn dist2(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bisect_is_lloyd_from_the_farthest_pair_with_ties_to_the_first_seed() {
+        // ⚠️ Pinned against an independent Python model of the documented algorithm, not
+        // against a quality property: on this input the other tie rule reaches a different
+        // 2-means fixed point -- `[1]` against the rest -- with a LOWER within-list cost, so
+        // "is it a good split" cannot tell them apart. "Is it the split the doc describes" can.
+        let corpus: Vec<Vec<f32>> = [1.0, -4.0, 1.0, 0.0, 4.0].map(|x| vec![x]).to_vec();
+        let (a, b, ca, cb) = bisect(&corpus, &[0, 1, 2, 3, 4]);
+        assert_eq!((a, b), (vec![1, 3], vec![0, 2, 4]));
+        assert_eq!((ca, cb), (vec![-2.0], vec![2.0]));
+    }
 }
