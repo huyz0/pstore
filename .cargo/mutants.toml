@@ -49,4 +49,10 @@ exclude_re = [
     # tie-break no real key reaches. Named by LINE AND COLUMN on purpose: an edit that moves it
     # makes it reappear as MISSED, rather than silently hiding a new `<`-to-`<=` in `place`. (M8h)
     'pstore-cluster/src/placement\.rs:77:54: replace < with <= in Placement',
+    # `rotate`'s sign flips are exactly +-1, so `x * flip` and `x / flip` are the same float.
+    # Premise: `rabitq::tests::every_sign_flip_is_exactly_plus_or_minus_one`. Rung 1 (flips as
+    # signs, `if neg { -x } else { x }`) was declined: the negation has its own mutants, and a
+    # rotation without its flips is still orthogonal, which recall cannot see. Named by line and
+    # column, so an edit that moves it makes it reappear as MISSED. (M8k)
+    'pstore-index/src/rabitq\.rs:293:23: replace \* with / in Quantizer::rotate',
 ]

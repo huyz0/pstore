@@ -326,3 +326,167 @@ fn an_int4_query_costs_little_accuracy() {
          a throughput trade should"
     );
 }
+
+#[test]
+fn a_vector_on_its_centroid_scores_the_centroid_not_nan() {
+    // A single-row posting list's centroid IS its row, and so is a list of duplicates: the
+    // residual is exactly zero. The module's own comment says the reconstruction is then
+    // `<c, q>` with a zero scale.
+    let q = Quantizer::new(8);
+    let v = vec![0.5f32, -1.0, 2.0, 0.0, 1.5, -0.5, 0.25, 3.0];
+    let code = q.encode_residual(&v, &v).unwrap();
+    assert_eq!(code.residual_norm(), 0.0);
+    // The code is PERSISTED (`write_to`), and the norm guard below returns before reading it
+    // -- so the stored form is pinned here: the zero residual is encoded as the zero vector,
+    // not normalised by its zero norm into NaNs.
+    assert_eq!(
+        code.alignment(),
+        0.0,
+        "the on-centroid code stores a NaN alignment"
+    );
+    assert!(code.bits().iter().all(|b| *b == 0));
+    let query = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let est = q.estimate_residual(&code, &q.prepare(&query).unwrap(), 0.5);
+    assert_eq!(
+        est, 0.5,
+        "an on-centroid vector scored {est}, not <c, q> = 0.5"
+    );
+}
+
+#[test]
+fn a_residual_too_small_to_have_a_norm_scores_the_centroid_not_nan() {
+    // Components near 1e-39 square to 0, so the norm is 0 and the residual is never
+    // normalised -- but its alignment is a nonzero subnormal, so the zero-alignment case does
+    // not catch it, and `raw / alignment` overflows. A zero norm has to mean "on the centroid".
+    let q = Quantizer::new(8);
+    let c = [0.0f32; 8];
+    let v = [1e-39f32, -1e-39, 1e-39, 0.0, 0.0, 1e-39, 0.0, 0.0];
+    let code = q.encode_residual(&v, &c).unwrap();
+    assert_eq!(code.residual_norm(), 0.0, "the fixture must underflow");
+    let query = q
+        .prepare(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        .unwrap();
+    let est = q.estimate_residual(&code, &query, 0.5);
+    assert_eq!(est, 0.5, "an underflowed residual scored {est}");
+}
+
+#[test]
+fn the_zero_vectors_own_code_estimates_zero() {
+    // `<0, q>` is 0 for every q. The zero vector's code has alignment 0, and dividing by it
+    // was the NaN above.
+    let q = Quantizer::new(8);
+    let code = q.encode(&[0.0; 8]).unwrap();
+    let est = q
+        .estimate(&code, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        .unwrap();
+    assert_eq!(est, 0.0);
+}
+
+#[test]
+fn a_dimension_error_says_what_it_expected_and_what_it_got() {
+    let err = Quantizer::new(4).encode(&[1.0, 2.0, 3.0]).unwrap_err();
+    assert_eq!(err.to_string(), "expected 4 dimensions, got 3");
+}
+
+#[test]
+fn a_quantizer_reports_the_dimension_it_was_built_for_not_the_padded_one() {
+    assert_eq!(Quantizer::new(5).dim(), 5);
+}
+
+#[test]
+fn the_residual_is_the_vector_minus_its_centroid_and_is_encoded_as_a_unit() {
+    let q = Quantizer::new(8);
+    let c = [1.0f32, 1.0, 0.5, -2.0, 0.0, 3.0, 1.0, 1.0];
+    // v - c = (3, 4, 0, 0, 0, 0, 0, 0): a norm of exactly 5.
+    let v: Vec<f32> = c
+        .iter()
+        .zip([3.0f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        .map(|(c, r)| c + r)
+        .collect();
+    let code = q.encode_residual(&v, &c).unwrap();
+    assert_eq!(code.residual_norm(), 5.0);
+    // The DIRECTION is what is quantized: the same bits and alignment as the unit residual's
+    // own code. Alignment scales with the norm, so an unnormalised residual shows up here.
+    let divided: Vec<f32> = [3.0f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        .iter()
+        .map(|x| x / 5.0)
+        .collect();
+    let unit_divided = q.encode(&divided).unwrap();
+    assert_eq!(code.bits(), unit_divided.bits());
+    assert_eq!(code.alignment(), unit_divided.alignment());
+}
+
+#[test]
+fn an_exact_zero_coordinate_is_not_a_positive_bit() {
+    // Codes are persisted (`read_code`), so the bit an exact 0 gets is part of the format.
+    // Unrotated, so the coordinates reach the sign test as written: `[1, 0]` has only its
+    // first bit set, and scored against `[0, 1]` the second coordinate counts NEGATIVELY.
+    let q = Quantizer::without_rotation(2);
+    let code = q.encode(&[1.0, 0.0]).unwrap();
+    assert_eq!(code.bits(), &[0b01]);
+    let against = q.prepare(&[0.0, 1.0]).unwrap();
+    assert_eq!(
+        q.estimate_unnormalized_for_test(&code, &against),
+        -1.0 / 2.0f32.sqrt()
+    );
+}
+
+#[test]
+fn an_int4_query_is_rounded_to_sevenths_of_its_largest_component() {
+    // Unrotated, so the query reaches the rounding as written; scored against the all-ones
+    // code, the raw estimate is the quantized components' sum over sqrt(2).
+    let q = Quantizer::without_rotation(2);
+    let ones = q.encode(&[1.0, 1.0]).unwrap();
+    let int4 = q.quantize_query_int4(&q.prepare(&[1.0, 0.3]).unwrap());
+    // The same arithmetic the quantizer does: step = max|x| / 7, then round to a step.
+    let step = 1.0f32 / 7.0;
+    let (a, b) = (
+        (1.0f32 / step).round() * step,
+        (0.3f32 / step).round() * step,
+    );
+    let expected = (0.0f32 + a + b) * (1.0 / 2.0f32.sqrt());
+    assert_eq!(q.estimate_unnormalized_for_test(&ones, &int4), expected);
+    assert_ne!(b, 0.3, "the fixture must be one rounding changes");
+    // And an all-zero query has nothing to scale by: it comes back as it went in.
+    let zero = q.quantize_query_int4(&q.prepare(&[0.0, 0.0]).unwrap());
+    assert_eq!(q.estimate_unnormalized_for_test(&ones, &zero), 0.0);
+}
+
+#[test]
+fn a_residual_estimate_is_the_centroid_plus_the_scaled_unit_estimate() {
+    // The identity the module documents: <o, q> ~ <c, q> + ||o - c|| * <unit, q>. At a
+    // norm of 5, a sum in place of the product is 5 + x rather than 5x.
+    let q = Quantizer::new(8);
+    let c = [0.0f32; 8];
+    let v = [3.0f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let code = q.encode_residual(&v, &c).unwrap();
+    let query = q
+        .prepare(&[0.5, -1.0, 2.0, 0.0, 1.0, 0.0, -0.5, 1.5])
+        .unwrap();
+    let centroid_dot = 0.75;
+    assert_eq!(
+        q.estimate_residual(&code, &query, centroid_dot) - centroid_dot,
+        5.0 * q.estimate_prepared(&code, &query)
+    );
+}
+
+#[test]
+fn a_code_that_represents_its_vector_exactly_has_no_error() {
+    // Every coordinate the same magnitude: the sign pattern IS the vector, the alignment is
+    // exactly 1, and the bound -- which widens as alignment falls -- is exactly 0.
+    let q = Quantizer::without_rotation(4);
+    let code = q.encode(&[0.5; 4]).unwrap();
+    assert_eq!(code.alignment(), 1.0);
+    assert_eq!(q.error_bound(&code), 0.0);
+}
+
+#[test]
+fn the_error_bound_is_epsilon_times_the_misalignment_over_the_remaining_dimensions() {
+    // `BOUND_EPSILON * sqrt((1 - a^2) / (D - 1)) / a`. At a = 0.5 and D = 4 that is
+    // `eps * sqrt(0.25) / 0.5`, exactly `eps` -- the `D - 1` is what the perfect-alignment
+    // test above cannot see, since there the numerator is 0 whatever divides it.
+    let q = Quantizer::without_rotation(4);
+    let code = q.encode(&[1.0, 0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(code.alignment(), 0.5);
+    assert_eq!(q.error_bound(&code), BOUND_EPSILON);
+}

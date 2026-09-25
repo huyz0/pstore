@@ -292,8 +292,11 @@ impl Quantizer {
         for ((slot, x), flip) in a.iter_mut().zip(v).zip(&self.flips) {
             *slot = x * flip;
         }
-        let mut h = 1;
-        while h < self.padded {
+        // One butterfly round per bit of `padded` (a power of two). A `while h < padded` with
+        // `h *= 2` said the same, and a `<=` there ran a round that split every chunk at its
+        // end and zipped it with nothing -- equivalent, so unkillable (M8k).
+        for k in 0..self.padded.trailing_zeros() {
+            let h = 1usize << k;
             for chunk in a.chunks_mut(h * 2) {
                 let (lo, hi) = chunk.split_at_mut(h);
                 for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
@@ -302,7 +305,6 @@ impl Quantizer {
                     *y = u - w;
                 }
             }
-            h *= 2;
         }
         let scale = 1.0 / (self.padded as f32).sqrt();
         for x in a.iter_mut() {
@@ -325,7 +327,8 @@ impl Quantizer {
             .collect();
         let norm = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
         // A vector sitting exactly on its centroid has no direction to quantize. Its
-        // reconstruction is `<c,q>` with a zero scale, which is exactly right.
+        // reconstruction is `<c,q>`, which `estimate_residual` returns for a zero norm: the
+        // unit estimate is meaningless here, and was `0 × ∞ = NaN` before M8k.
         let unit: Vec<f32> = if norm > 0.0 {
             residual.iter().map(|x| x / norm).collect()
         } else {
@@ -398,12 +401,25 @@ impl Quantizer {
     /// that ratio is the whole reason this is cheap.
     #[must_use]
     pub fn estimate_residual(&self, code: &Code, query: &Query, centroid_dot: f32) -> f32 {
+        // ⚠️ A zero norm means "on the centroid", whatever the code says: a residual whose
+        // components square to nothing (around 1e-39) keeps a nonzero subnormal alignment, so
+        // the unit estimate overflows and `0 × ∞` is NaN. Exactly `<c, q>` instead (M8k).
+        if code.residual_norm == 0.0 {
+            return centroid_dot;
+        }
         centroid_dot + code.residual_norm * self.estimate_prepared(code, query)
     }
 
     /// Estimates `<o, q>` from `o`'s code and a prepared query.
     #[must_use]
     pub fn estimate_prepared(&self, code: &Code, query: &Query) -> f32 {
+        // ⚠️ The zero vector's code: rotation is orthogonal, so the alignment (`||x||₁` of the
+        // rotated vector) is 0 when every coordinate is -- or when they are subnormal enough
+        // for the rotation's scaling to round them away. Either way the inner product with
+        // anything is 0 to within f32, and dividing by that alignment was `raw / 0` (M8k).
+        if code.alignment == 0.0 {
+            return 0.0;
+        }
         // ⚠️ The division is the whole construction. `<x̄, q>` is biased low by exactly the
         // factor `<x̄, x>`, which the encoder measured; dividing removes it.
         self.raw(code, &query.0) / code.alignment
@@ -431,5 +447,29 @@ impl Quantizer {
         let a = code.alignment.max(f32::EPSILON);
         let d = (self.padded.max(2) - 1) as f32;
         BOUND_EPSILON * ((1.0 - a * a).max(0.0) / d).sqrt() / a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "exactness IS the premise: a flip of 0.9999999 breaks the equivalence"
+    )]
+    fn every_sign_flip_is_exactly_plus_or_minus_one() {
+        // The premise of `.cargo/mutants.toml`'s exclusion of `x * flip` -> `x / flip` in
+        // `rotate`: dividing by an exact +-1 is multiplying by it. If a flip ever becomes a
+        // magnitude, that exclusion would hide a killable mutant -- this fails first.
+        for dim in [1, 2, 3, 8, 100, 768, 1536] {
+            let q = Quantizer::new(dim);
+            assert_eq!(q.flips.len(), q.padded);
+            assert!(
+                q.flips.iter().all(|f| *f == 1.0 || *f == -1.0),
+                "dim {dim} has a flip that is not +-1"
+            );
+        }
     }
 }
