@@ -22,7 +22,7 @@ that FAILED. Run on the code **before** the rung-1 changes, whose line numbers t
 3. **The split bound** — `a_list_at_the_split_bound_is_left_whole_and_one_past_it_is_split`.
    ⚠️ **OBSERVED-NOT killing 48:49 on the old code**, and that is the finding: the pre-check
    `any(.. > max)` never called the pass for a list of exactly `max`, so it masked the mutant.
-   Whether it is killed now is criterion 7.
+   On the restructured code it is caught: criterion 7's run reports no survivor.
 4. **The threshold and the neighbour** — `a_centroid_that_moves_exactly_the_threshold_is_not_disturbed`
    killed 304:49 `>`→`>=` and 314:69 `!=`→`==`. The edge value `f32::from_bits(0x3D01_7712)`
    was found by an f32 model and re-derived independently by both reviewers.
@@ -30,6 +30,8 @@ that FAILED. Run on the code **before** the rung-1 changes, whose line numbers t
    `!=`→`==` (the threshold test failed on it too).
 6. **`bisect`** — `bisect_is_lloyd_from_the_farthest_pair_with_ties_to_the_first_seed` killed
    449:30 `<=`→`>`.
-7. **The confirming run** — NOT-RUN yet: every `lire.rs` mutant on this tree against
-   `pstore-index`'s tests is running; recorded in a follow-up.
+7. **The confirming run** — `./scripts/mutants.sh --check pstore-index --file crates/pstore-index/src/lire.rs --test-workspace=false --test-package pstore-index`
+   on `968ece6`: **204 tested in 14m, 201 caught, 2 unviable, 1 timeout, 0 missed**. The
+   timeout is `lire.rs:63:11` `i += 1` → `*=`, which pins `i` at 0 and never ends — detected,
+   as the spec counts it. No survivor, so no workspace re-run was needed.
 8. **The full gate** — `./scripts/gates.sh` on this tree: all fifteen gates PASS.
