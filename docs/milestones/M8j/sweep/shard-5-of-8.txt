@@ -1,0 +1,2 @@
+# shard 5/8 of pstore-index, index-only tests, on f2ccdf9
+109 mutants tested in 22m: 96 caught, 13 unviable
