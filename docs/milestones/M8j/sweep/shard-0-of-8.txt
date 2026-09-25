@@ -1,0 +1,13 @@
+# shard 0/8 of pstore-index, index-only tests, on feefbd8
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with 0.0
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with 1.0
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with -1.0
+MISSED   crates/pstore-index/src/cluster.rs:247:23: replace > with >= in seed_centroids
+MISSED   crates/pstore-index/src/cluster.rs:271:55: replace || with && in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:29: replace || with && in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:74: replace < with == in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:74: replace < with <= in augment
+MISSED   crates/pstore-index/src/cluster.rs:346:66: replace < with <= in assign
+MISSED   crates/pstore-index/src/lire.rs:47:13: replace < with <= in split_pass
+MISSED   crates/pstore-index/src/lire.rs:48:49: replace > with >= in split_pass
+109 mutants tested in 12m: 11 missed, 95 caught, 3 unviable
