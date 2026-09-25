@@ -1,0 +1,18 @@
+# shard 3/8 of pstore-index, index-only tests, on 96f106a
+MISSED   crates/pstore-index/src/rabitq.rs:228:15: replace <= with > in Quantizer::quantize_query_int4
+MISSED   crates/pstore-index/src/rabitq.rs:264:9: replace Quantizer::dim -> usize with 0
+MISSED   crates/pstore-index/src/rabitq.rs:264:9: replace Quantizer::dim -> usize with 1
+MISSED   crates/pstore-index/src/rabitq.rs:293:23: replace * with / in Quantizer::rotate
+MISSED   crates/pstore-index/src/rabitq.rs:296:17: replace < with <= in Quantizer::rotate
+MISSED   crates/pstore-index/src/rabitq.rs:324:29: replace - with + in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with == in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with < in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with >= in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:330:39: replace / with % in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:330:39: replace / with * in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:353:19: replace > with >= in Quantizer::encode_unit
+MISSED   crates/pstore-index/src/rabitq.rs:401:43: replace * with + in Quantizer::estimate_residual
+MISSED   crates/pstore-index/src/rabitq.rs:421:9: replace Quantizer::estimate_unnormalized_for_test -> f32 with 0.0
+MISSED   crates/pstore-index/src/rabitq.rs:421:9: replace Quantizer::estimate_unnormalized_for_test -> f32 with -1.0
+MISSED   crates/pstore-index/src/rabitq.rs:432:37: replace - with + in Quantizer::error_bound
+109 mutants tested in 15m: 16 missed, 85 caught, 8 unviable
