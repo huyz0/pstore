@@ -1,0 +1,53 @@
+# 52 index-only MISSED names, re-run with the workspace tests, on bb84aff
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with 1.0
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with 0.0
+MISSED   crates/pstore-index/src/cluster.rs:124:9: replace Clustering::assignment_cost -> f64 with -1.0
+MISSED   crates/pstore-index/src/cluster.rs:247:23: replace > with >= in seed_centroids
+MISSED   crates/pstore-index/src/cluster.rs:271:55: replace || with && in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:29: replace || with && in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:74: replace < with == in augment
+MISSED   crates/pstore-index/src/cluster.rs:271:74: replace < with <= in augment
+MISSED   crates/pstore-index/src/cluster.rs:346:66: replace < with <= in assign
+MISSED   crates/pstore-index/src/lire.rs:47:13: replace < with <= in split_pass
+MISSED   crates/pstore-index/src/lire.rs:48:49: replace > with >= in split_pass
+MISSED   crates/pstore-index/src/lire.rs:50:19: replace += with -= in split_pass
+MISSED   crates/pstore-index/src/lire.rs:50:19: replace += with *= in split_pass
+MISSED   crates/pstore-index/src/lire.rs:65:38: replace - with + in split_pass
+MISSED   crates/pstore-index/src/lire.rs:65:38: replace - with / in split_pass
+MISSED   crates/pstore-index/src/lire.rs:215:49: replace > with < in maintain_with
+MISSED   crates/pstore-index/src/lire.rs:215:49: replace > with >= in maintain_with
+MISSED   crates/pstore-index/src/lire.rs:304:49: replace > with >= in maintain_with
+MISSED   crates/pstore-index/src/lire.rs:314:69: replace != with == in maintain_with
+MISSED   crates/pstore-index/src/lire.rs:340:25: replace != with == in maintain_with
+MISSED   crates/pstore-index/src/lire.rs:449:30: replace <= with > in bisect
+MISSED   crates/pstore-index/src/rabitq.rs:92:9: replace <impl fmt::Display for QuantError>::fmt -> fmt::Result with Ok(Default::default())
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with 0.0
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with 1.0
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with -1.0
+MISSED   crates/pstore-index/src/rabitq.rs:228:15: replace <= with > in Quantizer::quantize_query_int4
+MISSED   crates/pstore-index/src/rabitq.rs:264:9: replace Quantizer::dim -> usize with 0
+MISSED   crates/pstore-index/src/rabitq.rs:264:9: replace Quantizer::dim -> usize with 1
+MISSED   crates/pstore-index/src/rabitq.rs:293:23: replace * with / in Quantizer::rotate
+MISSED   crates/pstore-index/src/rabitq.rs:296:17: replace < with <= in Quantizer::rotate
+MISSED   crates/pstore-index/src/rabitq.rs:324:29: replace - with + in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with == in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with < in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:329:38: replace > with >= in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:330:39: replace / with % in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:330:39: replace / with * in Quantizer::encode_residual
+MISSED   crates/pstore-index/src/rabitq.rs:353:19: replace > with >= in Quantizer::encode_unit
+MISSED   crates/pstore-index/src/rabitq.rs:401:43: replace * with + in Quantizer::estimate_residual
+MISSED   crates/pstore-index/src/rabitq.rs:421:9: replace Quantizer::estimate_unnormalized_for_test -> f32 with 0.0
+MISSED   crates/pstore-index/src/rabitq.rs:421:9: replace Quantizer::estimate_unnormalized_for_test -> f32 with -1.0
+MISSED   crates/pstore-index/src/rabitq.rs:432:37: replace - with + in Quantizer::error_bound
+MISSED   crates/pstore-index/src/rabitq.rs:432:37: replace - with / in Quantizer::error_bound
+MISSED   crates/pstore-index/src/search.rs:50:25: replace * with / in probe_pruned
+MISSED   crates/pstore-index/src/search.rs:50:32: replace + with - in probe_pruned
+MISSED   crates/pstore-index/src/search.rs:50:32: replace + with * in probe_pruned
+MISSED   crates/pstore-index/src/sq8.rs:37:22: replace > with >= in encode
+MISSED   crates/pstore-index/src/sq8.rs:41:21: replace > with >= in encode
+MISSED   crates/pstore-index/src/vec_index.rs:363:40: replace + with * in assemble
+MISSED   crates/pstore-index/src/vec_index.rs:380:16: replace > with >= in assemble
+MISSED   crates/pstore-index/src/vec_index.rs:704:59: replace < with <= in VecIndex::search
+Found 53 mutants to test
+53 mutants tested in 43m: 50 missed, 3 caught
