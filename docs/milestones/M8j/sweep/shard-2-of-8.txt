@@ -1,0 +1,7 @@
+# shard 2/8 of pstore-index, index-only tests, on 7c10d4d
+MISSED   crates/pstore-index/src/lire.rs:449:30: replace <= with > in bisect
+MISSED   crates/pstore-index/src/rabitq.rs:92:9: replace <impl fmt::Display for QuantError>::fmt -> fmt::Result with Ok(Default::default())
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with 0.0
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with 1.0
+MISSED   crates/pstore-index/src/rabitq.rs:139:9: replace Code::residual_norm -> f32 with -1.0
+109 mutants tested in 14m: 5 missed, 104 caught
