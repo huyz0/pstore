@@ -1,0 +1,7 @@
+# shard 7/8 of pstore-index, index-only tests, on c469362
+MISSED   crates/pstore-index/src/vec_index.rs:363:40: replace + with * in assemble
+MISSED   crates/pstore-index/src/vec_index.rs:380:16: replace > with >= in assemble
+MISSED   crates/pstore-index/src/vec_index.rs:687:12: delete ! in VecIndex::search
+MISSED   crates/pstore-index/src/vec_index.rs:704:59: replace < with <= in VecIndex::search
+MISSED   crates/pstore-index/src/vec_index.rs:704:69: replace + with * in VecIndex::search
+103 mutants tested in 16m: 5 missed, 94 caught, 4 unviable
