@@ -229,9 +229,9 @@ fn dist2(a: &[f32], b: &[f32]) -> f32 {
 /// Initial centroids, spread rather than sampled.
 ///
 /// Farthest-point traversal from a deterministic start: each new centroid is the corpus
-/// point furthest from every centroid so far. No randomness, so two runs over the same
-/// corpus agree exactly — and unlike random sampling it cannot start with two centroids in
-/// the same dense blob, which is what leaves a whole region to one list.
+/// point furthest from every centroid so far, ties to the lowest row. No randomness, so two
+/// runs over the same corpus agree exactly — and unlike random sampling it cannot start with
+/// two centroids in the same dense blob, which is what leaves a whole region to one list.
 fn seed_centroids(corpus: &[Vec<f32>], k: usize, dim: usize) -> Vec<Vec<f32>> {
     let mut chosen: Vec<Vec<f32>> = Vec::with_capacity(k);
     chosen.push(corpus.first().cloned().unwrap_or_else(|| vec![0.0; dim]));

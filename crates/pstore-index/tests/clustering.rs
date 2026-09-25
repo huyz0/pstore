@@ -238,3 +238,78 @@ fn balance_is_bought_cheaply_not_at_any_price() {
         got / floor
     );
 }
+
+/// One-dimensional rows, exact in f32.
+fn line(xs: &[f32]) -> Vec<Vec<f32>> {
+    xs.iter().map(|x| vec![*x]).collect()
+}
+
+/// Two lists, one Lloyd pass, and nothing replicated unless a test says so.
+fn two_lists(balance: f32) -> Params {
+    Params {
+        target_list_size: 2,
+        balance,
+        iterations: 1,
+        replicas: 0,
+        ..Params::default()
+    }
+}
+
+#[test]
+fn the_assignment_cost_is_the_squared_distance_to_the_assigned_centroid() {
+    let corpus = vec![vec![1.0, 0.0], vec![-1.0, 0.0], vec![10.0, 2.0]];
+    let c = Clustering::from_parts(
+        vec![vec![0.0, 0.0], vec![10.0, 0.0]],
+        vec![vec![0, 1], vec![2]],
+    );
+    // 1 + 1 + 4.
+    assert_eq!(c.assignment_cost(&corpus), 6.0);
+}
+
+#[test]
+fn a_seeding_tie_goes_to_the_first_row() {
+    // The first centroid is row 0 at 0; rows 1 and 2 are both 1 away, and the second seed is
+    // row 1 -- ties to the lowest row, like every other tie in the module. The last row
+    // instead would mirror the whole clustering: [[0, 1], [2]].
+    let c = Clustering::build(&line(&[0.0, -1.0, 1.0]), two_lists(4.0));
+    assert_eq!(c.lists(), [vec![0, 2], vec![1]]);
+    assert_eq!(c.centroids(), [vec![0.5], vec![-1.0]]);
+}
+
+#[test]
+fn a_full_list_takes_no_more_rows() {
+    // Cap = floor(4 rows / 2 lists x 1.0) = 2. Row 3 is nearest list 0, which already holds
+    // two rows, so it goes to list 1. One row more would be 1.5x the mean at balance 1.0.
+    let c = Clustering::build(&line(&[0.0, 10.0, 0.1, 0.2]), two_lists(1.0));
+    assert_eq!(c.lists(), [vec![0, 2], vec![1, 3]]);
+}
+
+/// Rows 2 and 3 sit at 0, exactly between the centroids -0.5 and 0.5 that one pass gives:
+/// the cap of 2 sends the first to list 0 and the second to list 1.
+fn equidistant(boundary: f32) -> Clustering {
+    Clustering::build(
+        &line(&[-1.0, 1.0, 0.0, 0.0]),
+        Params {
+            replicas: 1,
+            boundary,
+            ..two_lists(1.0)
+        },
+    )
+}
+
+#[test]
+fn a_zero_boundary_replicates_nothing_not_even_an_exact_tie() {
+    // The documented meaning of 0.0. The rule "within (1 + boundary) of the nearest" admits
+    // a tie at 0.0, so it is the early return that makes 0.0 mean nothing.
+    let c = equidistant(0.0);
+    assert_eq!(c.centroids(), [vec![-0.5], vec![0.5]]);
+    assert_eq!(c.lists(), [vec![0, 2], vec![1, 3]]);
+}
+
+#[test]
+fn two_lists_are_enough_to_replicate_between() {
+    // Row 2 (in list 0) is as near list 1, so it is replicated there. Row 3's tie goes to
+    // list 0 as its nearest, so its "other" list is its own and adds nothing.
+    let c = equidistant(0.05);
+    assert_eq!(c.lists(), [vec![0, 2], vec![1, 2, 3]]);
+}

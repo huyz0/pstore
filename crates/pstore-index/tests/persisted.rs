@@ -12,7 +12,9 @@
 
 use pstore_blob::{Accounted, BlobStore, Key, MemoryStore};
 use pstore_format::{Document, Section};
-use pstore_index::cluster::Params;
+use pstore_index::cluster::{Clustering, Params};
+use pstore_index::rabitq::Quantizer;
+use pstore_index::sq8;
 use pstore_index::vec_index::{self, EXACT_SCAN_THRESHOLD, Query, Rerank, VecIndex};
 use pstore_testkit::depth::DepthCounting;
 use pstore_types::TenantId;
@@ -763,4 +765,131 @@ async fn a_clustered_index_keeps_its_recall_in_suite() {
          different",
         docs.len().div_ceil(11)
     );
+}
+
+/// Every hit of a query that probes every list and keeps every row, with the clustering the
+/// build used and its centroids.
+async fn score_everything(
+    rerank: Rerank,
+) -> (
+    Vec<Document>,
+    vec_index::Built,
+    Clustering,
+    Vec<f32>,
+    Vec<(usize, f32)>,
+) {
+    let s = MemoryStore::new();
+    let docs = corpus(TEST_THRESHOLD + 400, 12, 5);
+    let built = put(&s, &docs).await;
+    let vectors: Vec<Vec<f32>> = docs.iter().map(|d| d.vector().to_vec()).collect();
+    let clustering = Clustering::build(&vectors, params());
+    assert_eq!(
+        built.centroids.as_ref().unwrap().vectors,
+        clustering.centroids(),
+        "the test's clustering is not the one the build used"
+    );
+    let idx = VecIndex::open(&s, &Key::new(SEG), &Key::new(CEN), DIM)
+        .await
+        .unwrap();
+    let query = docs[3].vector().to_vec();
+    let hits = idx
+        .search(
+            &s,
+            &Key::new(SEG),
+            &query,
+            Query {
+                k: docs.len(),
+                p: clustering.lists().len(),
+                oversample: 1,
+                rerank,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), docs.len(), "a row was not scored");
+    (docs, built, clustering, query, hits)
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[tokio::test]
+async fn every_rung_zero_score_is_the_rows_code_against_its_own_lists_centroid() {
+    // ⚠️ A replicated document sits in two lists, and each copy is scored with ITS list's
+    // `<c, q>` -- so each copy must be coded against its list's centroid. Keyed by document,
+    // the last list a document appeared in won, and its copy in the first list was scored at
+    // `<v, q> + <c_first - c_last, q>`. Recomputed here independently: a hit's score is the
+    // best of its copies' (search keeps the best copy).
+    let (docs, built, clustering, query, hits) = score_everything(Rerank::None).await;
+    let quantizer = Quantizer::new(DIM);
+    let prepared = quantizer.prepare(&query).unwrap();
+    let mut best = vec![f32::NEG_INFINITY; docs.len()];
+    let mut replicated = 0;
+    let mut copies = vec![0usize; docs.len()];
+    for (li, list) in clustering.lists().iter().enumerate() {
+        let c = &clustering.centroids()[li];
+        for &d in list {
+            let code = quantizer.encode_residual(docs[d].vector(), c).unwrap();
+            let est = quantizer.estimate_residual(&code, &prepared, dot(c, &query));
+            best[d] = best[d].max(est);
+            copies[d] += 1;
+            if copies[d] == 2 {
+                replicated += 1;
+            }
+        }
+    }
+    assert!(
+        replicated > 0,
+        "the fixture replicates nothing, so it tests nothing"
+    );
+    for (r, score) in &hits {
+        let d = built.order[*r];
+        assert_eq!(
+            score.to_bits(),
+            best[d].to_bits(),
+            "d{d} ({} copies) scored {score}, its codes give {}",
+            copies[d],
+            best[d]
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_int8_score_is_the_rows_own_int8_estimate() {
+    // The sq8 buffer holding a row is found by span. A span's end is exclusive: the row at
+    // `first + len` is the NEXT list's first row, and read from this list's buffer it is past
+    // the end and scores `-inf`.
+    let (docs, built, _, query, hits) = score_everything(Rerank::Fast).await;
+    for (r, score) in &hits {
+        let d = built.order[*r];
+        let want = sq8::estimate(&sq8::encode(docs[d].vector()), &query);
+        assert_eq!(
+            score.to_bits(),
+            want.to_bits(),
+            "d{d} scored {score}, not {want}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_field_no_document_carries_writes_no_code_bytes() {
+    // A segment over a field nobody carries (a text-only or sparse-only segment) has no
+    // vector to code. A row coded anyway is a width-error fill: `code_len` zero bytes and an
+    // 8-byte sq8 header per row, stored and never readable as a vector.
+    let s = MemoryStore::new();
+    let docs = corpus(TEST_THRESHOLD + 400, 12, 7);
+    let built = vec_index::build_field(&docs, params(), "absent");
+    assert!(built.centroids.is_none());
+    s.put(&Key::new(SEG), built.segment.clone()).await.unwrap();
+    let seg = pstore_format::Segment::open(&s, &Key::new(SEG))
+        .await
+        .unwrap();
+    for section in [Section::RaBitQ, Section::Sq8] {
+        let len = seg.section(section).map_or(0, |r| r.end - r.start);
+        assert_eq!(
+            len, 0,
+            "{section:?} holds {len} bytes for a field nobody carries"
+        );
+    }
 }

@@ -259,3 +259,16 @@ fn a_constant_vector_quantises_without_dividing_by_zero() {
     assert_eq!(raw.len(), sq8::record_len(32));
     assert!((sq8::estimate_raw(&raw, &q) - 8.0).abs() < 1e-4);
 }
+
+#[test]
+fn a_range_too_narrow_for_a_step_codes_like_a_constant_vector() {
+    // One subnormal of range divided by 255 underflows to a zero step. Codes are persisted,
+    // so which code each coordinate gets is part of the format: all zero, as for a constant
+    // vector, not the 255 that dividing by the zero step would give the upper coordinate.
+    let narrow = sq8::encode(&[0.0, f32::from_bits(1)]);
+    assert_eq!(narrow.step(), 0.0);
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    sq8::write_to(&narrow, &mut got);
+    sq8::write_to(&sq8::encode(&[0.0, 0.0]), &mut want);
+    assert_eq!(got, want);
+}

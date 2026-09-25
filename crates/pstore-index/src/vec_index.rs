@@ -315,21 +315,25 @@ fn assemble(
         .unwrap_or(0);
     let quantizer = Quantizer::new(dim.max(1));
 
-    let (order, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
-        ((0..docs.len()).collect::<Vec<_>>(), None)
+    // `home` is the list each INDEX row sits in, beside `order`; empty when unclustered.
+    let (order, home, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
+        ((0..docs.len()).collect::<Vec<_>>(), Vec::new(), None)
     } else {
         let corpus: Vec<Vec<f32>> = docs.iter().map(|d| fit(d, field, dim)).collect();
         let c = Clustering::build(&corpus, params);
         // ⚠️ Rows are written in LIST order, so a posting list is one contiguous byte range
         // and a probe is one ranged read rather than a scatter of thousands.
         let mut order = Vec::with_capacity(docs.len());
+        let mut home = Vec::with_capacity(docs.len());
         let mut spans = Vec::with_capacity(c.lists().len());
-        for list in c.lists() {
+        for (li, list) in c.lists().iter().enumerate() {
             spans.push((order.len() as u32, list.len() as u32));
             order.extend(list.iter().copied());
+            home.extend(std::iter::repeat_n(li, list.len()));
         }
         (
             order,
+            home,
             Some(Centroids {
                 vectors: c.centroids().to_vec(),
                 spans,
@@ -356,31 +360,23 @@ fn assemble(
     let mut w = SegmentWriter::new(64);
     let mut rabitq = Vec::new();
     let mut eights = Vec::new();
-    // The centroid a row is coded against: its own list's, or the origin when unclustered.
-    let mut home: Vec<usize> = vec![usize::MAX; docs.len()];
-    if let Some(c) = &centroids {
-        for (li, (first, len)) in c.spans.iter().enumerate() {
-            for slot in *first..*first + *len {
-                if let Some(row) = order.get(slot as usize)
-                    && let Some(slot) = home.get_mut(*row)
-                {
-                    *slot = li;
-                }
-            }
-        }
-    }
     let zero = vec![0.0f32; dim];
     for row in &primary {
         if let Some(d) = docs.get(*row) {
             w.push(d.clone());
         }
     }
-    for row in &order {
+    for (slot, row) in order.iter().enumerate() {
         let Some(d) = docs.get(*row) else { continue };
         if dim > 0 {
-            let cen = centroids
-                .as_ref()
-                .and_then(|c| c.vectors.get(*home.get(*row).unwrap_or(&usize::MAX)))
+            // The centroid a row is coded against: its own LIST's, or the origin when
+            // unclustered. ⚠️ Per index row, not per document. A replicated document has one
+            // copy per list, and search scores each copy with its list's `<c, q>`. Keyed by
+            // document, the last list won and every other copy scored `<c_that - c_last, q>`
+            // off -- up or down, so the best copy was not the most accurate one.
+            let cen = home
+                .get(slot)
+                .and_then(|li| centroids.as_ref()?.vectors.get(*li))
                 .unwrap_or(&zero);
             // ⚠️ Zero-filled when the document lacks this field, never skipped. Codes are
             // fixed width per row, so a skipped row shifts every later one — and the

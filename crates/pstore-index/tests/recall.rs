@@ -14,7 +14,7 @@
 //! figure without them is not a measurement (`evaluation-methodology.md`). These run inside
 //! `cargo test`, so they are deliberately small; the gate-scale sweep is `scripts/recall.sh`.
 
-use pstore_index::cluster::Params;
+use pstore_index::cluster::{Clustering, Params};
 use pstore_index::ladder::Ladder;
 use pstore_index::search;
 
@@ -141,6 +141,14 @@ fn an_easy_query_prunes_more_than_a_hard_one() {
     );
     // And it never returns nothing, which would turn a hard query into no answer at all.
     assert!(e >= 1);
+}
+
+#[test]
+fn the_slack_is_a_fraction_of_the_nearest_distance() {
+    // Centroids at true distances 1, 1.5 and 3 from the query, all exactly representable.
+    // A slack of 1.0 admits lists up to 1 x (1 + 1.0) = 2 from the query: the first two.
+    let c = Clustering::from_parts(vec![vec![1.0], vec![1.5], vec![3.0]], vec![Vec::new(); 3]);
+    assert_eq!(search::probe_pruned(&c, &[0.0], 3, 1.0), vec![0, 1]);
 }
 
 #[test]

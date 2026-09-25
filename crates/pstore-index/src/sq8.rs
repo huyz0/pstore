@@ -33,8 +33,10 @@ pub fn encode(v: &[f32]) -> Code {
     let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     // A constant vector has no range; a zero step reconstructs it exactly, and dividing by
     // it is the only thing that could go wrong, so it is handled here rather than guarded
-    // at every use.
-    let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
+    // at every use. `max` rather than `if hi > lo`, whose `>=` differed only for an
+    // all-infinite vector: the empty vector's range is `-inf` and an infinite constant's is
+    // `inf - inf = NaN`, and `max` takes both to 0 as the branch did.
+    let step = (hi - lo).max(0.0) / 255.0;
     let codes = v
         .iter()
         .map(|x| {
