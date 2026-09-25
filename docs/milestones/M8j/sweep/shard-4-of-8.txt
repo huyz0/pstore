@@ -1,0 +1,8 @@
+# shard 4/8 of pstore-index, index-only tests, on cc80086
+MISSED   crates/pstore-index/src/rabitq.rs:432:37: replace - with / in Quantizer::error_bound
+MISSED   crates/pstore-index/src/search.rs:50:25: replace * with / in probe_pruned
+MISSED   crates/pstore-index/src/search.rs:50:32: replace + with - in probe_pruned
+MISSED   crates/pstore-index/src/search.rs:50:32: replace + with * in probe_pruned
+MISSED   crates/pstore-index/src/sq8.rs:37:22: replace > with >= in encode
+MISSED   crates/pstore-index/src/sq8.rs:41:21: replace > with >= in encode
+109 mutants tested in 15m: 6 missed, 89 caught, 14 unviable
