@@ -467,6 +467,28 @@ Windows, committed without the exec bit, and runnable on every OS but the ones C
 `portable` CI job runs the whole gate on three runners, and was **observed green on all
 three** — macOS under its own bash 3.2.
 
+### M9 — the API a turbopuffer client expects
+
+→ [`turbopuffer-api-parity.md`](turbopuffer-api-parity.md), which compares the two row by row
+and argues the order. The short form: turbopuffer is a document store with search, and pstore
+is a search index with ids — a write of `{id, vector, text}` and a query that returns `(id,
+score)`. Nine milestones close that, each end to end through the HTTP door:
+
+| # | Milestone |
+|---|---|
+| M9a | Attributes on write (`int`, `string`), `include_attributes` on query — at zero extra requests |
+| M9b | Filters: `Eq NotEq In NotIn Lt Lte Gt Gte And Or Not`, on the ANN and BM25 paths |
+| M9c | Upsert and delete by id: last write wins, `deletes` |
+| M9d | `cosine_distance`, `euclidean_squared`, exact `kNN`, `$dist`, base64 vectors |
+| M9e | Order by attribute, `offset`, id-cursor export |
+| M9f | Index lifecycle: delete, paginated list, metadata |
+| M9g | Multi-query, RRF weights, BM25 `Sum`/`Max`/`Product` |
+| M9h | `float`, `bool`, `datetime`, arrays; `Contains`/`ContainsAny` |
+| M9i | A scheduled fold, and `consistency` |
+
+⚠️ Only M9a is specified. The rest are a sequence, not specs: each is decomposed when it is
+next, because the one before changes what it should be.
+
 ## Cross-cutting, from day one
 
 | Discipline | Enforcement |
