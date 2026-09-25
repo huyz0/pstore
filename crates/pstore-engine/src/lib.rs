@@ -340,6 +340,12 @@ pub struct Answer {
     /// index, against D-34's three. Resolved inside the query, it is one fan-out round
     /// however many segments there are.
     pub ids: Vec<Option<String>>,
+    /// The attributes of every hit, in `hits` order: **empty** for a hit on the unfolded
+    /// rows, whose attributes [`Engine::resolve_rows`] reads from [`Self::unfolded`].
+    ///
+    /// ⚠️ From the same blocks that produced [`Self::ids`] (M9a): the block is the unit of
+    /// both, so carrying the attributes costs no request and no byte.
+    pub attributes: Vec<std::collections::BTreeMap<String, pstore_format::Value>>,
     /// The segments HEAD named for this index **when the answer was computed**, in the order
     /// every `Hit::segment` below [`Self::unfolded_at`] indexes.
     ///
@@ -882,17 +888,44 @@ impl<S: BlobStore> Engine<S> {
     /// that it got faster.
     #[must_use]
     pub fn resolve(&self, answer: &Answer) -> Vec<(String, f32)> {
+        self.resolve_rows(answer)
+            .into_iter()
+            .map(|(id, score, _)| (id, score))
+            .collect()
+    }
+
+    /// [`Self::resolve`], with each hit's attributes (M9a).
+    ///
+    /// A hit on the unfolded rows takes its attributes from the row itself; any other from
+    /// [`Answer::attributes`], which came with its id.
+    #[must_use]
+    pub fn resolve_rows(
+        &self,
+        answer: &Answer,
+    ) -> Vec<(
+        String,
+        f32,
+        std::collections::BTreeMap<String, pstore_format::Value>,
+    )> {
         answer
             .hits
             .iter()
             .enumerate()
             .filter_map(|(i, h)| {
-                let id = if h.segment == answer.unfolded_at {
-                    answer.unfolded.get(h.row).map(|d| d.id.clone())
+                let row = if h.segment == answer.unfolded_at {
+                    answer
+                        .unfolded
+                        .get(h.row)
+                        .map(|d| (d.id.clone(), d.attrs.clone()))
                 } else {
-                    answer.ids.get(i).cloned().flatten()
+                    answer
+                        .ids
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .map(|id| (id, answer.attributes.get(i).cloned().unwrap_or_default()))
                 };
-                id.map(|id| (id, h.score))
+                row.map(|(id, attrs)| (id, h.score, attrs))
             })
             .collect()
     }
@@ -1733,6 +1766,7 @@ impl<S: BlobStore> Engine<S> {
             return Ok(Answer {
                 hits: Vec::new(),
                 ids: Vec::new(),
+                attributes: Vec::new(),
                 unfolded,
                 unfolded_at,
                 segments: refs,
@@ -1746,7 +1780,7 @@ impl<S: BlobStore> Engine<S> {
             durable: Arc::clone(&self.store),
             fresh: fresh_store,
         };
-        let resolved = pstore_query::query_ids(&store, &targets, prefetch, fusion, top_k)
+        let resolved = pstore_query::query_rows(&store, &targets, prefetch, fusion, top_k)
             .await
             .map_err(|e| match e {
                 pstore_query::QueryError::Format(
@@ -1754,10 +1788,11 @@ impl<S: BlobStore> Engine<S> {
                 ) => EngineError::DimensionMismatch { expected, got },
                 other => EngineError::Query(other.to_string()),
             })?;
-        let (hits, ids) = resolved.into_iter().unzip();
+        let (hits, ids, attributes) = split_rows(resolved);
         Ok(Answer {
             hits,
             ids,
+            attributes,
             unfolded,
             unfolded_at,
             segments: refs,
@@ -1798,6 +1833,7 @@ impl<S: BlobStore> Engine<S> {
             return Ok(Answer {
                 hits: Vec::new(),
                 ids: Vec::new(),
+                attributes: Vec::new(),
                 unfolded: Vec::new(),
                 unfolded_at: 0,
                 segments: refs,
@@ -1810,7 +1846,7 @@ impl<S: BlobStore> Engine<S> {
         // an empty list and vanish. The test found it; the live path has always used this
         // value for the same reason.
         let unfolded_at = refs.len();
-        let resolved = pstore_query::query_ids(&*self.store, &targets, prefetch, fusion, top_k)
+        let resolved = pstore_query::query_rows(&*self.store, &targets, prefetch, fusion, top_k)
             .await
             .map_err(|e| match e {
                 pstore_query::QueryError::Format(
@@ -1818,10 +1854,11 @@ impl<S: BlobStore> Engine<S> {
                 ) => EngineError::DimensionMismatch { expected, got },
                 other => EngineError::Query(other.to_string()),
             })?;
-        let (hits, ids) = resolved.into_iter().unzip();
+        let (hits, ids, attributes) = split_rows(resolved);
         Ok(Answer {
             hits,
             ids,
+            attributes,
             unfolded: Vec::new(),
             unfolded_at,
             segments: refs,
@@ -1906,6 +1943,37 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
         .collect();
     names.sort_unstable();
     names.first().map(|s| (*s).to_owned())
+}
+
+/// A resolved ranking, as `Answer`'s three parallel columns: hits, ids, attributes.
+#[expect(
+    clippy::type_complexity,
+    reason = "the three columns `Answer` stores, named there; a struct here would be `Answer` again"
+)]
+fn split_rows(
+    resolved: Vec<(pstore_query::Hit, Option<Document>)>,
+) -> (
+    Vec<pstore_query::Hit>,
+    Vec<Option<String>>,
+    Vec<std::collections::BTreeMap<String, pstore_format::Value>>,
+) {
+    let mut hits = Vec::with_capacity(resolved.len());
+    let mut ids = Vec::with_capacity(resolved.len());
+    let mut attributes = Vec::with_capacity(resolved.len());
+    for (h, d) in resolved {
+        hits.push(h);
+        match d {
+            Some(d) => {
+                ids.push(Some(d.id));
+                attributes.push(d.attrs);
+            }
+            None => {
+                ids.push(None);
+                attributes.push(std::collections::BTreeMap::new());
+            }
+        }
+    }
+    (hits, ids, attributes)
 }
 
 #[cfg(test)]

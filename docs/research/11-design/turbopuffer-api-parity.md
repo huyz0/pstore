@@ -29,6 +29,7 @@ M9 milestones is the order in which the difference has to be closed.
 |---|---|---|
 | `upsert_rows` / `upsert_columns`: **overwrite by id** | append; a repeated id is a **second row**, and both can be returned | **M9c** — last write wins by id, as [`mutations-and-mvcc.md`](../05-storage-engine/mutations-and-mvcc.md) already specifies |
 | `deletes: [id]` | none | **M9c** — tombstones, then delete vectors |
+| an attribute set to `null` means "unset" | refused, `400` (M9a) | **M9c** decides, once a write can overwrite: `null` only means something against a prior value |
 | Row = `{id, vector?, <attr>: value…}` | `{id, vector, text?}` only; the engine's `attrs` are unreachable over HTTP | **M9a** |
 | `patch_rows` / `patch_columns`, `patch_by_filter`, `delete_by_filter` | none | Deferred: each is a read-modify-write at fold time, priced after M9c |
 | `upsert_condition` / `patch_condition` / `delete_condition` | none | Deferred with them |

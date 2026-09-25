@@ -740,6 +740,30 @@ impl Segment {
         key: &Key,
         rows: &[usize],
     ) -> Result<Vec<Option<String>>, FormatError> {
+        Ok(self
+            .rows_at(store, key, rows)
+            .await?
+            .into_iter()
+            .map(|r| r.map(|d| d.id))
+            .collect())
+    }
+
+    /// Specific rows' ids **and attributes**, from the same blocks [`Self::ids_at`] reads.
+    ///
+    /// ⚠️ **The same fetch, not a second one (M9a).** A block is the unit of both: it carries
+    /// every row's id and attributes, and the id could only ever be had by fetching and
+    /// decoding the whole block. Keeping the attributes that decode already produced is what
+    /// makes `include_attributes` cost no request and no byte. Vectors are not in a block and
+    /// are not returned: each [`Document`] here has an empty `vectors`.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn rows_at<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        rows: &[usize],
+    ) -> Result<Vec<Option<Document>>, FormatError> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -770,13 +794,13 @@ impl Segment {
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
 
-        // Row -> id, for the rows the fetched blocks happen to carry.
-        let mut found: BTreeMap<usize, String> = BTreeMap::new();
+        // Row -> its document, for the rows the fetched blocks happen to carry.
+        let mut found: BTreeMap<usize, Document> = BTreeMap::new();
         for (n, block) in wanted.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
             let start = base.get(*block).copied().unwrap_or(0);
             for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
-                found.insert(start + r, doc.id);
+                found.insert(start + r, doc);
             }
         }
         Ok(rows.iter().map(|r| found.get(r).cloned()).collect())

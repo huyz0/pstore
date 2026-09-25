@@ -277,18 +277,23 @@ async fn an_over_wide_segment_is_refused_by_the_fold() {
     // for the life of an immutable object. `build_all`'s `finish` writes it and reports it
     // durable.
     //
-    // Zone maps are per block and per attribute KEY, so enough distinct int attributes make
-    // even a one-block index exceed `INDEX_BUDGET`.
+    // ⚠️ **Wide by its field table, not its zone maps** (M9a). This fixture used to be 400
+    // distinct integer attributes, whose zone maps made even a one-block index exceed
+    // `INDEX_BUDGET` -- and that was a defect, not a fixture: M9a lets a client write
+    // integer attributes, and one such batch failed every fold of its tenant. The writer now
+    // drops zone maps rather than refuse. A vector field's NAME has no fallback: it is in
+    // the field table, which the reader needs, so a name longer than the budget is still a
+    // segment that cannot open in one round trip. The assertions below are unchanged.
     let store = Arc::new(MemoryStore::new());
     let t = TenantId(706);
     let e = Engine::new(Arc::clone(&store), t, LaneId(1));
     let wide: Vec<Document> = (0..4)
         .map(|i| {
             let mut d = doc(i);
-            for k in 0..400 {
-                d.attrs
-                    .insert(format!("attribute_number_{k:04}"), Value::Int(i as i64 + k));
-            }
+            d.vectors.insert(
+                "f".repeat(pstore_format::INDEX_BUDGET + 1),
+                pstore_format::VectorField::dense(vec![1.0, i as f32]),
+            );
             d
         })
         .collect();

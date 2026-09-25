@@ -47,6 +47,10 @@ pub struct DocumentIn {
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
+    /// Typed attributes: a JSON integer (`i64`) or string each (M9a). Anything else is
+    /// refused at the door rather than coerced — see `lib.rs`'s `to_document`.
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// `PUT /v1/indexes/{id}/documents`.
@@ -94,6 +98,23 @@ pub struct QueryRequest {
     /// nobody meant to make.
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    /// Which attributes each result carries: all, none, or those named. Omitted, with no
+    /// `exclude_attributes`, a row carries no `attributes` key at all.
+    #[serde(default)]
+    pub include_attributes: Option<IncludeAttributes>,
+    /// Names removed from what `include_attributes` selects; alone, "all except these".
+    #[serde(default)]
+    pub exclude_attributes: Option<Vec<String>>,
+}
+
+/// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum IncludeAttributes {
+    /// `true` for every attribute, `false` for none.
+    All(bool),
+    /// Only these, where a row has them.
+    Named(Vec<String>),
 }
 
 fn default_top_k() -> usize {
@@ -107,6 +128,10 @@ pub struct ResultRow {
     pub id: String,
     /// Its fused score.
     pub score: f32,
+    /// Its attributes, **only when the query asked** — absent otherwise, so a query that
+    /// did not ask gets exactly the response it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 /// What the answer cost and how fresh it is.

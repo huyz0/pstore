@@ -106,3 +106,70 @@ async fn resolving_nothing_costs_nothing() {
         "an empty hit list issued a request"
     );
 }
+
+/// A row as `rows_at` answers it: its id and its attributes, in name order.
+type Row = (String, Vec<(String, pstore_format::Value)>);
+
+#[tokio::test]
+async fn rows_at_returns_each_rows_id_and_attributes_in_one_round() {
+    // M9a. The block that resolves a row's id carries its attributes; returning them must
+    // not cost a second fetch, and each row must get its OWN attributes.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = acct.as_tenant(BILL);
+    let mut w = SegmentWriter::new(10);
+    for i in 0..50i64 {
+        let mut d = Document::new(format!("d{i:04}"), vec![i as f32, 1.0]);
+        d.attrs
+            .insert("n".to_owned(), pstore_format::Value::Int(i * 3));
+        if i % 2 == 0 {
+            d.attrs.insert(
+                "even".to_owned(),
+                pstore_format::Value::Str(format!("e{i}")),
+            );
+        }
+        w.push(d);
+    }
+    let key = Key::new("0000/seg/attrs");
+    store.put(&key, w.finish()).await.unwrap();
+    let seg = Segment::open(&store, &key).await.unwrap();
+
+    let before = acct.count(BILL, OpClass::Read);
+    let rows = seg.rows_at(&store, &key, &[7, 42, 999, 8]).await.unwrap();
+    assert_eq!(acct.count(BILL, OpClass::Read) - before, 1);
+    let got: Vec<Option<Row>> = rows
+        .into_iter()
+        .map(|r| r.map(|d| (d.id, d.attrs.into_iter().collect())))
+        .collect();
+    use pstore_format::Value::{Int, Str};
+    assert_eq!(
+        got,
+        vec![
+            Some(("d0007".to_owned(), vec![("n".to_owned(), Int(21))])),
+            Some((
+                "d0042".to_owned(),
+                vec![
+                    ("even".to_owned(), Str("e42".to_owned())),
+                    ("n".to_owned(), Int(126))
+                ]
+            )),
+            None,
+            Some((
+                "d0008".to_owned(),
+                vec![
+                    ("even".to_owned(), Str("e8".to_owned())),
+                    ("n".to_owned(), Int(24))
+                ]
+            )),
+        ]
+    );
+    // And `ids_at` is the same answer, ids only.
+    assert_eq!(
+        seg.ids_at(&store, &key, &[7, 42, 999, 8]).await.unwrap(),
+        vec![
+            Some("d0007".to_owned()),
+            Some("d0042".to_owned()),
+            None,
+            Some("d0008".to_owned())
+        ]
+    );
+}

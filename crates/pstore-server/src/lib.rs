@@ -489,7 +489,13 @@ async fn write_documents<S: BlobStore + 'static>(
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
 
-    let docs: Vec<Document> = req.documents.iter().map(to_document).collect();
+    // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
+    // buffered, not the half of the batch that came before the bad attribute.
+    let docs: Vec<Document> = req
+        .documents
+        .iter()
+        .map(to_document)
+        .collect::<Result<_, _>>()?;
     let written = docs.len();
     engine.write(&index, docs).await?;
     let durable = matches!(req.durability, types::Durability::Durable);
@@ -570,9 +576,13 @@ async fn query_index<S: BlobStore + 'static>(
         .filter(|h| h.segment == answer.unfolded_at)
         .count();
     let results = engine
-        .resolve(&answer)
+        .resolve_rows(&answer)
         .into_iter()
-        .map(|(id, score)| ResultRow { id, score })
+        .map(|(id, score, attrs)| ResultRow {
+            attributes: selected(&req, &attrs),
+            id,
+            score,
+        })
         .collect();
     Ok(axum::Json(QueryResponse {
         results,
@@ -762,16 +772,99 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
     Ok(legs)
 }
 
-/// The wire document, as the format's.
-fn to_document(d: &types::DocumentIn) -> Document {
+/// The wire document, as the format's — or the reason it cannot be one.
+///
+/// ⚠️ **Refused, never coerced** (M9a). The format stores `i64` and strings; turning `1.5`
+/// into `1`, `true` into `"true"`, or `null` into an absent attribute would store a value the
+/// client did not write, and nothing downstream could tell.
+fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
+    let text_field = pstore_format::text::DEFAULT_TEXT_FIELD;
     let mut doc = Document::new(d.id.clone(), d.vector.clone());
-    if let Some(t) = &d.text {
-        doc.attrs.insert(
-            pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
-            pstore_format::Value::Str(t.clone()),
-        );
+    let refuse = |name: &str, why: &str| {
+        ApiError::bad_request(format!("document {}: attribute `{name}` {why}", d.id))
+    };
+    for (name, value) in &d.attributes {
+        if name.is_empty() {
+            return Err(refuse(name, "has an empty name"));
+        }
+        let v = match value {
+            serde_json::Value::String(s) => pstore_format::Value::Str(s.clone()),
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => pstore_format::Value::Int(i),
+                None => {
+                    return Err(refuse(
+                        name,
+                        "is not an integer that fits i64; integers and strings are the only \
+                         attribute types",
+                    ));
+                }
+            },
+            _ => {
+                return Err(refuse(
+                    name,
+                    "is not an integer or a string, the only attribute types",
+                ));
+            }
+        };
+        if name == text_field && !matches!(v, pstore_format::Value::Str(_)) {
+            return Err(refuse(name, "is the text field and must be a string"));
+        }
+        doc.attrs.insert(name.clone(), v);
     }
-    doc
+    if let Some(t) = &d.text {
+        // `attributes.text` and top-level `text` are one field spelled twice; which one
+        // wins would be a rule nobody wrote down.
+        if doc.attrs.contains_key(text_field) {
+            return Err(refuse(
+                text_field,
+                "is given twice: as `text` and in `attributes`",
+            ));
+        }
+        doc.attrs
+            .insert(text_field.to_owned(), pstore_format::Value::Str(t.clone()));
+    }
+    Ok(doc)
+}
+
+/// One attribute as JSON.
+fn to_json(v: &pstore_format::Value) -> serde_json::Value {
+    match v {
+        pstore_format::Value::Int(n) => serde_json::Value::from(*n),
+        pstore_format::Value::Str(s) => serde_json::Value::from(s.as_str()),
+    }
+}
+
+/// The attributes a query asked for, or `None` when it asked for none (M9a).
+///
+/// ⚠️ `None` and `Some({})` are different answers: a query that did not ask gets rows with
+/// no `attributes` key, exactly as before this existed; one that asked gets the key, empty
+/// if the row has none of what it named.
+fn selected(
+    req: &QueryRequest,
+    attrs: &std::collections::BTreeMap<String, pstore_format::Value>,
+) -> Option<std::collections::BTreeMap<String, serde_json::Value>> {
+    let include = match (&req.include_attributes, &req.exclude_attributes) {
+        (None, None) | (Some(types::IncludeAttributes::All(false)), _) => return None,
+        (Some(i), _) => i,
+        // `exclude_attributes` alone: everything else.
+        (None, Some(_)) => &types::IncludeAttributes::All(true),
+    };
+    let excluded = |k: &str| {
+        req.exclude_attributes
+            .as_ref()
+            .is_some_and(|ex| ex.iter().any(|e| e == k))
+    };
+    Some(
+        attrs
+            .iter()
+            .filter(|(k, _)| match include {
+                types::IncludeAttributes::All(_) => true,
+                types::IncludeAttributes::Named(names) => names.iter().any(|n| n == *k),
+            })
+            .filter(|(k, _)| !excluded(k))
+            .map(|(k, v)| (k.clone(), to_json(v)))
+            .collect(),
+    )
 }
 
 /// What the process needs before it can serve.

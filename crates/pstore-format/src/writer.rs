@@ -24,6 +24,9 @@ pub struct SegmentWriter {
     write_text_fields: bool,
     text_fields: Vec<String>,
     rows_per_block: usize,
+    /// Whether sealed blocks carry zone maps. Cleared only by [`Self::seal_segment`]'s
+    /// fallback, for a segment whose integer attribute names cannot fit the index.
+    zone_maps: bool,
     /// Opaque, fixed-width payloads supplied by a higher layer.
     ///
     /// ⚠️ The format does **not** quantize. `pstore-format` is layer 2 and the quantizer is
@@ -58,6 +61,7 @@ impl SegmentWriter {
             write_text_fields: true,
             text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
+            zone_maps: true,
             extra: Vec::new(),
             raw_extra: Vec::new(),
             docs: Vec::new(),
@@ -168,14 +172,16 @@ impl SegmentWriter {
         }
         let offset = self.body.len() as u64;
         let mut zones: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-        for d in rows {
-            for (k, v) in &d.attrs {
-                if let Value::Int(n) = v {
-                    // Zone maps are built here, from the rows as they are written -- never
-                    // from a later pass that could disagree with the bytes.
-                    let e = zones.entry(k.clone()).or_insert((*n, *n));
-                    e.0 = e.0.min(*n);
-                    e.1 = e.1.max(*n);
+        if self.zone_maps {
+            for d in rows {
+                for (k, v) in &d.attrs {
+                    if let Value::Int(n) = v {
+                        // Zone maps are built here, from the rows as they are written --
+                        // never from a later pass that could disagree with the bytes.
+                        let e = zones.entry(k.clone()).or_insert((*n, *n));
+                        e.0 = e.0.min(*n);
+                        e.1 = e.1.max(*n);
+                    }
                 }
             }
         }
@@ -260,23 +266,6 @@ impl SegmentWriter {
     /// Seals the segment, and reports whether its meta region fits the suffix read.
     fn seal_segment(mut self) -> (Bytes, bool) {
         let docs = std::mem::take(&mut self.docs);
-        // ⚠️ Grow the block size until the index fits the budget, rather than trusting the
-        // caller's request. Doubling terminates: at one block the index is a handful of
-        // bytes, and every doubling at least halves the block count.
-        let idx = loop {
-            self.blocks.clear();
-            self.body = Enc::default();
-            self.rows = 0;
-            for chunk in docs.chunks(self.rows_per_block) {
-                self.seal(chunk);
-            }
-            let idx = self.encode_index();
-            if idx.len() <= self.index_budget || self.blocks.len() <= 1 {
-                break idx;
-            }
-            self.rows_per_block = self.rows_per_block.saturating_mul(2);
-        };
-
         // ⚠️ One set of sections per named field. Fields are taken in name order so the
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader
         // that predates the Fields table sees exactly the single-dense view it expects
@@ -288,9 +277,10 @@ impl SegmentWriter {
         names.sort();
         names.dedup();
 
-        let mut out = self.body;
         let mut dir: Vec<(Section, u64, u64)> = Vec::new();
         let mut fields: Vec<crate::FieldLayout> = Vec::new();
+        // Each dense field's section body, written after the blocks once their size is known.
+        let mut bodies: Vec<(Section, Vec<u8>)> = Vec::new();
         // ⚠️ Counted over DENSE fields only. Field 0 keeps the legacy section ids and names
         // are sorted, so counting sparse fields here would let one named `body_sparse` take
         // slot 0 from a dense `vector`: ids 2/3/4 would never be written, and a search over
@@ -356,8 +346,7 @@ impl SegmentWriter {
                     }
                 }
             }
-            dir.push((vectors_id, out.len() as u64, body.len() as u64));
-            out.raw(&body);
+            bodies.push((vectors_id, body));
             fields.push(crate::FieldLayout {
                 name: name.clone(),
                 kind: 0,
@@ -377,22 +366,6 @@ impl SegmentWriter {
                 },
             });
         }
-        let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
-        for (section, bytes) in &self.extra {
-            if bytes.is_empty() {
-                continue;
-            }
-            dir.push((*section, out.len() as u64, bytes.len() as u64));
-            out.raw(bytes);
-        }
-        for (id, bytes) in &self.raw_extra {
-            if bytes.is_empty() {
-                continue;
-            }
-            raw_dir.push((*id, out.len() as u64, bytes.len() as u64));
-            out.raw(bytes);
-        }
-
         // The meta region: directory first, then the block index, checksummed together and
         // addressed by the footer as one span. One suffix read brings back the footer and,
         // for any segment the writer produced, this whole region.
@@ -437,6 +410,79 @@ impl SegmentWriter {
             t.0
         };
 
+        // ⚠️ **What the meta region holds besides the block index** (M9a, found at code
+        // review). The fitting loop measured the block index against the WHOLE budget while
+        // `fits` below measures the whole region, so an index within this overhead of the
+        // budget passed the loop, skipped the zone-map fallback, and was refused anyway --
+        // one document with ~175 integer attribute names bricked its index. Nothing in the
+        // overhead depends on the block layout: one fixed-width directory entry per section,
+        // plus the two tables, all known before a block is sealed.
+        const ENTRY: usize = 2 + 8 + 8;
+        let sections = bodies.len()
+            + self.extra.iter().filter(|(_, b)| !b.is_empty()).count()
+            + self.raw_extra.iter().filter(|(_, b)| !b.is_empty()).count()
+            + usize::from(!fields_bytes.is_empty())
+            + usize::from(!text_bytes.is_empty())
+            + 1;
+        let overhead = 4 + sections * ENTRY + fields_bytes.len() + text_bytes.len();
+        let target = self.index_budget.saturating_sub(overhead);
+
+        // ⚠️ Grow the block size until the index fits the budget, rather than trusting the
+        // caller's request. Doubling terminates: every doubling at least halves the block
+        // count, and without zone maps one block's index entry is a handful of bytes.
+        //
+        // ⚠️ **But not with them** (M9a, found at spec review). A zone map is keyed by an
+        // integer attribute's NAME, and a block's map holds every name its rows carry -- so
+        // at one block the index holds the union of the segment's names, and no block size
+        // shrinks that. A batch of `{"score_<uuid>": 1}` documents made the segment
+        // unwritable, and since the fold seals here too, every fold of the tenant failed.
+        // So when doubling ends without fitting, seal again WITHOUT zone maps, from the
+        // requested block size: a block with no map is always read (`blocks_to_read`), which
+        // costs pruning and never a row. A segment that fits is sealed exactly as before.
+        let requested = self.rows_per_block;
+        let idx = loop {
+            self.blocks.clear();
+            self.body = Enc::default();
+            self.rows = 0;
+            for chunk in docs.chunks(self.rows_per_block) {
+                self.seal(chunk);
+            }
+            let idx = self.encode_index();
+            if idx.len() <= target {
+                break idx;
+            }
+            if self.blocks.len() <= 1 {
+                if !self.zone_maps {
+                    break idx;
+                }
+                self.zone_maps = false;
+                self.rows_per_block = requested;
+                continue;
+            }
+            self.rows_per_block = self.rows_per_block.saturating_mul(2);
+        };
+
+        let mut out = self.body;
+        for (id, body) in &bodies {
+            dir.push((*id, out.len() as u64, body.len() as u64));
+            out.raw(body);
+        }
+        let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
+        for (section, bytes) in &self.extra {
+            if bytes.is_empty() {
+                continue;
+            }
+            dir.push((*section, out.len() as u64, bytes.len() as u64));
+            out.raw(bytes);
+        }
+        for (id, bytes) in &self.raw_extra {
+            if bytes.is_empty() {
+                continue;
+            }
+            raw_dir.push((*id, out.len() as u64, bytes.len() as u64));
+            out.raw(bytes);
+        }
+
         let meta_offset = out.len() as u64;
         // These live inside the meta region, so their offsets are not known until the
         // directory's own length is. Pushed last, in this order, and patched below.
@@ -476,7 +522,6 @@ impl SegmentWriter {
         // sound. It is also why the field names went into their own section rather than
         // into the entries: a variable-length name would make this patch land in the wrong
         // slot and corrupt silently rather than fail.
-        const ENTRY: usize = 2 + 8 + 8;
         let mut at = meta_offset + meta.len() as u64;
         for (n, (_, bytes)) in inline.iter().enumerate() {
             let entry = 4 + (dir.len() - inline.len() + n) * ENTRY + 2;
@@ -493,6 +538,11 @@ impl SegmentWriter {
         // loop above can only shrink the BLOCK index; the directory and the Fields table
         // grow with the field count and it cannot help with those. Past that point a cold
         // open silently costs a second round trip — and every query built on it a fourth.
+        debug_assert_eq!(
+            meta.len(),
+            overhead + idx.len(),
+            "the overhead above is wrong"
+        );
         let fits = meta.len() <= self.index_budget;
 
         let meta_len = meta.len() as u32;

@@ -46,6 +46,10 @@ PUT /v1/indexes/acme_docs/documents
         "cost": { "blob_writes": 1, "blob_reads": 0 } }
 ```
 
+⚠️ **M9a:** `attributes` shipped as written here, `text` included. The query side speaks
+turbopuffer's names instead — `include_attributes` (`true`, `false` or names) and
+`exclude_attributes` — because M9 is parity with it ([turbopuffer-api-parity.md](turbopuffer-api-parity.md)).
+
 `read_token` is the handle for read-your-writes; `cost` makes request amplification visible to
 the caller, which is both honest and a differentiator.
 

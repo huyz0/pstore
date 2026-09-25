@@ -2,7 +2,7 @@
 
 use crate::fuse::{Fusion, Hit, fuse};
 use pstore_blob::{BlobStore, Key};
-use pstore_format::{FormatError, Segment};
+use pstore_format::{Document, FormatError, Segment};
 use pstore_index::sparse::SparseIndex;
 use pstore_index::text::{Stats, TextIndex};
 use pstore_index::vec_index::{self, VecIndex};
@@ -223,26 +223,30 @@ async fn run<S: BlobStore>(
 /// already reads — and that is a decision about what a segment stores, recorded in the
 /// backlog rather than made here.
 ///
+/// ⚠️ **And each hit's attributes, from the same round** (M9a). The blocks that resolve the
+/// ids carry the attributes, so they are kept rather than decoded and dropped; each document
+/// has an empty `vectors`. This replaced `query_ids`, whose last caller it was.
+///
 /// # Errors
 /// As [`query`], plus a block that cannot be read or decoded.
-pub async fn query_ids<S: BlobStore>(
+pub async fn query_rows<S: BlobStore>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
     fusion: Fusion,
     top_k: usize,
-) -> Result<Vec<(Hit, Option<String>)>, QueryError> {
+) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
     let (hits, opened) = run(store, targets, prefetch, fusion, top_k).await?;
-    resolve_ids(store, targets, &opened, &hits).await
+    resolve_rows(store, targets, &opened, &hits).await
 }
 
-/// The ids for `hits`, one fan-out round over the segments that carry them.
-async fn resolve_ids<S: BlobStore>(
+/// The rows for `hits`, one fan-out round over the segments that carry them.
+async fn resolve_rows<S: BlobStore>(
     store: &S,
     targets: &[Target],
     opened: &[Opened],
     hits: &[Hit],
-) -> Result<Vec<(Hit, Option<String>)>, QueryError> {
+) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
     let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
     for h in hits {
@@ -257,18 +261,18 @@ async fn resolve_ids<S: BlobStore>(
             let (Some(t), Some(o)) = (targets.get(*segment), opened.get(*segment)) else {
                 return Ok::<_, QueryError>((*segment, Vec::new()));
             };
-            let ids = o.segment.ids_at(store, &t.segment, rows).await?;
-            Ok((*segment, rows.iter().copied().zip(ids).collect::<Vec<_>>()))
+            let docs = o.segment.rows_at(store, &t.segment, rows).await?;
+            Ok((*segment, rows.iter().copied().zip(docs).collect::<Vec<_>>()))
         },
     ))
     .await?;
 
-    let mut by_hit: std::collections::BTreeMap<(usize, usize), String> =
+    let mut by_hit: std::collections::BTreeMap<(usize, usize), Document> =
         std::collections::BTreeMap::new();
     for (segment, pairs) in resolved {
-        for (row, id) in pairs {
-            if let Some(id) = id {
-                by_hit.insert((segment, row), id);
+        for (row, doc) in pairs {
+            if let Some(doc) = doc {
+                by_hit.insert((segment, row), doc);
             }
         }
     }
