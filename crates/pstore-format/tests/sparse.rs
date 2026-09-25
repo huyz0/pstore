@@ -928,3 +928,38 @@ fn f16_encodes_the_nearest_representable_value() {
     }
     assert!(checked > 100_000, "only {checked} values were checked");
 }
+
+#[tokio::test]
+async fn a_vectors_section_too_narrow_for_a_row_does_not_displace_the_postings() {
+    // A scan asks for its blocks, the vector rows, and the postings in ONE call and finds the
+    // postings by position. A `Vectors` section narrower than a row (here 2 bytes over 20
+    // rows) has a row width of 0; asking for its rows anyway would add empty ranges, which
+    // the store neither fetches nor returns, and the postings would be read one slot late.
+    let docs = corpus(20, 30, 4);
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let scan = |vectors: Option<Vec<u8>>| {
+        let (docs, p) = (docs.clone(), p.section.clone());
+        let dict = sparse::build(&docs, FIELD, ImpactEncoding::U8).dictionary;
+        async move {
+            let mut w = SegmentWriter::new(8);
+            for d in &docs {
+                w.push(d.clone());
+            }
+            let mut w = w.with_section(Section::SparsePostings, p);
+            if let Some(v) = vectors {
+                w = w.with_section(Section::Vectors, v);
+            }
+            let s = MemoryStore::new();
+            let key = Key::new("t/idx/seg");
+            s.put(&key, w.try_finish().unwrap()).await.unwrap();
+            s.put(&sparse::dict_key(&key), bytes::Bytes::from(dict))
+                .await
+                .unwrap();
+            let seg = Segment::open(&s, &key).await.unwrap();
+            seg.scan(&s, &key, None).await
+        }
+    };
+    let plain = scan(None).await.unwrap();
+    assert_eq!(plain.len(), docs.len());
+    assert_eq!(scan(Some(vec![0u8; 2])).await.unwrap(), plain);
+}

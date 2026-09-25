@@ -444,7 +444,13 @@ impl Segment {
         let Some(span) = self.section(Section::Vectors) else {
             return Ok(BTreeMap::new());
         };
-        if per_row == 0 || rows.is_empty() {
+        // Two returns, not one `||`: a row width of 0 must never reach `get_ranges`, whose
+        // empty ranges are neither fetched nor RETURNED, so a store that pairs results with
+        // requests by position would misplace them. No rows is simply nothing to fetch.
+        if per_row == 0 {
+            return Ok(BTreeMap::new());
+        }
+        if rows.is_empty() {
             return Ok(BTreeMap::new());
         }
         let mut wanted: Vec<usize> = rows.to_vec();

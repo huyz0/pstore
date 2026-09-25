@@ -1,0 +1,35 @@
+# the final tree: every pstore-format mutant against its own tests (--check '^crates/pstore-format/src/' --test-workspace=false --test-package pstore-format), then its pstore-format survivors against every package that can see the crate
+MISSED   crates/pstore-format/src/lib.rs:193:5: replace check_storable -> Result<(), FormatError> with Ok(())
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![]
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![0]
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![1]
+MISSED   crates/pstore-format/src/docs.rs:110:5: replace decode_docs -> Result<Vec<Document>, FormatError> with Ok(vec![])
+MISSED   crates/pstore-format/src/docs.rs:112:16: replace != with == in decode_docs
+MISSED   crates/pstore-format/src/docs.rs:121:34: replace << with >> in decode_docs
+MISSED   crates/pstore-format/src/docs.rs:125:33: replace == with != in decode_docs
+MISSED   crates/pstore-format/src/reader.rs:489:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![])
+MISSED   crates/pstore-format/src/reader.rs:489:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![]])
+MISSED   crates/pstore-format/src/reader.rs:489:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![0.0]])
+MISSED   crates/pstore-format/src/reader.rs:489:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![1.0]])
+MISSED   crates/pstore-format/src/reader.rs:489:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![-1.0]])
+MISSED   crates/pstore-format/src/reader.rs:492:22: replace == with != in Segment::vectors
+MISSED   crates/pstore-format/src/reader.rs:495:33: replace / with % in Segment::vectors
+MISSED   crates/pstore-format/src/reader.rs:495:33: replace / with * in Segment::vectors
+MISSED   crates/pstore-format/src/sparse.rs:274:9: replace Dictionary::is_empty -> bool with true
+MISSED   crates/pstore-format/src/text.rs:53:5: replace encode_norms -> Vec<u8> with vec![0]
+MISSED   crates/pstore-format/src/text.rs:53:5: replace encode_norms -> Vec<u8> with vec![1]
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with None
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with Some(0)
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with Some(1)
+MISSED   crates/pstore-format/src/text.rs:63:17: replace * with + in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:17: replace * with / in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:30: replace + with - in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:30: replace + with * in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:26: replace * with + in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:26: replace * with / in norm_at
+MISSED   crates/pstore-format/src/text.rs:263:9: replace TermDict::total_tokens -> u64 with 0
+MISSED   crates/pstore-format/src/text.rs:275:9: replace TermDict::is_empty -> bool with true
+MISSED   crates/pstore-format/src/text.rs:280:9: replace TermDict::terms -> impl Iterator<Item =&str> with ::std::iter::empty()
+758 mutants tested in 21m: 47 missed, 662 caught, 49 unviable
+# re-check of those 31:
+31 mutants tested in 19m: 31 caught

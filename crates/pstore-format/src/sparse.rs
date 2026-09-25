@@ -310,7 +310,8 @@ impl Dictionary {
 ///
 /// ⚠️ Rows first and impacts second, not interleaved, so a decoder that knows the count can
 /// find both halves without a per-posting length. `max` scales `U8` and is ignored by every
-/// other encoding.
+/// other encoding. For `U8` it must be the list's largest `|w|`, as `build` computes it: a
+/// smaller one, zero included, saturates rather than being treated as "no scale".
 pub fn write_list(out: &mut Vec<u8>, list: &[(u32, f32)], encoding: ImpactEncoding, max: f32) {
     let mut prev = 0u32;
     for (row, _) in list {
@@ -392,19 +393,20 @@ fn get_varint(raw: &[u8], at: usize) -> Option<(u64, usize)> {
     clippy::cast_possible_truncation,
     reason = "the quantization is the point; the bound is asserted"
 )]
-/// ⚠️ **Two mutants here are equivalent, and both are recorded rather than chased.**
-/// `max > 0.0` against `max >= 0.0`: the only input that reaches the difference is a term
-/// whose largest magnitude is zero, which means every impact in it is zero, and `0.0 / 0.0`
-/// casts to `0` — the same byte the guard produces. `+ 128` against `- 128`: the value is in
-/// `-127..=127` and the two differ by 256, which is nothing in a `u8`. A mutation score short
-/// by two with no explanation is a score the next reader re-investigates.
+/// ⚠️ **No guard on `max`, and no wrapping cast** — each had an equivalent mutant, now
+/// written out of existence (M8m). A term whose largest magnitude is zero has only zero
+/// impacts, and `0.0 / 0.0` is NaN, which Rust's saturating cast makes `0`: the byte the
+/// `max > 0.0` guard produced, so `>=` changed nothing. And `v + 128` with `v` in
+/// `-127..=127` always fits a `u8`, so it is converted rather than cast: `as u8` wrapped a
+/// `- 128` into the very same byte.
 fn put_impact(out: &mut Vec<u8>, w: f32, max: f32, encoding: ImpactEncoding) {
     match encoding {
         ImpactEncoding::U8 => {
             // ⚠️ Signed, centred on 128. Clamping negatives to zero would be a silent data
             // loss for any model that emits them, and costs nothing to avoid.
-            let scaled = if max > 0.0 { (w / max) * 127.0 } else { 0.0 };
-            out.push(((scaled.round() as i32).clamp(-127, 127) + 128) as u8);
+            let scaled = (w / max) * 127.0;
+            let v = (scaled.round() as i32).clamp(-127, 127);
+            out.push(u8::try_from(v + 128).unwrap_or(128));
         }
         ImpactEncoding::F16 => out.extend_from_slice(&f32_to_f16(w).to_le_bytes()),
         ImpactEncoding::F32 => out.extend_from_slice(&w.to_le_bytes()),
@@ -440,7 +442,8 @@ fn read_impact(b: &[u8], max: f32, encoding: ImpactEncoding) -> f32 {
 ///
 /// ⚠️ **Every `|` here has an equivalent `^` mutant**, and that is a property of the format
 /// rather than a gap in the tests: sign, exponent and significand occupy disjoint bits, so OR
-/// and XOR agree on every input that can reach them. `f16_encodes_the_nearest_representable_value`
+/// and XOR agree on every input that can reach them. Excluded by line and column in
+/// `.cargo/mutants.toml` (M8m). `f16_encodes_the_nearest_representable_value`
 /// covers the rest — it enumerates all 65,536 codes from the IEEE definition and checks
 /// 200,000 inputs against them, **exact midpoints included**, which is what killed the shift,
 /// mask and carry mutants that a handful of chosen values could not reach. The midpoints are

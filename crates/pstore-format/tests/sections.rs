@@ -230,3 +230,58 @@ async fn the_vector_section_starts_after_the_last_data_block() {
         vectors.start
     );
 }
+
+/// A document with an attribute and no vector field, so the body is its data blocks alone.
+fn plain(i: usize) -> Document {
+    let mut d = Document {
+        id: format!("p{i}"),
+        vectors: Default::default(),
+        attrs: Default::default(),
+    };
+    d.attrs.insert("n".to_owned(), Value::Int(i as i64));
+    d
+}
+
+#[tokio::test]
+async fn a_segment_is_its_data_blocks_its_index_and_its_footer() {
+    // Nothing between them and nothing after: the index is the meta region the footer
+    // points at, and the footer is what the suffix read has left over from the budget.
+    let footer = pstore_format::SUFFIX_FETCH as usize - pstore_format::INDEX_BUDGET;
+    for n in [1usize, 50, 600] {
+        let mut w = SegmentWriter::new(16);
+        for i in 0..n {
+            w.push(plain(i));
+        }
+        let bytes = w.finish();
+        let s = MemoryStore::new();
+        let key = Key::new("seg/exact");
+        s.put(&key, bytes.clone()).await.unwrap();
+        let seg = Segment::open(&s, &key).await.unwrap();
+        let index = pstore_format::index_section_len(&bytes).unwrap();
+        assert_eq!(
+            seg.data_end() as usize + index + footer,
+            bytes.len(),
+            "{n} rows: blocks end at {}, the index is {index} bytes",
+            seg.data_end()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_vectors_section_with_no_rows_reads_as_no_vectors() {
+    // `with_section` is public, so a segment can carry a `Vectors` section and no rows.
+    // Its row width is 0, not a division by zero, and asking for a row fetches nothing.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(7);
+    let ts = s.as_tenant(t);
+    let key = Key::new("seg/empty-vectors");
+    let bytes = SegmentWriter::new(16)
+        .with_section(Section::Vectors, vec![0u8; 16])
+        .finish();
+    ts.put(&key, bytes).await.unwrap();
+    let seg = Segment::open(&ts, &key).await.unwrap();
+    let before = s.count(t, pstore_blob::OpClass::Read);
+    assert!(seg.vector_rows(&ts, &key, &[0]).await.unwrap().is_empty());
+    assert!(seg.scan(&ts, &key, None).await.unwrap().is_empty());
+    assert_eq!(s.count(t, pstore_blob::OpClass::Read) - before, 0);
+}

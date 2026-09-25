@@ -1,0 +1,27 @@
+# the 55 pstore-format names MISSED in crate-only.txt, re-run with every test package that can see pstore-format (./scripts/mutants.sh --check <those names> --file 'crates/pstore-format/src/*.rs'), on 1444317
+MISSED   crates/pstore-format/src/lib.rs:145:5: replace index_section_len -> Option<usize> with Some(1)
+MISSED   crates/pstore-format/src/lib.rs:145:5: replace index_section_len -> Option<usize> with Some(0)
+MISSED   crates/pstore-format/src/reader.rs:346:9: replace Segment::data_end -> u64 with 0
+MISSED   crates/pstore-format/src/reader.rs:346:9: replace Segment::data_end -> u64 with 1
+MISSED   crates/pstore-format/src/reader.rs:382:35: replace match guard rows > 0 with true in Segment::vector_row_len
+MISSED   crates/pstore-format/src/reader.rs:382:40: replace > with >= in Segment::vector_row_len
+MISSED   crates/pstore-format/src/reader.rs:447:25: replace || with && in Segment::vector_rows
+MISSED   crates/pstore-format/src/reader.rs:591:82: replace > with >= in Segment::scan
+MISSED   crates/pstore-format/src/sparse.rs:406:33: replace > with >= in put_impact
+MISSED   crates/pstore-format/src/sparse.rs:407:64: replace + with - in put_impact
+MISSED   crates/pstore-format/src/sparse.rs:464:30: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:464:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:468:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:475:22: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:484:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:492:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:494:31: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:494:10: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:508:39: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:508:18: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:510:36: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:510:22: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:511:46: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:511:19: replace | with ^ in f16_to_f32
+Found 55 mutants to test
+55 mutants tested in 38m: 24 missed, 31 caught

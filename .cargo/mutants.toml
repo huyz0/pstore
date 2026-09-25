@@ -55,4 +55,12 @@ exclude_re = [
     # rotation without its flips is still orthogonal, which recall cannot see. Named by line and
     # column, so an edit that moves it makes it reappear as MISSED. (M8k)
     'pstore-index/src/rabitq\.rs:293:23: replace \* with / in Quantizer::rotate',
+    # The binary16 conversions assemble sign, exponent and significand with `|`, and the three
+    # occupy disjoint bits on every path that reaches them, so `^` is the same value. No test
+    # can witness that -- an equivalent mutant has no failing input -- so none backs it; what
+    # pins the functions is `f16_encodes_the_nearest_representable_value` (all 65,536 codes,
+    # exact midpoints included) and `f16_round_trips_within_its_precision`. Named by line and
+    # column: a moved or NEW `|` reappears as MISSED rather than hiding under this line. (M8m)
+    'pstore-format/src/sparse\.rs:(467:21|467:30|471:21|478:22|487:21|495:21|497:10|497:31): replace \| with \^ in f32_to_f16$',
+    'pstore-format/src/sparse\.rs:(511:18|511:39|513:22|513:36|514:19|514:46): replace \| with \^ in f16_to_f32$',
 ]

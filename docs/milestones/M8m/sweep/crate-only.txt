@@ -1,0 +1,75 @@
+# pstore-format against its own tests, on 1444317: ./scripts/mutants.sh --check '^crates/pstore-format/src/' --test-workspace=false --test-package pstore-format
+# (the filter also admits a few other crates' struct-field deletions; only pstore-format names are re-checked)
+MISSED   crates/pstore-blob/src/object_store_backend.rs:141:13: delete field range from struct object_store::GetOptions expression in <impl crate::BlobStore for ObjectStoreBackend>::get_suffix
+MISSED   crates/pstore-catalog/src/bucket.rs:424:13: delete field graveyard from struct BucketHead expression in reap
+MISSED   crates/pstore-engine/src/head.rs:163:13: delete field epoch from struct Self expression in Head::decode
+MISSED   crates/pstore-engine/src/head.rs:164:13: delete field nonce from struct Self expression in Head::decode
+MISSED   crates/pstore-format/src/lib.rs:145:5: replace index_section_len -> Option<usize> with Some(0)
+MISSED   crates/pstore-format/src/lib.rs:145:5: replace index_section_len -> Option<usize> with Some(1)
+MISSED   crates/pstore-format/src/lib.rs:193:5: replace check_storable -> Result<(), FormatError> with Ok(())
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![]
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![0]
+MISSED   crates/pstore-format/src/docs.rs:74:5: replace encode_docs -> Vec<u8> with vec![1]
+MISSED   crates/pstore-format/src/docs.rs:110:5: replace decode_docs -> Result<Vec<Document>, FormatError> with Ok(vec![])
+MISSED   crates/pstore-format/src/docs.rs:112:16: replace != with == in decode_docs
+MISSED   crates/pstore-format/src/docs.rs:121:34: replace << with >> in decode_docs
+MISSED   crates/pstore-format/src/docs.rs:125:33: replace == with != in decode_docs
+MISSED   crates/pstore-format/src/reader.rs:346:9: replace Segment::data_end -> u64 with 0
+MISSED   crates/pstore-format/src/reader.rs:346:9: replace Segment::data_end -> u64 with 1
+MISSED   crates/pstore-format/src/reader.rs:382:35: replace match guard rows > 0 with true in Segment::vector_row_len
+MISSED   crates/pstore-format/src/reader.rs:382:40: replace > with >= in Segment::vector_row_len
+MISSED   crates/pstore-format/src/reader.rs:447:25: replace || with && in Segment::vector_rows
+MISSED   crates/pstore-format/src/reader.rs:483:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![])
+MISSED   crates/pstore-format/src/reader.rs:483:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![]])
+MISSED   crates/pstore-format/src/reader.rs:483:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![0.0]])
+MISSED   crates/pstore-format/src/reader.rs:483:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![1.0]])
+MISSED   crates/pstore-format/src/reader.rs:483:9: replace Segment::vectors -> Result<Vec<Vec<f32>>, FormatError> with Ok(vec![vec![-1.0]])
+MISSED   crates/pstore-format/src/reader.rs:486:22: replace == with != in Segment::vectors
+MISSED   crates/pstore-format/src/reader.rs:489:33: replace / with % in Segment::vectors
+MISSED   crates/pstore-format/src/reader.rs:489:33: replace / with * in Segment::vectors
+MISSED   crates/pstore-format/src/reader.rs:591:82: replace > with >= in Segment::scan
+MISSED   crates/pstore-format/src/sparse.rs:274:9: replace Dictionary::is_empty -> bool with true
+MISSED   crates/pstore-format/src/sparse.rs:406:33: replace > with >= in put_impact
+MISSED   crates/pstore-format/src/sparse.rs:407:64: replace + with - in put_impact
+MISSED   crates/pstore-format/src/sparse.rs:464:30: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:464:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:468:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:475:22: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:484:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:492:21: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:494:31: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:494:10: replace | with ^ in f32_to_f16
+MISSED   crates/pstore-format/src/sparse.rs:508:39: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:508:18: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:510:36: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:510:22: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:511:46: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/sparse.rs:511:19: replace | with ^ in f16_to_f32
+MISSED   crates/pstore-format/src/text.rs:53:5: replace encode_norms -> Vec<u8> with vec![0]
+MISSED   crates/pstore-format/src/text.rs:53:5: replace encode_norms -> Vec<u8> with vec![1]
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with None
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with Some(0)
+MISSED   crates/pstore-format/src/text.rs:63:5: replace norm_at -> Option<u32> with Some(1)
+MISSED   crates/pstore-format/src/text.rs:63:17: replace * with + in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:17: replace * with / in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:30: replace + with - in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:30: replace + with * in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:26: replace * with + in norm_at
+MISSED   crates/pstore-format/src/text.rs:63:26: replace * with / in norm_at
+MISSED   crates/pstore-format/src/text.rs:263:9: replace TermDict::total_tokens -> u64 with 0
+MISSED   crates/pstore-format/src/text.rs:275:9: replace TermDict::is_empty -> bool with true
+MISSED   crates/pstore-format/src/text.rs:280:9: replace TermDict::terms -> impl Iterator<Item =&str> with ::std::iter::empty()
+MISSED   crates/pstore-index/src/rabitq.rs:213:13: delete field rotate from struct Self expression in Quantizer::without_rotation
+MISSED   crates/pstore-query/src/run.rs:470:40: delete field k from struct vec_index::Query expression in leg
+MISSED   crates/pstore-server/src/lib.rs:858:9: delete field backend from struct pstore_blob::Capabilities expression in s3_capabilities
+MISSED   crates/pstore-server/src/lib.rs:864:13: delete field cas from struct pstore_blob::Capabilities expression in s3_capabilities
+MISSED   crates/pstore-server/src/lib.rs:865:13: delete field create_if_absent from struct pstore_blob::Capabilities expression in s3_capabilities
+MISSED   crates/pstore-testkit/src/flaky.rs:134:13: delete field reads_fail from struct Self expression in Flaky::refusing_reads
+MISSED   crates/pstore-testkit/src/flaky.rs:143:13: delete field never_missing from struct Self expression in Flaky::never_missing
+MISSED   crates/pstore-testkit/src/flaky.rs:152:13: delete field always_contended from struct Self expression in Flaky::always_contended
+MISSED   crates/pstore-testkit/src/flaky.rs:165:13: delete field reads_fail_at from struct Self expression in Flaky::refusing_reads_at
+MISSED   crates/pstore-testkit/src/sweep.rs:286:17: delete field latency_min from struct pstore_blob::Faults expression in latency_sweep
+MISSED   crates/pstore-testkit/src/sweep.rs:287:17: delete field latency_max from struct pstore_blob::Faults expression in latency_sweep
+MISSED   crates/pstore-testkit/src/sweep.rs:322:17: delete field cas_lost from struct pstore_blob::Faults expression in cas_error_sweep
+Found 776 mutants to test
+776 mutants tested in 21m: 71 missed, 656 caught, 49 unviable
