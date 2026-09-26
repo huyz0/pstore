@@ -1284,9 +1284,6 @@ impl<S: BlobStore> Engine<S> {
         }))
     }
 
-    /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
-    /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
-    /// than a prune this engine already did changes nothing.
     /// What this process has flushed and nobody is yet known to have folded (M9i.1): the
     /// oldest batch's instant and the bundles' total size. **Issues no request.**
     ///
@@ -1308,6 +1305,9 @@ impl<S: BlobStore> Engine<S> {
         })
     }
 
+    /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
+    /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
+    /// than a prune this engine already did changes nothing.
     fn prune_to(&self, head: &Head) {
         let _ = self.mem().prune(self.watermark(head));
     }

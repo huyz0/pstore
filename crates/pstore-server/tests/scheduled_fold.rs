@@ -342,6 +342,89 @@ async fn the_age_threshold_is_exact() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn age_is_measured_from_the_oldest_batch() {
+    // Code review: with one batch, oldest and newest are the same batch.
+    let w = world(2);
+    let (a, b) = (&w.apis[0], &w.apis[1]);
+    write(a, 42, &["x"], true).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    write(a, 42, &["y"], true).await;
+    let minute = policy(Duration::from_secs(60), MIB);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(a.fold_due(&minute).await.folded, 0);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        a.fold_due(&minute).await.folded,
+        1,
+        "aged from the newest batch"
+    );
+    assert_eq!(found(b, 42).await, ["x", "y"]);
+}
+
+#[tokio::test]
+async fn bytes_are_summed_across_batches_and_met_exactly() {
+    let w = world(1);
+    let a = &w.apis[0];
+    // A first write and fold, so the lane is registered and later writes bill only bundles.
+    write(a, 33, &["w"], true).await;
+    a.fold_due(&policy(NOW, MIB)).await;
+    let written = |w: &World| {
+        w.stores
+            .iter()
+            .map(|s| s.bytes(TenantId(33), OpClass::Write))
+            .sum::<u64>()
+    };
+    let before = written(&w);
+    write(a, 33, &["x"], true).await;
+    let one = written(&w) - before;
+    write(a, 33, &["y"], true).await;
+    let two = written(&w) - before;
+    assert!(one > 0 && two > one);
+    let at = |bytes| policy(HOUR, bytes);
+    assert_eq!(
+        a.fold_due(&at(two + 1)).await.folded,
+        0,
+        "one byte short folded"
+    );
+    assert_eq!(
+        a.fold_due(&at(two)).await.folded,
+        1,
+        "the exact total did not fold"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backoff_doubles_to_its_cap_and_resets() {
+    let w = world(1);
+    let a = &w.apis[0];
+    write(a, 62, &["x"], true).await;
+    *w.switch.fail.lock().unwrap() = Some("/tnt/62/HEAD".to_owned());
+    let p = FoldPolicy {
+        period: Duration::from_secs(1),
+        age: Duration::from_secs(8),
+        bytes: 1,
+    };
+    // Attempts at 0, 1, 3, 7, then every 8: 15, 23, 31, 39, 47, 55, 63.
+    let mut attempts = Vec::new();
+    for tick in 0..64 {
+        if a.fold_due(&p).await.failed == 1 {
+            attempts.push(tick);
+        }
+        tokio::time::advance(p.period).await;
+    }
+    assert_eq!(attempts, [0, 1, 3, 7, 15, 23, 31, 39, 47, 55, 63]);
+    // A success resets it: the next failure is retried one period later, not eight.
+    *w.switch.fail.lock().unwrap() = None;
+    tokio::time::advance(p.age).await;
+    assert_eq!(a.fold_due(&p).await.folded, 1);
+    write(a, 62, &["y"], true).await;
+    *w.switch.fail.lock().unwrap() = Some("/tnt/62/HEAD".to_owned());
+    assert_eq!(a.fold_due(&p).await.failed, 1);
+    tokio::time::advance(p.period).await;
+    assert_eq!(a.fold_due(&p).await.failed, 1, "the backoff was not reset");
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_loop_folds_on_its_own_and_stops() {
     let w = world(2);
     let (a, b) = (Arc::clone(&w.apis[0]), Arc::clone(&w.apis[1]));
@@ -521,6 +604,14 @@ fn the_fold_policy_is_configured_or_refused() {
             bytes: 4096
         })
     );
+    // `off` does not excuse a bad value beside it.
+    let e = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_FOLD", "off"),
+        ("PSTORE_FOLD_AGE_S", "0"),
+    ]))
+    .unwrap_err();
+    assert!(e.to_string().contains("PSTORE_FOLD_AGE_S"), "{e}");
     for (var, value) in [
         ("PSTORE_FOLD_PERIOD_MS", "0"),
         ("PSTORE_FOLD_AGE_S", "-1"),
@@ -540,10 +631,12 @@ async fn the_fold_duty_tells_the_truth() {
     let text = b.to_string();
     assert!(!text.contains("read on every query"), "{text}");
     assert!(text.contains("scheduled"), "{text}");
+    assert!(text.contains("died or restarted"), "{text}");
     let deploy =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/deploy.md"))
             .unwrap();
     assert!(!deploy.contains("read on every query"));
+    assert!(deploy.contains("only writer died, or restarted"));
     for var in [
         "PSTORE_FOLD_PERIOD_MS",
         "PSTORE_FOLD_AGE_S",

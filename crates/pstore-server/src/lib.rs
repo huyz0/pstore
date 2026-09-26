@@ -268,7 +268,10 @@ impl<S: BlobStore + 'static> Api<S> {
                         .get(&tenant)
                         .map_or(policy.period, |(_, d)| d.saturating_mul(2))
                         .min(policy.age);
-                    backoff.insert(tenant, (tokio::time::Instant::now() + delay, delay));
+                    // `checked_add`: an absurd configured age must not panic the loop dead.
+                    let now = tokio::time::Instant::now();
+                    let until = now.checked_add(delay).unwrap_or(now + policy.period);
+                    backoff.insert(tenant, (until, delay));
                 }
             }
         }
@@ -1759,9 +1762,9 @@ impl Config {
 /// The scheduled fold's policy from the environment (M9i.1). Unset is the default; anything
 /// that is not a positive integer, or a `PSTORE_FOLD` other than `off`, is refused by name.
 fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolicy>, ConfigError> {
-    match get("PSTORE_FOLD").as_deref() {
-        None => {}
-        Some("off") => return Ok(None),
+    let on = match get("PSTORE_FOLD").as_deref() {
+        None => true,
+        Some("off") => false,
         Some(other) => {
             return Err(ConfigError::Fold(
                 "PSTORE_FOLD",
@@ -1769,7 +1772,7 @@ fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolic
                 "unset, or off to leave folding to the operator",
             ));
         }
-    }
+    };
     let positive = |var: &'static str| -> Result<Option<u64>, ConfigError> {
         get(var)
             .map(|v| {
@@ -1781,12 +1784,14 @@ fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolic
             .transpose()
     };
     let d = FoldPolicy::default();
-    Ok(Some(FoldPolicy {
+    // Validated even when `off` (code review): a bad value is refused, never ignored.
+    let policy = FoldPolicy {
         period: positive("PSTORE_FOLD_PERIOD_MS")?
             .map_or(d.period, std::time::Duration::from_millis),
         age: positive("PSTORE_FOLD_AGE_S")?.map_or(d.age, std::time::Duration::from_secs),
         bytes: positive("PSTORE_FOLD_BYTES")?.unwrap_or(d.bytes),
-    }))
+    };
+    Ok(on.then_some(policy))
 }
 
 /// Runs [`Api::fold_due`] every `policy.period` until `stop` resolves (M9i.1).
