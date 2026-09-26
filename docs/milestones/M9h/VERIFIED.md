@@ -95,3 +95,67 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
      missed**.
    - Code review: one round, pass, with one minor, taken.
    - `./scripts/gates.sh` on the committed tree: all fifteen PASS.
+
+## M9h.3 — `datetime`
+
+⚠️ **Rebuilt twice after container restarts.** Each restart restored an older snapshot and
+lost the uncommitted change. It was rebuilt from the same edits, and every result below that
+names this tree was re-run on it. The "observed red" notes record the first copy, and each is
+a test that this tree also carries.
+
+1. **Round trip** — `datetimes_come_back_in_utc` (`cargo test -p pstore-server --test
+   datetime`), unfolded and folded, covers:
+   - `Z` and `+02:00`, the latter rendered in UTC, and a 6-digit fraction;
+   - `.500` rendered as `.5`;
+   - an array, and `[]`;
+   - the leap days `2024-02-29` and `2000-02-29`, the latter written with a `-00:00` offset;
+   - a zero-padded year `0001`;
+   - an undeclared string, which stays a string.
+   `a_datetime_round_trips_and_its_range_is_enforced` (`cargo test -p pstore-format --test
+   typed_values`) checks the result is version 2. The strict parser has its own unit tests,
+   including every day of 1600 to 2000 (`cargo test -p pstore-format --lib datetime`).
+   **Observed red** on the M9h.2 server, where `schema` was ignored and the offset form came
+   back as written, as did every test in the file.
+2. **Comparison** — `a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes`,
+   unfolded and folded:
+   - `Gte` admits the datetimes and, bytewise, the plain string;
+   - `Lt` and `Eq` with offset literals compare by instant, and `Eq` does not match the
+     string whose text differs;
+   - a non-date literal admits nothing;
+   - `Eq 5` admits only the number;
+   - `In`, and `Contains` over an array of datetimes, both work.
+3. **Pruning pays** — `a_datetime_column_prunes_its_blocks`: `Lt` over 2,000 hourly datetimes
+   reads at most a quarter of the unprunable `Not(Gte)`. **Observed red** (96,565 bytes each)
+   while `schema` was ignored. `a_string_literal_prunes_a_datetime_zone_at_its_exact_edges`
+   (`cargo test -p pstore-query --lib filter`) pins each operator's prune and keep edges,
+   `holds_string`, and a missing entry. It was added at code review, because the soundness
+   harness below sees rows lost but never blocks kept.
+4. **Pruning is sound** — `cargo test -p pstore-query --test datetime_pruning` covers:
+   - four segments: flag `2`, zone-free (found by lowering the budget), flag `1`, and
+     version 1;
+   - the block layouts the spec lists;
+   - RFC 3339 ids, and an engine-written attribute named `id` holding a datetime;
+   - each operator and its negation, `In` and `ContainsAny`, on `t` and on `id`, over
+     datetimes, their microsecond neighbours, offset forms, non-date strings and numbers.
+   With the `id` guard removed from `could_admit`, two of the four tests went red.
+   `a_dated_index_is_framed_exactly` (`cargo test -p pstore-format --lib reader`) pins flag
+   2's framing: a string mark of 0 or 1 only, and nothing after the table.
+5. **rank_by order** — `rank_by_puts_datetimes_between_numbers_and_strings`, unfolded and
+   folded, with two datetimes whose instant order reverses their text order. **Observed red**:
+   they sorted as strings.
+6. **Refusals** — `what_is_not_a_datetime_is_refused`: the fifteen values the spec lists, plus
+   an array holding a date without a time; and a `schema` of `int`, `[]datetime`, an unused
+   name, `text`, or a non-object. The parser also accepts the offset bounds `±23:59`.
+   `a_datetime_round_trips_and_its_range_is_enforced` checks that `check_storable` refuses one
+   microsecond outside either bound, scalar or in an array. `a_datetime_literal_compares_by_instant`
+   covers the engine API's datetime literal.
+7. **Bytes kept** — `a_segment_without_floats_keeps_its_bytes` still holds its f17fdd7 hash.
+   `a_typed_segment_without_datetimes_keeps_its_bytes` pins a float and bool segment's hash,
+   **recorded on 25e43b5** in a worktree of that commit.
+8. **Gates** — code review of this tree: pass, with three minors. The flag-2 framing test is
+   added. The `text` refusal branch is redundant with the unused-name rule and is kept. The
+   literal re-parsed per row is a cost, not a defect. `./scripts/gates.sh` on this tree: see
+   the commit. `./scripts/mutants.sh` over the diff: NOT-RUN on this tree yet. It ran on the
+   first copy (323 tested, 307 caught, 15 unviable, 1 missed, the datetime-literal arm, since
+   tested), and two restarts cut the re-runs short. The re-run's result is added when it
+   finishes, before this lands on `main`.

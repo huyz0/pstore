@@ -45,6 +45,11 @@ fn encode_value(e: &mut Enc, v: &Value) {
             e.u8(3);
             e.u8(u8::from(*b));
         }
+        // M9h.3: microseconds since the epoch, UTC.
+        Value::DateTime(t) => {
+            e.u8(5);
+            e.i64(*t);
+        }
         // M9h.2: a count, then each element with its own tag.
         Value::Array(items) => {
             e.u8(4);
@@ -88,6 +93,7 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
             Value::Array(items)
         }
         4 => return Err(FormatError::Corrupt("an array inside an array")),
+        5 => Value::DateTime(d.i64()?),
         // A tag from a future version. Refused, not guessed: a mistyped attribute is
         // one a filter later reads as the wrong thing.
         _ => return Err(FormatError::Corrupt("unknown value tag")),

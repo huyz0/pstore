@@ -526,26 +526,40 @@ impl Segment {
         // M9h.1: a typed segment says whether its zone maps are on; if they are, a float table
         // per block follows, and every block's zones are complete.
         if version == crate::VERSION_TYPED {
-            match d.u8()? {
-                0 => {}
-                1 => {
-                    for b in &mut blocks {
-                        let n = d.u32()? as usize;
-                        for _ in 0..n {
-                            let k = d.string()?;
-                            b.zones.floats.insert(k, (d.f64()?, d.f64()?));
-                        }
-                        b.zones.complete = true;
+            let flag = d.u8()?;
+            if flag > 2 {
+                return Err(FormatError::Corrupt(
+                    "a zone-map flag that is not 0, 1 or 2",
+                ));
+            }
+            if flag >= 1 {
+                for b in &mut blocks {
+                    let n = d.u32()? as usize;
+                    for _ in 0..n {
+                        let k = d.string()?;
+                        b.zones.floats.insert(k, (d.f64()?, d.f64()?));
                     }
+                    b.zones.complete = true;
                 }
-                _ => {
-                    return Err(FormatError::Corrupt(
-                        "a zone-map flag that is neither 0 nor 1",
-                    ));
+            }
+            // M9h.3: the datetime table, per block, after the float tables.
+            if flag == 2 {
+                for b in &mut blocks {
+                    let n = d.u32()? as usize;
+                    for _ in 0..n {
+                        let k = d.string()?;
+                        let (lo, hi) = (d.i64()?, d.i64()?);
+                        let strings = match d.u8()? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(FormatError::Corrupt("a string mark neither 0 nor 1")),
+                        };
+                        b.zones.datetimes.insert(k, (lo, hi, strings));
+                    }
                 }
             }
             if !d.at_end() {
-                return Err(FormatError::Corrupt("bytes after the float zone table"));
+                return Err(FormatError::Corrupt("bytes after the zone tables"));
             }
         }
         Ok(blocks)
@@ -1021,6 +1035,46 @@ mod tests {
         e.0
     }
 
+    /// A flag-2 tail (M9h.3): one float zone, then one datetime entry with string `mark`.
+    fn dated(mark: u8, trailing: &[u8]) -> Vec<u8> {
+        let mut e = Enc::default();
+        e.u32(1);
+        e.u64(0);
+        e.u32(10);
+        e.u32(1);
+        e.u32(0);
+        e.u8(2);
+        e.u32(1);
+        e.bytes(b"x");
+        e.f64(-1.5);
+        e.f64(2.0);
+        e.u32(1);
+        e.bytes(b"t");
+        e.i64(-5);
+        e.i64(7);
+        e.u8(mark);
+        e.raw(trailing);
+        e.0
+    }
+
+    #[test]
+    fn a_dated_index_is_framed_exactly() {
+        // M9h.3, code review: the datetime table after the float tables, a mark of 0 or 1
+        // only, and nothing after it.
+        for (mark, strings) in [(0, false), (1, true)] {
+            let b = Segment::decode_index(&dated(mark, &[]), crate::VERSION_TYPED).unwrap();
+            assert!(b[0].zones.complete);
+            assert_eq!(b[0].zones.floats.get("x"), Some(&(-1.5, 2.0)));
+            assert_eq!(b[0].zones.datetimes.get("t"), Some(&(-5, 7, strings)));
+        }
+        for bad in [dated(2, &[]), dated(0, &[0])] {
+            assert!(matches!(
+                Segment::decode_index(&bad, crate::VERSION_TYPED),
+                Err(FormatError::Corrupt(_))
+            ));
+        }
+    }
+
     #[test]
     fn a_typed_index_is_framed_exactly() {
         // Spec review, m3: a flag that is neither 0 nor 1, or bytes after the tables, are
@@ -1030,7 +1084,7 @@ mod tests {
         assert_eq!(zoned[0].zones.floats.get("x"), Some(&(-1.5, 2.0)));
         let free = Segment::decode_index(&index(0, &[]), crate::VERSION_TYPED).unwrap();
         assert!(!free[0].zones.complete && free[0].zones.floats.is_empty());
-        for bad in [index(2, &[]), index(1, &[0]), index(0, &[0])] {
+        for bad in [index(3, &[]), index(1, &[0]), index(0, &[0])] {
             assert!(matches!(
                 Segment::decode_index(&bad, crate::VERSION_TYPED),
                 Err(FormatError::Corrupt(_))

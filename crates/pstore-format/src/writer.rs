@@ -190,7 +190,21 @@ impl SegmentWriter {
                             e.0 = e.0.min(*f);
                             e.1 = e.1.max(*f);
                         }
+                        Value::DateTime(t) => {
+                            let e = zones.datetimes.entry(k.clone()).or_insert((*t, *t, false));
+                            e.0 = e.0.min(*t);
+                            e.1 = e.1.max(*t);
+                        }
                         Value::Str(_) | Value::Bool(_) | Value::Array(_) => {}
+                    }
+                }
+            }
+            // M9h.3: whether each datetime name also holds a scalar string here -- the one
+            // fact that lets a string literal rule the block out.
+            for d in rows {
+                for (k, v) in &d.attrs {
+                    if let (Value::Str(_), Some(e)) = (v, zones.datetimes.get_mut(k)) {
+                        e.2 = true;
                     }
                 }
             }
@@ -225,8 +239,16 @@ impl SegmentWriter {
         // M9h.1: only a typed segment says whether its zone maps are on, and then carries a
         // float table per block -- so an untyped segment keeps its bytes. See
         // `Zones::complete` for what the flag lets a reader conclude.
+        //
+        // M9h.3: flag 2 when a block holds a scalar datetime zone, and then a datetime table per
+        // block after the float tables. Without one, flag 1 keeps M9h.1's bytes.
+        let dated = self.blocks.iter().any(|b| !b.zones.datetimes.is_empty());
         if self.typed {
-            idx.u8(u8::from(self.zone_maps));
+            idx.u8(match (self.zone_maps, dated) {
+                (false, _) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+            });
         }
         if self.typed && self.zone_maps {
             for b in &self.blocks {
@@ -235,6 +257,17 @@ impl SegmentWriter {
                     idx.bytes(k.as_bytes());
                     idx.f64(*lo);
                     idx.f64(*hi);
+                }
+            }
+        }
+        if self.typed && self.zone_maps && dated {
+            for b in &self.blocks {
+                idx.u32(b.zones.datetimes.len() as u32);
+                for (k, (lo, hi, strings)) in &b.zones.datetimes {
+                    idx.bytes(k.as_bytes());
+                    idx.i64(*lo);
+                    idx.i64(*hi);
+                    idx.u8(u8::from(*strings));
                 }
             }
         }
@@ -293,9 +326,12 @@ impl SegmentWriter {
     fn seal_segment(mut self) -> (Bytes, bool) {
         let docs = std::mem::take(&mut self.docs);
         self.typed = docs.iter().any(|d| {
-            d.attrs
-                .values()
-                .any(|v| matches!(v, Value::Float(_) | Value::Bool(_) | Value::Array(_)))
+            d.attrs.values().any(|v| {
+                matches!(
+                    v,
+                    Value::Float(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_)
+                )
+            })
         });
         // ⚠️ One set of sections per named field. Fields are taken in name order so the
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader

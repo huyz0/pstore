@@ -20,9 +20,9 @@ pub struct OrderBy {
 /// A row's place in the order, computed once.
 ///
 /// ⚠️ **Not `Value`'s own order reversed for `desc`.** The absent group sorts last in BOTH
-/// directions, and ties break on the id ascending in both: `asc` is bools, numbers, strings,
-/// arrays, absent; `desc` is arrays, strings, numbers, bools, absent, each group's values
-/// reversed. Arrays are never compared by content (M9h.2): among themselves they tie, and the
+/// directions, and ties break on the id ascending in both: `asc` is bools, numbers,
+/// datetimes, strings, arrays, absent; `desc` is arrays, strings, datetimes, numbers, bools,
+/// absent, each group's values reversed. Arrays are never compared by content (M9h.2): among themselves they tie, and the
 /// id decides.
 ///
 /// ⚠️ **Numbers are one group** (M9h.1): an int and a float interleave by exact value, and
@@ -42,12 +42,20 @@ impl Rank {
         } else {
             doc.attrs.get(&by.attr).cloned()
         };
-        let group = match (&value, by.desc) {
-            (Some(Value::Bool(_)), false) | (Some(Value::Array(_)), true) => 0,
-            (Some(Value::Int(_) | Value::Float(_)), false) | (Some(Value::Str(_)), true) => 1,
-            (Some(Value::Str(_)), false) | (Some(Value::Int(_) | Value::Float(_)), true) => 2,
-            (Some(Value::Array(_)), false) | (Some(Value::Bool(_)), true) => 3,
-            (None, _) => 4,
+        // Ascending: bools, numbers, datetimes (M9h.3), strings, arrays; descending reverses
+        // the groups. Absent is last both ways.
+        let group = match &value {
+            Some(Value::Bool(_)) => 0,
+            Some(Value::Int(_) | Value::Float(_)) => 1,
+            Some(Value::DateTime(_)) => 2,
+            Some(Value::Str(_)) => 3,
+            Some(Value::Array(_)) => 4,
+            None => 5,
+        };
+        let group = if by.desc && group < 5 {
+            4 - group
+        } else {
+            group
         };
         Self {
             desc: by.desc,
@@ -64,6 +72,7 @@ impl Ord for Rank {
             // Bytewise, as the `Gt` cursor compares (`filter.rs`).
             (Some(Value::Str(a)), Some(Value::Str(b))) => a.as_bytes().cmp(b.as_bytes()),
             (Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
+            (Some(Value::DateTime(a)), Some(Value::DateTime(b))) => a.cmp(b),
             (Some(a), Some(b)) => match (Number::of(a), Number::of(b)) {
                 // A NaN never reaches storage (`check_storable`), so `None` is unreachable.
                 (Some(a), Some(b)) => cmp_numbers(a, b).unwrap_or(Ordering::Equal),

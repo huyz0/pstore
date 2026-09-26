@@ -10,8 +10,8 @@
 - **M9h.2** — arrays of scalars, and `Contains`/`ContainsAny`. Specified when M9h.1 lands.
 - **M9h.3** — `datetime`. JSON has no datetime, so an RFC 3339 string is a datetime only if
   something *declares* it. **There is no attribute schema today**: M7d's schema is the vector
-  width, text field and metric, and M9a stores each value's type with the value. Declaring
-  one is new HEAD state, so it gets its own task, specified when M9h.2 lands.
+  width, text field and metric, and M9a stores each value's type with the value. So a write
+  declares its datetimes itself, per request, and the value carries the type (see M9h.3).
 
 Until each lands, what it adds stays `400 bad_request`, as today.
 
@@ -275,6 +275,192 @@ Unchanged. An array adds no request and no depth, and costs only its own bytes i
 - Arrays may mix types, where turbopuffer's are homogeneous. M9h.3's declared types will
   have to say what happens to a mixed array already stored under a name declared `[]T` (m7).
 
-## M9h.3 — `datetime`, declared
+## M9h.3 — `datetime`
 
-To be specified when M9h.2 lands.
+### Delta
+
+⚠️ **Declared per request, typed per value.** pstore has no attribute schema: a value carries
+its own type (M9a, M9h.1, M9h.2). A datetime keeps that model.
+- A write names which of its attributes are datetimes, and each such value is stored as one.
+- Nothing is recorded in HEAD. A later write that omits the declaration stores a plain
+  string, exactly as a later write of `1.5` under a name that held `1` stores a float.
+- turbopuffer's schema is fixed per attribute. Matching that is persistent HEAD state, bound
+  into the WAL with the write that declares it. That is out of scope here, and stated as such.
+
+**Values.**
+- `Value` gains `DateTime(i64)`: microseconds since 1970-01-01T00:00:00Z, in UTC, with codec
+  tag `5`. A segment holding one is typed (`VERSION = 2`).
+- It is a scalar, so it may be an array element.
+- Structurally, it orders after arrays.
+- The range is `0000-01-01` to `9999-12-31`; anything outside is refused by
+  `check_storable`.
+
+**Writing.**
+- A write may carry `"schema": {"<attr>": "datetime", ..}`.
+- `datetime` is the only type accepted there. Each of these is `400`:
+  - any other type, turbopuffer's `[]datetime` included;
+  - a name the batch's attributes never use, or the text field;
+  - a `schema` that is not an object.
+- Under a declared name, each value is an RFC 3339 string or an array of them. `[]` is an
+  empty array. Anything else is `400`, naming the document and attribute.
+- **The one parser** (spec review, M2). Both a write and a filter literal go through it: a
+  string is a datetime if and only if this accepts it.
+  - The exact form is `YYYY-MM-DDTHH:MM:SS`, then an optional `.` followed by 1 to 6
+    digits, then `Z` or `±HH:MM`.
+  - `T` and `Z` are uppercase. There is no space separator. Seconds run 00–59, so a leap
+    second is refused. Days are checked against the month, with leap years by the Gregorian
+    rule.
+  - Offset hours run 00–23 and offset minutes 00–59. `-00:00` is accepted as UTC.
+  - A `.` with no digits is refused.
+  - The value is converted to UTC, and the year must then lie in `0000`–`9999`. So
+    `9999-12-31T23:59:59-01:00` and `0000-01-01T00:00:00+01:00` are refused.
+- A datetime comes back as `YYYY-MM-DDTHH:MM:SS[.f]Z` in UTC.
+  - The year is always four digits, zero-padded.
+  - The fraction is given only when it is non-zero, with trailing zeros removed.
+  - So `2024-05-01T14:30:00+02:00` comes back as `2024-05-01T12:30:00Z`: the same instant,
+    not the same text.
+
+**Filters.**
+- A string literal compared with a datetime row is read as RFC 3339, and compared by
+  instant. That holds for `Eq`, `Lt`, `Lte`, `Gt`, `Gte`, `In`, `Contains` and
+  `ContainsAny`. A literal that is not RFC 3339 is false against a datetime row.
+- A string literal compared with a string row is compared bytewise, as today. That holds
+  even if it looks like a date, so a string attribute's behaviour does not change.
+- A number against a datetime row is false.
+
+**Zone maps.** A datetime is pruned by its instant.
+- **Flag `2`.** The M9h.1 flag gains the value `2`: zone maps are on, and per block the float
+  table is followed by a datetime table.
+  - It is written only when the segment holds a **scalar** datetime **and** zone maps are on.
+  - A segment whose datetimes are all inside arrays has no datetime entry to write, so it
+    keeps flag `1`.
+  - A zone-free datetime segment writes `0`, and a typed segment without a datetime still
+    writes `1` with M9h.1's bytes.
+- **The datetime table** has one entry per name that holds a **scalar** datetime in the
+  block: `(min, max, holds_string)`. The first two are microseconds; `holds_string` says
+  whether the name also holds a scalar string in that block. (Spec review, minor 2: this
+  replaces a table of every string name per block, at a fraction of the cost.)
+- **Scalars only** (spec review, M1). Zones cover scalar values only, as M9h.2's do, and
+  `Contains`, `ContainsAny` and their negations never prune.
+- **Pruning a string literal `s` against a name.** A block is ruled out only under flag
+  `2`, and only when **all** of these hold:
+  - the name is not `id` (spec review, B1). The id is a string no zone describes, so an
+    `id` filter never prunes by a string, as today;
+  - the name has a datetime entry in the block. With no entry, no datetime row exists, but
+    whether a string does is unknown;
+  - the entry says the name holds no string, so no bytewise comparison can match;
+  - either `s` is not RFC 3339, so no datetime row matches either, or the entry's
+    `(min, max)` rules the instant out.
+- **Other segments.** Under flags `0` and `1`, and in `VERSION = 1` segments, a string
+  literal never prunes, as today. Numbers keep M9h.1's zones: a datetime row matches no
+  number.
+- **Old binaries.** A binary at M9h.1 or M9h.2 reads flag `2` as corrupt, so it fails at
+  open. A zone-free datetime segment (flag `0`) fails for it only at block decode, as
+  `unknown value tag`. Both are loud; neither is silent.
+- The legacy `pstore_format::Filter::could_match` answers `true` for a datetime literal.
+
+**rank_by.** Datetimes form their own group, ordered by instant:
+- ascending: bools, numbers, datetimes, strings, arrays, absent;
+- descending: arrays, strings, datetimes, numbers, bools, absent.
+
+**Does not change:** any request without a `schema` or a datetime; any segment without a
+datetime (bytes and flag); how string literals compare with string rows; the depth of any
+query.
+
+### Acceptance criteria
+
+1. **Round trip.** With `schema: {"t": "datetime"}`, these come back from both the memtable
+   and a fold:
+   - `2024-05-01T12:30:00Z` as written;
+   - `2024-05-01T14:30:00+02:00` as `2024-05-01T12:30:00Z`;
+   - `1999-12-31T23:59:59.123456Z` as written;
+   - `2024-05-01T12:30:00.500Z` as `2024-05-01T12:30:00.5Z`;
+   - the array `["2024-01-01T00:00:00Z"]` as written.
+   `2024-02-29T00:00:00Z` and `2000-02-29T00:00:00Z` are accepted, and `[]` under a declared
+   name. The same string written without a `schema` comes back as a plain string. A segment
+   holding a datetime is `VERSION = 2` with flag `2`.
+2. **Comparison.** Rows `a` = `2024-01-01T00:00:00Z`, `b` = `2024-06-01T00:00:00Z` and
+   `c` = `2025-01-01T00:00:00Z` are datetimes. Row `s` holds the plain string
+   `"2024-06-01T00:00:00Z"`, and row `n` holds `5`. Then:
+   - `Gte "2024-06-01T00:00:00Z"` admits `b`, `c` and `s`, the last bytewise.
+   - `Lt "2024-03-01T01:00:00+01:00"` admits `a` only, compared by instant.
+   - `Eq "2024-06-01T02:00:00+02:00"` admits `b` only: `s` does not match that text.
+   - `Gt "not a date"` admits nothing: it is not RFC 3339, so no datetime row matches, and
+     `s` sorts before it bytewise.
+   - `Eq 5` admits `n` only.
+   - `In ["2024-01-01T00:00:00Z"]` admits `a`, and so does `ContainsAny` over an array row
+     holding it.
+3. **Pruning pays.** 2,000 rows `t_i` = `2024-01-01T00:00:00Z` + `i` hours are folded. A
+   rank_by over `t` filtered by `Lt "2024-01-03T16:00:00Z"` reads at most a quarter of the
+   bytes of the unprunable `Not(Gte ...)`.
+4. **Pruning is sound.** One name holds datetimes, strings (some RFC 3339, some not), ints and
+   arrays of datetimes, across blocks. The ids are themselves RFC 3339 strings.
+   - Four segments are tested:
+     - flag `2`;
+     - zone-free, forced by the index budget as in M9h.1;
+     - a flag-`1` segment of the same rows minus the datetimes and the arrays of them;
+     - a `VERSION = 1` segment of the strings and ints alone.
+   - The flag-`2` segment includes:
+     - a block where the name is held only by arrays of datetimes;
+     - a block where an array element lies outside the block's scalar datetime zone;
+     - a block where a date-like string lies outside the block's datetime zone;
+     - a block with datetimes and no string.
+   - The predicates are each operator and its negation, `In` and `ContainsAny`, on the name
+     and on `id`.
+   - The literals include the datetimes, their neighbours by one microsecond, RFC 3339
+     strings with offsets, and non-date strings.
+   In every segment, the rows through the zones equal brute-force `admits`.
+5. **rank_by order.** Two datetimes are chosen so their instant order is the reverse of
+   their text order: `d24` = `2024-01-01T00:00:00+05:00` (19:00 UTC on the 31st) and
+   `d23` = `2023-12-31T20:00:00Z`. Ascending over `true`, `1`, `d24`, `d23`, `"a"`, `[1]` and
+   absent gives: true, 1, d24, d23, "a", [1], absent. Descending gives: [1], "a", d23, d24,
+   1, true, absent.
+6. **Refusals.** Each of these is `400`:
+   - under a declared name:
+     - `2024-05-01`
+     - `2024-05-01T12:30:00.1234567Z`
+     - `2024-05-01T12:30:00.Z`
+     - `2024-05-01 12:30:00Z`
+     - `2024-05-01t12:30:00z`
+     - `2024-05-01T12:30:60Z`
+     - `2024-05-01T12:30:00+24:00`
+     - `2024-05-01T12:30:00+01:60`
+     - `2024-13-01T00:00:00Z`
+     - `2023-02-29T00:00:00Z`
+     - `1900-02-29T00:00:00Z`
+     - `9999-12-31T23:59:59-01:00`
+     - `0000-01-01T00:00:00+01:00`
+     - `1`
+     - `null`
+   - `schema` naming `int` or `[]datetime`, a name the batch never uses, or `text`;
+   - `schema` that is not an object.
+   `check_storable` refuses a datetime outside `0000`–`9999`.
+7. **Bytes kept.** M9h.1's byte pin still holds, and so does a typed float segment's flag `1`.
+8. `./scripts/gates.sh` passes; `./scripts/mutants.sh` over the diff misses 0.
+
+### Test plan
+
+| # | Fails first | Mutation it catches |
+|---|---|---|
+| 1 | the offset form comes back as the string written: `schema` is ignored today | an offset unapplied; a fraction lost; a datetime rendered as an int |
+| 2 | (after 1) | a literal compared bytewise with a datetime row; a date-like literal parsed against a string row |
+| 3 | a datetime column never prunes | the datetime table unread |
+| 4 | (after 3) | a string literal pruning under flag `1` or on `id`; `holds_string` ignored; `Contains` pruning on a scalar zone |
+| 5 | a datetime sorts as a string | the group order |
+| 6 | accepted by a lax parser | a field range unchecked; the century leap rule wrong; the range checked before UTC |
+
+### RA budget
+
+Unchanged. The datetime table is in the `Blocks` payload and arrives with the suffix read.
+It counts against `INDEX_BUDGET`, and the zone-free fallback applies.
+
+### Risks
+
+- **Rolling deploy** (spec review, M4). A write request ignores unknown fields, so a node from
+  before M9h.3 accepts `schema` and stores the values as plain strings, permanently.
+  Clients must not send `schema` until every node runs M9h.3. Refusing unknown request
+  fields is a separate change.
+- The datetime table spends `INDEX_BUDGET` on each datetime name per block.
+- Declaring per request means one name can hold both datetimes and plain strings, if a
+  writer forgets the declaration. The filter rules above keep both answerable, but a client
+  wanting one type per name must declare it on every write until a persistent schema lands.

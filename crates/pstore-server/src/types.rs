@@ -48,8 +48,9 @@ pub struct DocumentIn {
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
-    /// Typed attributes: a JSON integer (`i64`) or string each (M9a), or a float or bool
-    /// (M9h.1). Anything else is refused at the door rather than coerced — see `lib.rs`'s
+    /// Typed attributes: a JSON integer (`i64`) or string each (M9a), a float or bool
+    /// (M9h.1), an array of those (M9h.2), or a datetime the write's `schema` declares
+    /// (M9h.3). Anything else is refused at the door rather than coerced — see `lib.rs`'s
     /// `scalar`.
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
@@ -73,6 +74,11 @@ pub struct WriteRequest {
     /// `dot_product`, the default and every index's metric before M9d. Refused if unknown.
     #[serde(default)]
     pub distance_metric: Option<String>,
+    /// Which of this batch's attributes are datetimes (M9h.3): `{"<attr>": "datetime"}`.
+    /// **Per request**: a value carries its type, and nothing is recorded for the index, so a
+    /// write that omits it stores plain strings.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.

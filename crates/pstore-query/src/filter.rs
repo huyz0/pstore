@@ -4,7 +4,7 @@
 //! returns fewer than `k` whenever it is selective, and nothing says so. `run` therefore
 //! builds each segment's [`Mask`] from its blocks and applies it to exhaustive legs.
 
-use pstore_format::{Number, Value, Zones, cmp_numbers};
+use pstore_format::{Number, Value, Zones, cmp_numbers, datetime};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -98,7 +98,10 @@ impl Predicate {
                         Op::Gte => hi.is_some_and(Ordering::is_ge),
                     }
                 }),
-                None => true,
+                None => match want {
+                    Value::Str(s) if name != ID => could_hold_string(zones, name, *op, s),
+                    _ => true,
+                },
             },
             // ⚠️ A string or bool member can never prune: one name may hold strings in some
             // rows and numbers in others (M9a stores values as written), and the zones cover
@@ -115,11 +118,40 @@ impl Predicate {
     }
 }
 
+/// Whether a row holding `name` could satisfy `name op s` for a string literal (M9h.3).
+///
+/// ⚠️ Only a datetime entry can rule the block out, and only when it says the name holds no
+/// string here: a string row compares bytewise, and nothing describes those. With no entry,
+/// no datetime row exists but a string row may, so the block is kept. The caller keeps `id`
+/// out: no zone describes it.
+fn could_hold_string(zones: &Zones, name: &str, op: Op, s: &str) -> bool {
+    let Some(&(lo, hi, strings)) = zones.datetimes.get(name) else {
+        return true;
+    };
+    if strings {
+        return true;
+    }
+    // Not RFC 3339, so it matches no datetime row -- and there is no string row.
+    let Some(x) = datetime::parse(s) else {
+        return false;
+    };
+    match op {
+        Op::Eq => lo <= x && x <= hi,
+        Op::Lt => lo < x,
+        Op::Lte => lo <= x,
+        Op::Gt => hi > x,
+        Op::Gte => hi >= x,
+    }
+}
+
 /// `have op want`: numbers as one exact line (an int and a float compare by value, M9h.1),
-/// strings by bytes, bools with `false < true`, anything else false.
+/// strings by bytes, bools with `false < true`, datetimes by instant -- a string literal read
+/// as RFC 3339 against a datetime row (M9h.3) -- and anything else false.
 fn compare(have: &Value, op: Op, want: &Value) -> bool {
     let ord = match (have, want) {
         (Value::Str(a), Value::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+        (Value::DateTime(a), Value::DateTime(b)) => Some(a.cmp(b)),
+        (Value::DateTime(a), Value::Str(b)) => datetime::parse(b).map(|b| a.cmp(&b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         _ => match (Number::of(have), Number::of(want)) {
             (Some(a), Some(b)) => cmp_numbers(a, b),
@@ -197,6 +229,61 @@ mod tests {
         assert!(!Predicate::Or(vec![no.clone(), no]).could_admit(&z));
         assert!(Predicate::And(vec![]).could_admit(&z));
         assert!(!Predicate::Or(vec![]).could_admit(&z));
+    }
+
+    #[test]
+    fn a_string_literal_prunes_a_datetime_zone_at_its_exact_edges() {
+        // M9h.3, code review: the soundness harness sees rows lost, never blocks kept, so the
+        // edges that make pruning PAY are pinned here.
+        let us = |s: &str| datetime::parse(s).unwrap();
+        let (lo, hi) = (us("2024-01-01T00:00:00Z"), us("2024-12-31T00:00:00Z"));
+        let lit = |t: i64| Value::Str(datetime::format(t));
+        let z = |strings: bool| Zones {
+            datetimes: [("t".to_owned(), (lo, hi, strings))].into_iter().collect(),
+            complete: true,
+            ..Zones::default()
+        };
+        let at =
+            |zones: &Zones, op, v: Value| Predicate::Cmp("t".to_owned(), op, v).could_admit(zones);
+        let dated = z(false);
+        for (op, no, yes) in [
+            (Op::Eq, lo - 1, lo),
+            (Op::Eq, hi + 1, hi),
+            (Op::Lt, lo, lo + 1),
+            (Op::Lte, lo - 1, lo),
+            (Op::Gt, hi, hi - 1),
+            (Op::Gte, hi + 1, hi),
+        ] {
+            assert!(!at(&dated, op, lit(no)), "{op:?} {no} pruned nothing");
+            assert!(at(&dated, op, lit(yes)), "{op:?} {yes} was pruned");
+        }
+        // Not a date, so no datetime row matches, and the entry says there is no string row.
+        assert!(!at(&dated, Op::Eq, Value::Str("not a date".to_owned())));
+        // A string row beside the datetimes compares bytewise: nothing can be ruled out.
+        let mixed = z(true);
+        assert!(at(&mixed, Op::Eq, lit(hi + 1)));
+        assert!(at(&mixed, Op::Eq, Value::Str("not a date".to_owned())));
+        // No entry for the name: no datetime row, but a string row is unknown.
+        let other = Predicate::Cmp("u".to_owned(), Op::Eq, lit(hi + 1));
+        assert!(other.could_admit(&dated));
+        // The id is described by no zone, even when an attribute of that name is.
+        let id = Zones {
+            datetimes: [(ID.to_owned(), (lo, hi, false))].into_iter().collect(),
+            complete: true,
+            ..Zones::default()
+        };
+        assert!(Predicate::Cmp(ID.to_owned(), Op::Eq, lit(hi + 1)).could_admit(&id));
+    }
+
+    #[test]
+    fn a_datetime_literal_compares_by_instant() {
+        // The engine API can pass a `DateTime` literal, which the server never builds (it
+        // sends strings): it must compare by instant, not fall through to cross-type false.
+        let row = BTreeMap::from([("t".to_owned(), Value::DateTime(10))]);
+        let at = |op, t| Predicate::Cmp("t".to_owned(), op, Value::DateTime(t)).admits("x", &row);
+        assert!(at(Op::Eq, 10) && !at(Op::Eq, 11));
+        assert!(at(Op::Lt, 11) && !at(Op::Lt, 10));
+        assert!(at(Op::Gt, 9) && !at(Op::Gt, 10));
     }
 
     #[test]

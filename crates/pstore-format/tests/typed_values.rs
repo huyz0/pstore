@@ -209,3 +209,56 @@ fn a_nested_array_does_not_decode() {
         ok.attrs
     );
 }
+
+#[test]
+fn a_typed_segment_without_datetimes_keeps_its_bytes() {
+    // Recorded on 25e43b5, the commit before M9h.3: flag 1 and M9h.1's float tables, byte for
+    // byte, so a datetime table is never written for a segment that holds no datetime.
+    let b = typed_segment();
+    assert_eq!(fnv(&b), 3_636_883_691_723_148_763, "len {}", b.len());
+}
+
+#[tokio::test]
+async fn a_datetime_round_trips_and_its_range_is_enforced() {
+    use pstore_blob::{BlobStore, Key, MemoryStore};
+    use pstore_format::datetime;
+    let mut w = SegmentWriter::new(2);
+    for (i, t) in [datetime::MIN, 0, datetime::MAX].into_iter().enumerate() {
+        let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
+        d.attrs.insert("t".to_owned(), Value::DateTime(t));
+        d.attrs
+            .insert("a".to_owned(), Value::Array(vec![Value::DateTime(t)]));
+        w.push(d);
+    }
+    let bytes = w.finish();
+    assert_eq!(version(&bytes), 2);
+    let store = MemoryStore::new();
+    let key = Key::new("seg");
+    store.put(&key, bytes).await.unwrap();
+    let seg = pstore_format::Segment::open(&store, &key).await.unwrap();
+    let got: Vec<Value> = seg
+        .scan(&store, &key, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.attrs["t"].clone())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            Value::DateTime(datetime::MIN),
+            Value::DateTime(0),
+            Value::DateTime(datetime::MAX)
+        ]
+    );
+    for t in [datetime::MIN - 1, datetime::MAX + 1] {
+        for v in [Value::DateTime(t), Value::Array(vec![Value::DateTime(t)])] {
+            let mut d = Document::new("a", vec![1.0]);
+            d.attrs.insert("t".to_owned(), v.clone());
+            assert!(pstore_format::check_storable(&d).is_err(), "{v:?}");
+        }
+    }
+    // Structurally, a datetime orders after an array, and by instant among datetimes.
+    assert!(Value::Array(vec![]) < Value::DateTime(datetime::MIN));
+    assert!(Value::DateTime(0) < Value::DateTime(1));
+}

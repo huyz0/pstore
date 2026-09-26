@@ -16,6 +16,7 @@
 //! table: the key is enough.
 
 mod codec;
+pub mod datetime;
 mod docs;
 mod reader;
 pub mod sparse;
@@ -192,6 +193,9 @@ pub enum Value {
     /// Scalars, of any types, in order (M9h.2). No zone map, and never nested:
     /// [`check_storable`] refuses an array inside an array.
     Array(Vec<Value>),
+    /// An instant: microseconds since 1970-01-01T00:00:00Z, within
+    /// [`datetime::MIN`]`..=`[`datetime::MAX`] (M9h.3). A scalar, so an array may hold one.
+    DateTime(i64),
 }
 
 impl Value {
@@ -202,6 +206,7 @@ impl Value {
             Self::Float(_) => 2,
             Self::Bool(_) => 3,
             Self::Array(_) => 4,
+            Self::DateTime(_) => 5,
         }
     }
 }
@@ -228,6 +233,7 @@ impl Ord for Value {
             (Self::Float(a), Self::Float(b)) => a.total_cmp(b),
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
             (Self::Array(a), Self::Array(b)) => a.cmp(b),
+            (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -249,7 +255,7 @@ impl Number {
         match v {
             Value::Int(n) => Some(Self::Int(*n)),
             Value::Float(f) => Some(Self::Float(*f)),
-            Value::Str(_) | Value::Bool(_) | Value::Array(_) => None,
+            Value::Str(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_) => None,
         }
     }
 }
@@ -320,6 +326,8 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
     // M9h.1: a NaN compares as nothing and ±∞ as a bound no zone map can hold. JSON cannot
     // write either; the engine API can, so the door is here.
     let not_finite = |v: &Value| matches!(v, Value::Float(f) if !f.is_finite());
+    let out_of_range =
+        |v: &Value| matches!(v, Value::DateTime(t) if !(datetime::MIN..=datetime::MAX).contains(t));
     for v in d.attrs.values() {
         let inside: &[Value] = match v {
             Value::Array(items) => items,
@@ -328,6 +336,11 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
         if inside.iter().any(not_finite) {
             return Err(FormatError::Unsupported(
                 "a float attribute must be finite: NaN and infinities are refused",
+            ));
+        }
+        if inside.iter().any(out_of_range) {
+            return Err(FormatError::Unsupported(
+                "a datetime must lie in the years 0000 to 9999, UTC",
             ));
         }
         // M9h.2: an array holds scalars. Nesting has no filter that reads it, and no zone.
@@ -509,7 +522,14 @@ impl Filter {
             Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
             // A string or bool equality has no integer zone to prune on, and this legacy
             // filter matches structurally, so a float never equals an int row here either.
-            Self::Eq(_, Value::Str(_) | Value::Float(_) | Value::Bool(_) | Value::Array(_)) => true,
+            Self::Eq(
+                _,
+                Value::Str(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Array(_)
+                | Value::DateTime(_),
+            ) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,
         }
@@ -581,6 +601,9 @@ pub struct Zones {
     pub ints: BTreeMap<String, (i64, i64)>,
     /// Float attributes (M9h.1).
     pub floats: BTreeMap<String, (f64, f64)>,
+    /// Scalar datetime attributes (M9h.3): `(min, max)` microseconds, and whether the name
+    /// also holds a scalar string in the block. Present only in a flag-2 segment.
+    pub datetimes: BTreeMap<String, (i64, i64, bool)>,
     /// The segment is typed (M9h.1) and says its zone maps are on, so an absent int or float
     /// zone means **no row of that type** holds the name.
     ///
