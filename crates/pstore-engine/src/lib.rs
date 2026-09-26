@@ -337,11 +337,46 @@ struct Fresh {
     index: String,
     /// The private store the segment and its sidecars live in.
     store: Arc<pstore_blob::MemoryStore>,
-    /// Where in that store.
-    target: pstore_query::Target,
+    /// Where in that store; `None` when every unfolded operation is a delete.
+    target: Option<pstore_query::Target>,
     /// The documents, in the segment's row order — which the clustering decides, so it is not
     /// the order they were written in.
     rows: Vec<Document>,
+    /// Every id with an unfolded operation, upsert or delete: the rows they supersede in the
+    /// index's segments are hidden (M9c.2). ⚠️ From the SAME memtable snapshot as `rows`, so a
+    /// write landing between the two cannot show both versions of an id.
+    shadow: std::collections::HashSet<String>,
+}
+
+/// The attribute name marking a tombstone (M9c.2): **empty**, which the write door refuses and
+/// `Engine::write` refuses too, so no client can forge one.
+const TOMBSTONE: &str = "";
+
+/// A delete of `id`, as an operation in the same ordered log as writes (M9c.2).
+fn tombstone(id: String) -> Document {
+    Document {
+        id,
+        vectors: BTreeMap::new(),
+        attrs: BTreeMap::from([(TOMBSTONE.to_owned(), pstore_format::Value::Int(0))]),
+    }
+}
+
+/// Whether an operation is a delete.
+fn is_tombstone(d: &Document) -> bool {
+    d.attrs.contains_key(TOMBSTONE)
+}
+
+/// Each id's **newest** operation, in the order those operations arrived (M9c.2).
+fn newest(ops: Vec<Document>) -> Vec<Document> {
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, d) in ops.iter().enumerate() {
+        last.insert(d.id.clone(), i);
+    }
+    ops.into_iter()
+        .enumerate()
+        .filter(|(i, d)| last.get(&d.id) == Some(i))
+        .map(|(_, d)| d)
+        .collect()
 }
 
 #[cfg(test)]
@@ -391,9 +426,10 @@ mod memtable_tests {
 
 /// A fresh segment as one query uses it: its target, rows and store, taken together.
 struct FreshView {
-    target: pstore_query::Target,
+    target: Option<pstore_query::Target>,
     rows: Vec<Document>,
     store: Arc<pstore_blob::MemoryStore>,
+    shadow: std::collections::HashSet<String>,
 }
 
 impl Fresh {
@@ -402,6 +438,7 @@ impl Fresh {
             target: self.target.clone(),
             rows: self.rows.clone(),
             store: Arc::clone(&self.store),
+            shadow: self.shadow.clone(),
         }
     }
 }
@@ -674,7 +711,10 @@ impl<S: BlobStore> Engine<S> {
     /// segment undetected — a mixed-width segment, which no later guard can refuse, because a
     /// segment declares one width and scores every row against it.
     fn implied(&self, docs: &[Document]) -> (Option<u32>, Option<String>) {
-        let dims = docs.first().map(|d| d.vector().len() as u32);
+        let dims = docs
+            .iter()
+            .find(|d| !is_tombstone(d))
+            .map(|d| d.vector().len() as u32);
         let has_text = docs.iter().any(|d| self.carries_text(d));
         (dims, has_text.then(|| self.text_field.clone()))
     }
@@ -698,6 +738,10 @@ impl<S: BlobStore> Engine<S> {
         schema: &head::IndexSchema,
         doc: &Document,
     ) -> Option<EngineError> {
+        // A tombstone has no vector and no text: nothing about it can contradict a schema.
+        if is_tombstone(doc) {
+            return None;
+        }
         let dims = doc.vector().len() as u32;
         if dims != schema.dims {
             return Some(EngineError::SchemaConflict {
@@ -866,6 +910,13 @@ impl<S: BlobStore> Engine<S> {
         // existed, such a document was written as *nothing*, silently.
         for d in &docs {
             pstore_format::check_storable(d).map_err(|e| EngineError::Format(e.to_string()))?;
+            // The empty name marks a tombstone (M9c.2); a document carrying it would be a delete.
+            if d.attrs.contains_key(TOMBSTONE) {
+                return Err(EngineError::Format(format!(
+                    "document {}: an attribute with an empty name is reserved",
+                    d.id
+                )));
+            }
         }
         let mut m = self.mem();
         // ⚠️ **One index, one width**, checked against the rows this process already holds
@@ -898,8 +949,10 @@ impl<S: BlobStore> Engine<S> {
         let known = m
             .pending
             .get(index)
-            .and_then(|rows| rows.first())
-            .or_else(|| m.durable_rows(index).next())
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .find(|d| !is_tombstone(d))
             .or_else(|| docs.first())
             .map(|d| d.vector().len());
         if let Some(expected) = known
@@ -911,6 +964,17 @@ impl<S: BlobStore> Engine<S> {
             });
         }
         m.buffer(index, docs);
+        Ok(())
+    }
+
+    /// Deletes `ids` from `index` (M9c.2): buffered as tombstones, in the same ordered log as
+    /// writes, so the newest operation on an id decides it. Flushed and folded as writes are.
+    ///
+    /// # Errors
+    /// None today; the signature matches [`Self::write`]'s.
+    pub async fn delete(&self, index: &str, ids: Vec<String>) -> Result<(), EngineError> {
+        let ops = ids.into_iter().map(tombstone).collect();
+        self.mem().buffer(index, ops);
         Ok(())
     }
 
@@ -971,7 +1035,14 @@ impl<S: BlobStore> Engine<S> {
         self.remember_schemas(&at.head);
         Ok(at.head.indexes.get(index).map(|refs| IndexStats {
             segments: refs.len() as u64,
-            documents: refs.iter().map(|r| u64::from(r.rows)).sum(),
+            // Live rows: a segment's deleted rows are not documents (M9c.2).
+            documents: refs
+                .iter()
+                .map(|r| {
+                    let gone = at.head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
+                    u64::from(r.rows.saturating_sub(gone))
+                })
+                .sum(),
             epoch: at.head.epoch,
             schema: at.head.schemas.get(index).cloned(),
             rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
@@ -1240,6 +1311,18 @@ impl<S: BlobStore> Engine<S> {
             // An index whose every row was dropped seals nothing, and must not seal an empty
             // segment either.
             by_index.retain(|_, docs| !docs.is_empty());
+            // ⚠️ **The newest operation per id decides it** (M9c.2), AFTER the reject pass: a
+            // rejected newest operation leaves the older version standing rather than deleting
+            // it. Every id this fold touches supersedes that id in the index's existing
+            // segments; only the upserts are sealed.
+            let mut touched: BTreeMap<String, std::collections::HashSet<String>> = BTreeMap::new();
+            for (idx, docs) in &mut by_index {
+                touched.insert(idx.clone(), docs.iter().map(|d| d.id.clone()).collect());
+                *docs = newest(std::mem::take(docs))
+                    .into_iter()
+                    .filter(|d| !is_tombstone(d))
+                    .collect();
+            }
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
@@ -1247,6 +1330,11 @@ impl<S: BlobStore> Engine<S> {
             // computed from would otherwise share a tag. Derived from the epoch and lane,
             // so it is deterministic and needs no clock.
             next.nonce = nonce_for(next.epoch, self.lane);
+
+            for (idx, ids) in &touched {
+                self.supersede(&at.head, &mut next, idx, ids).await?;
+            }
+            by_index.retain(|_, docs| !docs.is_empty());
 
             // One segment per index. Folding every index into one object would make each
             // index's ref point at the whole thing, and a scan would return its
@@ -1329,6 +1417,67 @@ impl<S: BlobStore> Engine<S> {
         Err(EngineError::Lost)
     }
 
+    /// Marks every row of `index`'s existing segments whose id is in `ids` as deleted, writing
+    /// each affected segment a new cumulative delete vector and recording it in `next` (M9c.2).
+    ///
+    /// ⚠️ **Reads the ids of every existing segment of the index** -- one open and one block
+    /// read each, in parallel -- because ids cannot be pruned by a zone map. That is the price of
+    /// an update that is a write rather than a read-modify-write; compaction bounds the segment
+    /// count, not the bytes, and the fold's cost reports it.
+    async fn supersede(
+        &self,
+        head: &Head,
+        next: &mut Head,
+        index: &str,
+        ids: &std::collections::HashSet<String>,
+    ) -> Result<(), EngineError> {
+        let refs = head.indexes.get(index).cloned().unwrap_or_default();
+        let found = futures_util::future::try_join_all(refs.iter().map(|r| async move {
+            let key = Key::new(r.key.clone());
+            let old = head.deletes.get(&r.key).map(|(k, _)| k.clone());
+            let (seg, before) =
+                futures_util::future::join(Segment::open(&*self.store, &key), async {
+                    match &old {
+                        Some(k) => self
+                            .store
+                            .get(&Key::new(k.clone()))
+                            .await
+                            .map(|raw| pstore_query::deletes::decode(&raw)),
+                        None => Ok(std::collections::HashSet::new()),
+                    }
+                })
+                .await;
+            let (seg, mut rows) = (seg?, before?);
+            let hit: Vec<usize> = seg
+                .rows_where(&*self.store, &key, |_| true)
+                .await?
+                .into_iter()
+                .filter(|(row, d)| ids.contains(&d.id) && !rows.contains(row))
+                .map(|(row, _)| row)
+                .collect();
+            if hit.is_empty() {
+                return Ok::<_, EngineError>(None);
+            }
+            rows.extend(hit);
+            Ok(Some((r.key.clone(), old, rows)))
+        }))
+        .await?;
+        for (segment, old, rows) in found.into_iter().flatten() {
+            let key = head::dv_key(&segment, next.epoch.0, self.lane.0);
+            self.store
+                .put(
+                    &Key::new(key.clone()),
+                    bytes::Bytes::from(pstore_query::deletes::encode(&rows)),
+                )
+                .await?;
+            if let Some(old) = old {
+                next.graveyard.entry(next.epoch.0).or_default().push(old);
+            }
+            next.deletes.insert(segment, (key, rows.len() as u32));
+        }
+        Ok(())
+    }
+
     /// Reaps objects dereferenced more than `retention` epochs ago.
     ///
     /// **Zero LIST.** GC works from the manifest's graveyard, which records each key at
@@ -1364,6 +1513,8 @@ impl<S: BlobStore> Engine<S> {
                 .values()
                 .flatten()
                 .map(|r| r.key.as_str())
+                // And every delete vector HEAD names (M9c.2).
+                .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
                 .collect();
             let doomed: Vec<Key> = due
                 .iter()
@@ -1512,6 +1663,38 @@ impl<S: BlobStore> Engine<S> {
         self.compact_inner(index, Some(interfere)).await
     }
 
+    /// A segment's rows `filter` admits, less the rows its delete vector names, in row order
+    /// (M9c.2). A segment without a vector is a plain scan; with one, the same zone pruning
+    /// through `rows_where`, which also says which row each document is.
+    async fn live_rows(
+        &self,
+        seg: &Segment,
+        key: &Key,
+        vector: Option<&(String, u32)>,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<Document>, EngineError> {
+        let Some((dv, _)) = vector else {
+            return Ok(seg.scan(&*self.store, key, filter).await?);
+        };
+        let (raw, rows) = futures_util::future::join(
+            self.store.get(&Key::new(dv.clone())),
+            seg.rows_where(&*self.store, key, |zones| {
+                filter.is_none_or(|f| {
+                    zones
+                        .get(f.column())
+                        .is_none_or(|(lo, hi)| f.could_match(*lo, *hi))
+                })
+            }),
+        )
+        .await;
+        let deleted = pstore_query::deletes::decode(&raw?);
+        Ok(rows?
+            .into_iter()
+            .filter(|(row, d)| !deleted.contains(row) && filter.is_none_or(|f| f.matches(d)))
+            .map(|(_, d)| d)
+            .collect())
+    }
+
     async fn compact_inner(
         &self,
         index: &str,
@@ -1530,11 +1713,19 @@ impl<S: BlobStore> Engine<S> {
         let opened =
             futures_util::future::try_join_all(keys.iter().map(|k| Segment::open(&*self.store, k)))
                 .await?;
+        // ⚠️ **The inputs' delete vectors as this HEAD names them** (M9c.2): the merge drops the
+        // rows they name, and is abandoned below if a fold changes any of them first -- a merge
+        // sealed before a delete and committed after it would resurrect the deleted row.
+        let vectors: Vec<Option<(String, u32)>> = inputs
+            .iter()
+            .map(|i| at.head.deletes.get(&i.key).cloned())
+            .collect();
         let scanned = futures_util::future::try_join_all(
             opened
                 .iter()
                 .zip(&keys)
-                .map(|(seg, k)| seg.scan(&*self.store, k, None)),
+                .zip(&vectors)
+                .map(|((seg, k), dv)| self.live_rows(seg, k, dv.as_ref(), None)),
         )
         .await?;
         // In input order, so the merged segment reads back in the order the inputs would
@@ -1571,7 +1762,11 @@ impl<S: BlobStore> Engine<S> {
 
         let mut out_key = self.compacted_key(at.head.epoch.next(), index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
-        self.seal(&out_key, &rows, text_field).await?;
+        // ⚠️ None when every input row is deleted (M9c.2): the merge then only removes.
+        let empty = rows.is_empty();
+        if !empty {
+            self.seal(&out_key, &rows, text_field).await?;
+        }
         // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
         // buried rather than left for M6e's orphan sweeper.
         let mut stale: Vec<Key> = Vec::new();
@@ -1588,7 +1783,7 @@ impl<S: BlobStore> Engine<S> {
             // epoch is what says when it became live. One extra PUT on a contended compaction,
             // no rebuild, and the invariant every past epoch depends on holds by construction.
             let want = self.compacted_key(at.head.epoch.next(), index);
-            if want != out_key {
+            if want != out_key && !empty {
                 self.seal(&want, &rows, text_field).await?;
                 stale.push(out_key.clone());
                 out_key = want;
@@ -1608,13 +1803,28 @@ impl<S: BlobStore> Engine<S> {
             {
                 return Ok(None);
             }
+            // ⚠️ And if a fold deleted rows of an input since the read (M9c.2, review B1): the
+            // merged rows include them, and its vector would be buried with the input.
+            if inputs
+                .iter()
+                .zip(&vectors)
+                .any(|(i, dv)| at.head.deletes.get(&i.key) != dv.as_ref())
+            {
+                return Ok(None);
+            }
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
+            // The inputs' delete vectors die with them: the merge already dropped their rows.
+            for i in &inputs {
+                if let Some((dv, _)) = next.deletes.remove(&i.key) {
+                    next.graveyard.entry(next.epoch.0).or_default().push(dv);
+                }
+            }
             // Segments added since we read: kept, in place, after the merged one. Dropping
             // them would silently discard every row folded while we were merging.
-            let mut kept: Vec<SegmentRef> = vec![out.clone()];
+            let mut kept: Vec<SegmentRef> = if empty { Vec::new() } else { vec![out.clone()] };
             kept.extend(
                 current
                     .iter()
@@ -1670,38 +1880,37 @@ impl<S: BlobStore> Engine<S> {
         // rows that no longer include what it lacks.
         for _ in 0..STALE_HEAD_RETRIES {
             let at = head::read(&*self.store, self.tenant).await?;
-            let keys: Vec<Key> = at
-                .head
-                .indexes
-                .get(index)
-                .into_iter()
-                .flatten()
-                .map(|r| Key::new(r.key.clone()))
-                .collect();
+            let refs: Vec<&SegmentRef> = at.head.indexes.get(index).into_iter().flatten().collect();
+            let keys: Vec<Key> = refs.iter().map(|r| Key::new(r.key.clone())).collect();
 
             let opened = futures_util::future::try_join_all(
                 keys.iter().map(|k| Segment::open(&*self.store, k)),
             )
             .await?;
-            let scanned = futures_util::future::try_join_all(
-                opened
-                    .iter()
-                    .zip(&keys)
-                    .map(|(seg, k)| seg.scan(&*self.store, k, filter)),
-            )
-            .await?;
+            let scanned =
+                futures_util::future::try_join_all(opened.iter().zip(&keys).zip(&refs).map(
+                    |((seg, k), r)| self.live_rows(seg, k, at.head.deletes.get(&r.key), filter),
+                ))
+                .await?;
             let mut out: Vec<Document> = scanned.into_iter().flatten().collect();
             let mut m = self.mem();
             if !m.prune(self.watermark(&at.head)) {
                 continue;
             }
-            let unfolded: Vec<&Document> = m
+            let unfolded: Vec<Document> = m
                 .durable_rows(index)
                 .chain(m.pending.get(index).into_iter().flatten())
+                .cloned()
                 .collect();
-            for d in unfolded {
-                if filter.is_none_or(|f| f.matches(d)) {
-                    out.push(d.clone());
+            drop(m);
+            // ⚠️ Each id's newest unfolded operation decides it (M9c.2): its folded rows are
+            // shadowed, and a tombstone contributes nothing.
+            let shadow: std::collections::HashSet<&str> =
+                unfolded.iter().map(|d| d.id.as_str()).collect();
+            out.retain(|d| !shadow.contains(d.id.as_str()));
+            for d in newest(unfolded) {
+                if !is_tombstone(&d) && filter.is_none_or(|f| f.matches(&d)) {
+                    out.push(d);
                 }
             }
             return Ok(out);
@@ -1722,17 +1931,17 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         watermark: u64,
     ) -> Result<Option<Option<FreshView>>, EngineError> {
-        let (generation, rows) = {
+        let (generation, ops) = {
             let mut m = self.mem();
             if !m.prune(watermark) {
                 return Ok(None);
             }
-            let rows: Vec<Document> = m
+            let ops: Vec<Document> = m
                 .durable_rows(index)
                 .chain(m.pending.get(index).into_iter().flatten())
                 .cloned()
                 .collect();
-            (m.generation, rows)
+            (m.generation, ops)
         };
         let mut slot = self.fresh.lock().await;
         // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
@@ -1744,9 +1953,30 @@ impl<S: BlobStore> Engine<S> {
         {
             return Ok(Some(Some(f.view())));
         }
-        if rows.is_empty() {
+        if ops.is_empty() {
             *slot = None;
             return Ok(Some(None));
+        }
+        // ⚠️ The newest operation per id decides it (M9c.2): a later write replaces an earlier
+        // one, a tombstone removes it -- and every id touched shadows its older rows in the
+        // index's segments, whether its newest operation was a write or a delete.
+        let shadow: std::collections::HashSet<String> = ops.iter().map(|d| d.id.clone()).collect();
+        let rows: Vec<Document> = newest(ops)
+            .into_iter()
+            .filter(|d| !is_tombstone(d))
+            .collect();
+        if rows.is_empty() {
+            let fresh = Fresh {
+                generation,
+                index: index.to_owned(),
+                store: Arc::new(pstore_blob::MemoryStore::new()),
+                target: None,
+                rows,
+                shadow,
+            };
+            let view = fresh.view();
+            *slot = Some(fresh);
+            return Ok(Some(Some(view)));
         }
 
         let store = Arc::new(pstore_blob::MemoryStore::new());
@@ -1795,6 +2025,8 @@ impl<S: BlobStore> Engine<S> {
         let target = pstore_query::Target {
             centroids: pstore_index::vec_index::centroid_key(&key),
             segment: key,
+            deleted: None,
+            shadowed: false,
         };
         // In the segment's row order, which the clustering decides — not the order written.
         let ordered: Vec<Document> = built
@@ -1806,8 +2038,9 @@ impl<S: BlobStore> Engine<S> {
             generation,
             index: index.to_owned(),
             store,
-            target,
+            target: Some(target),
             rows: ordered,
+            shadow,
         };
         let view = fresh.view();
         *slot = Some(fresh);
@@ -1860,24 +2093,17 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
         let refs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
-        let mut targets: Vec<pstore_query::Target> = refs
-            .iter()
-            .map(|r| {
-                let segment = Key::new(r.key.clone());
-                pstore_query::Target {
-                    centroids: pstore_index::vec_index::centroid_key(&segment),
-                    segment,
-                }
-            })
-            .collect();
+        let mut targets = segment_targets(&refs, &at.head.deletes, true);
         let unfolded_at = targets.len();
 
-        let (unfolded, fresh_store) = match fresh {
+        // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
+        // even when every such operation was a delete and there is no fresh segment at all.
+        let (unfolded, fresh_store, shadow) = match fresh {
             Some(v) => {
-                targets.push(v.target);
-                (v.rows, Some(v.store))
+                targets.extend(v.target);
+                (v.rows, Some(v.store), v.shadow)
             }
-            None => (Vec::new(), None),
+            None => (Vec::new(), None, std::collections::HashSet::new()),
         };
         if targets.is_empty() {
             return Ok(Answer {
@@ -1897,15 +2123,17 @@ impl<S: BlobStore> Engine<S> {
             durable: Arc::clone(&self.store),
             fresh: fresh_store,
         };
-        let resolved =
-            pstore_query::query_rows_filtered(&store, &targets, prefetch, filter, fusion, top_k)
-                .await
-                .map_err(|e| match e {
-                    pstore_query::QueryError::Format(
-                        pstore_format::FormatError::DimensionMismatch { expected, got },
-                    ) => EngineError::DimensionMismatch { expected, got },
-                    other => EngineError::Query(other.to_string()),
-                })?;
+        let resolved = pstore_query::query_rows_filtered(
+            &store, &targets, prefetch, filter, &shadow, fusion, top_k,
+        )
+        .await
+        .map_err(|e| match e {
+            pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
+                expected,
+                got,
+            }) => EngineError::DimensionMismatch { expected, got },
+            other => EngineError::Query(other.to_string()),
+        })?;
         let (hits, ids, attributes) = split_rows(resolved);
         Ok(Answer {
             hits,
@@ -1974,16 +2202,9 @@ impl<S: BlobStore> Engine<S> {
         self.remember_schemas(&at.head);
         let then = at.head.as_of(epoch)?;
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
-        let targets: Vec<pstore_query::Target> = refs
-            .iter()
-            .map(|r| {
-                let segment = Key::new(r.key.clone());
-                pstore_query::Target {
-                    centroids: pstore_index::vec_index::centroid_key(&segment),
-                    segment,
-                }
-            })
-            .collect();
+        // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
+        // unfolded rows are newer than any past epoch.
+        let targets = segment_targets(&refs, &then.deletes, false);
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -2006,6 +2227,7 @@ impl<S: BlobStore> Engine<S> {
             &targets,
             prefetch,
             filter,
+            &std::collections::HashSet::new(),
             fusion,
             top_k,
         )
@@ -2106,6 +2328,25 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
         .collect();
     names.sort_unstable();
     names.first().map(|s| (*s).to_owned())
+}
+
+/// Query targets for HEAD's segments, each with its delete vector (M9c.2).
+fn segment_targets(
+    refs: &[SegmentRef],
+    deletes: &BTreeMap<String, (String, u32)>,
+    shadowed: bool,
+) -> Vec<pstore_query::Target> {
+    refs.iter()
+        .map(|r| {
+            let segment = Key::new(r.key.clone());
+            pstore_query::Target {
+                centroids: pstore_index::vec_index::centroid_key(&segment),
+                deleted: deletes.get(&r.key).map(|(key, _)| Key::new(key.clone())),
+                shadowed,
+                segment,
+            }
+        })
+        .collect()
 }
 
 /// A resolved ranking, as `Answer`'s three parallel columns: hits, ids, attributes.

@@ -85,6 +85,11 @@ pub struct Target {
     /// Its centroid table. Absent in the store is not an error: D-10 reads that as "scan me
     /// exactly".
     pub centroids: Key,
+    /// Its delete vector, when it has one (M9c). Fetched in the open round.
+    pub deleted: Option<Key>,
+    /// Whether the query's shadowed ids hide rows here. `false` for the fresh segment, whose
+    /// rows ARE the newest versions.
+    pub shadowed: bool,
 }
 
 /// Which sidecars a query needs, derived from the legs.
@@ -93,6 +98,8 @@ struct Opened {
     centroids: Option<bytes::Bytes>,
     dictionary: Option<bytes::Bytes>,
     terms: Option<bytes::Bytes>,
+    /// Rows its delete vector excludes; empty when it has none.
+    deleted: std::collections::HashSet<usize>,
 }
 
 /// Runs every leg over one segment and fuses the answers.
@@ -112,7 +119,17 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
-    Ok(run(store, targets, prefetch, None, fusion, top_k).await?.0)
+    Ok(run(
+        store,
+        targets,
+        prefetch,
+        None,
+        &std::collections::HashSet::new(),
+        fusion,
+        top_k,
+    )
+    .await?
+    .0)
 }
 
 /// The ranking **and the segments it was computed over**, still open.
@@ -125,9 +142,10 @@ async fn run<S: BlobStore>(
     targets: &[Target],
     prefetch: &[Prefetch],
     filter: Option<&Predicate>,
+    shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
-) -> Result<(Vec<Hit>, Vec<Opened>), QueryError> {
+) -> Result<(Vec<Hit>, Vec<Opened>, Known), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
     // be written.
@@ -181,13 +199,19 @@ async fn run<S: BlobStore>(
     // removes what the predicate does not admit, and only then is the limit applied. The
     // mask's blocks are addressable the moment the segment is open, exactly as the legs'
     // ranges are, so fetching it alongside them adds no round trip.
+    //
+    // ⚠️ **Superseded rows are excluded the same way** (M9c): a row in a segment's delete
+    // vector, or -- in a shadowed segment -- one whose id has a newer unfolded operation. Without
+    // a filter the legs need not be exhaustive: at most `deleted + shadowed` of a segment's rows
+    // can be excluded, so a leg asked for that many more still has `limit` left after them.
     let legs_fut =
         futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().flat_map(
             |(i, (o, t))| {
                 runnable.iter().enumerate().map(move |(j, r)| async move {
+                    let hidden = o.deleted.len() + if t.shadowed { shadow.len() } else { 0 };
                     let r = match filter {
                         Some(_) => r.exhaustive(o.segment.index_row_count()),
-                        None => *r,
+                        None => r.widened(hidden, o.segment.row_count()),
                     };
                     leg(store, &t.segment, o, &r, i, stats)
                         .await
@@ -203,14 +227,57 @@ async fn run<S: BlobStore>(
             }
         }));
     let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
-    let per_segment = per_segment.into_iter().map(|(i, j, hits)| {
-        let Some(Some(m)) = masks.get(i) else {
-            return (j, hits);
-        };
+    let candidates: Vec<(usize, usize, Vec<Hit>)> = per_segment
+        .into_iter()
+        .map(|(i, j, hits)| {
+            let admitted = masks.get(i).and_then(Option::as_ref);
+            let deleted = opened.get(i).map(|o| &o.deleted);
+            // ⚠️ **Cut to what can survive the shadow**, before its documents are fetched
+            // (review of M9c.2): at most `|shadow|` of a segment's candidates are shadowed, so
+            // the rest of the widened list can never reach the answer -- and fetching it read a
+            // block per candidate, a number that grows with the deleted count.
+            let room = runnable.get(j).map_or(0, Runnable::limit)
+                + if targets.get(i).is_some_and(|t| t.shadowed) {
+                    shadow.len()
+                } else {
+                    0
+                };
+            let kept = hits
+                .into_iter()
+                .filter(|h| admitted.is_none_or(|m| m.contains(&h.row)))
+                .filter(|h| deleted.is_none_or(|d| !d.contains(&h.row)))
+                .take(room)
+                .collect();
+            (i, j, kept)
+        })
+        .collect();
+
+    // ⚠️ **Shadowing is checked on the CANDIDATES' ids** (M9c.2, spec review): reading every
+    // block of every segment to find the shadowed rows would read the whole index on every
+    // query of a process with anything unfolded. The candidates' documents are fetched in one
+    // fan-out round, and it is the round that resolves the answer's ids anyway: `known` carries
+    // them there, so the depth is unchanged.
+    // A non-empty shadow comes with the index's segments as shadowed targets, or with none.
+    let known = if !shadow.is_empty() {
+        let wanted: Vec<(usize, usize)> = candidates
+            .iter()
+            .flat_map(|(i, _, hits)| hits.iter().map(move |h| (*i, h.row)))
+            .collect();
+        fetch_rows(store, targets, &opened, &wanted).await?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let per_segment = candidates.into_iter().map(|(i, j, hits)| {
+        let shadowed = targets.get(i).is_some_and(|t| t.shadowed);
         let limit = runnable.get(j).map_or(0, Runnable::limit);
         let kept: Vec<Hit> = hits
             .into_iter()
-            .filter(|h| m.contains(&h.row))
+            .filter(|h| {
+                !shadowed
+                    || known
+                        .get(&(i, h.row))
+                        .is_none_or(|d| !shadow.contains(&d.id))
+            })
             .take(limit)
             .collect();
         (j, kept)
@@ -237,7 +304,7 @@ async fn run<S: BlobStore>(
                 .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
         });
     }
-    Ok((fuse(&legs, fusion, top_k), opened))
+    Ok((fuse(&legs, fusion, top_k), opened, known))
 }
 
 /// The ranking, **and the id of every hit**, in one more round than the ranking alone.
@@ -269,11 +336,13 @@ pub async fn query_rows_filtered<S: BlobStore>(
     targets: &[Target],
     prefetch: &[Prefetch],
     filter: Option<&Predicate>,
+    shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
-    let (hits, opened) = run(store, targets, prefetch, filter, fusion, top_k).await?;
-    resolve_rows(store, targets, &opened, &hits).await
+    let (hits, opened, known) =
+        run(store, targets, prefetch, filter, shadow, fusion, top_k).await?;
+    resolve_rows(store, targets, &opened, &hits, known).await
 }
 
 /// The data rows of one segment `filter` admits, from its blocks, zone-map pruned.
@@ -292,17 +361,20 @@ async fn mask<S: BlobStore>(
         .collect())
 }
 
-/// The rows for `hits`, one fan-out round over the segments that carry them.
-async fn resolve_rows<S: BlobStore>(
+/// Documents already fetched this query, by `(segment, row)`.
+type Known = std::collections::BTreeMap<(usize, usize), Document>;
+
+/// The documents at `(segment, row)` pairs: one fan-out round over the segments holding them.
+async fn fetch_rows<S: BlobStore>(
     store: &S,
     targets: &[Target],
     opened: &[Opened],
-    hits: &[Hit],
-) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
+    wanted: &[(usize, usize)],
+) -> Result<Known, QueryError> {
     let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
-    for h in hits {
-        rows_per_segment.entry(h.segment).or_default().push(h.row);
+    for (segment, row) in wanted {
+        rows_per_segment.entry(*segment).or_default().push(*row);
     }
     // ⚠️ One round: every segment's blocks are fetched together. Serially this is where the
     // depth went from 3 to 3 + 2N.
@@ -318,19 +390,37 @@ async fn resolve_rows<S: BlobStore>(
         },
     ))
     .await?;
-
-    let mut by_hit: std::collections::BTreeMap<(usize, usize), Document> =
-        std::collections::BTreeMap::new();
+    let mut out = Known::new();
     for (segment, pairs) in resolved {
         for (row, doc) in pairs {
             if let Some(doc) = doc {
-                by_hit.insert((segment, row), doc);
+                out.insert((segment, row), doc);
             }
         }
     }
+    Ok(out)
+}
+
+/// The rows for `hits`, one fan-out round over the segments that carry them.
+async fn resolve_rows<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    opened: &[Opened],
+    hits: &[Hit],
+    mut known: Known,
+) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
+    // Only what the shadow check did not already fetch (M9c.2): when it ran, this is nothing.
+    let missing: Vec<(usize, usize)> = hits
+        .iter()
+        .map(|h| (h.segment, h.row))
+        .filter(|k| !known.contains_key(k))
+        .collect();
+    if !missing.is_empty() {
+        known.extend(fetch_rows(store, targets, opened, &missing).await?);
+    }
     Ok(hits
         .iter()
-        .map(|h| (*h, by_hit.get(&(h.segment, h.row)).cloned()))
+        .map(|h| (*h, known.get(&(h.segment, h.row)).cloned()))
         .collect())
 }
 
@@ -361,6 +451,50 @@ impl Runnable<'_> {
         match self {
             Self::Text { limit, .. } | Self::Dense { limit, .. } | Self::Sparse { limit, .. } => {
                 *limit
+            }
+        }
+    }
+
+    /// The same leg asking for `extra` more rows than its limit: room for rows the query will
+    /// exclude as superseded (M9c), so `limit` survive them. A clustered dense leg also probes
+    /// `rows / live` times as many lists (spec review): excluded rows are candidates it spends
+    /// probes on, and more `k` from the same lists cannot replace them.
+    fn widened(self, extra: usize, rows: usize) -> Self {
+        match self {
+            Self::Text {
+                field,
+                query,
+                limit,
+            } => Self::Text {
+                field,
+                query,
+                limit: limit + extra,
+            },
+            Self::Sparse {
+                field,
+                query,
+                limit,
+            } => Self::Sparse {
+                field,
+                query,
+                limit: limit + extra,
+            },
+            Self::Dense {
+                field,
+                query,
+                limit,
+                tune,
+            } => {
+                let live = rows.saturating_sub(extra).max(1);
+                Self::Dense {
+                    field,
+                    query,
+                    limit: limit + extra,
+                    tune: vec_index::Query {
+                        p: tune.p.saturating_mul(rows.max(1)).div_ceil(live),
+                        ..tune
+                    },
+                }
             }
         }
     }
@@ -456,7 +590,20 @@ async fn open<S: BlobStore>(
     // ⚠️ Three futures, one round. Every key is derived and none depends on another's
     // contents, so awaiting them in sequence would cost a round trip per modality — which is
     // exactly what `prefetch[]` must not turn into.
-    let (segment, cen, dict, terms) = futures_util::future::join4(
+    // ⚠️ The delete vector rides the same round (M9c): its key is derived, like the others.
+    // Unlike them, a named vector that cannot be read is an ERROR -- answering without it would
+    // return rows a newer write superseded, which is a wrong answer rather than a slow one.
+    let dv = async {
+        match &target.deleted {
+            Some(k) => store
+                .get_immutable(k, pstore_blob::Class::Pinned)
+                .await
+                .map(|raw| crate::deletes::decode(&raw))
+                .map_err(|e| QueryError::Format(FormatError::from(e))),
+            None => Ok(std::collections::HashSet::new()),
+        }
+    };
+    let (segment, cen, dict, terms, deleted) = futures_util::future::join5(
         Segment::open(store, key),
         maybe(store, wants_dense.then(|| centroids.clone())),
         maybe(
@@ -467,6 +614,7 @@ async fn open<S: BlobStore>(
             store,
             wants_text.then(|| pstore_format::text::dict_key(key)),
         ),
+        dv,
     )
     .await;
     Ok(Opened {
@@ -474,6 +622,7 @@ async fn open<S: BlobStore>(
         centroids: cen,
         dictionary: dict,
         terms,
+        deleted: deleted?,
     })
 }
 

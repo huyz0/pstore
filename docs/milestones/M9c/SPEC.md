@@ -25,7 +25,7 @@ races are fixed first, as M9c.1.
 **Does not change:** what a flush writes, what a fold folds, the bundle or HEAD format, or any
 query's requests; only *which in-memory rows* a query pairs with the HEAD it read.
 
-## Delta — M9c.2: upsert and delete (revised at spec review; specified, not yet built)
+## Delta — M9c.2: upsert and delete (revised at spec review)
 
 - **Wire.** A write is an upsert; `deletes: [id]` joins `documents`, either may be empty but
   not both; a later duplicate in a request wins; `deletes` apply after `documents`.
@@ -82,8 +82,11 @@ segment with a vector, in the open round.
 ## Risks
 
 - Row 37 cannot be forced deterministically; its fix is structural (no re-lock), not tested.
-- M9c.2's fold reads the index's ids: bytes grow with the index until compaction. Revealed by the
-  fold's own `cost`; a per-segment id filter is the fix if it bites.
+- M9c.2's fold reads every existing segment's data blocks (whole rows, not only ids -- code
+  review) on each fold that touches the index, inserts included: bytes grow with the index until
+  compaction. Revealed by the fold's own `cost`; a per-segment id filter is the fix if it bites.
+- A fold attempt that loses its CAS leaves the vectors it wrote unburied, for M6e's orphan
+  sweeper, as it already did its segment (code review, minor).
 
 ## Tasks
 

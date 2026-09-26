@@ -35,6 +35,9 @@ fn populated() -> Head {
     h.indexes.insert("beta".to_owned(), vec![]);
     h.watermarks.insert(1, 9);
     h.watermarks.insert(77, 0);
+    // M9c: a segment's delete vector.
+    h.deletes
+        .insert("a/1.seg".to_owned(), ("a/1.seg.dv".to_owned(), 3));
     h
 }
 
@@ -58,8 +61,9 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     // A partially-decoded HEAD would be a partially-visible index: some segments present,
     // others silently absent, reported as success.
     //
-    // ⚠️ **Three cuts now decode, and they are named rather than tolerated.** M7d added the
-    // schema and reject sections as OPTIONAL trailing ones and M7e added the reap horizon,
+    // ⚠️ **Four cuts now decode, and they are named rather than tolerated.** M7d added the
+    // schema and reject sections as OPTIONAL trailing ones, M7e added the reap horizon and
+    // M9c the delete vectors,
     // because every HEAD written before each of them ends where it ends and reading that as
     // corrupt would make every existing store unreadable. The price is that a HEAD truncated
     // *exactly* at one of those boundaries is indistinguishable from an older, complete one.
@@ -76,8 +80,8 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     let no_schemas = encode_without_schemas(&populated()).len();
     assert_eq!(
         decodable,
-        vec![no_schemas, no_schemas + 4, no_schemas + 8],
-        "the only decodable truncations must be the three optional-section boundaries"
+        vec![no_schemas, no_schemas + 4, no_schemas + 8, no_schemas + 16],
+        "the only decodable truncations must be the four optional-section boundaries"
     );
     // And what they decode to is the older HEAD, not a partial one.
     let at_boundary = Head::decode(&bytes[..no_schemas]).unwrap();
@@ -222,7 +226,9 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
         },
     );
     h.reaped_before = 77;
-    let full = h.encode();
+    // The horizon as the LAST section, as it was written before M9c.
+    h.deletes.clear();
+    let full = &h.encode()[..h.encode().len() - 4];
     let without = &full[..full.len() - 8];
     let decoded = Head::decode(without).expect("a HEAD from before the horizon must decode");
     assert_eq!(decoded.reaped_before, 0);
@@ -237,5 +243,24 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
             "a horizon cut short by {cut} bytes decoded"
         );
     }
-    assert_eq!(Head::decode(&full).unwrap().reaped_before, 77);
+    assert_eq!(Head::decode(full).unwrap().reaped_before, 77);
+}
+
+#[test]
+fn a_head_without_delete_vectors_decodes_as_none() {
+    // M9c's trailing section: a HEAD written before it ends at the horizon.
+    let h = populated();
+    let full = h.encode();
+    let mut older = h.clone();
+    older.deletes.clear();
+    let without = &older.encode()[..older.encode().len() - 4];
+    let decoded = Head::decode(without).expect("a HEAD from before M9c must decode");
+    assert!(decoded.deletes.is_empty());
+    assert_eq!(decoded.indexes, h.indexes);
+    // A section cut anywhere inside is refused, never read as fewer vectors.
+    let start = without.len();
+    for cut in start + 1..full.len() {
+        assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
+    }
+    assert_eq!(Head::decode(&full).unwrap().deletes, h.deletes);
 }

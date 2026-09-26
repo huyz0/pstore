@@ -100,6 +100,33 @@ pub struct Head {
     ///
     /// Bounded, not unbounded: GC prunes an entry in the same pass that reaps it.
     pub graveyard: BTreeMap<u64, Vec<String>>,
+    /// Per segment key, its current **delete vector**: `(the vector's key, rows it deletes)`
+    /// (M9c). ⚠️ A fourth optional trailing section: absent means no segment has deleted rows.
+    /// A replaced vector is buried, so GC reaps it and `as_of` can still find it.
+    pub deletes: BTreeMap<String, (String, u32)>,
+}
+
+/// Where a segment's delete vector written at `epoch` by `lane` lives (M9c): the segment's
+/// own key, then the epoch and the writer's lane.
+///
+/// ⚠️ **With the lane** (spec review of M9c): two folders against the same HEAD both write a
+/// vector for the same segment at the same epoch, with different contents; one CAS wins, and
+/// the loser's unconditional PUT landing afterwards would overwrite the vector HEAD names --
+/// create-if-absent is not honoured everywhere, which is why segment keys carry the lane too.
+///
+/// ⚠️ It keeps the segment's `/seg/` path, and that is safe only because [`key_index`] reads a
+/// key as a segment **only when it ends in `.seg`** — without that, `as_of` would resurrect a
+/// buried delete vector as a segment of its index.
+#[must_use]
+pub(crate) fn dv_key(segment: &str, epoch: u64, lane: u64) -> String {
+    format!("{segment}.{epoch:020}-{lane:016x}.dv")
+}
+
+/// The segment and epoch a delete-vector key names, or `None` for any other key.
+fn dv_of(key: &str) -> Option<(&str, u64)> {
+    let (segment, stamp) = key.strip_suffix(".dv")?.rsplit_once('.')?;
+    let (epoch, _lane) = stamp.split_once('-')?;
+    Some((segment, epoch.parse().ok()?))
 }
 
 impl Head {
@@ -153,6 +180,12 @@ impl Head {
             out.extend_from_slice(&n.to_le_bytes());
         }
         out.extend_from_slice(&self.reaped_before.to_le_bytes());
+        out.extend_from_slice(&(self.deletes.len() as u32).to_le_bytes());
+        for (segment, (key, rows)) in &self.deletes {
+            put_str(&mut out, segment);
+            put_str(&mut out, key);
+            out.extend_from_slice(&rows.to_le_bytes());
+        }
         out
     }
 
@@ -225,6 +258,14 @@ impl Head {
         // it is `CorruptHead` rather than a horizon of zero — `take` gives that for free, and
         // a horizon read short is a horizon that refuses nothing.
         h.reaped_before = c.u64()?;
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let segment = c.string()?;
+            let key = c.string()?;
+            h.deletes.insert(segment, (key, c.u32()?));
+        }
         Ok(h)
     }
 
@@ -298,6 +339,42 @@ impl Head {
         for refs in out.indexes.values_mut() {
             refs.sort_by(|a, b| a.key.cmp(&b.key));
         }
+        // ⚠️ **Each segment's delete vector as it stood at the epoch** (M9c): the one written at
+        // or before it -- the current one, or one buried after it. The present's vector applied
+        // to the past would hide rows that were live then. There is **at most one**: a vector
+        // is buried at the epoch its successor is written, so two written at or before the
+        // epoch cannot both be buried after it.
+        let mut best: BTreeMap<String, (String, u32)> = BTreeMap::new();
+        let mut consider = |key: &str, rows: u32| {
+            let Some((segment, epoch)) = dv_of(key) else {
+                return;
+            };
+            if epoch <= out.epoch.0 {
+                best.insert(segment.to_owned(), (key.to_owned(), rows));
+            }
+        };
+        for (key, rows) in self.deletes.values() {
+            consider(key, *rows);
+        }
+        for (buried, keys) in &self.graveyard {
+            if *buried <= out.epoch.0 {
+                continue;
+            }
+            for key in keys {
+                // The count of a buried vector is not kept: the query reads the vector itself.
+                consider(key, 0);
+            }
+        }
+        let live: std::collections::BTreeSet<&str> = out
+            .indexes
+            .values()
+            .flatten()
+            .map(|r| r.key.as_str())
+            .collect();
+        out.deletes = best
+            .into_iter()
+            .filter(|(segment, _)| live.contains(segment.as_str()))
+            .collect();
         Ok(out)
     }
 
@@ -359,6 +436,10 @@ pub(crate) fn key_epoch(key: &str) -> Option<u64> {
 /// ⚠️ The prefix is what separates a segment from a WAL bundle, which lives under `…/wal/` and
 /// whose filename is a sequence number in the same shape as an epoch.
 fn key_index(key: &str) -> Option<String> {
+    // Only a segment's own key: a delete vector (M9c) and every sidecar share its path.
+    if !key.ends_with(".seg") {
+        return None;
+    }
     let (before, _) = key.split_once("/seg/")?;
     let (_, index) = before.split_once("/idx/")?;
     (!index.is_empty()).then(|| index.to_owned())

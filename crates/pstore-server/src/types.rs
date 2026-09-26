@@ -59,8 +59,14 @@ pub struct WriteRequest {
     /// Defaults to `batched`. ⚠️ An unknown value is **refused**, never downgraded.
     #[serde(default)]
     pub durability: Durability,
-    /// The batch. Batch-first: the cheap thing is the natural thing.
+    /// The batch. Batch-first: the cheap thing is the natural thing. Each is an **upsert**
+    /// (M9c): a later write of an id replaces the earlier one, and a later duplicate in this
+    /// batch wins.
+    #[serde(default)]
     pub documents: Vec<DocumentIn>,
+    /// Ids to delete, applied **after** `documents` (M9c). Either list may be empty, not both.
+    #[serde(default)]
+    pub deletes: Vec<String>,
 }
 
 /// The answer to a write.
@@ -72,6 +78,8 @@ pub struct WriteResponse {
     pub epoch: u64,
     /// Documents accepted.
     pub documents_written: usize,
+    /// Ids a delete was **requested** for -- not ids found, which would need a read (M9c).
+    pub documents_deleted: usize,
     /// Whether the batch is in the blob store or only in this process.
     pub durable: bool,
     /// What it cost.

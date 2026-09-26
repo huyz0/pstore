@@ -12,6 +12,7 @@
 //! and every functional test passes. `store.rs` makes the same point about ranges: width is
 //! free, depth is not.
 
+pub mod deletes;
 mod filter;
 mod fuse;
 mod run;

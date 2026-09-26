@@ -36,6 +36,8 @@ async fn a_query_vector_of_the_wrong_dimension_is_refused_by_the_dense_leg() {
 
     let target = Target {
         centroids: pstore_index::vec_index::centroid_key(&key),
+        deleted: None,
+        shadowed: false,
         segment: key.clone(),
     };
     // Four dimensions in, two out. ⚠️ Asserted on BOTH paths, because only one of them was

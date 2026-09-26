@@ -136,6 +136,8 @@ async fn main() {
         store.put(&key, seg).await.unwrap();
         targets.push(Target {
             centroids: Key::new(format!("{}.cen", key.as_str())),
+            deleted: None,
+            shadowed: false,
             segment: key,
         });
         ids.push(shard_ids);

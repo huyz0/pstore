@@ -462,8 +462,10 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let req: WriteRequest = parse_write(&body)?;
-    if req.documents.is_empty() {
-        return Err(ApiError::bad_request("a write with no documents"));
+    if req.documents.is_empty() && req.deletes.is_empty() {
+        return Err(ApiError::bad_request(
+            "a write with no documents and no deletes",
+        ));
     }
     // ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
     // the segment layout cannot store. A zero-dimension vector is storable and meaningless,
@@ -472,7 +474,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // match — so the request that breaks that rule is the one that gets the error, rather
     // than the query that meets the consequence later.
     let dims = req.documents.first().map_or(0, |d| d.vector.len());
-    if dims == 0 {
+    if dims == 0 && !req.documents.is_empty() {
         return Err(ApiError::bad_request("a document with no vector"));
     }
     if let Some(odd) = req.documents.iter().find(|d| d.vector.len() != dims) {
@@ -497,7 +499,12 @@ async fn write_documents<S: BlobStore + 'static>(
         .map(to_document)
         .collect::<Result<_, _>>()?;
     let written = docs.len();
-    engine.write(&index, docs).await?;
+    if !docs.is_empty() {
+        engine.write(&index, docs).await?;
+    }
+    // After the documents: a request that writes and deletes an id deletes it.
+    let deleted = req.deletes.len();
+    engine.delete(&index, req.deletes).await?;
     let durable = matches!(req.durability, types::Durability::Durable);
     if durable {
         engine.flush().await?;
@@ -505,6 +512,7 @@ async fn write_documents<S: BlobStore + 'static>(
     Ok(axum::Json(WriteResponse {
         epoch: engine.epoch().0,
         documents_written: written,
+        documents_deleted: deleted,
         durable,
         cost: api.spend(tenant).since(before),
     }))

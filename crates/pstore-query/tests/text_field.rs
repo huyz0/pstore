@@ -80,6 +80,8 @@ async fn run(store: &MemoryStore, seg: &Key, cen: &Key, field: &str) -> Result<u
     let targets = [Target {
         segment: seg.clone(),
         centroids: cen.clone(),
+        deleted: None,
+        shadowed: false,
     }];
     query(
         store,
