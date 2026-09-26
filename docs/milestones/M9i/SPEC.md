@@ -239,7 +239,8 @@ that follow another process's write. The default stays `eventual`.
   - A bundle there is a durable write no fold has committed.
   - For this process's own lane, batches from the watermark to `next` are in its memtable,
     which every answer includes. A bundle at `next` exists only if another incarnation wrote
-    one.
+    one, or while this engine's own flush has landed its PUT but not advanced `next`, which
+    costs a harmless extra refusal.
 - **Round 3:** the query's block reads, as today.
 - For an index with no folded segment, `eventual` needs one round; `strong` needs two.
 
@@ -247,8 +248,9 @@ that follow another process's write. The default stays `eventual`.
 - The answer is discarded, and the query is refused with `503 not_folded`, retryable, with
   `Retry-After: 1`.
 - The tenant is marked **requested** in the `Api`. M9i.1's `fold_tick` treats a requested
-  tenant as due, under its concurrency cap, backoff and shutdown, and clears the mark when it
-  folds.
+  tenant as due, under its concurrency cap, backoff and shutdown. The mark is taken when the
+  fold starts and put back if it fails; a fold that commits or finds nothing leaves it
+  cleared.
 - The mark is a set, so K refusals ask for one fold, not K (spec review, M2).
 - With no fold loop running (`PSTORE_FOLD=off`, or plain `serve`), nothing folds it; the
   refusal stands until an operator's or another process's fold.
@@ -288,9 +290,11 @@ depth is at most `max(eventual's, 2)` and never over 3.
    - After `B.fold_due` (which folds the requested tenant), `strong` through B returns it.
 2. **Strong serves what it can.** With nothing unfolded, and one lane registered but holding
    no watermark entry, `strong` through B answers exactly what `eventual` does.
-3. **Own lane.** A durable write through A (B has flushed, so both lanes are registered):
-   `strong` through A answers it at once. The requests exceed `eventual`'s by exactly 1 GET
-   and 2 HEAD probes.
+3. **Own lane.** B writes durably and a fold commits it, so both lanes are registered and lane
+   B has a watermark of 1 over a folded, unreaped bundle 0. Then A writes durably. `strong`
+   through A answers A's write at once, **served**, not refused. The requests exceed
+   `eventual`'s by exactly 1 GET and 2 HEAD probes. A probe at `w - 1` would find B's folded
+   bundle and refuse, so this criterion catches it.
 4. **A dead writer's lane.** A second `Api` on lane A (a restart) holds nothing in memory
    while lane A has an unfolded bundle. `strong` through it is refused.
 5. **Depth.** With at least one folded segment and three registered lanes, `strong` has
@@ -314,9 +318,9 @@ depth is at most `max(eventual's, 2)` and never over 3.
 
 | # | Fails first | Mutation it catches |
 |---|---|---|
-| 1 | `consistency` is ignored | a probe at `w - 1` or `w + 1`; the refusal not retryable; no request marked |
+| 1 | `consistency` is ignored | a probe at `w + 1`; the refusal not retryable; no request marked |
 | 2 | (after 1) | a clean or unwatermarked lane read as dirty |
-| 3 | (after 1) | the own lane unprobed; `next` ignored; the registry read twice |
+| 3 | (after 1) | a probe at `w - 1`; `next` ignored; the registry read twice |
 | 4 | (after 1) | the own lane trusted after a restart |
 | 5 | (after 1) | the probes awaited one after another, or in a round of their own |
 | 6 | (after 1) | `rank_by` not checked |
