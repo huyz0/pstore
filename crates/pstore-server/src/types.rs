@@ -42,7 +42,8 @@ pub enum Durability {
 pub struct DocumentIn {
     /// The client's identifier.
     pub id: String,
-    /// The dense vector.
+    /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d).
+    #[serde(deserialize_with = "vector")]
     pub vector: Vec<f32>,
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
@@ -67,6 +68,61 @@ pub struct WriteRequest {
     /// Ids to delete, applied **after** `documents` (M9c). Either list may be empty, not both.
     #[serde(default)]
     pub deletes: Vec<String>,
+    /// How the index compares vectors (M9d): `cosine_distance`, `euclidean_squared`, or
+    /// `dot_product`, the default and every index's metric before M9d. Refused if unknown.
+    #[serde(default)]
+    pub distance_metric: Option<String>,
+}
+
+/// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VectorIn {
+    Array(Vec<f32>),
+    Base64(String),
+}
+
+/// A vector from either spelling. ⚠️ **Refused, never repaired**: a length that is not whole
+/// `f32`s is not truncated, and a non-finite component -- which base64 can carry and JSON
+/// cannot -- is not stored.
+fn decode_vector<E: serde::de::Error>(raw: VectorIn) -> Result<Vec<f32>, E> {
+    use base64::Engine as _;
+    let v = match raw {
+        VectorIn::Array(v) => v,
+        VectorIn::Base64(s) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map_err(|e| E::custom(format!("a vector that is not base64: {e}")))?;
+            if bytes.len() % 4 != 0 {
+                return Err(E::custom(format!(
+                    "a base64 vector of {} bytes, which is not a whole number of f32s",
+                    bytes.len()
+                )));
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|c| {
+                    <[u8; 4]>::try_from(c)
+                        .map(f32::from_le_bytes)
+                        .map_err(|e| E::custom(e.to_string()))
+                })
+                .collect::<Result<_, _>>()?
+        }
+    };
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(E::custom("a vector with a non-finite component"));
+    }
+    Ok(v)
+}
+
+fn vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
+    decode_vector(VectorIn::deserialize(d)?)
+}
+
+fn some_vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
+    Option::<VectorIn>::deserialize(d)?
+        .map(decode_vector)
+        .transpose()
 }
 
 /// The answer to a write.
@@ -89,8 +145,8 @@ pub struct WriteResponse {
 /// `POST /v1/indexes/{id}/query`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueryRequest {
-    /// The dense leg's query vector.
-    #[serde(default)]
+    /// The dense leg's query vector, as a document's is written (M9d).
+    #[serde(default, deserialize_with = "some_vector")]
     pub vector: Option<Vec<f32>>,
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
@@ -116,6 +172,10 @@ pub struct QueryRequest {
     /// turbopuffer's filter arrays, parsed by `lib.rs`'s `predicate` (M9b).
     #[serde(default)]
     pub filters: Option<serde_json::Value>,
+    /// Every row scored at full precision -- turbopuffer's `kNN` (M9d). Reads every vector of
+    /// the index, at the default depth.
+    #[serde(default)]
+    pub exact: bool,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -139,6 +199,10 @@ pub struct ResultRow {
     pub id: String,
     /// Its fused score.
     pub score: f32,
+    /// Its distance under the index's metric, when the query's dense leg scored it (M9d).
+    /// Without `exact` it is the ranking rung's estimate.
+    #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]
+    pub dist: Option<f32>,
     /// Its attributes, **only when the query asked** — absent otherwise, so a query that
     /// did not ask gets exactly the response it always did.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,8 +236,10 @@ pub struct QueryResponse {
 /// What an index's rows must look like. Inferred by its first fold, immutable afterwards.
 #[derive(Debug, Clone, Serialize)]
 pub struct Schema {
-    /// Components in every vector.
+    /// Components in every vector, as a client writes them.
     pub dims: u32,
+    /// How vectors are compared (M9d).
+    pub distance_metric: &'static str,
     /// The attribute the text index is built over, or empty if the index carries no text.
     pub text_field: String,
 }

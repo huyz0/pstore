@@ -145,7 +145,7 @@ async fn run<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
-) -> Result<(Vec<Hit>, Vec<Opened>, Known), QueryError> {
+) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
     // be written.
@@ -304,8 +304,19 @@ async fn run<S: BlobStore>(
                 .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
         });
     }
-    Ok((fuse(&legs, fusion, top_k), opened, known))
+    // ⚠️ **The dense leg's own score, kept before fusion replaces it** (M9d): a fused score is
+    // `Σ 1/(k + rank)` whatever the legs were, so `$dist` has no other source.
+    let dense: Dense = runnable
+        .iter()
+        .position(|r| matches!(r, Runnable::Dense { .. }))
+        .and_then(|j| legs.get(j))
+        .map(|leg| leg.iter().map(|h| ((h.segment, h.row), h.score)).collect())
+        .unwrap_or_default();
+    Ok((fuse(&legs, fusion, top_k), opened, known, dense))
 }
+
+/// The first dense leg's score of each row it ranked, by `(segment, row)` (M9d).
+type Dense = std::collections::BTreeMap<(usize, usize), f32>;
 
 /// The ranking, **and the id of every hit**, in one more round than the ranking alone.
 ///
@@ -329,6 +340,9 @@ async fn run<S: BlobStore>(
 ///
 /// ⚠️ **Only with documents `filter` admits**, when there is one (M9b): see `run`.
 ///
+/// And each hit's score in the first dense leg, if that leg ranked it (M9d): the fused score
+/// is a rank sum, and `$dist` is computed from this.
+///
 /// # Errors
 /// As [`query`], plus a block that cannot be read or decoded.
 pub async fn query_rows_filtered<S: BlobStore>(
@@ -339,10 +353,17 @@ pub async fn query_rows_filtered<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
-) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
-    let (hits, opened, known) =
+) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
+    let (hits, opened, known, dense) =
         run(store, targets, prefetch, filter, shadow, fusion, top_k).await?;
-    resolve_rows(store, targets, &opened, &hits, known).await
+    Ok(resolve_rows(store, targets, &opened, &hits, known)
+        .await?
+        .into_iter()
+        .map(|(h, d)| {
+            let score = dense.get(&(h.segment, h.row)).copied();
+            (h, d, score)
+        })
+        .collect())
 }
 
 /// The data rows of one segment `filter` admits, from its blocks, zone-map pruned.

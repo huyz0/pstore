@@ -686,6 +686,7 @@ async fn a_clustered_query_returns_the_documents_it_should() {
                             p: probe,
                             oversample: 4,
                             rerank,
+                            exact: false,
                         },
                     )
                     .await
@@ -749,6 +750,7 @@ async fn a_clustered_index_keeps_its_recall_in_suite() {
                     p: 8,
                     oversample: 8,
                     rerank: Rerank::Fast,
+                    exact: false,
                 },
             )
             .await
@@ -802,6 +804,7 @@ async fn score_everything(
                 p: clustering.lists().len(),
                 oversample: 1,
                 rerank,
+                exact: false,
             },
         )
         .await

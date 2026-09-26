@@ -45,6 +45,10 @@ pub struct Query {
     pub oversample: usize,
     /// Which rung the answer comes from.
     pub rerank: Rerank,
+    /// Every row scored at full precision, from the `Vectors` section, as a segment without a
+    /// centroid table always is (M9d, `kNN`). ⚠️ Not `Rerank::Exact` over an exhaustive probe:
+    /// that reads every code and then every vector, one round trip deeper, for the same answer.
+    pub exact: bool,
 }
 
 impl Default for Query {
@@ -72,6 +76,7 @@ impl Default for Query {
             // ⚠️ `Fast`, not `None`. C-3: rung 0 alone measures 0.30 recall@10, not the
             // 90-95% `quantization.md` claims, and int8 rides in the same round trip.
             rerank: Rerank::Fast,
+            exact: false,
         }
     }
 }
@@ -564,7 +569,7 @@ impl VecIndex {
         q: Query,
     ) -> Result<Vec<(usize, f32)>, pstore_format::FormatError> {
         let quantizer = Quantizer::new(self.dim.max(1));
-        let Some(centroids) = &self.centroids else {
+        let Some(centroids) = self.centroids.as_ref().filter(|_| !q.exact) else {
             // D-10: no index, so read the vectors and be exactly right.
             let vectors = self.segment.vectors(store, key).await?;
             let mut scored: Vec<(usize, f32)> = vectors

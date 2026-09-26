@@ -235,7 +235,8 @@ async fn attributes_are_absent_unless_asked_for() {
         assert_eq!(rows.len(), 3);
         for row in rows {
             let keys: Vec<&String> = row.as_object().unwrap().keys().collect();
-            assert_eq!(keys, ["id", "score"], "{row}");
+            // `$dist` since M9d: the dense leg scored every row. Still no attributes.
+            assert_eq!(keys, ["$dist", "id", "score"], "{row}");
         }
     }
 }

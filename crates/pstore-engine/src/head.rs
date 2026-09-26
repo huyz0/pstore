@@ -33,6 +33,85 @@ pub struct IndexSchema {
     /// The attribute the text index is built over. **Empty means the fold that recorded this
     /// schema saw no text at all**, which is not the same as a field named "".
     pub text_field: String,
+    /// How its vectors are compared (M9d). `dims` is the **stored** width, which this adds to.
+    pub metric: Metric,
+}
+
+impl IndexSchema {
+    /// The width a client writes and queries: `dims` less what the metric's transform adds.
+    #[must_use]
+    pub fn client_dims(&self) -> u32 {
+        self.dims.saturating_sub(self.metric.extra() as u32)
+    }
+}
+
+/// How an index's vectors are compared (M9d).
+///
+/// ⚠️ **Every metric is ranked as a dot product.** The index's rungs maximise `<q, v>`, so the
+/// others are transforms applied on the write and on the query: cosine normalizes both sides,
+/// and euclidean stores `[v, −‖v‖²/2]` against a query `[q, 1]`, whose dot product
+/// `q·v − ‖v‖²/2` ranks as `−‖q − v‖²`. Nothing below the engine learns what a metric is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Metric {
+    /// `−q·v`. pstore's metric before M9d, so every index without one recorded is this.
+    #[default]
+    DotProduct,
+    /// `1 − cos(q, v)`.
+    CosineDistance,
+    /// `‖q − v‖²`.
+    EuclideanSquared,
+}
+
+impl Metric {
+    /// Its name on the wire, turbopuffer's spelling.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DotProduct => "dot_product",
+            Self::CosineDistance => "cosine_distance",
+            Self::EuclideanSquared => "euclidean_squared",
+        }
+    }
+
+    /// The metric a wire name names.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            Self::DotProduct,
+            Self::CosineDistance,
+            Self::EuclideanSquared,
+        ]
+        .into_iter()
+        .find(|m| m.name() == name)
+    }
+
+    /// Its code in HEAD, and on a row as the reserved `$metric` attribute.
+    #[must_use]
+    pub fn code(self) -> i64 {
+        match self {
+            Self::DotProduct => 0,
+            Self::CosineDistance => 1,
+            Self::EuclideanSquared => 2,
+        }
+    }
+
+    /// The metric a code names.
+    #[must_use]
+    pub fn from_code(code: i64) -> Option<Self> {
+        [
+            Self::DotProduct,
+            Self::CosineDistance,
+            Self::EuclideanSquared,
+        ]
+        .into_iter()
+        .find(|m| m.code() == code)
+    }
+
+    /// Components the stored vector has beyond the client's.
+    #[must_use]
+    pub fn extra(self) -> usize {
+        usize::from(self == Self::EuclideanSquared)
+    }
 }
 
 /// Why a past epoch cannot be answered.
@@ -186,6 +265,18 @@ impl Head {
             put_str(&mut out, key);
             out.extend_from_slice(&rows.to_le_bytes());
         }
+        // M9d: each schema's metric, when it is not the default every older index has.
+        let metrics: Vec<(&String, Metric)> = self
+            .schemas
+            .iter()
+            .filter(|(_, s)| s.metric != Metric::DotProduct)
+            .map(|(name, s)| (name, s.metric))
+            .collect();
+        out.extend_from_slice(&(metrics.len() as u32).to_le_bytes());
+        for (name, metric) in metrics {
+            put_str(&mut out, name);
+            out.push(metric.code() as u8);
+        }
         out
     }
 
@@ -241,6 +332,7 @@ impl Head {
                 IndexSchema {
                     dims: c.u32()?,
                     text_field: c.string()?,
+                    metric: Metric::DotProduct,
                 },
             );
         }
@@ -265,6 +357,18 @@ impl Head {
             let segment = c.string()?;
             let key = c.string()?;
             h.deletes.insert(segment, (key, c.u32()?));
+        }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let metric = Metric::from_code(i64::from(c.u8()?)).ok_or(EngineError::CorruptHead)?;
+            // A metric belongs to a schema; one naming no schema is not a HEAD this wrote.
+            h.schemas
+                .get_mut(&name)
+                .ok_or(EngineError::CorruptHead)?
+                .metric = metric;
         }
         Ok(h)
     }
@@ -405,6 +509,12 @@ impl Cur<'_> {
         let out = self.b.get(self.i..end).ok_or(EngineError::CorruptHead)?;
         self.i = end;
         Ok(out)
+    }
+    fn u8(&mut self) -> Result<u8, EngineError> {
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(EngineError::CorruptHead)
     }
     fn u32(&mut self) -> Result<u32, EngineError> {
         Ok(u32::from_le_bytes(

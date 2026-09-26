@@ -61,9 +61,9 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     // A partially-decoded HEAD would be a partially-visible index: some segments present,
     // others silently absent, reported as success.
     //
-    // ⚠️ **Four cuts now decode, and they are named rather than tolerated.** M7d added the
+    // ⚠️ **Five cuts now decode, and they are named rather than tolerated.** M7d added the
     // schema and reject sections as OPTIONAL trailing ones, M7e added the reap horizon and
-    // M9c the delete vectors,
+    // M9c the delete vectors and M9d the metrics,
     // because every HEAD written before each of them ends where it ends and reading that as
     // corrupt would make every existing store unreadable. The price is that a HEAD truncated
     // *exactly* at one of those boundaries is indistinguishable from an older, complete one.
@@ -80,8 +80,14 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     let no_schemas = encode_without_schemas(&populated()).len();
     assert_eq!(
         decodable,
-        vec![no_schemas, no_schemas + 4, no_schemas + 8, no_schemas + 16],
-        "the only decodable truncations must be the four optional-section boundaries"
+        vec![
+            no_schemas,
+            no_schemas + 4,
+            no_schemas + 8,
+            no_schemas + 16,
+            bytes.len() - 4
+        ],
+        "the only decodable truncations must be the five optional-section boundaries"
     );
     // And what they decode to is the older HEAD, not a partial one.
     let at_boundary = Head::decode(&bytes[..no_schemas]).unwrap();
@@ -159,6 +165,7 @@ fn a_schema_round_trips_with_its_reject_count() {
         pstore_engine::IndexSchema {
             dims: 384,
             text_field: "body".to_owned(),
+            metric: pstore_engine::Metric::DotProduct,
         },
     );
     h.schemas.insert(
@@ -166,6 +173,7 @@ fn a_schema_round_trips_with_its_reject_count() {
         pstore_engine::IndexSchema {
             dims: 4,
             text_field: String::new(),
+            metric: pstore_engine::Metric::DotProduct,
         },
     );
     h.schema_rejects.insert("alpha".to_owned(), 17);
@@ -223,12 +231,13 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
         pstore_engine::IndexSchema {
             dims: 4,
             text_field: String::new(),
+            metric: pstore_engine::Metric::DotProduct,
         },
     );
     h.reaped_before = 77;
     // The horizon as the LAST section, as it was written before M9c.
     h.deletes.clear();
-    let full = &h.encode()[..h.encode().len() - 4];
+    let full = &h.encode()[..h.encode().len() - 8]; // no deletes, no metrics
     let without = &full[..full.len() - 8];
     let decoded = Head::decode(without).expect("a HEAD from before the horizon must decode");
     assert_eq!(decoded.reaped_before, 0);
@@ -253,13 +262,14 @@ fn a_head_without_delete_vectors_decodes_as_none() {
     let full = h.encode();
     let mut older = h.clone();
     older.deletes.clear();
-    let without = &older.encode()[..older.encode().len() - 4];
+    let without = &older.encode()[..older.encode().len() - 8]; // no deletes, no metrics
     let decoded = Head::decode(without).expect("a HEAD from before M9c must decode");
     assert!(decoded.deletes.is_empty());
     assert_eq!(decoded.indexes, h.indexes);
     // A section cut anywhere inside is refused, never read as fewer vectors.
     let start = without.len();
-    for cut in start + 1..full.len() {
+    // Up to the (empty) metric section M9d appended, whose own boundary is a decodable cut.
+    for cut in start + 1..full.len() - 4 {
         assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
     }
     assert_eq!(Head::decode(&full).unwrap().deletes, h.deletes);

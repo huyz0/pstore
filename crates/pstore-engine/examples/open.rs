@@ -186,6 +186,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                             pstore_engine::IndexSchema {
                                 dims: 8,
                                 text_field: String::new(),
+                                metric: pstore_engine::Metric::DotProduct,
                             },
                         )
                     })

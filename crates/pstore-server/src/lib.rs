@@ -288,6 +288,7 @@ impl From<EngineError> for ApiError {
             EngineError::DimensionMismatch { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
+            EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             EngineError::BackendCannotFence { .. } => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
@@ -467,6 +468,17 @@ async fn write_documents<S: BlobStore + 'static>(
             "a write with no documents and no deletes",
         ));
     }
+    // ⚠️ An unknown metric is refused, never read as the default (M9d): a client that asked
+    // for cosine and got dot products would be told nothing.
+    let metric = match req.distance_metric.as_deref() {
+        None => pstore_engine::Metric::DotProduct,
+        Some(name) => pstore_engine::Metric::parse(name).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "distance_metric {name:?} is not one of cosine_distance, euclidean_squared, \
+                 dot_product"
+            ))
+        })?,
+    };
     // ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
     // the segment layout cannot store. A zero-dimension vector is storable and meaningless,
     // and a batch whose vectors disagree makes the *index's* dimension depend on which
@@ -500,7 +512,7 @@ async fn write_documents<S: BlobStore + 'static>(
         .collect::<Result<_, _>>()?;
     let written = docs.len();
     if !docs.is_empty() {
-        engine.write(&index, docs).await?;
+        engine.write_as(&index, docs, metric).await?;
     }
     // After the documents: a request that writes and deletes an id deletes it.
     let deleted = req.deletes.len();
@@ -589,10 +601,11 @@ async fn query_index<S: BlobStore + 'static>(
     let results = engine
         .resolve_rows(&answer)
         .into_iter()
-        .map(|(id, score, attrs)| ResultRow {
+        .map(|(id, score, attrs, dist)| ResultRow {
             attributes: selected(&req, &attrs),
             id,
             score,
+            dist,
         })
         .collect();
     Ok(axum::Json(QueryResponse {
@@ -637,7 +650,8 @@ async fn index_summary<S: BlobStore + 'static>(
         epoch: s.epoch.0,
         unfolded,
         schema: s.schema.map(|sc| SchemaOut {
-            dims: sc.dims,
+            dims: sc.client_dims(),
+            distance_metric: sc.metric.name(),
             text_field: sc.text_field,
         }),
         rejected_rows: s.rejected_rows,
@@ -765,7 +779,10 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
                 .unwrap_or_else(|| pstore_format::DEFAULT_FIELD.to_owned()),
             query: v.clone(),
             limit: req.top_k,
-            tune: pstore_index::vec_index::Query::default(),
+            tune: pstore_index::vec_index::Query {
+                exact: req.exact,
+                ..pstore_index::vec_index::Query::default()
+            },
         });
     }
     if let Some(t) = &req.text {
@@ -797,6 +814,11 @@ fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
     for (name, value) in &d.attributes {
         if name.is_empty() {
             return Err(refuse(name, "has an empty name"));
+        }
+        // `$` names are the engine's (M9d: `$metric` carries a row's metric to the fold), as
+        // turbopuffer reserves them for `$dist`.
+        if name.starts_with('$') {
+            return Err(refuse(name, "is reserved: names beginning `$` are"));
         }
         // `id` in a filter always means the document id (M9b); an attribute of that name
         // would give `["id", "Eq", x]` two meanings.
@@ -1137,4 +1159,30 @@ pub async fn serve<S: BlobStore + 'static>(
     axum::serve(listener, api.router())
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    fn dense_tune(body: serde_json::Value) -> pstore_index::vec_index::Query {
+        let req: QueryRequest = serde_json::from_value(body).unwrap();
+        match prefetch(&req).unwrap().first() {
+            Some(pstore_query::Prefetch::Dense { tune, .. }) => *tune,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_reaches_the_dense_leg() {
+        // Code review of M9d: every server corpus is below the exact-scan threshold, so no
+        // API test can tell a dropped `exact` from a forwarded one.
+        assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
+        assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
+    }
 }

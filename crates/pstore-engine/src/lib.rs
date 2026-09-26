@@ -6,7 +6,7 @@ mod head;
 pub mod lanes;
 
 pub use bundle::Entry;
-pub use head::{Head, HeadAt, IndexSchema, SegmentRef, TimeTravel};
+pub use head::{Head, HeadAt, IndexSchema, Metric, SegmentRef, TimeTravel};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{Document, Filter, Segment};
@@ -78,6 +78,11 @@ pub enum EngineError {
         /// What was observed of it.
         observed: String,
     },
+    /// A vector the index's metric cannot measure (M9d), as a document or a query: a zero
+    /// vector under `cosine_distance`, or one whose squared norm overflows `f32`. A client's
+    /// error, typed so it can be answered as one.
+    #[error("{0}: the vector's norm is zero or too large for the index's distance metric")]
+    Unmeasurable(String),
     /// The query vector's dimension is not the indexed field's.
     ///
     /// ⚠️ **Typed, and the only query failure that is**, because it is the one a *client*
@@ -346,6 +351,9 @@ struct Fresh {
     /// index's segments are hidden (M9c.2). ⚠️ From the SAME memtable snapshot as `rows`, so a
     /// write landing between the two cannot show both versions of an id.
     shadow: std::collections::HashSet<String>,
+    /// The metric the unfolded rows were written under, when there are any (M9d): what a query
+    /// of an index with no schema yet transforms by.
+    metric: Option<Metric>,
 }
 
 /// The attribute name marking a tombstone (M9c.2): **empty**, which the write door refuses and
@@ -364,6 +372,65 @@ fn tombstone(id: String) -> Document {
 /// Whether an operation is a delete.
 fn is_tombstone(d: &Document) -> bool {
     d.attrs.contains_key(TOMBSTONE)
+}
+
+/// The reserved attribute a row carries its metric in, from the write to the fold (M9d).
+/// Stripped before anything is sealed; absent means `dot_product`.
+const METRIC_ATTR: &str = "$metric";
+
+/// The metric a row was written under.
+fn metric_of(d: &Document) -> Metric {
+    match d.attrs.get(METRIC_ATTR) {
+        Some(pstore_format::Value::Int(code)) => Metric::from_code(*code).unwrap_or_default(),
+        _ => Metric::DotProduct,
+    }
+}
+
+/// The row as it is sealed and served: without its metric.
+fn stripped(mut d: Document) -> Document {
+    d.attrs.remove(METRIC_ATTR);
+    d
+}
+
+/// `v` as `metric` stores it (M9d), or `None` when the metric cannot measure it: a zero
+/// vector under cosine has no direction, and -- code review -- a finite vector whose squared
+/// norm overflows `f32` would be stored as zeros under cosine and with a `-inf` component
+/// under euclidean.
+fn transform_stored(metric: Metric, v: &[f32]) -> Option<Vec<f32>> {
+    let norm2: f32 = v.iter().map(|x| x * x).sum();
+    match metric {
+        Metric::DotProduct => Some(v.to_vec()),
+        Metric::CosineDistance => (norm2 > 0.0 && norm2.is_finite()).then(|| {
+            let n = norm2.sqrt();
+            v.iter().map(|x| x / n).collect()
+        }),
+        Metric::EuclideanSquared => norm2
+            .is_finite()
+            .then(|| v.iter().copied().chain([-norm2 / 2.0]).collect()),
+    }
+}
+
+/// A query as `metric` scores it, or `None` as [`transform_stored`] refuses one (M9d).
+fn transform_query(metric: Metric, q: &[f32]) -> Option<Vec<f32>> {
+    match metric {
+        Metric::EuclideanSquared => q
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .is_finite()
+            .then(|| q.iter().copied().chain([1.0]).collect()),
+        other => transform_stored(other, q),
+    }
+}
+
+/// The distance a dense score is, under `metric`, for a query of squared norm `q2` (M9d).
+/// Clamped to the metric's range, which rounding alone can leave.
+fn distance(metric: Metric, score: f32, q2: f32) -> f32 {
+    match metric {
+        Metric::DotProduct => -score,
+        Metric::CosineDistance => (1.0 - score).clamp(0.0, 2.0),
+        Metric::EuclideanSquared => (q2 - 2.0 * score).max(0.0),
+    }
 }
 
 /// Each id's **newest** operation, in the order those operations arrived (M9c.2).
@@ -430,6 +497,7 @@ struct FreshView {
     rows: Vec<Document>,
     store: Arc<pstore_blob::MemoryStore>,
     shadow: std::collections::HashSet<String>,
+    metric: Option<Metric>,
 }
 
 impl Fresh {
@@ -439,6 +507,7 @@ impl Fresh {
             rows: self.rows.clone(),
             store: Arc::clone(&self.store),
             shadow: self.shadow.clone(),
+            metric: self.metric,
         }
     }
 }
@@ -477,6 +546,9 @@ pub struct Answer {
     /// ⚠️ From the same blocks that produced [`Self::ids`] (M9a): the block is the unit of
     /// both, so carrying the attributes costs no request and no byte.
     pub attributes: Vec<std::collections::BTreeMap<String, pstore_format::Value>>,
+    /// Each hit's distance under the index's metric, in `hits` order, when the query's first
+    /// dense leg scored it (M9d): `$dist`. Smaller is nearer under every metric.
+    pub dists: Vec<Option<f32>>,
     /// The segments HEAD named for this index **when the answer was computed**, in the order
     /// every `Hit::segment` below [`Self::unfolded_at`] indexes.
     ///
@@ -488,6 +560,14 @@ pub struct Answer {
     /// without asking again.
     pub segments: Vec<SegmentRef>,
 }
+
+/// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
+pub type Resolved = (
+    String,
+    f32,
+    std::collections::BTreeMap<String, pstore_format::Value>,
+    Option<f32>,
+);
 
 /// What HEAD knows about one index, without reading a single segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,13 +790,21 @@ impl<S: BlobStore> Engine<S> {
     /// one function, so a wrong-width row that was not first in the batch was sealed into the
     /// segment undetected — a mixed-width segment, which no later guard can refuse, because a
     /// segment declares one width and scores every row against it.
-    fn implied(&self, docs: &[Document]) -> (Option<u32>, Option<String>) {
-        let dims = docs
-            .iter()
-            .find(|d| !is_tombstone(d))
-            .map(|d| d.vector().len() as u32);
+    ///
+    /// ⚠️ The metric too (M9d), from the same first row: the schema a fold creates is recorded
+    /// BEFORE its reject pass, so the other rows are checked against it.
+    fn implied(&self, docs: &[Document]) -> head::IndexSchema {
+        let first = docs.iter().find(|d| !is_tombstone(d));
         let has_text = docs.iter().any(|d| self.carries_text(d));
-        (dims, has_text.then(|| self.text_field.clone()))
+        head::IndexSchema {
+            dims: first.map_or(0, |d| d.vector().len() as u32),
+            text_field: if has_text {
+                self.text_field.clone()
+            } else {
+                String::new()
+            },
+            metric: first.map(metric_of).unwrap_or_default(),
+        }
     }
 
     /// Whether this row has text in the attribute this process indexes.
@@ -742,13 +830,25 @@ impl<S: BlobStore> Engine<S> {
         if is_tombstone(doc) {
             return None;
         }
+        // The metric first (M9d): cosine and dot have one width, so only this tells them apart.
+        let metric = metric_of(doc);
+        if metric != schema.metric {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "the distance metric",
+                expected: schema.metric.name().to_owned(),
+                got: metric.name().to_owned(),
+            });
+        }
         let dims = doc.vector().len() as u32;
         if dims != schema.dims {
+            // In the width the client wrote: the metric's transform is not theirs to know.
+            let extra = metric.extra() as u32;
             return Some(EngineError::SchemaConflict {
                 index: index.to_owned(),
                 what: "the vector width",
-                expected: schema.dims.to_string(),
-                got: dims.to_string(),
+                expected: schema.client_dims().to_string(),
+                got: dims.saturating_sub(extra).to_string(),
             });
         }
         if !schema.text_field.is_empty()
@@ -902,7 +1002,49 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// Buffers documents. **Visible immediately**; durable at the next [`Self::flush`].
+    ///
+    /// Under `dot_product`, the metric of every index before M9d: see [`Self::write_as`].
     pub async fn write(&self, index: &str, docs: Vec<Document>) -> Result<(), EngineError> {
+        self.write_as(index, docs, Metric::DotProduct).await
+    }
+
+    /// [`Self::write`], under `metric` (M9d): each dense vector is stored as the metric's
+    /// transform, and the row carries the metric to the fold, which records it in the index's
+    /// schema. A metric contradicting the index's is refused exactly where a width is.
+    ///
+    /// # Errors
+    /// As [`Self::write`]; and a zero vector under `cosine_distance`, which has no direction,
+    /// or an attribute whose name begins `$`, which is reserved.
+    pub async fn write_as(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+    ) -> Result<(), EngineError> {
+        let mut docs = docs;
+        for d in &mut docs {
+            if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
+                return Err(EngineError::Format(format!(
+                    "document {}: attribute `{name}` is reserved: names beginning `$` are",
+                    d.id
+                )));
+            }
+            for field in d.vectors.values_mut() {
+                if let pstore_format::VectorField::Dense(vs) = field {
+                    for v in vs.iter_mut() {
+                        *v = transform_stored(metric, v).ok_or_else(|| {
+                            EngineError::Unmeasurable(format!("document {}", d.id))
+                        })?;
+                    }
+                }
+            }
+            if metric != Metric::DotProduct {
+                d.attrs.insert(
+                    METRIC_ATTR.to_owned(),
+                    pstore_format::Value::Int(metric.code()),
+                );
+            }
+        }
         // ⚠️ Refused at the DOOR, not at the fold. The document model expresses named,
         // plural and sparse fields; the segment layout stores one dense vector until M3b.3.
         // Accepting a document here and discovering at fold time that it cannot be stored
@@ -954,13 +1096,24 @@ impl<S: BlobStore> Engine<S> {
             .chain(m.durable_rows(index))
             .find(|d| !is_tombstone(d))
             .or_else(|| docs.first())
-            .map(|d| d.vector().len());
-        if let Some(expected) = known
+            .map(|d| (metric_of(d), d.vector().len()));
+        // ⚠️ And one metric (M9d), on the same rung: cosine and dot have one width.
+        if let Some((known_metric, _)) = known
+            && known_metric != metric
+        {
+            return Err(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "the distance metric",
+                expected: known_metric.name().to_owned(),
+                got: metric.name().to_owned(),
+            });
+        }
+        if let Some((_, expected)) = known
             && let Some(odd) = docs.iter().find(|d| d.vector().len() != expected)
         {
             return Err(EngineError::DimensionMismatch {
-                expected,
-                got: odd.vector().len(),
+                expected: expected.saturating_sub(metric.extra()),
+                got: odd.vector().len().saturating_sub(metric.extra()),
             });
         }
         m.buffer(index, docs);
@@ -1060,7 +1213,7 @@ impl<S: BlobStore> Engine<S> {
     pub fn resolve(&self, answer: &Answer) -> Vec<(String, f32)> {
         self.resolve_rows(answer)
             .into_iter()
-            .map(|(id, score, _)| (id, score))
+            .map(|(id, score, _, _)| (id, score))
             .collect()
     }
 
@@ -1069,14 +1222,7 @@ impl<S: BlobStore> Engine<S> {
     /// A hit on the unfolded rows takes its attributes from the row itself; any other from
     /// [`Answer::attributes`], which came with its id.
     #[must_use]
-    pub fn resolve_rows(
-        &self,
-        answer: &Answer,
-    ) -> Vec<(
-        String,
-        f32,
-        std::collections::BTreeMap<String, pstore_format::Value>,
-    )> {
+    pub fn resolve_rows(&self, answer: &Answer) -> Vec<Resolved> {
         answer
             .hits
             .iter()
@@ -1095,7 +1241,8 @@ impl<S: BlobStore> Engine<S> {
                         .flatten()
                         .map(|id| (id, answer.attributes.get(i).cloned().unwrap_or_default()))
                 };
-                row.map(|(id, attrs)| (id, h.score, attrs))
+                let dist = answer.dists.get(i).copied().flatten();
+                row.map(|(id, attrs)| (id, h.score, attrs, dist))
             })
             .collect()
     }
@@ -1291,8 +1438,17 @@ impl<S: BlobStore> Engine<S> {
             // ⚠️ Before `seal`, so a contradiction costs **zero write-class requests** and
             // cannot orphan an object no HEAD will ever name.
             let mut rejects: BTreeMap<String, u64> = BTreeMap::new();
+            // ⚠️ **A new index's schema is implied BEFORE the pass, and the pass runs against it**
+            // (M9d, spec review): skipping the pass for a new index sealed two writers' first
+            // rows together whatever they disagreed on -- same width, different metrics, and
+            // nothing counted.
+            let created: BTreeMap<String, head::IndexSchema> = by_index
+                .iter()
+                .filter(|(idx, _)| !at.head.schemas.contains_key(*idx))
+                .map(|(idx, docs)| (idx.clone(), self.implied(docs)))
+                .collect();
             for (idx, docs) in &mut by_index {
-                let Some(schema) = at.head.schemas.get(idx) else {
+                let Some(schema) = at.head.schemas.get(idx).or_else(|| created.get(idx)) else {
                     continue;
                 };
                 // ⚠️ **Per row, not per index.** Dropping the whole index's rows would
@@ -1345,17 +1501,12 @@ impl<S: BlobStore> Engine<S> {
                 // vectors records no text field, so a differently-configured process may
                 // still fold into it.
                 if !next.schemas.contains_key(idx) {
-                    let (dims, text) = self.implied(docs);
-                    next.schemas.insert(
-                        idx.clone(),
-                        head::IndexSchema {
-                            dims: dims.unwrap_or(0),
-                            text_field: text.unwrap_or_default(),
-                        },
-                    );
+                    next.schemas.insert(idx.clone(), self.implied(docs));
                 }
                 let seg_key = self.segment_key(next.epoch, idx);
-                self.seal(&seg_key, docs, &self.text_field).await?;
+                // Without `$metric` (M9d): the schema holds it now, and a segment never does.
+                let sealed: Vec<Document> = docs.iter().cloned().map(stripped).collect();
+                self.seal(&seg_key, &sealed, &self.text_field).await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -1910,7 +2061,7 @@ impl<S: BlobStore> Engine<S> {
             out.retain(|d| !shadow.contains(d.id.as_str()));
             for d in newest(unfolded) {
                 if !is_tombstone(&d) && filter.is_none_or(|f| f.matches(&d)) {
-                    out.push(d);
+                    out.push(stripped(d));
                 }
             }
             return Ok(out);
@@ -1965,6 +2116,9 @@ impl<S: BlobStore> Engine<S> {
             .into_iter()
             .filter(|d| !is_tombstone(d))
             .collect();
+        // The metric read, then stripped (M9d): no segment, fresh ones included, stores it.
+        let metric = rows.first().map(metric_of);
+        let rows: Vec<Document> = rows.into_iter().map(stripped).collect();
         if rows.is_empty() {
             let fresh = Fresh {
                 generation,
@@ -1973,6 +2127,7 @@ impl<S: BlobStore> Engine<S> {
                 target: None,
                 rows,
                 shadow,
+                metric,
             };
             let view = fresh.view();
             *slot = Some(fresh);
@@ -2041,6 +2196,7 @@ impl<S: BlobStore> Engine<S> {
             target: Some(target),
             rows: ordered,
             shadow,
+            metric,
         };
         let view = fresh.view();
         *slot = Some(fresh);
@@ -2098,18 +2254,29 @@ impl<S: BlobStore> Engine<S> {
 
         // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
         // even when every such operation was a delete and there is no fresh segment at all.
-        let (unfolded, fresh_store, shadow) = match fresh {
+        let (unfolded, fresh_store, shadow, fresh_metric) = match fresh {
             Some(v) => {
                 targets.extend(v.target);
-                (v.rows, Some(v.store), v.shadow)
+                (v.rows, Some(v.store), v.shadow, v.metric)
             }
-            None => (Vec::new(), None, std::collections::HashSet::new()),
+            None => (Vec::new(), None, std::collections::HashSet::new(), None),
         };
+        // From the HEAD already read, or -- an index not yet folded -- from its unfolded rows.
+        let metric = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.metric)
+            .or(fresh_metric)
+            .unwrap_or_default();
+        let (prefetch, q2) = scored_by(metric, prefetch)?;
+        let prefetch = prefetch.as_slice();
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
                 ids: Vec::new(),
                 attributes: Vec::new(),
+                dists: Vec::new(),
                 unfolded,
                 unfolded_at,
                 segments: refs,
@@ -2127,18 +2294,13 @@ impl<S: BlobStore> Engine<S> {
             &store, &targets, prefetch, filter, &shadow, fusion, top_k,
         )
         .await
-        .map_err(|e| match e {
-            pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
-                expected,
-                got,
-            }) => EngineError::DimensionMismatch { expected, got },
-            other => EngineError::Query(other.to_string()),
-        })?;
-        let (hits, ids, attributes) = split_rows(resolved);
+        .map_err(|e| query_error(metric, e))?;
+        let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
         Ok(Answer {
             hits,
             ids,
             attributes,
+            dists,
             unfolded,
             unfolded_at,
             segments: refs,
@@ -2210,6 +2372,7 @@ impl<S: BlobStore> Engine<S> {
                 hits: Vec::new(),
                 ids: Vec::new(),
                 attributes: Vec::new(),
+                dists: Vec::new(),
                 unfolded: Vec::new(),
                 unfolded_at: 0,
                 segments: refs,
@@ -2222,28 +2385,31 @@ impl<S: BlobStore> Engine<S> {
         // an empty list and vanish. The test found it; the live path has always used this
         // value for the same reason.
         let unfolded_at = refs.len();
+        // A schema is immutable, so the present's says what the past's did (M9d).
+        let metric = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.metric)
+            .unwrap_or_default();
+        let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
             &*self.store,
             &targets,
-            prefetch,
+            &prefetch,
             filter,
             &std::collections::HashSet::new(),
             fusion,
             top_k,
         )
         .await
-        .map_err(|e| match e {
-            pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
-                expected,
-                got,
-            }) => EngineError::DimensionMismatch { expected, got },
-            other => EngineError::Query(other.to_string()),
-        })?;
-        let (hits, ids, attributes) = split_rows(resolved);
+        .map_err(|e| query_error(metric, e))?;
+        let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
         Ok(Answer {
             hits,
             ids,
             attributes,
+            dists,
             unfolded: Vec::new(),
             unfolded_at,
             segments: refs,
@@ -2355,17 +2521,22 @@ fn segment_targets(
     reason = "the three columns `Answer` stores, named there; a struct here would be `Answer` again"
 )]
 fn split_rows(
-    resolved: Vec<(pstore_query::Hit, Option<Document>)>,
+    resolved: Vec<(pstore_query::Hit, Option<Document>, Option<f32>)>,
+    metric: Metric,
+    q2: f32,
 ) -> (
     Vec<pstore_query::Hit>,
     Vec<Option<String>>,
     Vec<std::collections::BTreeMap<String, pstore_format::Value>>,
+    Vec<Option<f32>>,
 ) {
     let mut hits = Vec::with_capacity(resolved.len());
     let mut ids = Vec::with_capacity(resolved.len());
     let mut attributes = Vec::with_capacity(resolved.len());
-    for (h, d) in resolved {
+    let mut dists = Vec::with_capacity(resolved.len());
+    for (h, d, score) in resolved {
         hits.push(h);
+        dists.push(score.map(|s| distance(metric, s, q2)));
         match d {
             Some(d) => {
                 ids.push(Some(d.id));
@@ -2377,7 +2548,62 @@ fn split_rows(
             }
         }
     }
-    (hits, ids, attributes)
+    (hits, ids, attributes, dists)
+}
+
+/// The legs as `metric` scores them (M9d): each dense query transformed. With the squared
+/// norm of the first dense leg's query, which `$dist` needs under `euclidean_squared`.
+///
+/// ⚠️ **The probe is unchanged, by measurement.** Spec review argued an L2 probe over
+/// transformed centroids is swamped by the augmented component; the dot-product probe it
+/// proposed measured no better (`a_clustered_segment_recalls_under_every_metric`, M9d's
+/// VERIFIED.md), so the one probe every index has stays.
+///
+/// # Errors
+/// A zero dense query under `cosine_distance`: it has no direction to compare.
+fn scored_by(
+    metric: Metric,
+    prefetch: &[pstore_query::Prefetch],
+) -> Result<(Vec<pstore_query::Prefetch>, f32), EngineError> {
+    let mut q2 = None;
+    let legs = prefetch
+        .iter()
+        .map(|leg| match leg {
+            pstore_query::Prefetch::Dense {
+                field,
+                query,
+                limit,
+                tune,
+            } => {
+                q2.get_or_insert_with(|| query.iter().map(|x| x * x).sum::<f32>());
+                let query = transform_query(metric, query)
+                    .ok_or_else(|| EngineError::Unmeasurable("the query".to_owned()))?;
+                Ok(pstore_query::Prefetch::Dense {
+                    field: field.clone(),
+                    query,
+                    limit: *limit,
+                    tune: *tune,
+                })
+            }
+            other => Ok(other.clone()),
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok((legs, q2.unwrap_or(0.0)))
+}
+
+/// A query's error as the engine reports it: a width mismatch in the width the CLIENT used,
+/// not the stored one the metric's transform widened (M9d).
+fn query_error(metric: Metric, e: pstore_query::QueryError) -> EngineError {
+    match e {
+        pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
+            expected,
+            got,
+        }) => EngineError::DimensionMismatch {
+            expected: expected.saturating_sub(metric.extra()),
+            got: got.saturating_sub(metric.extra()),
+        },
+        other => EngineError::Query(other.to_string()),
+    }
 }
 
 #[cfg(test)]

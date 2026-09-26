@@ -25,6 +25,8 @@ axum          = { version = "0.8", default-features = false, features = ["http1"
 # emulator-integration feature for a probe example, not a shipping image's dependency set —
 # and the GCS client is one the capability matrix says must never be a CAS target.
 object_store  = { version = "0.14.1", features = ["aws"] }
+# D-36: a vector may arrive as base64 of little-endian `f32`s (M9d). Already in the lockfile.
+base64        = "0.22"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 thiserror     = "2"
