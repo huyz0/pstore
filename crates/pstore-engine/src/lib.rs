@@ -593,6 +593,9 @@ pub struct IndexStats {
     pub epoch: Epoch,
     /// What its rows must look like, once a fold has recorded it.
     pub schema: Option<head::IndexSchema>,
+    /// The epoch of the last commit that rewrote its segments or their delete vectors -- a
+    /// fold into it, a fold deleting from it, a compaction -- or `None` with no segment (M9f).
+    pub updated_epoch: Option<Epoch>,
     /// Rows a fold **discarded** because they contradicted that schema. ⚠️ Acknowledged
     /// writes, dropped rather than allowed to stop the tenant, and reported so the discard
     /// is visible rather than silent.
@@ -1186,6 +1189,7 @@ impl<S: BlobStore> Engine<S> {
         // Every path that reads HEAD warms the door's schema cache, so the check costs a
         // request only for a process that has never read one.
         self.remember_schemas(&at.head);
+        self.prune_to(&at.head);
         Ok(at.head.indexes.into_keys().collect())
     }
 
@@ -1198,7 +1202,20 @@ impl<S: BlobStore> Engine<S> {
     pub async fn index_stats(&self, index: &str) -> Result<Option<IndexStats>, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.remember_schemas(&at.head);
+        self.prune_to(&at.head);
         Ok(at.head.indexes.get(index).map(|refs| IndexStats {
+            // The newest commit that rewrote its segments or their delete vectors (M9f): both
+            // keys carry the epoch they were written at, and a retry re-derives them.
+            updated_epoch: refs
+                .iter()
+                .filter_map(|r| head::key_epoch(&r.key))
+                .chain(
+                    refs.iter()
+                        .filter_map(|r| at.head.deletes.get(&r.key))
+                        .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
+                )
+                .max()
+                .map(Epoch),
             segments: refs.len() as u64,
             // Live rows: a segment's deleted rows are not documents (M9c.2).
             documents: refs
@@ -1212,6 +1229,13 @@ impl<S: BlobStore> Engine<S> {
             schema: at.head.schemas.get(index).cloned(),
             rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
         }))
+    }
+
+    /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
+    /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
+    /// than a prune this engine already did changes nothing.
+    fn prune_to(&self, head: &Head) {
+        let _ = self.mem().prune(self.watermark(head));
     }
 
     /// Turns an [`Answer`]'s hits into `(id, score)` pairs. **Issues no requests.**

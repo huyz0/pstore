@@ -271,15 +271,38 @@ pub struct IndexSummary {
     /// contradicted the schema. Reported because a discard nobody can see is indistinguishable
     /// from a bug — and because the alternative to discarding was stopping the tenant.
     pub rejected_rows: u64,
+    /// The epoch of the last commit that rewrote its segments or their delete vectors, or
+    /// `null` before its first fold (M9f).
+    pub updated_epoch: Option<u64>,
+    /// `documents`, under turbopuffer's name (M9f).
+    pub approx_row_count: u64,
     /// What the summary cost.
     pub cost: Cost,
+}
+
+/// `GET /v1/indexes?prefix=&cursor=&page_size=` (M9f).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListParams {
+    /// Only names beginning with this.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Only names strictly after this.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// At most this many, 1 to 1000; 100 when absent. A string, so a bad value is this API's
+    /// refusal rather than the extractor's.
+    #[serde(default)]
+    pub page_size: Option<String>,
 }
 
 /// `GET /v1/indexes`.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexList {
-    /// Every index HEAD names, **unioned with this process's unfolded ones**, in name order.
+    /// Every index HEAD names, **unioned with this process's unfolded ones**, in name order:
+    /// one page of them (M9f).
     pub indexes: Vec<String>,
+    /// The cursor for the next page -- the last name on this one -- or `null` on the last.
+    pub next_cursor: Option<String>,
     /// What the enumeration cost. Zero LISTs, which is the claim worth reporting.
     pub cost: Cost,
 }

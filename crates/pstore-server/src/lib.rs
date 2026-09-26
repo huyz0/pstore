@@ -30,8 +30,8 @@ use types::Schema as SchemaOut;
 
 mod types;
 pub use types::{
-    Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, QueryMeta,
-    QueryRequest, QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
+    Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
+    QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -647,6 +647,7 @@ async fn index_summary<S: BlobStore + 'static>(
         epoch: engine.epoch(),
         schema: None,
         rejected_rows: 0,
+        updated_epoch: None,
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -660,6 +661,8 @@ async fn index_summary<S: BlobStore + 'static>(
             text_field: sc.text_field,
         }),
         rejected_rows: s.rejected_rows,
+        updated_epoch: s.updated_epoch.map(|e| e.0),
+        approx_row_count: s.documents,
         cost: api.spend(tenant).since(before),
     }))
 }
@@ -668,8 +671,20 @@ async fn index_summary<S: BlobStore + 'static>(
 async fn list_indexes<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     headers: HeaderMap,
+    Query(params): Query<ListParams>,
 ) -> Result<axum::Json<IndexList>, ApiError> {
     let tenant = tenant_of(&headers)?;
+    // 1 to 1000, 100 when absent (M9f): refused past either edge, never clamped.
+    let page_size = match params.page_size.as_deref() {
+        None => 100,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("page_size {raw:?} is not an integer 1 to 1000"))
+            })?,
+    };
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // ⚠️ **One read, never a LIST.** A LIST over the tenant's prefix is the obvious
@@ -678,8 +693,23 @@ async fn list_indexes<S: BlobStore + 'static>(
     names.extend(engine.pending_indexes().await);
     names.sort_unstable();
     names.dedup();
+    // Byte order, strictly after the cursor: a name is on exactly one page of a stable list.
+    let prefix = params.prefix.unwrap_or_default();
+    let cursor = params.cursor.unwrap_or_default();
+    let mut page: Vec<String> = names
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && n.as_str() > cursor.as_str())
+        .take(page_size + 1)
+        .collect();
+    let next_cursor = if page.len() > page_size {
+        page.truncate(page_size);
+        page.last().cloned()
+    } else {
+        None
+    };
     Ok(axum::Json(IndexList {
-        indexes: names,
+        indexes: page,
+        next_cursor,
         cost: api.spend(tenant).since(before),
     }))
 }

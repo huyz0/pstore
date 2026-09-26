@@ -202,7 +202,7 @@ pub(crate) fn dv_key(segment: &str, epoch: u64, lane: u64) -> String {
 }
 
 /// The segment and epoch a delete-vector key names, or `None` for any other key.
-fn dv_of(key: &str) -> Option<(&str, u64)> {
+pub(crate) fn dv_of(key: &str) -> Option<(&str, u64)> {
     let (segment, stamp) = key.strip_suffix(".dv")?.rsplit_once('.')?;
     let (epoch, _lane) = stamp.split_once('-')?;
     Some((segment, epoch.parse().ok()?))
