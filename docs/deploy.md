@@ -40,11 +40,16 @@ code cannot go undocumented. ⚠️ The *prose* under each heading is hand-writt
 compares it to the constant's one-line summary — this list cannot fall behind, but it can
 disagree in detail.
 
-### `fold` — nothing folds on a timer
+### `fold` — a scheduled fold runs, for the tenants each server wrote
 
-Call `POST /v1/admin/fold` on a schedule, once per tenant per lane. Bundles that are never
-folded accumulate forever and are read on every query: freshness is a read cost, and an
-unfolded tenant is a tenant whose queries get slower without bound.
+Each server folds, on its own, every tenant it wrote whose unfolded bundles reach 1 MiB or
+are an hour old (M9i.1, D-39; `PSTORE_FOLD_*` below). Until a fold commits, a durable write is
+visible only to the process that wrote it: queries read HEAD and the segments it names, never
+a bundle, so another process simply does not see the write yet.
+
+⚠️ **What is still yours:** a tenant whose only writer died, or restarted, keeps its unfolded
+bundles until some process writes that tenant again or you call `POST /v1/admin/fold` for it.
+A fold is tenant-wide, so any live writer of the tenant folds a dead writer's bundles too.
 
 ### `reap` — nothing collects garbage on a timer
 
@@ -77,6 +82,10 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_BUCKET` | `pstore` | Must exist; the server does not create it. |
 | `PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY` | the provider's credential chain | ⚠️ **Unset is the deployed case**: an instance profile or a service-account role. Both halves or neither — half a pair is ignored. |
 | `PSTORE_REGION` | `us-east-1` | |
+| `PSTORE_FOLD` | on | Exactly `off` disables the scheduled fold; anything else is refused. |
+| `PSTORE_FOLD_PERIOD_MS` | `1000` | How often the fold loop looks. Looking costs no request. |
+| `PSTORE_FOLD_AGE_S` | `3600` | A tenant is folded once its oldest unfolded write is this old. Shorter means faster visibility to other processes, and more folds: D-39 prices it. |
+| `PSTORE_FOLD_BYTES` | `1048576` | ...or once its unfolded bundles total this many bytes. |
 
 ## Observability
 

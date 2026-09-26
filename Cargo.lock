@@ -1225,6 +1225,7 @@ dependencies = [
 name = "pstore-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "bytes",

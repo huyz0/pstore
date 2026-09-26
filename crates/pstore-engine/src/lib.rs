@@ -160,6 +160,15 @@ pub(crate) fn require_fencing<S: BlobStore + ?Sized>(store: &S) -> Result<(), En
     }
 }
 
+/// What a process has flushed and not yet seen folded (M9i.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unfolded {
+    /// When the oldest such batch became durable.
+    pub oldest: tokio::time::Instant,
+    /// The bundles' total encoded size.
+    pub bytes: u64,
+}
+
 /// Rows written but not yet folded, held in memory and served by queries.
 ///
 /// This is the freshness layer: **visibility does not wait on the fold**, so the flush
@@ -178,6 +187,9 @@ struct Memtable {
     /// this lane left the rows here, served twice. Now a batch is dropped only when a HEAD's
     /// watermark for this lane is past its sequence, whoever folded it.
     durable: Vec<(u64, BTreeMap<String, Vec<Document>>)>,
+    /// Beside each durable batch, by sequence: when it became durable and its bundle's size
+    /// (M9i.1). What a scheduled fold decides from, without a request.
+    stamps: BTreeMap<u64, (tokio::time::Instant, u64)>,
     /// Every batch below this sequence is known folded and has been dropped. A query holding a
     /// HEAD whose watermark is below it would be missing rows its HEAD does not have yet, and
     /// re-reads HEAD instead.
@@ -215,6 +227,7 @@ impl Memtable {
         // watermark finds it; above `pruned`, an older watermark's `retain` removes nothing.
         let before = self.durable.len();
         self.durable.retain(|(seq, _)| *seq >= watermark);
+        self.stamps.retain(|seq, _| *seq >= watermark);
         if self.durable.len() != before {
             self.generation += 1;
         }
@@ -1274,6 +1287,27 @@ impl<S: BlobStore> Engine<S> {
     /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
     /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
     /// than a prune this engine already did changes nothing.
+    /// What this process has flushed and nobody is yet known to have folded (M9i.1): the
+    /// oldest batch's instant and the bundles' total size. **Issues no request.**
+    ///
+    /// ⚠️ A batch below `pruned` is excluded: it is one a fold already folded, pushed by a
+    /// flush that lost the race (see `flush_inner`). The next `prune` removes it; until then it
+    /// must not make the tenant due.
+    #[must_use]
+    pub fn unfolded(&self) -> Option<Unfolded> {
+        let m = self.mem();
+        let live = m.stamps.range(m.pruned..).map(|(_, v)| *v);
+        live.fold(None, |acc: Option<Unfolded>, (at, bytes)| {
+            Some(match acc {
+                None => Unfolded { oldest: at, bytes },
+                Some(u) => Unfolded {
+                    oldest: u.oldest.min(at),
+                    bytes: u.bytes + bytes,
+                },
+            })
+        })
+    }
+
     fn prune_to(&self, head: &Head) {
         let _ = self.mem().prune(self.watermark(head));
     }
@@ -1412,9 +1446,9 @@ impl<S: BlobStore> Engine<S> {
         // Burning a number on a failed write punches a permanent hole, and every bundle after
         // it -- all acknowledged, all durable -- becomes invisible to every future reader. Found
         // by the OQ-91 scenario losing two acknowledged rows on seed 0, not by reading this code.
-        self.store
-            .put(&self.lane_key(seq), bundle::encode(&pending).into())
-            .await?;
+        let body = bundle::encode(&pending);
+        let size = body.len() as u64;
+        self.store.put(&self.lane_key(seq), body.into()).await?;
         {
             let mut s = self
                 .seq
@@ -1445,6 +1479,7 @@ impl<S: BlobStore> Engine<S> {
         // so no cached fresh view keeps it. Until then -- and in the window before this drain,
         // where the rows are in `pending` AND a segment -- a query returns them twice. Residual.
         m.durable.push((seq.0, batch));
+        m.stamps.insert(seq.0, (tokio::time::Instant::now(), size));
         Ok(Some(seq))
     }
 
@@ -1468,6 +1503,25 @@ impl<S: BlobStore> Engine<S> {
         {
             Folded::Committed(epoch) | Folded::Nothing(epoch) => Ok(epoch),
             // Only a drop finds its index missing.
+            Folded::Missing => Err(EngineError::Lost),
+        }
+    }
+
+    /// [`Self::fold`], saying whether it **committed** (M9i.1): `false` when there was nothing
+    /// to fold, which a scheduled fold counts apart from a fold that did work.
+    ///
+    /// # Errors
+    /// As [`Self::fold`].
+    pub async fn fold_committed(&self) -> Result<bool, EngineError> {
+        match self
+            .fold_inner(
+                None,
+                None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+            )
+            .await?
+        {
+            Folded::Committed(_) => Ok(true),
+            Folded::Nothing(_) => Ok(false),
             Folded::Missing => Err(EngineError::Lost),
         }
     }
@@ -1552,6 +1606,10 @@ impl<S: BlobStore> Engine<S> {
                 .collect();
             // A drop commits even with nothing else to fold.
             if keys.is_empty() && drop.is_none() {
+                // ⚠️ Pruned to the HEAD it read (M9i.1, spec review): nothing is left because
+                // another process folded this lane, and a batch left in `durable` would keep
+                // the tenant due for a scheduled fold on every tick.
+                self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
 
@@ -1589,6 +1647,7 @@ impl<S: BlobStore> Engine<S> {
                 by_index.remove(x);
             }
             if by_index.is_empty() && drop.is_none() {
+                self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
             // ⚠️ Remembered from the HEAD this fold READ, so the door has something to

@@ -32,11 +32,12 @@ futures-util  = { version = "0.3", default-features = false, features = ["std", 
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 thiserror     = "2"
-tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
 tower         = { version = "0.5", features = ["util"] }
-tokio         = { version = "1", features = ["io-util"] }
+tokio         = { version = "1", features = ["io-util", "test-util"] }
 http-body-util = "0.1"
+async-trait   = "0.1"
 bytes         = "1"

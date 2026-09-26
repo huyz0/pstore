@@ -44,8 +44,9 @@ pub use types::{
 pub const UNSCHEDULED: [Duty; 4] = [
     Duty {
         id: "fold",
-        instead: "call POST /v1/admin/fold on a schedule, once per tenant per lane; nothing \
-                  inside the server does, and unfolded bundles are read on every query",
+        instead: "a scheduled fold runs inside each server (M9i.1), but only for tenants that \
+                  server wrote; a tenant whose only writer died or restarted is invisible to \
+                  every other process until someone calls POST /v1/admin/fold for it",
     },
     Duty {
         id: "reap",
@@ -103,7 +104,48 @@ pub struct Api<S> {
     /// assertions untestable under a parallel test binary — the same argument `Config` already
     /// makes about reading the environment.
     http: Mutex<Http>,
+    /// Per tenant, when its next scheduled fold may run after a failure, and the delay that
+    /// set it (M9i.1).
+    backoff: Mutex<HashMap<TenantId, (tokio::time::Instant, std::time::Duration)>>,
 }
+
+/// When a scheduled fold runs (M9i.1): D-39's triggers, size or age, never a fixed timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldPolicy {
+    /// How often the loop looks. Looking costs no request.
+    pub period: std::time::Duration,
+    /// A tenant is due once its oldest unfolded batch is this old.
+    pub age: std::time::Duration,
+    /// A tenant is due once its unfolded bundles total this many bytes.
+    pub bytes: u64,
+}
+
+impl Default for FoldPolicy {
+    /// D-39's own triggers: an hour, or a mebibyte.
+    fn default() -> Self {
+        Self {
+            period: std::time::Duration::from_secs(1),
+            age: std::time::Duration::from_secs(3600),
+            bytes: 1 << 20,
+        }
+    }
+}
+
+/// What one [`Api::fold_due`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FoldTick {
+    /// Tenants whose fold committed.
+    pub folded: usize,
+    /// Tenants whose fold found nothing: another process had folded them.
+    pub nothing: usize,
+    /// Tenants whose fold failed; each now backs off.
+    pub failed: usize,
+    /// Due tenants skipped because they are still backing off.
+    pub deferred: usize,
+}
+
+/// Folds at once, at most, per tick.
+const FOLD_CONCURRENCY: usize = 4;
 
 /// Per-route and per-refusal counters. ⚠️ **No tenant dimension**: 1M tenants × four request
 /// classes is four million series, which is how a metrics endpoint takes down the thing it
@@ -114,6 +156,8 @@ struct Http {
     requests: std::collections::BTreeMap<(String, u16), u64>,
     /// `code -> count`, for the refusals the error table names.
     refusals: std::collections::BTreeMap<&'static str, u64>,
+    /// `outcome -> count` for scheduled folds (M9i.1).
+    folds: std::collections::BTreeMap<&'static str, u64>,
 }
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -140,7 +184,107 @@ impl<S: BlobStore + 'static> Api<S> {
             lane,
             engines: tokio::sync::Mutex::new(HashMap::new()),
             http: Mutex::new(Http::default()),
+            backoff: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Folds every tenant this process holds that `policy` says is due (M9i.1).
+    ///
+    /// ⚠️ **Decided from memory, so an idle tenant costs no request**: a tenant is due only if
+    /// this process flushed a batch nobody is yet known to have folded, and it is old or large
+    /// enough. The engines are snapshotted and the map's lock released before any fold, so a
+    /// request never waits behind one. A failed fold backs off, doubling from `period` up to
+    /// `age`, so a tenant that cannot fold is not retried every tick.
+    pub async fn fold_due(&self, policy: &FoldPolicy) -> FoldTick {
+        self.fold_tick(policy, &std::sync::atomic::AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::fold_due`], starting no tenant's fold once `halt` is set: the ones already in
+    /// flight finish, the rest are left due for the next process to run.
+    async fn fold_tick(
+        &self,
+        policy: &FoldPolicy,
+        halt: &std::sync::atomic::AtomicBool,
+    ) -> FoldTick {
+        use futures_util::StreamExt;
+        let engines: Vec<(TenantId, Arc<Engine<TenantView<S>>>)> = self
+            .engines
+            .lock()
+            .await
+            .iter()
+            .map(|(t, e)| (*t, Arc::clone(e)))
+            .collect();
+        let now = tokio::time::Instant::now();
+        let mut tick = FoldTick::default();
+        let mut due = Vec::new();
+        for (tenant, engine) in engines {
+            let Some(u) = engine.unfolded() else {
+                continue;
+            };
+            if now.duration_since(u.oldest) < policy.age && u.bytes < policy.bytes {
+                continue;
+            }
+            let waiting = self
+                .backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&tenant)
+                .is_some_and(|(until, _)| now < *until);
+            if waiting {
+                tick.deferred += 1;
+                continue;
+            }
+            due.push((tenant, engine));
+        }
+        let results: Vec<_> = futures_util::stream::iter(due)
+            .map(|(tenant, engine)| async move {
+                if halt.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                Some((tenant, engine.fold_committed().await))
+            })
+            .buffer_unordered(FOLD_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        let mut backoff = self
+            .backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (tenant, outcome) in results {
+            match outcome {
+                Ok(committed) => {
+                    backoff.remove(&tenant);
+                    if committed {
+                        tick.folded += 1;
+                    } else {
+                        tick.nothing += 1;
+                    }
+                }
+                Err(_) => {
+                    tick.failed += 1;
+                    let delay = backoff
+                        .get(&tenant)
+                        .map_or(policy.period, |(_, d)| d.saturating_mul(2))
+                        .min(policy.age);
+                    backoff.insert(tenant, (tokio::time::Instant::now() + delay, delay));
+                }
+            }
+        }
+        drop(backoff);
+        let mut http = self
+            .http
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (outcome, n) in [
+            ("folded", tick.folded),
+            ("nothing", tick.nothing),
+            ("failed", tick.failed),
+        ] {
+            *http.folds.entry(outcome).or_default() += n as u64;
+        }
+        tick
     }
 
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.
@@ -390,6 +534,14 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
     for ((route, status), n) in &http.requests {
         out.push_str(&format!(
             "pstore_http_requests_total{{route=\"{route}\",status=\"{status}\"}} {n}\n"
+        ));
+    }
+    out.push_str("# HELP pstore_fold_total Scheduled folds by outcome (M9i.1).\n");
+    out.push_str("# TYPE pstore_fold_total counter\n");
+    for outcome in ["folded", "nothing", "failed"] {
+        out.push_str(&format!(
+            "pstore_fold_total{{outcome=\"{outcome}\"}} {}\n",
+            http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
     out.push_str("# HELP pstore_refusals_total Refusals by their stable code.\n");
@@ -1468,6 +1620,8 @@ pub struct Config {
     /// who forgets to set one ships a **dev password** at a real bucket. Both halves must be
     /// present or neither is used, because half a key pair is not a credential.
     pub credentials: Option<(String, String)>,
+    /// The scheduled fold's policy, or `None` when `PSTORE_FOLD=off` (M9i.1).
+    pub fold: Option<FoldPolicy>,
 }
 
 /// Where a server keeps its data.
@@ -1557,6 +1711,9 @@ pub enum ConfigError {
     /// and into request time — the failure mode this whole milestone exists to remove.
     #[error("PSTORE_S3_ENDPOINT must be set when PSTORE_BACKEND=s3")]
     Endpoint,
+    /// A scheduled-fold variable that is not what it must be (M9i.1).
+    #[error("{0}={1} is refused: {2}")]
+    Fold(&'static str, String, &'static str),
 }
 
 impl Config {
@@ -1594,8 +1751,105 @@ impl Config {
             endpoint,
             bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
+            fold: fold_policy(&get)?,
         })
     }
+}
+
+/// The scheduled fold's policy from the environment (M9i.1). Unset is the default; anything
+/// that is not a positive integer, or a `PSTORE_FOLD` other than `off`, is refused by name.
+fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolicy>, ConfigError> {
+    match get("PSTORE_FOLD").as_deref() {
+        None => {}
+        Some("off") => return Ok(None),
+        Some(other) => {
+            return Err(ConfigError::Fold(
+                "PSTORE_FOLD",
+                other.to_owned(),
+                "unset, or off to leave folding to the operator",
+            ));
+        }
+    }
+    let positive = |var: &'static str| -> Result<Option<u64>, ConfigError> {
+        get(var)
+            .map(|v| {
+                v.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(ConfigError::Fold(var, v, "a positive integer"))
+            })
+            .transpose()
+    };
+    let d = FoldPolicy::default();
+    Ok(Some(FoldPolicy {
+        period: positive("PSTORE_FOLD_PERIOD_MS")?
+            .map_or(d.period, std::time::Duration::from_millis),
+        age: positive("PSTORE_FOLD_AGE_S")?.map_or(d.age, std::time::Duration::from_secs),
+        bytes: positive("PSTORE_FOLD_BYTES")?.unwrap_or(d.bytes),
+    }))
+}
+
+/// Runs [`Api::fold_due`] every `policy.period` until `stop` resolves (M9i.1).
+///
+/// ⚠️ **Ticks never overlap**: a tick is awaited, then the loop sleeps. When `stop` resolves
+/// mid-tick, no further tenant's fold starts, and the folds already in flight are awaited:
+/// each commits by CAS or not at all, so stopping never leaves HEAD half-written.
+pub async fn run_folds<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    policy: FoldPolicy,
+    stop: impl std::future::Future<Output = ()> + Send,
+) {
+    let halt = std::sync::atomic::AtomicBool::new(false);
+    tokio::pin!(stop);
+    loop {
+        let tick = api.fold_tick(&policy, &halt);
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut stop => {
+                halt.store(true, std::sync::atomic::Ordering::SeqCst);
+                tick.await;
+                return;
+            }
+            _ = &mut tick => {}
+        }
+        tokio::select! {
+            () = &mut stop => return,
+            () = tokio::time::sleep(policy.period) => {}
+        }
+    }
+}
+
+/// [`serve`], with the scheduled fold running beside it when `fold` is set (M9i.1). One
+/// signal stops both, and the fold loop has returned before this does.
+///
+/// # Errors
+/// If the server stops with an I/O error.
+pub async fn serve_folding<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    fold: Option<FoldPolicy>,
+) -> std::io::Result<()> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let tx = Arc::new(tx);
+    let folds = fold.map(|policy| {
+        let mut rx = rx.clone();
+        tokio::spawn(run_folds(Arc::clone(&api), policy, async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+        }))
+    });
+    let signal = Arc::clone(&tx);
+    let served = serve(api, listener, async move {
+        shutdown.await;
+        let _ = signal.send(true);
+    })
+    .await;
+    // Also when `serve` failed before its signal: the loop must not outlive the server.
+    let _ = tx.send(true);
+    if let Some(folds) = folds {
+        let _ = folds.await;
+    }
+    served
 }
 
 /// Serves until `shutdown` resolves.

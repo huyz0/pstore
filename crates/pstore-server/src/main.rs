@@ -6,7 +6,7 @@
 //! being wrong about is in the library.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
-use pstore_server::{Api, Backend, Config, s3_capabilities, serve};
+use pstore_server::{Api, Backend, Config, s3_capabilities, serve_folding};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -86,13 +86,13 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     eprintln!(
-        "pstore-server: listening on {}, lane {:?}, backend {:?}, profile {:?}",
-        config.bind, config.lane, config.backend, config.profile
+        "pstore-server: listening on {}, lane {:?}, backend {:?}, profile {:?}, fold {:?}",
+        config.bind, config.lane, config.backend, config.profile, config.fold
     );
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    match serve(api, listener, shutdown).await {
+    match serve_folding(api, listener, shutdown, config.fold).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("pstore-server: {e}");
