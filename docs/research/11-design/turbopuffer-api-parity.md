@@ -54,7 +54,7 @@ M9 milestones is the order in which the difference has to be closed.
 | `rank_by: [attr, "asc"\|"desc"]`, `offset`, paging by `id` | none | **M9e** — and it is the export path, as turbopuffer made it |
 | `aggregate_by: Count, Sum`, `group_by` | none | Deferred: needs M9b's filter evaluation first |
 | multi-query (≤ 16), `rerank_by: ["RRF", {rank_constant, weights}]` | two legs, RRF `k = 60` fixed; `score` is the RRF value | **M9g** |
-| `consistency: strong \| eventual` (strong default) | other processes see a write only after an operator `fold` | **M9i** — a scheduled fold; `session` tokens per [session-and-affinity-protocol.md](session-and-affinity-protocol.md) |
+| `consistency: strong \| eventual` (strong default) | other processes see a write only after an operator `fold` | **M9i** — a scheduled fold (M9i.1); `eventual` default and `strong` by refusal (M9i.2). `session` tokens per [session-and-affinity-protocol.md](session-and-affinity-protocol.md) are **deferred** (BACKLOG) |
 | `$dist` per row; `billing`, `performance` | `score`; `meta.cost` in blob requests and bytes | Ours is already more honest about cost (D34); `$dist` with M9d |
 | `compute_attributes` (`Highlight`, `Embed`, `VectorDist`), `explain_query` | none | Declined for now: embedding is a model-hosting product decision |
 | — | `as_of`: **pstore has it** (M7e, by epoch) | No time-travel parameter in SDK 2.10.2's query params |

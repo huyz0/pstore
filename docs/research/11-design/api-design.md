@@ -116,6 +116,7 @@ Structured, actionable, and honest about which are retryable:
 | `429 rate_limited` + `Retry-After` | Tenant quota, or WAL backpressure |
 | `409 version_conflict` | Optimistic write with a stale client `version` |
 | `503 storage_unavailable` | Blob store degraded; `durable` writes fail closed |
+| `503 not_folded` + `Retry-After` | A `strong` query found another process's unfolded write; a fold is requested and a retry is served after it (M9i.2) |
 | `400 schema_conflict` | Type mismatch, dimension mismatch |
 | `504 deadline_exceeded` | With `partial` results attached where possible |
 

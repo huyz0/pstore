@@ -32,6 +32,13 @@ blob store*. We expose that cost as a choice.
 > for the same reason. `strong` and `bounded` remain available.
 
 ### `strong` (no longer the default)
+
+> ⚠️ **Corrected by [M9i.2](../../milestones/M9i/SPEC.md).** A strong read probes each lane's
+> tail and **refuses** (`503 not_folded`) when it finds an unfolded bundle; it does not scan
+> the unfolded WAL. Reading bundles found by a probe is a data-dependent chain of blob
+> fetches on a user path, which the three-round budget forbids. The refusal asks for a fold,
+> and a retry after it is served.
+
 Read HEAD (conditional GET, usually a 304), then probe the lane tail. Sees every
 acknowledged write.
 - **Cost:** 1–2 Rseq. **Latency floor:** ~1 blob RTT (~10–30 ms).
@@ -89,6 +96,9 @@ t5  structural CAS commit publishes it   <- epoch advances
   memtable, so every node that can answer a query for the index has the record ~1 ms after
   arrival, independent of when the PUT lands. The t2–t5 sequence below describes durability
   and query *efficiency*, not freshness.
+- ⚠️ **Corrected by M9i.2:** no query scans the un-folded WAL. Another process's write
+  between t2 and t5 is invisible to `eventual`, and `strong` refuses rather than scanning (see
+  §2's banner).
 - Between t2 and t5, data is **visible but unindexed**: strong-mode queries must scan the
   memtable (and any un-folded WAL) as well as the indexed segments. We cap the unindexed volume (turbopuffer caps at
   128 MiB; we do the same, adaptively) and apply back-pressure beyond it.
