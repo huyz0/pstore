@@ -1146,9 +1146,10 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
 
 /// The wire document, as the format's — or the reason it cannot be one.
 ///
-/// ⚠️ **Refused, never coerced** (M9a). The format stores `i64` and strings; turning `1.5`
-/// into `1`, `true` into `"true"`, or `null` into an absent attribute would store a value the
-/// client did not write, and nothing downstream could tell.
+/// ⚠️ **Refused, never coerced** (M9a). The format stores `i64`, strings, and since M9h.1
+/// finite floats and bools; turning `1.5` into `1`, `true` into `"true"`, or `null` into an
+/// absent attribute would store a value the client did not write, and nothing downstream
+/// could tell.
 fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
     let text_field = pstore_format::text::DEFAULT_TEXT_FIELD;
     let mut doc = Document::new(d.id.clone(), d.vector.clone());
@@ -1169,24 +1170,9 @@ fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
         if name == pstore_query::ID_ATTRIBUTE {
             return Err(refuse(name, "is reserved: `id` is the document id"));
         }
-        let v = match value {
-            serde_json::Value::String(s) => pstore_format::Value::Str(s.clone()),
-            serde_json::Value::Number(n) => match n.as_i64() {
-                Some(i) => pstore_format::Value::Int(i),
-                None => {
-                    return Err(refuse(
-                        name,
-                        "is not an integer that fits i64; integers and strings are the only \
-                         attribute types",
-                    ));
-                }
-            },
-            _ => {
-                return Err(refuse(
-                    name,
-                    "is not an integer or a string, the only attribute types",
-                ));
-            }
+        let v = match scalar(value) {
+            Ok(v) => v,
+            Err(why) => return Err(refuse(name, &why)),
         };
         if name == text_field && !matches!(v, pstore_format::Value::Str(_)) {
             return Err(refuse(name, "is the text field and must be a string"));
@@ -1239,14 +1225,7 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
             let op = op
                 .as_str()
                 .ok_or_else(|| bad("the operator is a string".to_owned()))?;
-            let scalar = |x: &serde_json::Value| match x {
-                serde_json::Value::String(s) => Ok(pstore_format::Value::Str(s.clone())),
-                serde_json::Value::Number(n) => n
-                    .as_i64()
-                    .map(pstore_format::Value::Int)
-                    .ok_or_else(|| bad(format!("{x} is not an integer that fits i64"))),
-                other => Err(bad(format!("{other} is not an integer or a string"))),
-            };
+            let scalar = |x: &serde_json::Value| scalar(x).map_err(|why| bad(format!("{x} {why}")));
             let cmp = |o: Op| -> Result<Predicate, ApiError> {
                 Ok(Predicate::Cmp(attr.clone(), o, scalar(value)?))
             };
@@ -1282,11 +1261,41 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
     }
 }
 
+/// One JSON value as an attribute value, in a write or a filter -- or why it is none.
+///
+/// ⚠️ **The int/float split is serde_json's** (M9h.1, spec review): an `i64` is an int and an
+/// `f64` a float, so `2.0` is a float -- and so is an integer literal beyond `u64` or below
+/// `i64::MIN`, or `-0`, which serde_json itself parses as `f64` before this sees it. Only an
+/// integer in `(i64::MAX, u64::MAX]` arrives as an integer that does not fit, and is refused.
+fn scalar(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
+    use pstore_format::Value;
+    match x {
+        serde_json::Value::String(s) => Ok(Value::Str(s.clone())),
+        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Int(i))
+            } else if n.is_f64() {
+                // serde_json never parses a non-finite number.
+                n.as_f64()
+                    .map(Value::Float)
+                    .ok_or_else(|| "is not a finite number".to_owned())
+            } else {
+                Err("is an integer beyond i64; integers must fit i64".to_owned())
+            }
+        }
+        _ => Err("is not an integer, a float, a string or a bool, the attribute types".to_owned()),
+    }
+}
+
 /// One attribute as JSON.
 fn to_json(v: &pstore_format::Value) -> serde_json::Value {
     match v {
         pstore_format::Value::Int(n) => serde_json::Value::from(*n),
         pstore_format::Value::Str(s) => serde_json::Value::from(s.as_str()),
+        // Stored floats are finite (`check_storable`), which is all `from` refuses.
+        pstore_format::Value::Float(f) => serde_json::Value::from(*f),
+        pstore_format::Value::Bool(b) => serde_json::Value::from(*b),
     }
 }
 

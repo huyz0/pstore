@@ -30,6 +30,9 @@ impl Enc {
     pub(crate) fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    pub(crate) fn f64(&mut self, v: f64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
     pub(crate) fn bytes(&mut self, v: &[u8]) {
         // Length-prefixed, so a decoder never has to guess where a field ends.
         self.u32(v.len() as u32);
@@ -56,6 +59,11 @@ pub(crate) struct Dec<'a> {
 impl<'a> Dec<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    /// Whether every byte has been read.
+    pub(crate) fn at_end(&self) -> bool {
+        self.pos >= self.buf.len()
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
@@ -99,6 +107,13 @@ impl<'a> Dec<'a> {
     pub(crate) fn f32(&mut self) -> Result<f32, FormatError> {
         Ok(f32::from_le_bytes(
             self.take(4)?
+                .try_into()
+                .map_err(|_| FormatError::Truncated)?,
+        ))
+    }
+    pub(crate) fn f64(&mut self) -> Result<f64, FormatError> {
+        Ok(f64::from_le_bytes(
+            self.take(8)?
                 .try_into()
                 .map_err(|_| FormatError::Truncated)?,
         ))

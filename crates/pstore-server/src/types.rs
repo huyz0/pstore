@@ -48,8 +48,9 @@ pub struct DocumentIn {
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
-    /// Typed attributes: a JSON integer (`i64`) or string each (M9a). Anything else is
-    /// refused at the door rather than coerced — see `lib.rs`'s `to_document`.
+    /// Typed attributes: a JSON integer (`i64`) or string each (M9a), or a float or bool
+    /// (M9h.1). Anything else is refused at the door rather than coerced — see `lib.rs`'s
+    /// `scalar`.
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
 }

@@ -255,8 +255,7 @@ async fn returning_attributes_costs_no_request_and_no_byte() {
 #[tokio::test]
 async fn a_value_the_format_cannot_store_is_refused_not_coerced() {
     for (value, name) in [
-        (json!(1.5), "x"),
-        (json!(true), "x"),
+        // M9h.1 gave `1.5` and `true` a type; `tests/typed_values.rs` covers them.
         (json!([1, 2]), "x"),
         (json!({"k": 1}), "x"),
         (json!(null), "x"),

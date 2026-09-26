@@ -198,11 +198,9 @@ async fn a_malformed_filter_is_refused() {
     for f in [
         json!(["n", "Like", 3]),
         json!(["n", "Eq"]),
-        json!(["n", "Eq", 1.5]),
-        json!(["n", "Eq", true]),
+        // M9h.1 gave `1.5`, `true` and `[1, 2.5]` a meaning; `tests/typed_values.rs` has them.
         json!(["n", "Lt", null]),
         json!(["n", "In", 3]),
-        json!(["n", "In", [1, 2.5]]),
         json!(["And", ["n", "Eq", 1]]),
         json!(["Not", []]),
         json!("n"),

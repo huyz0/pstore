@@ -4,7 +4,8 @@
 //! returns fewer than `k` whenever it is selective, and nothing says so. `run` therefore
 //! builds each segment's [`Mask`] from its blocks and applies it to exhaustive legs.
 
-use pstore_format::Value;
+use pstore_format::{Number, Value, Zones, cmp_numbers};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// The document id, addressed as if it were an attribute — turbopuffer's `id`.
@@ -56,51 +57,66 @@ impl Predicate {
         match self {
             Self::Cmp(name, op, want) => get(name).is_some_and(|have| compare(&have, *op, want)),
             Self::Absent(name) => get(name).is_none(),
-            Self::In(name, set) => get(name).is_some_and(|have| set.contains(&have)),
+            Self::In(name, set) => {
+                get(name).is_some_and(|have| set.iter().any(|w| compare(&have, Op::Eq, w)))
+            }
             Self::And(all) => all.iter().all(|p| p.admits(id, attrs)),
             Self::Or(any) => any.iter().any(|p| p.admits(id, attrs)),
             Self::Not(p) => !p.admits(id, attrs),
         }
     }
 
-    /// Whether a block whose integer attributes span these zones **could** hold an admitted
-    /// row. `false` only when it provably cannot: a wrongly dropped block silently loses rows.
+    /// Whether a block with these zone maps **could** hold an admitted row. `false` only
+    /// when it provably cannot: a wrongly dropped block silently loses rows.
     ///
-    /// ⚠️ A zone covers only rows that HAVE the attribute, and a block may hold rows without
-    /// it — so absence, `Not`, and anything over a string or the id cannot prune.
+    /// ⚠️ A zone covers only rows that HAVE the attribute as a number, and a block may hold
+    /// rows without it -- so absence, `Not`, and anything over a string, a bool or the id
+    /// cannot prune. A numeric literal is checked against **both** the int and the float
+    /// zone, because the two are compared as one (M9h.1).
     #[must_use]
-    pub fn could_admit(&self, zones: &BTreeMap<String, (i64, i64)>) -> bool {
+    pub fn could_admit(&self, zones: &Zones) -> bool {
         match self {
-            Self::Cmp(name, op, Value::Int(n)) => zones.get(name).is_none_or(|(lo, hi)| match op {
-                Op::Eq => lo <= n && n <= hi,
-                Op::Lt => lo < n,
-                Op::Lte => lo <= n,
-                Op::Gt => hi > n,
-                Op::Gte => hi >= n,
-            }),
-            Self::In(name, set) => match zones.get(name) {
-                // ⚠️ A string member can never prune: one name may hold strings in some rows
-                // and integers in others (M9a stores values as written), and the zone covers
-                // only the integers.
-                Some((lo, hi)) => set.iter().any(|v| match v {
-                    Value::Int(n) => lo <= n && n <= hi,
-                    Value::Str(_) => true,
+            Self::Cmp(name, op, want) => match Number::of(want) {
+                Some(x) => zones.could_hold_number(name, |lo, hi| {
+                    let (lo, hi) = (cmp_numbers(lo, x), cmp_numbers(hi, x));
+                    match op {
+                        Op::Eq => {
+                            lo.is_some_and(Ordering::is_le) && hi.is_some_and(Ordering::is_ge)
+                        }
+                        Op::Lt => lo.is_some_and(Ordering::is_lt),
+                        Op::Lte => lo.is_some_and(Ordering::is_le),
+                        Op::Gt => hi.is_some_and(Ordering::is_gt),
+                        Op::Gte => hi.is_some_and(Ordering::is_ge),
+                    }
                 }),
                 None => true,
             },
+            // ⚠️ A string or bool member can never prune: one name may hold strings in some
+            // rows and numbers in others (M9a stores values as written), and the zones cover
+            // only the numbers.
+            Self::In(name, set) => set
+                .iter()
+                .any(|v| Self::Cmp(name.clone(), Op::Eq, v.clone()).could_admit(zones)),
             Self::And(all) => all.iter().all(|p| p.could_admit(zones)),
             Self::Or(any) => any.iter().any(|p| p.could_admit(zones)),
-            Self::Cmp(..) | Self::Absent(_) | Self::Not(_) => true,
+            Self::Absent(_) | Self::Not(_) => true,
         }
     }
 }
 
-/// `have op want`: integers numerically, strings by bytes, anything else false.
+/// `have op want`: numbers as one exact line (an int and a float compare by value, M9h.1),
+/// strings by bytes, bools with `false < true`, anything else false.
 fn compare(have: &Value, op: Op, want: &Value) -> bool {
     let ord = match (have, want) {
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Str(a), Value::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
-        _ => return false,
+        (Value::Str(a), Value::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        _ => match (Number::of(have), Number::of(want)) {
+            (Some(a), Some(b)) => cmp_numbers(a, b),
+            _ => None,
+        },
+    };
+    let Some(ord) = ord else {
+        return false;
     };
     match op {
         Op::Eq => ord.is_eq(),
@@ -122,11 +138,14 @@ pub(crate) type Mask = std::collections::HashSet<usize>;
 mod tests {
     use super::*;
 
-    fn zones(pairs: &[(&str, i64, i64)]) -> BTreeMap<String, (i64, i64)> {
-        pairs
-            .iter()
-            .map(|(k, lo, hi)| ((*k).to_owned(), (*lo, *hi)))
-            .collect()
+    fn zones(pairs: &[(&str, i64, i64)]) -> Zones {
+        Zones {
+            ints: pairs
+                .iter()
+                .map(|(k, lo, hi)| ((*k).to_owned(), (*lo, *hi)))
+                .collect(),
+            ..Zones::default()
+        }
     }
 
     fn eq(name: &str, n: i64) -> Predicate {
@@ -172,8 +191,8 @@ mod tests {
     #[test]
     fn a_missing_zone_never_prunes() {
         // A zone-free segment (M9a's fallback) has no zones at all.
-        assert!(eq("a", 99).could_admit(&BTreeMap::new()));
-        assert!(Predicate::In("a".to_owned(), vec![Value::Int(1)]).could_admit(&BTreeMap::new()));
+        assert!(eq("a", 99).could_admit(&Zones::default()));
+        assert!(Predicate::In("a".to_owned(), vec![Value::Int(1)]).could_admit(&Zones::default()));
     }
 
     #[test]

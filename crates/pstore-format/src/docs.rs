@@ -31,6 +31,15 @@ fn encode_attrs(e: &mut Enc, attrs: &BTreeMap<String, Value>) {
                 e.u8(1);
                 e.bytes(s.as_bytes());
             }
+            // M9h.1. A reader from before it refuses these tags as unknown, never misreads.
+            Value::Float(f) => {
+                e.u8(2);
+                e.f64(*f);
+            }
+            Value::Bool(b) => {
+                e.u8(3);
+                e.u8(u8::from(*b));
+            }
         }
     }
 }
@@ -43,6 +52,12 @@ fn decode_attrs(d: &mut Dec<'_>) -> Result<BTreeMap<String, Value>, FormatError>
         let v = match d.u8()? {
             0 => Value::Int(d.i64()?),
             1 => Value::Str(d.string()?),
+            2 => Value::Float(d.f64()?),
+            3 => match d.u8()? {
+                0 => Value::Bool(false),
+                1 => Value::Bool(true),
+                _ => return Err(FormatError::Corrupt("a bool that is neither 0 nor 1")),
+            },
             // A tag from a future version. Refused, not guessed: a mistyped attribute is
             // one a filter later reads as the wrong thing.
             _ => return Err(FormatError::Corrupt("unknown value tag")),

@@ -2025,7 +2025,10 @@ impl<S: BlobStore> Engine<S> {
             self.store.get(&Key::new(dv.clone())),
             seg.rows_where(&*self.store, key, |zones| {
                 filter.is_none_or(|f| {
+                    // The legacy filter matches structurally: only int rows, which the int
+                    // zone covers whole.
                     zones
+                        .ints
                         .get(f.column())
                         .is_none_or(|(lo, hi)| f.could_match(*lo, *hi))
                 })

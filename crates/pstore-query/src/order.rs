@@ -4,7 +4,7 @@
 use crate::filter::Predicate;
 use crate::run::{QueryError, Target};
 use pstore_blob::BlobStore;
-use pstore_format::{Document, Segment, Value};
+use pstore_format::{Document, Number, Segment, Value, cmp_numbers};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 
@@ -20,9 +20,12 @@ pub struct OrderBy {
 /// A row's place in the order, computed once.
 ///
 /// ⚠️ **Not `Value`'s own order reversed for `desc`.** The absent group sorts last in BOTH
-/// directions, and ties break on the id ascending in both: `asc` is integers, strings, absent;
-/// `desc` is strings, integers, absent, each group's values reversed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// directions, and ties break on the id ascending in both: `asc` is bools, numbers, strings,
+/// absent; `desc` is strings, numbers, bools, absent, each group's values reversed.
+///
+/// ⚠️ **Numbers are one group** (M9h.1): an int and a float interleave by exact value, and
+/// equal ones (`1` and `1.0`) tie, broken by the id. Equality is the order's, never `Value`'s.
+#[derive(Debug, Clone)]
 struct Rank {
     desc: bool,
     group: u8,
@@ -38,9 +41,10 @@ impl Rank {
             doc.attrs.get(&by.attr).cloned()
         };
         let group = match (&value, by.desc) {
-            (Some(Value::Int(_)), false) | (Some(Value::Str(_)), true) => 0,
-            (Some(_), _) => 1,
-            (None, _) => 2,
+            (Some(Value::Bool(_)), false) | (Some(Value::Str(_)), true) => 0,
+            (Some(Value::Int(_) | Value::Float(_)), _) => 1,
+            (Some(Value::Str(_)), false) | (Some(Value::Bool(_)), true) => 2,
+            (None, _) => 3,
         };
         Self {
             desc: by.desc,
@@ -54,10 +58,15 @@ impl Rank {
 impl Ord for Rank {
     fn cmp(&self, other: &Self) -> Ordering {
         let values = match (&self.value, &other.value) {
-            (Some(Value::Int(a)), Some(Value::Int(b))) => a.cmp(b),
             // Bytewise, as the `Gt` cursor compares (`filter.rs`).
             (Some(Value::Str(a)), Some(Value::Str(b))) => a.as_bytes().cmp(b.as_bytes()),
-            // Different groups never reach here; the group decided.
+            (Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
+            (Some(a), Some(b)) => match (Number::of(a), Number::of(b)) {
+                // A NaN never reaches storage (`check_storable`), so `None` is unreachable.
+                (Some(a), Some(b)) => cmp_numbers(a, b).unwrap_or(Ordering::Equal),
+                // Different groups never reach here; the group decided.
+                _ => Ordering::Equal,
+            },
             _ => Ordering::Equal,
         };
         self.group
@@ -66,6 +75,14 @@ impl Ord for Rank {
             .then_with(|| self.id.as_bytes().cmp(other.id.as_bytes()))
     }
 }
+
+impl PartialEq for Rank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Rank {}
 
 impl PartialOrd for Rank {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

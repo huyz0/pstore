@@ -163,14 +163,136 @@ pub(crate) const FOOTER_LEN: usize = 8 + 2 + 8 + 4 + 4 + 8 + 8;
 
 pub(crate) const MAGIC: &[u8; 8] = b"PSTORESG";
 pub(crate) const VERSION: u16 = 1;
+/// A segment holding a float or a bool (M9h.1).
+///
+/// ⚠️ **A version, not only a tag** (spec review). A reader from before M9h.1 ignores bytes
+/// after the zones it knows, so given the float table under version 1 it would open the
+/// segment, prune on its integer zones alone, and drop a float row it never decoded --
+/// silently. Under version 2 it refuses at `open`. A segment holding neither stays version 1,
+/// byte for byte.
+pub(crate) const VERSION_TYPED: u16 = 2;
 
 /// An attribute value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// ⚠️ `Eq` and `Ord` are hand-written (M9h.1) because `f64` has neither: a float compares by
+/// `f64::total_cmp`, and variants order as declared. That is the **structural** order -- the
+/// one a map or a dedupe needs. How a filter or an order-by compares numbers is
+/// [`cmp_numbers`], which puts an int and a float on one line.
+#[derive(Debug, Clone)]
 pub enum Value {
-    /// Signed integer. The type zone maps prune on.
+    /// Signed integer. Zone maps prune on it.
     Int(i64),
     /// UTF-8 string.
     Str(String),
+    /// A finite float (M9h.1). Zone maps prune on it; NaN and ±∞ are refused by
+    /// [`check_storable`].
+    Float(f64),
+    /// A bool (M9h.1). No zone map: two values prune nothing worth a zone.
+    Bool(bool),
+}
+
+impl Value {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Int(_) => 0,
+            Self::Str(_) => 1,
+            Self::Float(_) => 2,
+            Self::Bool(_) => 3,
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Value {}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Str(a), Self::Str(b)) => a.cmp(b),
+            (Self::Float(a), Self::Float(b)) => a.total_cmp(b),
+            (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+/// A number: what an int and a float are both compared as.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
+    /// An integer.
+    Int(i64),
+    /// A float.
+    Float(f64),
+}
+
+impl Number {
+    /// The number a value holds, if it holds one.
+    #[must_use]
+    pub fn of(v: &Value) -> Option<Self> {
+        match v {
+            Value::Int(n) => Some(Self::Int(*n)),
+            Value::Float(f) => Some(Self::Float(*f)),
+            Value::Str(_) | Value::Bool(_) => None,
+        }
+    }
+}
+
+/// Two numbers compared **exactly**, never cast through `f64` (M9h.1): `2^53 + 1` is greater
+/// than `2^53` as a float, which it would equal as one. `-0.0` equals `0.0`. `None` only
+/// for a NaN, which `check_storable` keeps out of storage.
+#[must_use]
+pub fn cmp_numbers(a: Number, b: Number) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Number::Int(x), Number::Int(y)) => Some(x.cmp(&y)),
+        (Number::Float(x), Number::Float(y)) => x.partial_cmp(&y),
+        (Number::Int(x), Number::Float(y)) => int_vs_float(x, y),
+        (Number::Float(x), Number::Int(y)) => int_vs_float(y, x).map(std::cmp::Ordering::reverse),
+    }
+}
+
+/// `i` against `f`, exactly.
+fn int_vs_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    // 2^63 is exact as an f64; every i64 is below it and at least -2^63.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    // In range, so the truncation is exact, and so is the fraction left over.
+    let t = f.trunc();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "t is integral and in i64's range"
+    )]
+    let whole = t as i64;
+    Some(i.cmp(&whole).then_with(|| {
+        let frac = f - t;
+        if frac > 0.0 {
+            Ordering::Less
+        } else if frac < 0.0 {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }))
 }
 
 /// Whether a document is one this format version can store faithfully.
@@ -190,6 +312,16 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
     // the way `FieldVectors` mirrors `Vectors`. Without this, the writer takes the first
     // field in name order and the second is written as **nothing**, which is precisely the
     // silent loss this function exists to make loud.
+    // M9h.1: a NaN compares as nothing and ±∞ as a bound no zone map can hold. JSON cannot
+    // write either; the engine API can, so the door is here.
+    if d.attrs
+        .values()
+        .any(|v| matches!(v, Value::Float(f) if !f.is_finite()))
+    {
+        return Err(FormatError::Unsupported(
+            "a float attribute must be finite: NaN and infinities are refused",
+        ));
+    }
     if d.vectors
         .values()
         .filter(|f| matches!(f, VectorField::Sparse(_)))
@@ -360,8 +492,9 @@ impl Filter {
     pub fn could_match(&self, min: i64, max: i64) -> bool {
         match self {
             Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
-            // A string equality has no ordering to prune on, so every block could match.
-            Self::Eq(_, Value::Str(_)) => true,
+            // A string or bool equality has no integer zone to prune on, and this legacy
+            // filter matches structurally, so a float never equals an int row here either.
+            Self::Eq(_, Value::Str(_) | Value::Float(_) | Value::Bool(_)) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,
         }
@@ -418,6 +551,42 @@ pub(crate) struct BlockMeta {
     pub offset: u64,
     pub len: u32,
     pub rows: u32,
-    /// Per integer column, the block's `(min, max)`. **The pruning input.**
-    pub zones: BTreeMap<String, (i64, i64)>,
+    /// The block's zone maps. **The pruning input.**
+    pub zones: Zones,
+}
+
+/// One block's zone maps: per attribute, the `(min, max)` of the rows holding it.
+///
+/// ⚠️ A zone covers only the rows that HAVE the attribute with that type. An absent zone
+/// rules nothing out -- the block may be zone-free, or hold that name under another type --
+/// **unless** [`Self::complete`]: see there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Zones {
+    /// Integer attributes.
+    pub ints: BTreeMap<String, (i64, i64)>,
+    /// Float attributes (M9h.1).
+    pub floats: BTreeMap<String, (f64, f64)>,
+    /// The segment is typed (M9h.1) and says its zone maps are on, so an absent int or float
+    /// zone means **no row of that type** holds the name.
+    ///
+    /// Otherwise the float side rules everything out -- an untyped segment holds no float --
+    /// and an absent int zone rules nothing out, as before M9h.1. A typed zone-free segment
+    /// has no zone at all, so there the int side rules nothing out either.
+    pub complete: bool,
+}
+
+impl Zones {
+    /// Whether some row holding `name` as a number could satisfy `ok(lo, hi)` over its
+    /// type's zone. Numbers of both types are checked, because a filter compares them as one.
+    #[must_use]
+    pub fn could_hold_number(&self, name: &str, ok: impl Fn(Number, Number) -> bool) -> bool {
+        let int = self.ints.get(name).map_or(!self.complete, |&(lo, hi)| {
+            ok(Number::Int(lo), Number::Int(hi))
+        });
+        let float = self
+            .floats
+            .get(name)
+            .is_some_and(|&(lo, hi)| ok(Number::Float(lo), Number::Float(hi)));
+        int || float
+    }
 }

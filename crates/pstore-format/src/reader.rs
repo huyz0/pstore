@@ -3,6 +3,7 @@
 use crate::codec::{Dec, checksum};
 use crate::{
     BlockMeta, Document, FOOTER_LEN, Filter, FormatError, MAGIC, SUFFIX_FETCH, Section, VERSION,
+    Zones,
 };
 use bytes::Bytes;
 use pstore_blob::{BlobStore, Key};
@@ -46,7 +47,7 @@ impl Segment {
             return Err(FormatError::Corrupt("bad magic"));
         }
         let version = d.u16()?;
-        if version != VERSION {
+        if version != VERSION && version != crate::VERSION_TYPED {
             return Err(FormatError::UnsupportedVersion(version));
         }
         let meta_offset = d.u64()?;
@@ -119,7 +120,7 @@ impl Segment {
         let blocks = idx_bytes.get(lo..hi).ok_or(FormatError::Truncated)?;
 
         let mut seg = Self {
-            blocks: Self::decode_index(blocks)?,
+            blocks: Self::decode_index(blocks, version)?,
             rows,
             sections,
             fields: Vec::new(),
@@ -503,17 +504,17 @@ impl Segment {
             .collect())
     }
 
-    fn decode_index(bytes: &[u8]) -> Result<Vec<BlockMeta>, FormatError> {
+    fn decode_index(bytes: &[u8], version: u16) -> Result<Vec<BlockMeta>, FormatError> {
         let mut d = Dec::new(bytes);
         let n = d.u32()? as usize;
         let mut blocks = Vec::with_capacity(n.min(1 << 20));
         for _ in 0..n {
             let (offset, len, rows) = (d.u64()?, d.u32()?, d.u32()?);
             let zn = d.u32()? as usize;
-            let mut zones = BTreeMap::new();
+            let mut zones = Zones::default();
             for _ in 0..zn {
                 let k = d.string()?;
-                zones.insert(k, (d.i64()?, d.i64()?));
+                zones.ints.insert(k, (d.i64()?, d.i64()?));
             }
             blocks.push(BlockMeta {
                 offset,
@@ -521,6 +522,31 @@ impl Segment {
                 rows,
                 zones,
             });
+        }
+        // M9h.1: a typed segment says whether its zone maps are on; if they are, a float table
+        // per block follows, and every block's zones are complete.
+        if version == crate::VERSION_TYPED {
+            match d.u8()? {
+                0 => {}
+                1 => {
+                    for b in &mut blocks {
+                        let n = d.u32()? as usize;
+                        for _ in 0..n {
+                            let k = d.string()?;
+                            b.zones.floats.insert(k, (d.f64()?, d.f64()?));
+                        }
+                        b.zones.complete = true;
+                    }
+                }
+                _ => {
+                    return Err(FormatError::Corrupt(
+                        "a zone-map flag that is neither 0 nor 1",
+                    ));
+                }
+            }
+            if !d.at_end() {
+                return Err(FormatError::Corrupt("bytes after the float zone table"));
+            }
         }
         Ok(blocks)
     }
@@ -548,7 +574,7 @@ impl Segment {
             .enumerate()
             .filter(|(_, b)| match filter {
                 None => true,
-                Some(f) => match b.zones.get(f.column()) {
+                Some(f) => match b.zones.ints.get(f.column()) {
                     Some((lo, hi)) => f.could_match(*lo, *hi),
                     // No zone map for that column -- it may be a string, or absent from
                     // this block. Cannot prune, so must read.
@@ -751,8 +777,7 @@ impl Segment {
     /// Every row of the blocks `keep` does not rule out, with its absolute row number — the
     /// input to a query's filter mask (M9b).
     ///
-    /// `keep` sees each block's zone map (integer attribute → `(min, max)`, empty for a
-    /// zone-free segment) and must answer `true` unless no row in the block can match. The
+    /// `keep` sees each block's [`Zones`] (empty for a zone-free segment) and must answer `true` unless no row in the block can match. The
     /// kept blocks are fetched in **one** coalesced `get_ranges`; no vector is read.
     ///
     /// # Errors
@@ -761,7 +786,7 @@ impl Segment {
         &self,
         store: &S,
         key: &Key,
-        keep: impl Fn(&BTreeMap<String, (i64, i64)>) -> bool,
+        keep: impl Fn(&Zones) -> bool,
     ) -> Result<Vec<(usize, Document)>, FormatError> {
         let mut out = Vec::new();
         self.visit_rows_where(store, key, keep, |row, doc| out.push((row, doc)))
@@ -779,7 +804,7 @@ impl Segment {
         &self,
         store: &S,
         key: &Key,
-        keep: impl Fn(&BTreeMap<String, (i64, i64)>) -> bool,
+        keep: impl Fn(&Zones) -> bool,
         mut visit: impl FnMut(usize, Document),
     ) -> Result<(), FormatError> {
         let mut base = 0usize;
@@ -964,4 +989,55 @@ fn decode_field(
         .map(|b| vec![read(b)])
         .take(rows)
         .collect())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+    use crate::codec::Enc;
+
+    /// One block with no int zone, then a typed segment's tail: the flag, and for flag 1 a
+    /// float table with one zone.
+    fn index(flag: u8, trailing: &[u8]) -> Vec<u8> {
+        let mut e = Enc::default();
+        e.u32(1);
+        e.u64(0);
+        e.u32(10);
+        e.u32(1);
+        e.u32(0);
+        e.u8(flag);
+        if flag == 1 {
+            e.u32(1);
+            e.bytes(b"x");
+            e.f64(-1.5);
+            e.f64(2.0);
+        }
+        e.raw(trailing);
+        e.0
+    }
+
+    #[test]
+    fn a_typed_index_is_framed_exactly() {
+        // Spec review, m3: a flag that is neither 0 nor 1, or bytes after the tables, are
+        // corrupt -- never read as something a later version meant.
+        let zoned = Segment::decode_index(&index(1, &[]), crate::VERSION_TYPED).unwrap();
+        assert!(zoned[0].zones.complete);
+        assert_eq!(zoned[0].zones.floats.get("x"), Some(&(-1.5, 2.0)));
+        let free = Segment::decode_index(&index(0, &[]), crate::VERSION_TYPED).unwrap();
+        assert!(!free[0].zones.complete && free[0].zones.floats.is_empty());
+        for bad in [index(2, &[]), index(1, &[0]), index(0, &[0])] {
+            assert!(matches!(
+                Segment::decode_index(&bad, crate::VERSION_TYPED),
+                Err(FormatError::Corrupt(_))
+            ));
+        }
+        // Version 1 reads no tail, as before M9h.1.
+        let untyped = Segment::decode_index(&index(0, &[]), VERSION).unwrap();
+        assert!(!untyped[0].zones.complete);
+    }
 }

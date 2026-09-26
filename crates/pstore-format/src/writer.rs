@@ -1,9 +1,8 @@
 //! Building a segment.
 
 use crate::codec::{Enc, checksum};
-use crate::{BlockMeta, Document, FOOTER_LEN, FormatError, MAGIC, Section, VERSION, Value};
+use crate::{BlockMeta, Document, FOOTER_LEN, FormatError, MAGIC, Section, VERSION, Value, Zones};
 use bytes::Bytes;
-use std::collections::BTreeMap;
 
 /// Accumulates documents and emits one immutable segment.
 ///
@@ -27,6 +26,8 @@ pub struct SegmentWriter {
     /// Whether sealed blocks carry zone maps. Cleared only by [`Self::seal_segment`]'s
     /// fallback, for a segment whose integer attribute names cannot fit the index.
     zone_maps: bool,
+    /// Some row holds a float or a bool: the segment is [`crate::VERSION_TYPED`].
+    typed: bool,
     /// Opaque, fixed-width payloads supplied by a higher layer.
     ///
     /// ⚠️ The format does **not** quantize. `pstore-format` is layer 2 and the quantizer is
@@ -62,6 +63,7 @@ impl SegmentWriter {
             text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
             zone_maps: true,
+            typed: false,
             extra: Vec::new(),
             raw_extra: Vec::new(),
             docs: Vec::new(),
@@ -171,16 +173,24 @@ impl SegmentWriter {
             return;
         }
         let offset = self.body.len() as u64;
-        let mut zones: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+        let mut zones = Zones::default();
         if self.zone_maps {
             for d in rows {
                 for (k, v) in &d.attrs {
-                    if let Value::Int(n) = v {
-                        // Zone maps are built here, from the rows as they are written --
-                        // never from a later pass that could disagree with the bytes.
-                        let e = zones.entry(k.clone()).or_insert((*n, *n));
-                        e.0 = e.0.min(*n);
-                        e.1 = e.1.max(*n);
+                    // Zone maps are built here, from the rows as they are written -- never
+                    // from a later pass that could disagree with the bytes.
+                    match v {
+                        Value::Int(n) => {
+                            let e = zones.ints.entry(k.clone()).or_insert((*n, *n));
+                            e.0 = e.0.min(*n);
+                            e.1 = e.1.max(*n);
+                        }
+                        Value::Float(f) => {
+                            let e = zones.floats.entry(k.clone()).or_insert((*f, *f));
+                            e.0 = e.0.min(*f);
+                            e.1 = e.1.max(*f);
+                        }
+                        Value::Str(_) | Value::Bool(_) => {}
                     }
                 }
             }
@@ -205,11 +215,27 @@ impl SegmentWriter {
             idx.u64(b.offset);
             idx.u32(b.len);
             idx.u32(b.rows);
-            idx.u32(b.zones.len() as u32);
-            for (k, (lo, hi)) in &b.zones {
+            idx.u32(b.zones.ints.len() as u32);
+            for (k, (lo, hi)) in &b.zones.ints {
                 idx.bytes(k.as_bytes());
                 idx.i64(*lo);
                 idx.i64(*hi);
+            }
+        }
+        // M9h.1: only a typed segment says whether its zone maps are on, and then carries a
+        // float table per block -- so an untyped segment keeps its bytes. See
+        // `Zones::complete` for what the flag lets a reader conclude.
+        if self.typed {
+            idx.u8(u8::from(self.zone_maps));
+        }
+        if self.typed && self.zone_maps {
+            for b in &self.blocks {
+                idx.u32(b.zones.floats.len() as u32);
+                for (k, (lo, hi)) in &b.zones.floats {
+                    idx.bytes(k.as_bytes());
+                    idx.f64(*lo);
+                    idx.f64(*hi);
+                }
             }
         }
         idx
@@ -266,6 +292,11 @@ impl SegmentWriter {
     /// Seals the segment, and reports whether its meta region fits the suffix read.
     fn seal_segment(mut self) -> (Bytes, bool) {
         let docs = std::mem::take(&mut self.docs);
+        self.typed = docs.iter().any(|d| {
+            d.attrs
+                .values()
+                .any(|v| matches!(v, Value::Float(_) | Value::Bool(_)))
+        });
         // ⚠️ One set of sections per named field. Fields are taken in name order so the
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader
         // that predates the Fields table sees exactly the single-dense view it expects
@@ -552,7 +583,11 @@ impl SegmentWriter {
         // The footer is last and fixed-width, so `Range: -N` finds it without knowing the
         // object's length -- which is what makes an open possible from the key alone.
         out.raw(MAGIC);
-        out.u16(VERSION);
+        out.u16(if self.typed {
+            crate::VERSION_TYPED
+        } else {
+            VERSION
+        });
         out.u64(meta_offset);
         out.u32(meta_len);
         out.u32(self.rows);
