@@ -146,7 +146,10 @@ impl<S: BlobStore + 'static> Api<S> {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/v1/indexes", get(list_indexes::<S>))
-            .route("/v1/indexes/{index}", get(index_summary::<S>))
+            .route(
+                "/v1/indexes/{index}",
+                get(index_summary::<S>).delete(delete_index::<S>),
+            )
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
             .route(
@@ -775,6 +778,29 @@ async fn fold_tenant<S: BlobStore + 'static>(
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     let epoch = engine.fold().await?;
+    Ok(axum::Json(FoldResponse {
+        epoch: epoch.0,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// `DELETE /v1/indexes/{index}` (M9f.2): a fold that drops it. `404` if there is no such index,
+/// and then nothing is committed.
+async fn delete_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<FoldResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let Some(epoch) = engine.delete_index(&index).await? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found",
+            format!("this tenant has no index {index}"),
+        ));
+    };
     Ok(axum::Json(FoldResponse {
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),

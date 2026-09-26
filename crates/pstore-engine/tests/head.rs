@@ -61,9 +61,9 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
     // A partially-decoded HEAD would be a partially-visible index: some segments present,
     // others silently absent, reported as success.
     //
-    // ⚠️ **Five cuts now decode, and they are named rather than tolerated.** M7d added the
+    // ⚠️ **Six cuts now decode, and they are named rather than tolerated.** M7d added the
     // schema and reject sections as OPTIONAL trailing ones, M7e added the reap horizon and
-    // M9c the delete vectors and M9d the metrics,
+    // M9c the delete vectors, M9d the metrics and M9f.2 the dropped schemas,
     // because every HEAD written before each of them ends where it ends and reading that as
     // corrupt would make every existing store unreadable. The price is that a HEAD truncated
     // *exactly* at one of those boundaries is indistinguishable from an older, complete one.
@@ -85,9 +85,10 @@ fn a_truncated_head_is_refused_at_every_length_but_a_section_boundary() {
             no_schemas + 4,
             no_schemas + 8,
             no_schemas + 16,
+            bytes.len() - 8,
             bytes.len() - 4
         ],
-        "the only decodable truncations must be the five optional-section boundaries"
+        "the only decodable truncations must be the six optional-section boundaries"
     );
     // And what they decode to is the older HEAD, not a partial one.
     let at_boundary = Head::decode(&bytes[..no_schemas]).unwrap();
@@ -237,7 +238,7 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
     h.reaped_before = 77;
     // The horizon as the LAST section, as it was written before M9c.
     h.deletes.clear();
-    let full = &h.encode()[..h.encode().len() - 8]; // no deletes, no metrics
+    let full = &h.encode()[..h.encode().len() - 12]; // no deletes, metrics or drops
     let without = &full[..full.len() - 8];
     let decoded = Head::decode(without).expect("a HEAD from before the horizon must decode");
     assert_eq!(decoded.reaped_before, 0);
@@ -262,15 +263,52 @@ fn a_head_without_delete_vectors_decodes_as_none() {
     let full = h.encode();
     let mut older = h.clone();
     older.deletes.clear();
-    let without = &older.encode()[..older.encode().len() - 8]; // no deletes, no metrics
+    let without = &older.encode()[..older.encode().len() - 12]; // no deletes, metrics or drops
     let decoded = Head::decode(without).expect("a HEAD from before M9c must decode");
     assert!(decoded.deletes.is_empty());
     assert_eq!(decoded.indexes, h.indexes);
     // A section cut anywhere inside is refused, never read as fewer vectors.
     let start = without.len();
-    // Up to the (empty) metric section M9d appended, whose own boundary is a decodable cut.
-    for cut in start + 1..full.len() - 4 {
+    // Up to the (empty) sections appended after it, whose own boundaries are decodable cuts.
+    for cut in start + 1..full.len() - 8 {
         assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
     }
     assert_eq!(Head::decode(&full).unwrap().deletes, h.deletes);
+}
+
+#[test]
+fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
+    // M9f.2's trailing section: whole, and pruned exactly when nothing before it is answerable.
+    let schema = |metric| pstore_engine::IndexSchema {
+        dims: 3,
+        text_field: "body".to_owned(),
+        metric,
+    };
+    let mut h = populated();
+    h.dropped.push((
+        "x".to_owned(),
+        7,
+        schema(pstore_engine::Metric::CosineDistance),
+    ));
+    h.dropped.push((
+        "x".to_owned(),
+        9,
+        schema(pstore_engine::Metric::EuclideanSquared),
+    ));
+    let full = h.encode();
+    assert_eq!(Head::decode(&full).unwrap(), h);
+    // A cut inside the section is refused.
+    for cut in full.len() - 5..full.len() {
+        assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
+    }
+    let mut reaped = h.clone();
+    reaped.record_reap(6);
+    assert_eq!(
+        reaped.dropped.len(),
+        2,
+        "a horizon short of the drop keeps it"
+    );
+    reaped.record_reap(7);
+    assert_eq!(reaped.dropped.len(), 1, "a horizon at the drop reaps it");
+    assert_eq!(reaped.dropped[0].1, 9);
 }

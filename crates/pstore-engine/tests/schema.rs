@@ -220,10 +220,20 @@ async fn the_write_door_uses_the_schema_the_process_has_read() {
         .await
         .expect_err("the door let a wrong width through with the schema in hand");
     assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    // ⚠️ Exactly one read since M9f.2: a refusal re-reads HEAD once before it stands, because
+    // after an index is dropped and made again the cached schema is stale. An accepted write
+    // still costs nothing.
+    assert_eq!(
+        acct.count(T, OpClass::Read) - before,
+        1,
+        "a refusal is one HEAD read, no more"
+    );
+    let before = acct.count(T, OpClass::Read);
+    e.write("docs", vec![doc("right", 4)]).await.unwrap();
     assert_eq!(
         acct.count(T, OpClass::Read),
         before,
-        "the door check issued a request"
+        "an accepted write issued a request"
     );
 }
 

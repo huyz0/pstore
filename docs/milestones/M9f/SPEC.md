@@ -15,7 +15,8 @@ round 2's findings, and reviewed again as its own task.
 
 **Delete.** `DELETE /v1/indexes/{index}` removes the index. It answers `200` with the epoch
 that removed it, or `404` if the index does not exist. It exists if any of these holds:
-- HEAD names it in `indexes`, `schemas` or `schema_rejects`;
+- HEAD names it in `indexes` or `schema_rejects` (a schema is only recorded beside a segment
+  list, so `schemas` adds nothing -- amended at the mutation sweep);
 - a bundle the drop read holds its rows;
 - this process has pending rows for it.
 

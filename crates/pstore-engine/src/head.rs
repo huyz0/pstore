@@ -183,6 +183,10 @@ pub struct Head {
     /// (M9c). ⚠️ A fourth optional trailing section: absent means no segment has deleted rows.
     /// A replaced vector is buried, so GC reaps it and `as_of` can still find it.
     pub deletes: BTreeMap<String, (String, u32)>,
+    /// Indexes dropped within GC's window (M9f.2): `(name, the epoch that dropped it, its
+    /// schema)`. `as_of` an epoch before the drop scores by that schema's metric -- the present
+    /// has none, or a recreated index's. Pruned when GC's horizon reaches the epoch.
+    pub dropped: Vec<(String, u64, IndexSchema)>,
 }
 
 /// Where a segment's delete vector written at `epoch` by `lane` lives (M9c): the segment's
@@ -277,6 +281,16 @@ impl Head {
             put_str(&mut out, name);
             out.push(metric.code() as u8);
         }
+        // M9f.2: the dropped indexes' schemas, whole (a live schema's metric is in the section
+        // above; a dropped one has no entry there to hang it on).
+        out.extend_from_slice(&(self.dropped.len() as u32).to_le_bytes());
+        for (name, epoch, schema) in &self.dropped {
+            put_str(&mut out, name);
+            out.extend_from_slice(&epoch.to_le_bytes());
+            out.extend_from_slice(&schema.dims.to_le_bytes());
+            put_str(&mut out, &schema.text_field);
+            out.push(schema.metric.code() as u8);
+        }
         out
     }
 
@@ -370,6 +384,25 @@ impl Head {
                 .ok_or(EngineError::CorruptHead)?
                 .metric = metric;
         }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let epoch = c.u64()?;
+            let dims = c.u32()?;
+            let text_field = c.string()?;
+            let metric = Metric::from_code(i64::from(c.u8()?)).ok_or(EngineError::CorruptHead)?;
+            h.dropped.push((
+                name,
+                epoch,
+                IndexSchema {
+                    dims,
+                    text_field,
+                    metric,
+                },
+            ));
+        }
         Ok(h)
     }
 
@@ -381,6 +414,11 @@ impl Head {
     /// — a pass with nothing due returns before it commits — which is exactly why this is a
     /// function with its own test rather than a line inside `gc` that nothing can reach.
     pub fn record_reap(&mut self, horizon: u64) {
+        // A dropped schema outlives its index until nothing before the drop is answerable
+        // (M9f.2): `as_of` refuses every epoch below the horizon, so at `horizon >= epoch` no
+        // query can ask for it.
+        self.dropped
+            .retain(|(_, epoch, _)| *epoch > horizon.max(self.reaped_before));
         self.reaped_before = self.reaped_before.max(horizon);
     }
 

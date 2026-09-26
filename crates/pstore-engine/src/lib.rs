@@ -569,6 +569,16 @@ pub type Resolved = (
     Option<f32>,
 );
 
+/// How a fold ended.
+enum Folded {
+    /// It committed this epoch.
+    Committed(Epoch),
+    /// There was nothing to fold; HEAD was at this epoch.
+    Nothing(Epoch),
+    /// A drop found no such index, and committed nothing (M9f.2).
+    Missing,
+}
+
 /// What [`Engine::ordered`] returns (M9e).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ordered {
@@ -1075,7 +1085,38 @@ impl<S: BlobStore> Engine<S> {
                 )));
             }
         }
+        // ⚠️ **A refusal re-reads HEAD once before it stands** (M9f.2): both rungs can be stale
+        // after an index is dropped and made again -- the cached schema, and this process's own
+        // flushed rows, which a process that only writes never prunes -- and would then refuse
+        // the new index's width forever. A read on the refusal path only, never per write, and
+        // with the memtable released: it is a std mutex, and an `.await` under it would block.
+        {
+            let mut m = self.mem();
+            if self.door_conflict(&m, index, &docs, metric).is_none() {
+                m.buffer(index, docs);
+                return Ok(());
+            }
+        }
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
         let mut m = self.mem();
+        let _ = m.prune(self.watermark(&at.head));
+        if let Some(e) = self.door_conflict(&m, index, &docs, metric) {
+            return Err(e);
+        }
+        m.buffer(index, docs);
+        Ok(())
+    }
+
+    /// Why `docs` cannot join `index` under `metric`, by what this process knows without a
+    /// request: the schema it last read, and the rows it holds unfolded.
+    fn door_conflict(
+        &self,
+        m: &Memtable,
+        index: &str,
+        docs: &[Document],
+        metric: Metric,
+    ) -> Option<EngineError> {
         // ⚠️ **One index, one width**, checked against the rows this process already holds
         // for it — buffered or flushed-but-unfolded. Costs no request, because the answer is
         // in memory or it is not knowable for free at all.
@@ -1093,9 +1134,9 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ **Rung one of the ladder: the schema this process has already read**, at zero
         // requests. Cold, it has nothing to compare against and the flush is what refuses.
         if let Some(schema) = self.cached_schema(index)
-            && let Some(e) = self.batch_conflict(index, &schema, &docs)
+            && let Some(e) = self.batch_conflict(index, &schema, docs)
         {
-            return Err(e);
+            return Some(e);
         }
         // ⚠️ **Falls back to the batch's own first row**, which closes the case a reviewer
         // spotted next to the one this ladder was built for: a brand-new index created by a
@@ -1116,7 +1157,7 @@ impl<S: BlobStore> Engine<S> {
         if let Some((known_metric, _)) = known
             && known_metric != metric
         {
-            return Err(EngineError::SchemaConflict {
+            return Some(EngineError::SchemaConflict {
                 index: index.to_owned(),
                 what: "the distance metric",
                 expected: known_metric.name().to_owned(),
@@ -1126,13 +1167,12 @@ impl<S: BlobStore> Engine<S> {
         if let Some((_, expected)) = known
             && let Some(odd) = docs.iter().find(|d| d.vector().len() != expected)
         {
-            return Err(EngineError::DimensionMismatch {
+            return Some(EngineError::DimensionMismatch {
                 expected: expected.saturating_sub(metric.extra()),
                 got: odd.vector().len().saturating_sub(metric.extra()),
             });
         }
-        m.buffer(index, docs);
-        Ok(())
+        None
     }
 
     /// Deletes `ids` from `index` (M9c.2): buffered as tombstones, in the same ordered log as
@@ -1419,7 +1459,76 @@ impl<S: BlobStore> Engine<S> {
     /// copy would make the WAL write-only: the objects would be paid for and never read,
     /// and a process that restarted could not recover a single acknowledged write.
     pub async fn fold(&self) -> Result<Epoch, EngineError> {
+        match self
+            .fold_inner(
+                None,
+                None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+            )
+            .await?
+        {
+            Folded::Committed(epoch) | Folded::Nothing(epoch) => Ok(epoch),
+            // Only a drop finds its index missing.
+            Folded::Missing => Err(EngineError::Lost),
+        }
+    }
+
+    /// Deletes `index` (M9f.2): **a fold that drops it**, so every bundle holding its rows up
+    /// to each lane's tail is read, and the watermarks advance past them -- no later fold can
+    /// bring those rows back. Every other index folds as usual. Returns the epoch that dropped
+    /// it, or `None` if it does not exist: HEAD names no segment list or reject count for it,
+    /// no bundle read holds a row of it that is not a delete, and neither does this process's
+    /// pending memory. `None` commits nothing.
+    ///
+    /// ⚠️ **Under this lane's flush lock, from before the tails are read until the commit.** An
+    /// in-flight flush otherwise lands a bundle past the tail the drop read -- bringing rows
+    /// written before the delete back -- and then drains `pending` rows the drop already
+    /// removed, marking a later write flushed in a bundle that lacks it (spec review).
+    ///
+    /// ⚠️ **Linearized at its commit.** A write the drop did not read -- flushed after it read
+    /// that lane's tail, or still in another process's memory -- is a write after the delete,
+    /// and its fold creates the index again with only that write.
+    ///
+    /// # Errors
+    /// As [`Self::fold`].
+    pub async fn delete_index(&self, index: &str) -> Result<Option<Epoch>, EngineError> {
+        self.delete_index_inner(
+            index,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// [`Self::delete_index`], with `interfere` awaited between the first attempt's reads and
+    /// its commit, so a test can make another delete land first and force the retry.
+    #[doc(hidden)]
+    pub async fn delete_index_with_interference_for_test(
+        &self,
+        index: &str,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Option<Epoch>, EngineError> {
+        self.delete_index_inner(index, Some(interfere)).await
+    }
+
+    async fn delete_index_inner(
+        &self,
+        index: &str,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Option<Epoch>, EngineError> {
+        let _flushing = self.flushing.lock().await;
+        Ok(match self.fold_inner(Some(index), interfere).await? {
+            Folded::Committed(epoch) => Some(epoch),
+            Folded::Nothing(_) | Folded::Missing => None,
+        })
+    }
+
+    /// The fold, and -- with `drop` -- the delete of one index (M9f.2).
+    async fn fold_inner(
+        &self,
+        drop: Option<&str>,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Folded, EngineError> {
         require_fencing(&*self.store)?;
+        let mut interfere = interfere;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
             let live = lanes::live(&*self.store, self.tenant).await?;
@@ -1441,8 +1550,9 @@ impl<S: BlobStore> Engine<S> {
                     (*from..*tail).map(move |n| (*lane, bundle_key(self.tenant, *lane, Seq(n))))
                 })
                 .collect();
-            if keys.is_empty() {
-                return Ok(at.head.epoch);
+            // A drop commits even with nothing else to fold.
+            if keys.is_empty() && drop.is_none() {
+                return Ok(Folded::Nothing(at.head.epoch));
             }
 
             let bodies =
@@ -1458,8 +1568,28 @@ impl<S: BlobStore> Engine<S> {
                         .extend(bundle::read_entry(body, &entry)?);
                 }
             }
-            if by_index.is_empty() {
-                return Ok(at.head.epoch);
+            // ⚠️ **Existence is decided here, on every attempt** (M9f.2): after the bundles are
+            // read and before anything is sealed, so a missing index on the first attempt writes
+            // nothing. Rows that are all deletes do not make an index exist, as queries decide.
+            if let Some(x) = drop {
+                let rows = |docs: Option<&Vec<Document>>| {
+                    docs.is_some_and(|d| d.iter().any(|d| !is_tombstone(d)))
+                };
+                // A schema is only ever recorded beside a segment list, so `schemas` adds nothing
+                // (mutation sweep); a reject count is NOT -- a fold can count a rejected row of an
+                // index whose accepted rows were all deleted, and seal nothing (code review).
+                let exists = at.head.indexes.contains_key(x)
+                    || at.head.schema_rejects.contains_key(x)
+                    || rows(by_index.get(x))
+                    || rows(self.mem().pending.get(x));
+                if !exists {
+                    return Ok(Folded::Missing);
+                }
+                // Before the reject pass, so none of its rows are counted as rejects.
+                by_index.remove(x);
+            }
+            if by_index.is_empty() && drop.is_none() {
+                return Ok(Folded::Nothing(at.head.epoch));
             }
             // ⚠️ Remembered from the HEAD this fold READ, so the door has something to
             // refuse against; the committed one is remembered below, because a fold that
@@ -1580,9 +1710,37 @@ impl<S: BlobStore> Engine<S> {
                 .entry(next.epoch.0)
                 .or_default()
                 .extend(keys.iter().map(|(_, k)| k.as_str().to_owned()));
+            // The drop (M9f.2): the index's segment list, schema, reject count and delete
+            // vectors leave HEAD, the segments and vectors are buried at this epoch -- written
+            // even when empty, so the GC that prunes `dropped` is never skipped for having
+            // nothing due -- and the schema is kept in `dropped` for `as_of`.
+            if let Some(x) = drop {
+                let grave = next.graveyard.entry(next.epoch.0).or_default();
+                for r in next.indexes.remove(x).unwrap_or_default() {
+                    if let Some((dv, _)) = next.deletes.remove(&r.key) {
+                        grave.push(dv);
+                    }
+                    grave.push(r.key);
+                }
+                next.schema_rejects.remove(x);
+                if let Some(schema) = next.schemas.remove(x) {
+                    next.dropped.push((x.to_owned(), next.epoch.0, schema));
+                }
+            }
+            if let Some(f) = interfere.take() {
+                f.await;
+            }
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
+                    // A drop's pending rows go with it, and no cached fresh view may keep
+                    // serving them. Its durable batches are all below the new watermark (the
+                    // flush lock is held), so the prune below removes them.
+                    if let Some(x) = drop {
+                        let mut m = self.mem();
+                        m.pending.remove(x);
+                        m.generation += 1;
+                    }
                     // A fold that recorded a schema is the moment this process learns it, so
                     // the door refuses against the committed state rather than the one read
                     // before the fold.
@@ -1591,7 +1749,7 @@ impl<S: BlobStore> Engine<S> {
                     // lane was probed has a sequence at or past the new watermark and stays.
                     self.mem().prune(self.watermark(&next));
                     self.record_commit(epoch);
-                    return Ok(epoch);
+                    return Ok(Folded::Committed(epoch));
                 }
                 Err(EngineError::Lost | EngineError::Contended)
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
@@ -2421,13 +2579,9 @@ impl<S: BlobStore> Engine<S> {
         // an empty list and vanish. The test found it; the live path has always used this
         // value for the same reason.
         let unfolded_at = refs.len();
-        // A schema is immutable, so the present's says what the past's did (M9d).
-        let metric = at
-            .head
-            .schemas
-            .get(index)
-            .map(|s| s.metric)
-            .unwrap_or_default();
+        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
+        // (M9f.2).
+        let metric = metric_at(&at.head, index, epoch);
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
             &*self.store,
@@ -2657,6 +2811,21 @@ fn split_rows(
         }
     }
     (hits, ids, attributes, dists)
+}
+
+/// The metric `index` had at `epoch` (M9f.2): the schema of the first drop of that name after
+/// the epoch, if it was dropped since -- the present schema is then another index's, or none --
+/// and otherwise the present one.
+fn metric_at(head: &Head, index: &str, epoch: Epoch) -> Metric {
+    head.dropped
+        .iter()
+        // `>` and `>=` agree: `as_of` the drop's own epoch finds no segment of the index to
+        // score, so which schema it would use is never observed (mutation sweep, equivalent).
+        .filter(|(name, dropped, _)| name == index && *dropped > epoch.0)
+        .min_by_key(|(_, dropped, _)| *dropped)
+        .map(|(_, _, schema)| schema.metric)
+        .or_else(|| head.schemas.get(index).map(|s| s.metric))
+        .unwrap_or_default()
 }
 
 /// The legs as `metric` scores them (M9d): each dense query transformed. With the squared

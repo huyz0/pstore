@@ -194,6 +194,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 schema_rejects: Default::default(),
                 reaped_before: 0,
                 deletes: Default::default(),
+                dropped: Default::default(),
             };
             store
                 .put(

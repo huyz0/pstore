@@ -181,3 +181,31 @@ async fn a_list_forgets_what_another_process_folded_away() {
     let (s, b) = send(&writer, request("GET", "/v1/indexes/ghost", None)).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
 }
+
+#[tokio::test]
+async fn delete_removes_an_index_and_refuses_a_missing_one() {
+    // M9f.2, through the API.
+    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    put(&api, "gone", true).await;
+    put(&api, "kept", true).await;
+    fold(&api).await;
+    put(&api, "gone", false).await;
+    let (s, b) = send(&api, request("DELETE", "/v1/indexes/gone", None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["epoch"].as_u64().is_some(), "{b}");
+    let (s, _) = send(&api, request("GET", "/v1/indexes/gone", None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let q = json!({"vector": [1.0, 2.0]});
+    let (s, _) = send(&api, request("POST", "/v1/indexes/gone/query", Some(&q))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, l) = list(&api, "").await;
+    assert_eq!(l["indexes"], json!(["kept"]));
+    let (s, _) = send(&api, request("POST", "/v1/indexes/kept/query", Some(&q))).await;
+    assert_eq!(s, StatusCode::OK);
+    // Missing: 404, and nothing committed.
+    let (_, before) = send(&api, request("GET", "/v1/indexes/kept", None)).await;
+    let (s, b) = send(&api, request("DELETE", "/v1/indexes/never", None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    let (_, after) = send(&api, request("GET", "/v1/indexes/kept", None)).await;
+    assert_eq!(before["epoch"], after["epoch"], "a missing index committed");
+}
