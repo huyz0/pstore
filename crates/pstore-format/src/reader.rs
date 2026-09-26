@@ -763,6 +763,25 @@ impl Segment {
         key: &Key,
         keep: impl Fn(&BTreeMap<String, (i64, i64)>) -> bool,
     ) -> Result<Vec<(usize, Document)>, FormatError> {
+        let mut out = Vec::new();
+        self.visit_rows_where(store, key, keep, |row, doc| out.push((row, doc)))
+            .await?;
+        Ok(out)
+    }
+
+    /// [`Self::rows_where`], handing each row to `visit` as its block is decoded instead of
+    /// collecting them (M9e): the same one coalesced fetch, and a caller that keeps only some
+    /// rows -- an order-by selecting `top_k` -- never holds the segment decoded.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn visit_rows_where<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(&BTreeMap<String, (i64, i64)>) -> bool,
+        mut visit: impl FnMut(usize, Document),
+    ) -> Result<(), FormatError> {
         let mut base = 0usize;
         let mut wanted: Vec<(usize, &BlockMeta)> = Vec::new();
         for b in &self.blocks {
@@ -772,20 +791,19 @@ impl Segment {
             base += b.rows as usize;
         }
         if wanted.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let ranges: Vec<std::ops::Range<u64>> = wanted
             .iter()
             .map(|(_, b)| b.offset..b.offset + u64::from(b.len))
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
-        let mut out = Vec::new();
         for ((start, _), buf) in wanted.iter().zip(&bufs) {
             for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
-                out.push((start + r, doc));
+                visit(start + r, doc);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Specific rows' ids **and attributes**, from the same blocks [`Self::ids_at`] reads.

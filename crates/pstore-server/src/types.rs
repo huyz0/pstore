@@ -176,6 +176,13 @@ pub struct QueryRequest {
     /// the index, at the default depth.
     #[serde(default)]
     pub exact: bool,
+    /// `[attr, "asc" | "desc"]`: every admitted document in that order, instead of a relevance
+    /// ranking (M9e). `attr` may be `id`, which is how an index is exported, a page at a time.
+    #[serde(default)]
+    pub rank_by: Option<serde_json::Value>,
+    /// Documents of a `rank_by` order to skip (M9e). Refused without `rank_by`.
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -197,8 +204,9 @@ fn default_top_k() -> usize {
 pub struct ResultRow {
     /// The document's id.
     pub id: String,
-    /// Its fused score.
-    pub score: f32,
+    /// Its fused score. Absent for a `rank_by` order (M9e), which has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
     /// Its distance under the index's metric, when the query's dense leg scored it (M9d).
     /// Without `exact` it is the ranking rung's estimate.
     #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]

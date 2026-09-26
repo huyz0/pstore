@@ -543,6 +543,11 @@ async fn query_index<S: BlobStore + 'static>(
     if req.top_k == 0 {
         return Err(ApiError::bad_request("top_k must be greater than zero"));
     }
+    // ⚠️ Before `prefetch`, which refuses a query with no vector and no text: an ordered query
+    // has neither by definition (M9e).
+    if let Some(by) = order_by(&req)? {
+        return ordered(api, tenant, &index, &req, &by).await;
+    }
     let legs = prefetch(&req)?;
     let filter = req.filters.as_ref().map(predicate).transpose()?;
 
@@ -604,7 +609,7 @@ async fn query_index<S: BlobStore + 'static>(
         .map(|(id, score, attrs, dist)| ResultRow {
             attributes: selected(&req, &attrs),
             id,
-            score,
+            score: Some(score),
             dist,
         })
         .collect();
@@ -763,6 +768,112 @@ fn parse_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
         ));
     }
     serde_json::from_value(raw).map_err(|e| ApiError::bad_request(format!("malformed body: {e}")))
+}
+
+/// The most a `rank_by` query may skip and return together (M9e): its rows are held in memory.
+const MAX_ORDERED: usize = 10_000;
+
+/// The order a query asks for, if it asks for one -- or why it cannot mean one (M9e).
+///
+/// ⚠️ **Refused, never combined.** An ordered answer and a relevance answer are different
+/// questions, so `rank_by` beside `vector`, `text`, `field` or `exact: true` is a request that
+/// means nothing -- and answering one of them would silently drop the other.
+fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiError> {
+    let Some(raw) = &req.rank_by else {
+        if req.offset.is_some() {
+            return Err(ApiError::bad_request(
+                "offset applies only to a rank_by order",
+            ));
+        }
+        return Ok(None);
+    };
+    let by = match raw.as_array().map(Vec::as_slice) {
+        Some(
+            [
+                serde_json::Value::String(attr),
+                serde_json::Value::String(dir),
+            ],
+        ) => {
+            let desc = match dir.as_str() {
+                "asc" => false,
+                "desc" => true,
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "rank_by direction {other:?} is not \"asc\" or \"desc\""
+                    )));
+                }
+            };
+            pstore_query::OrderBy {
+                attr: attr.clone(),
+                desc,
+            }
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "rank_by is [attribute, \"asc\" | \"desc\"]",
+            ));
+        }
+    };
+    if req.vector.is_some() || req.text.is_some() || req.field.is_some() || req.exact {
+        return Err(ApiError::bad_request(
+            "rank_by orders by an attribute; it cannot be combined with vector, text, field \
+             or exact",
+        ));
+    }
+    if req.top_k.saturating_add(req.offset.unwrap_or(0)) > MAX_ORDERED {
+        return Err(ApiError::bad_request(format!(
+            "top_k + offset may be at most {MAX_ORDERED} for a rank_by order"
+        )));
+    }
+    Ok(Some(by))
+}
+
+/// A `rank_by` query (M9e): three round trips, no resolve round, no score.
+async fn ordered<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    tenant: TenantId,
+    index: &str,
+    req: &QueryRequest,
+    by: &pstore_query::OrderBy,
+) -> Result<axum::Json<QueryResponse>, ApiError> {
+    let filter = req.filters.as_ref().map(predicate).transpose()?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let got = engine
+        .ordered(
+            index,
+            by,
+            filter.as_ref(),
+            req.offset.unwrap_or(0),
+            req.top_k,
+            req.as_of.map(pstore_types::Epoch),
+        )
+        .await?;
+    if !got.exists {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found",
+            format!("this tenant has no index {index}"),
+        ));
+    }
+    let results = got
+        .rows
+        .into_iter()
+        .map(|d| ResultRow {
+            attributes: selected(req, &d.attrs),
+            id: d.id,
+            score: None,
+            dist: None,
+        })
+        .collect();
+    Ok(axum::Json(QueryResponse {
+        results,
+        meta: QueryMeta {
+            epoch: req.as_of.unwrap_or_else(|| engine.epoch().0),
+            unfolded_hits: got.unfolded,
+            cost: api.spend(tenant).since(before),
+        },
+    }))
 }
 
 /// The legs a query asks for. A query with none is a request nobody meant to make.

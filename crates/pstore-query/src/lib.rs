@@ -15,8 +15,10 @@
 pub mod deletes;
 mod filter;
 mod fuse;
+mod order;
 mod run;
 
 pub use filter::{ID as ID_ATTRIBUTE, Op, Predicate};
 pub use fuse::{Fusion, Hit, fuse};
+pub use order::{OrderBy, Selector, select};
 pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered};

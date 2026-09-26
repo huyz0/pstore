@@ -569,6 +569,18 @@ pub type Resolved = (
     Option<f32>,
 );
 
+/// What [`Engine::ordered`] returns (M9e).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ordered {
+    /// The documents, in order, each with its attributes and no vectors.
+    pub rows: Vec<Document>,
+    /// How many of them are unfolded rows, which another process would not have returned.
+    pub unfolded: usize,
+    /// Whether the index exists at all -- a segment, or an unfolded operation -- so a caller
+    /// can tell "no such index" from "nothing matched" without asking again.
+    pub exists: bool,
+}
+
 /// What HEAD knows about one index, without reading a single segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStats {
@@ -2413,6 +2425,78 @@ impl<S: BlobStore> Engine<S> {
             unfolded: Vec::new(),
             unfolded_at,
             segments: refs,
+        })
+    }
+
+    /// Every document `filter` admits, in `by`'s order, from `offset` for `limit` (M9e).
+    ///
+    /// **Three round trips** -- HEAD, the segments opened with their delete vectors, their
+    /// admitted blocks -- and no resolve round: a block carries ids and attributes. Rows are
+    /// **selected** into `offset + limit`, never sorted whole, so an unfiltered order over a
+    /// large index holds its fetched bytes and not its decoded rows. With `as_of`, that epoch's
+    /// manifest and delete vectors, and no unfolded rows.
+    ///
+    /// # Errors
+    /// [`EngineError::TimeTravel`] outside the window; a segment or block that cannot be read.
+    pub async fn ordered(
+        &self,
+        index: &str,
+        by: &pstore_query::OrderBy,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+    ) -> Result<Ordered, EngineError> {
+        let (refs, targets, unfolded, shadow) = match as_of {
+            Some(epoch) => {
+                let at = head::read(&*self.store, self.tenant).await?;
+                self.remember_schemas(&at.head);
+                let then = at.head.as_of(epoch)?;
+                let refs = then.indexes.get(index).cloned().unwrap_or_default();
+                let targets = segment_targets(&refs, &then.deletes, false);
+                (refs, targets, Vec::new(), std::collections::HashSet::new())
+            }
+            None => {
+                let (at, fresh) = self.head_and_fresh(index).await?;
+                self.remember_schemas(&at.head);
+                let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
+                let targets = segment_targets(&refs, &at.head.deletes, true);
+                let (rows, shadow) = fresh.map_or_else(
+                    || (Vec::new(), std::collections::HashSet::new()),
+                    |v| (v.rows, v.shadow),
+                );
+                (refs, targets, rows, shadow)
+            }
+        };
+        let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
+        pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector)
+            .await
+            .map_err(|e| EngineError::Query(e.to_string()))?;
+        // As a relevance query decides it: segments, or unfolded rows that are not deletes. An
+        // index only unfolded deletes ever touched does not exist (code review).
+        let exists = !refs.is_empty() || !unfolded.is_empty();
+        // The unfolded rows are the newest version of each id they carry, tombstones already
+        // gone; the segments' older rows of those ids were shadowed above.
+        for mut d in unfolded {
+            if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
+                // As a block's rows are: attributes, no vectors.
+                d.vectors.clear();
+                selector.offer(d);
+            }
+        }
+        let rows: Vec<Document> = selector
+            .into_sorted()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+        // A row is unfolded exactly when its id has an unfolded operation: the segment's
+        // version of such an id was shadowed.
+        let unfolded = rows.iter().filter(|d| shadow.contains(&d.id)).count();
+        Ok(Ordered {
+            rows,
+            unfolded,
+            exists,
         })
     }
 
