@@ -161,17 +161,23 @@ pub(crate) fn require_fencing<S: BlobStore + ?Sized>(store: &S) -> Result<(), En
 /// interval never enters the time-to-searchable budget.
 #[derive(Debug, Default)]
 struct Memtable {
-    /// Buffered but not yet in a bundle.
+    /// Buffered but not yet in a bundle -- **including rows whose bundle PUT is in flight**
+    /// (M9c.1, BACKLOG row 35): a flush moves them only once the PUT has succeeded, so a query
+    /// during the PUT still sees them.
     pending: BTreeMap<String, Vec<Document>>,
-    /// Flushed to a bundle, durable, still not folded into a segment.
-    durable: BTreeMap<String, Vec<Document>>,
-    /// Bumped whenever either map changes, so a cached fresh segment knows it is stale.
+    /// Flushed batches not yet known to be folded, each with its bundle's lane sequence.
     ///
-    /// ⚠️ `flush` moves rows from `pending` to `durable` without changing what they are -- but
-    /// while the bundle PUT is in flight they are in NEITHER map (BACKLOG row 35), so a query in
-    /// that window caches a fresh segment without them, and the bump after the flush is what
-    /// stops that segment being served afterwards. Not needless while that gap exists; M8g
-    /// deferred these bumps' surviving mutants to its fix.
+    /// ⚠️ **Tagged, so a fold removes exactly what it folded** (M9c.1, rows 36 and 38). A
+    /// fold used to clear the whole map, including a batch flushed after it probed the lane --
+    /// durable, acknowledged, and invisible until the next fold; and another process folding
+    /// this lane left the rows here, served twice. Now a batch is dropped only when a HEAD's
+    /// watermark for this lane is past its sequence, whoever folded it.
+    durable: Vec<(u64, BTreeMap<String, Vec<Document>>)>,
+    /// Every batch below this sequence is known folded and has been dropped. A query holding a
+    /// HEAD whose watermark is below it would be missing rows its HEAD does not have yet, and
+    /// re-reads HEAD instead.
+    pruned: u64,
+    /// Bumped whenever the rows change, so a cached fresh segment knows it is stale.
     generation: u64,
 }
 
@@ -186,6 +192,29 @@ impl Memtable {
             .entry(index.to_owned())
             .or_default()
             .extend(docs);
+    }
+
+    /// The flushed rows of `index`, oldest batch first.
+    fn durable_rows<'a>(&'a self, index: &'a str) -> impl Iterator<Item = &'a Document> + 'a {
+        self.durable
+            .iter()
+            .flat_map(move |(_, batch)| batch.get(index).into_iter().flatten())
+    }
+
+    /// Drops every batch a HEAD with this lane `watermark` has folded (its sequence is below
+    /// it), and reports whether the rows are now consistent with that HEAD: `false` when an
+    /// earlier call already dropped batches this HEAD has not folded yet.
+    fn prune(&mut self, watermark: u64) -> bool {
+        // No `watermark > pruned` guard: a batch below `pruned` is one a flush pushed after a
+        // fold had already folded it (see `flush_inner`), and dropping it is right whichever
+        // watermark finds it; above `pruned`, an older watermark's `retain` removes nothing.
+        let before = self.durable.len();
+        self.durable.retain(|(seq, _)| *seq >= watermark);
+        if self.durable.len() != before {
+            self.generation += 1;
+        }
+        self.pruned = self.pruned.max(watermark);
+        self.pruned <= watermark
     }
 }
 
@@ -314,6 +343,71 @@ struct Fresh {
     /// the order they were written in.
     rows: Vec<Document>,
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod memtable_tests {
+    use super::*;
+
+    fn batch(id: &str) -> BTreeMap<String, Vec<Document>> {
+        BTreeMap::from([("i".to_owned(), vec![Document::new(id, vec![1.0])])])
+    }
+
+    #[test]
+    fn a_prune_drops_exactly_the_batches_a_watermark_folded() {
+        let mut m = Memtable {
+            durable: vec![(0, batch("a")), (1, batch("b")), (2, batch("c"))],
+            ..Memtable::default()
+        };
+        // Watermark 2: sequences 0 and 1 are folded, 2 is not.
+        assert!(m.prune(2));
+        let left: Vec<&str> = m.durable_rows("i").map(|d| d.id.as_str()).collect();
+        assert_eq!(left, ["c"]);
+        assert_eq!(
+            m.generation, 1,
+            "dropping rows must invalidate a cached fresh segment"
+        );
+        // The same watermark again changes nothing and is still consistent.
+        assert!(m.prune(2));
+        assert_eq!(m.generation, 1);
+    }
+
+    #[test]
+    fn a_head_older_than_a_prune_is_reported_stale() {
+        // A query holding a HEAD that folded less than an earlier prune removed would pair it
+        // with rows missing what it lacks -- the reverse of row 36. It must re-read HEAD.
+        let mut m = Memtable {
+            durable: vec![(0, batch("a")), (1, batch("b"))],
+            ..Memtable::default()
+        };
+        assert!(m.prune(1));
+        assert!(!m.prune(0), "a HEAD behind the prune was accepted");
+        assert!(m.prune(1));
+    }
+}
+
+/// A fresh segment as one query uses it: its target, rows and store, taken together.
+struct FreshView {
+    target: pstore_query::Target,
+    rows: Vec<Document>,
+    store: Arc<pstore_blob::MemoryStore>,
+}
+
+impl Fresh {
+    fn view(&self) -> FreshView {
+        FreshView {
+            target: self.target.clone(),
+            rows: self.rows.clone(),
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+/// A HEAD older than rows this engine already pruned is re-read, at most this many times.
+const STALE_HEAD_RETRIES: usize = 4;
 
 /// What [`Engine::query`] returns: hits, plus the documents behind the fresh ordinal.
 ///
@@ -805,7 +899,7 @@ impl<S: BlobStore> Engine<S> {
             .pending
             .get(index)
             .and_then(|rows| rows.first())
-            .or_else(|| m.durable.get(index).and_then(|rows| rows.first()))
+            .or_else(|| m.durable_rows(index).next())
             .or_else(|| docs.first())
             .map(|d| d.vector().len());
         if let Some(expected) = known
@@ -831,7 +925,12 @@ impl<S: BlobStore> Engine<S> {
     /// that is the honest answer rather than a limitation, because nothing durable records it.
     pub async fn pending_indexes(&self) -> Vec<String> {
         let m = self.mem();
-        let mut names: Vec<String> = m.pending.keys().chain(m.durable.keys()).cloned().collect();
+        let mut names: Vec<String> = m
+            .pending
+            .keys()
+            .chain(m.durable.iter().flat_map(|(_, batch)| batch.keys()))
+            .cloned()
+            .collect();
         names.sort_unstable();
         names.dedup();
         names
@@ -982,13 +1081,16 @@ impl<S: BlobStore> Engine<S> {
             let at = head::read(&*self.store, self.tenant).await?;
             self.remember_schemas(&at.head);
         }
+        // ⚠️ A SNAPSHOT, not a take (M9c.1, row 35): the rows stay in `pending`, visible,
+        // while their bundle is written, and move only once it has landed. Writes arriving
+        // meanwhile append behind them; flushes are serialized by `flushing`, so the rows this
+        // flush wrote are exactly the first `counts[index]` of each index's pending list.
         let pending = {
-            let mut m = self.mem();
-            m.generation += 1;
+            let m = self.mem();
             if m.pending.is_empty() {
                 return Ok(None);
             }
-            std::mem::take(&mut m.pending)
+            m.pending.clone()
         };
         if check {
             let refusal = pending.iter().find_map(|(index, docs)| {
@@ -996,9 +1098,6 @@ impl<S: BlobStore> Engine<S> {
                 self.batch_conflict(index, &schema, docs)
             });
             if let Some(e) = refusal {
-                // ⚠️ The rows go back: a refused flush must not swallow what it refused, or
-                // the caller's retry writes nothing.
-                self.restore(pending);
                 return Err(e);
             }
         }
@@ -1007,35 +1106,21 @@ impl<S: BlobStore> Engine<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Registered once, on the lane's first flush. A lane nobody can find is a lane
-        // whose writes cannot be recovered, and the registration is what makes a successor
-        // able to discover it without being told.
-        if seq == Seq::ZERO
-            && let Err(e) = lanes::register(&*self.store, self.tenant, self.lane).await
-        {
-            self.restore(pending);
-            return Err(e);
+        // Registered once, on the lane's first flush. A lane nobody can find is a lane whose
+        // writes cannot be recovered, and the registration is what makes a successor able to
+        // discover it without being told.
+        if seq == Seq::ZERO {
+            lanes::register(&*self.store, self.tenant, self.lane).await?;
         }
-        // The one PUT.
-        if let Err(e) = self
-            .store
+        // The one PUT. ⚠️ **On failure the sequence is not consumed, and this is load-bearing**
+        // (OQ-91). A lane is recovered by probing forward from the last watermark until a key is
+        // missing, so a lane must be DENSE: the first absent sequence is taken as the end.
+        // Burning a number on a failed write punches a permanent hole, and every bundle after
+        // it -- all acknowledged, all durable -- becomes invisible to every future reader. Found
+        // by the OQ-91 scenario losing two acknowledged rows on seed 0, not by reading this code.
+        self.store
             .put(&self.lane_key(seq), bundle::encode(&pending).into())
-            .await
-        {
-            // ⚠️ **The sequence is not consumed, and this is load-bearing** (OQ-91).
-            //
-            // A lane is recovered by probing forward from the last watermark until a key
-            // is missing, so a lane must be DENSE: the first absent sequence is taken as
-            // the end. Burning a number on a failed write punches a permanent hole, and
-            // every bundle after it — all of them acknowledged, all of them durable —
-            // becomes invisible to every future reader. One refused PUT silently
-            // truncates the lane forever.
-            //
-            // Found by the OQ-91 scenario losing two acknowledged rows on seed 0, not by
-            // reading this code.
-            self.restore(pending);
-            return Err(e.into());
-        }
+            .await?;
         {
             let mut s = self
                 .seq
@@ -1043,31 +1128,30 @@ impl<S: BlobStore> Engine<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *s = seq.next();
         }
-        // Only now does it move from pending to durable: a write that failed to land must
-        // not be reported as durable, and must stay visible so it is not lost.
+        // ⚠️ No generation bump (M9c.1): the flushed rows move from the front of `pending` to
+        // the back of `durable`, and a fresh view is `durable` then `pending` -- the same rows in
+        // the same order, so a cached fresh segment built before the move is still exact.
         let mut m = self.mem();
-        m.generation += 1;
-        for (idx, docs) in pending {
-            m.durable.entry(idx).or_default().extend(docs);
+        let mut batch: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+        for (idx, docs) in &pending {
+            if let Some(rows) = m.pending.get_mut(idx) {
+                batch.insert(
+                    idx.clone(),
+                    rows.drain(..docs.len().min(rows.len())).collect(),
+                );
+                if rows.is_empty() {
+                    m.pending.remove(idx);
+                }
+            }
         }
+        // ⚠️ **A fold may already have folded this bundle** (review of M9c.1): it is in the
+        // store before the PUT's future resolves, and `fold` does not take `flushing`, so a
+        // fold -- this engine's or another's -- can fold it and prune before this drain. The
+        // batch is pushed anyway: the next query's `prune` drops it, and bumps the generation
+        // so no cached fresh view keeps it. Until then -- and in the window before this drain,
+        // where the rows are in `pending` AND a segment -- a query returns them twice. Residual.
+        m.durable.push((seq.0, batch));
         Ok(Some(seq))
-    }
-
-    /// Puts a failed flush's rows back in front of anything written since.
-    ///
-    /// Without this a refused flush would drop the rows it took, which is a silent loss of
-    /// data the caller was never told was durable — worse than the error it reports,
-    /// because the caller's retry would have no way to know what to retry.
-    fn restore(&self, pending: BTreeMap<String, Vec<Document>>) {
-        let mut m = self.mem();
-        m.generation += 1;
-        for (idx, mut docs) in pending {
-            let slot = m.pending.entry(idx).or_default();
-            // Older rows first: they were written first, and a later write to the same id
-            // must stay later.
-            docs.append(slot);
-            *slot = docs;
-        }
     }
 
     /// Replays **every lane's** unfolded WAL bundles into segments and commits them.
@@ -1228,10 +1312,9 @@ impl<S: BlobStore> Engine<S> {
                     // the door refuses against the committed state rather than the one read
                     // before the fold.
                     self.remember_schemas(&next);
-                    let mut m = self.mem();
-                    m.generation += 1;
-                    m.durable.clear();
-                    drop(m);
+                    // ⚠️ Only what this fold folded (M9c.1, row 36): a batch flushed after the
+                    // lane was probed has a sequence at or past the new watermark and stays.
+                    self.mem().prune(self.watermark(&next));
                     self.record_commit(epoch);
                     return Ok(epoch);
                 }
@@ -1582,43 +1665,48 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         filter: Option<&Filter>,
     ) -> Result<Vec<Document>, EngineError> {
-        let at = head::read(&*self.store, self.tenant).await?;
-        let keys: Vec<Key> = at
-            .head
-            .indexes
-            .get(index)
-            .into_iter()
-            .flatten()
-            .map(|r| Key::new(r.key.clone()))
-            .collect();
+        // ⚠️ The unfolded rows must be the ones THIS HEAD has not folded (M9c.1): a HEAD that
+        // is older than a prune this engine already did is re-read rather than paired with
+        // rows that no longer include what it lacks.
+        for _ in 0..STALE_HEAD_RETRIES {
+            let at = head::read(&*self.store, self.tenant).await?;
+            let keys: Vec<Key> = at
+                .head
+                .indexes
+                .get(index)
+                .into_iter()
+                .flatten()
+                .map(|r| Key::new(r.key.clone()))
+                .collect();
 
-        // ⚠️ Segments are opened TOGETHER, then scanned together. A loop over segment refs
-        // is functionally identical and turns a ten-segment index into a twenty-one-hop
-        // query -- measured, not guessed -- which is six times the whole latency budget.
-        // Width is free; depth is not.
-        let opened =
-            futures_util::future::try_join_all(keys.iter().map(|k| Segment::open(&*self.store, k)))
-                .await?;
-        let scanned = futures_util::future::try_join_all(
-            opened
-                .iter()
-                .zip(&keys)
-                .map(|(seg, k)| seg.scan(&*self.store, k, filter)),
-        )
-        .await?;
-        let mut out: Vec<Document> = scanned.into_iter().flatten().collect();
-        // Unfolded rows live only in memory. They are not in any segment, so there is
-        // nothing to deduplicate against -- the fold clears them in the same step that
-        // publishes the segment.
-        let m = self.mem();
-        for src in [&m.durable, &m.pending] {
-            for d in src.get(index).into_iter().flatten() {
+            let opened = futures_util::future::try_join_all(
+                keys.iter().map(|k| Segment::open(&*self.store, k)),
+            )
+            .await?;
+            let scanned = futures_util::future::try_join_all(
+                opened
+                    .iter()
+                    .zip(&keys)
+                    .map(|(seg, k)| seg.scan(&*self.store, k, filter)),
+            )
+            .await?;
+            let mut out: Vec<Document> = scanned.into_iter().flatten().collect();
+            let mut m = self.mem();
+            if !m.prune(self.watermark(&at.head)) {
+                continue;
+            }
+            let unfolded: Vec<&Document> = m
+                .durable_rows(index)
+                .chain(m.pending.get(index).into_iter().flatten())
+                .collect();
+            for d in unfolded {
                 if filter.is_none_or(|f| f.matches(d)) {
                     out.push(d.clone());
                 }
             }
+            return Ok(out);
         }
-        Ok(out)
+        Err(EngineError::Lost)
     }
 
     /// Seals this index's unfolded rows into a segment that lives only in memory.
@@ -1629,25 +1717,36 @@ impl<S: BlobStore> Engine<S> {
     /// ⚠️ A refusal here **fails the query**. Falling back to the folded-only answer would be
     /// silently returning the stale result this exists to remove, which is worse than an error
     /// a caller can see.
-    async fn fresh_target(&self, index: &str) -> Result<Option<pstore_query::Target>, EngineError> {
+    async fn fresh_view(
+        &self,
+        index: &str,
+        watermark: u64,
+    ) -> Result<Option<Option<FreshView>>, EngineError> {
         let (generation, rows) = {
-            let m = self.mem();
-            let mut rows: Vec<Document> = Vec::new();
-            for src in [&m.durable, &m.pending] {
-                rows.extend(src.get(index).into_iter().flatten().cloned());
+            let mut m = self.mem();
+            if !m.prune(watermark) {
+                return Ok(None);
             }
+            let rows: Vec<Document> = m
+                .durable_rows(index)
+                .chain(m.pending.get(index).into_iter().flatten())
+                .cloned()
+                .collect();
             (m.generation, rows)
         };
         let mut slot = self.fresh.lock().await;
+        // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
+        // rows and store afterwards let a concurrent query on another index replace the cached
+        // segment in between, and this one then ran `mem/a.seg` against `b`'s store.
         if let Some(f) = slot.as_ref()
             && f.generation == generation
             && f.index == index
         {
-            return Ok(Some(f.target.clone()));
+            return Ok(Some(Some(f.view())));
         }
         if rows.is_empty() {
             *slot = None;
-            return Ok(None);
+            return Ok(Some(None));
         }
 
         let store = Arc::new(pstore_blob::MemoryStore::new());
@@ -1703,14 +1802,16 @@ impl<S: BlobStore> Engine<S> {
             .iter()
             .filter_map(|r| rows.get(*r).cloned())
             .collect();
-        *slot = Some(Fresh {
+        let fresh = Fresh {
             generation,
             index: index.to_owned(),
             store,
-            target: target.clone(),
+            target,
             rows: ordered,
-        });
-        Ok(Some(target))
+        };
+        let view = fresh.view();
+        *slot = Some(fresh);
+        Ok(Some(Some(view)))
     }
 
     /// Runs `prefetch` over every segment HEAD names for `index` **and over the rows not yet
@@ -1752,7 +1853,9 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
     ) -> Result<Answer, EngineError> {
-        let at = head::read(&*self.store, self.tenant).await?;
+        // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
+        // a prune this engine already did would be paired with rows missing what it lacks.
+        let (at, fresh) = self.head_and_fresh(index).await?;
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
@@ -1769,16 +1872,13 @@ impl<S: BlobStore> Engine<S> {
             .collect();
         let unfolded_at = targets.len();
 
-        let fresh = self.fresh_target(index).await?;
-        let held = self.fresh.lock().await;
-        let (unfolded, fresh_store) = match (&fresh, held.as_ref()) {
-            (Some(_), Some(f)) => (f.rows.clone(), Some(Arc::clone(&f.store))),
-            _ => (Vec::new(), None),
+        let (unfolded, fresh_store) = match fresh {
+            Some(v) => {
+                targets.push(v.target);
+                (v.rows, Some(v.store))
+            }
+            None => (Vec::new(), None),
         };
-        drop(held);
-        if let Some(t) = fresh {
-            targets.push(t);
-        }
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -1815,6 +1915,26 @@ impl<S: BlobStore> Engine<S> {
             unfolded_at,
             segments: refs,
         })
+    }
+
+    /// HEAD, and the fresh view of `index` consistent with it: the unfolded rows it has not
+    /// folded. Re-reads HEAD when this engine already pruned past it.
+    async fn head_and_fresh(
+        &self,
+        index: &str,
+    ) -> Result<(head::HeadAt, Option<FreshView>), EngineError> {
+        for _ in 0..STALE_HEAD_RETRIES {
+            let at = head::read(&*self.store, self.tenant).await?;
+            if let Some(view) = self.fresh_view(index, self.watermark(&at.head)).await? {
+                return Ok((at, view));
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// How far HEAD has folded this engine's own lane.
+    fn watermark(&self, head: &Head) -> u64 {
+        head.watermarks.get(&self.lane.0).copied().unwrap_or(0)
     }
 
     /// The same query, against the manifest as it stood at `epoch`.
