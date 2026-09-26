@@ -188,4 +188,98 @@ bytes trip the threshold, more if due tenants outrun the 4-way concurrency.
 
 ## M9i.2 — `consistency`
 
-To be specified when M9i.1 lands.
+### What each level promises
+
+A query may carry `"consistency": "eventual"` or `"strong"`.
+- **`eventual`** is the default, and exactly today's behaviour. The answer reflects:
+  - the HEAD read by the query (never cached);
+  - every write this process acknowledged;
+  - another process's durable writes once a fold commits them, which M9i.1 bounds at about
+    `age + period` while their writer lives.
+- **`strong`** answers only if it reflects **every durable write acknowledged by any process
+  before the query began**. Otherwise it is refused, never served stale.
+
+⚠️ **Not turbopuffer's default.** Their default is `strong`. Making it pstore's would add a
+registry read and one probe per lane to every query. With D-39's 1-hour fold age, it would
+also refuse most queries that follow a write from another process. The default stays
+`eventual`, and a client asks for `strong`.
+
+### Delta
+
+**How `strong` is decided, within the three-round budget** (AGENTS.md: "never a
+data-dependent chain"):
+- **Round 1:** HEAD, as today, and in parallel the tenant's lane registry. Both keys are
+  derived from the tenant; nothing is listed.
+- **Round 2:** in parallel with the query's own segment reads, one `head` probe per
+  registered lane **other than this process's**, of the bundle at that lane's watermark in
+  the HEAD read in round 1. A bundle there is a durable write no fold has committed.
+- **This process's lane is not probed.** It is single-writer, and each of its unfolded
+  batches is in this engine's memtable, which every answer already includes. That is exact
+  while the engine holds every sequence from the watermark up to its next; it does not after
+  a restart, so the lane is probed then.
+- **Round 3:** the query's block reads, as today.
+- If any probe finds a bundle, the answer is discarded. The query is refused with
+  `503 not_folded`, retryable, with `Retry-After: 1`, and a fold of the tenant is started in
+  the background: the refusal never waits on it. A retry after that fold commits is served.
+- A probe that errors is an error, like any read.
+
+**Cost.** `strong` adds 1 GET and `lanes - 1` HEAD probes per query, in rounds that already
+exist. Requests scale with the nodes that ever wrote the tenant, not with records. `eventual`
+adds nothing.
+
+**Where it applies:**
+- Relevance queries and `rank_by` orders.
+- Each sub-query of a multi-query carries its own `consistency`.
+- `strong` with `as_of` is `400`: a past epoch is already exactly what it is.
+- Any other value, `"Strong"` included, is `400`.
+
+**Response.** `meta.consistency` names the level served. A multi-query reports one per
+sub-query, as `meta.consistencies`.
+
+**Does not change:** a query without `consistency`, which is served, costed and reported
+exactly as today, except for the new `meta` field; the depth of any query.
+
+### Acceptance criteria
+
+1. **Strong refuses what it cannot see.** Two `Api`s, A and B, share a store. A durable write
+   through A, unfolded:
+   - `strong` through B is `503 not_folded`, retryable, with `Retry-After`;
+   - after the background fold that refusal started, `strong` through B returns the row;
+   - `eventual` through B does not return it before that fold.
+2. **Strong serves what it can.** With nothing unfolded anywhere, `strong` through B answers
+   exactly what `eventual` does.
+3. **This process's own writes need no probe.** A durable write through A: `strong` through
+   A answers it at once, and probes only lane B. Counted: the requests exceed `eventual`'s by
+   exactly 1 GET plus 1 HEAD probe.
+4. **Depth.** `strong` has the same round-trip depth as `eventual` for a filtered relevance
+   query and for a `rank_by` order, measured with the testkit's depth counter.
+5. **Rank orders too.** Criterion 1 holds for a `rank_by` query.
+6. **Refusals.** Each is `400`: `consistency` of `"Strong"`, `"bounded"`, `1`, or
+   `{"mode": "strong"}`; and `strong` with `as_of`. A sub-query's refusal refuses the
+   multi-query.
+7. **Reported.** `meta.consistency` is `"eventual"` by default and `"strong"` when asked. A
+   multi-query reports each sub-query's level.
+8. `./scripts/gates.sh` passes; `./scripts/mutants.sh` over the diff misses 0.
+
+### Test plan
+
+| # | Fails first | Mutation it catches |
+|---|---|---|
+| 1 | `consistency` is ignored | a probe skipped; the refusal not retryable; no fold started |
+| 2 | (after 1) | a clean lane read as dirty |
+| 3 | (after 1) | the own lane probed; the registry read twice |
+| 4 | (after 1) | the probes in a round of their own |
+| 5 | (after 1) | `rank_by` not checked |
+| 6 | accepted today | a bound unchecked |
+| 7 | the field does not exist | the level misreported |
+
+### RA budget
+
+Unchanged depth. `strong` adds 1 GET and `lanes - 1` HEAD probes, within rounds 1 and 2.
+
+### Risks
+
+- **A write-heavy tenant can make `strong` refuse often.** It succeeds only between a fold
+  and the next durable write from another process. The background fold narrows that window
+  but does not close it.
+- A lane that registered and never wrote is still probed, and lanes are never deregistered.
