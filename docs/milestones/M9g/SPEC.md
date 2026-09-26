@@ -37,10 +37,16 @@ first, if there is one, then each text query.
 - `sum` and `max` take **text legs only**; a dense leg is refused.
 - (M9g.2, round 2) **Neither post-mask cut applies under `sum`**: each leg's union across
   segments is uncut, and only the fused ranking is cut to `top_k` -- copying the filter path
-  literally re-cuts each leg to its limit. And **the legs are fused before the shadow round**:
+  literally re-cuts each leg to its limit. And, **under `sum` only, the legs are fused before
+  the shadow round** (RRF and `max` keep the per-leg check, because dropping a row shifts the
+  others' ranks):
   the top `top_k + |shadow|` fused candidates are resolved, shadowed ones dropped, then cut to
   `top_k`, because checking the shadow on every exhaustive candidate would fetch a block per
-  matching row. Requests unchanged; bytes are the terms' postings plus those rows.
+  matching row. At most `|shadow|` fused rows can be shadowed: an id has at most one live row
+  across the folded segments (M9c.2's delete vectors). A text leg already reads every posting
+  of its terms whatever its limit, so an exhaustive `sum` leg adds no bytes, only candidates
+  held in memory; the shadow round adds `|shadow|` rows. `max` with every weight 0 is refused
+  (every row would tie at 0).
 
 Rules for the fields:
 - `weights` is optional; when present, it must have one finite, non-negative number per leg.
@@ -83,6 +89,12 @@ depth of any query.
    row, which returns the raw BM25. Weights scale each leg's contribution. And the truncation
    case: `top_k = 1`, where the row with the best sum is neither leg's own first, returns that
    row.
+   2b. (M9g.2) With one unrelated row unfolded, what the shadow check adds to a `sum` query's
+   bytes -- its bytes less the same query's with nothing unfolded -- does not grow with the
+   rows its terms match: every row of the index matching, at 2,000 rows it is at most 16 KiB
+   more than at 500 (spec review: a ratio fails when the smaller difference is 0). The margin
+   is sized for the fold's 64 rows per block (`vec_index.rs`), well over one block of the
+   fixture's short rows; a fixture with larger blocks restates it as one block.
 3. A multi-query of a vector query, a two-text `sum` query and a `rank_by` order returns, per
    query, exactly what each returns alone. `cost.blob_lists` is 0.
 4. Each refusal above is `400`, including a sub-query's own refusal. A default query's response
@@ -100,13 +112,14 @@ depth of any query.
 
 ## RA budget
 
-Unchanged for a single query, except `sum`: its legs are exhaustive, so its bytes are every
-posting of its terms, at the same depth. A multi-query of `n` issues at most `n` queries'
+Unchanged for a single query. `sum`'s exhaustive legs add no bytes (a text leg reads every
+posting of its terms already) and no depth; its shadow round resolves `|shadow|` more rows. A multi-query of `n` issues at most `n` queries'
 requests, at the depth of the deepest one, because they run concurrently.
 
 ## Risks
 
-- A `sum` query reads all its terms' postings; a common term makes that the index's size.
+- A `sum` query holds every candidate of every leg in memory; a common term makes that the
+  index's row count.
 - Sub-queries of one request may be answered at different epochs.
 
 ## Tasks

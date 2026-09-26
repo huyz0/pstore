@@ -47,6 +47,22 @@ pub enum Fusion {
         /// One per leg, in leg order.
         weights: Weights,
     },
+    /// The weighted **sum of raw leg scores** (M9g.2): a leg that did not score a row adds
+    /// nothing, which is its score -- BM25 is never negative. ⚠️ **Text legs only**, and the
+    /// caller enforces it (the server refuses a dense leg): a dense or sparse score can be
+    /// negative, and a row that leg retrieved would then rank below one it never found. Its
+    /// legs are whole, not cut at their limit: see `run`.
+    Sum {
+        /// One per leg, in leg order.
+        weights: Weights,
+    },
+    /// The largest weighted raw leg score (M9g.2), text legs only as for [`Fusion::Sum`]. Legs
+    /// keep their limit: a row's best leg ranks it within that leg's own top, so no cut loses
+    /// it.
+    Max {
+        /// One per leg, in leg order.
+        weights: Weights,
+    },
 }
 
 /// The most legs a query may fuse (M9g.1): one dense leg and fifteen text legs, turbopuffer's
@@ -58,12 +74,21 @@ pub const MAX_LEGS: usize = 16;
 pub struct Weights([f32; MAX_LEGS]);
 
 impl Weights {
+    /// Every leg weighing 1: what an unweighted `sum` or `max` is (M9g.2).
+    pub const ONE: Self = Self([1.0; MAX_LEGS]);
+
     /// These weights, or `None` for more than [`MAX_LEGS`]. Legs past the given ones weigh 1.
     #[must_use]
     pub fn of(weights: &[f32]) -> Option<Self> {
         let mut all = [1.0; MAX_LEGS];
         all.get_mut(..weights.len())?.copy_from_slice(weights);
         Some(Self(all))
+    }
+
+    /// Whether the first `legs` weights are all zero (M9g.2).
+    #[must_use]
+    pub fn all_zero(&self, legs: usize) -> bool {
+        self.0.iter().take(legs).all(|w| *w == 0.0)
     }
 
     /// Leg `i`'s weight.
@@ -110,6 +135,13 @@ pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
                 Fusion::WeightedRrf { k, weights } => {
                     *slot.or_insert(0.0) += weights.get(j) / (k + rank);
                 }
+                Fusion::Sum { weights } => *slot.or_insert(0.0) += weights.get(j) * hit.score,
+                // Only the legs that scored the row: an absent leg is not a zero.
+                Fusion::Max { weights } => {
+                    let v = weights.get(j) * hit.score;
+                    let best = slot.or_insert(v);
+                    *best = best.max(v);
+                }
             }
         }
     }
@@ -147,5 +179,8 @@ mod tests {
         );
         assert!(Weights::of(&[1.0; MAX_LEGS]).is_some());
         assert!(Weights::of(&[1.0; MAX_LEGS + 1]).is_none());
+        let zeros = Weights::of(&[0.0, 0.0, 3.0]).unwrap();
+        assert!(zeros.all_zero(2));
+        assert!(!zeros.all_zero(3));
     }
 }

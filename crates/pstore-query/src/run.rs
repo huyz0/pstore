@@ -204,14 +204,20 @@ async fn run<S: BlobStore>(
     // vector, or -- in a shadowed segment -- one whose id has a newer unfolded operation. Without
     // a filter the legs need not be exhaustive: at most `deleted + shadowed` of a segment's rows
     // can be excluded, so a leg asked for that many more still has `limit` left after them.
+    // ⚠️ **Under `Sum`, every leg is whole** (M9g.2, spec review): a leg cut at its limit drops
+    // a row's contribution, so the best sum can be a row no leg ranks first -- and whether it
+    // survives would hang on how the index is cut into segments. So the leg is exhaustive and
+    // no cut is re-applied; the fused ranking is what is cut, below.
+    let whole = matches!(fusion, Fusion::Sum { .. });
     let legs_fut =
         futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().flat_map(
             |(i, (o, t))| {
                 runnable.iter().enumerate().map(move |(j, r)| async move {
                     let hidden = o.deleted.len() + if t.shadowed { shadow.len() } else { 0 };
-                    let r = match filter {
-                        Some(_) => r.exhaustive(o.segment.index_row_count()),
-                        None => r.widened(hidden, o.segment.row_count()),
+                    let r = if filter.is_some() || whole {
+                        r.exhaustive(o.segment.index_row_count())
+                    } else {
+                        r.widened(hidden, o.segment.row_count())
                     };
                     leg(store, &t.segment, o, &r, i, stats)
                         .await
@@ -236,12 +242,16 @@ async fn run<S: BlobStore>(
             // (review of M9c.2): at most `|shadow|` of a segment's candidates are shadowed, so
             // the rest of the widened list can never reach the answer -- and fetching it read a
             // block per candidate, a number that grows with the deleted count.
-            let room = runnable.get(j).map_or(0, Runnable::limit)
-                + if targets.get(i).is_some_and(|t| t.shadowed) {
-                    shadow.len()
-                } else {
-                    0
-                };
+            let room = if whole {
+                usize::MAX
+            } else {
+                runnable.get(j).map_or(0, Runnable::limit)
+                    + if targets.get(i).is_some_and(|t| t.shadowed) {
+                        shadow.len()
+                    } else {
+                        0
+                    }
+            };
             let kept = hits
                 .into_iter()
                 .filter(|h| admitted.is_none_or(|m| m.contains(&h.row)))
@@ -251,6 +261,20 @@ async fn run<S: BlobStore>(
             (i, j, kept)
         })
         .collect();
+
+    if whole {
+        return summed(
+            store,
+            targets,
+            opened,
+            candidates,
+            runnable.len(),
+            shadow,
+            fusion,
+            top_k,
+        )
+        .await;
+    }
 
     // ⚠️ **Shadowing is checked on the CANDIDATES' ids** (M9c.2, spec review): reading every
     // block of every segment to find the shadowed rows would read the whole index on every
@@ -317,6 +341,51 @@ async fn run<S: BlobStore>(
 
 /// The first dense leg's score of each row it ranked, by `(segment, row)` (M9d).
 type Dense = std::collections::BTreeMap<(usize, usize), f32>;
+
+/// `Sum`'s end of `run` (M9g.2): the whole legs **fused before the shadow round**. Checking the
+/// shadow on every candidate of a whole leg would fetch a block per matching row (spec review);
+/// at most `|shadow|` of the fused rows can be shadowed -- an id has at most one live row across
+/// the folded segments, because a fold supersedes every older row of an id it folds with a
+/// delete vector (M9c.2) -- so the top `top_k + |shadow|` are resolved, the shadowed dropped,
+/// and the rest cut to `top_k`. RRF and `max` keep the per-leg shadow check: dropping a row
+/// shifts the others' ranks. No dense leg is allowed here,
+/// so there is no `$dist`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the tail of `run`, taking what it built"
+)]
+async fn summed<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    opened: Vec<Opened>,
+    candidates: Vec<(usize, usize, Vec<Hit>)>,
+    leg_count: usize,
+    shadow: &std::collections::HashSet<String>,
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
+    let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); leg_count];
+    for (_, j, hits) in candidates {
+        if let Some(leg) = legs.get_mut(j) {
+            leg.extend(hits);
+        }
+    }
+    let mut fused = fuse(&legs, fusion, top_k.saturating_add(shadow.len()));
+    let known = if shadow.is_empty() {
+        Known::new()
+    } else {
+        let wanted: Vec<(usize, usize)> = fused.iter().map(|h| (h.segment, h.row)).collect();
+        fetch_rows(store, targets, &opened, &wanted).await?
+    };
+    fused.retain(|h| {
+        !targets.get(h.segment).is_some_and(|t| t.shadowed)
+            || known
+                .get(&(h.segment, h.row))
+                .is_none_or(|d| !shadow.contains(&d.id))
+    });
+    fused.truncate(top_k);
+    Ok((fused, opened, known, Dense::new()))
+}
 
 /// The ranking, **and the id of every hit**, in one more round than the ranking alone.
 ///

@@ -764,7 +764,7 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
         .as_object()
         .filter(|o| o.len() == 1)
         .and_then(|o| o.iter().next())
-        .ok_or_else(|| bad("an object with one kind: rrf"))?;
+        .ok_or_else(|| bad("an object with one of rrf, sum or max"))?;
     let params = params
         .as_object()
         .ok_or_else(|| bad("its parameters are an object"))?;
@@ -815,7 +815,27 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
                 Some(weights) => Fusion::WeightedRrf { k, weights },
             })
         }
-        other => Err(bad(&format!("{other:?} is not rrf"))),
+        // Text legs only (spec review): a dense score can be negative, so a row the dense leg
+        // retrieved would rank below one it never found, whose missing leg adds nothing.
+        "sum" | "max" if req.vector.is_some() => Err(bad(&format!(
+            "{kind} combines text legs' scores; a dense leg's can be negative"
+        ))),
+        // `k` is RRF's alone, and a parameter is never accepted to be ignored (code review).
+        "sum" | "max" if params.contains_key("k") => {
+            Err(bad(&format!("k is rrf's parameter, not {kind}'s")))
+        }
+        "sum" => Ok(Fusion::Sum {
+            weights: weights.unwrap_or(Weights::ONE),
+        }),
+        // Every weight zero ties every row at 0, and the tie then breaks over the union of the
+        // legs' cuts rather than over what matched (spec review).
+        "max" if weights.is_some_and(|w| w.all_zero(legs)) => {
+            Err(bad("max with every weight 0 ranks nothing"))
+        }
+        "max" => Ok(Fusion::Max {
+            weights: weights.unwrap_or(Weights::ONE),
+        }),
+        other => Err(bad(&format!("{other:?} is not rrf, sum or max"))),
     }
 }
 
