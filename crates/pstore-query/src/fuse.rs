@@ -39,6 +39,37 @@ pub enum Fusion {
         /// parameter precisely so that question can be answered by measurement later.
         k: f32,
     },
+    /// RRF with a weight per leg (M9g): each leg contributes `w / (k + rank)`. D-27's escape
+    /// hatch, for a caller that has measured.
+    WeightedRrf {
+        /// As [`Fusion::Rrf`]'s.
+        k: f32,
+        /// One per leg, in leg order.
+        weights: Weights,
+    },
+}
+
+/// The most legs a query may fuse (M9g.1): one dense leg and fifteen text legs, turbopuffer's
+/// sixteen sub-queries.
+pub const MAX_LEGS: usize = 16;
+
+/// A weight per leg, at most [`MAX_LEGS`] of them -- fixed, so [`Fusion`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Weights([f32; MAX_LEGS]);
+
+impl Weights {
+    /// These weights, or `None` for more than [`MAX_LEGS`]. Legs past the given ones weigh 1.
+    #[must_use]
+    pub fn of(weights: &[f32]) -> Option<Self> {
+        let mut all = [1.0; MAX_LEGS];
+        all.get_mut(..weights.len())?.copy_from_slice(weights);
+        Some(Self(all))
+    }
+
+    /// Leg `i`'s weight.
+    fn get(&self, i: usize) -> f32 {
+        self.0.get(i).copied().unwrap_or(1.0)
+    }
 }
 
 impl Default for Fusion {
@@ -49,10 +80,11 @@ impl Default for Fusion {
 
 /// Fuses each leg's ranked answer into one, keeping the best `top_k`.
 ///
-/// ⚠️ **Order-independent.** The contributions are summed, and ties break on
-/// `(segment, row)`, so shuffling the legs cannot change the ranking. Breaking ties by
-/// insertion order instead would make the answer depend on the order a caller happened to
-/// write its `prefetch[]`.
+/// ⚠️ **Order-independent, until weights name legs by position** (M9g). The contributions are
+/// summed, and ties break on `(segment, row)`, so shuffling the legs cannot change an
+/// unweighted ranking. Breaking ties by insertion order instead would make the answer depend
+/// on the order a caller happened to write its `prefetch[]`. A weighted fusion's weights are
+/// in leg order, so there the order is the caller's, by construction.
 ///
 /// ⚠️ **Keyed on the pair, never on the row.** Rows are only unique inside a segment, so a
 /// map keyed on the row alone silently merges two documents whenever two segments happen to
@@ -60,10 +92,9 @@ impl Default for Fusion {
 /// rather than rare.
 #[must_use]
 pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
-    let Fusion::Rrf { k } = fusion;
     let mut acc: std::collections::BTreeMap<(usize, usize), f32> =
         std::collections::BTreeMap::new();
-    for leg in legs {
+    for (j, leg) in legs.iter().enumerate() {
         for (i, hit) in leg.iter().enumerate() {
             // ⚠️ Rank is **1-based**. Zero-based makes the first hit worth `1/k` and the
             // second `1/(k+1)` — a smaller gap between first and second than between any
@@ -73,7 +104,13 @@ pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
                 reason = "a rank beyond 2^24 is a limit no leg reaches"
             )]
             let rank = (i + 1) as f32;
-            *acc.entry((hit.segment, hit.row)).or_insert(0.0) += 1.0 / (k + rank);
+            let slot = acc.entry((hit.segment, hit.row));
+            match fusion {
+                Fusion::Rrf { k } => *slot.or_insert(0.0) += 1.0 / (k + rank),
+                Fusion::WeightedRrf { k, weights } => {
+                    *slot.or_insert(0.0) += weights.get(j) / (k + rank);
+                }
+            }
         }
     }
     let mut out: Vec<Hit> = acc
@@ -91,4 +128,24 @@ pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
     });
     out.truncate(top_k);
     out
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weights_fill_to_one_and_refuse_past_the_bound() {
+        let w = Weights::of(&[2.0, 0.5]).unwrap();
+        assert_eq!(
+            (w.get(0), w.get(1), w.get(2), w.get(MAX_LEGS - 1)),
+            (2.0, 0.5, 1.0, 1.0)
+        );
+        assert!(Weights::of(&[1.0; MAX_LEGS]).is_some());
+        assert!(Weights::of(&[1.0; MAX_LEGS + 1]).is_none());
+    }
 }

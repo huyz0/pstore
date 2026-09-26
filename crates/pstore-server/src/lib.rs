@@ -31,7 +31,8 @@ use types::Schema as SchemaOut;
 mod types;
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
-    QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema, WriteRequest, WriteResponse,
+    MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema,
+    TextIn, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -539,91 +540,283 @@ async fn query_index<S: BlobStore + 'static>(
     Path(index): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<axum::Json<QueryResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let req: QueryRequest = serde_json::from_slice(&body)
+    let raw: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
+    // ⚠️ Every query is planned -- every refusal found -- before any runs (M9g): one refused
+    // sub-query refuses the request, and nothing partial is returned.
+    let Some(subs) = raw.get("queries") else {
+        let req = parse_query(raw)?;
+        let plan = plan(&req)?;
+        let engine = api.engine(tenant).await;
+        let before = api.spend(tenant);
+        let got = run(&engine, &index, &req, plan).await?;
+        return Ok(axum::Json(QueryResponse {
+            results: got.results,
+            meta: QueryMeta {
+                epoch: got.epoch,
+                unfolded_hits: got.unfolded_hits,
+                cost: api.spend(tenant).since(before),
+            },
+        })
+        .into_response());
+    };
+    let reqs = multi_query(&raw, subs)?;
+    let plans = reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
+    let got = futures_util::future::try_join_all(
+        reqs.iter()
+            .zip(plans)
+            .map(|(req, plan)| run(&engine, &index, req, plan)),
+    )
+    .await?;
+    Ok(axum::Json(MultiQueryResponse {
+        meta: MultiQueryMeta {
+            epochs: got.iter().map(|g| g.epoch).collect(),
+            unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
+            cost: api.spend(tenant).since(before),
+        },
+        results: got.into_iter().map(|g| g.results).collect(),
+    })
+    .into_response())
+}
+
+/// The most queries one request may carry (M9g), turbopuffer's bound.
+const MAX_QUERIES: usize = 16;
+
+/// A query body, or why it is not one.
+fn parse_query(raw: serde_json::Value) -> Result<QueryRequest, ApiError> {
+    let req: QueryRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
     if req.top_k == 0 {
         return Err(ApiError::bad_request("top_k must be greater than zero"));
     }
+    Ok(req)
+}
+
+/// `{"queries": [...]}`'s sub-queries (M9g): 1 to 16, alone in the body, none nested.
+fn multi_query(
+    raw: &serde_json::Value,
+    subs: &serde_json::Value,
+) -> Result<Vec<QueryRequest>, ApiError> {
+    if raw.as_object().is_some_and(|o| o.len() > 1) {
+        return Err(ApiError::bad_request(
+            "queries is the whole request: each query carries its own fields",
+        ));
+    }
+    let subs = subs
+        .as_array()
+        .filter(|a| (1..=MAX_QUERIES).contains(&a.len()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("queries is an array of 1 to {MAX_QUERIES} queries"))
+        })?;
+    subs.iter()
+        .map(|q| {
+            if q.get("queries").is_some() {
+                return Err(ApiError::bad_request("a query inside queries may not nest"));
+            }
+            parse_query(q.clone())
+        })
+        .collect()
+}
+
+/// What a query will run, decided -- and refused -- before it runs.
+enum Plan {
+    /// A `rank_by` order (M9e).
+    Ordered(pstore_query::OrderBy, Option<pstore_query::Predicate>),
+    /// A relevance ranking: its legs, filter and fusion.
+    Ranked(
+        Vec<pstore_query::Prefetch>,
+        Option<pstore_query::Predicate>,
+        pstore_query::Fusion,
+    ),
+}
+
+fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
+    let filter = req.filters.as_ref().map(predicate).transpose()?;
     // ⚠️ Before `prefetch`, which refuses a query with no vector and no text: an ordered query
     // has neither by definition (M9e).
-    if let Some(by) = order_by(&req)? {
-        return ordered(api, tenant, &index, &req, &by).await;
+    if let Some(by) = order_by(req)? {
+        return Ok(Plan::Ordered(by, filter));
     }
-    let legs = prefetch(&req)?;
-    let filter = req.filters.as_ref().map(predicate).transpose()?;
+    let legs = prefetch(req)?;
+    let fusion = fusion(req, legs.len())?;
+    Ok(Plan::Ranked(legs, filter, fusion))
+}
 
-    let engine = api.engine(tenant).await;
-    let before = api.spend(tenant);
-    // ⚠️ **One read of HEAD for the whole request.** Existence is decided from the snapshot
-    // the query already read -- asking first would double the cost of every query, and
-    // resolving afterwards against a second read would race a fold. `Answer::segments` is
-    // what carries it.
-    // ⚠️ Time travel is the same query against a manifest reconstructed from the HEAD it
-    // already reads -- no archive, no extra request -- and `meta.epoch` reports which epoch
-    // was served, because a stale answer indistinguishable from a fresh one is worse than no
-    // answer at all.
+/// One query's answer, before it becomes a response.
+struct Answered {
+    results: Vec<ResultRow>,
+    epoch: u64,
+    unfolded_hits: usize,
+}
+
+/// Runs a planned query.
+///
+/// ⚠️ **One read of HEAD per query.** Existence is decided from the snapshot the query already
+/// read -- asking first would double the cost of every query, and resolving afterwards against a
+/// second read would race a fold. `Answer::segments` is what carries it. Time travel is the
+/// same query against a manifest reconstructed from the HEAD it already reads, and `epoch`
+/// reports which epoch was served.
+async fn run<E: BlobStore>(
+    engine: &Engine<E>,
+    index: &str,
+    req: &QueryRequest,
+    plan: Plan,
+) -> Result<Answered, ApiError> {
+    let missing = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found",
+            format!("this tenant has no index {index}"),
+        )
+    };
+    let epoch = || req.as_of.unwrap_or_else(|| engine.epoch().0);
+    let (legs, filter, fusion) = match plan {
+        Plan::Ordered(by, filter) => {
+            let got = engine
+                .ordered(
+                    index,
+                    &by,
+                    filter.as_ref(),
+                    req.offset.unwrap_or(0),
+                    req.top_k,
+                    req.as_of.map(pstore_types::Epoch),
+                )
+                .await?;
+            if !got.exists {
+                return Err(missing());
+            }
+            return Ok(Answered {
+                results: got
+                    .rows
+                    .into_iter()
+                    .map(|d| ResultRow {
+                        attributes: selected(req, &d.attrs),
+                        id: d.id,
+                        score: None,
+                        dist: None,
+                    })
+                    .collect(),
+                epoch: epoch(),
+                unfolded_hits: got.unfolded,
+            });
+        }
+        Plan::Ranked(legs, filter, fusion) => (legs, filter, fusion),
+    };
     let answer = match req.as_of {
-        Some(epoch) => {
+        Some(e) => {
             engine
                 .query_as_of_filtered(
-                    &index,
-                    pstore_types::Epoch(epoch),
+                    index,
+                    pstore_types::Epoch(e),
                     &legs,
                     filter.as_ref(),
-                    pstore_query::Fusion::Rrf { k: 60.0 },
+                    fusion,
                     req.top_k,
                 )
                 .await?
         }
         None => {
             engine
-                .query_filtered(
-                    &index,
-                    &legs,
-                    filter.as_ref(),
-                    pstore_query::Fusion::Rrf { k: 60.0 },
-                    req.top_k,
-                )
+                .query_filtered(index, &legs, filter.as_ref(), fusion, req.top_k)
                 .await?
         }
     };
     if answer.segments.is_empty() && answer.unfolded.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "index_not_found",
-            format!("this tenant has no index {index}"),
-        ));
+        return Err(missing());
     }
-
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
-    // than HEAD's segments — M5f's finding, where keying on the row alone merged two
-    // unrelated documents into one. `Engine::resolve` is what knows that; the handler counts
-    // the fresh ones so the caller can see which half of the answer it is looking at.
+    // than HEAD's segments -- M5f's finding, where keying on the row alone merged two
+    // unrelated documents into one.
     let unfolded_hits = answer
         .hits
         .iter()
         .filter(|h| h.segment == answer.unfolded_at)
         .count();
-    let results = engine
-        .resolve_rows(&answer)
-        .into_iter()
-        .map(|(id, score, attrs, dist)| ResultRow {
-            attributes: selected(&req, &attrs),
-            id,
-            score: Some(score),
-            dist,
-        })
-        .collect();
-    Ok(axum::Json(QueryResponse {
-        results,
-        meta: QueryMeta {
-            epoch: req.as_of.unwrap_or_else(|| engine.epoch().0),
-            unfolded_hits,
-            cost: api.spend(tenant).since(before),
-        },
-    }))
+    Ok(Answered {
+        results: engine
+            .resolve_rows(&answer)
+            .into_iter()
+            .map(|(id, score, attrs, dist)| ResultRow {
+                attributes: selected(req, &attrs),
+                id,
+                score: Some(score),
+                dist,
+            })
+            .collect(),
+        epoch: epoch(),
+        unfolded_hits,
+    })
+}
+
+/// How a query's legs combine (M9g.1), or why the request cannot mean it.
+fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiError> {
+    use pstore_query::{Fusion, Weights};
+    let Some(raw) = &req.fusion else {
+        return Ok(Fusion::Rrf { k: 60.0 });
+    };
+    let bad = |why: &str| ApiError::bad_request(format!("fusion: {why}"));
+    let (kind, params) = raw
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.iter().next())
+        .ok_or_else(|| bad("an object with one kind: rrf"))?;
+    let params = params
+        .as_object()
+        .ok_or_else(|| bad("its parameters are an object"))?;
+    // A mistyped parameter is refused, never read as its default (code review).
+    if let Some(other) = params
+        .keys()
+        .find(|p| !matches!(p.as_str(), "k" | "weights"))
+    {
+        return Err(bad(&format!(
+            "{other:?} is not a parameter; k and weights are"
+        )));
+    }
+    let weights = match params.get("weights") {
+        None => None,
+        Some(w) => {
+            let ws = w
+                .as_array()
+                .ok_or_else(|| bad("weights is an array"))?
+                .iter()
+                .map(|x| {
+                    x.as_f64()
+                        .map(|f| f as f32)
+                        .filter(|f| f.is_finite() && *f >= 0.0)
+                        .ok_or_else(|| bad("each weight is a finite number of at least 0"))
+                })
+                .collect::<Result<Vec<f32>, _>>()?;
+            if ws.len() != legs {
+                return Err(bad(&format!(
+                    "{} weights for {legs} legs; one per leg, the dense leg first",
+                    ws.len()
+                )));
+            }
+            Some(Weights::of(&ws).ok_or_else(|| bad("more weights than legs allowed"))?)
+        }
+    };
+    match kind.as_str() {
+        "rrf" => {
+            let k = match params.get("k") {
+                None => 60.0,
+                Some(k) => k
+                    .as_f64()
+                    .map(|f| f as f32)
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .ok_or_else(|| bad("k is a finite number above 0"))?,
+            };
+            Ok(match weights {
+                None => Fusion::Rrf { k },
+                Some(weights) => Fusion::WeightedRrf { k, weights },
+            })
+        }
+        other => Err(bad(&format!("{other:?} is not rrf"))),
+    }
 }
 
 /// `GET /v1/indexes/{index}`.
@@ -870,10 +1063,15 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
             ));
         }
     };
-    if req.vector.is_some() || req.text.is_some() || req.field.is_some() || req.exact {
+    if req.vector.is_some()
+        || req.text.is_some()
+        || req.field.is_some()
+        || req.exact
+        || req.fusion.is_some()
+    {
         return Err(ApiError::bad_request(
-            "rank_by orders by an attribute; it cannot be combined with vector, text, field \
-             or exact",
+            "rank_by orders by an attribute; it cannot be combined with vector, text, field, \
+             exact or fusion",
         ));
     }
     if req.top_k.saturating_add(req.offset.unwrap_or(0)) > MAX_ORDERED {
@@ -882,54 +1080,6 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
         )));
     }
     Ok(Some(by))
-}
-
-/// A `rank_by` query (M9e): three round trips, no resolve round, no score.
-async fn ordered<S: BlobStore + 'static>(
-    api: Arc<Api<S>>,
-    tenant: TenantId,
-    index: &str,
-    req: &QueryRequest,
-    by: &pstore_query::OrderBy,
-) -> Result<axum::Json<QueryResponse>, ApiError> {
-    let filter = req.filters.as_ref().map(predicate).transpose()?;
-    let engine = api.engine(tenant).await;
-    let before = api.spend(tenant);
-    let got = engine
-        .ordered(
-            index,
-            by,
-            filter.as_ref(),
-            req.offset.unwrap_or(0),
-            req.top_k,
-            req.as_of.map(pstore_types::Epoch),
-        )
-        .await?;
-    if !got.exists {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "index_not_found",
-            format!("this tenant has no index {index}"),
-        ));
-    }
-    let results = got
-        .rows
-        .into_iter()
-        .map(|d| ResultRow {
-            attributes: selected(req, &d.attrs),
-            id: d.id,
-            score: None,
-            dist: None,
-        })
-        .collect();
-    Ok(axum::Json(QueryResponse {
-        results,
-        meta: QueryMeta {
-            epoch: req.as_of.unwrap_or_else(|| engine.epoch().0),
-            unfolded_hits: got.unfolded,
-            cost: api.spend(tenant).since(before),
-        },
-    }))
 }
 
 /// The legs a query asks for. A query with none is a request nobody meant to make.
@@ -952,10 +1102,17 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
             },
         });
     }
-    if let Some(t) = &req.text {
+    let texts = req.text.as_ref().map(TextIn::queries).unwrap_or_default();
+    if req.text.is_some() && !(1..pstore_query::MAX_LEGS).contains(&texts.len()) {
+        return Err(ApiError::bad_request(format!(
+            "text is a string or an array of 1 to {} strings",
+            pstore_query::MAX_LEGS - 1
+        )));
+    }
+    for t in texts {
         legs.push(pstore_query::Prefetch::Text {
             field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
-            query: t.clone(),
+            query: t.to_owned(),
             limit: req.top_k,
         });
     }

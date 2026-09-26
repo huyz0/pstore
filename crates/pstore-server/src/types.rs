@@ -151,9 +151,13 @@ pub struct QueryRequest {
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
     pub field: Option<String>,
-    /// The BM25 leg's query text.
+    /// The BM25 leg's query text -- or several, each its own leg (M9g).
     #[serde(default)]
-    pub text: Option<String>,
+    pub text: Option<TextIn>,
+    /// How the legs combine (M9g.1): `{"rrf": {"k", "weights"}}`, the default being `k = 60`
+    /// and every weight 1. Parsed by `lib.rs`'s `fusion`.
+    #[serde(default)]
+    pub fusion: Option<serde_json::Value>,
     /// Answer as the index stood at this epoch. ⚠️ Bounded by what GC has reaped: below the
     /// horizon the request is **refused** rather than answered with a short index.
     #[serde(default)]
@@ -229,6 +233,48 @@ pub struct QueryMeta {
     /// not have returned it.
     pub unfolded_hits: usize,
     /// What it cost.
+    pub cost: Cost,
+}
+
+/// A query's text: one string, or several, each a BM25 leg (M9g).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TextIn {
+    /// One leg.
+    One(String),
+    /// A leg each.
+    Many(Vec<String>),
+}
+
+impl TextIn {
+    /// The legs' queries, in request order.
+    #[must_use]
+    pub fn queries(&self) -> Vec<&str> {
+        match self {
+            Self::One(q) => vec![q.as_str()],
+            Self::Many(qs) => qs.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// The answer to `{"queries": [...]}` (M9g): each query's results in request order, and one
+/// cost -- the spend of queries that ran concurrently is not attributable to one of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiQueryResponse {
+    /// Each query's ranking, in request order.
+    pub results: Vec<Vec<ResultRow>>,
+    /// Freshness per query, and the request's cost.
+    pub meta: MultiQueryMeta,
+}
+
+/// [`MultiQueryResponse`]'s meta.
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiQueryMeta {
+    /// The epoch each query was answered at.
+    pub epochs: Vec<u64>,
+    /// Each query's hits from unfolded rows.
+    pub unfolded_hits: Vec<usize>,
+    /// What the whole request cost.
     pub cost: Cost,
 }
 

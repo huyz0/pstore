@@ -1228,6 +1228,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "futures-util",
  "http-body-util",
  "object_store",
  "pstore-blob",
