@@ -524,6 +524,7 @@ async fn query_index<S: BlobStore + 'static>(
         return Err(ApiError::bad_request("top_k must be greater than zero"));
     }
     let legs = prefetch(&req)?;
+    let filter = req.filters.as_ref().map(predicate).transpose()?;
 
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
@@ -538,10 +539,11 @@ async fn query_index<S: BlobStore + 'static>(
     let answer = match req.as_of {
         Some(epoch) => {
             engine
-                .query_as_of(
+                .query_as_of_filtered(
                     &index,
                     pstore_types::Epoch(epoch),
                     &legs,
+                    filter.as_ref(),
                     pstore_query::Fusion::Rrf { k: 60.0 },
                     req.top_k,
                 )
@@ -549,9 +551,10 @@ async fn query_index<S: BlobStore + 'static>(
         }
         None => {
             engine
-                .query(
+                .query_filtered(
                     &index,
                     &legs,
+                    filter.as_ref(),
                     pstore_query::Fusion::Rrf { k: 60.0 },
                     req.top_k,
                 )
@@ -787,6 +790,11 @@ fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
         if name.is_empty() {
             return Err(refuse(name, "has an empty name"));
         }
+        // `id` in a filter always means the document id (M9b); an attribute of that name
+        // would give `["id", "Eq", x]` two meanings.
+        if name == pstore_query::ID_ATTRIBUTE {
+            return Err(refuse(name, "is reserved: `id` is the document id"));
+        }
         let v = match value {
             serde_json::Value::String(s) => pstore_format::Value::Str(s.clone()),
             serde_json::Value::Number(n) => match n.as_i64() {
@@ -824,6 +832,80 @@ fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
             .insert(text_field.to_owned(), pstore_format::Value::Str(t.clone()));
     }
     Ok(doc)
+}
+
+/// A turbopuffer filter array as a predicate — or why it is not one (M9b).
+///
+/// ⚠️ **Refused, never guessed.** A clause this cannot read is a 400, not dropped: a filter
+/// silently ignored answers with documents the caller excluded.
+fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
+    use pstore_query::{Op, Predicate};
+    let bad = |why: String| ApiError::bad_request(format!("malformed filter {v}: {why}"));
+    let arr = v
+        .as_array()
+        .ok_or_else(|| bad("a filter is an array".to_owned()))?;
+    match arr.as_slice() {
+        [op, clauses] if op == "And" || op == "Or" => {
+            let list = clauses
+                .as_array()
+                .ok_or_else(|| bad(format!("{op} takes an array of filters")))?;
+            let parts = list.iter().map(predicate).collect::<Result<Vec<_>, _>>()?;
+            Ok(if op == "And" {
+                Predicate::And(parts)
+            } else {
+                Predicate::Or(parts)
+            })
+        }
+        [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(predicate(inner)?))),
+        [attr, op, value] => {
+            let attr = attr
+                .as_str()
+                .ok_or_else(|| bad("the attribute is a string".to_owned()))?
+                .to_owned();
+            let op = op
+                .as_str()
+                .ok_or_else(|| bad("the operator is a string".to_owned()))?;
+            let scalar = |x: &serde_json::Value| match x {
+                serde_json::Value::String(s) => Ok(pstore_format::Value::Str(s.clone())),
+                serde_json::Value::Number(n) => n
+                    .as_i64()
+                    .map(pstore_format::Value::Int)
+                    .ok_or_else(|| bad(format!("{x} is not an integer that fits i64"))),
+                other => Err(bad(format!("{other} is not an integer or a string"))),
+            };
+            let cmp = |o: Op| -> Result<Predicate, ApiError> {
+                Ok(Predicate::Cmp(attr.clone(), o, scalar(value)?))
+            };
+            match op {
+                "Eq" if value.is_null() => Ok(Predicate::Absent(attr)),
+                "NotEq" if value.is_null() => Ok(Predicate::Not(Box::new(Predicate::Absent(attr)))),
+                "Eq" => cmp(Op::Eq),
+                "NotEq" => Ok(Predicate::Not(Box::new(cmp(Op::Eq)?))),
+                "Lt" => cmp(Op::Lt),
+                "Lte" => cmp(Op::Lte),
+                "Gt" => cmp(Op::Gt),
+                "Gte" => cmp(Op::Gte),
+                "In" | "NotIn" => {
+                    let set = value
+                        .as_array()
+                        .ok_or_else(|| bad(format!("{op} takes an array of values")))?
+                        .iter()
+                        .map(scalar)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let p = Predicate::In(attr, set);
+                    Ok(if op == "In" {
+                        p
+                    } else {
+                        Predicate::Not(Box::new(p))
+                    })
+                }
+                other => Err(bad(format!("unknown operator {other}"))),
+            }
+        }
+        _ => Err(bad(
+            "expected [attr, op, value], [\"And\"|\"Or\", [..]] or [\"Not\", filter]".to_owned(),
+        )),
+    }
 }
 
 /// One attribute as JSON.

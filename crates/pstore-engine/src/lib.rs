@@ -1735,6 +1735,23 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
     ) -> Result<Answer, EngineError> {
+        self.query_filtered(index, prefetch, None, fusion, top_k)
+            .await
+    }
+
+    /// [`Self::query`], answering only with documents `filter` admits (M9b) — the unfolded
+    /// rows included, which are the fresh segment and take the same path.
+    ///
+    /// # Errors
+    /// As [`Self::query`].
+    pub async fn query_filtered(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+    ) -> Result<Answer, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
@@ -1780,14 +1797,15 @@ impl<S: BlobStore> Engine<S> {
             durable: Arc::clone(&self.store),
             fresh: fresh_store,
         };
-        let resolved = pstore_query::query_rows(&store, &targets, prefetch, fusion, top_k)
-            .await
-            .map_err(|e| match e {
-                pstore_query::QueryError::Format(
-                    pstore_format::FormatError::DimensionMismatch { expected, got },
-                ) => EngineError::DimensionMismatch { expected, got },
-                other => EngineError::Query(other.to_string()),
-            })?;
+        let resolved =
+            pstore_query::query_rows_filtered(&store, &targets, prefetch, filter, fusion, top_k)
+                .await
+                .map_err(|e| match e {
+                    pstore_query::QueryError::Format(
+                        pstore_format::FormatError::DimensionMismatch { expected, got },
+                    ) => EngineError::DimensionMismatch { expected, got },
+                    other => EngineError::Query(other.to_string()),
+                })?;
         let (hits, ids, attributes) = split_rows(resolved);
         Ok(Answer {
             hits,
@@ -1812,6 +1830,23 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         epoch: Epoch,
         prefetch: &[pstore_query::Prefetch],
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+    ) -> Result<Answer, EngineError> {
+        self.query_as_of_filtered(index, epoch, prefetch, None, fusion, top_k)
+            .await
+    }
+
+    /// [`Self::query_as_of`] with a filter, as [`Self::query_filtered`].
+    ///
+    /// # Errors
+    /// As [`Self::query_as_of`].
+    pub async fn query_as_of_filtered(
+        &self,
+        index: &str,
+        epoch: Epoch,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
         fusion: pstore_query::Fusion,
         top_k: usize,
     ) -> Result<Answer, EngineError> {
@@ -1846,14 +1881,22 @@ impl<S: BlobStore> Engine<S> {
         // an empty list and vanish. The test found it; the live path has always used this
         // value for the same reason.
         let unfolded_at = refs.len();
-        let resolved = pstore_query::query_rows(&*self.store, &targets, prefetch, fusion, top_k)
-            .await
-            .map_err(|e| match e {
-                pstore_query::QueryError::Format(
-                    pstore_format::FormatError::DimensionMismatch { expected, got },
-                ) => EngineError::DimensionMismatch { expected, got },
-                other => EngineError::Query(other.to_string()),
-            })?;
+        let resolved = pstore_query::query_rows_filtered(
+            &*self.store,
+            &targets,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+        )
+        .await
+        .map_err(|e| match e {
+            pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
+                expected,
+                got,
+            }) => EngineError::DimensionMismatch { expected, got },
+            other => EngineError::Query(other.to_string()),
+        })?;
         let (hits, ids, attributes) = split_rows(resolved);
         Ok(Answer {
             hits,

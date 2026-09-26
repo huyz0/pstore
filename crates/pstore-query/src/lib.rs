@@ -12,8 +12,10 @@
 //! and every functional test passes. `store.rs` makes the same point about ranges: width is
 //! free, depth is not.
 
+mod filter;
 mod fuse;
 mod run;
 
+pub use filter::{ID as ID_ATTRIBUTE, Op, Predicate};
 pub use fuse::{Fusion, Hit, fuse};
-pub use run::{Prefetch, QueryError, Target, query, query_rows};
+pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered};

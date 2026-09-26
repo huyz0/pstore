@@ -105,6 +105,9 @@ pub struct QueryRequest {
     /// Names removed from what `include_attributes` selects; alone, "all except these".
     #[serde(default)]
     pub exclude_attributes: Option<Vec<String>>,
+    /// turbopuffer's filter arrays, parsed by `lib.rs`'s `predicate` (M9b).
+    #[serde(default)]
+    pub filters: Option<serde_json::Value>,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.

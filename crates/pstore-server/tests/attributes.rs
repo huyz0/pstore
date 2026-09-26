@@ -262,6 +262,7 @@ async fn a_value_the_format_cannot_store_is_refused_not_coerced() {
         (json!(u64::MAX), "x"),
         (json!(1), ""),
         (json!(1), "text"),
+        (json!("x"), "id"),
         (json!("twice"), "text"),
     ] {
         let api = api();

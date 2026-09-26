@@ -748,6 +748,46 @@ impl Segment {
             .collect())
     }
 
+    /// Every row of the blocks `keep` does not rule out, with its absolute row number — the
+    /// input to a query's filter mask (M9b).
+    ///
+    /// `keep` sees each block's zone map (integer attribute → `(min, max)`, empty for a
+    /// zone-free segment) and must answer `true` unless no row in the block can match. The
+    /// kept blocks are fetched in **one** coalesced `get_ranges`; no vector is read.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn rows_where<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(&BTreeMap<String, (i64, i64)>) -> bool,
+    ) -> Result<Vec<(usize, Document)>, FormatError> {
+        let mut base = 0usize;
+        let mut wanted: Vec<(usize, &BlockMeta)> = Vec::new();
+        for b in &self.blocks {
+            if keep(&b.zones) {
+                wanted.push((base, b));
+            }
+            base += b.rows as usize;
+        }
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranges: Vec<std::ops::Range<u64>> = wanted
+            .iter()
+            .map(|(_, b)| b.offset..b.offset + u64::from(b.len))
+            .collect();
+        let bufs = store.get_ranges(key, &ranges).await?;
+        let mut out = Vec::new();
+        for ((start, _), buf) in wanted.iter().zip(&bufs) {
+            for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
+                out.push((start + r, doc));
+            }
+        }
+        Ok(out)
+    }
+
     /// Specific rows' ids **and attributes**, from the same blocks [`Self::ids_at`] reads.
     ///
     /// ⚠️ **The same fetch, not a second one (M9a).** A block is the unit of both: it carries

@@ -1,5 +1,6 @@
 //! Running the legs — concurrently, over one open segment.
 
+use crate::filter::{Mask, Predicate};
 use crate::fuse::{Fusion, Hit, fuse};
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{Document, FormatError, Segment};
@@ -111,7 +112,7 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
-    Ok(run(store, targets, prefetch, fusion, top_k).await?.0)
+    Ok(run(store, targets, prefetch, None, fusion, top_k).await?.0)
 }
 
 /// The ranking **and the segments it was computed over**, still open.
@@ -123,6 +124,7 @@ async fn run<S: BlobStore>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
+    filter: Option<&Predicate>,
     fusion: Fusion,
     top_k: usize,
 ) -> Result<(Vec<Hit>, Vec<Opened>), QueryError> {
@@ -171,17 +173,48 @@ async fn run<S: BlobStore>(
     }));
 
     // ⚠️ N x R futures, still one round: no leg's ranges depend on another's contents.
-    let per_segment =
+    //
+    // ⚠️ **With a filter, every leg is exhaustive and the mask rides the same round** (M9b).
+    // A leg that stopped at its `limit` and was filtered afterwards would return fewer than
+    // `limit` whenever the predicate is selective, silently -- so each leg returns every
+    // candidate (the dense leg probing every list: `p` costs bytes, not depth), the mask
+    // removes what the predicate does not admit, and only then is the limit applied. The
+    // mask's blocks are addressable the moment the segment is open, exactly as the legs'
+    // ranges are, so fetching it alongside them adds no round trip.
+    let legs_fut =
         futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().flat_map(
             |(i, (o, t))| {
                 runnable.iter().enumerate().map(move |(j, r)| async move {
-                    leg(store, &t.segment, o, r, i, stats)
+                    let r = match filter {
+                        Some(_) => r.exhaustive(o.segment.index_row_count()),
+                        None => *r,
+                    };
+                    leg(store, &t.segment, o, &r, i, stats)
                         .await
-                        .map(|hits| (j, hits))
+                        .map(|hits| (i, j, hits))
                 })
             },
-        ))
-        .await?;
+        ));
+    let masks_fut =
+        futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
+            match filter {
+                Some(f) => mask(store, &t.segment, &o.segment, f).await.map(Some),
+                None => Ok(None),
+            }
+        }));
+    let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
+    let per_segment = per_segment.into_iter().map(|(i, j, hits)| {
+        let Some(Some(m)) = masks.get(i) else {
+            return (j, hits);
+        };
+        let limit = runnable.get(j).map_or(0, Runnable::limit);
+        let kept: Vec<Hit> = hits
+            .into_iter()
+            .filter(|h| m.contains(&h.row))
+            .take(limit)
+            .collect();
+        (j, kept)
+    });
 
     // ⚠️ Regrouped by RETRIEVER, not by segment, and each retriever's union re-ranked before
     // it is fused. `fuse` reads a leg's position in the vec as its rank, so concatenating
@@ -227,17 +260,36 @@ async fn run<S: BlobStore>(
 /// ids carry the attributes, so they are kept rather than decoded and dropped; each document
 /// has an empty `vectors`. This replaced `query_ids`, whose last caller it was.
 ///
+/// ⚠️ **Only with documents `filter` admits**, when there is one (M9b): see `run`.
+///
 /// # Errors
 /// As [`query`], plus a block that cannot be read or decoded.
-pub async fn query_rows<S: BlobStore>(
+pub async fn query_rows_filtered<S: BlobStore>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
+    filter: Option<&Predicate>,
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
-    let (hits, opened) = run(store, targets, prefetch, fusion, top_k).await?;
+    let (hits, opened) = run(store, targets, prefetch, filter, fusion, top_k).await?;
     resolve_rows(store, targets, &opened, &hits).await
+}
+
+/// The data rows of one segment `filter` admits, from its blocks, zone-map pruned.
+async fn mask<S: BlobStore>(
+    store: &S,
+    key: &Key,
+    segment: &Segment,
+    filter: &Predicate,
+) -> Result<Mask, QueryError> {
+    Ok(segment
+        .rows_where(store, key, |zones| filter.could_admit(zones))
+        .await?
+        .into_iter()
+        .filter(|(_, d)| filter.admits(&d.id, &d.attrs))
+        .map(|(row, _)| row)
+        .collect())
 }
 
 /// The rows for `hits`, one fan-out round over the segments that carry them.
@@ -283,6 +335,7 @@ async fn resolve_rows<S: BlobStore>(
 }
 
 /// A leg this build can actually run.
+#[derive(Clone, Copy)]
 enum Runnable<'a> {
     Text {
         field: &'a str,
@@ -300,6 +353,47 @@ enum Runnable<'a> {
         query: &'a [(u32, f32)],
         limit: usize,
     },
+}
+
+impl Runnable<'_> {
+    /// Rows this leg contributes at most.
+    fn limit(&self) -> usize {
+        match self {
+            Self::Text { limit, .. } | Self::Dense { limit, .. } | Self::Sparse { limit, .. } => {
+                *limit
+            }
+        }
+    }
+
+    /// The same leg returning **every** candidate of a segment of `rows` rows: a filter
+    /// masks it before its limit applies (M9b). The dense leg probes every list and keeps
+    /// every candidate through the ladder.
+    fn exhaustive(self, rows: usize) -> Self {
+        let rows = rows.max(1);
+        match self {
+            Self::Text { field, query, .. } => Self::Text {
+                field,
+                query,
+                limit: rows,
+            },
+            Self::Sparse { field, query, .. } => Self::Sparse {
+                field,
+                query,
+                limit: rows,
+            },
+            Self::Dense {
+                field, query, tune, ..
+            } => Self::Dense {
+                field,
+                query,
+                limit: rows,
+                tune: vec_index::Query {
+                    p: usize::MAX,
+                    ..tune
+                },
+            },
+        }
+    }
 }
 
 impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
