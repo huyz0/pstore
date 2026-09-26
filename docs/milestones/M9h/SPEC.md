@@ -165,7 +165,115 @@ read, as the integer zones do.
 
 ## M9h.2 — arrays, `Contains`, `ContainsAny`
 
-To be specified when M9h.1 lands.
+### Delta
+
+**Values.**
+- `Value` gains `Array(Vec<Value>)`, whose elements are scalars: an int, a float, a string
+  or a bool. The elements may be of mixed types, and an array may be empty.
+- The codec gives it tag `4`: a `u32` count, then each element with its own tag.
+- A segment holding an array is typed (`VERSION = 2`), exactly as one holding a float, so a
+  reader from before M9h.1 refuses it at open.
+- `check_storable` refuses an array nested in an array, and a non-finite float anywhere
+  inside one. The decoder also refuses tag `4` inside an array as corrupt, and caps the
+  element preallocation, as the other counts do (spec review, m4).
+- The legacy `pstore_format::Filter` matches an array by structural `Value` equality, and
+  its `could_match` answers `true` for one (m2).
+- Structurally, arrays order after bools and compare element by element under `Value`'s
+  order.
+
+**Over HTTP.**
+- A JSON array of scalars is an array attribute, and it comes back as written.
+- These are refused:
+  - an element that is `null`, an object, or an array;
+  - an array as the text field.
+
+**Filters.** Four new operators, each taking `[attr, op, value]`:
+- `["tags","Contains",x]`: the row's attribute is an array, and some element equals `x` under
+  M9h.1's rules. So `2` is found in `[2.0]`.
+- `["tags","ContainsAny",[x, y, ..]]`: the row's attribute is an array that holds at least
+  one of the members. An empty list admits nothing.
+- `NotContains` and `NotContainsAny` are the negations, so they admit a row whose attribute
+  is absent or is not an array.
+
+The existing operators treat an array as its own type:
+- `Eq`, `Lt`, `Lte`, `Gt`, `Gte` and `In` are false against an array row, as any cross-type
+  comparison is.
+- An array is `400` as the value of `Eq`, `NotEq`, `Lt`, `Lte`, `Gt` or `Gte`, and as a
+  member of `In` or `NotIn` (spec review, M-1). Accepted, it would compare false with every
+  row, so `NotIn [["a"]]` would silently admit everything.
+- `Contains` takes one scalar, and `ContainsAny` a JSON array of scalars; anything else is
+  `400`.
+
+**Zone maps.** An array has no zone, and `Contains` and `ContainsAny` never prune.
+- This is sound for M9h.1's zones: an array row matches no scalar comparison, so it does not
+  need to be covered by an int or float zone.
+- It is complete: a flag-`1` segment's "no zone means no row of that type" stays true for
+  ints and floats, because an array is neither.
+
+**rank_by.**
+- Ascending: bools, numbers, strings, arrays, then absent.
+- Descending: arrays, strings, numbers, bools, then absent.
+- Arrays are **not** ordered by their contents. Among themselves they tie, and the tie is
+  broken by id ascending in both directions. That is a defined order, not a sort key.
+
+**Does not change:** any segment or bundle without an array, float or bool (the M9h.1 byte
+pin still holds); any request without an array or the new operators; the depth of any query.
+
+### Acceptance criteria
+
+1. **Round trip.** `[1, 2.0, 2.5, "a", true]` and `[]` come back as written, both unfolded
+   and folded, with `2.0` still a float. A segment holding only `[]`, and one holding only
+   `[1, "a"]`, are `VERSION = 2` (spec review, m1).
+2. **Contains and ContainsAny.** Over rows `r` = `["red","blue"]`, `n` = `[1, 2.0]`,
+   `e` = `[]`, `s` = `"red"` (a scalar) and `x` (absent):
+   - `Contains "red"` admits only `r`.
+   - `Contains 2` admits `n`, and so does `Contains 1.0`.
+   - `ContainsAny ["blue", 1]` admits `r` and `n`.
+   - `ContainsAny []` admits nothing.
+   - `NotContains "red"` admits `n`, `e`, `s` and `x`.
+   - `NotContainsAny ["red", 2]` admits `e`, `s` and `x`.
+   - `Eq "red"` admits only `s`, and `In ["red"]` also admits only `s`.
+   All of this holds unfolded and folded.
+3. **Refusals.** Each of these is `400`:
+   - a nested array written, or one holding `null`, an object, or `9223372036854775808`;
+   - an array as the text field;
+   - `Eq` or `Lt` with an array value, and `In` or `NotIn` with an array member;
+   - `Contains` with an array, `null` or an object value;
+   - `ContainsAny` with a non-array value, or with a non-scalar member.
+   The engine refuses a nested array and a non-finite float inside an array.
+4. **Pruning stays sound.** M9h.1's soundness test, with array rows added to the mixed
+   segment and `Contains`, `ContainsAny` and their negations added to the predicates, still
+   matches brute-force `admits` in all three segments. The mixed segment has at least one
+   block where the name is held only by arrays, and one where an array holds a number outside
+   that block's zones (m6).
+5. **rank_by order.** Ascending over `true`, `1`, `"a"`, `[2]` (id `p`), `[1]` (id `q`) and
+   an absent row gives `true, 1, "a", p, q, absent`. Descending gives `p, q, "a", 1, true,
+   absent`.
+6. `./scripts/gates.sh` passes; `./scripts/mutants.sh` over the diff misses 0.
+
+### Test plan
+
+| # | Fails first | Mutation it catches |
+|---|---|---|
+| 1 | an array is refused at the door | a tag wrong; an element lost; an array-only segment left untyped |
+| 2 | `Contains` is an unknown operator | a structural element comparison (misses `[2.0]`); a negation that drops absent rows; `ContainsAny` as all |
+| 3 | nested arrays accepted | a bound unchecked |
+| 4 | (after 2) | `Contains` pruning on a scalar zone |
+| 5 | an array sorts as a string | the group order; arrays ordered by content |
+
+### RA budget
+
+Unchanged. An array adds no request and no depth, and costs only its own bytes in a block.
+
+### Risks
+
+- An array is unbounded apart from the request's body limit, so one row can carry a large
+  one. A per-array bound is not added here.
+- A binary at M9h.1 accepts `VERSION = 2`, so it opens an array segment and fails only when
+  it decodes an array block or replays an array bundle. That failure is loud, but it is
+  reported as `corrupt: unknown value tag` rather than at open (m5).
+- Arrays may mix types, where turbopuffer's are homogeneous. M9h.3's declared types will
+  have to say what happens to a mixed array already stored under a name declared `[]T` (m7).
 
 ## M9h.3 — `datetime`, declared
 

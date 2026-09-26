@@ -56,6 +56,26 @@ fn docs(mixed: bool) -> Vec<Document> {
             out.push(Document::new(format!("e{i:03}"), vec![0.0, 1.0]));
         }
     }
+    if mixed {
+        // M9h.2 (spec review, m6): a block whose `n` is only arrays, and a block where an
+        // array holds a number outside that block's zones. Padded so each is one block of 3.
+        while out.len() % 3 != 0 {
+            out.push(Document::new(format!("pad{}", out.len()), vec![0.0, 1.0]));
+        }
+        let arrays = [
+            Value::Array(vec![Value::Int(1), Value::Str("2".to_owned())]),
+            Value::Array(vec![Value::Float(2.5)]),
+            Value::Array(vec![]),
+            Value::Int(5),
+            Value::Array(vec![Value::Float(1e12), Value::Int(BIG), Value::Bool(true)]),
+            Value::Float(6.0),
+        ];
+        for (i, v) in arrays.into_iter().enumerate() {
+            let mut d = Document::new(format!("a{i:03}"), vec![1.0, 1.0]);
+            d.attrs.insert("n".to_owned(), v);
+            out.push(d);
+        }
+    }
     out
 }
 
@@ -99,6 +119,15 @@ fn predicates() -> Vec<Predicate> {
     for pair in l.windows(2) {
         out.push(Predicate::In(n(), pair.to_vec()));
     }
+    for pair in l.windows(2) {
+        let p = Predicate::ContainsAny(n(), pair.to_vec());
+        out.push(Predicate::Not(Box::new(p.clone())));
+        out.push(p);
+    }
+    for x in [Value::Float(1e12), Value::Int(1), Value::Float(1.0)] {
+        out.push(Predicate::ContainsAny(n(), vec![x]));
+    }
+    out.push(Predicate::ContainsAny(n(), vec![]));
     out.push(Predicate::In(n(), vec![Value::Float(-0.0)]));
     out.push(Predicate::In(n(), vec![Value::Int(0)]));
     out

@@ -189,6 +189,9 @@ pub enum Value {
     Float(f64),
     /// A bool (M9h.1). No zone map: two values prune nothing worth a zone.
     Bool(bool),
+    /// Scalars, of any types, in order (M9h.2). No zone map, and never nested:
+    /// [`check_storable`] refuses an array inside an array.
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -198,6 +201,7 @@ impl Value {
             Self::Str(_) => 1,
             Self::Float(_) => 2,
             Self::Bool(_) => 3,
+            Self::Array(_) => 4,
         }
     }
 }
@@ -223,6 +227,7 @@ impl Ord for Value {
             (Self::Str(a), Self::Str(b)) => a.cmp(b),
             (Self::Float(a), Self::Float(b)) => a.total_cmp(b),
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (Self::Array(a), Self::Array(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -244,7 +249,7 @@ impl Number {
         match v {
             Value::Int(n) => Some(Self::Int(*n)),
             Value::Float(f) => Some(Self::Float(*f)),
-            Value::Str(_) | Value::Bool(_) => None,
+            Value::Str(_) | Value::Bool(_) | Value::Array(_) => None,
         }
     }
 }
@@ -314,13 +319,23 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
     // silent loss this function exists to make loud.
     // M9h.1: a NaN compares as nothing and ±∞ as a bound no zone map can hold. JSON cannot
     // write either; the engine API can, so the door is here.
-    if d.attrs
-        .values()
-        .any(|v| matches!(v, Value::Float(f) if !f.is_finite()))
-    {
-        return Err(FormatError::Unsupported(
-            "a float attribute must be finite: NaN and infinities are refused",
-        ));
+    let not_finite = |v: &Value| matches!(v, Value::Float(f) if !f.is_finite());
+    for v in d.attrs.values() {
+        let inside: &[Value] = match v {
+            Value::Array(items) => items,
+            _ => std::slice::from_ref(v),
+        };
+        if inside.iter().any(not_finite) {
+            return Err(FormatError::Unsupported(
+                "a float attribute must be finite: NaN and infinities are refused",
+            ));
+        }
+        // M9h.2: an array holds scalars. Nesting has no filter that reads it, and no zone.
+        if inside.iter().any(|i| matches!(i, Value::Array(_))) {
+            return Err(FormatError::Unsupported(
+                "an array attribute holds scalars: an array inside an array is refused",
+            ));
+        }
     }
     if d.vectors
         .values()
@@ -494,7 +509,7 @@ impl Filter {
             Self::Eq(_, Value::Int(n)) => *n >= min && *n <= max,
             // A string or bool equality has no integer zone to prune on, and this legacy
             // filter matches structurally, so a float never equals an int row here either.
-            Self::Eq(_, Value::Str(_) | Value::Float(_) | Value::Bool(_)) => true,
+            Self::Eq(_, Value::Str(_) | Value::Float(_) | Value::Bool(_) | Value::Array(_)) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,
         }

@@ -21,7 +21,9 @@ pub struct OrderBy {
 ///
 /// ⚠️ **Not `Value`'s own order reversed for `desc`.** The absent group sorts last in BOTH
 /// directions, and ties break on the id ascending in both: `asc` is bools, numbers, strings,
-/// absent; `desc` is strings, numbers, bools, absent, each group's values reversed.
+/// arrays, absent; `desc` is arrays, strings, numbers, bools, absent, each group's values
+/// reversed. Arrays are never compared by content (M9h.2): among themselves they tie, and the
+/// id decides.
 ///
 /// ⚠️ **Numbers are one group** (M9h.1): an int and a float interleave by exact value, and
 /// equal ones (`1` and `1.0`) tie, broken by the id. Equality is the order's, never `Value`'s.
@@ -41,10 +43,11 @@ impl Rank {
             doc.attrs.get(&by.attr).cloned()
         };
         let group = match (&value, by.desc) {
-            (Some(Value::Bool(_)), false) | (Some(Value::Str(_)), true) => 0,
-            (Some(Value::Int(_) | Value::Float(_)), _) => 1,
-            (Some(Value::Str(_)), false) | (Some(Value::Bool(_)), true) => 2,
-            (None, _) => 3,
+            (Some(Value::Bool(_)), false) | (Some(Value::Array(_)), true) => 0,
+            (Some(Value::Int(_) | Value::Float(_)), false) | (Some(Value::Str(_)), true) => 1,
+            (Some(Value::Str(_)), false) | (Some(Value::Int(_) | Value::Float(_)), true) => 2,
+            (Some(Value::Array(_)), false) | (Some(Value::Bool(_)), true) => 3,
+            (None, _) => 4,
         };
         Self {
             desc: by.desc,

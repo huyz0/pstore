@@ -55,3 +55,43 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
      unviable, 0 missed**.
    - Code review: one round, pass with two minors (that test, and this line).
    - `./scripts/gates.sh` on the committed tree: all fifteen PASS.
+
+## M9h.2 — arrays, `Contains`, `ContainsAny`
+
+1. **Round trip** — `arrays_come_back_as_written` (`cargo test -p pstore-server --test
+   arrays`): `[1, 2.0, 2.5, "a", true]` and `[]`, unfolded and folded, `2.0` still a float.
+   `a_segment_holding_only_arrays_is_version_2` (`cargo test -p pstore-format --test
+   typed_values`) covers `[]` and `[1, "a"]`. **Observed red** on the M9h.1 server, which
+   refused the array at the door, as it did every test in the file.
+2. **Contains and ContainsAny** — `contains_finds_an_element_by_value`, unfolded and folded:
+   - `Contains "red"`, `Contains 2` and `Contains 1.0` against `[1, 2.0]`;
+   - `ContainsAny ["blue", 1]`, and `ContainsAny []`, which admits nothing;
+   - `NotContains` and `NotContainsAny`, which keep the scalar and absent rows;
+   - `Eq` and `In` against an array row, which are false.
+3. **Refusals** — `what_an_array_cannot_hold_is_refused` covers:
+   - on write: a nested array, `null`, an object, and `9223372036854775808` as an element,
+     and an array as the text field;
+   - in a filter: `Eq` and `Lt` with an array value; `In` and `NotIn` with an array member;
+     `Contains` with an array, `null` or an object; `ContainsAny` with a non-array or a
+     non-scalar member.
+   `an_array_holds_only_finite_scalars` and `a_nested_array_does_not_decode` cover the
+   engine and the decoder. M9h.1's two refusal tests replace their flat `[1, 2]` member,
+   which now has a meaning, with the nested `[[1, 2]]`, which still has none.
+4. **Pruning stays sound** — `cargo test -p pstore-query --test typed_pruning`: the mixed
+   rows gain a block whose `n` is only arrays, and a block where an array holds `1e12` and
+   `2^53 + 1` outside its zones. `ContainsAny` over neighbouring literal pairs, single
+   members and `[]`, with its negations, matches brute-force `admits` in all three segments.
+5. **rank_by order** — `rank_by_puts_arrays_after_strings_ordered_by_id`, unfolded and folded.
+6. **Gates** (M9h.2):
+   - `./scripts/mutants.sh --check . --in-diff <the M9h.2 diff>`: **41 tested in 22m, 31
+     caught, 8 unviable, 2 missed**:
+     - deleting `Value::cmp`'s array arm, because no test compared two arrays structurally;
+     - deleting `decode_value`'s nested-array arm, which the fallback arm made equivalent
+       to its own error.
+   - `structural_equality_keeps_types_apart` now orders arrays, and
+     `a_nested_array_does_not_decode` asserts the specific error. The decoder now grows its
+     array rather than reserving from the count (code review's minor).
+   - `--check 'Ord for Value|decode_value'` then gave **37 tested, 34 caught, 3 unviable, 0
+     missed**.
+   - Code review: one round, pass, with one minor, taken.
+   - `./scripts/gates.sh` on the committed tree: all fifteen PASS.

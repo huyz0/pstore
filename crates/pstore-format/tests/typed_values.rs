@@ -126,6 +126,10 @@ fn structural_equality_keeps_types_apart() {
     assert!(Value::Str("z".to_owned()) < Value::Float(f64::MIN));
     assert!(Value::Float(f64::MAX) < Value::Bool(false));
     assert!(Value::Bool(false) < Value::Bool(true));
+    // Arrays compare element by element, not as one equal lump (M9h.2).
+    let arr = |n| Value::Array(vec![Value::Int(n)]);
+    assert!(arr(1) < arr(2) && arr(1) != arr(2) && arr(2) == arr(2));
+    assert!(Value::Bool(true) < Value::Array(vec![]));
 }
 
 #[test]
@@ -153,4 +157,55 @@ fn numbers_compare_exactly_across_int_and_float() {
     assert_eq!(c(i(i64::MIN), f(-1e19)), Some(Greater));
     assert_eq!(c(i(1), f(f64::NAN)), None);
     assert_eq!(c(i(1), i(2)), Some(Less));
+}
+
+#[test]
+fn a_segment_holding_only_arrays_is_version_2() {
+    // Spec review of M9h.2, m1: typed by the array itself, not by what is inside it.
+    for items in [vec![], vec![Value::Int(1), Value::Str("a".to_owned())]] {
+        let mut w = SegmentWriter::new(2);
+        let mut d = Document::new("a", vec![1.0]);
+        d.attrs.insert("n".to_owned(), Value::Array(items.clone()));
+        w.push(d);
+        assert_eq!(version(&w.finish()), 2, "{items:?}");
+    }
+}
+
+#[test]
+fn an_array_holds_only_finite_scalars() {
+    for items in [
+        vec![Value::Array(vec![])],
+        vec![Value::Int(1), Value::Float(f64::NAN)],
+    ] {
+        let mut d = Document::new("a", vec![1.0]);
+        d.attrs.insert("n".to_owned(), Value::Array(items.clone()));
+        assert!(pstore_format::check_storable(&d).is_err(), "{items:?}");
+    }
+}
+
+#[test]
+fn a_nested_array_does_not_decode() {
+    // Written past `check_storable`, a nested array must still not come back as data.
+    let mut d = Document::new("a", vec![1.0]);
+    d.attrs.insert(
+        "n".to_owned(),
+        Value::Array(vec![Value::Array(vec![Value::Int(1)])]),
+    );
+    let rows = pstore_format::encode_rows(std::slice::from_ref(&d));
+    assert_eq!(
+        pstore_format::decode_rows(&rows).err(),
+        Some(pstore_format::FormatError::Corrupt(
+            "an array inside an array"
+        ))
+    );
+    let mut ok = Document::new("a", vec![1.0]);
+    ok.attrs.insert(
+        "n".to_owned(),
+        Value::Array(vec![Value::Int(1), Value::Bool(true)]),
+    );
+    let rows = pstore_format::encode_rows(std::slice::from_ref(&ok));
+    assert_eq!(
+        pstore_format::decode_rows(&rows).unwrap()[0].attrs,
+        ok.attrs
+    );
 }

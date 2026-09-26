@@ -291,7 +291,8 @@ async fn what_still_has_no_type_is_refused() {
         beyond_i64.clone(),
         json!(u64::MAX),
         json!({"k": 1}),
-        json!([1, 2]),
+        // M9h.2 gave a flat array meaning; a nested one still has none.
+        json!([[1, 2]]),
         json!(null),
     ] {
         let api = api();

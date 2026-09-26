@@ -256,7 +256,8 @@ async fn returning_attributes_costs_no_request_and_no_byte() {
 async fn a_value_the_format_cannot_store_is_refused_not_coerced() {
     for (value, name) in [
         // M9h.1 gave `1.5` and `true` a type; `tests/typed_values.rs` covers them.
-        (json!([1, 2]), "x"),
+        // M9h.2 gave a flat array meaning; a nested one still has none.
+        (json!([[1, 2]]), "x"),
         (json!({"k": 1}), "x"),
         (json!(null), "x"),
         (json!(u64::MAX), "x"),

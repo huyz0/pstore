@@ -22,23 +22,35 @@ fn encode_attrs(e: &mut Enc, attrs: &BTreeMap<String, Value>) {
     e.u32(attrs.len() as u32);
     for (k, v) in attrs {
         e.bytes(k.as_bytes());
-        match v {
-            Value::Int(n) => {
-                e.u8(0);
-                e.i64(*n);
-            }
-            Value::Str(s) => {
-                e.u8(1);
-                e.bytes(s.as_bytes());
-            }
-            // M9h.1. A reader from before it refuses these tags as unknown, never misreads.
-            Value::Float(f) => {
-                e.u8(2);
-                e.f64(*f);
-            }
-            Value::Bool(b) => {
-                e.u8(3);
-                e.u8(u8::from(*b));
+        encode_value(e, v);
+    }
+}
+
+fn encode_value(e: &mut Enc, v: &Value) {
+    match v {
+        Value::Int(n) => {
+            e.u8(0);
+            e.i64(*n);
+        }
+        Value::Str(s) => {
+            e.u8(1);
+            e.bytes(s.as_bytes());
+        }
+        // M9h.1. A reader from before it refuses these tags as unknown, never misreads.
+        Value::Float(f) => {
+            e.u8(2);
+            e.f64(*f);
+        }
+        Value::Bool(b) => {
+            e.u8(3);
+            e.u8(u8::from(*b));
+        }
+        // M9h.2: a count, then each element with its own tag.
+        Value::Array(items) => {
+            e.u8(4);
+            e.u32(items.len() as u32);
+            for i in items {
+                encode_value(e, i);
             }
         }
     }
@@ -49,22 +61,37 @@ fn decode_attrs(d: &mut Dec<'_>) -> Result<BTreeMap<String, Value>, FormatError>
     let mut attrs = BTreeMap::new();
     for _ in 0..n {
         let k = d.string()?;
-        let v = match d.u8()? {
-            0 => Value::Int(d.i64()?),
-            1 => Value::Str(d.string()?),
-            2 => Value::Float(d.f64()?),
-            3 => match d.u8()? {
-                0 => Value::Bool(false),
-                1 => Value::Bool(true),
-                _ => return Err(FormatError::Corrupt("a bool that is neither 0 nor 1")),
-            },
-            // A tag from a future version. Refused, not guessed: a mistyped attribute is
-            // one a filter later reads as the wrong thing.
-            _ => return Err(FormatError::Corrupt("unknown value tag")),
-        };
-        attrs.insert(k, v);
+        attrs.insert(k, decode_value(d, true)?);
     }
     Ok(attrs)
+}
+
+/// One tagged value; an array only where `array` allows it, so never nested.
+fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
+    Ok(match d.u8()? {
+        0 => Value::Int(d.i64()?),
+        1 => Value::Str(d.string()?),
+        2 => Value::Float(d.f64()?),
+        3 => match d.u8()? {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => return Err(FormatError::Corrupt("a bool that is neither 0 nor 1")),
+        },
+        4 if array => {
+            let n = d.u32()? as usize;
+            // Grown as elements decode, never reserved from the count: a corrupt count then
+            // fails at the bytes it lacks instead of reserving gigabytes (M6a's remedy).
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode_value(d, false)?);
+            }
+            Value::Array(items)
+        }
+        4 => return Err(FormatError::Corrupt("an array inside an array")),
+        // A tag from a future version. Refused, not guessed: a mistyped attribute is
+        // one a filter later reads as the wrong thing.
+        _ => return Err(FormatError::Corrupt("unknown value tag")),
+    })
 }
 
 /// The run encoding's own version, written ahead of the count.

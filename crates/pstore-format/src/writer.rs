@@ -190,7 +190,7 @@ impl SegmentWriter {
                             e.0 = e.0.min(*f);
                             e.1 = e.1.max(*f);
                         }
-                        Value::Str(_) | Value::Bool(_) => {}
+                        Value::Str(_) | Value::Bool(_) | Value::Array(_) => {}
                     }
                 }
             }
@@ -295,7 +295,7 @@ impl SegmentWriter {
         self.typed = docs.iter().any(|d| {
             d.attrs
                 .values()
-                .any(|v| matches!(v, Value::Float(_) | Value::Bool(_)))
+                .any(|v| matches!(v, Value::Float(_) | Value::Bool(_) | Value::Array(_)))
         });
         // ⚠️ One set of sections per named field. Fields are taken in name order so the
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader

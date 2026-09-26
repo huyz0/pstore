@@ -35,6 +35,9 @@ pub enum Predicate {
     Absent(String),
     /// Present and equal to one of these.
     In(String, Vec<Value>),
+    /// An array holding an element equal to one of these (M9h.2). `Contains x` is
+    /// `ContainsAny [x]`. A scalar or absent attribute is false; an empty list admits nothing.
+    ContainsAny(String, Vec<Value>),
     /// Every clause; `And []` is true.
     And(Vec<Predicate>),
     /// Any clause; `Or []` is false.
@@ -60,6 +63,12 @@ impl Predicate {
             Self::In(name, set) => {
                 get(name).is_some_and(|have| set.iter().any(|w| compare(&have, Op::Eq, w)))
             }
+            Self::ContainsAny(name, set) => match get(name) {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
+                _ => false,
+            },
             Self::And(all) => all.iter().all(|p| p.admits(id, attrs)),
             Self::Or(any) => any.iter().any(|p| p.admits(id, attrs)),
             Self::Not(p) => !p.admits(id, attrs),
@@ -99,7 +108,9 @@ impl Predicate {
                 .any(|v| Self::Cmp(name.clone(), Op::Eq, v.clone()).could_admit(zones)),
             Self::And(all) => all.iter().all(|p| p.could_admit(zones)),
             Self::Or(any) => any.iter().any(|p| p.could_admit(zones)),
-            Self::Absent(_) | Self::Not(_) => true,
+            // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
+            // the arrays beside them.
+            Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
         }
     }
 }

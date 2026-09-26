@@ -1170,7 +1170,16 @@ fn to_document(d: &types::DocumentIn) -> Result<Document, ApiError> {
         if name == pstore_query::ID_ATTRIBUTE {
             return Err(refuse(name, "is reserved: `id` is the document id"));
         }
-        let v = match scalar(value) {
+        let v = match value {
+            // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|i| scalar(i).map_err(|why| format!("holds an element that {why}")))
+                .collect::<Result<Vec<_>, _>>()
+                .map(pstore_format::Value::Array),
+            _ => scalar(value),
+        };
+        let v = match v {
             Ok(v) => v,
             Err(why) => return Err(refuse(name, &why)),
         };
@@ -1238,6 +1247,29 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
                 "Lte" => cmp(Op::Lte),
                 "Gt" => cmp(Op::Gt),
                 "Gte" => cmp(Op::Gte),
+                // M9h.2: `Contains x` is `ContainsAny [x]`, over an array attribute's elements.
+                "Contains" | "NotContains" => {
+                    let p = Predicate::ContainsAny(attr, vec![scalar(value)?]);
+                    Ok(if op == "Contains" {
+                        p
+                    } else {
+                        Predicate::Not(Box::new(p))
+                    })
+                }
+                "ContainsAny" | "NotContainsAny" => {
+                    let set = value
+                        .as_array()
+                        .ok_or_else(|| bad(format!("{op} takes an array of values")))?
+                        .iter()
+                        .map(scalar)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let p = Predicate::ContainsAny(attr, set);
+                    Ok(if op == "ContainsAny" {
+                        p
+                    } else {
+                        Predicate::Not(Box::new(p))
+                    })
+                }
                 "In" | "NotIn" => {
                     let set = value
                         .as_array()
@@ -1296,6 +1328,7 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
         // Stored floats are finite (`check_storable`), which is all `from` refuses.
         pstore_format::Value::Float(f) => serde_json::Value::from(*f),
         pstore_format::Value::Bool(b) => serde_json::Value::from(*b),
+        pstore_format::Value::Array(items) => items.iter().map(to_json).collect(),
     }
 }
 
