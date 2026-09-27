@@ -48,9 +48,21 @@ and 7 were also **seen red** with the one fix each rests on removed.
     named, and the four variables documented.
     `the_duties_endpoint_reports_every_unscheduled_duty` (`cargo test -p pstore-server --test
     deploy`) still holds.
-12. **Gates** — `./scripts/gates.sh` on this tree: see the commit. The mutation sweep over the
-    diff is NOT-RUN yet: M9h.3's re-run holds the disk. It is added before this lands on
-    `main`.
+12. **Gates** — `./scripts/gates.sh` on this tree: see the commit. The mutation sweep:
+    `./scripts/mutants.sh --in-diff`, run one source file at a time over M9h.3, M9i.1 and
+    M9i.2 together (`git diff 25e43b5..HEAD`), each shard committed under
+    [`sweep/`](sweep/) as it finished. Container restarts had killed three
+    whole-diff runs.
+    - **Totals: 403 tested, 366 caught, 34 unviable, 3 missed.**
+    - `datetime.rs`: 246 of 246 caught.
+    - All three misses were in the server's `lib.rs`: the scheduled fold's `nothing` count, an
+      explicit `"eventual"`, and an overflow fallback that could itself overflow.
+    - Each got a test, and the fallback became a fixed far future.
+    - The re-sweep `--check 'fold_tick|in level' --file crates/pstore-server/src/lib.rs` then
+      missed 5 of 36, all in that new fallback: the "absurd" test's period still fit in an
+      `Instant`. It now uses u64::MAX seconds and advances five years, and all five mutants
+      were each seen caught by hand.
+    Code review: two rounds (block on two test gaps, then pass).
 
 ## M9i.2 — `consistency`
 
@@ -89,12 +101,10 @@ All in `cargo test -p pstore-server --test consistency`. Every test in the file 
 11. **Docs** — `the_research_is_corrected_where_it_promised_otherwise`.
 12. **Gates** — code review: one round, pass, with four minors:
     - the `max` test in 4, taken;
-    - the engine also refusing `strong` with `as_of`, taken;
+    - the engine also refusing strong with as_of, taken;
     - no HEAD clone for an `eventual` order, taken;
     - a failed requested fold keeping its mark, untested and left as a minor.
-    The mutation sweep over M9h.3, M9i.1 and M9i.2 runs one source file at a time,
-    each shard committed under [`sweep/`](sweep/) as it finishes, because container restarts
-    killed three whole-diff runs. Its result is recorded here before this lands on `main`.
+    The mutation sweep is M9i.1's criterion 12 above, one sweep over all three changes.
     `./scripts/gates.sh` on this tree: see the commit.
 
 ⚠️ **Found at spec review, outside this task, and carried to BACKLOG:**

@@ -155,7 +155,16 @@ a test that this tree also carries.
 8. **Gates** — code review of this tree: pass, with three minors. The flag-2 framing test is
    added. The `text` refusal branch is redundant with the unused-name rule and is kept. The
    literal re-parsed per row is a cost, not a defect. `./scripts/gates.sh` on this tree: see
-   the commit. `./scripts/mutants.sh` over the diff: NOT-RUN on this tree yet. It ran on the
-   first copy (323 tested, 307 caught, 15 unviable, 1 missed, the datetime-literal arm, since
-   tested), and two restarts cut the re-runs short. The re-run's result is added when it
-   finishes, before this lands on `main`.
+   the commit. `./scripts/mutants.sh --in-diff`, run one source file at a time over M9h.3, M9i.1 and
+   M9i.2 together (`git diff 25e43b5..HEAD`), each shard committed under
+   [`../M9i/sweep/`](../M9i/sweep/) as it finished. Container restarts had killed three
+   whole-diff runs.
+   - **Totals: 403 tested, 366 caught, 34 unviable, 3 missed.**
+   - `datetime.rs`: 246 of 246 caught.
+   - All three misses were in the server's `lib.rs`: the scheduled fold's `nothing` count, an
+     explicit `"eventual"`, and an overflow fallback that could itself overflow.
+   - Each got a test, and the fallback became a fixed far future.
+   - The re-sweep `--check 'fold_tick|in level' --file crates/pstore-server/src/lib.rs` then
+     missed 5 of 36, all in that new fallback: the "absurd" test's period still fit in an
+     `Instant`. It now uses u64::MAX seconds and advances five years, and all five mutants
+     were each seen caught by hand.

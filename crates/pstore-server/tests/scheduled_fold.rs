@@ -535,17 +535,20 @@ async fn an_absurd_period_backs_off_without_panicking() {
     let a = &w.apis[0];
     write(a, 63, &["x"], true).await;
     *w.switch.fail.lock().unwrap() = Some("/tnt/63/HEAD".to_owned());
+    // `u64::MAX` seconds -- `PSTORE_FOLD_AGE_S` can say it -- is past what an `Instant` holds;
+    // `u64::MAX` milliseconds is not, and never reached the fallback (mutation sweep).
     let p = FoldPolicy {
-        period: Duration::from_millis(u64::MAX),
-        age: Duration::from_millis(u64::MAX),
+        period: Duration::from_secs(u64::MAX),
+        age: Duration::from_secs(u64::MAX),
         bytes: 1,
     };
     assert_eq!(a.fold_due(&p).await.failed, 1);
-    tokio::time::advance(Duration::from_secs(3600)).await;
+    // Five years on, the fallback's decade has not passed: still deferred.
+    tokio::time::advance(Duration::from_secs(5 * 365 * 86_400)).await;
     assert_eq!(
         a.fold_due(&p).await.deferred,
         1,
-        "a failed fold was retried at once"
+        "the fallback deadline came early"
     );
 }
 
