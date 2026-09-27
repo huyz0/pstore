@@ -63,6 +63,9 @@ read path except `strong`'s own-lane probe above; the format.
    - E2's `strong` query is refused with `NotFolded` before that fold, because `b` is unfolded.
      After it, the same query is served.
    - After a fold, a scan returns `a`, `b` and `c`, each exactly once.
+   1b. (Mutation sweep) The resume's HEAD read is its own. After bundle 0 is folded and then
+   deleted (as `gc` reaps it), E2 runs a query, which fills the schema cache, and then
+   flushes. The flush lands at `Seq(2)`.
 2. **Restart with nothing folded.** E1 flushes `a`, then `b`. E2 on L flushes `c`, and its
    flush returns `Seq(2)`. A fold then returns all three rows, each once.
 3. **Cost.** For E2 in criterion 2:
@@ -81,6 +84,7 @@ read path except `strong`'s own-lane probe above; the format.
 | # | Fails first | Mutation it catches |
 |---|---|---|
 | 1 | `c` overwrites bundle 0 and is pruned, then never folded | resume from 0 instead of the watermark; a resume skipped; `settled` probing at `next` after a resume |
+| 1b | lands at `Seq(0)` with the read skipped | the schema cache standing in for the resume's read |
 | 2 | the flush returns `Seq(0)` and `a` is lost | the tail not probed |
 | 3 | 2 reads today, not 10 | a resume on every flush; a registration on every flush |
 | 4 | new test; red with the resume marked done before its reads succeed | the resume latched on failure |

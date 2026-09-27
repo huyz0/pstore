@@ -11,7 +11,7 @@
 //! single-writer, so a successor on the SAME lane must continue at the tail, not at zero:
 //! zero overwrites bundles already written, folded or not, and those rows are gone.
 
-use pstore_blob::{Accounted, MemoryStore, OpClass};
+use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
 use pstore_engine::{Consistency, Engine, EngineError};
 use pstore_format::{DEFAULT_FIELD, Document};
 use pstore_query::{Fusion, Prefetch};
@@ -42,16 +42,19 @@ async fn put<S: pstore_blob::BlobStore>(e: &Engine<S>, id: &str) -> Option<Seq> 
     e.flush().await.unwrap()
 }
 
-async fn strong<S: pstore_blob::BlobStore>(e: &Engine<S>) -> Result<(), EngineError> {
-    let dense = [Prefetch::Dense {
+fn dense() -> [Prefetch; 1] {
+    [Prefetch::Dense {
         field: DEFAULT_FIELD.to_owned(),
         query: vec![1.0, 0.5],
         limit: 10,
         tune: pstore_index::vec_index::Query::default(),
-    }];
+    }]
+}
+
+async fn strong<S: pstore_blob::BlobStore>(e: &Engine<S>) -> Result<(), EngineError> {
     e.query_filtered_as(
         "idx",
-        &dense,
+        &dense(),
         None,
         Fusion::default(),
         10,
@@ -84,6 +87,38 @@ async fn a_restart_after_a_fold_resumes_at_the_tail() {
     assert_eq!(ids(&e2).await, ["a", "b", "c"]);
     let reader = Engine::new(Arc::clone(&s), t, LaneId(99));
     assert_eq!(ids(&reader).await, ["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn a_warm_schema_cache_does_not_stand_in_for_the_resumes_head_read() {
+    // The resume's watermark must come from a HEAD read it makes, not from whichever path
+    // happened to fill the schema cache first. Probing from 0 instead stops at a folded
+    // bundle `gc` reaped, and the flush overwrites a sequence already folded.
+    let s = Arc::new(MemoryStore::new());
+    let t = TenantId(904);
+    {
+        let e1 = Engine::new(Arc::clone(&s), t, LANE);
+        put(&e1, "a").await;
+        e1.fold().await.unwrap();
+        put(&e1, "b").await;
+    }
+    s.delete_batch(&[pstore_engine::bundle_key(t, LANE, Seq(0))])
+        .await
+        .unwrap();
+    let e2 = Engine::new(Arc::clone(&s), t, LANE);
+    // A query first: it reads HEAD, and fills the schema cache from it.
+    let answer = e2
+        .query("idx", &dense(), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(answer.hits.len(), 1);
+    assert_eq!(
+        put(&e2, "c").await,
+        Some(Seq(2)),
+        "resumed from a guessed watermark"
+    );
+    e2.fold().await.unwrap();
+    assert_eq!(ids(&e2).await, ["a", "b", "c"]);
 }
 
 #[tokio::test]

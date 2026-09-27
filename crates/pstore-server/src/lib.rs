@@ -1713,11 +1713,12 @@ pub struct Config {
     /// This process's WAL lane.
     ///
     /// ⚠️ **Required, and never defaulted.** Lanes are single-writer and dense: two processes
-    /// writing one tenant on the same lane both start at sequence zero and overwrite each
-    /// other's bundles — acknowledged, durable writes, gone, with no error anywhere, because
+    /// writing one tenant on the same lane **at once** resume at the same tail and overwrite
+    /// each other's bundles — acknowledged, durable writes, gone, with no error anywhere, because
     /// a bundle is an unconditional `put`. A default here would make that the *normal* way to
     /// run two servers. Nothing detects the collision today; the backlog names create-if-absent
-    /// bundles as the fix and M2's density invariant as why it is not a one-line change.
+    /// bundles as the fix and M2's density invariant as why it is not a one-line change. A
+    /// restart on the same lane, once the old process is gone, resumes it (M9j).
     pub lane: LaneId,
     /// Which store to open.
     pub backend: Backend,
