@@ -1,0 +1,3 @@
+# crates/pstore-query/src/filter.rs  (git diff 25e43b5..edae2f5, exit 0)
+Found 22 mutants to test
+22 mutants tested in 22m: 22 caught
