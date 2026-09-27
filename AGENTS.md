@@ -88,6 +88,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `scripts/build-index.py --check` | the generated regions in `AGENTS.md` are current, and the Gates table matches what CI runs |
 | `scripts/check-verified.py` | every acceptance criterion has an evidence line, and every test it names resolves (OQ-167) |
 | `scripts/check-slos.py` | every service objective is **`enforced` with a gate that exists** or **`blocked` with a blocker named**. ⚠️ There is no third status, because the third status is how "we aim for p99 under 100 ms" gets written by someone who has measured nothing. Rung 3: the rule is a predicate over files |
+| `scripts/check-milestone-ids.py` | every milestone directory is `M<n>`, a plain number: M10, M11, and so on. Tasks are `M<n>.<k>`. ⚠️ From M0a to M9j a theme was split into lettered sub-milestones only because the first one was copied: the `spec` skill fixed task ids and never milestone ids. The lettered names that exist stay, recognised by rule, not by a list. Rung 3 |
 | `scripts/recall.sh` | recall@10 above its floor (D-35). Runs outside `cargo test`, so `cargo mutants` does not rebuild a gate-scale corpus once per mutant |
 | `scripts/ndcg.sh` | ranking quality above its floor (D-31) — **and a control ranker below it**, so a judged set we generated cannot pass everything |
 | `scripts/depth.sh` | round-trip depth and query bytes **at gate scale** (20,000 rows). Outside `cargo test` for the same reason `recall.sh` is: a sweep reruns the suite once per mutant |

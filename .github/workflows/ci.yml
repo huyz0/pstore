@@ -167,6 +167,8 @@ jobs:
       - run: ./scripts/selftest-check-verified.sh
       - run: ./scripts/check-slos.py
       - run: ./scripts/selftest-check-slos.sh
+      - run: ./scripts/check-milestone-ids.py
+      - run: ./scripts/check-milestone-ids.py --self-test
       - run: ./scripts/check-poison.sh --selftest
       # Every shell script the gates run is portable, or declares why not -- a grep, and
       # the `portable` job below is what catches what a grep cannot.

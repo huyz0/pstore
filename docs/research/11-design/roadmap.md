@@ -489,6 +489,33 @@ score)`. Nine milestones close that, each end to end through the HTTP door:
 ⚠️ Only M9a is specified. The rest are a sequence, not specs: each is decomposed when it is
 next, because the one before changes what it should be.
 
+⚠️ **All nine landed, plus M9j** (BACKLOG row 39, a restarted writer resuming its lane).
+**M9j is the last lettered milestone.** From M10 on, a milestone is the next integer and its
+tasks are `M<n>.<k>`. `scripts/check-milestone-ids.py` refuses a new lettered directory.
+
+### M10 onward — what M9 left open, one number each
+
+These are the two backlog rows M9i filed, then every row
+[`turbopuffer-api-parity.md`](turbopuffer-api-parity.md) marks **Deferred**. Like M9, this
+is a sequence and not a set of specs: each milestone is specified when it is next.
+
+| # | Milestone | Why here |
+|---|---|---|
+| M10 | **The served epoch.** `meta.epoch` reports the HEAD the query was answered from, not the process's last commit, so a `strong` answer says what it reflects. ([BACKLOG](../../milestones/BACKLOG.md) row 40) | A correctness bug in what the API reports; small |
+| M11 | **`session` and `bounded` consistency.** `session` tokens per [D-69](session-and-affinity-protocol.md), and `bounded` (OQ-125); both are refused today. (BACKLOG row 41) | The rest of the `consistency` row; M10's served epoch is what a token carries |
+| M12 | **Aggregations**: `aggregate_by` (`Count`, `Sum`) and `group_by`. OQ-68 decides whether DataFusion earns its weight. | Its stated blocker, filter evaluation, landed in M9b |
+| M13 | **Patches and conditional writes**: `patch_rows`/`patch_columns`, `patch_by_filter`, `delete_by_filter`, `upsert_condition`/`patch_condition`/`delete_condition` | A read-modify-write at fold time, on M9c's last-write-wins; it has to be priced before it is built |
+| M14 | **Full-text analyzer options**: tokenizer versions, languages, stemming, stopwords, case, ASCII folding, `k1`/`b`; and `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence` | An analyzer is part of the segment format, and changing one is a reindex |
+| M15 | **`Glob`, `IGlob`, `Regex`, `Fuzzy`** over a trigram index | Refused as `Unimplemented` today; after M14, which settles what a token is |
+| M16 | **`copy_from_namespace`, `branch_from_namespace`** (OQ-33) | Branching is one PUT by design; it waits for a caller |
+| M17 | **`hint_cache_warm`** | Needs the NVMe tier (D-23), which does not exist yet |
+
+**Not planned,** with the reason in the parity tables:
+- CMEK, sharding and backpressure: declined for now.
+- `Highlight`, `Embed` and `explain_query`: declined for now.
+- Pinning and read-only replicas: declined, because they give a node ownership.
+- `_debug/recall`: ours is a CI gate, not an endpoint.
+
 ## Cross-cutting, from day one
 
 | Discipline | Enforcement |

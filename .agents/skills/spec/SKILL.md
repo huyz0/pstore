@@ -5,7 +5,8 @@ description: Write a delta spec and its verification ledger before implementing.
 
 # Spec
 
-One `SPEC.md` per milestone, in `docs/milestones/<id>/`, with a `VERIFIED.md` beside it.
+One `SPEC.md` per milestone, in `docs/milestones/M<n>/`, with a `VERIFIED.md` beside it. A
+milestone is the next integer (M10, M11, …), never a letter suffix (`scripts/check-milestone-ids.py`).
 **≤200 lines of spec, ≤100 of verified.** If it is longer, it is restating the corpus.
 
 ## ⚠️ A spec is a delta, not a description
