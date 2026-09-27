@@ -1,0 +1,3 @@
+# crates/pstore-format/src/datetime.rs  (git diff 25e43b5..08b0260, exit 0)
+Found 246 mutants to test
+246 mutants tested in 2h: 246 caught
