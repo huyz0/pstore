@@ -1,0 +1,3 @@
+# crates/pstore-engine/src/lib.rs  (git diff 25e43b5..f76c75e, exit 0)
+Found 31 mutants to test
+31 mutants tested in 20m: 19 caught, 12 unviable
