@@ -194,6 +194,9 @@ pub struct QueryRequest {
     /// Documents of a `rank_by` order to skip (M9e). Refused without `rank_by`.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// `"eventual"` (the default, and `null`) or `"strong"` (M9i.2). Anything else is refused.
+    #[serde(default)]
+    pub consistency: Option<serde_json::Value>,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -241,6 +244,8 @@ pub struct QueryMeta {
     pub unfolded_hits: usize,
     /// What it cost.
     pub cost: Cost,
+    /// The level served: `eventual` or `strong` (M9i.2).
+    pub consistency: &'static str,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g).
@@ -283,6 +288,8 @@ pub struct MultiQueryMeta {
     pub unfolded_hits: Vec<usize>,
     /// What the whole request cost.
     pub cost: Cost,
+    /// Each query's level served (M9i.2).
+    pub consistencies: Vec<&'static str>,
 }
 
 /// The answer to a query.

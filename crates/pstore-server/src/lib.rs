@@ -107,6 +107,8 @@ pub struct Api<S> {
     /// Per tenant, when its next scheduled fold may run after a failure, and the delay that
     /// set it (M9i.1).
     backoff: Mutex<HashMap<TenantId, (tokio::time::Instant, std::time::Duration)>>,
+    /// Tenants a refused `strong` read asked a fold of (M9i.2). A set: many refusals, one fold.
+    requested: Mutex<std::collections::HashSet<TenantId>>,
 }
 
 /// When a scheduled fold runs (M9i.1): D-39's triggers, size or age, never a fixed timer.
@@ -185,7 +187,27 @@ impl<S: BlobStore + 'static> Api<S> {
             engines: tokio::sync::Mutex::new(HashMap::new()),
             http: Mutex::new(Http::default()),
             backoff: Mutex::new(HashMap::new()),
+            requested: Mutex::new(std::collections::HashSet::new()),
         }))
+    }
+
+    /// Passes `result` through, first marking `tenant` for a fold if it is a `not_folded`
+    /// refusal (M9i.2). The fold loop takes the mark; nothing is folded here, on the query's
+    /// path.
+    async fn requesting<T>(
+        &self,
+        tenant: TenantId,
+        result: Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        if let Err(e) = &result
+            && e.code == "not_folded"
+        {
+            self.requested
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(tenant);
+        }
+        result
     }
 
     /// Folds every tenant this process holds that `policy` says is due (M9i.1).
@@ -219,10 +241,16 @@ impl<S: BlobStore + 'static> Api<S> {
         let mut tick = FoldTick::default();
         let mut due = Vec::new();
         for (tenant, engine) in engines {
-            let Some(u) = engine.unfolded() else {
-                continue;
-            };
-            if now.duration_since(u.oldest) < policy.age && u.bytes < policy.bytes {
+            // A refused `strong` read asked for this tenant (M9i.2), whatever it holds.
+            let requested = self
+                .requested
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&tenant);
+            let old_or_large = engine.unfolded().is_some_and(|u| {
+                now.duration_since(u.oldest) >= policy.age || u.bytes >= policy.bytes
+            });
+            if !old_or_large && !requested {
                 continue;
             }
             let waiting = self
@@ -242,7 +270,13 @@ impl<S: BlobStore + 'static> Api<S> {
                 if halt.load(std::sync::atomic::Ordering::SeqCst) {
                     return None;
                 }
-                Some((tenant, engine.fold_committed().await))
+                // The mark is taken as the fold starts, and put back below if it fails.
+                let requested = self
+                    .requested
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&tenant);
+                Some((tenant, requested, engine.fold_committed().await))
             })
             .buffer_unordered(FOLD_CONCURRENCY)
             .filter_map(std::future::ready)
@@ -252,7 +286,13 @@ impl<S: BlobStore + 'static> Api<S> {
             .backoff
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (tenant, outcome) in results {
+        for (tenant, requested, outcome) in results {
+            if requested && outcome.is_err() {
+                self.requested
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(tenant);
+            }
             match outcome {
                 Ok(committed) => {
                     backoff.remove(&tenant);
@@ -375,6 +415,8 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     retryable: bool,
+    /// Seconds for a `Retry-After` header, when the refusal names one (M9i.2).
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -388,6 +430,7 @@ impl ApiError {
             // status. `429` and `5xx` are the retryable classes; a request the client got
             // wrong will be just as wrong the second time.
             retryable: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            retry_after: None,
         }
     }
 
@@ -399,8 +442,13 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.code;
+        let retry_after = self.retry_after;
         let body = ErrorBody::new(self.code, self.message, self.retryable);
         let mut res = (self.status, axum::Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            res.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
         res.extensions_mut().insert(RefusalCode(code));
         res
     }
@@ -428,6 +476,16 @@ impl From<EngineError> for ApiError {
             // the error-table arm an acceptance criterion of its own.
             // ⚠️ A caller asking for an epoch outside the window asked wrongly, and can tell
             // from the message which bound it crossed. Without this arm it is a `500`.
+            // M9i.2: a strong read that met another process's unfolded write. Retryable once a
+            // fold commits it, which the handler asks for.
+            EngineError::NotFolded => Self {
+                retry_after: Some(1),
+                ..Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "not_folded",
+                    format!("{e} -- a fold has been requested; retry"),
+                )
+            },
             EngineError::TimeTravel(_) => Self::new(
                 StatusCode::BAD_REQUEST,
                 "time_travel_horizon",
@@ -582,6 +640,7 @@ const REFUSAL_CODES: &[&str] = &[
     "time_travel_horizon",
     "version_conflict",
     "storage_unavailable",
+    "not_folded",
     "internal",
 ];
 
@@ -707,13 +766,16 @@ async fn query_index<S: BlobStore + 'static>(
         let plan = plan(&req)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
-        let got = run(&engine, &index, &req, plan).await?;
+        let got = api
+            .requesting(tenant, run(&engine, &index, &req, plan).await)
+            .await?;
         return Ok(axum::Json(QueryResponse {
             results: got.results,
             meta: QueryMeta {
                 epoch: got.epoch,
                 unfolded_hits: got.unfolded_hits,
                 cost: api.spend(tenant).since(before),
+                consistency: got.consistency,
             },
         })
         .into_response());
@@ -728,12 +790,14 @@ async fn query_index<S: BlobStore + 'static>(
             .zip(plans)
             .map(|(req, plan)| run(&engine, &index, req, plan)),
     )
-    .await?;
+    .await;
+    let got = api.requesting(tenant, got).await?;
     Ok(axum::Json(MultiQueryResponse {
         meta: MultiQueryMeta {
             epochs: got.iter().map(|g| g.epoch).collect(),
             unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
             cost: api.spend(tenant).since(before),
+            consistencies: got.iter().map(|g| g.consistency).collect(),
         },
         results: got.into_iter().map(|g| g.results).collect(),
     })
@@ -792,6 +856,7 @@ enum Plan {
 }
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
+    level(req)?;
     let filter = req.filters.as_ref().map(predicate).transpose()?;
     // ⚠️ Before `prefetch`, which refuses a query with no vector and no text: an ordered query
     // has neither by definition (M9e).
@@ -803,8 +868,41 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     Ok(Plan::Ranked(legs, filter, fusion))
 }
 
+/// A query's consistency (M9i.2): `eventual` unless it asks for `strong`, and refused for
+/// anything else -- a level it cannot promise is never served as one it can.
+fn level(req: &QueryRequest) -> Result<pstore_engine::Consistency, ApiError> {
+    use pstore_engine::Consistency;
+    let level = match &req.consistency {
+        None | Some(serde_json::Value::Null) => Consistency::Eventual,
+        Some(v) => match v.as_str() {
+            Some("eventual") => Consistency::Eventual,
+            Some("strong") => Consistency::Strong,
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "consistency {v} is not eventual or strong; session and bounded are not \
+                     offered yet"
+                )));
+            }
+        },
+    };
+    if level == Consistency::Strong && req.as_of.is_some() {
+        return Err(ApiError::bad_request(
+            "strong with as_of: a past epoch is already exactly what it is",
+        ));
+    }
+    Ok(level)
+}
+
+fn level_name(level: pstore_engine::Consistency) -> &'static str {
+    match level {
+        pstore_engine::Consistency::Eventual => "eventual",
+        pstore_engine::Consistency::Strong => "strong",
+    }
+}
+
 /// One query's answer, before it becomes a response.
 struct Answered {
+    consistency: &'static str,
     results: Vec<ResultRow>,
     epoch: u64,
     unfolded_hits: usize,
@@ -831,16 +929,18 @@ async fn run<E: BlobStore>(
         )
     };
     let epoch = || req.as_of.unwrap_or_else(|| engine.epoch().0);
+    let consistency = level(req)?;
     let (legs, filter, fusion) = match plan {
         Plan::Ordered(by, filter) => {
             let got = engine
-                .ordered(
+                .ordered_as(
                     index,
                     &by,
                     filter.as_ref(),
                     req.offset.unwrap_or(0),
                     req.top_k,
                     req.as_of.map(pstore_types::Epoch),
+                    consistency,
                 )
                 .await?;
             if !got.exists {
@@ -859,6 +959,7 @@ async fn run<E: BlobStore>(
                     .collect(),
                 epoch: epoch(),
                 unfolded_hits: got.unfolded,
+                consistency: level_name(consistency),
             });
         }
         Plan::Ranked(legs, filter, fusion) => (legs, filter, fusion),
@@ -878,7 +979,14 @@ async fn run<E: BlobStore>(
         }
         None => {
             engine
-                .query_filtered(index, &legs, filter.as_ref(), fusion, req.top_k)
+                .query_filtered_as(
+                    index,
+                    &legs,
+                    filter.as_ref(),
+                    fusion,
+                    req.top_k,
+                    consistency,
+                )
                 .await?
         }
     };
@@ -906,6 +1014,7 @@ async fn run<E: BlobStore>(
             .collect(),
         epoch: epoch(),
         unfolded_hits,
+        consistency: level_name(consistency),
     })
 }
 

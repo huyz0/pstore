@@ -51,3 +51,45 @@ and 7 were also **seen red** with the one fix each rests on removed.
 12. **Gates** — `./scripts/gates.sh` on this tree: see the commit. The mutation sweep over the
     diff is NOT-RUN yet: M9h.3's re-run holds the disk. It is added before this lands on
     `main`.
+
+## M9i.2 — `consistency`
+
+All in `cargo test -p pstore-server --test consistency`. Every test in the file was
+**observed red** at first: `consistency` was ignored, and the API it names did not exist.
+
+1. **Strong refuses what it cannot see** — `strong_refuses_what_it_cannot_see`:
+   - lane A has a watermark of 1 and one unfolded bundle;
+   - `strong` through B is `503 not_folded`, retryable, with `Retry-After`;
+   - `eventual` does not see the write;
+   - `B.fold_due` under a policy that folds only requested tenants folds it;
+   - `strong` then serves both rows.
+2. **Strong serves what it can** — `strong_serves_what_it_can`, with a lane registered that
+   holds no watermark.
+3. **Own lane** — `the_own_lane_is_probed_past_what_this_process_holds`: served, not refused,
+   at exactly 3 more reads than `eventual`, one registry GET and two probes. Seen red with the
+   own lane probed at its watermark rather than `next`.
+4. **A dead writer's lane** — `a_dead_writers_lane_is_not_trusted_after_a_restart`.
+5. **Depth** — `strong_costs_no_extra_round_trip`: three lanes, folded segments, a filtered
+   relevance query and a `rank_by` order. `strong`'s depth is at most `eventual`'s, which
+   measured 4 for the filtered query; the probes overlap it and measured 3. With the probes
+   awaited one lane at a time after the query, it went red. The spec's earlier "never over
+   3" was corrected: this `eventual` query is itself 4 rounds.
+6. **Rank orders too** — `strong_refuses_for_a_rank_order_too`.
+7. **A probe error is an error** — `a_probe_that_fails_is_an_error`: `503
+   storage_unavailable`.
+8. **One fold for many refusals** — `many_refusals_ask_for_one_fold`: eight refusals, one
+   fold, then nothing due.
+9. **Refusals** — `what_consistency_cannot_mean_is_refused`: the five values, `strong` with
+   `as_of`, a multi-query with a bad sub-query, and `null` served as `eventual`.
+10. **Reported** — `each_sub_query_reports_its_level`, and the `meta.consistency` assertions
+    in 1 and 2.
+11. **Docs** — `the_research_is_corrected_where_it_promised_otherwise`.
+12. **Gates** — the mutation sweep over M9h.3, M9i.1 and M9i.2 runs one source file at a time,
+    each shard committed under [`sweep/`](sweep/) as it finishes, because container restarts
+    killed three whole-diff runs. Its result is recorded here before this lands on `main`.
+    `./scripts/gates.sh` on this tree: see the commit.
+
+⚠️ **Found at spec review, outside this task, and carried to BACKLOG:**
+- A server restarted on its stable lane starts at sequence 0 and can overwrite its own unfolded
+  bundles.
+- `meta.epoch` reports the process's last commit, not the HEAD it served.

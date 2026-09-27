@@ -278,7 +278,7 @@ sub-query, as `meta.consistencies`.
 
 **Does not change:** a query without `consistency`, which is served, costed and reported as
 today, except for the new `meta` field; the depth of any `eventual` query. A `strong` query's
-depth is at most `max(eventual's, 2)` and never over 3.
+depth is at most `max(eventual's, 2)`: it adds no round to a query that has segments.
 
 ### Acceptance criteria
 
@@ -297,9 +297,11 @@ depth is at most `max(eventual's, 2)` and never over 3.
    bundle and refuse, so this criterion catches it.
 4. **A dead writer's lane.** A second `Api` on lane A (a restart) holds nothing in memory
    while lane A has an unfolded bundle. `strong` through it is refused.
-5. **Depth.** With at least one folded segment and three registered lanes, `strong` has
-   `eventual`'s depth for a filtered relevance query and for a `rank_by` order, measured with
-   `pstore_testkit::depth::DepthCounting`.
+5. **Depth.** With at least one folded segment and three registered lanes, `strong`'s depth
+   is at most `eventual`'s for a filtered relevance query and for a `rank_by` order, measured
+   with `pstore_testkit::depth::DepthCounting`. (At most: the counter opens a round only when
+   nothing is in flight, so overlapping probes can merge two of the query's rounds; probes
+   awaited one after another add rounds.)
 6. **Rank orders too.** Criterion 1's refusal holds for a `rank_by` query.
 7. **A probe error is an error.** With a probe's HEAD failing, `strong` returns
    `503 storage_unavailable`, not an answer.
@@ -331,8 +333,8 @@ depth is at most `max(eventual's, 2)` and never over 3.
 
 ### RA budget
 
-A `strong` query has at most `max(eventual's depth, 2)` rounds, never over 3. It adds 1 GET
-and one HEAD per registered lane (at most 4096).
+A `strong` query has at most `max(eventual's depth, 2)` rounds. It adds 1 GET and one HEAD
+per registered lane (at most 4096).
 
 ### Risks
 

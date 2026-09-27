@@ -59,6 +59,10 @@ pub enum EngineError {
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
+    /// A `strong` read found a durable write no fold has committed (M9i.2): it refuses rather
+    /// than serve an answer that misses it.
+    #[error("a strong read found an unfolded write; a fold is needed first")]
+    NotFolded,
     /// The backend's recorded profile says it cannot fence, so nothing may be told it is
     /// durable.
     ///
@@ -158,6 +162,16 @@ pub(crate) fn require_fencing<S: BlobStore + ?Sized>(store: &S) -> Result<(), En
             observed: format!("{observed:?}"),
         }),
     }
+}
+
+/// What a query promises about writes it did not make (M9i.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Consistency {
+    /// The HEAD it reads and this process's own writes: today's answer.
+    #[default]
+    Eventual,
+    /// Every durable write any process acknowledged before its HEAD read, or a refusal.
+    Strong,
 }
 
 /// What a process has flushed and not yet seen folded (M9i.1).
@@ -2498,9 +2512,61 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
     ) -> Result<Answer, EngineError> {
+        self.query_filtered_as(
+            index,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+            Consistency::Eventual,
+        )
+        .await
+    }
+
+    /// [`Self::query_filtered`] at a [`Consistency`] (M9i.2). `Strong` reads the lane registry
+    /// beside HEAD and probes each lane's tail beside the segment reads, so it adds no round.
+    ///
+    /// # Errors
+    /// As [`Self::query`], and [`EngineError::NotFolded`] when `Strong` finds an unfolded write.
+    pub async fn query_filtered_as(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+    ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
-        let (at, fresh) = self.head_and_fresh(index).await?;
+        let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
+        let (answer, settled) = futures_util::future::try_join(
+            self.answer(index, &at, fresh, prefetch, filter, fusion, top_k),
+            self.settled(&at.head, lanes.as_deref()),
+        )
+        .await?;
+        if settled {
+            Ok(answer)
+        } else {
+            Err(EngineError::NotFolded)
+        }
+    }
+
+    /// The query's rounds after HEAD: its segments and blocks.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, passed on"
+    )]
+    async fn answer(
+        &self,
+        index: &str,
+        at: &head::HeadAt,
+        fresh: Option<FreshView>,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+    ) -> Result<Answer, EngineError> {
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
@@ -2564,18 +2630,69 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// HEAD, and the fresh view of `index` consistent with it: the unfolded rows it has not
-    /// folded. Re-reads HEAD when this engine already pruned past it.
-    async fn head_and_fresh(
+    /// folded. Re-reads HEAD when this engine already pruned past it. For `Strong`, the lane
+    /// registry too, read beside the first HEAD read: both keys are the tenant's own, so
+    /// neither waits on the other (M9i.2).
+    async fn head_and_fresh_as(
         &self,
         index: &str,
-    ) -> Result<(head::HeadAt, Option<FreshView>), EngineError> {
-        for _ in 0..STALE_HEAD_RETRIES {
-            let at = head::read(&*self.store, self.tenant).await?;
+        consistency: Consistency,
+    ) -> Result<(head::HeadAt, Option<FreshView>, Option<Vec<LaneId>>), EngineError> {
+        let mut lanes = None;
+        for attempt in 0..STALE_HEAD_RETRIES {
+            let at = if consistency == Consistency::Strong && attempt == 0 {
+                let (at, live) = futures_util::future::try_join(
+                    head::read(&*self.store, self.tenant),
+                    lanes::live(&*self.store, self.tenant),
+                )
+                .await?;
+                lanes = Some(live);
+                at
+            } else {
+                head::read(&*self.store, self.tenant).await?
+            };
             if let Some(view) = self.fresh_view(index, self.watermark(&at.head)).await? {
-                return Ok((at, view));
+                return Ok((at, view, lanes));
             }
         }
         Err(EngineError::Lost)
+    }
+
+    /// Whether no registered lane holds a bundle `head` has not folded (M9i.2): one `head`
+    /// probe per lane, all at once. `None` lanes -- an `Eventual` read -- probe nothing.
+    ///
+    /// ⚠️ **This process's own lane is probed too**, at `max(watermark, next)`. Its batches
+    /// from the watermark up are in the memtable every answer includes, so only a bundle this
+    /// engine did not write -- a previous incarnation's, after a restart -- can be there.
+    async fn settled(&self, head: &Head, lanes: Option<&[LaneId]>) -> Result<bool, EngineError> {
+        let Some(lanes) = lanes else {
+            return Ok(true);
+        };
+        let next = self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+        let probes = lanes.iter().map(|lane| {
+            let folded = head.watermarks.get(&lane.0).copied().unwrap_or(0);
+            let at = if *lane == self.lane {
+                folded.max(next)
+            } else {
+                folded
+            };
+            let key = bundle_key(self.tenant, *lane, Seq(at));
+            async move {
+                match self.store.head(&key).await {
+                    Ok(_) => Ok(false),
+                    Err(pstore_blob::BlobError::NotFound(_)) => Ok(true),
+                    Err(e) => Err(EngineError::from(e)),
+                }
+            }
+        });
+        Ok(futures_util::future::try_join_all(probes)
+            .await?
+            .into_iter()
+            .all(|clean| clean))
     }
 
     /// How far HEAD has folded this engine's own lane.
@@ -2687,6 +2804,38 @@ impl<S: BlobStore> Engine<S> {
         limit: usize,
         as_of: Option<Epoch>,
     ) -> Result<Ordered, EngineError> {
+        self.ordered_as(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            as_of,
+            Consistency::Eventual,
+        )
+        .await
+    }
+
+    /// [`Self::ordered`] at a [`Consistency`] (M9i.2), as [`Self::query_filtered_as`] does it.
+    /// A past epoch is what it is: `Strong` with `as_of` is refused by the caller.
+    ///
+    /// # Errors
+    /// As [`Self::ordered`], and [`EngineError::NotFolded`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, and its level"
+    )]
+    pub async fn ordered_as(
+        &self,
+        index: &str,
+        by: &pstore_query::OrderBy,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+    ) -> Result<Ordered, EngineError> {
+        let mut settle: Option<(Head, Option<Vec<LaneId>>)> = None;
         let (refs, targets, unfolded, shadow) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
@@ -2697,8 +2846,9 @@ impl<S: BlobStore> Engine<S> {
                 (refs, targets, Vec::new(), std::collections::HashSet::new())
             }
             None => {
-                let (at, fresh) = self.head_and_fresh(index).await?;
+                let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
                 self.remember_schemas(&at.head);
+                settle = Some((at.head.clone(), lanes));
                 let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
                 let targets = segment_targets(&refs, &at.head.deletes, true);
                 let (rows, shadow) = fresh.map_or_else(
@@ -2709,9 +2859,20 @@ impl<S: BlobStore> Engine<S> {
             }
         };
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
-        pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector)
-            .await
-            .map_err(|e| EngineError::Query(e.to_string()))?;
+        let (selected, settled) = futures_util::future::join(
+            pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
+            async {
+                match &settle {
+                    Some((head, lanes)) => self.settled(head, lanes.as_deref()).await,
+                    None => Ok(true),
+                }
+            },
+        )
+        .await;
+        selected.map_err(|e| EngineError::Query(e.to_string()))?;
+        if !settled? {
+            return Err(EngineError::NotFolded);
+        }
         // As a relevance query decides it: segments, or unfolded rows that are not deletes. An
         // index only unfolded deletes ever touched does not exist (code review).
         let exists = !refs.is_empty() || !unfolded.is_empty();
