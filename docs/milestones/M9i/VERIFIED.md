@@ -68,7 +68,10 @@ All in `cargo test -p pstore-server --test consistency`. Every test in the file 
 3. **Own lane** — `the_own_lane_is_probed_past_what_this_process_holds`: served, not refused,
    at exactly 3 more reads than `eventual`, one registry GET and two probes. Seen red with the
    own lane probed at its watermark rather than `next`.
-4. **A dead writer's lane** — `a_dead_writers_lane_is_not_trusted_after_a_restart`.
+4. **A dead writer's lane** — `a_dead_writers_lane_is_not_trusted_after_a_restart`. The folded
+   bundle 0 is reaped first, so only a probe at the watermark, not at the restarted engine's
+   `next` of 0, finds the unfolded bundle (code review). Seen red with `max(watermark, next)`
+   replaced by `next`, which cargo-mutants cannot generate.
 5. **Depth** — `strong_costs_no_extra_round_trip`: three lanes, folded segments, a filtered
    relevance query and a `rank_by` order. `strong`'s depth is at most `eventual`'s, which
    measured 4 for the filtered query; the probes overlap it and measured 3. With the probes
@@ -84,7 +87,12 @@ All in `cargo test -p pstore-server --test consistency`. Every test in the file 
 10. **Reported** — `each_sub_query_reports_its_level`, and the `meta.consistency` assertions
     in 1 and 2.
 11. **Docs** — `the_research_is_corrected_where_it_promised_otherwise`.
-12. **Gates** — the mutation sweep over M9h.3, M9i.1 and M9i.2 runs one source file at a time,
+12. **Gates** — code review: one round, pass, with four minors:
+    - the `max` test in 4, taken;
+    - the engine also refusing `strong` with `as_of`, taken;
+    - no HEAD clone for an `eventual` order, taken;
+    - a failed requested fold keeping its mark, untested and left as a minor.
+    The mutation sweep over M9h.3, M9i.1 and M9i.2 runs one source file at a time,
     each shard committed under [`sweep/`](sweep/) as it finishes, because container restarts
     killed three whole-diff runs. Its result is recorded here before this lands on `main`.
     `./scripts/gates.sh` on this tree: see the commit.

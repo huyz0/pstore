@@ -347,6 +347,16 @@ async fn the_own_lane_is_probed_past_what_this_process_holds() {
 async fn a_dead_writers_lane_is_not_trusted_after_a_restart() {
     let w = world(&[1]);
     one_unfolded(&w, 104).await;
+    // GC has reaped the folded bundle 0: only a probe at the watermark, not at the restarted
+    // engine's `next` of 0, can find the unfolded bundle 1 (code review).
+    w.switch
+        .inner
+        .delete_batch(&[Key::new(format!(
+            "{:04x}/wal/104/{:016x}/{:016}.bundle",
+            104, 1, 0
+        ))])
+        .await
+        .unwrap();
     // A second process on lane 1, holding nothing: a restart.
     let again = Api::new(w.stores[0].clone(), LaneId(1)).unwrap();
     let (s, _, body) = query(&again, 104, &relevance(Some("strong"))).await;

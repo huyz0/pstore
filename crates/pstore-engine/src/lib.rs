@@ -2835,7 +2835,13 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
-        let mut settle: Option<(Head, Option<Vec<LaneId>>)> = None;
+        // A past epoch is what it is (M9i.2): a strong read of one would check nothing.
+        if as_of.is_some() && consistency == Consistency::Strong {
+            return Err(EngineError::Query(
+                "strong with as_of: a past epoch is already exactly what it is".to_owned(),
+            ));
+        }
+        let mut settle: Option<(Head, Vec<LaneId>)> = None;
         let (refs, targets, unfolded, shadow) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
@@ -2848,7 +2854,10 @@ impl<S: BlobStore> Engine<S> {
             None => {
                 let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
                 self.remember_schemas(&at.head);
-                settle = Some((at.head.clone(), lanes));
+                // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
+                if let Some(lanes) = lanes {
+                    settle = Some((at.head.clone(), lanes));
+                }
                 let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
                 let targets = segment_targets(&refs, &at.head.deletes, true);
                 let (rows, shadow) = fresh.map_or_else(
@@ -2863,7 +2872,7 @@ impl<S: BlobStore> Engine<S> {
             pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
             async {
                 match &settle {
-                    Some((head, lanes)) => self.settled(head, lanes.as_deref()).await,
+                    Some((head, lanes)) => self.settled(head, Some(lanes)).await,
                     None => Ok(true),
                 }
             },
