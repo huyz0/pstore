@@ -244,6 +244,9 @@ async fn another_process_sees_a_durable_write_with_no_admin_call() {
     let (a, b) = (&w.apis[0], &w.apis[1]);
     write(a, 11, &["x"], true).await;
     assert!(found(b, 11).await.is_empty(), "visible before any fold");
+    // A query through the writer prunes at the watermark it reads; the live batch's stamp
+    // must survive it (mutation sweep: `>=` flipped in `prune` dropped it, and nothing was due).
+    assert_eq!(found(a, 11).await, ["x"]);
     let tick = a.fold_due(&policy(NOW, MIB)).await;
     assert_eq!(tick.folded, 1, "{tick:?}");
     assert_eq!(found(b, 11).await, ["x"]);
