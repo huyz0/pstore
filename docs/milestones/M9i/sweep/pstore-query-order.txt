@@ -1,0 +1,3 @@
+# crates/pstore-query/src/order.rs  (git diff 25e43b5..b01d3fb, exit 0)
+Found 9 mutants to test
+9 mutants tested in 11m: 7 caught, 2 unviable
