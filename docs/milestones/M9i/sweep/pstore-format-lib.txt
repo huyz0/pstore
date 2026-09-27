@@ -1,0 +1,3 @@
+# crates/pstore-format/src/lib.rs  (git diff 25e43b5..d06e2e0, exit 0)
+Found 9 mutants to test
+9 mutants tested in 9m: 7 caught, 2 unviable
