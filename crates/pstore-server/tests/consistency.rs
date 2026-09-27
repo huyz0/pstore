@@ -458,10 +458,17 @@ async fn each_sub_query_reports_its_level() {
     let w = world(&[1]);
     let a = &w.apis[0];
     write(a, 109, "x").await;
-    let multi = json!({"queries": [relevance(None), relevance(Some("strong"))]});
+    let multi = json!({"queries": [
+        relevance(None),
+        relevance(Some("strong")),
+        relevance(Some("eventual"))
+    ]});
     let (s, _, b) = query(a, 109, &multi).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    assert_eq!(b["meta"]["consistencies"], json!(["eventual", "strong"]));
+    assert_eq!(
+        b["meta"]["consistencies"],
+        json!(["eventual", "strong", "eventual"])
+    );
 }
 
 #[test]

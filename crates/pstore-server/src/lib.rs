@@ -308,9 +308,12 @@ impl<S: BlobStore + 'static> Api<S> {
                         .get(&tenant)
                         .map_or(policy.period, |(_, d)| d.saturating_mul(2))
                         .min(policy.age);
-                    // `checked_add`: an absurd configured age must not panic the loop dead.
+                    // `checked_add`: an absurd configured period or age must not panic the loop
+                    // dead. Past what an `Instant` holds, a decade is as good as forever.
                     let now = tokio::time::Instant::now();
-                    let until = now.checked_add(delay).unwrap_or(now + policy.period);
+                    let until = now
+                        .checked_add(delay)
+                        .unwrap_or_else(|| now + std::time::Duration::from_secs(10 * 365 * 86_400));
                     backoff.insert(tenant, (until, delay));
                 }
             }

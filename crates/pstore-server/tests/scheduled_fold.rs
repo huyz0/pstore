@@ -280,7 +280,9 @@ async fn a_tenant_with_nothing_to_fold_costs_no_request() {
     b.fold_due(&due).await;
     assert_eq!(found(b, 23).await, ["x", "y"]);
     let first = a.fold_due(&due).await;
-    assert!(first.folded + first.nothing <= 1, "{first:?}");
+    // B folded lane A's bundle too: A's fold finds nothing, and prunes (mutation sweep: the
+    // `nothing` count was never asserted).
+    assert_eq!((first.folded, first.nothing), (0, 1), "{first:?}");
     let before = w.requests(23);
     let second = a.fold_due(&due).await;
     assert_eq!(
@@ -524,6 +526,27 @@ async fn a_failing_fold_backs_off_and_recovers() {
         tokio::time::advance(p.period).await;
     }
     assert_eq!(folded, 1, "never recovered");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_absurd_period_backs_off_without_panicking() {
+    // Past what an `Instant` can hold, the deadline must not overflow (mutation sweep).
+    let w = world(1);
+    let a = &w.apis[0];
+    write(a, 63, &["x"], true).await;
+    *w.switch.fail.lock().unwrap() = Some("/tnt/63/HEAD".to_owned());
+    let p = FoldPolicy {
+        period: Duration::from_millis(u64::MAX),
+        age: Duration::from_millis(u64::MAX),
+        bytes: 1,
+    };
+    assert_eq!(a.fold_due(&p).await.failed, 1);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(
+        a.fold_due(&p).await.deferred,
+        1,
+        "a failed fold was retried at once"
+    );
 }
 
 #[tokio::test]
