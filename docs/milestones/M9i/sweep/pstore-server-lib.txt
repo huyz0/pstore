@@ -1,0 +1,6 @@
+# crates/pstore-server/src/lib.rs  (git diff 25e43b5..f746327, exit 2)
+Found 65 mutants to test
+MISSED   crates/pstore-server/src/lib.rs:302:38: replace += with *= in Api<S>::fold_tick in 9s build + 61s test
+MISSED   crates/pstore-server/src/lib.rs:313:70: replace + with - in Api<S>::fold_tick in 7s build + 64s test
+MISSED   crates/pstore-server/src/lib.rs:878:13: delete match arm Some("eventual") in level in 40s build + 63s test
+65 mutants tested in 35m: 3 missed, 46 caught, 16 unviable
