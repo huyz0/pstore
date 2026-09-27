@@ -112,11 +112,23 @@ async fn the_whole_flow_stays_inside_its_request_budget() {
         // its index refusable before it becomes durable. A schema read per flush would be a
         // request per write, which is the thing this assertion exists to protect: the
         // steady-state number below is unchanged at 1.
+        //
+        // ⚠️ **12 since M9j, not 4**: the first flush resumes the lane -- one window of 8
+        // parallel probes for its tail -- so a process restarted on its lane cannot overwrite
+        // what its predecessor wrote (BACKLOG row 39). Once per engine, like the schema read,
+        // which the resume now makes. Its depth is bounded too, and unchanged: HEAD, then the
+        // probes beside the registry's read, then a new lane's CAS, then the PUT. At most,
+        // because the counter merges rounds that overlap.
         assert_eq!(
             s.requests(),
-            if batch == 0 { 4 } else { 1 },
+            if batch == 0 { 12 } else { 1 },
             "a batch cost {} requests",
             s.requests()
+        );
+        assert!(
+            s.depth() <= if batch == 0 { 4 } else { 1 },
+            "depth {}",
+            s.depth()
         );
         e.fold().await.unwrap();
     }

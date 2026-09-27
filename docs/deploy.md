@@ -28,9 +28,14 @@ shape a precondition can have. An Azure backend is a design decision with its ow
 ## One lane per process
 
 `PSTORE_LANE` is required and never defaulted. WAL lanes are single-writer and dense: two
-processes writing one tenant on the same lane both start at sequence zero and overwrite each
-other's bundles — acknowledged, durable writes, gone, with no error. Nothing detects the
-collision. Give every server process a distinct lane and keep it stable across restarts.
+processes writing one tenant on the same lane **at the same time** overwrite each other's
+bundles — acknowledged, durable writes, gone, with no error. Nothing detects the collision.
+Give every server process a distinct lane and keep it stable across restarts.
+
+A restart on the same lane is safe, provided the old process has stopped (M9j). A process's
+first flush to a tenant resumes the lane where it ended: it reads HEAD's watermark for the
+lane, then probes forward from it, with no LIST. Those probes are the first flush's only
+extra cost, 8 parallel reads.
 
 ## Unscheduled duties
 

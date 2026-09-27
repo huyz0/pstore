@@ -97,9 +97,13 @@ async fn a_durable_write_costs_its_lane_registration_once_then_one_put() {
     // set, and HEAD for the index schemas. The schema read is what lets a row contradicting
     // its index be refused before it is durable -- without it the only remaining guard is the
     // fold, and a fold that refuses stops the tenant.
+    //
+    // ⚠️ **10 since M9j**: the first flush also resumes the lane, with one window of 8
+    // parallel probes for its tail, so a server restarted on its lane cannot overwrite what
+    // it wrote before (BACKLOG row 39). Still once per process; HEAD serves both.
     assert_eq!(
-        body["cost"]["blob_reads"], 2,
-        "first flush reads the lane set and the schemas"
+        body["cost"]["blob_reads"], 10,
+        "first flush reads the lane set, HEAD, and one window of probes"
     );
     assert_eq!(body["cost"]["blob_lists"], 0);
 

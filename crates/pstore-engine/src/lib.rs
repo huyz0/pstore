@@ -646,9 +646,10 @@ pub struct Engine<S> {
     tenant: TenantId,
     lane: LaneId,
     mem: Mutex<Memtable>,
-    /// Next sequence in this lane. Lanes are single-writer, so this needs no coordination
-    /// with anyone — which is the entire point of lanes.
-    seq: Mutex<Seq>,
+    /// Where this lane stands: `None` until the first flush resumes it (M9j). Lanes are
+    /// single-writer, so this needs no coordination with anyone — which is the entire point
+    /// of lanes.
+    seq: Mutex<Option<Resumed>>,
     /// What the last HEAD this process read said each index's rows must look like.
     ///
     /// ⚠️ **An early refusal, never a source of truth.** Another process may have folded
@@ -693,6 +694,21 @@ pub struct Engine<S> {
     /// write no postings. The merged segment would carry every row and no text index, with
     /// nothing reporting an error. `compact` takes the name from its inputs instead.
     text_field: String,
+}
+
+/// A lane as this engine resumed it (M9j, BACKLOG row 39).
+///
+/// ⚠️ **A lane outlives the process writing it.** `deploy.md` keeps `PSTORE_LANE` stable
+/// across restarts, so a process starting at sequence 0 overwrote bundles its predecessor
+/// had written -- folded ones, which no fold reads again, and unfolded ones, which destroyed
+/// acknowledged rows -- and `prune` then dropped its own batches as below the watermark.
+#[derive(Debug, Clone, Copy)]
+struct Resumed {
+    /// The tail found at the resume. Bundles below it and at or above HEAD's watermark are a
+    /// predecessor's: unfolded, and not in this memtable.
+    at: u64,
+    /// The next sequence to write.
+    next: Seq,
 }
 
 /// The ABA guard: a value that never repeats for two different commits.
@@ -753,7 +769,7 @@ impl<S: BlobStore> Engine<S> {
             tenant,
             lane,
             mem: Mutex::new(Memtable::default()),
-            seq: Mutex::new(Seq::ZERO),
+            seq: Mutex::new(None),
             schemas: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
@@ -1397,6 +1413,35 @@ impl<S: BlobStore> Engine<S> {
         self.mem().buffer(index, docs);
     }
 
+    /// Finds where this lane stands, once per engine, before its first bundle (M9j):
+    /// probing forward from `watermark`, this lane's in a HEAD the caller read **afresh**,
+    /// without LIST.
+    ///
+    /// ⚠️ Afresh, never cached: a stale watermark whose folded bundles `gc` has reaped would
+    /// stop the probe early, at sequences already folded.
+    ///
+    /// Registers the lane alongside the probes: a lane nobody can find is a lane whose writes
+    /// cannot be recovered, and the registration is what makes a successor able to discover
+    /// it without being told. Idempotent, so a restart costs one GET for it.
+    ///
+    /// ⚠️ Latched only on success: a failed probe or registration resumes nothing, and the
+    /// next flush retries all of it.
+    async fn resume(&self, watermark: u64) -> Result<Seq, EngineError> {
+        let (tail, ()) = futures_util::future::try_join(
+            lanes::tail(&*self.store, self.tenant, self.lane, watermark),
+            lanes::register(&*self.store, self.tenant, self.lane),
+        )
+        .await?;
+        *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Resumed {
+            at: tail,
+            next: Seq(tail),
+        });
+        Ok(Seq(tail))
+    }
+
     /// Writes everything buffered as **one bundle object**, whatever it covers.
     ///
     /// `RA = 1 W` for the batch, and for every index in it.
@@ -1414,15 +1459,6 @@ impl<S: BlobStore> Engine<S> {
     async fn flush_inner(&self, check: bool) -> Result<Option<Seq>, EngineError> {
         require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
-        // ⚠️ **Rung two, and the rung that makes the fold's drop path a race rather than a
-        // routine.** Nothing wrong may become durable, so the schema is read here — **once
-        // per process**, on the first flush, beside the lane registration that already reads.
-        // A read per flush would be a request per write, which is the cost model this design
-        // exists to protect.
-        if check && self.schemas_unseen() {
-            let at = head::read(&*self.store, self.tenant).await?;
-            self.remember_schemas(&at.head);
-        }
         // ⚠️ A SNAPSHOT, not a take (M9c.1, row 35): the rows stay in `pending`, visible,
         // while their bundle is written, and move only once it has landed. Writes arriving
         // meanwhile append behind them; flushes are serialized by `flushing`, so the rows this
@@ -1434,6 +1470,22 @@ impl<S: BlobStore> Engine<S> {
             }
             m.pending.clone()
         };
+        let lane = *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // ⚠️ **Rung two, and the rung that makes the fold's drop path a race rather than a
+        // routine.** Nothing wrong may become durable, so the schema is read here — **once
+        // per process**, on the first flush, in the read the lane's resume makes anyway. A
+        // read per flush would be a request per write, which is the cost model this design
+        // exists to protect.
+        let watermark = if lane.is_none() || (check && self.schemas_unseen()) {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+            self.watermark(&at.head)
+        } else {
+            0
+        };
         if check {
             let refusal = pending.iter().find_map(|(index, docs)| {
                 let schema = self.cached_schema(index)?;
@@ -1443,17 +1495,10 @@ impl<S: BlobStore> Engine<S> {
                 return Err(e);
             }
         }
-        let seq = *self
-            .seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Registered once, on the lane's first flush. A lane nobody can find is a lane whose
-        // writes cannot be recovered, and the registration is what makes a successor able to
-        // discover it without being told.
-        if seq == Seq::ZERO {
-            lanes::register(&*self.store, self.tenant, self.lane).await?;
-        }
+        let seq = match lane {
+            Some(l) => l.next,
+            None => self.resume(watermark).await?,
+        };
         // The one PUT. ⚠️ **On failure the sequence is not consumed, and this is load-bearing**
         // (OQ-91). A lane is recovered by probing forward from the last watermark until a key is
         // missing, so a lane must be DENSE: the first absent sequence is taken as the end.
@@ -1468,7 +1513,9 @@ impl<S: BlobStore> Engine<S> {
                 .seq
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *s = seq.next();
+            if let Some(l) = s.as_mut() {
+                l.next = seq.next();
+            }
         }
         // ⚠️ No generation bump (M9c.1): the flushed rows move from the front of `pending` to
         // the back of `durable`, and a fresh view is `durable` then `pending` -- the same rows in
@@ -2668,17 +2715,18 @@ impl<S: BlobStore> Engine<S> {
         let Some(lanes) = lanes else {
             return Ok(true);
         };
-        let next = self
+        let own = *self
             .seq
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let probes = lanes.iter().map(|lane| {
             let folded = head.watermarks.get(&lane.0).copied().unwrap_or(0);
-            let at = if *lane == self.lane {
-                folded.max(next)
-            } else {
-                folded
+            // Past this engine's own bundles, which its memtable holds -- but only once HEAD
+            // has folded everything a predecessor on this lane left below the resume point
+            // (M9j): those are in neither HEAD nor memory.
+            let at = match own {
+                Some(r) if *lane == self.lane && folded >= r.at => folded.max(r.next.0),
+                _ => folded,
             };
             let key = bundle_key(self.tenant, *lane, Seq(at));
             async move {

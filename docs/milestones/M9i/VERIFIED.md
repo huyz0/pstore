@@ -108,6 +108,7 @@ All in `cargo test -p pstore-server --test consistency`. Every test in the file 
     `./scripts/gates.sh` on this tree: see the commit.
 
 ⚠️ **Found at spec review, outside this task, and carried to BACKLOG:**
+- ⚠️ **Corrected by [M9j](../M9j/SPEC.md):** a restarted engine now resumes its lane at the tail.
 - A server restarted on its stable lane starts at sequence 0 and can overwrite its own unfolded
   bundles.
 - `meta.epoch` reports the process's last commit, not the HEAD it served.

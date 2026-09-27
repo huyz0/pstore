@@ -210,6 +210,7 @@ A query may carry `"consistency": "eventual"` or `"strong"`. A `null` or absent 
   - Preconditions, stated rather than implied:
     - A write is acknowledged only when its bundle is in the store, so `strong` is no stronger
       than the WAL.
+    - ⚠️ **Corrected by [M9j](../M9j/SPEC.md):** a restarted engine now resumes its lane at the tail.
     - The known restart defect (BACKLOG) means a restarted process can overwrite its own lane
       without `strong` seeing it.
     - GC must not reap a bundle folded after the query's HEAD read. That holds while at most
