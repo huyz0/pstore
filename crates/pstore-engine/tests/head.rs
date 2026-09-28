@@ -400,3 +400,41 @@ fn a_trigram_set_round_trips_with_and_without_full_text() {
         assert_eq!(Head::decode(&full).unwrap(), h, "{fts:?}");
     }
 }
+
+#[test]
+fn a_branched_set_round_trips_and_is_pruned_by_the_reap() {
+    // M16's trailing section follows M15.2's, so both earlier counts are written -- as 0 --
+    // whenever a branch is recorded, or the branch count would be read as a schema count.
+    let mut h = populated();
+    h.branched.insert("b1".to_owned(), 7);
+    h.branched.insert("b2".to_owned(), 12);
+    let full = h.encode();
+    assert_eq!(Head::decode(&full).unwrap(), h);
+    let plain = {
+        let mut p = h.clone();
+        p.branched.clear();
+        p.encode()
+    };
+    // The two zero counts end where a HEAD may end, and read as no branches; every other
+    // cut inside the new bytes is refused.
+    let (fts_end, trigram_end) = (plain.len() + 4, plain.len() + 8);
+    for cut in plain.len() + 1..full.len() {
+        match Head::decode(&full[..cut]) {
+            Ok(d) => {
+                assert!(
+                    [fts_end, trigram_end].contains(&cut),
+                    "cut at {cut} decoded"
+                );
+                assert!(d.branched.is_empty(), "cut at {cut}: {d:?}");
+            }
+            Err(_) => assert!(![fts_end, trigram_end].contains(&cut), "cut at {cut}"),
+        }
+    }
+    // Below the reap nothing is answerable, so "absent before" says nothing there.
+    h.record_reap(7);
+    assert_eq!(h.branched.keys().collect::<Vec<_>>(), ["b2"]);
+    h.record_reap(3);
+    assert_eq!(h.branched.len(), 1, "a lower horizon never restores");
+    h.record_reap(12);
+    assert!(h.branched.is_empty());
+}

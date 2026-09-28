@@ -57,6 +57,9 @@ pub enum EngineError {
     /// A segment could not be read.
     #[error("format error: {0}")]
     Format(String),
+    /// A request the engine will not carry out, and why (M16): a client's error.
+    #[error("{0}")]
+    Refused(String),
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
@@ -685,6 +688,8 @@ fn by_filter(
 /// One segment's rows as a fold reads them to supersede ids -- and, with vectors, to find the
 /// base versions deferred operations resolve against (M13).
 struct Prepared {
+    /// The key its delete vector is recorded under: `head::dv_ref` of the index and segment
+    /// (M16), which is what `supersede` writes and records.
     key: String,
     old: Option<String>,
     deleted: std::collections::HashSet<usize>,
@@ -2054,7 +2059,7 @@ impl<S: BlobStore> Engine<S> {
                     .filter_map(|r| head::key_epoch(&r.key))
                     .chain(
                         refs.iter()
-                            .filter_map(|r| at.head.deletes.get(&r.key))
+                            .filter_map(|r| at.head.deletes.get(&head::dv_ref(index, &r.key)))
                             .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
                     )
                     .max()
@@ -2064,7 +2069,11 @@ impl<S: BlobStore> Engine<S> {
                 documents: refs
                     .iter()
                     .map(|r| {
-                        let gone = at.head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
+                        let gone = at
+                            .head
+                            .deletes
+                            .get(&head::dv_ref(index, &r.key))
+                            .map_or(0, |(_, n)| *n);
                         u64::from(r.rows.saturating_sub(gone))
                     })
                     .sum(),
@@ -2374,6 +2383,145 @@ impl<S: BlobStore> Engine<S> {
         .await
     }
 
+    /// Makes `dest` a branch of `src` (M16): the same segments, the same schema, and a copy of
+    /// each delete vector under `dest`'s own key, committed as one HEAD CAS. Zero bytes of a
+    /// segment are copied, and from then on each index changes only itself.
+    ///
+    /// Holds `src`'s **folded** state at the commit: fold first to include unfolded writes.
+    ///
+    /// # Errors
+    /// [`EngineError::Refused`] for a name outside `[A-Za-z0-9_.-]{1,128}` or `.`/`..`, equal
+    /// names, a `src` that does not exist, or a `dest` that does or that GC's window still
+    /// remembers dropping; and as a commit fails.
+    pub async fn branch(&self, src: &str, dest: &str) -> Result<Epoch, EngineError> {
+        self.branch_inner(
+            src,
+            dest,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// [`Self::branch`], with `interfere` awaited between the first attempt's copies and its
+    /// commit, so a test can make that commit lose.
+    #[doc(hidden)]
+    pub async fn branch_with_interference_for_test(
+        &self,
+        src: &str,
+        dest: &str,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Epoch, EngineError> {
+        self.branch_inner(src, dest, Some(interfere)).await
+    }
+
+    async fn branch_inner(
+        &self,
+        src: &str,
+        dest: &str,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Epoch, EngineError> {
+        require_fencing(&*self.store)?;
+        let named = |n: &str| {
+            (1..=128).contains(&n.len())
+                && n != "."
+                && n != ".."
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        };
+        for n in [src, dest] {
+            if !named(n) {
+                return Err(EngineError::Refused(format!(
+                    "a branch's index name {n:?} must match [A-Za-z0-9_.-]{{1,128}} and not be \
+                     . or .."
+                )));
+            }
+        }
+        if src == dest {
+            return Err(EngineError::Refused(format!(
+                "an index cannot be branched from itself ({src:?})"
+            )));
+        }
+        let mut interfere = interfere;
+        // Copies this call wrote for an attempt that lost: buried, never leaked.
+        let mut stale: Vec<String> = Vec::new();
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            let Some(refs) = at.head.indexes.get(src).filter(|r| !r.is_empty()).cloned() else {
+                return Err(EngineError::Refused(format!(
+                    "the index {src:?} does not exist: nothing folded to branch from"
+                )));
+            };
+            // `dest` must not exist, as a drop decides existence, and must not be a name GC's
+            // window remembers dropping: its past would become unreadable.
+            let pending = {
+                let m = self.mem();
+                m.pending
+                    .get(dest)
+                    .into_iter()
+                    .flatten()
+                    .chain(m.durable_rows(dest))
+                    .any(|d| !is_rowless(d))
+            };
+            if at.head.indexes.contains_key(dest)
+                || at.head.schema_rejects.contains_key(dest)
+                || pending
+            {
+                return Err(EngineError::Refused(format!(
+                    "the index {dest:?} exists: a branch creates its index"
+                )));
+            }
+            if at.head.dropped.iter().any(|(n, _, _)| n == dest) {
+                return Err(EngineError::Refused(format!(
+                    "the index {dest:?} was dropped within GC's window, and a branch there \
+                     would hide its past; branch to another name, or after GC"
+                )));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            let mut copies = Vec::new();
+            for r in &refs {
+                let Some((from, rows)) = at.head.deletes.get(&head::dv_ref(src, &r.key)) else {
+                    continue;
+                };
+                let bytes = self.store.get(&Key::new(from.clone())).await?;
+                let to = head::dv_ref(dest, &r.key);
+                let key = head::dv_key(&to, next.epoch.0, self.lane.0);
+                self.store.put(&Key::new(key.clone()), bytes).await?;
+                copies.push(key.clone());
+                next.deletes.insert(to, (key, *rows));
+            }
+            next.indexes.insert(dest.to_owned(), refs);
+            if let Some(schema) = at.head.schemas.get(src) {
+                next.schemas.insert(dest.to_owned(), schema.clone());
+            }
+            next.branched.insert(dest.to_owned(), next.epoch.0);
+            // A lost attempt's copies were never live: buried under their own epochs, as a
+            // compaction buries its losers, so GC reaps them and `as_of` never finds them.
+            for k in &stale {
+                let born = head::dv_of(k).map_or(next.epoch.0, |(_, e)| e);
+                next.graveyard.entry(born).or_default().push(k.clone());
+            }
+            if let Some(f) = interfere.take() {
+                f.await;
+            }
+            match head::commit(&*self.store, self.tenant, &at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    return Ok(epoch);
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    stale.extend(copies);
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
     /// [`Self::delete_index`], with `interfere` awaited between the first attempt's reads and
     /// its commit, so a test can make another delete land first and force the retry.
     #[doc(hidden)]
@@ -2671,11 +2819,13 @@ impl<S: BlobStore> Engine<S> {
             // nothing due -- and the schema is kept in `dropped` for `as_of`.
             if let Some(x) = drop {
                 let grave = next.graveyard.entry(next.epoch.0).or_default();
+                // M16: its own vectors, and a marker for a segment it borrowed -- never the
+                // segment itself, which its owner may still name.
                 for r in next.indexes.remove(x).unwrap_or_default() {
-                    if let Some((dv, _)) = next.deletes.remove(&r.key) {
+                    if let Some((dv, _)) = next.deletes.remove(&head::dv_ref(x, &r.key)) {
                         grave.push(dv);
                     }
-                    grave.push(r.key);
+                    grave.push(head::burial(x, &r.key));
                 }
                 next.schema_rejects.remove(x);
                 if let Some(schema) = next.schemas.remove(x) {
@@ -2786,7 +2936,9 @@ impl<S: BlobStore> Engine<S> {
             .iter()
             .map(|r| async move {
                 let key = Key::new(r.key.clone());
-                let old = head.deletes.get(&r.key).map(|(k, _)| k.clone());
+                // M16: the vector as this index records it, scoped when it borrows the segment.
+                let dv = head::dv_ref(index, &r.key);
+                let old = head.deletes.get(&dv).map(|(k, _)| k.clone());
                 let (seg, before) =
                     futures_util::future::join(Segment::open(&*self.store, &key), async {
                         match &old {
@@ -2827,7 +2979,7 @@ impl<S: BlobStore> Engine<S> {
                     seg.rows_where(&*self.store, &key, |_| true).await?
                 };
                 Ok::<_, EngineError>(Prepared {
-                    key: r.key.clone(),
+                    key: dv,
                     old,
                     deleted,
                     rows,
@@ -2879,15 +3031,36 @@ impl<S: BlobStore> Engine<S> {
                 // And every delete vector HEAD names (M9c.2).
                 .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
                 .collect();
+            // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
+            // it is a burial of the segment.
+            let object = |k: &String| -> String {
+                match head::unscoped(k) {
+                    Some((segment, _)) if !k.ends_with(".dv") => segment.to_owned(),
+                    _ => k.clone(),
+                }
+            };
+            // ⚠️ **A key buried again inside the window waits for that burial** (M16, spec
+            // review B1): a segment shared by a branch is buried once by each index that lets
+            // it go, and reaping it at the first would take it from a reader of the second's
+            // past.
+            let later: std::collections::BTreeSet<String> = at
+                .head
+                .graveyard
+                .range(horizon.saturating_add(1)..)
+                .flat_map(|(_, keys)| keys.iter().map(object))
+                .collect();
             let doomed: Vec<Key> = due
                 .iter()
                 .filter_map(|e| at.head.graveyard.get(e))
                 .flatten()
+                .map(object)
                 // ⚠️ Checked against what HEAD names *now*, not against what it named when
                 // the key was buried. Cheap, and the one thing standing between a bug
                 // anywhere in the commit path and deleting live data.
-                .filter(|k| !live.contains(k.as_str()))
-                .map(|k| Key::new(k.clone()))
+                .filter(|k| !live.contains(k.as_str()) && !later.contains(k))
+                .collect::<std::collections::BTreeSet<String>>()
+                .into_iter()
+                .map(Key::new)
                 .collect();
             // ⚠️ And the sidecars beside each SEGMENT. The graveyard records segments and
             // bundles alike; a sidecar is reachable only by derivation from a segment, so one
@@ -3084,7 +3257,7 @@ impl<S: BlobStore> Engine<S> {
         // sealed before a delete and committed after it would resurrect the deleted row.
         let vectors: Vec<Option<(String, u32)>> = inputs
             .iter()
-            .map(|i| at.head.deletes.get(&i.key).cloned())
+            .map(|i| at.head.deletes.get(&head::dv_ref(index, &i.key)).cloned())
             .collect();
         let scanned = futures_util::future::try_join_all(
             opened
@@ -3178,7 +3351,7 @@ impl<S: BlobStore> Engine<S> {
             if inputs
                 .iter()
                 .zip(&vectors)
-                .any(|(i, dv)| at.head.deletes.get(&i.key) != dv.as_ref())
+                .any(|(i, dv)| at.head.deletes.get(&head::dv_ref(index, &i.key)) != dv.as_ref())
             {
                 return Ok(None);
             }
@@ -3188,7 +3361,7 @@ impl<S: BlobStore> Engine<S> {
             next.nonce = nonce_for(next.epoch, self.lane);
             // The inputs' delete vectors die with them: the merge already dropped their rows.
             for i in &inputs {
-                if let Some((dv, _)) = next.deletes.remove(&i.key) {
+                if let Some((dv, _)) = next.deletes.remove(&head::dv_ref(index, &i.key)) {
                     next.graveyard.entry(next.epoch.0).or_default().push(dv);
                 }
             }
@@ -3206,7 +3379,7 @@ impl<S: BlobStore> Engine<S> {
             next.graveyard
                 .entry(next.epoch.0)
                 .or_default()
-                .extend(inputs.iter().map(|i| i.key.clone()));
+                .extend(inputs.iter().map(|i| head::burial(index, &i.key)));
             // ⚠️ **Buried under ITS OWN key epoch, not this one.** The graveyard means "was
             // live, and stopped being referenced here"; a key that was never live has no such
             // epoch, and burying it at the committing one would put it straight back into the
@@ -3257,11 +3430,13 @@ impl<S: BlobStore> Engine<S> {
                 keys.iter().map(|k| Segment::open(&*self.store, k)),
             )
             .await?;
-            let scanned =
-                futures_util::future::try_join_all(opened.iter().zip(&keys).zip(&refs).map(
-                    |((seg, k), r)| self.live_rows(seg, k, at.head.deletes.get(&r.key), filter),
-                ))
-                .await?;
+            let scanned = futures_util::future::try_join_all(
+                opened.iter().zip(&keys).zip(&refs).map(|((seg, k), r)| {
+                    let dv = at.head.deletes.get(&head::dv_ref(index, &r.key));
+                    self.live_rows(seg, k, dv, filter)
+                }),
+            )
+            .await?;
             let mut out: Vec<Document> = scanned.into_iter().flatten().collect();
             let mut m = self.mem();
             if !m.prune(self.watermark(&at.head)) {
@@ -3597,7 +3772,7 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
         let refs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
-        let mut targets = segment_targets(&refs, &at.head.deletes, true);
+        let mut targets = segment_targets(index, &refs, &at.head.deletes, true);
         let unfolded_at = targets.len();
 
         // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
@@ -3912,7 +4087,7 @@ impl<S: BlobStore> Engine<S> {
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
         // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
         // unfolded rows are newer than any past epoch.
-        let targets = segment_targets(&refs, &then.deletes, false);
+        let targets = segment_targets(index, &refs, &then.deletes, false);
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -4196,13 +4371,16 @@ impl<S: BlobStore> Engine<S> {
             }
         };
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
-        let targets = segment_targets(&refs, &head.deletes, shadowed);
+        let targets = segment_targets(index, &refs, &head.deletes, shadowed);
         // Live rows by HEAD's arithmetic, as `index_stats` counts documents: each segment's
         // rows less its deleted ones (M9c.2). What the count fast path answers from (M12).
         let live = refs
             .iter()
             .map(|r| {
-                let gone = head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
+                let gone = head
+                    .deletes
+                    .get(&head::dv_ref(index, &r.key))
+                    .map_or(0, |(_, n)| *n);
                 u64::from(r.rows.saturating_sub(gone))
             })
             .sum();
@@ -4421,6 +4599,7 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
 
 /// Query targets for HEAD's segments, each with its delete vector (M9c.2).
 fn segment_targets(
+    index: &str,
     refs: &[SegmentRef],
     deletes: &BTreeMap<String, (String, u32)>,
     shadowed: bool,
@@ -4430,7 +4609,9 @@ fn segment_targets(
             let segment = Key::new(r.key.clone());
             pstore_query::Target {
                 centroids: pstore_index::vec_index::centroid_key(&segment),
-                deleted: deletes.get(&r.key).map(|(key, _)| Key::new(key.clone())),
+                deleted: deletes
+                    .get(&head::dv_ref(index, &r.key))
+                    .map(|(key, _)| Key::new(key.clone())),
                 shadowed,
                 segment,
             }

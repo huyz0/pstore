@@ -192,6 +192,9 @@ pub struct Head {
     /// schema)`. `as_of` an epoch before the drop scores by that schema's metric -- the present
     /// has none, or a recreated index's. Pruned when GC's horizon reaches the epoch.
     pub dropped: Vec<(String, u64, IndexSchema)>,
+    /// Each branch (M16), by the epoch it was made at: below it, the index did not exist.
+    /// Pruned when GC's horizon reaches it, as `dropped` is.
+    pub branched: BTreeMap<String, u64>,
 }
 
 /// Where a segment's delete vector written at `epoch` by `lane` lives (M9c): the segment's
@@ -211,6 +214,53 @@ pub(crate) fn dv_key(segment: &str, epoch: u64, lane: u64) -> String {
 }
 
 /// The segment and epoch a delete-vector key names, or `None` for any other key.
+/// The key `index`'s delete vector for `segment` is recorded under (M16): the segment's own
+/// key when the index owns it -- the index its path names -- and a scoped key when it borrows
+/// it from a branch's source. Every read, insert and removal of `Head::deletes` goes through
+/// this, so two indexes sharing a segment never share its deletes.
+#[must_use]
+pub(crate) fn dv_ref(index: &str, segment: &str) -> String {
+    if key_index(segment).as_deref() == Some(index) {
+        segment.to_owned()
+    } else {
+        scoped(index, segment)
+    }
+}
+
+/// `segment` as `index` borrows it: the key followed by `.br-` and the index name in hex, so
+/// it holds no dot of its own and `dv_of` still parses a vector key built on it.
+#[must_use]
+pub(crate) fn scoped(index: &str, segment: &str) -> String {
+    let hex: String = index.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{segment}.br-{hex}")
+}
+
+/// The segment and index a scoped key names, or `None` for any other key (M16). As a
+/// graveyard entry it is a **marker**: `index` stopped naming a borrowed `segment`.
+#[must_use]
+pub(crate) fn unscoped(key: &str) -> Option<(&str, String)> {
+    let (segment, hex) = key.rsplit_once(".br-")?;
+    if !segment.ends_with(".seg") || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect();
+    Some((segment, String::from_utf8(bytes?).ok()?))
+}
+
+/// What `index` buries when it stops naming `segment` (M16): the key when it owns it, and a
+/// marker when it borrowed it -- which names no object, and which GC reads as a burial of
+/// the segment.
+#[must_use]
+pub(crate) fn burial(index: &str, segment: &str) -> String {
+    dv_ref(index, segment)
+}
+
 pub(crate) fn dv_of(key: &str) -> Option<(&str, u64)> {
     let (segment, stamp) = key.strip_suffix(".dv")?.rsplit_once('.')?;
     let (epoch, _lane) = stamp.split_once('-')?;
@@ -327,14 +377,15 @@ impl Head {
             .collect();
         // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
         // one is -- otherwise the later count would be read as the earlier one's.
-        if !fts.is_empty() || !trigram.is_empty() {
+        if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in fts {
                 put_ref(&mut out, *kind, *at, *name);
                 put_str(&mut out, &s.fts.encode());
             }
         }
-        if !trigram.is_empty() {
+        // M16: and the trigram count before the branches, by the same rule.
+        if !trigram.is_empty() || !self.branched.is_empty() {
             out.extend_from_slice(&(trigram.len() as u32).to_le_bytes());
             for (kind, at, s, name) in trigram {
                 put_ref(&mut out, *kind, *at, *name);
@@ -342,6 +393,13 @@ impl Head {
                 for n in &s.trigram {
                     put_str(&mut out, n);
                 }
+            }
+        }
+        if !self.branched.is_empty() {
+            out.extend_from_slice(&(self.branched.len() as u32).to_le_bytes());
+            for (name, epoch) in &self.branched {
+                put_str(&mut out, name);
+                out.extend_from_slice(&epoch.to_le_bytes());
             }
         }
         out
@@ -506,6 +564,13 @@ impl Head {
             }
             schema.trigram = names;
         }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            h.branched.insert(name, c.u64()?);
+        }
         Ok(h)
     }
 
@@ -522,6 +587,9 @@ impl Head {
         // query can ask for it.
         self.dropped
             .retain(|(_, epoch, _)| *epoch > horizon.max(self.reaped_before));
+        // M16: below the horizon nothing is answerable, so "absent before" says nothing.
+        let floor = horizon.max(self.reaped_before);
+        self.branched.retain(|_, epoch| *epoch > floor);
         self.reaped_before = self.reaped_before.max(horizon);
     }
 
@@ -565,6 +633,19 @@ impl Head {
                 continue;
             }
             for key in keys {
+                // M16: a marker is a borrowed segment its branch stopped naming, and belongs
+                // to the branch -- not to the index its path names.
+                if let Some((segment, index)) = unscoped(key)
+                    && !key.ends_with(".dv")
+                {
+                    if key_epoch(segment).is_some_and(|born| born <= epoch.0) {
+                        out.indexes.entry(index).or_default().push(SegmentRef {
+                            key: segment.to_owned(),
+                            rows: 0,
+                        });
+                    }
+                    continue;
+                }
                 // ⚠️ The graveyard holds **WAL bundles too**, and a bundle key ends in a
                 // 16-digit zero-padded *sequence number* sitting exactly where a loose parser
                 // would read an epoch. The index comes from the key's own path, so a bundle
@@ -580,9 +661,14 @@ impl Head {
                 }
             }
         }
-        out.indexes.retain(|_, refs| !refs.is_empty());
+        // M16: a branch did not exist below the epoch it was made at.
+        out.indexes.retain(|name, refs| {
+            !refs.is_empty() && self.branched.get(name).is_none_or(|b| *b <= epoch.0)
+        });
         for refs in out.indexes.values_mut() {
             refs.sort_by(|a, b| a.key.cmp(&b.key));
+            // A segment two burials resurrect is one segment.
+            refs.dedup_by(|a, b| a.key == b.key);
         }
         // ⚠️ **Each segment's delete vector as it stood at the epoch** (M9c): the one written at
         // or before it -- the current one, or one buried after it. The present's vector applied
@@ -610,11 +696,11 @@ impl Head {
                 consider(key, 0);
             }
         }
-        let live: std::collections::BTreeSet<&str> = out
+        // M16: live as each index records its vectors -- a borrowed segment's scoped.
+        let live: std::collections::BTreeSet<String> = out
             .indexes
-            .values()
-            .flatten()
-            .map(|r| r.key.as_str())
+            .iter()
+            .flat_map(|(index, refs)| refs.iter().map(move |r| dv_ref(index, &r.key)))
             .collect();
         out.deletes = best
             .into_iter()

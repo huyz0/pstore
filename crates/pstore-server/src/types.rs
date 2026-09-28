@@ -104,6 +104,14 @@ pub struct WriteRequest {
     /// fold admits the filter (M13.2), before `delete_by_filter`.
     #[serde(default)]
     pub patch_by_filter: Option<serde_json::Value>,
+    /// Makes this index a branch of the one named (M16): its folded state at the commit, sharing
+    /// every segment. **Alone** in its request.
+    #[serde(default)]
+    pub branch_from_namespace: Option<String>,
+    /// The same operation as `branch_from_namespace` (M16): segments are immutable, so a
+    /// physical copy would buy nothing a branch does not.
+    #[serde(default)]
+    pub copy_from_namespace: Option<String>,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.

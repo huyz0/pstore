@@ -506,6 +506,8 @@ impl From<EngineError> for ApiError {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
+            // M16: the client asked for a branch the engine will not make.
+            EngineError::Refused(_) => Self::bad_request(e.to_string()),
             EngineError::BackendCannotFence { .. } => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
@@ -860,6 +862,9 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let req: WriteRequest = parse_write(&body)?;
+    if let Some(src) = branch_source(&req, &body)? {
+        return branch_index(&api, tenant, token, src, &index).await;
+    }
     let dated = declared_datetimes(&req)?;
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
@@ -1013,6 +1018,62 @@ async fn write_documents<S: BlobStore + 'static>(
             documents_deleted: deleted,
             documents_patched: patched,
             durable,
+            cost: api.spend(tenant).since(before),
+            session: session.clone(),
+        }),
+        &session,
+    ))
+}
+
+/// The index a write asks to branch from (M16), if it asks -- refused unless the request says
+/// nothing else, since a branch beside a batch, a schema or a durability would have to mean an
+/// order or a promise the branch does not make.
+fn branch_source<'a>(req: &'a WriteRequest, body: &[u8]) -> Result<Option<&'a str>, ApiError> {
+    let src = match (&req.branch_from_namespace, &req.copy_from_namespace) {
+        (None, None) => return Ok(None),
+        (Some(s), None) | (None, Some(s)) => s.as_str(),
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "branch_from_namespace and copy_from_namespace are one operation, and must come \
+                 alone: name one",
+            ));
+        }
+    };
+    // ⚠️ Counted on the raw body: `durability` has a default, so the parsed request cannot
+    // tell a stated one from an absent one.
+    let raw: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
+    if raw.as_object().is_none_or(|o| o.len() != 1) {
+        return Err(ApiError::bad_request(
+            "a branch must come alone: no documents, patches, deletes, conditions, schema, \
+             distance_metric or durability beside it",
+        ));
+    }
+    Ok(Some(src))
+}
+
+/// A write that branches `dest` from `src` (M16): the tenant folded first, so the branch holds
+/// every acknowledged durable write, then one commit.
+async fn branch_index<S: BlobStore + 'static>(
+    api: &Arc<Api<S>>,
+    tenant: TenantId,
+    mut token: session::Token,
+    src: &str,
+    dest: &str,
+) -> Result<Response, ApiError> {
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    engine.fold().await?;
+    let epoch = engine.branch(src, dest).await?;
+    token.saw(epoch.0);
+    let session = token.encode();
+    Ok(with_session(
+        axum::Json(WriteResponse {
+            epoch: epoch.0,
+            documents_written: 0,
+            documents_deleted: 0,
+            documents_patched: 0,
+            durable: true,
             cost: api.spend(tenant).since(before),
             session: session.clone(),
         }),

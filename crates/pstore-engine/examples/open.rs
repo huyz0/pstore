@@ -197,6 +197,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 reaped_before: 0,
                 deletes: Default::default(),
                 dropped: Default::default(),
+                branched: Default::default(),
             };
             store
                 .put(
