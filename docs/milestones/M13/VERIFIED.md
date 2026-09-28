@@ -79,4 +79,54 @@ hand mutation, as named below. So were the tests added at code review.
 
    A condition that nests too deeply to reach the fold is also refused (code review). With
    the fix removed by hand, it failed. So did the `patch_columns` vector case.
-8. **Gates** — NOT-RUN yet: the mutation sweep over the M13.1 diff and code review round 2 are running; this line is replaced with their results.
+8. **Gates**, with M13.2's.
+   - `./scripts/mutants.sh --check . --in-diff <3286f4e's source diff from 835ff94>` (the
+     whole of M13): **190 tested in 3h, 157 caught, 23 unviable, 10 missed.** The sweep ran
+     on `3286f4e`, before M13.2's review fixes, and each miss was re-run by hand against the
+     tree of `6b7f8bc`:
+     - `||` → `&&` in `patch_attrs`: killed by `a_patch_of_a_reserved_name_is_refused`,
+       which covers the engine's own door; the API's door had hidden it.
+     - Array guard → `true`, depth `>` → `==` and `>=`, and depth `+` → `*` in
+       `condition.rs`: killed by `anything_else_is_none` (`cargo test -p pstore-query --lib
+       condition`), with a nested array, a predicate exactly `MAX_DEPTH` deep, and a deep
+       `And`.
+     - `==` → `!=` for a patch's `vector` key: killed by `what_a_patch_cannot_mean_is_refused`,
+       which now tells "carries no vector" from "unknown field".
+     - Both `||` → `&&` in `patch_of`'s reserved check: killed by
+       `what_a_by_filter_operation_cannot_mean_is_refused` (the `$x: null` case, added at code
+       review).
+     - `||` → `&&` in the durable-only rule: every clause is killed, by
+       `what_a_patch_cannot_mean_is_refused` (conditional upserts and deletes) and
+       `what_a_by_filter_operation_cannot_mean_is_refused` (both by-filter kinds).
+     - ⚠️ `&&` → `||` in the fold's `needed` is **equivalent**. It enlarges `needed` with the
+       ids of plain operations, and with the empty id of a by-filter one.
+       - An enlarged `keep` only holds more rows in memory.
+       - An extra base row is either an id this fold's own operations already hold in their
+         state, which wins, or a row no filter admits.
+   - M13.2's review fixes (`97cbb7f`) landed after that sweep started. They are swept with
+     M14's diff, and recorded in [M14's ledger](../M14/VERIFIED.md).
+   - Spec review: two rounds. Code review: M13.1 two rounds (the second passed with three
+     minors, fixed); M13.2 one round, which passed with six minors, all fixed.
+   - `./scripts/gates.sh`: see the line added when it ran, below.
+
+## M13.2 — `delete_by_filter` and `patch_by_filter`
+
+Tests are in `cargo test -p pstore-server --test patch_by_filter`. **Observed red:** all five
+first-written tests failed on the tree without M13.2's source: four on "a write with no
+documents, patches or deletes", and the refusal test because no message named a filter.
+
+1. `a_delete_by_filter_deletes_exactly_what_it_admits` and
+   `a_patch_by_filter_merges_into_exactly_what_it_admits`: 2,000 rows in 4 folds against the
+   model.
+2. `a_by_filter_operation_sees_this_folds_earlier_operations`: a row made to match is deleted,
+   and one patched out of matching is kept.
+   - `a_by_filter_operation_never_revives_a_row_deleted_earlier_in_its_fold` and
+     `one_request_patches_by_filter_then_deletes_by_filter` came from code review.
+   - `a_by_filter_operation_judges_whole_rows_not_the_ids_a_fold_keeps` (engine) failed with
+     the base re-judged over id-only rows, and with `keep` ignoring filters.
+3. `a_by_filter_operation_is_invisible_until_its_fold`, on the writer and on another process.
+4. `what_a_by_filter_operation_cannot_mean_is_refused`: a malformed filter, missing or extra
+   keys, reserved and non-storable attributes, and both kinds batched.
+   `a_by_filter_filter_the_fold_cannot_read_is_refused_at_the_call` (engine) covers the depth.
+5. **Gates** — as M13.1's line 8, where `./scripts/mutants.sh` and each hand re-run of its
+   misses are enumerated.
