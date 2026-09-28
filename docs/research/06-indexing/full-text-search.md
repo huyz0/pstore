@@ -184,6 +184,11 @@ frequencies, so the same posting-list machinery serves them.
 
 - **Trigram index** for regex/glob (turbopuffer offers this) — a second inverted index over
   character trigrams, same machinery.
+
+  > ⚠️ **Corrected (M15):** not an inverted index. Answering with rows needs a postings fetch
+  > between the open and the block reads, a round no other filter pays (M9b: a filter adds no
+  > round). M15 prunes **blocks** instead, with a per-block trigram Bloom sketch in the index
+  > section the open round already reads. See [`M15/SPEC.md`](../../milestones/M15/SPEC.md).
 - **Phrase queries / positions** — an optional positions section, fetched only for phrase
   queries. Keep it in its own section so it is never fetched otherwise.
 - **Tokenization/analysis** — language-aware; Tantivy provides this. Stored in the schema, in
