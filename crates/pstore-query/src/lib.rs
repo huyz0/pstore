@@ -13,6 +13,7 @@
 //! free, depth is not.
 
 mod aggregate;
+pub mod condition;
 pub mod deletes;
 mod filter;
 mod fuse;

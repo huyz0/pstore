@@ -404,6 +404,148 @@ fn is_tombstone(d: &Document) -> bool {
     d.attrs.contains_key(TOMBSTONE)
 }
 
+/// The reserved attribute naming a **deferred** operation's kind (M13): one resolved at the
+/// fold, against the version the fold's order puts before it. `$`-names are refused at the
+/// door, so no client can forge one.
+const OP_ATTR: &str = "$op";
+/// A deferred operation's condition, as [`pstore_query::condition::encode`] writes it.
+const COND_ATTR: &str = "$cond";
+/// The attributes a patch removes, as an array of their names.
+const UNSET_ATTR: &str = "$unset";
+/// A patch: set and remove some attributes of the current version, if there is one.
+const OP_PATCH: i64 = 1;
+/// An upsert applied only if the current version, when there is one, admits the condition.
+const OP_COND_UPSERT: i64 = 2;
+/// A delete applied only if the current version admits the condition.
+const OP_COND_DELETE: i64 = 3;
+
+fn op_code(d: &Document) -> Option<i64> {
+    match d.attrs.get(OP_ATTR) {
+        Some(pstore_format::Value::Int(c)) => Some(*c),
+        _ => None,
+    }
+}
+
+/// Whether an operation is deferred to the fold (M13): invisible to every read until then.
+fn is_deferred(d: &Document) -> bool {
+    d.attrs.contains_key(OP_ATTR)
+}
+
+/// Whether an operation carries no full row -- a delete, conditional or not, or a patch -- so
+/// nothing about it can say what width, metric or text an index has.
+fn is_rowless(d: &Document) -> bool {
+    is_tombstone(d) || op_code(d) == Some(OP_PATCH)
+}
+
+/// A deferred operation's condition: `Some(None)` for none, `None` for one that cannot be
+/// read -- which admits nothing, so an operation it guards is skipped rather than applied.
+fn condition_of(d: &Document) -> Option<Option<pstore_query::Predicate>> {
+    match d.attrs.get(COND_ATTR) {
+        None => Some(None),
+        Some(pstore_format::Value::Str(s)) => pstore_query::condition::decode(s).map(Some),
+        Some(_) => None,
+    }
+}
+
+/// The operation without its deferral markers: what is sealed.
+fn cleaned(mut d: Document) -> Document {
+    d.attrs.remove(OP_ATTR);
+    d.attrs.remove(COND_ATTR);
+    d.attrs.remove(UNSET_ATTR);
+    d
+}
+
+/// `base` with `patch` applied: its attributes set, its `$unset` names removed, and the base's
+/// vectors -- dense and sparse, already stored under the index's metric -- kept untouched.
+fn merged(mut base: Document, patch: &Document) -> Document {
+    for (k, v) in &patch.attrs {
+        if !k.starts_with('$') {
+            base.attrs.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(pstore_format::Value::Array(names)) = patch.attrs.get(UNSET_ATTR) {
+        for n in names {
+            if let pstore_format::Value::Str(n) = n {
+                base.attrs.remove(n);
+            }
+        }
+    }
+    base
+}
+
+/// Applies an index's operations **in fold order** over `base`, the current versions of the
+/// ids deferred operations name (M13). Returns every id whose version changed, in first-touch
+/// order, and the versions to seal.
+///
+/// ⚠️ **A delete is an entry meaning "no version"**, not an absent entry: a patch after it
+/// must not fall back to `base` and bring the row back (spec review, M2). And a skipped
+/// operation -- a refused condition, a patch of nothing -- is no entry at all, so it touches
+/// nothing: the id's segment row and delete vector stay as they are.
+fn resolve(
+    ops: Vec<Document>,
+    base: &std::collections::HashMap<String, Document>,
+) -> (Vec<String>, Vec<Document>) {
+    let mut state: std::collections::HashMap<String, Option<Document>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for op in ops {
+        let id = op.id.clone();
+        let current = match state.get(&id) {
+            Some(v) => v.clone(),
+            None => base.get(&id).cloned(),
+        };
+        let cond = condition_of(&op);
+        let admits = |cur: &Document| match &cond {
+            Some(None) => true,
+            Some(Some(p)) => p.admits(&cur.id, &cur.attrs),
+            None => false,
+        };
+        let next: Option<Option<Document>> = match op_code(&op) {
+            None if is_tombstone(&op) => Some(None),
+            None => Some(Some(op)),
+            Some(OP_PATCH) => current.filter(&admits).map(|c| Some(merged(c, &op))),
+            Some(OP_COND_UPSERT) => current
+                .as_ref()
+                .is_none_or(&admits)
+                .then(|| Some(cleaned(op))),
+            Some(OP_COND_DELETE) => current.filter(admits).map(|_| None),
+            // A kind this build does not know is skipped, never applied as something else.
+            Some(_) => None,
+        };
+        if let Some(v) = next {
+            if !state.contains_key(&id) {
+                order.push(id.clone());
+            }
+            state.insert(id, v);
+        }
+    }
+    let sealed = order
+        .iter()
+        .filter_map(|id| state.get(id).cloned().flatten())
+        .collect();
+    (order, sealed)
+}
+
+/// One segment's rows as a fold reads them to supersede ids -- and, with vectors, to find the
+/// base versions deferred operations resolve against (M13).
+struct Prepared {
+    key: String,
+    old: Option<String>,
+    deleted: std::collections::HashSet<usize>,
+    rows: Vec<(usize, Document)>,
+}
+
+/// A patch of one row (M13): attributes to set, and names to remove.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Patch {
+    /// The row.
+    pub id: String,
+    /// Attributes set, replacing any value they had.
+    pub set: BTreeMap<String, pstore_format::Value>,
+    /// Attributes removed.
+    pub unset: Vec<String>,
+}
+
 /// The reserved attribute a row carries its metric in, from the write to the fold (M9d).
 /// Stripped before anything is sealed; absent means `dot_product`.
 const METRIC_ATTR: &str = "$metric";
@@ -936,8 +1078,8 @@ impl<S: BlobStore> Engine<S> {
     /// ⚠️ The metric too (M9d), from the same first row: the schema a fold creates is recorded
     /// BEFORE its reject pass, so the other rows are checked against it.
     fn implied(&self, docs: &[Document]) -> head::IndexSchema {
-        let first = docs.iter().find(|d| !is_tombstone(d));
-        let has_text = docs.iter().any(|d| self.carries_text(d));
+        let first = docs.iter().find(|d| !is_rowless(d));
+        let has_text = docs.iter().any(|d| !is_rowless(d) && self.carries_text(d));
         head::IndexSchema {
             dims: first.map_or(0, |d| d.vector().len() as u32),
             text_field: if has_text {
@@ -968,8 +1110,9 @@ impl<S: BlobStore> Engine<S> {
         schema: &head::IndexSchema,
         doc: &Document,
     ) -> Option<EngineError> {
-        // A tombstone has no vector and no text: nothing about it can contradict a schema.
-        if is_tombstone(doc) {
+        // A tombstone, or a patch (M13), has no vector: nothing about it can contradict a
+        // schema. A conditional upsert is a full row and is checked as any upsert is.
+        if is_rowless(doc) {
             return None;
         }
         // The metric first (M9d): cosine and dot have one width, so only this tells them apart.
@@ -1163,6 +1306,112 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
     ) -> Result<(), EngineError> {
+        self.write_marked(index, docs, metric, None).await
+    }
+
+    /// [`Self::write_as`], applied at the fold only if each row's current version, when it has
+    /// one, admits `cond` (M13): a conditional upsert, checked at the door and the fold as any
+    /// upsert is, and invisible until the fold that decides it.
+    ///
+    /// # Errors
+    /// As [`Self::write_as`].
+    pub async fn write_if(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+        cond: &pstore_query::Predicate,
+    ) -> Result<(), EngineError> {
+        let mark = pstore_query::condition::encode(cond);
+        self.write_marked(index, docs, metric, Some(mark)).await
+    }
+
+    /// Patches rows at the fold (M13): each sets and removes attributes of its id's current
+    /// version -- if `cond`, when given, admits it -- and a patch of an id with no version is
+    /// ignored. Invisible until that fold.
+    ///
+    /// # Errors
+    /// An attribute name that is empty or begins `$`, which are reserved.
+    pub async fn patch(
+        &self,
+        index: &str,
+        patches: Vec<Patch>,
+        cond: Option<&pstore_query::Predicate>,
+    ) -> Result<(), EngineError> {
+        let cond = cond.map(pstore_query::condition::encode);
+        let mut ops = Vec::with_capacity(patches.len());
+        for p in patches {
+            if let Some(name) = p
+                .set
+                .keys()
+                .chain(&p.unset)
+                .find(|k| k.is_empty() || k.starts_with('$'))
+            {
+                return Err(EngineError::Format(format!(
+                    "patch of {}: attribute `{name}` is reserved",
+                    p.id
+                )));
+            }
+            let mut attrs = p.set;
+            attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
+            if !p.unset.is_empty() {
+                attrs.insert(
+                    UNSET_ATTR.to_owned(),
+                    pstore_format::Value::Array(
+                        p.unset.into_iter().map(pstore_format::Value::Str).collect(),
+                    ),
+                );
+            }
+            if let Some(c) = &cond {
+                attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
+            }
+            ops.push(Document {
+                id: p.id,
+                vectors: BTreeMap::new(),
+                attrs,
+            });
+        }
+        self.mem().buffer(index, ops);
+        Ok(())
+    }
+
+    /// Deletes `ids` at the fold only where the current version admits `cond` (M13).
+    ///
+    /// # Errors
+    /// None today; the signature matches [`Self::delete`]'s.
+    pub async fn delete_if(
+        &self,
+        index: &str,
+        ids: Vec<String>,
+        cond: &pstore_query::Predicate,
+    ) -> Result<(), EngineError> {
+        let mark = pstore_query::condition::encode(cond);
+        let ops = ids
+            .into_iter()
+            .map(|id| {
+                let mut d = tombstone(id);
+                d.attrs.insert(
+                    OP_ATTR.to_owned(),
+                    pstore_format::Value::Int(OP_COND_DELETE),
+                );
+                d.attrs.insert(
+                    COND_ATTR.to_owned(),
+                    pstore_format::Value::Str(mark.clone()),
+                );
+                d
+            })
+            .collect();
+        self.mem().buffer(index, ops);
+        Ok(())
+    }
+
+    async fn write_marked(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+        mark: Option<String>,
+    ) -> Result<(), EngineError> {
         let mut docs = docs;
         for d in &mut docs {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
@@ -1185,6 +1434,14 @@ impl<S: BlobStore> Engine<S> {
                     METRIC_ATTR.to_owned(),
                     pstore_format::Value::Int(metric.code()),
                 );
+            }
+            if let Some(c) = &mark {
+                d.attrs.insert(
+                    OP_ATTR.to_owned(),
+                    pstore_format::Value::Int(OP_COND_UPSERT),
+                );
+                d.attrs
+                    .insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
             }
         }
         // ⚠️ Refused at the DOOR, not at the fold. The document model expresses named,
@@ -1267,8 +1524,8 @@ impl<S: BlobStore> Engine<S> {
             .into_iter()
             .flatten()
             .chain(m.durable_rows(index))
-            .find(|d| !is_tombstone(d))
-            .or_else(|| docs.first())
+            .find(|d| !is_rowless(d))
+            .or_else(|| docs.iter().find(|d| !is_rowless(d)))
             .map(|d| (metric_of(d), d.vector().len()));
         // ⚠️ And one metric (M9d), on the same rung: cosine and dot have one width.
         if let Some((known_metric, _)) = known
@@ -1783,7 +2040,7 @@ impl<S: BlobStore> Engine<S> {
             // nothing. Rows that are all deletes do not make an index exist, as queries decide.
             if let Some(x) = drop {
                 let rows = |docs: Option<&Vec<Document>>| {
-                    docs.is_some_and(|d| d.iter().any(|d| !is_tombstone(d)))
+                    docs.is_some_and(|d| d.iter().any(|d| !is_rowless(d)))
                 };
                 // A schema is only ever recorded beside a segment list, so `schemas` adds nothing
                 // (mutation sweep); a reject count is NOT -- a fold can count a rejected row of an
@@ -1849,12 +2106,46 @@ impl<S: BlobStore> Engine<S> {
             // it. Every id this fold touches supersedes that id in the index's existing
             // segments; only the upserts are sealed.
             let mut touched: BTreeMap<String, std::collections::HashSet<String>> = BTreeMap::new();
+            let mut deferred: Vec<String> = Vec::new();
             for (idx, docs) in &mut by_index {
+                if docs.iter().any(is_deferred) {
+                    deferred.push(idx.clone());
+                    continue;
+                }
                 touched.insert(idx.clone(), docs.iter().map(|d| d.id.clone()).collect());
                 *docs = newest(std::mem::take(docs))
                     .into_iter()
                     .filter(|d| !is_tombstone(d))
                     .collect();
+            }
+            // ⚠️ **Deferred operations resolve here** (M13), in fold order, against the current
+            // versions: read with vectors by ONE pass over the index's segments, which the
+            // supersede below reuses rather than reading again. Inside the commit loop, so a
+            // retry re-reads against the HEAD it read -- never a base cached across attempts.
+            let mut prepared_for: BTreeMap<String, Vec<Prepared>> = BTreeMap::new();
+            for idx in deferred {
+                let docs = by_index.remove(&idx).unwrap_or_default();
+                let needed: std::collections::HashSet<&str> = docs
+                    .iter()
+                    .filter(|d| is_deferred(d))
+                    .map(|d| d.id.as_str())
+                    .collect();
+                let prepared = self.prepare(&at.head, &idx, true).await?;
+                let base: std::collections::HashMap<String, Document> = prepared
+                    .iter()
+                    .flat_map(|p| {
+                        p.rows
+                            .iter()
+                            .filter(|(row, d)| {
+                                !p.deleted.contains(row) && needed.contains(d.id.as_str())
+                            })
+                            .map(|(_, d)| (d.id.clone(), d.clone()))
+                    })
+                    .collect();
+                let (changed, sealed) = resolve(docs, &base);
+                touched.insert(idx.clone(), changed.into_iter().collect());
+                by_index.insert(idx.clone(), sealed);
+                prepared_for.insert(idx, prepared);
             }
 
             let mut next = at.head.clone();
@@ -1865,7 +2156,11 @@ impl<S: BlobStore> Engine<S> {
             next.nonce = nonce_for(next.epoch, self.lane);
 
             for (idx, ids) in &touched {
-                self.supersede(&at.head, &mut next, idx, ids).await?;
+                let prepared = match prepared_for.remove(idx) {
+                    Some(p) => p,
+                    None => self.prepare(&at.head, idx, false).await?,
+                };
+                self.supersede(&mut next, prepared, ids).await?;
             }
             by_index.retain(|_, docs| !docs.is_empty());
 
@@ -1982,13 +2277,52 @@ impl<S: BlobStore> Engine<S> {
     /// count, not the bytes, and the fold's cost reports it.
     async fn supersede(
         &self,
-        head: &Head,
         next: &mut Head,
-        index: &str,
+        prepared: Vec<Prepared>,
         ids: &std::collections::HashSet<String>,
     ) -> Result<(), EngineError> {
+        for p in prepared {
+            let hit: Vec<usize> = p
+                .rows
+                .iter()
+                .filter(|(row, d)| ids.contains(&d.id) && !p.deleted.contains(row))
+                .map(|(row, _)| *row)
+                .collect();
+            if hit.is_empty() {
+                continue;
+            }
+            let mut rows = p.deleted;
+            rows.extend(hit);
+            let key = head::dv_key(&p.key, next.epoch.0, self.lane.0);
+            self.store
+                .put(
+                    &Key::new(key.clone()),
+                    bytes::Bytes::from(pstore_query::deletes::encode(&rows)),
+                )
+                .await?;
+            if let Some(old) = p.old {
+                next.graveyard.entry(next.epoch.0).or_default().push(old);
+            }
+            next.deletes.insert(p.key, (key, rows.len() as u32));
+        }
+        Ok(())
+    }
+
+    /// Every existing segment of `index` with its delete vector and rows -- ids and attributes,
+    /// and with `vectors` the rows' vectors too (M13) -- one open and one coalesced read each,
+    /// all in parallel.
+    ///
+    /// ⚠️ With vectors it is `Segment::scan` with **no filter**, and that is load-bearing: `scan`
+    /// returns rows without their positions, so list order is row position only when every
+    /// block is read. A filtered scan here would shift every delete this fold writes.
+    async fn prepare(
+        &self,
+        head: &Head,
+        index: &str,
+        vectors: bool,
+    ) -> Result<Vec<Prepared>, EngineError> {
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
-        let found = futures_util::future::try_join_all(refs.iter().map(|r| async move {
+        futures_util::future::try_join_all(refs.iter().map(|r| async move {
             let key = Key::new(r.key.clone());
             let old = head.deletes.get(&r.key).map(|(k, _)| k.clone());
             let (seg, before) =
@@ -2003,35 +2337,24 @@ impl<S: BlobStore> Engine<S> {
                     }
                 })
                 .await;
-            let (seg, mut rows) = (seg?, before?);
-            let hit: Vec<usize> = seg
-                .rows_where(&*self.store, &key, |_| true)
-                .await?
-                .into_iter()
-                .filter(|(row, d)| ids.contains(&d.id) && !rows.contains(row))
-                .map(|(row, _)| row)
-                .collect();
-            if hit.is_empty() {
-                return Ok::<_, EngineError>(None);
-            }
-            rows.extend(hit);
-            Ok(Some((r.key.clone(), old, rows)))
+            let (seg, deleted) = (seg?, before?);
+            let rows: Vec<(usize, Document)> = if vectors {
+                seg.scan(&*self.store, &key, None)
+                    .await?
+                    .into_iter()
+                    .enumerate()
+                    .collect()
+            } else {
+                seg.rows_where(&*self.store, &key, |_| true).await?
+            };
+            Ok::<_, EngineError>(Prepared {
+                key: r.key.clone(),
+                old,
+                deleted,
+                rows,
+            })
         }))
-        .await?;
-        for (segment, old, rows) in found.into_iter().flatten() {
-            let key = head::dv_key(&segment, next.epoch.0, self.lane.0);
-            self.store
-                .put(
-                    &Key::new(key.clone()),
-                    bytes::Bytes::from(pstore_query::deletes::encode(&rows)),
-                )
-                .await?;
-            if let Some(old) = old {
-                next.graveyard.entry(next.epoch.0).or_default().push(old);
-            }
-            next.deletes.insert(segment, (key, rows.len() as u32));
-        }
-        Ok(())
+        .await
     }
 
     /// Reaps objects dereferenced more than `retention` epochs ago.
@@ -2459,6 +2782,7 @@ impl<S: BlobStore> Engine<S> {
             let unfolded: Vec<Document> = m
                 .durable_rows(index)
                 .chain(m.pending.get(index).into_iter().flatten())
+                .filter(|d| !is_deferred(d))
                 .cloned()
                 .collect();
             drop(m);
@@ -2495,9 +2819,12 @@ impl<S: BlobStore> Engine<S> {
             if !m.prune(watermark) {
                 return Ok(None);
             }
+            // ⚠️ Deferred operations are invisible until their fold (M13): they neither shadow a
+            // segment row nor add one.
             let ops: Vec<Document> = m
                 .durable_rows(index)
                 .chain(m.pending.get(index).into_iter().flatten())
+                .filter(|d| !is_deferred(d))
                 .cloned()
                 .collect();
             (m.generation, ops)
@@ -2920,6 +3247,9 @@ impl<S: BlobStore> Engine<S> {
         let Some(lanes) = lanes else {
             return Ok(true);
         };
+        // An unfolded deferred operation of this process's is not reflected in its memtable
+        // (M13): its lane is then probed at the watermark, like any other process's.
+        let deferred = self.holds_deferred();
         let own = *self
             .seq
             .lock()
@@ -2930,7 +3260,9 @@ impl<S: BlobStore> Engine<S> {
             // has folded everything a predecessor on this lane left below the resume point
             // (M9j): those are in neither HEAD nor memory.
             let at = match own {
-                Some(r) if *lane == self.lane && folded >= r.at => folded.max(r.next.0),
+                Some(r) if *lane == self.lane && folded >= r.at && !deferred => {
+                    folded.max(r.next.0)
+                }
                 _ => folded,
             };
             let key = bundle_key(self.tenant, *lane, Seq(at));
@@ -2948,6 +3280,16 @@ impl<S: BlobStore> Engine<S> {
             .all(|clean| clean))
     }
 
+    /// Whether this process holds an unfolded deferred operation (M13).
+    fn holds_deferred(&self) -> bool {
+        let m = self.mem();
+        m.pending
+            .values()
+            .flatten()
+            .chain(m.durable.iter().flat_map(|(_, b)| b.values().flatten()))
+            .any(is_deferred)
+    }
+
     /// This engine's lane.
     #[must_use]
     pub fn lane(&self) -> LaneId {
@@ -2963,6 +3305,11 @@ impl<S: BlobStore> Engine<S> {
         let folded = watermarks.get(&lane.0).copied().unwrap_or(0);
         if folded >= next {
             return true;
+        }
+        // Not from memory while a deferred operation of this process's is unfolded (M13): the
+        // memtable does not reflect it.
+        if self.holds_deferred() {
+            return false;
         }
         let own = *self
             .seq

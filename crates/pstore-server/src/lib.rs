@@ -702,6 +702,96 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
         .ok_or_else(refuse)
 }
 
+/// A write's patches (M13), from `patch_rows` and `patch_columns`, in that order. Values are
+/// converted as a document's attributes are; `null` removes an attribute.
+fn patches_of(
+    req: &WriteRequest,
+    dated: &std::collections::BTreeSet<String>,
+) -> Result<Vec<pstore_engine::Patch>, ApiError> {
+    let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+    for raw in &req.patch_rows {
+        let o = raw
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("a patch is {\"id\", \"attributes\"}"))?;
+        let id = o
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ApiError::bad_request("a patch needs a string id"))?;
+        if let Some(k) = o.keys().find(|k| *k != "id" && *k != "attributes") {
+            return Err(ApiError::bad_request(if k == "vector" {
+                format!("patch of {id}: a patch carries no vector; upsert the row to change it")
+            } else {
+                format!("patch of {id}: unknown field {k}")
+            }));
+        }
+        let attrs = match o.get("attributes") {
+            None => serde_json::Map::new(),
+            Some(serde_json::Value::Object(m)) => m.clone(),
+            Some(_) => {
+                return Err(ApiError::bad_request(format!(
+                    "patch of {id}: attributes is an object"
+                )));
+            }
+        };
+        rows.push((id.to_owned(), attrs));
+    }
+    if let Some(cols) = &req.patch_columns {
+        let bad = |why: &str| ApiError::bad_request(format!("patch_columns: {why}"));
+        let cols = cols
+            .as_object()
+            .ok_or_else(|| bad("an object of columns"))?;
+        let ids = cols
+            .get("id")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| bad("an `id` column is required"))?;
+        let mut columns = Vec::new();
+        for (name, col) in cols.iter().filter(|(n, _)| *n != "id") {
+            let col = col
+                .as_array()
+                .filter(|c| c.len() == ids.len())
+                .ok_or_else(|| bad("every column must have one value per id"))?;
+            columns.push((name, col));
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let id = id.as_str().ok_or_else(|| bad("ids are strings"))?;
+            let attrs = columns
+                .iter()
+                .filter_map(|(name, col)| col.get(i).map(|v| ((*name).clone(), v.clone())))
+                .collect();
+            rows.push((id.to_owned(), attrs));
+        }
+    }
+    rows.into_iter()
+        .map(|(id, attrs)| {
+            let unset: Vec<String> = attrs
+                .iter()
+                .filter(|(_, v)| v.is_null())
+                .map(|(k, _)| k.clone())
+                .collect();
+            let set: serde_json::Map<String, serde_json::Value> =
+                attrs.into_iter().filter(|(_, v)| !v.is_null()).collect();
+            // Converted as a document's attributes are: every refusal of one is a patch's too.
+            let as_doc: types::DocumentIn = serde_json::from_value(
+                serde_json::json!({"id": id, "vector": [], "attributes": set}),
+            )
+            .map_err(|e| ApiError::bad_request(format!("patch of {id}: {e}")))?;
+            for name in &unset {
+                if name.is_empty() || name.starts_with('$') || name == pstore_query::ID_ATTRIBUTE {
+                    return Err(ApiError::bad_request(format!(
+                        "patch of {id}: attribute `{name}` is reserved"
+                    )));
+                }
+            }
+            let doc = to_document(&as_doc, dated)?;
+            Ok(pstore_engine::Patch {
+                id,
+                set: doc.attrs,
+                unset,
+            })
+        })
+        .collect()
+}
+
 /// `PUT /v1/indexes/{index}/documents`.
 async fn write_documents<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -715,9 +805,45 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let req: WriteRequest = parse_write(&body)?;
-    if req.documents.is_empty() && req.deletes.is_empty() {
+    let dated = declared_datetimes(&req)?;
+    let patches = patches_of(&req, &dated)?;
+    if req.documents.is_empty() && req.deletes.is_empty() && patches.is_empty() {
         return Err(ApiError::bad_request(
-            "a write with no documents and no deletes",
+            "a write with no documents, patches or deletes",
+        ));
+    }
+    // M13: each condition guards its own kind of operation, and must have some to guard.
+    let condition = |name: &str, v: &Option<serde_json::Value>, any: bool| {
+        v.as_ref()
+            .map(|v| {
+                if any {
+                    predicate(v)
+                } else {
+                    Err(ApiError::bad_request(format!(
+                        "{name} with no operations of its kind to apply to"
+                    )))
+                }
+            })
+            .transpose()
+    };
+    let upsert_if = condition(
+        "upsert_condition",
+        &req.upsert_condition,
+        !req.documents.is_empty(),
+    )?;
+    let patch_if = condition("patch_condition", &req.patch_condition, !patches.is_empty())?;
+    let delete_if = condition(
+        "delete_condition",
+        &req.delete_condition,
+        !req.deletes.is_empty(),
+    )?;
+    // ⚠️ **Deferred operations are durable only** (M13, spec review M4): a batched one would sit
+    // where no fold reads it and no probe finds it, so a strong read here could miss it.
+    let deferred = !patches.is_empty() || upsert_if.is_some() || delete_if.is_some();
+    if deferred && !matches!(req.durability, types::Durability::Durable) {
+        return Err(ApiError::bad_request(
+            "patches and conditional writes are durable only: they are applied at a fold, which \
+             reads only what a flush made durable",
         ));
     }
     // ⚠️ An unknown metric is refused, never read as the default (M9d): a client that asked
@@ -757,7 +883,6 @@ async fn write_documents<S: BlobStore + 'static>(
 
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
-    let dated = declared_datetimes(&req)?;
     let docs: Vec<Document> = req
         .documents
         .iter()
@@ -765,11 +890,22 @@ async fn write_documents<S: BlobStore + 'static>(
         .collect::<Result<_, _>>()?;
     let written = docs.len();
     if !docs.is_empty() {
-        engine.write_as(&index, docs, metric).await?;
+        match &upsert_if {
+            Some(c) => engine.write_if(&index, docs, metric, c).await?,
+            None => engine.write_as(&index, docs, metric).await?,
+        }
+    }
+    // Then the patches, then the deletes (M13): a later operation on an id wins.
+    let patched = patches.len();
+    if !patches.is_empty() {
+        engine.patch(&index, patches, patch_if.as_ref()).await?;
     }
     // After the documents: a request that writes and deletes an id deletes it.
     let deleted = req.deletes.len();
-    engine.delete(&index, req.deletes).await?;
+    match &delete_if {
+        Some(c) => engine.delete_if(&index, req.deletes, c).await?,
+        None => engine.delete(&index, req.deletes).await?,
+    }
     let durable = matches!(req.durability, types::Durability::Durable);
     if durable {
         engine.flush().await?;
@@ -787,6 +923,7 @@ async fn write_documents<S: BlobStore + 'static>(
             epoch: engine.epoch().0,
             documents_written: written,
             documents_deleted: deleted,
+            documents_patched: patched,
             durable,
             cost: api.spend(tenant).since(before),
             session: session.clone(),

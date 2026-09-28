@@ -79,6 +79,23 @@ pub struct WriteRequest {
     /// write that omits it stores plain strings.
     #[serde(default)]
     pub schema: Option<serde_json::Value>,
+    /// Patches (M13): `[{"id", "attributes": {..}}]`, each setting the attributes it names --
+    /// `null` removes one -- on the id's current version at the fold. Taken raw, so a patch
+    /// carrying a vector is refused rather than ignored.
+    #[serde(default)]
+    pub patch_rows: Vec<serde_json::Value>,
+    /// The same patches in columns (M13): `{"id": [..], "<attr>": [..]}`, one value per id.
+    #[serde(default)]
+    pub patch_columns: Option<serde_json::Value>,
+    /// A filter each of `documents` applies only if the id's current version admits (M13).
+    #[serde(default)]
+    pub upsert_condition: Option<serde_json::Value>,
+    /// A filter each patch applies only if the id's current version admits (M13).
+    #[serde(default)]
+    pub patch_condition: Option<serde_json::Value>,
+    /// A filter each of `deletes` applies only if the id's current version admits (M13).
+    #[serde(default)]
+    pub delete_condition: Option<serde_json::Value>,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.
@@ -143,6 +160,8 @@ pub struct WriteResponse {
     pub documents_written: usize,
     /// Ids a delete was **requested** for -- not ids found, which would need a read (M9c).
     pub documents_deleted: usize,
+    /// Ids a patch was **requested** for (M13), as `documents_deleted` counts.
+    pub documents_patched: usize,
     /// Whether the batch is in the blob store or only in this process.
     pub durable: bool,
     /// What it cost.
