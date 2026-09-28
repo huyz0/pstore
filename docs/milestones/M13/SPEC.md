@@ -88,7 +88,11 @@ A bundle written before M13 holds none, and reads as it did.
 - For each index with a deferred operation in the span, the fold first reads the base
   versions it needs, with `Segment::scan` over every existing segment of the index.
   - `scan` returns ids, attributes and vectors, dense and sparse, in one coalesced round per
-    segment, all segments in parallel (spec review, B1: blocks alone carry no vectors).
+    segment (spec review, B1: blocks alone carry no vectors).
+  - At most 4 segments are read at once, so an index of N segments costs about N/4 rounds
+    in sequence. The rows a segment's scan does not keep are dropped to their ids before
+    the next is read (code review, M13.1: all segments at once would hold the index in
+    memory). A fold is not a user-facing path, so the depth budget does not bind it.
   - Delete vectors are respected, as a query respects them.
   - Only the rows a deferred operation names, or that a by-filter operation admits, are
     kept.

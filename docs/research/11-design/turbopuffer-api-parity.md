@@ -31,8 +31,9 @@ M9 milestones is the order in which the difference has to be closed.
 | `deletes: [id]` | none | **M9c** — tombstones, then delete vectors |
 | an attribute set to `null` means "unset" | refused, `400` (M9a) | **M9c** decides, once a write can overwrite: `null` only means something against a prior value |
 | Row = `{id, vector?, <attr>: value…}` | `{id, vector, text?}` only; the engine's `attrs` are unreachable over HTTP | **M9a** |
-| `patch_rows` / `patch_columns`, `patch_by_filter`, `delete_by_filter` | none | **M13**: each is a read-modify-write at fold time, priced after M9c |
-| `upsert_condition` / `patch_condition` / `delete_condition` | none | **M13**, with them |
+| `patch_rows` / `patch_columns` | `patch_rows` / `patch_columns`; `null` removes an attribute | **Landed in [M13](../../milestones/M13/SPEC.md).1**: deferred to the fold, which resolves each patch against the current version; a write still costs 1 PUT, and a patched row keeps its stored vectors. ⚠️ Invisible to every read until that fold, and `session` and `strong` refuse rather than serve around it |
+| `patch_by_filter`, `delete_by_filter` | none | **M13.2**: one deferred operation each, applied at the fold to every row whose current version the filter admits |
+| `upsert_condition` / `patch_condition` / `delete_condition` | each, evaluated at the fold against the current version | **Landed in M13.1**, with patches. A conditional upsert of a missing id inserts it; a patch or conditional delete of one does nothing |
 | `distance_metric`: `cosine_distance`, `euclidean_squared` | **dot product only**, not selectable | **M9d**, recorded in HEAD's schema like `dims` |
 | `schema` inline in a write | inferred at first fold, immutable (M7d) | M9a accepts types by inference; declared schemas with M9h |
 | `copy_from_namespace`, `branch_from_namespace` | none | **M16**: branching is one PUT by design ([mutations-and-mvcc.md](../05-storage-engine/mutations-and-mvcc.md)); no caller yet |
