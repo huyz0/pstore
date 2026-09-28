@@ -47,6 +47,12 @@ of every existing segment of each index it folds (`supersede`).
 Order within a request: `documents`, then patches, then `deletes`. A later operation on an id
 wins, as in M9c.2. A request with no operation at all is refused, as today.
 
+**Deferred operations are durable only** (spec review, M4). A request carrying one with
+`durability: "batched"` is `400`.
+- A batched one would sit in this process's memory, where no fold reads it and no probe finds
+  it.
+- So a `strong` read here could be served without it.
+
 **Semantics at the fold**, each operation against the id's current version in fold order:
 
 | Operation | Current version exists | No current version |
@@ -58,9 +64,17 @@ wins, as in M9c.2. A request with no operation at all is refused, as today.
 
 - A skipped conditional operation, or a patch of nothing, **touches nothing**: the id's
   segment row stays and its delete vector is unchanged.
-- A patched result is checked against the index's schema, as any row is. A result that
-  contradicts it is dropped and counted in `rejected_rows`, and the old version stands
-  (M7d's rung three).
+- **Patches and conditional deletes are exempt from the reject pass and from schema
+  inference**, as tombstones are (spec review, M1).
+  - A **conditional upsert is not exempt** (spec review round 2): it is a full row, with its
+    own vector and `$metric`, and is checked and inferred from as any upsert is.
+  - A patch carries no vector and no `$metric`, so today's pass would drop every one.
+  - A merged row takes its vector (dense and sparse) from the base version, already stored
+    under the index's metric, and it is sealed without transforming it again.
+  - A patch can change neither width nor metric. The text-field check depends on the
+    folding process's configuration (spec review, M3), so it is not applied to a merged
+    row, and a non-string value in the text field is indexed as no text, as a write's is.
+  - So a merged row is never rejected.
 - The response's `documents_patched` counts ids requested, as `documents_deleted` does.
 
 **Representation.** A deferred operation is a row in the lane bundle, carrying reserved
@@ -72,14 +86,23 @@ A bundle written before M13 holds none, and reads as it did.
 
 **The fold.**
 - For each index with a deferred operation in the span, the fold first reads the base
-  versions it needs: every live row of the index's existing segments whose id a deferred
-  operation names.
-  - Delete vectors and the rejected are respected, as a query respects them.
-  - The read is one pass over the index's blocks, in parallel per segment: **the index's
-    bytes, once per such fold**. Ids cannot be pruned by a zone map, which is `supersede`'s
-    price too.
-- It then applies every operation in order, over a map of the versions this fold has
-  produced.
+  versions it needs, with `Segment::scan` over every existing segment of the index.
+  - `scan` returns ids, attributes and vectors, dense and sparse, in one coalesced round per
+    segment, all segments in parallel (spec review, B1: blocks alone carry no vectors).
+  - Delete vectors are respected, as a query respects them.
+  - Only the rows a deferred operation names, or that a by-filter operation admits, are
+    kept.
+  - ⚠️ `scan` is called with **no filter**, and that is load-bearing (spec review round 2).
+    It returns rows without their positions, so list order is row position only when every
+    block is read. `supersede` needs positions for the delete vectors. A filtered `scan`
+    here would silently shift them.
+  - For that index, `supersede` takes its ids from this same pass instead of its own read. So
+    the cost is **the index's bytes, once per such fold**, not twice.
+  - Like everything in the fold, the base read is repeated on every commit attempt, against
+    the HEAD that attempt read, and never cached across attempts (spec review, m1).
+- It then applies every operation in order, over a map from id to this fold's version of it.
+  A delete leaves an entry meaning "no version": a patch after it in the same fold is
+  ignored rather than read from the base, which would bring the row back (spec review, M2).
 - Every id whose version changed is touched: superseded in its segment, and, if it still
   exists, sealed.
 - Where no deferred operation is present, the fold is unchanged: no extra read.
@@ -90,10 +113,17 @@ A bundle written before M13 holds none, and reads as it did.
 - The own-lane shortcuts treat an unfolded bundle holding a deferred operation as **not** in
   memory. That covers `settled` (M9i.2, `strong`), `covers` and `unfolded_next` (M11.1,
   `session`).
-- The engine remembers the next sequence past its last such bundle. Until HEAD's watermark
-  reaches it:
-  - `strong` probes its own lane at the watermark;
-  - a `session` entry for this lane is covered only by the watermark.
+- While this process holds any unfolded durable batch carrying a deferred operation:
+  - `strong` probes its own lane at the watermark, so it finds that bundle and refuses;
+  - a `session` entry for this lane is covered only by the watermark;
+  - `unfolded_next` names the lane.
+
+  Deferred operations are durable only, so every one is in such a batch.
+
+⚠️ **Deterministic within a fold, not across fold boundaries** (spec review, m2). As M9c.2
+states for upserts, operations are ordered lane then sequence within a fold, and folds in
+commit order. So a patch on a lower lane, causally after an upsert on a higher lane, is
+overwritten by it if both land in one fold. Stated, not hidden.
 
 **Does not change:** a write's cost, any read's cost, a fold without deferred operations,
 or the segment format.
@@ -107,8 +137,10 @@ or the segment format.
      - the count is unchanged.
    - A patch of a missing id changes nothing.
    - `patch_columns` equals `patch_rows`.
-2. **Order.** In one fold, in lane order: upsert, then patch, then patch the same id again.
-   The two patches compose. A patch before an upsert of the same id is overwritten by it.
+2. **Order.** In one fold, in lane order:
+   - upsert, then patch, then patch the same id again: the two patches compose;
+   - a patch before an upsert of the same id is overwritten by it;
+   - a delete, then a patch of the same id: the row stays deleted (spec review, M2).
 3. **Conditions.**
    - Each conditional kind, admitted and refused, over an existing and a missing id, gives the
      table's result after a fold.
@@ -118,8 +150,13 @@ or the segment format.
      pre-patch row.
    - A `session` read with the patch's token is refused, on this process and on another.
    - A `strong` read through this process is refused too.
-5. **Schema.** A patch that would contradict the schema is dropped, counted in
-   `rejected_rows`, and the old version stands.
+5. **Vectors and schema.**
+   - A conditional upsert of the wrong width is dropped and counted in `rejected_rows`, as
+     an unconditional one is (spec review round 2).
+   - A patched row keeps its dense vector under cosine and euclidean indexes, not transformed
+     again: a query for it finds it at the same distance as before the patch.
+   - It keeps its sparse vector too.
+   - Neither patches nor conditions add to `rejected_rows` (spec review, M1).
 6. **Cost.**
    - A write carrying patches costs exactly 1 PUT, as any write does.
    - A fold with no deferred operation issues exactly the reads it issued before M13.
@@ -128,7 +165,10 @@ or the segment format.
    - `patch_columns` of unequal lengths;
    - a condition that is not a filter;
    - a condition with no operations of its kind;
-   - a client attribute named `$op` or `$cond`.
+   - a deferred operation with `durability: "batched"`.
+
+   (`$op` and `$cond` need nothing new: names beginning `$` are already refused, spec
+   review m3.)
 8. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.
 
 ### Test plan
@@ -139,7 +179,7 @@ or the segment format.
 | 2 | as 1 | operations applied out of fold order |
 | 3 | as 1 | a condition ignored; a skipped operation touching the id |
 | 4 | as 1 | a deferred operation shown or shadowing before the fold; an own-lane shortcut trusting it |
-| 5 | as 1 | the schema check skipped on a merged row |
+| 5 | as 1 | a stored vector transformed twice; a sparse vector dropped |
 | 6 | as 1 | a base read taken with no deferred operation |
 
 ## M13.2 — `delete_by_filter` and `patch_by_filter`
@@ -153,9 +193,8 @@ or the segment format.
   - folded rows, from the base read;
   - rows this fold's earlier operations produced.
 
-  The base read for an index with a by-filter operation also takes every live row that
-  predicate admits, pruned by zone maps as a query is. So the base is what the filters admit,
-  plus the ids named.
+  The base read is the same `scan` of every segment: it already reads the whole index, so a
+  by-filter operation adds no read. It keeps every row a by-filter predicate admits.
 - The response counts nothing it cannot know: `documents_deleted` and `documents_patched`
   stay the per-id request counts.
 
@@ -166,10 +205,12 @@ or the segment format.
 2. A row an earlier operation in the same fold made match is affected; one it made stop
    matching is not.
 3. Before the fold, reads are unaffected, as in M13.1 criterion 4.
-4. A by-filter operation's fold reads only blocks its filter's zone maps admit, plus the
-   named ids' segments.
-5. Refusals: a by-filter operation whose filter or attributes are malformed is `400`.
-6. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.
+4. Refusals: a by-filter operation whose filter or attributes are malformed is `400`, as is
+   one with `durability: "batched"`.
+5. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.
+
+(Spec review, M5: a criterion that the fold reads only the blocks a filter's zone maps admit
+is gone. `supersede` reads every block of the index anyway, so there is nothing to save.)
 
 ## RA budget
 
@@ -187,8 +228,11 @@ or the segment format.
 - Deferred operations are invisible until a fold, so a client must fold, or wait for the
   scheduled one (M9i.1), to see its own patch. That is stated, and `session` refuses rather
   than serves stale.
+- While this process holds an unfolded deferred operation, `strong` is refused for **every**
+  index on it until a fold, because a lane probe cannot tell which index a bundle touches.
+  That is an availability cost, accepted and stated (spec review round 2).
 
 ## Tasks
 
 - **M13.1** — per-id patches and conditions; criteria 1–8.
-- **M13.2** — by-filter operations; criteria 1–6.
+- **M13.2** — by-filter operations; criteria 1–5.
