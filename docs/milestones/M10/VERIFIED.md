@@ -42,3 +42,29 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
      - BACKLOG row 42, for the index-metadata fallback.
    - Code review: one round, pass. Its one major was that this ledger was not yet written.
    - `./scripts/gates.sh` on this tree: all seventeen PASS.
+
+## M10.2 — the index-metadata endpoint's epoch
+
+⚠️ The gate checks M10.1's criteria only, so these lines are enumerated here and not by the
+script (as in M9i and M11).
+
+1. **A read-only process** — `an_unfolded_index_reports_the_epoch_of_the_head_read`
+   (`cargo test -p pstore-server --test served_epoch`). **Observed red** with the source fix
+   stashed: it reported 0.
+2. **A stale process** — `an_unfolded_index_on_a_stale_process_reports_the_newer_epoch`.
+   **Observed red**: it reported `e` (1), not `e + 1`.
+3. **The engine** — `stats_of_a_missing_index_carry_the_heads_epoch`
+   (`cargo test -p pstore-engine --test served_epoch`). **Observed red** as a compile error:
+   `index_stats_at` did not exist. It also pins the stats' own epoch, the site a hand mutant
+   of M10.1 had left untested.
+4. **No cost** — `an_unfolded_index_reports_the_epoch_of_the_head_read` asserts 1 read, 0 writes
+   and 0 LISTs.
+5. **Gates**
+   - `./scripts/mutants.sh --check . --in-diff <the M10.2 source diff>`: **8 tested, 2
+     caught, 6 unviable, 0 missed.**
+   - ⚠️ No separate spec review was run for this small task. The code review checked the diff
+     against the spec: one round, pass, three minors:
+     - this ledger was not yet written;
+     - row 42 was not yet closed;
+     - the spec was in the same change as the code (it was written first).
+   - `./scripts/gates.sh` on this tree: all seventeen PASS.

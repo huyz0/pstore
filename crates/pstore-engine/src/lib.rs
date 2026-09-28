@@ -1325,35 +1325,52 @@ impl<S: BlobStore> Engine<S> {
     /// # Errors
     /// If HEAD cannot be read.
     pub async fn index_stats(&self, index: &str) -> Result<Option<IndexStats>, EngineError> {
+        Ok(self.index_stats_at(index).await?.1)
+    }
+
+    /// [`Self::index_stats`], with the epoch of the HEAD it read -- **also when HEAD names no
+    /// such index** (M10.2, BACKLOG row 42). An index only this process holds unfolded has no
+    /// stats, and without this its caller could only report this process's last commit: 0 on
+    /// a process that only reads, stale on one another process folded past.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn index_stats_at(
+        &self,
+        index: &str,
+    ) -> Result<(Epoch, Option<IndexStats>), EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.remember_schemas(&at.head);
         self.prune_to(&at.head);
-        Ok(at.head.indexes.get(index).map(|refs| IndexStats {
-            // The newest commit that rewrote its segments or their delete vectors (M9f): both
-            // keys carry the epoch they were written at, and a retry re-derives them.
-            updated_epoch: refs
-                .iter()
-                .filter_map(|r| head::key_epoch(&r.key))
-                .chain(
-                    refs.iter()
-                        .filter_map(|r| at.head.deletes.get(&r.key))
-                        .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
-                )
-                .max()
-                .map(Epoch),
-            segments: refs.len() as u64,
-            // Live rows: a segment's deleted rows are not documents (M9c.2).
-            documents: refs
-                .iter()
-                .map(|r| {
-                    let gone = at.head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
-                    u64::from(r.rows.saturating_sub(gone))
-                })
-                .sum(),
-            epoch: at.head.epoch,
-            schema: at.head.schemas.get(index).cloned(),
-            rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
-        }))
+        Ok((
+            at.head.epoch,
+            at.head.indexes.get(index).map(|refs| IndexStats {
+                // The newest commit that rewrote its segments or their delete vectors (M9f): both
+                // keys carry the epoch they were written at, and a retry re-derives them.
+                updated_epoch: refs
+                    .iter()
+                    .filter_map(|r| head::key_epoch(&r.key))
+                    .chain(
+                        refs.iter()
+                            .filter_map(|r| at.head.deletes.get(&r.key))
+                            .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
+                    )
+                    .max()
+                    .map(Epoch),
+                segments: refs.len() as u64,
+                // Live rows: a segment's deleted rows are not documents (M9c.2).
+                documents: refs
+                    .iter()
+                    .map(|r| {
+                        let gone = at.head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
+                        u64::from(r.rows.saturating_sub(gone))
+                    })
+                    .sum(),
+                epoch: at.head.epoch,
+                schema: at.head.schemas.get(index).cloned(),
+                rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
+            }),
+        ))
     }
 
     /// What this process has flushed and nobody is yet known to have folded (M9i.1): the

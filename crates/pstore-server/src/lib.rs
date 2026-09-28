@@ -1300,7 +1300,7 @@ async fn index_summary<S: BlobStore + 'static>(
     let tenant = tenant_of(&headers)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let stats = engine.index_stats(&index).await?;
+    let (served, stats) = engine.index_stats_at(&index).await?;
     let unfolded = engine.pending_indexes().await.iter().any(|i| i == &index);
     if stats.is_none() && !unfolded {
         return Err(ApiError::new(
@@ -1312,7 +1312,8 @@ async fn index_summary<S: BlobStore + 'static>(
     let s = stats.unwrap_or(pstore_engine::IndexStats {
         segments: 0,
         documents: 0,
-        epoch: engine.epoch(),
+        // The HEAD read, never this process's last commit (M10.2, BACKLOG row 42).
+        epoch: served,
         schema: None,
         rejected_rows: 0,
         updated_epoch: None,

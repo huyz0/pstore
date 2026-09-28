@@ -146,3 +146,49 @@ async fn the_served_epoch_repeats_the_read_as_of() {
         assert_eq!(past["meta"]["epoch"], live["meta"]["epoch"]);
     }
 }
+
+/// A batched write to `fresh`: held in this process's memory only, never folded.
+async fn hold_fresh(api: &Arc<Api<MemoryStore>>) {
+    let body = json!({"durability": "batched", "documents": [
+        {"id": "f", "vector": [1.0, 0.5]}]});
+    let (s, b) = send(
+        api,
+        request("PUT", "/v1/indexes/fresh/documents", Some(&body)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+async fn summary(api: &Arc<Api<MemoryStore>>) -> Value {
+    let (s, b) = send(api, request("GET", "/v1/indexes/fresh", None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["unfolded"], true, "{b}");
+    b
+}
+
+#[tokio::test]
+async fn an_unfolded_index_reports_the_epoch_of_the_head_read() {
+    // M10.2, BACKLOG row 42: a process that never committed.
+    let (a, b) = two();
+    put(&b, "x", 1).await;
+    let e = fold(&b).await;
+    assert!(e >= 1);
+    hold_fresh(&a).await;
+    let got = summary(&a).await;
+    assert_eq!(got["epoch"], e, "{got}");
+    // One HEAD read, as before the fix.
+    assert_eq!(got["cost"]["blob_reads"], 1, "{got}");
+    assert_eq!(got["cost"]["blob_writes"], 0);
+    assert_eq!(got["cost"]["blob_lists"], 0);
+}
+
+#[tokio::test]
+async fn an_unfolded_index_on_a_stale_process_reports_the_newer_epoch() {
+    let (a, b) = two();
+    put(&a, "x", 1).await;
+    let e = fold(&a).await;
+    put(&b, "y", 2).await;
+    assert_eq!(fold(&b).await, e + 1);
+    hold_fresh(&a).await;
+    assert_eq!(summary(&a).await["epoch"], e + 1);
+}

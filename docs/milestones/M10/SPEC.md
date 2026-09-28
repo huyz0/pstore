@@ -82,3 +82,40 @@ Unchanged: the epoch comes from a HEAD the query already read.
 
 - **M10.1** — the engine's `epoch` fields, the server's report, and BACKLOG row 40 closed;
   criteria 1–6.
+- **M10.2** — BACKLOG row 42, below.
+
+## M10.2 — the index-metadata endpoint's epoch
+
+**Serves:** [BACKLOG](../BACKLOG.md) row 42, found at M10.1's spec review. It is the same
+defect as row 40, on the other read path.
+
+### What is true today
+
+`GET /v1/indexes/{index}` reports HEAD's epoch for a folded index. For an index that only
+this process holds, unfolded, `index_stats` returns `None`, and the handler fills
+`engine.epoch()` instead, which is this process's last commit:
+- a process that never committed reports 0;
+- a stale one reports its own old epoch.
+
+### Delta
+
+- The engine gains `index_stats_at`, which returns the epoch of the HEAD it read beside the
+  stats, including when HEAD has no such index. `index_stats` keeps its signature and
+  delegates to it.
+- The handler reports that epoch in the fallback.
+- **Does not change:** any request count (still one HEAD read), any other field, or the
+  format.
+
+### Acceptance criteria
+
+1. **A read-only process.**
+   - Process B folds a write, reaching epoch `e >= 1`.
+   - Process A, which never committed, holds a batched write to index `fresh`.
+   - A's `GET /v1/indexes/fresh` reports `e`, and `unfolded: true`.
+2. **A stale process.**
+   - A folds, reaching `e`, and then B folds, reaching `e + 1`.
+   - A holds an unfolded write to `fresh`.
+   - A reports `e + 1`.
+3. **The engine.** `index_stats_at` of a missing index returns HEAD's epoch and `None`.
+4. **No cost.** Criterion 1's request is 1 read, 0 writes and 0 LISTs.
+5. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.

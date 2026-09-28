@@ -106,3 +106,15 @@ async fn a_past_answer_carries_the_epoch_it_asked_for() {
         .unwrap();
     assert_eq!(a.hits.len(), 1);
 }
+
+#[tokio::test]
+async fn stats_of_a_missing_index_carry_the_heads_epoch() {
+    // M10.2: the epoch of the HEAD read, even when HEAD names no such index.
+    let r = reader().await;
+    let (epoch, stats) = r.index_stats_at("never-written").await.unwrap();
+    assert_eq!(epoch, Epoch(2));
+    assert!(stats.is_none());
+    let (epoch, stats) = r.index_stats_at("idx").await.unwrap();
+    assert_eq!(epoch, Epoch(2));
+    assert_eq!(stats.unwrap().epoch, Epoch(2));
+}
