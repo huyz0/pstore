@@ -107,7 +107,8 @@ hand mutation, as named below. So were the tests added at code review.
      M14's diff, and recorded in [M14's ledger](../M14/VERIFIED.md).
    - Spec review: two rounds. Code review: M13.1 two rounds (the second passed with three
      minors, fixed); M13.2 one round, which passed with six minors, all fixed.
-   - `./scripts/gates.sh`: see the line added when it ran, below.
+   - `./scripts/gates.sh` on the tree of `ddf7f03`, which also holds M14 and M15's work in
+     progress: **all seventeen PASS**, exit 0.
 
 ## M13.2 — `delete_by_filter` and `patch_by_filter`
 
