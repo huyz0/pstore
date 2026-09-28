@@ -127,8 +127,8 @@ fn a_sketch_never_costs_the_open_a_second_read() {
         let Ok(plain) = build(budget, false) else {
             continue;
         };
-        let declared = build(budget, true)
-            .unwrap_or_else(|e| panic!("at a budget of {budget}: {e}"));
+        let declared =
+            build(budget, true).unwrap_or_else(|e| panic!("at a budget of {budget}: {e}"));
         let has = declared.len() != plain.len();
         sketched += usize::from(has);
         if !has {

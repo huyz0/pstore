@@ -575,19 +575,31 @@ mod tests {
 
     #[test]
     fn a_regex_compiles_to_at_most_one_mebibyte() {
-        // The limit is stated, not the crate's default: the smallest `\w{n}` refused is the
-        // first one past 1 MiB compiled, and the one before it is within.
+        // The limit is stated, not the crate's default. The boundary is found with the crate's
+        // own builder at 1 MiB -- each probe past it fails fast -- and a pattern refuses exactly
+        // from there: a larger limit would compile the first `\\w{n}` past it, a smaller one
+        // refuse the last within.
         let source = |n: usize| format!("\\w{{{n}}}");
-        let n = (1..=4096)
-            .find(|n| Pattern::new(PatternKind::Regex, &source(*n)).is_err())
-            .expect("no size refused");
         let within = |n: usize| {
             regex::RegexBuilder::new(&source(n))
                 .size_limit(1 << 20)
                 .build()
                 .is_ok()
         };
-        assert!(n > 1 && within(n - 1) && !within(n), "refused from {n}");
+        let (mut lo, mut hi) = (1, 4096);
+        assert!(within(lo) && !within(hi));
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if within(mid) { lo = mid } else { hi = mid }
+        }
+        assert!(
+            Pattern::new(PatternKind::Regex, &source(lo)).is_ok(),
+            "{lo} refused"
+        );
+        assert!(
+            Pattern::new(PatternKind::Regex, &source(hi)).is_err(),
+            "{hi} compiled"
+        );
     }
 
     #[test]
