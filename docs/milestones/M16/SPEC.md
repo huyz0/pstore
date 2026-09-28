@@ -21,7 +21,8 @@ The corpus designed a branch as a new HEAD per index, so refcounting had to span
   - `copy_from_namespace` is the same operation, since a physical copy of immutable segments
     buys nothing (stated in the parity doc);
   - it answers the commit `epoch`, and a session token that saw it.
-- **Names.** `src` and `dest` must match `[A-Za-z0-9_.-]{1,128}` and differ. This bounds key
+- **Names.** `src` and `dest` must match `[A-Za-z0-9_.-]{1,128}`, must not be `.` or `..`,
+  and must differ. This bounds key
   length, and makes the owner of a segment key exact: **`owner(seg) = key_index(seg)`**. An
   index **borrows** a segment it names but does not own. There is no stored set, so a past
   epoch answers by the same rule.
@@ -31,6 +32,7 @@ The corpus designed a branch as a new HEAD per index, so refcounting had to span
 - **What a branch holds.** `src`'s folded state at the commit. The server folds the tenant
   first, so every acknowledged durable write is in it.
   - A durable write to `dest` racing the commit lands on the branch, as any later write would.
+    A racing row that contradicts the schema is counted as a reject, by the fold's rule.
   - `dest` takes `src`'s whole schema.
 - **The commit** is one HEAD CAS, on the HEAD every input was derived from. It:
   - adds `dest`'s refs, which are `src`'s keys;
@@ -38,7 +40,9 @@ The corpus designed a branch as a new HEAD per index, so refcounting had to span
   - records `branched[dest] = epoch`.
 
   For each of `src`'s segments with a vector at `dv_ref(src, seg)`, it copies that vector,
-  1 GET and 1 PUT, to `dv_key(scoped(dest, seg), epoch, lane)`. A copy made by an attempt
+  1 GET and 1 PUT, to `dv_key(dv_ref(dest, seg), epoch, lane)`. That is the plain key when
+  `dest` owns the segment, which happens when a dropped name is restored from its own branch
+  once the drop has left GC's window (spec review round 2). A copy made by an attempt
   that loses its CAS is **buried under its own key epoch**, as compaction buries its losers.
 - **One delete-vector key per (index, segment):** `dv_ref(index, seg)` is `seg` when the index
   owns it, and otherwise `scoped(index, seg)` = `seg` + `.br-` + hex(index). Every read,
@@ -48,7 +52,8 @@ The corpus designed a branch as a new HEAD per index, so refcounting had to span
   - compaction's lookup and burial, and the drop's.
 - **Burying a borrowed segment** (the branch compacts or drops it) buries a **marker**,
   `scoped(index, seg)`, not `seg`. A marker names no object.
-  - GC treats it as a burial of `seg`.
+  - GC treats it as a burial of `seg`: the marker itself never enters the delete batch, and
+    the sidecars are derived from `seg`.
   - `as_of` resurrects `seg` under the marker's index.
 - **GC** skips any key, or any marker's segment, that is still named by HEAD **or buried
   again in a graveyard entry newer than the horizon**. A doubly buried key is thus reaped only
@@ -80,7 +85,8 @@ of `src` costs.
    - With `src` burying X at E2 and `dest` at E4, `gc` with a horizon in [E2, E4) leaves X in
      the store.
 4. **Deep.** A branch of a branch of a branch, with deletes at each level, satisfies 1–3, and
-   copies each level's vector from `dv_ref` rather than the plain key.
+   copies each level's vector from `dv_ref` rather than the plain key. **Restore:** branch A
+   to B, drop A, `gc` past the drop, then branch B to A. A equals B, deleted rows included.
 5. **History.** For both indexes, `as_of` at an epoch after the branch equals the query then,
    both before and after either index compacts or drops a shared segment. Below `branched`,
    `dest` is `404` and `src` is unchanged.
@@ -102,8 +108,8 @@ of `src` costs.
 |---|---|---|
 | 1 | the field is refused | a vector not copied; the schema not copied |
 | 2 | as 1 | any `deletes` site using the plain key: supersede, compaction, drop |
-| 3 | as 1 | the newer-burial check removed; a marker not mapped to its segment |
-| 4 | as 1 | copying `src`'s plain vector in place of `dv_ref(src)` |
+| 3 | as 1 | the newer-burial check removed; a marker not mapped to its segment, or sent to the delete batch |
+| 4 | as 1 | copying `src`'s plain vector in place of `dv_ref(src)`; copying to `scoped(dest)` in place of `dv_ref(dest)` |
 | 5 | as 1 | a marker resurrected under `owner`; a scoped vector dropped by the liveness filter; `branched` unread |
 | 6 | as 1 | a GET per segment; a loser's copy left unburied |
 | 7 | the section does not exist | an empty earlier section omitted |
@@ -120,8 +126,8 @@ compaction bounds, never with rows. Everything else is unchanged.
 - **Retained bytes.** A branch keeps a parent's segments alive after the parent drops them.
   Nothing reports those bytes: the corpus's "surface it" hazard stays open.
 - **Mixed versions.** A pre-M16 process knows no markers and no scoped keys, so it would write
-  a branch's deletes into the shared vector. An upgrade must reach every process before any
-  branch exists, and no gate enforces it.
+  a branch's deletes into the shared vector, and its GC lacks the newer-burial check. An
+  upgrade must reach every process before any branch exists, and no gate enforces it.
 
 ## Tasks
 
