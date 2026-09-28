@@ -65,3 +65,37 @@ async fn a_compaction_keeps_the_analyzer() {
         "compaction re-analyzed with the default"
     );
 }
+
+#[tokio::test]
+async fn the_fresh_view_follows_an_analyzer_another_process_recorded() {
+    // This process holds an unfolded row declared with stemming, and has served it. Another
+    // process then creates the index with the default: this one's rows have not changed, but
+    // the analyzer its fresh view must use has, so the view it cached is stale.
+    let store = Arc::new(MemoryStore::new());
+    let a = Engine::new(Arc::clone(&store), TenantId(61), LaneId(1));
+    let b = Engine::new(Arc::clone(&store), TenantId(61), LaneId(2));
+    let stem = FullText {
+        analyzer: Analyzer {
+            stemming: true,
+            ..Analyzer::default()
+        },
+        ..FullText::default()
+    };
+    a.write_with(
+        "idx",
+        vec![doc("r", "he runs daily")],
+        Metric::DotProduct,
+        &stem,
+    )
+    .await
+    .unwrap();
+    assert_eq!(find(&a, "running").await, ["r"]);
+    b.write("idx", vec![doc("s", "she sings")]).await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert!(
+        find(&a, "running").await.is_empty(),
+        "the fresh view kept the stemming analyzer"
+    );
+    assert_eq!(find(&a, "runs").await, ["r"]);
+}
