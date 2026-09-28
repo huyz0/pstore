@@ -303,10 +303,10 @@ async fn an_analyzer_is_fixed_when_its_index_is_created() {
     assert_eq!(b["error"]["code"], "schema_conflict", "{b}");
     fold(a).await;
     // Against the schema.
-    for other in [
-        json!({"stemming": false}),
-        json!(true),
-        json!({"k1": 1.3, "stemming": true}),
+    for (other, names) in [
+        (json!({"stemming": false}), "stemming false"),
+        (json!(true), "stemming false"),
+        (json!({"k1": 1.3, "stemming": true}), "k1 1.3"),
     ] {
         let (s, b) = put(a, &[("x", "anything")], Some(other.clone())).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{other}: {b}");
@@ -314,6 +314,11 @@ async fn an_analyzer_is_fixed_when_its_index_is_created() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(
             msg.contains("analyzer") && msg.contains("reindex") && msg.contains("copy"),
+            "{msg}"
+        );
+        // Both analyzers, spelled out: the index's, and the one declared.
+        assert!(
+            msg.contains("language english, stemming true") && msg.contains(names),
             "{msg}"
         );
     }

@@ -261,3 +261,54 @@ async fn a_patch_of_a_reserved_name_is_refused() {
         "a refused patch was buffered"
     );
 }
+
+#[tokio::test]
+async fn a_patch_never_resurrects_a_row_a_delete_vector_buries() {
+    // `x` is deleted at one fold and patched -- by id, and by a filter its old row admits --
+    // at the next. Its old row is still in its segment, buried only by the delete vector, so
+    // a fold that read it as a current version would patch it back to life.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(57), LaneId(1));
+    let mut x = Document::new("x", vec![1.0, 0.5]);
+    x.attrs.insert("a".to_owned(), Value::Int(1));
+    e.write("idx", vec![x, Document::new("y", vec![0.0, 1.0])])
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.delete("idx", vec!["x".to_owned()]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let set = || BTreeMap::from([("b".to_owned(), Value::Int(2))]);
+    e.patch(
+        "idx",
+        vec![Patch {
+            id: "x".to_owned(),
+            set: set(),
+            unset: vec![],
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    e.patch_by_filter(
+        "idx",
+        &Predicate::Cmp("a".to_owned(), Op::Eq, Value::Int(1)),
+        Patch {
+            id: String::new(),
+            set: set(),
+            unset: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let ids: Vec<String> = e
+        .scan("idx", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(ids, ["y"]);
+}
