@@ -6,7 +6,7 @@
 //! ever travels from this process's writer to a fold, so it has no version but its tags. A
 //! tag it does not know decodes as `None`, never as a different predicate.
 
-use crate::filter::{Op, Predicate};
+use crate::filter::{Op, Predicate, TokenOp};
 use pstore_format::Value;
 
 /// Deeper than any filter a client writes: bounds the decoder's recursion.
@@ -123,6 +123,28 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
             b.push(6);
             put_pred(b, q);
         }
+        // M14.2: the operator, the text, and the analyzer when one is bound.
+        Predicate::Tokens(a, op, text, analyzer) => {
+            b.push(7);
+            put_str(b, a);
+            b.push(match op {
+                TokenOp::All => 0,
+                TokenOp::Any => 1,
+                TokenOp::Sequence => 2,
+            });
+            put_str(b, text);
+            match analyzer {
+                None => b.push(0),
+                Some(an) => {
+                    b.push(1);
+                    let full = pstore_format::text::FullText {
+                        analyzer: *an,
+                        ..pstore_format::text::FullText::default()
+                    };
+                    put_str(b, &full.encode());
+                }
+            }
+        }
     }
 }
 
@@ -220,6 +242,22 @@ impl Reader<'_> {
                 }
             }
             6 => Predicate::Not(Box::new(self.pred(depth + 1)?)),
+            7 => {
+                let a = self.string()?;
+                let op = match self.u8()? {
+                    0 => TokenOp::All,
+                    1 => TokenOp::Any,
+                    2 => TokenOp::Sequence,
+                    _ => return None,
+                };
+                let text = self.string()?;
+                let analyzer = match self.u8()? {
+                    0 => None,
+                    1 => Some(pstore_format::text::FullText::decode(&self.string()?)?.analyzer),
+                    _ => return None,
+                };
+                Predicate::Tokens(a, op, text, analyzer)
+            }
             _ => return None,
         })
     }
@@ -246,6 +284,18 @@ mod tests {
             Predicate::ContainsAny(a(), vec![Value::Str(String::new())]),
             Predicate::Or(vec![]),
             Predicate::Not(Box::new(Predicate::And(vec![]))),
+            Predicate::Tokens(a(), TokenOp::All, "x y".into(), None),
+            Predicate::Tokens(a(), TokenOp::Any, String::new(), None),
+            Predicate::Tokens(
+                a(),
+                TokenOp::Sequence,
+                "Häuser".into(),
+                Some(pstore_format::text::Analyzer {
+                    language: pstore_format::text::Language::German,
+                    stemming: true,
+                    ..pstore_format::text::Analyzer::default()
+                }),
+            ),
         ])
     }
 
@@ -265,6 +315,7 @@ mod tests {
             format!("{good}00"),
             good[..good.len() - 2].to_owned(),
             "07".to_owned(),
+            "08".to_owned(),
             // A Cmp with an unknown operator.
             format!("00{}{}", "01000000", "6109"),
         ] {

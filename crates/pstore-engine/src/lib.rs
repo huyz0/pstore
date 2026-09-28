@@ -462,10 +462,18 @@ fn encoded(cond: &pstore_query::Predicate) -> Result<String, EngineError> {
 
 /// A deferred operation's condition: `Some(None)` for none, `None` for one that cannot be
 /// read -- which admits nothing, so an operation it guards is skipped rather than applied.
-fn condition_of(d: &Document) -> Option<Option<pstore_query::Predicate>> {
+///
+/// ⚠️ **The fold's one bind** (M14.2): every token predicate in it is bound to `analyzer`,
+/// the fold's schema's. `resolve`, `by_filter` and the fold's `keep` all read through here.
+fn condition_of(
+    d: &Document,
+    analyzer: &pstore_format::text::Analyzer,
+) -> Option<Option<pstore_query::Predicate>> {
     match d.attrs.get(COND_ATTR) {
         None => Some(None),
-        Some(pstore_format::Value::Str(s)) => pstore_query::condition::decode(s).map(Some),
+        Some(pstore_format::Value::Str(s)) => {
+            pstore_query::condition::decode(s).map(|p| Some(p.bound(analyzer)))
+        }
         Some(_) => None,
     }
 }
@@ -507,13 +515,14 @@ fn merged(mut base: Document, patch: &Document) -> Document {
 fn resolve(
     ops: Vec<Document>,
     base: &std::collections::HashMap<String, Document>,
+    analyzer: &pstore_format::text::Analyzer,
 ) -> (Vec<String>, Vec<Document>) {
     let mut state: std::collections::HashMap<String, Option<Document>> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for op in ops {
         if is_by_filter(&op) {
-            by_filter(&op, base, &mut state, &mut order);
+            by_filter(&op, base, &mut state, &mut order, analyzer);
             continue;
         }
         let id = op.id.clone();
@@ -521,7 +530,7 @@ fn resolve(
             Some(v) => v.clone(),
             None => base.get(&id).cloned(),
         };
-        let cond = condition_of(&op);
+        let cond = condition_of(&op, analyzer);
         let admits = |cur: &Document| match &cond {
             Some(None) => true,
             Some(Some(p)) => p.admits(&cur.id, &cur.attrs),
@@ -619,8 +628,9 @@ fn by_filter(
     base: &std::collections::HashMap<String, Document>,
     state: &mut std::collections::HashMap<String, Option<Document>>,
     order: &mut Vec<String>,
+    analyzer: &pstore_format::text::Analyzer,
 ) {
-    let Some(Some(filter)) = condition_of(op) else {
+    let Some(Some(filter)) = condition_of(op, analyzer) else {
         return;
     };
     let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
@@ -961,6 +971,9 @@ struct Scope {
     settle: Option<(Head, Vec<LaneId>)>,
     /// Live folded rows by HEAD's arithmetic: the count fast path's answer (M12).
     live: u64,
+    /// The full-text schema its filters bind to (M14.2), by the rule a relevance query's
+    /// view uses.
+    fts: FullText,
 }
 
 /// What [`Engine::aggregate_as`] returns (M12).
@@ -2389,6 +2402,13 @@ impl<S: BlobStore> Engine<S> {
             let mut prepared_for: BTreeMap<String, Vec<Prepared>> = BTreeMap::new();
             for idx in deferred {
                 let docs = by_index.remove(&idx).unwrap_or_default();
+                // M14.2: conditions bind to the index's analyzer -- the one this fold records,
+                // when it creates the index.
+                let fts = at
+                    .head
+                    .schemas
+                    .get(&idx)
+                    .map_or_else(|| self.implied(&docs).fts, |s| s.fts);
                 let needed: std::collections::HashSet<&str> = docs
                     .iter()
                     .filter(|d| is_deferred(d) && !is_by_filter(d))
@@ -2399,7 +2419,7 @@ impl<S: BlobStore> Engine<S> {
                 let filters: Vec<pstore_query::Predicate> = docs
                     .iter()
                     .filter(|d| is_by_filter(d))
-                    .filter_map(|d| condition_of(d).flatten())
+                    .filter_map(|d| condition_of(d, &fts.analyzer).flatten())
                     .collect();
                 let keep = |d: &Document| {
                     needed.contains(d.id.as_str())
@@ -2413,7 +2433,7 @@ impl<S: BlobStore> Engine<S> {
                     .flat_map(|p| std::mem::take(&mut p.kept))
                     .map(|(_, d)| (d.id.clone(), d))
                     .collect();
-                let (changed, sealed) = resolve(docs, &base);
+                let (changed, sealed) = resolve(docs, &base, &fts.analyzer);
                 touched.insert(idx.clone(), changed.into_iter().collect());
                 by_index.insert(idx.clone(), sealed);
                 prepared_for.insert(idx, prepared);
@@ -3440,6 +3460,9 @@ impl<S: BlobStore> Engine<S> {
             .map(|s| s.fts)
             .or(fresh_fts)
             .unwrap_or_default();
+        // M14.2: a read's one bind, where its view is resolved.
+        let bound = filter.map(|f| f.bound(&fts.analyzer));
+        let filter = bound.as_ref();
         // From the HEAD already read, or -- an index not yet folded -- from its unfolded rows.
         let metric = at
             .head
@@ -3752,6 +3775,9 @@ impl<S: BlobStore> Engine<S> {
         // (M9f.2).
         let schema = schema_at(&at.head, index, epoch);
         let metric = schema.metric;
+        // M14.2: bound to that epoch's analyzer.
+        let bound = filter.map(|f| f.bound(&schema.fts.analyzer));
+        let filter = bound.as_ref();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
             &*self.store,
@@ -3895,10 +3921,14 @@ impl<S: BlobStore> Engine<S> {
             watermarks,
             staleness,
             settle,
+            fts,
             ..
         } = self
             .scope(index, as_of, consistency, allow_hit, hit)
             .await?;
+        // M14.2: a read's one bind, where its view is resolved.
+        let bound = filter.map(|f| f.bound(&fts.analyzer));
+        let filter = bound.as_ref();
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
         let (selected, settled) = futures_util::future::join(
             pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
@@ -3952,11 +3982,12 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
     ) -> Result<Scope, EngineError> {
-        let (head, epoch, settle, staleness, unfolded, shadow, shadowed) = match as_of {
+        let (head, epoch, settle, staleness, unfolded, shadow, shadowed, fts) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 self.remember_schemas(&at.head);
                 let then = at.head.as_of(epoch)?;
+                let fts = schema_at(&at.head, index, epoch).fts;
                 (
                     then,
                     epoch,
@@ -3965,6 +3996,7 @@ impl<S: BlobStore> Engine<S> {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     false,
+                    fts,
                 )
             }
             None => {
@@ -3976,12 +4008,28 @@ impl<S: BlobStore> Engine<S> {
                 self.remember_schemas(&at.head);
                 // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
-                let (rows, shadow) = got.fresh.map_or_else(
-                    || (Vec::new(), std::collections::HashSet::new()),
-                    |v| (v.rows, v.shadow),
+                let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
+                    || (Vec::new(), std::collections::HashSet::new(), None),
+                    |v| (v.rows, v.shadow, Some(v.fts)),
                 );
+                let fts = at
+                    .head
+                    .schemas
+                    .get(index)
+                    .map(|s| s.fts)
+                    .or(fresh_fts)
+                    .unwrap_or_default();
                 let epoch = at.head.epoch;
-                (at.head, epoch, settle, got.staleness, rows, shadow, true)
+                (
+                    at.head,
+                    epoch,
+                    settle,
+                    got.staleness,
+                    rows,
+                    shadow,
+                    true,
+                    fts,
+                )
             }
         };
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
@@ -4005,6 +4053,7 @@ impl<S: BlobStore> Engine<S> {
             staleness,
             settle,
             live,
+            fts,
         })
     }
 
@@ -4072,6 +4121,9 @@ impl<S: BlobStore> Engine<S> {
         let scope = self
             .scope(index, as_of, consistency, allow_hit, hit)
             .await?;
+        // M14.2: a read's one bind, where its view is resolved.
+        let bound = filter.map(|f| f.bound(&scope.fts.analyzer));
+        let filter = bound.as_ref();
         // ⚠️ **Live reads only** (code review, B1): `Head::as_of` rebuilds a buried segment and a
         // buried delete vector with a count of 0, so a past epoch's arithmetic is wrong after a
         // compaction or a replaced vector. The full path reads the vectors themselves.

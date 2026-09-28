@@ -2300,6 +2300,18 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
                         Predicate::Not(Box::new(p))
                     })
                 }
+                // M14.2: token predicates, bound to the index's analyzer by the engine.
+                "ContainsAllTokens" | "ContainsAnyToken" | "ContainsTokenSequence" => {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| bad(format!("{op} takes a string of text")))?;
+                    let how = match op {
+                        "ContainsAllTokens" => pstore_query::TokenOp::All,
+                        "ContainsAnyToken" => pstore_query::TokenOp::Any,
+                        _ => pstore_query::TokenOp::Sequence,
+                    };
+                    Ok(Predicate::Tokens(attr, how, text.to_owned(), None))
+                }
                 other => Err(bad(format!("unknown operator {other}"))),
             }
         }

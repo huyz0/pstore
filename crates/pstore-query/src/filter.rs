@@ -26,6 +26,17 @@ pub enum Op {
     Gte,
 }
 
+/// How a token predicate matches the query's tokens against a row's (M14.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenOp {
+    /// Every query token is among the row's: `ContainsAllTokens`.
+    All,
+    /// At least one is: `ContainsAnyToken`.
+    Any,
+    /// They appear consecutively and in order: `ContainsTokenSequence`.
+    Sequence,
+}
+
 /// A predicate over one document's id and attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
@@ -44,12 +55,48 @@ pub enum Predicate {
     Or(Vec<Predicate>),
     /// Not the clause. `NotEq v` is `Not(Cmp(Eq, v))`, so it admits an absent attribute.
     Not(Box<Predicate>),
+    /// The attribute's tokens against the text's, both analyzed by the analyzer (M14.2): the
+    /// index's, which the engine [binds](Predicate::bound). A missing or non-string
+    /// attribute -- an array included -- is false.
+    ///
+    /// ⚠️ **Unbound is unknown**, and unknown admits nothing whatever encloses it, `Not`
+    /// included (spec review round 2): answering as the default analyzer, or as "everything"
+    /// under a `Not`, would be a wrong answer from a missed bind that no test could tell
+    /// from a right one on a default index.
+    Tokens(
+        String,
+        TokenOp,
+        String,
+        Option<pstore_format::text::Analyzer>,
+    ),
 }
 
 impl Predicate {
-    /// Whether a document with this id and these attributes is admitted.
+    /// Whether a document with this id and these attributes is admitted: only when the whole
+    /// predicate is known true.
     #[must_use]
     pub fn admits(&self, id: &str, attrs: &BTreeMap<String, Value>) -> bool {
+        self.eval(id, attrs) == Some(true)
+    }
+
+    /// This predicate with every token predicate in it bound to `analyzer` (M14.2).
+    #[must_use]
+    pub fn bound(&self, analyzer: &pstore_format::text::Analyzer) -> Self {
+        match self {
+            Self::Tokens(name, op, text, _) => {
+                Self::Tokens(name.clone(), *op, text.clone(), Some(*analyzer))
+            }
+            Self::And(all) => Self::And(all.iter().map(|p| p.bound(analyzer)).collect()),
+            Self::Or(any) => Self::Or(any.iter().map(|p| p.bound(analyzer)).collect()),
+            Self::Not(p) => Self::Not(Box::new(p.bound(analyzer))),
+            other => other.clone(),
+        }
+    }
+
+    /// Three-valued: `None` when an unbound token predicate is anywhere in it. Strictly --
+    /// `And(false, unknown)` is unknown too, so no enclosing `Not` can turn a missed bind into
+    /// an answer.
+    fn eval(&self, id: &str, attrs: &BTreeMap<String, Value>) -> Option<bool> {
         let get = |name: &str| -> Option<Value> {
             if name == ID {
                 Some(Value::Str(id.to_owned()))
@@ -57,7 +104,7 @@ impl Predicate {
                 attrs.get(name).cloned()
             }
         };
-        match self {
+        Some(match self {
             Self::Cmp(name, op, want) => get(name).is_some_and(|have| compare(&have, *op, want)),
             Self::Absent(name) => get(name).is_none(),
             Self::In(name, set) => {
@@ -69,10 +116,33 @@ impl Predicate {
                     .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
                 _ => false,
             },
-            Self::And(all) => all.iter().all(|p| p.admits(id, attrs)),
-            Self::Or(any) => any.iter().any(|p| p.admits(id, attrs)),
-            Self::Not(p) => !p.admits(id, attrs),
-        }
+            Self::And(all) => {
+                let known = all
+                    .iter()
+                    .map(|p| p.eval(id, attrs))
+                    .collect::<Option<Vec<bool>>>()?;
+                return Some(known.into_iter().all(|b| b));
+            }
+            Self::Or(any) => {
+                let known = any
+                    .iter()
+                    .map(|p| p.eval(id, attrs))
+                    .collect::<Option<Vec<bool>>>()?;
+                return Some(known.into_iter().any(|b| b));
+            }
+            Self::Not(p) => return p.eval(id, attrs).map(|b| !b),
+            Self::Tokens(name, op, text, analyzer) => {
+                let a = analyzer.as_ref()?;
+                return Some(match get(name) {
+                    Some(Value::Str(s)) => tokens_match(
+                        *op,
+                        &pstore_format::text::analyze(a, text),
+                        &pstore_format::text::analyze(a, &s),
+                    ),
+                    _ => false,
+                });
+            }
+        })
     }
 
     /// Whether a block with these zone maps **could** hold an admitted row. `false` only
@@ -114,7 +184,19 @@ impl Predicate {
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
             Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
+            // Tokens have no zone: every block could hold a match (M14.2).
+            Self::Tokens(..) => true,
         }
+    }
+}
+
+/// Whether a row's tokens satisfy `op` against the query's (M14.2). An empty query is the
+/// vacuous reading: every string for `All` and `Sequence`, none for `Any`.
+fn tokens_match(op: TokenOp, query: &[String], row: &[String]) -> bool {
+    match op {
+        TokenOp::All => query.iter().all(|q| row.contains(q)),
+        TokenOp::Any => query.iter().any(|q| row.contains(q)),
+        TokenOp::Sequence => query.is_empty() || row.windows(query.len()).any(|w| w == query),
     }
 }
 
@@ -302,5 +384,57 @@ mod tests {
         assert!(!lt.admits("x", &a));
         let gt = Predicate::Cmp("a".to_owned(), Op::Gt, Value::Str("5".to_owned()));
         assert!(!gt.admits("x", &a));
+    }
+
+    #[test]
+    fn tokens_are_three_valued_and_never_admit_unbound() {
+        use pstore_format::text::Analyzer;
+        let row = BTreeMap::from([
+            ("t".to_owned(), Value::Str("the quick brown fox".to_owned())),
+            (
+                "arr".to_owned(),
+                Value::Array(vec![Value::Str("fox".to_owned())]),
+            ),
+        ]);
+        let tok = |op, text: &str| Predicate::Tokens("t".to_owned(), op, text.to_owned(), None);
+        let d = Analyzer::default();
+        let yes = |p: Predicate| p.bound(&d).admits("x", &row);
+        assert!(yes(tok(TokenOp::All, "fox QUICK")));
+        assert!(!yes(tok(TokenOp::All, "fox wolf")));
+        assert!(yes(tok(TokenOp::Any, "fox wolf")));
+        assert!(!yes(tok(TokenOp::Any, "wolf")));
+        assert!(yes(tok(TokenOp::Sequence, "quick brown")));
+        assert!(!yes(tok(TokenOp::Sequence, "brown quick")));
+        assert!(!yes(tok(TokenOp::Sequence, "quick fox")));
+        // The vacuous readings of a query with no tokens.
+        assert!(yes(tok(TokenOp::All, "")));
+        assert!(yes(tok(TokenOp::Sequence, "!!")));
+        assert!(!yes(tok(TokenOp::Any, "")));
+        // An array of strings, or a missing attribute, admits nothing.
+        let arr = Predicate::Tokens("arr".to_owned(), TokenOp::Any, "fox".to_owned(), None);
+        assert!(!yes(arr));
+        assert!(!yes(Predicate::Tokens(
+            "no".to_owned(),
+            TokenOp::All,
+            String::new(),
+            None
+        )));
+        // Unbound: nothing, under every composition -- `Not` and `Or` included.
+        let unbound = tok(TokenOp::Any, "wolf");
+        let t = Predicate::And(vec![]);
+        let f = Predicate::Or(vec![]);
+        for p in [
+            unbound.clone(),
+            Predicate::Not(Box::new(unbound.clone())),
+            Predicate::Or(vec![t.clone(), unbound.clone()]),
+            Predicate::Not(Box::new(Predicate::And(vec![f, unbound.clone()]))),
+        ] {
+            assert!(!p.admits("x", &row), "{p:?}");
+            assert!(
+                p.bound(&d).admits("x", &row) || matches!(p, Predicate::Tokens(..)),
+                "{p:?}"
+            );
+        }
+        assert!(tok(TokenOp::All, "x").could_admit(&Zones::default()));
     }
 }

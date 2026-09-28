@@ -164,7 +164,8 @@ is amended: the analyzer is part of the schema, and segments are built under it.
 3. As `upsert_condition`, `delete_by_filter` and `patch_by_filter`, a stemmed token predicate
    decides at the fold as the query does, including in the fold that creates the schema.
 4. Every token predicate survives `condition::encode`/`decode`.
-5. A filtered query with a token predicate stays within 3 sequential rounds.
+5. A token predicate adds no round (M9b's rule): depth equals the same query unfiltered, and
+   an ordered query's is at most 3. (Amended: a ranked query is 4 deep with no filter.)
 6. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.
 
 ### Test plan
@@ -191,8 +192,7 @@ Unchanged for writes, queries and folds: analysis is CPU over bytes already read
   compaction re-seals with the default. Nothing reveals it except the ranking changing.
   An old fold also reads a new condition tag as `None`, and skips the write. M9d's metric has
   the same exposure, and no gate enforces upgrading before declaring.
-- **Declared but absent:** a write declaring `full_text_search` on a text field no row
-  carries still sets the schema.
+- **Declared but absent:** a declaration sets the schema even if no row carries text.
 
 ## Tasks
 
