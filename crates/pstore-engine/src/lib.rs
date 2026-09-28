@@ -586,6 +586,11 @@ pub struct Answer {
     /// also what lets a caller tell "this index does not exist" from "it matched nothing",
     /// without asking again.
     pub segments: Vec<SegmentRef>,
+    /// The epoch of the manifest the segments came from (M10): the HEAD a live query read,
+    /// or the epoch an `as_of` query asked for. ⚠️ Never this engine's last commit, which is
+    /// 0 on a process that only reads and stale on one another process has folded past.
+    /// Rows at [`Self::unfolded_at`] are this process's unfolded writes, newer than it.
+    pub epoch: Epoch,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -616,6 +621,8 @@ pub struct Ordered {
     /// Whether the index exists at all -- a segment, or an unfolded operation -- so a caller
     /// can tell "no such index" from "nothing matched" without asking again.
     pub exists: bool,
+    /// The epoch of the manifest the rows came from, as [`Answer::epoch`] (M10).
+    pub epoch: Epoch,
 }
 
 /// What HEAD knows about one index, without reading a single segment.
@@ -2649,6 +2656,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded,
                 unfolded_at,
                 segments: refs,
+                epoch: at.head.epoch,
             });
         }
 
@@ -2673,6 +2681,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded,
             unfolded_at,
             segments: refs,
+            epoch: at.head.epoch,
         })
     }
 
@@ -2797,6 +2806,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded: Vec::new(),
                 unfolded_at: 0,
                 segments: refs,
+                epoch: then.epoch,
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -2830,6 +2840,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded: Vec::new(),
             unfolded_at,
             segments: refs,
+            epoch: then.epoch,
         })
     }
 
@@ -2890,14 +2901,20 @@ impl<S: BlobStore> Engine<S> {
             ));
         }
         let mut settle: Option<(Head, Vec<LaneId>)> = None;
-        let (refs, targets, unfolded, shadow) = match as_of {
+        let (refs, targets, unfolded, shadow, epoch) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 self.remember_schemas(&at.head);
                 let then = at.head.as_of(epoch)?;
                 let refs = then.indexes.get(index).cloned().unwrap_or_default();
                 let targets = segment_targets(&refs, &then.deletes, false);
-                (refs, targets, Vec::new(), std::collections::HashSet::new())
+                (
+                    refs,
+                    targets,
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    then.epoch,
+                )
             }
             None => {
                 let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
@@ -2912,7 +2929,7 @@ impl<S: BlobStore> Engine<S> {
                     || (Vec::new(), std::collections::HashSet::new()),
                     |v| (v.rows, v.shadow),
                 );
-                (refs, targets, rows, shadow)
+                (refs, targets, rows, shadow, at.head.epoch)
             }
         };
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
@@ -2955,6 +2972,7 @@ impl<S: BlobStore> Engine<S> {
             rows,
             unfolded,
             exists,
+            epoch,
         })
     }
 

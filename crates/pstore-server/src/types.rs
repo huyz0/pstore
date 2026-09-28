@@ -234,7 +234,8 @@ pub struct ResultRow {
 /// What the answer cost and how fresh it is.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryMeta {
-    /// The epoch the answer was computed against.
+    /// The epoch the answer was computed against: the HEAD it read, or its `as_of` (M10).
+    /// Rows from this process's unfolded writes are newer, and counted in `unfolded_hits`.
     pub epoch: u64,
     /// Hits served from the freshness layer rather than from a segment.
     ///

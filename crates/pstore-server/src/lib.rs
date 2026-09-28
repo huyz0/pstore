@@ -931,7 +931,6 @@ async fn run<E: BlobStore>(
             format!("this tenant has no index {index}"),
         )
     };
-    let epoch = || req.as_of.unwrap_or_else(|| engine.epoch().0);
     let consistency = level(req)?;
     let (legs, filter, fusion) = match plan {
         Plan::Ordered(by, filter) => {
@@ -960,7 +959,7 @@ async fn run<E: BlobStore>(
                         dist: None,
                     })
                     .collect(),
-                epoch: epoch(),
+                epoch: got.epoch.0,
                 unfolded_hits: got.unfolded,
                 consistency: level_name(consistency),
             });
@@ -1015,7 +1014,7 @@ async fn run<E: BlobStore>(
                 dist,
             })
             .collect(),
-        epoch: epoch(),
+        epoch: answer.epoch.0,
         unfolded_hits,
         consistency: level_name(consistency),
     })
