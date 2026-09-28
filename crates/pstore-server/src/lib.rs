@@ -767,13 +767,18 @@ fn patches_of(
         }
     }
     rows.into_iter()
-        .map(|(id, attrs)| patch_of(id, attrs, dated))
+        .map(|(id, attrs)| {
+            let who = format!("patch of {id}");
+            patch_of(id, &who, attrs, dated)
+        })
         .collect()
 }
 
 /// One patch of `id`: `attributes` converted as a document's are, `null` removing one.
+/// Refusals name `who`.
 fn patch_of(
     id: String,
+    who: &str,
     attrs: serde_json::Map<String, serde_json::Value>,
     dated: &std::collections::BTreeSet<String>,
 ) -> Result<pstore_engine::Patch, ApiError> {
@@ -787,11 +792,11 @@ fn patch_of(
     // Converted as a document's attributes are: every refusal of one is a patch's too.
     let as_doc: types::DocumentIn =
         serde_json::from_value(serde_json::json!({"id": id, "vector": [], "attributes": set}))
-            .map_err(|e| ApiError::bad_request(format!("patch of {id}: {e}")))?;
+            .map_err(|e| ApiError::bad_request(format!("{who}: {e}")))?;
     for name in &unset {
         if name.is_empty() || name.starts_with('$') || name == pstore_query::ID_ATTRIBUTE {
             return Err(ApiError::bad_request(format!(
-                "patch of {id}: attribute `{name}` is reserved"
+                "{who}: attribute `{name}` is reserved"
             )));
         }
     }
@@ -831,8 +836,14 @@ fn patch_by_filter_of(
         return Err(bad());
     };
     let filter = write_filter("patch_by_filter", f)?;
-    let patch = patch_of(String::new(), attrs.clone(), dated)
-        .map_err(|e| ApiError::bad_request(format!("patch_by_filter: {}", e.message)))?;
+    // Refusals from the document conversion name no operation, so they are prefixed here.
+    let patch = patch_of(String::new(), "patch_by_filter", attrs.clone(), dated).map_err(|e| {
+        if e.message.starts_with("patch_by_filter") {
+            e
+        } else {
+            ApiError::bad_request(format!("patch_by_filter: {}", e.message))
+        }
+    })?;
     Ok((filter, patch))
 }
 
@@ -907,7 +918,8 @@ async fn write_documents<S: BlobStore + 'static>(
         || patch_by.is_some();
     if deferred && !matches!(req.durability, types::Durability::Durable) {
         return Err(ApiError::bad_request(
-            "patches and conditional writes are durable only: they are applied at a fold, which \
+            "patches, conditional writes and by-filter operations are durable only: they are \
+             applied at a fold, which \
              reads only what a flush made durable",
         ));
     }

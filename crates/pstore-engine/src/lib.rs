@@ -2285,14 +2285,12 @@ impl<S: BlobStore> Engine<S> {
                         || filters.iter().any(|f| f.admits(&d.id, &d.attrs))
                 };
                 let prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
+                let mut prepared = prepared;
+                // Moved out, not cloned: `supersede` needs ids and positions only.
                 let base: std::collections::HashMap<String, Document> = prepared
-                    .iter()
-                    .flat_map(|p| {
-                        p.kept
-                            .iter()
-                            .filter(|(row, _)| !p.deleted.contains(row))
-                            .map(|(_, d)| (d.id.clone(), d.clone()))
-                    })
+                    .iter_mut()
+                    .flat_map(|p| std::mem::take(&mut p.kept))
+                    .map(|(_, d)| (d.id.clone(), d))
                     .collect();
                 let (changed, sealed) = resolve(docs, &base);
                 touched.insert(idx.clone(), changed.into_iter().collect());
@@ -2520,7 +2518,8 @@ impl<S: BlobStore> Engine<S> {
                                 attrs: BTreeMap::new(),
                             },
                         ));
-                        if keep(&d) {
+                        // A row a delete vector already buries is no current version.
+                        if !deleted.contains(&row) && keep(&d) {
                             kept.push((row, d));
                         }
                     }

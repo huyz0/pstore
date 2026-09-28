@@ -192,6 +192,22 @@ async fn what_a_by_filter_operation_cannot_mean_is_refused() {
             "patch_by_filter",
         ),
         (
+            json!({"durability": "durable", "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": 5}}),
+            "patch_by_filter",
+        ),
+        (
+            json!({"durability": "durable", "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": {"$x": 1}}}),
+            "patch_by_filter",
+        ),
+        (
+            json!({"durability": "durable", "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": {"a": [[1]]}}}),
+            "patch_by_filter",
+        ),
+        (
+            json!({"durability": "durable", "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": {"$x": null}}}),
+            "patch_by_filter",
+        ),
+        (
             json!({"durability": "batched", "delete_by_filter": ["n", "Eq", 1]}),
             "durable",
         ),
@@ -201,4 +217,42 @@ async fn what_a_by_filter_operation_cannot_mean_is_refused() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(msg.contains(why), "{body}: {msg:?} does not name {why:?}");
     }
+}
+
+#[tokio::test]
+async fn a_by_filter_operation_never_revives_a_row_deleted_earlier_in_its_fold() {
+    let w = apis(&[1]);
+    let a = &w[0];
+    write(a, json!({"documents": [doc(1), doc(2)]})).await;
+    fold(a).await;
+    write(a, json!({"deletes": ["d00001"]})).await;
+    write(
+        a,
+        json!({"patch_by_filter": {"filters": ["n", "Lt", 100], "attributes": {"seen": true}}}),
+    )
+    .await;
+    fold(a).await;
+    let got = rows(a).await;
+    assert_eq!(got.keys().collect::<Vec<_>>(), ["d00002"], "{got:?}");
+    assert_eq!(got["d00002"]["seen"], true);
+}
+
+#[tokio::test]
+async fn one_request_patches_by_filter_then_deletes_by_filter() {
+    let w = apis(&[1]);
+    let a = &w[0];
+    write(a, json!({"documents": [doc(1), doc(2), doc(3)]})).await;
+    fold(a).await;
+    // The patch marks two rows; the delete, applied after it, removes what it marked.
+    write(
+        a,
+        json!({
+            "patch_by_filter": {"filters": ["n", "Lt", 3], "attributes": {"gone": true}},
+            "delete_by_filter": ["gone", "Eq", true],
+        }),
+    )
+    .await;
+    fold(a).await;
+    let got = rows(a).await;
+    assert_eq!(got.keys().collect::<Vec<_>>(), ["d00003"], "{got:?}");
 }

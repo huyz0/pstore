@@ -209,3 +209,24 @@ async fn a_by_filter_operation_judges_whole_rows_not_the_ids_a_fold_keeps() {
         .collect();
     assert_eq!(ids, ["x"]);
 }
+
+#[tokio::test]
+async fn a_by_filter_filter_the_fold_cannot_read_is_refused_at_the_call() {
+    let mut deep = Predicate::Cmp("a".to_owned(), Op::Eq, Value::Int(1));
+    for _ in 0..80 {
+        deep = Predicate::Not(Box::new(deep));
+    }
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(56), LaneId(1));
+    let patch = Patch {
+        id: String::new(),
+        set: BTreeMap::from([("a".to_owned(), Value::Int(2))]),
+        unset: vec![],
+    };
+    assert!(e.delete_by_filter("idx", &deep).await.is_err());
+    assert!(e.patch_by_filter("idx", &deep, patch).await.is_err());
+    assert_eq!(
+        e.flush().await.unwrap(),
+        None,
+        "a refused operation was buffered"
+    );
+}
