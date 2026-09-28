@@ -820,6 +820,8 @@ async fn query_index<S: BlobStore + 'static>(
         return Ok(with_session(
             axum::Json(QueryResponse {
                 results: got.results,
+                aggregations: got.aggregations,
+                aggregation_groups: got.aggregation_groups,
                 meta: QueryMeta {
                     epoch: got.epoch,
                     unfolded_hits: got.unfolded_hits,
@@ -903,13 +905,121 @@ fn multi_query(
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
             }
+            // A multi-query's results are lists of rows; an aggregation's are not (M12).
+            if q.get("aggregate_by").is_some() {
+                return Err(ApiError::bad_request(
+                    "aggregate_by inside a multi-query is not offered",
+                ));
+            }
             parse_query(q.clone())
         })
         .collect()
 }
 
+/// An aggregation's labels, groups and bound (M12), or `None` for a query that asks for rows.
+fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>, ApiError> {
+    use pstore_query::Aggregate;
+    let Some(raw) = &req.aggregate_by else {
+        if req.group_by.is_some() {
+            return Err(ApiError::bad_request("group_by without aggregate_by"));
+        }
+        return Ok(None);
+    };
+    for (field, present) in [
+        ("vector", req.vector.is_some()),
+        ("text", req.text.is_some()),
+        ("rank_by", req.rank_by.is_some()),
+        ("offset", req.offset.is_some()),
+        ("fusion", req.fusion.is_some()),
+        ("include_attributes", req.include_attributes.is_some()),
+        ("exclude_attributes", req.exclude_attributes.is_some()),
+    ] {
+        if present {
+            return Err(ApiError::bad_request(format!(
+                "aggregate_by cannot be combined with {field}"
+            )));
+        }
+    }
+    let labels = raw
+        .as_object()
+        .filter(|o| (1..=MAX_AGGREGATES).contains(&o.len()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "aggregate_by maps 1 to {MAX_AGGREGATES} labels to an aggregate"
+            ))
+        })?;
+    let mut out = Vec::with_capacity(labels.len());
+    for (label, v) in labels {
+        let malformed =
+            || ApiError::bad_request(format!("aggregate {label} must be [kind, attribute]"));
+        let (kind, attr) = match v.as_array().map(Vec::as_slice) {
+            Some([kind, attr]) => (
+                kind.as_str().ok_or_else(malformed)?,
+                attr.as_str().ok_or_else(malformed)?,
+            ),
+            _ => return Err(malformed()),
+        };
+        let agg = match (kind, attr) {
+            ("Count", pstore_query::ID_ATTRIBUTE) => Aggregate::Count(None),
+            ("Count", a) => Aggregate::Count(Some(a.to_owned())),
+            ("Sum", pstore_query::ID_ATTRIBUTE) => {
+                return Err(ApiError::bad_request(format!(
+                    "aggregate {label}: Sum of id is not a number"
+                )));
+            }
+            ("Sum", a) => Aggregate::Sum(a.to_owned()),
+            (other, _) => {
+                return Err(ApiError::bad_request(format!(
+                    "aggregate {label}: {other} is not Count or Sum"
+                )));
+            }
+        };
+        out.push((label.clone(), agg));
+    }
+    let group_by: Vec<String> = match &req.group_by {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .filter(|a| (1..=MAX_GROUP_BY).contains(&a.len()))
+            .and_then(|a| {
+                a.iter()
+                    .map(|n| n.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("group_by is 1 to {MAX_GROUP_BY} attribute names"))
+            })?,
+    };
+    if let Some((label, _)) = out.iter().find(|(l, _)| group_by.contains(l)) {
+        return Err(ApiError::bad_request(format!(
+            "label {label} is also a group_by attribute: a group would carry it twice"
+        )));
+    }
+    Ok(Some(pstore_query::AggregateSpec {
+        labels: out,
+        group_by,
+        top_k: req.top_k,
+    }))
+}
+
+/// Labels one aggregation may compute (M12).
+const MAX_AGGREGATES: usize = 16;
+/// Attributes one aggregation may group by (M12).
+const MAX_GROUP_BY: usize = 8;
+
+/// A total as JSON: a float sum that overflowed has no JSON number, so it is `null` (M12).
+fn total_json(t: pstore_query::Total) -> serde_json::Value {
+    match t {
+        pstore_query::Total::Int(n) => serde_json::Value::from(n),
+        pstore_query::Total::Float(f) => serde_json::Value::from(f),
+        pstore_query::Total::Null => serde_json::Value::Null,
+    }
+}
+
 /// What a query will run, decided -- and refused -- before it runs.
 enum Plan {
+    /// Counts and sums, optionally grouped (M12).
+    Aggregate(pstore_query::AggregateSpec, Option<pstore_query::Predicate>),
     /// A `rank_by` order (M9e).
     Ordered(pstore_query::OrderBy, Option<pstore_query::Predicate>),
     /// A relevance ranking: its legs, filter and fusion.
@@ -923,6 +1033,10 @@ enum Plan {
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
     let filter = req.filters.as_ref().map(predicate).transpose()?;
+    // Before both: an aggregation has no vector, text or order by definition (M12).
+    if let Some(spec) = aggregation(req)? {
+        return Ok(Plan::Aggregate(spec, filter));
+    }
     // ⚠️ Before `prefetch`, which refuses a query with no vector and no text: an ordered query
     // has neither by definition (M9e).
     if let Some(by) = order_by(req)? {
@@ -1071,6 +1185,10 @@ struct Answered {
     token: session::Token,
     /// How old the HEAD served was (M11.2).
     staleness_ms: u64,
+    /// An ungrouped aggregation's totals (M12).
+    aggregations: Option<serde_json::Map<String, serde_json::Value>>,
+    /// A grouped aggregation's groups (M12).
+    aggregation_groups: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// Runs a planned query.
@@ -1105,6 +1223,54 @@ async fn run<E: BlobStore>(
         }
     };
     let (legs, filter, fusion) = match plan {
+        Plan::Aggregate(spec, filter) => {
+            let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
+            let group_by = spec.group_by.clone();
+            let got = engine
+                .aggregate_as(
+                    index,
+                    spec,
+                    filter.as_ref(),
+                    req.as_of.map(pstore_types::Epoch),
+                    consistency,
+                )
+                .await?;
+            // ⚠️ Before "no such index", as for an order.
+            let token = checked(got.epoch.0, &got.watermarks)?;
+            if !got.exists {
+                return Err(missing());
+            }
+            let rows: Vec<serde_json::Map<String, serde_json::Value>> = got
+                .groups
+                .into_iter()
+                .map(|(key, totals)| {
+                    let mut row = serde_json::Map::new();
+                    for (attr, k) in group_by.iter().zip(&key) {
+                        let v = k.value().as_ref().map_or(serde_json::Value::Null, to_json);
+                        row.insert(attr.clone(), v);
+                    }
+                    for (name, t) in names.iter().zip(totals) {
+                        row.insert(name.clone(), total_json(t));
+                    }
+                    row
+                })
+                .collect();
+            let (aggregations, aggregation_groups) = if group_by.is_empty() {
+                (rows.into_iter().next(), None)
+            } else {
+                (None, Some(rows))
+            };
+            return Ok(Answered {
+                token,
+                staleness_ms: millis(got.staleness),
+                results: Vec::new(),
+                epoch: got.epoch.0,
+                unfolded_hits: got.unfolded,
+                consistency: level_name(level),
+                aggregations,
+                aggregation_groups,
+            });
+        }
         Plan::Ordered(by, filter) => {
             let got = engine
                 .ordered_as(
@@ -1125,6 +1291,8 @@ async fn run<E: BlobStore>(
             return Ok(Answered {
                 token,
                 staleness_ms: millis(got.staleness),
+                aggregations: None,
+                aggregation_groups: None,
                 results: got
                     .rows
                     .into_iter()
@@ -1196,6 +1364,8 @@ async fn run<E: BlobStore>(
         consistency: level_name(level),
         token,
         staleness_ms: millis(answer.staleness),
+        aggregations: None,
+        aggregation_groups: None,
     })
 }
 

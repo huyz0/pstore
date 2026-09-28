@@ -52,7 +52,7 @@ M9 milestones is the order in which the difference has to be closed.
 | `rank_by: [attr, "ANN", vec]`, `"kNN"` (exact) | ANN only; exact only below 25,000 rows | **M9d** exposes `kNN` (the `Rerank::Exact` rung already exists) |
 | `rank_by: [attr, "BM25", q]`, `Sum`, `Max`, `Product`, `Saturate`, `Decay` | one BM25 field, RRF-fused with the vector leg | **M9g** |
 | `rank_by: [attr, "asc"\|"desc"]`, `offset`, paging by `id` | none | **M9e** — and it is the export path, as turbopuffer made it |
-| `aggregate_by: Count, Sum`, `group_by` | none | **M12**: needed M9b's filter evaluation first, which has landed |
+| `aggregate_by: Count, Sum`, `group_by` | none | **Landed in [M12](../../milestones/M12/SPEC.md)**: `Count` and `Sum`, grouped by up to 8 attributes, the `top_k` smallest groups exact in bounded memory; an unfiltered count is HEAD's arithmetic. Not inside a multi-query |
 | multi-query (≤ 16), `rerank_by: ["RRF", {rank_constant, weights}]` | two legs, RRF `k = 60` fixed; `score` is the RRF value | **M9g** |
 | `consistency: strong \| eventual` (strong default) | other processes see a write only after an operator `fold` | **M9i** — a scheduled fold (M9i.1); `eventual` default and `strong` by refusal (M9i.2). `session` tokens per [session-and-affinity-protocol.md](session-and-affinity-protocol.md) landed in [M11.1](../../milestones/M11/SPEC.md), without the routing hint; `bounded(max_staleness_ms)` in M11.2 |
 | `$dist` per row; `billing`, `performance` | `score`; `meta.cost` in blob requests and bytes | Ours is already more honest about cost (D34); `$dist` with M9d |

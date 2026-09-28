@@ -12,12 +12,14 @@
 //! and every functional test passes. `store.rs` makes the same point about ranges: width is
 //! free, depth is not.
 
+mod aggregate;
 pub mod deletes;
 mod filter;
 mod fuse;
 mod order;
 mod run;
 
+pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
 pub use filter::{ID as ID_ATTRIBUTE, Op, Predicate};
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
 pub use order::{OrderBy, Selector, select};

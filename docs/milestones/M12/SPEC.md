@@ -34,6 +34,8 @@ through the API means paging every id out of it.
 - With any float, the sum is an `f64`, the integers converted, summed in the order the rows
   are visited. That order is not stable across folds, so the last bits may differ.
 - A sum over no numeric value is `0`.
+- A float sum that overflows to ±∞ is reported as `null`, since JSON cannot carry it (spec
+  review).
 
 **The response.**
 - Without `group_by`: `{"aggregations": {"n": 42, "total": 17.5}, "results": [], "meta": …}`.
@@ -45,11 +47,19 @@ through the API means paging every id out of it.
 **What a group is.**
 - A group's key is the tuple of its rows' `group_by` values, absent as `null`.
 - Numbers group by numeric value, so `1` and `1.0` are one group. An integral float within
-  the `i64` range is reported as an integer. This is the filters' equality (M9h.1), not
-  `Value`'s structural one.
-- Arrays group as whole values.
-- Keys order as a `rank_by` ascending does: bools, numbers, datetimes, strings, arrays, and
-  absent last.
+  the `i64` range is reported as an integer, exactly, even above 2^53. This is the filters'
+  equality (M9h.1), not `Value`'s structural one. A datetime is never a number.
+- Arrays group as whole values, element by element, with the same scalar rules, so `[1]` and
+  `[1.0]` are one key.
+- **The order** (spec review, M1):
+  - A scalar key orders by type group as a `rank_by` ascending does: bools, numbers,
+    datetimes, strings, arrays, and absent last. Within a group it orders by value: `false` before
+    `true`, numbers by numeric value, datetimes by instant, and strings bytewise.
+  - Arrays order lexicographically by element, a proper prefix first. (`rank_by` ties
+    arrays; a group has no id to break the tie, so it needs this total order.)
+  - A tuple of several `group_by` attributes orders lexicographically, by attribute in
+    request order.
+  - Two keys are one group exactly when this order calls them equal.
 
 **Bounded memory, exact answers.**
 - Only the `top_k` smallest keys are held: a key larger than every kept key, when the
@@ -66,9 +76,19 @@ through the API means paging every id out of it.
 - `Engine::aggregate_as` does for aggregation what `ordered_as` does for an order: the same
   HEAD and fresh-view handling, `strong` probes, `bounded` cache and fallback.
 
-**The count fast path.** When there is no filter and no `group_by`, every aggregate is
-`["Count", "id"]`, and the index has nothing unfolded in this process, the count is HEAD's
-arithmetic. It is each segment's rows less its deleted rows (HEAD carries both), as
+**The count fast path.** When there is no filter and no `group_by`, and every aggregate is
+`["Count", "id"]`, the count may be HEAD's arithmetic.
+- **When** (spec review, M3): the decision is made on the fresh view from the **same**
+  `head_and_fresh_as` call as the full path, never on the memtable read beforehand. With
+  any unfolded row or delete for the index in that view, it takes the full path.
+- **As of a past epoch:** it counts `Head::as_of`'s segments and deletes.
+- **An index with no segment and nothing unfolded** is `404`, on both paths, as for an order
+  (`exists`).
+- **Levels** (spec review, M2): every level runs as on the full path. `strong` still probes
+  its lanes, a `session` token is still checked, and a `bounded` hit reads nothing. So
+  "1 read" is `eventual`'s cost.
+
+The count itself is each segment's rows less its deleted rows (HEAD carries both), as
 `index_stats` counts documents. So it is **one read**, and no segment is opened. That is
 [`query-path.md`](../../research/08-query-engine/query-path.md)'s "answered entirely from the
 index section".
@@ -91,7 +111,7 @@ here asks for.
 
 ## Acceptance criteria
 
-1. **Count and sum.**
+1. **Count and sum.** (Test data is chosen so that no float sum cancels near 0.)
    - Over 2,000 folded rows plus unfolded writes, which include an upsert and a delete of
      folded ids, the aggregates equal a brute-force computation over the same rows. That
      covers `Count id`, `Count attr`, `Sum` of an int column, and `Sum` of a mixed int and
@@ -100,16 +120,30 @@ here asks for.
 2. **Groups.**
    - `group_by` one and two attributes: every group and its aggregates equal brute force.
    - `top_k = 3` returns exactly the 3 smallest keys, with complete aggregates, over at
-     least 3 segments whose key sets differ.
+     least 3 segments whose key sets differ. In one segment, one of the global 3 smallest
+     keys is that segment's own 3rd smallest (spec review, M4).
+   - **Memory** (spec review, M4): an aggregator offered 1,000 distinct keys with
+     `top_k = 3` holds at most 3 groups at every step, asserted by a unit test as
+     `Selector`'s bound is.
+   - Array keys `[1]`, `[1.0]` and `[1, 2]`: the first two are one group, ordered before the
+     third.
    - `1` and `1.0` form one group, and absent is `null` and last.
-3. **Fast path.** An unfiltered, ungrouped `Count id` over 2,000 folded rows in 4 segments,
-   one of them with deletes, costs exactly **1 read** and equals the full path's count. With
-   one unfolded write it takes the full path and still equals brute force.
+3. **Fast path.** An unfiltered, ungrouped `Count id` at `eventual`, over 2,000 folded rows
+   in 4 segments with one of them carrying deletes:
+   - costs exactly **1 read**, and equals the full path's count;
+   - with one unfolded write, or one unfolded delete, takes the full path and still equals
+     brute force;
+   - `as_of` a past epoch equals brute force over that epoch's rows;
+   - a missing index is `404`.
 4. **Depth.** With a filter, an aggregation's depth is at most 3.
-5. **Consistency.** A `strong` aggregation is refused while another process has an unfolded
-   write, and a `session` one with that write's token is too. `bounded` reports
-   `staleness_ms`.
-6. **Refusals.** Each case above is `400`.
+5. **Consistency.** On the fast-path shape and on a filtered one:
+   - a `strong` aggregation is refused while another process has an unfolded write;
+   - a `session` one with that write's token is refused too;
+   - a `bounded` hit reports `staleness_ms`, and reads no HEAD. On the fast-path shape it reads
+     nothing at all (spec review round 2: a filtered hit still reads its segments).
+6. **Refusals.** Each case above is `400`, and its message names the aggregation rule
+   broken. Several would otherwise be 400 for an unrelated reason, such as "needs vector"
+   (spec review, minor).
 7. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` over the diff misses 0.
 
 ## Test plan

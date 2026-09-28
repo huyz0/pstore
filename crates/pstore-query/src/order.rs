@@ -197,6 +197,42 @@ pub async fn select<S: BlobStore>(
     shadow: &HashSet<String>,
     selector: &mut Selector,
 ) -> Result<(), QueryError> {
+    let (by, cap) = (selector.by.clone(), selector.cap);
+    // ⚠️ **A selector per segment**, merged after: collecting a segment's admitted rows and
+    // selecting afterwards would hold the whole segment decoded, which is the sort this exists
+    // not to do.
+    let per_segment = visit(
+        store,
+        targets,
+        filter,
+        shadow,
+        || Selector::new(by.clone(), cap),
+        Selector::offer,
+    )
+    .await?;
+    for doc in per_segment.into_iter().flat_map(Selector::into_sorted) {
+        selector.offer(doc);
+    }
+    Ok(())
+}
+
+/// The visiting [`select`] and [`crate::aggregate`] share (M12): every admitted row of every
+/// target, less deleted and shadowed rows, offered to a sink of its segment's own -- `new`
+/// makes one per segment -- in the two rounds `select` states. Returns the sinks, in target
+/// order, for the caller to merge.
+pub(crate) async fn visit<S, T, N, O>(
+    store: &S,
+    targets: &[Target],
+    filter: Option<&Predicate>,
+    shadow: &HashSet<String>,
+    new: N,
+    offer: O,
+) -> Result<Vec<T>, QueryError>
+where
+    S: BlobStore,
+    N: Fn() -> T,
+    O: Fn(&mut T, Document),
+{
     let opened = futures_util::future::try_join_all(targets.iter().map(|t| async move {
         let (segment, deleted) =
             futures_util::future::join(Segment::open(store, &t.segment), async {
@@ -215,13 +251,10 @@ pub async fn select<S: BlobStore>(
         Ok::<_, QueryError>((segment?, deleted?))
     }))
     .await?;
-    let (by, cap) = (&selector.by, selector.cap);
-    // ⚠️ **A selector per segment**, merged after: collecting a segment's admitted rows and
-    // selecting afterwards would hold the whole segment decoded, which is the sort this exists
-    // not to do.
-    let per_segment = futures_util::future::try_join_all(opened.iter().zip(targets).map(
+    let (new, offer) = (&new, &offer);
+    futures_util::future::try_join_all(opened.iter().zip(targets).map(
         |((segment, deleted), t)| async move {
-            let mut local = Selector::new(by.clone(), cap);
+            let mut local = new();
             segment
                 .visit_rows_where(
                     store,
@@ -231,19 +264,15 @@ pub async fn select<S: BlobStore>(
                         let hidden =
                             deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
                         if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
-                            local.offer(doc);
+                            offer(&mut local, doc);
                         }
                     },
                 )
                 .await?;
-            Ok::<_, QueryError>(local.into_sorted())
+            Ok::<_, QueryError>(local)
         },
     ))
-    .await?;
-    for doc in per_segment.into_iter().flatten() {
-        selector.offer(doc);
-    }
-    Ok(())
+    .await
 }
 
 #[cfg(test)]

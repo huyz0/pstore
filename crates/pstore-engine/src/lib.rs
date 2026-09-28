@@ -632,6 +632,38 @@ struct Fetched {
     hit: bool,
 }
 
+/// What an order or an aggregation reads: see `Engine::scope`.
+struct Scope {
+    refs: Vec<SegmentRef>,
+    targets: Vec<pstore_query::Target>,
+    unfolded: Vec<Document>,
+    shadow: std::collections::HashSet<String>,
+    epoch: Epoch,
+    watermarks: BTreeMap<u64, u64>,
+    staleness: std::time::Duration,
+    settle: Option<(Head, Vec<LaneId>)>,
+    /// Live folded rows by HEAD's arithmetic: the count fast path's answer (M12).
+    live: u64,
+}
+
+/// What [`Engine::aggregate_as`] returns (M12).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aggregated {
+    /// Each group's key and its totals in label order, ascending by key; with no `group_by`,
+    /// exactly one group with an empty key.
+    pub groups: Vec<(Vec<pstore_query::Key>, Vec<pstore_query::Total>)>,
+    /// How many of this process's unfolded rows were counted.
+    pub unfolded: usize,
+    /// Whether the index exists at all, as [`Ordered::exists`].
+    pub exists: bool,
+    /// As [`Answer::epoch`].
+    pub epoch: Epoch,
+    /// As [`Answer::watermarks`].
+    pub watermarks: BTreeMap<u64, u64>,
+    /// As [`Answer::staleness`].
+    pub staleness: std::time::Duration,
+}
+
 /// What [`Engine::ordered`] returns (M9e).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ordered {
@@ -3163,61 +3195,23 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
-        let mut settle: Option<(Head, Vec<LaneId>)> = None;
-        let mut staleness = std::time::Duration::ZERO;
-        let (refs, targets, unfolded, shadow, epoch, watermarks) = match as_of {
-            Some(epoch) => {
-                let at = head::read(&*self.store, self.tenant).await?;
-                self.remember_schemas(&at.head);
-                let then = at.head.as_of(epoch)?;
-                let refs = then.indexes.get(index).cloned().unwrap_or_default();
-                let targets = segment_targets(&refs, &then.deletes, false);
-                (
-                    refs,
-                    targets,
-                    Vec::new(),
-                    std::collections::HashSet::new(),
-                    then.epoch,
-                    then.watermarks.clone(),
-                )
-            }
-            None => {
-                let got = self
-                    .head_and_fresh_as(index, consistency, allow_hit)
-                    .await?;
-                *hit = got.hit;
-                staleness = got.staleness;
-                let (at, fresh, lanes) = (got.at, got.fresh, got.lanes);
-                self.remember_schemas(&at.head);
-                // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
-                if let Some(lanes) = lanes {
-                    settle = Some((at.head.clone(), lanes));
-                }
-                let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
-                let targets = segment_targets(&refs, &at.head.deletes, true);
-                let (rows, shadow) = fresh.map_or_else(
-                    || (Vec::new(), std::collections::HashSet::new()),
-                    |v| (v.rows, v.shadow),
-                );
-                (
-                    refs,
-                    targets,
-                    rows,
-                    shadow,
-                    at.head.epoch,
-                    at.head.watermarks.clone(),
-                )
-            }
-        };
+        let Scope {
+            refs,
+            targets,
+            unfolded,
+            shadow,
+            epoch,
+            watermarks,
+            staleness,
+            settle,
+            ..
+        } = self
+            .scope(index, as_of, consistency, allow_hit, hit)
+            .await?;
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
         let (selected, settled) = futures_util::future::join(
             pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
-            async {
-                match &settle {
-                    Some((head, lanes)) => self.settled(head, Some(lanes)).await,
-                    None => Ok(true),
-                }
-            },
+            self.settled_scope(settle.as_ref()),
         )
         .await;
         selected.map_err(|e| EngineError::Query(e.to_string()))?;
@@ -3252,6 +3246,185 @@ impl<S: BlobStore> Engine<S> {
             epoch,
             watermarks,
             staleness,
+        })
+    }
+
+    /// What an order or an aggregation reads (M9e, M12): the manifest -- HEAD, or HEAD as of a
+    /// past epoch -- its segments as targets, and this process's unfolded rows consistent with
+    /// it. The same HEAD handling for both, `strong`'s probe state and the `bounded` cache
+    /// included, so neither can drift from the other.
+    async fn scope(
+        &self,
+        index: &str,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<Scope, EngineError> {
+        let (head, epoch, settle, staleness, unfolded, shadow, shadowed) = match as_of {
+            Some(epoch) => {
+                let at = head::read(&*self.store, self.tenant).await?;
+                self.remember_schemas(&at.head);
+                let then = at.head.as_of(epoch)?;
+                (
+                    then,
+                    epoch,
+                    None,
+                    std::time::Duration::ZERO,
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    false,
+                )
+            }
+            None => {
+                let got = self
+                    .head_and_fresh_as(index, consistency, allow_hit)
+                    .await?;
+                *hit = got.hit;
+                let at = got.at;
+                self.remember_schemas(&at.head);
+                // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
+                let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
+                let (rows, shadow) = got.fresh.map_or_else(
+                    || (Vec::new(), std::collections::HashSet::new()),
+                    |v| (v.rows, v.shadow),
+                );
+                let epoch = at.head.epoch;
+                (at.head, epoch, settle, got.staleness, rows, shadow, true)
+            }
+        };
+        let refs = head.indexes.get(index).cloned().unwrap_or_default();
+        let targets = segment_targets(&refs, &head.deletes, shadowed);
+        // Live rows by HEAD's arithmetic, as `index_stats` counts documents: each segment's
+        // rows less its deleted ones (M9c.2). What the count fast path answers from (M12).
+        let live = refs
+            .iter()
+            .map(|r| {
+                let gone = head.deletes.get(&r.key).map_or(0, |(_, n)| *n);
+                u64::from(r.rows.saturating_sub(gone))
+            })
+            .sum();
+        Ok(Scope {
+            refs,
+            targets,
+            unfolded,
+            shadow,
+            epoch,
+            watermarks: head.watermarks,
+            staleness,
+            settle,
+            live,
+        })
+    }
+
+    /// Whether `settle` -- a strong read's HEAD and lanes -- finds nothing unfolded.
+    async fn settled_scope(
+        &self,
+        settle: Option<&(Head, Vec<LaneId>)>,
+    ) -> Result<bool, EngineError> {
+        match settle {
+            Some((head, lanes)) => self.settled(head, Some(lanes)).await,
+            None => Ok(true),
+        }
+    }
+
+    /// Counts and sums the rows of `index` that `filter` admits, optionally grouped (M12), at
+    /// a [`Consistency`] or `as_of` a past epoch, as [`Self::ordered_as`] reads them.
+    ///
+    /// ⚠️ **The count fast path**: with no filter, no group, only row counts, and nothing
+    /// unfolded in the **same** fresh view the full path would use, the count is HEAD's
+    /// arithmetic -- no segment is opened.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_as`].
+    pub async fn aggregate_as(
+        &self,
+        index: &str,
+        spec: pstore_query::AggregateSpec,
+        filter: Option<&pstore_query::Predicate>,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+    ) -> Result<Aggregated, EngineError> {
+        if as_of.is_some() && consistency == Consistency::Strong {
+            return Err(EngineError::Query(
+                "strong with as_of: a past epoch is already exactly what it is".to_owned(),
+            ));
+        }
+        // As `ordered_as`: a failed read from the `bounded` cache retries fresh (M11.2).
+        let mut hit = false;
+        let first = self
+            .aggregate_once(index, &spec, filter, as_of, consistency, true, &mut hit)
+            .await;
+        match first {
+            Err(_) if hit => {
+                self.aggregate_once(index, &spec, filter, as_of, consistency, false, &mut hit)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the aggregation's own parameters, its level, and the cache's say"
+    )]
+    async fn aggregate_once(
+        &self,
+        index: &str,
+        spec: &pstore_query::AggregateSpec,
+        filter: Option<&pstore_query::Predicate>,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<Aggregated, EngineError> {
+        let scope = self
+            .scope(index, as_of, consistency, allow_hit, hit)
+            .await?;
+        let fast = filter.is_none()
+            && spec.counts_rows_only()
+            && scope.unfolded.is_empty()
+            && scope.shadow.is_empty();
+        let mut aggregator = pstore_query::Aggregator::new(spec.clone());
+        let (visited, settled) = futures_util::future::join(
+            async {
+                if fast {
+                    return Ok(());
+                }
+                pstore_query::aggregate(
+                    &*self.store,
+                    &scope.targets,
+                    filter,
+                    &scope.shadow,
+                    &mut aggregator,
+                )
+                .await
+            },
+            self.settled_scope(scope.settle.as_ref()),
+        )
+        .await;
+        visited.map_err(|e| EngineError::Query(e.to_string()))?;
+        if !settled? {
+            return Err(EngineError::NotFolded);
+        }
+        if fast {
+            aggregator.count_rows(scope.live);
+        }
+        let exists = !scope.refs.is_empty() || !scope.unfolded.is_empty();
+        let mut unfolded = 0;
+        for d in &scope.unfolded {
+            if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
+                aggregator.offer(d);
+                unfolded += 1;
+            }
+        }
+        Ok(Aggregated {
+            groups: aggregator.finish(),
+            unfolded,
+            exists,
+            epoch: scope.epoch,
+            watermarks: scope.watermarks,
+            staleness: scope.staleness,
         })
     }
 

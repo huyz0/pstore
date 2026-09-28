@@ -98,7 +98,7 @@ layers below it, so the dependency list *is* the architecture. `cargo-deny` addi
   candidate.)
 - OQ-67: `rkyv` vs `bitcode` vs flatbuffers for the manifest — needs forward/backward
   compatibility rules first.
-- OQ-68: Is DataFusion worth adopting for aggregations, or does it drag in too much?
+- ~~OQ-68~~: Is DataFusion worth adopting for aggregations, or does it drag in too much? **Answered by [M12](../../milestones/M12/SPEC.md): no, for Count, Sum and `group_by`.**
 
 ## Sources
 

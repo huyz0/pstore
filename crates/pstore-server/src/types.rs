@@ -193,6 +193,13 @@ pub struct QueryRequest {
     /// ranking (M9e). `attr` may be `id`, which is how an index is exported, a page at a time.
     #[serde(default)]
     pub rank_by: Option<serde_json::Value>,
+    /// `{label: ["Count" | "Sum", attr]}`: counts and sums instead of rows (M12). Parsed by
+    /// `lib.rs`'s `aggregation`.
+    #[serde(default)]
+    pub aggregate_by: Option<serde_json::Value>,
+    /// Attributes whose values group an aggregation (M12). Refused without `aggregate_by`.
+    #[serde(default)]
+    pub group_by: Option<serde_json::Value>,
     /// Documents of a `rank_by` order to skip (M9e). Refused without `rank_by`.
     #[serde(default)]
     pub offset: Option<usize>,
@@ -312,8 +319,14 @@ pub struct MultiQueryMeta {
 /// The answer to a query.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResponse {
-    /// The ranking.
+    /// The ranking. Empty for an aggregation (M12).
     pub results: Vec<ResultRow>,
+    /// An aggregation without `group_by`: each label's total (M12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregations: Option<serde_json::Map<String, serde_json::Value>>,
+    /// An aggregation with `group_by`: each group's key and totals, ascending by key (M12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation_groups: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     /// Cost and freshness.
     pub meta: QueryMeta,
 }

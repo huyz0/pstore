@@ -120,7 +120,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-63` RRF `k` default (60 vs 10) ·
 `OQ-65` multi-vector storage layout ·
 `OQ-67` manifest serialization format ·
-`OQ-68` DataFusion for aggregations ·
+~~`OQ-68`~~ DataFusion for aggregations — **ANSWERED (M12): no.** Count, Sum and bounded `group_by` over the existing row visitor are a few hundred lines; DataFusion's weight buys SQL nothing here asks for ·
 `OQ-69` io_uring for the NVMe cache tier ·
 `OQ-70` core split between Tokio and the scan pool ·
 `OQ-71` `simsimd` dispatch overhead ·
