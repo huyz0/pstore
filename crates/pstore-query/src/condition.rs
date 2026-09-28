@@ -327,6 +327,15 @@ mod tests {
         ] {
             assert_eq!(decode(&bad), None, "{bad}");
         }
+        // An array inside an array: a value no filter writes (M13 sweep).
+        let nested = format!("00{}61{}05{}05{}", "01000000", "00", "01000000", "00000000");
+        assert_eq!(decode(&nested), None, "{nested}");
+        // Exactly at the bound: decodes (M13 sweep).
+        let mut edge = Predicate::And(vec![]);
+        for _ in 0..MAX_DEPTH {
+            edge = Predicate::Not(Box::new(edge));
+        }
+        assert_eq!(decode(&encode(&edge)), Some(edge));
         // Nested past the bound.
         let mut deep = Predicate::And(vec![]);
         for _ in 0..=MAX_DEPTH {
