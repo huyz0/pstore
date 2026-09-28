@@ -19,10 +19,8 @@ becomes terms uses it:
 Before the first fold there is no schema. Places 3–5 then use the **first declared analyzer
 among the unfolded rows**, else the default, as `fresh_metric` does for M9d.
 
-The **default analyzer** is today's: split on anything not alphanumeric, lowercase, nothing
-else, with `k1 = 1.2` and `b = 0.75`.
-
-Every existing index, and every HEAD written before M14, reads as it did.
+The **default analyzer** is today's (split on non-alphanumerics, lowercase; `k1 = 1.2`,
+`b = 0.75`), so every existing index and pre-M14 HEAD reads as it did.
 
 ## M14.1 — analyzer options
 
@@ -33,23 +31,20 @@ Every existing index, and every HEAD written before M14, reads as it did.
   - `language`: one of the 18 that the `rust-stemmers` crate's Snowball stemmers cover,
     default `english`;
   - `stemming`, `remove_stopwords`, `case_sensitive` and `ascii_folding`, all default false.
-    - Stopwords are the Lucene English set, so asking for them with another language is
-      refused.
-    - Folding is NFKD with the combining marks dropped (`unicode-normalization`): `é` becomes
-      `e`, and `ß` and `æ` stay as they are.
+    - Stopwords are the Lucene English set; another language with stopwords is refused.
+    - Folding is NFKD without combining marks (`unicode-normalization`): `é` becomes `e`;
+      `ß` and `æ` stay.
 
-  The steps run in order: split, case, fold, stopwords, stem. `analyze(&Analyzer, &str)`
-  replaces `analyze(&str)`.
-  - ⚠️ A `case_sensitive` index keeps `The` past the lowercase stopword list, and Snowball
-    does not stem `Running`. That is stated, not repaired.
+  Steps run split, case, fold, stopwords, stem; `analyze(&Analyzer, &str)` replaces
+  `analyze(&str)`. ⚠️ So a `case_sensitive` index keeps `The` past the lowercase stopword
+  list, and Snowball does not stem `Running`: stated, not repaired.
 - **`k1` and `b`** are stored as `f32` beside the analyzer, with `k1` in `[0, 3]` and `b` in
   `[0, 1]`. A declaration is converted to `f32` before it is compared, so re-declaring `1.2`
   equals the stored value.
 - **Wire.**
   - The write's `schema` map (M9h.3) accepts `{"<text field>": {"type": "string",
     "full_text_search": true | {options}}}`, where `true` means the default.
-  - An unknown option or value is refused, and so is naming an attribute that is not the
-    index's text field.
+  - An unknown option or value is refused, as is an attribute other than the text field.
   - `GET /v1/indexes/{index}` reports the analyzer, `k1` and `b`.
 - **`$fts`**, a reserved row attribute carrying the encoded declaration, is written for
   **every** declaration, the default included.
@@ -59,19 +54,17 @@ Every existing index, and every HEAD written before M14, reads as it did.
     the fold, else the default.
   - A row declaring a different analyzer than the schema is dropped by the reject pass and
     counted in `rejected_rows`.
-  - `stripped()` removes `$fts` as it removes `$metric`, so it never reaches a segment or a
-    response.
+  - `stripped()` removes `$fts` as it does `$metric`: never in a segment or a response.
 - **The door** checks a declaration against:
   - the cached schema;
-  - this process's unfolded rows, the `known` rung of M9d.
+  - this process's unfolded rows: the first one *declaring* an analyzer, since an undeclared
+    one has no opinion.
 
   A different one is `schema_conflict` naming "the analyzer". The message says a change is a
   reindex into a new index, and names M16's copy as the path.
 - **HEAD** gains a trailing section for every schema, live or dropped, whose analyzer, `k1`
-  or `b` differs from the default. It uses M9d's mechanism, so an older HEAD decodes with the
-  default.
-- **Queries.** A BM25 leg analyzes with the view's analyzer and scores with its `k1` and `b`.
-  `as_of` an epoch uses that epoch's schema, including a dropped index's.
+  or `b` is not the default (M9d's mechanism: an older HEAD decodes as the default).
+- **Queries.** BM25 analyzes and scores with the view's schema; `as_of` uses that epoch's.
 
 **Does not change:** the segment format, the dictionary, any operation's request count, or
 two-pass IDF. The parity doc's row, which says "an analyzer is part of the segment format",
@@ -144,13 +137,19 @@ is amended: the analyzer is part of the schema, and segments are built under it.
   - A query with no tokens admits every string for `All` and `Sequence`, and none for `Any`.
   - ⚠️ With stopwords removed, `bank of america` matches `bank in america`, because no
     positions are kept.
-- **Binding.** A token predicate carries `Option<Analyzer>`, and an **unbound one admits
-  nothing**. A missed bind then fails every token test, even on a default index, rather than
-  answering as the default. There is one bind per path:
+- **Binding.** A token predicate carries `Option<Analyzer>`, and **evaluation is three-valued**
+  (spec review round 2):
+  - an unbound one is *unknown*;
+  - `Not`, `And` and `Or` keep unknown as unknown;
+  - `admits` is true only when the whole filter is known true.
+
+  So no composition of an unbound predicate admits a row, `Not` included. A missed bind
+  fails every token test rather than answering as the default, or as everything. There is one
+  bind per path:
   - for reads, where the view is resolved, with the view's analyzer (place 3's rule before a
     fold);
-  - for deferred operations, in `condition_of`, with the fold's schema, `implied()`'s when
-    the fold creates it. The fold's `keep` and `resolve` both read through it.
+  - for deferred operations, in `condition_of`, with the fold's schema, `implied()`'s when the
+    fold creates it. The fold's `keep` and `resolve` both read through it.
 - **No index.** Zone maps admit every block, and evaluation is per row on the attribute
   already read, in queries, aggregations, conditions and by-filter operations.
   `condition.rs` gains their tags, and an unknown tag still decodes as `None`.
@@ -160,7 +159,8 @@ is amended: the analyzer is part of the schema, and segments are built under it.
 1. Each predicate equals brute force over 2,000 rows under a **stemming** English analyzer,
    where the default's answer differs. This includes `Not`, `And` and `Or`, arrays and
    non-strings, and an attribute other than the text field.
-2. The same predicates give the same answer in an aggregation, and before the first fold.
+2. The same predicates give the same answer in an ordered query, in an aggregation, and
+   before the first fold.
 3. As `upsert_condition`, `delete_by_filter` and `patch_by_filter`, a stemmed token predicate
    decides at the fold as the query does, including in the fold that creates the schema.
 4. Every token predicate survives `condition::encode`/`decode`.
@@ -173,13 +173,13 @@ is amended: the analyzer is part of the schema, and segments are built under it.
 |---|---|---|
 | 1 | the filter is refused | `All` as `Any`; the order ignored in `Sequence`; a query bound to the default |
 | 2 | as 1 | the aggregation path or the fresh view unbound |
-| 3 | as 1 | `condition_of` unbound, so `keep` never loads the row; the fold binding HEAD's schema instead of `implied()`'s |
+| 3 | as 1 | `condition_of` unbound, so `keep` never loads the row; the fold binding HEAD's schema instead of `implied()`'s; `Not` of an unbound predicate admitting all, caught by `delete_by_filter` of a `Not(token)` |
 | 4 | a tag is missing | a tag or the analyzer dropped in the encoding |
 | 5 | as 1 | a token predicate adding a round |
 
 ## RA budget
 
-Unchanged for writes, queries and folds. Analysis is CPU over bytes already read.
+Unchanged for writes, queries and folds: analysis is CPU over bytes already read.
 
 ## Risks
 
@@ -189,8 +189,8 @@ Unchanged for writes, queries and folds. Analysis is CPU over bytes already read
 - **A mixed-version cluster erases the analyzer.** `Head::decode` ignores trailing sections
   it does not know, so a pre-M14 process's next commit drops the section, and its
   compaction re-seals with the default. Nothing reveals it except the ranking changing.
-  M9d's metric has the same exposure. An upgrade must reach every process before an index
-  declares an analyzer.
+  An old fold also reads a new condition tag as `None`, and skips the write. M9d's metric has
+  the same exposure, and no gate enforces upgrading before declaring.
 - **Declared but absent:** a write declaring `full_text_search` on a text field no row
   carries still sets the schema.
 
