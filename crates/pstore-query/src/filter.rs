@@ -163,10 +163,10 @@ fn glob_runs(glob: &str) -> Vec<String> {
         match c {
             '*' | '?' => runs.push(String::new()),
             '[' => {
-                for c in it.by_ref() {
-                    if c == ']' {
-                        break;
-                    }
+                // Read exactly as `glob_regex` reads it (code review, M15 B1): a class whose
+                // end is found differently here would leave its members in a required run.
+                if glob_class(&mut it).is_err() {
+                    return vec![String::new()];
                 }
                 runs.push(String::new());
             }
@@ -230,28 +230,49 @@ fn glob_regex(glob: &str, ci: bool) -> Result<String, String> {
             '*' => out.push_str(".*"),
             '?' => out.push('.'),
             '\\' => out.push_str(&lit(it.next().ok_or("a glob ends in an escape")?)),
-            '[' => {
-                let mut class = String::from("[");
-                let mut first = true;
-                loop {
-                    let c = it.next().ok_or("a glob has an unterminated [")?;
-                    match c {
-                        ']' if !first => break,
-                        '!' if first => class.push('^'),
-                        '-' if !first && !class.ends_with('[') && !class.ends_with('^') => {
-                            class.push('-');
-                        }
-                        c => class.push_str(&lit(c)),
-                    }
-                    first = false;
-                }
-                class.push(']');
-                out.push_str(&class);
-            }
+            '[' => out.push_str(&glob_class(&mut it)?),
             c => out.push_str(&lit(c)),
         }
     }
     out.push_str("\\z");
+    Ok(out)
+}
+
+/// A glob class, read after its `[`, as a regex class: an optional leading `!` negates it, the
+/// first member may be `]`, `a-z` is a range, and every other character -- a `-` included -- is
+/// a member. The one reader both the translation and the literal runs use.
+fn glob_class(it: &mut std::str::Chars<'_>) -> Result<String, String> {
+    let unterminated = || "a glob has an unterminated [".to_owned();
+    let mut members: Vec<char> = Vec::new();
+    let mut negated = false;
+    let mut first = true;
+    loop {
+        let c = it.next().ok_or_else(unterminated)?;
+        match c {
+            '!' if first && !negated && members.is_empty() => {
+                negated = true;
+                continue;
+            }
+            ']' if !first => break,
+            c => members.push(c),
+        }
+        first = false;
+    }
+    let mut out = String::from(if negated { "[^" } else { "[" });
+    let mut i = 0;
+    while let Some(&c) = members.get(i) {
+        match (members.get(i + 1), members.get(i + 2)) {
+            (Some('-'), Some(&hi)) => {
+                out.push_str(&format!("{}-{}", lit(c), lit(hi)));
+                i += 3;
+            }
+            _ => {
+                out.push_str(&lit(c));
+                i += 1;
+            }
+        }
+    }
+    out.push(']');
     Ok(out)
 }
 

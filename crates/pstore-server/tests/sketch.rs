@@ -335,3 +335,36 @@ async fn a_fuzzy_match_at_distance_k_is_never_pruned() {
     let f = json!(["s", "Fuzzy", {"value": "abXdefgYij", "max_edits": 2}]);
     assert_eq!(run(a, &f).await.0, BTreeSet::from(["d00150".to_owned()]));
 }
+
+#[tokio::test]
+async fn a_glob_class_never_prunes_a_match() {
+    // Code review, M15 B1: a class opening with `]`, or `!]`, read one way by the translation
+    // and another by the literal runs, required trigrams no match holds.
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    let values = ["xyz", "]yz", "ayz", "zzz", "ab"];
+    let docs: Vec<Value> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({"id": format!("d{i}"), "vector": [1.0, 0.5], "attributes": {"s": v, "u": v}}))
+        .collect();
+    let (s, b) = put(a, json!({"schema": declared(), "documents": docs})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    for folded in [false, true] {
+        if folded {
+            fold(a).await;
+        }
+        for (g, want) in [
+            ("[]x]yz", vec!["d0", "d1"]),
+            ("[!]x]yz", vec!["d2"]),
+            ("[]]*", vec!["d1"]),
+            ("[a-]b", vec!["d4"]),
+        ] {
+            let want: BTreeSet<String> = want.into_iter().map(str::to_owned).collect();
+            for attr in ["s", "u"] {
+                let got = run(a, &json!([attr, "Glob", g])).await.0;
+                assert_eq!(got, want, "{attr} {g} folded={folded}");
+            }
+        }
+    }
+}

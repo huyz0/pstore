@@ -72,7 +72,7 @@ async fn ids(api: &A, f: &Value) -> BTreeSet<String> {
 /// newline and a slash for a careless glob.
 const ALPHABET: &[char] = &[
     'a', 'b', 'c', 'A', 'B', 's', 'S', 'ſ', 'σ', 'ς', 'Σ', 'µ', 'μ', 'Μ', 'k', 'K', '\u{212A}',
-    'İ', 'i', '/', '\n', ' ', '.', '*', 'x',
+    'İ', 'i', '/', '\n', ' ', '.', '*', 'x', ']', '-', '+',
 ];
 
 fn string(i: usize) -> String {
@@ -117,12 +117,10 @@ fn glob(p: &[char], s: &[char], ci: bool) -> bool {
         Some('*') => (0..=s.len()).any(|i| glob(&p[1..], &s[i..], ci)),
         Some('?') => !s.is_empty() && glob(&p[1..], &s[1..], ci),
         Some('[') => {
-            let close = p.iter().skip(2).position(|c| *c == ']').unwrap() + 2;
-            let (neg, body) = if p[1] == '!' {
-                (true, &p[2..close])
-            } else {
-                (false, &p[1..close])
-            };
+            // The first member, after an optional `!`, may be `]`.
+            let start = if p[1] == '!' { 2 } else { 1 };
+            let close = p.iter().skip(start + 1).position(|c| *c == ']').unwrap() + start + 1;
+            let (neg, body) = (start == 2, &p[start..close]);
             let Some(&c) = s.first() else { return false };
             let mut hit = false;
             let mut k = 0;
@@ -165,7 +163,7 @@ fn cases() -> Vec<Case> {
     let mut out: Vec<Case> = Vec::new();
     let globs = [
         "a*", "*b*", "?c*", "[ab]*", "[!a]*", "[a-c]?*", "*\\**", "*/*", "*\n*", "ſ*", "*σ*", "K*",
-        "*İ", "s?k", "*", "",
+        "*İ", "s?k", "*", "", "[]x]*", "[!]x]*", "[]]a*", "[+--]*", "*[a-]",
     ];
     for g in globs {
         let p: Vec<char> = g.chars().collect();

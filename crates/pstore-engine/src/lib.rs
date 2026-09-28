@@ -462,21 +462,41 @@ fn encoded(cond: &pstore_query::Predicate) -> Result<String, EngineError> {
         .ok_or_else(|| EngineError::Format("a condition nests too deeply".to_owned()))
 }
 
-/// A deferred operation's condition: `Some(None)` for none, `None` for one that cannot be
-/// read -- which admits nothing, so an operation it guards is skipped rather than applied.
-///
-/// ⚠️ **The fold's one bind** (M14.2): every token predicate in it is bound to `analyzer`,
-/// the fold's schema's. `resolve`, `by_filter` and the fold's `keep` all read through here.
-fn condition_of(
-    d: &Document,
-    analyzer: &pstore_format::text::Analyzer,
-) -> Option<Option<pstore_query::Predicate>> {
-    match d.attrs.get(COND_ATTR) {
-        None => Some(None),
-        Some(pstore_format::Value::Str(s)) => {
-            pstore_query::condition::decode(s).map(|p| Some(p.bound(analyzer)))
+/// One fold's deferred conditions, each decoded once (code review, M15 M1): a write stamps
+/// one condition on every document it carries, and decoding compiles its patterns.
+struct Conditions<'a> {
+    analyzer: &'a pstore_format::text::Analyzer,
+    decoded: std::collections::HashMap<String, Option<pstore_query::Predicate>>,
+}
+
+impl<'a> Conditions<'a> {
+    fn new(analyzer: &'a pstore_format::text::Analyzer) -> Self {
+        Self {
+            analyzer,
+            decoded: std::collections::HashMap::new(),
         }
-        Some(_) => None,
+    }
+
+    /// A deferred operation's condition: `Some(None)` for none, `None` for one that cannot
+    /// be read -- which admits nothing, so an operation it guards is skipped, not applied.
+    ///
+    /// ⚠️ **The fold's one bind** (M14.2): every token predicate in it is bound to the fold's
+    /// analyzer. `resolve`, `by_filter` and the fold's `keep` all read through here.
+    fn of(&mut self, d: &Document) -> Option<Option<pstore_query::Predicate>> {
+        match d.attrs.get(COND_ATTR) {
+            None => Some(None),
+            Some(pstore_format::Value::Str(s)) => {
+                let analyzer = self.analyzer;
+                self.decoded
+                    .entry(s.clone())
+                    .or_insert_with(|| {
+                        pstore_query::condition::decode(s).map(|p| p.bound(analyzer))
+                    })
+                    .clone()
+                    .map(Some)
+            }
+            Some(_) => None,
+        }
     }
 }
 
@@ -517,14 +537,14 @@ fn merged(mut base: Document, patch: &Document) -> Document {
 fn resolve(
     ops: Vec<Document>,
     base: &std::collections::HashMap<String, Document>,
-    analyzer: &pstore_format::text::Analyzer,
+    cx: &mut Conditions<'_>,
 ) -> (Vec<String>, Vec<Document>) {
     let mut state: std::collections::HashMap<String, Option<Document>> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for op in ops {
         if is_by_filter(&op) {
-            by_filter(&op, base, &mut state, &mut order, analyzer);
+            by_filter(&op, base, &mut state, &mut order, cx);
             continue;
         }
         let id = op.id.clone();
@@ -532,7 +552,7 @@ fn resolve(
             Some(v) => v.clone(),
             None => base.get(&id).cloned(),
         };
-        let cond = condition_of(&op, analyzer);
+        let cond = cx.of(&op);
         let admits = |cur: &Document| match &cond {
             Some(None) => true,
             Some(Some(p)) => p.admits(&cur.id, &cur.attrs),
@@ -630,9 +650,9 @@ fn by_filter(
     base: &std::collections::HashMap<String, Document>,
     state: &mut std::collections::HashMap<String, Option<Document>>,
     order: &mut Vec<String>,
-    analyzer: &pstore_format::text::Analyzer,
+    cx: &mut Conditions<'_>,
 ) {
-    let Some(Some(filter)) = condition_of(op, analyzer) else {
+    let Some(Some(filter)) = cx.of(op) else {
         return;
     };
     let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
@@ -1754,6 +1774,17 @@ impl<S: BlobStore> Engine<S> {
         mark: Option<String>,
         declared: &Declared,
     ) -> Result<(), EngineError> {
+        // `id` is no attribute a segment stores, so a sketch of it would describe nothing --
+        // or a user attribute of that name, and prune `id` filters by it (code review, M15).
+        if declared
+            .trigram
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|n| n == pstore_query::ID_ATTRIBUTE))
+        {
+            return Err(EngineError::Format(
+                "\"id\" cannot be declared regex: it is not sketched".to_owned(),
+            ));
+        }
         let mut docs = docs;
         for d in &mut docs {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
@@ -2521,12 +2552,13 @@ impl<S: BlobStore> Engine<S> {
                     .filter(|d| is_deferred(d) && !is_by_filter(d))
                     .map(|d| d.id.as_str())
                     .collect();
+                let mut cx = Conditions::new(&fts.analyzer);
                 // M13.2: and every row a by-filter operation's filter admits. A filter that
                 // cannot be read admits nothing, as `resolve` reads it.
                 let filters: Vec<pstore_query::Predicate> = docs
                     .iter()
                     .filter(|d| is_by_filter(d))
-                    .filter_map(|d| condition_of(d, &fts.analyzer).flatten())
+                    .filter_map(|d| cx.of(d).flatten())
                     .collect();
                 let keep = |d: &Document| {
                     needed.contains(d.id.as_str())
@@ -2540,7 +2572,7 @@ impl<S: BlobStore> Engine<S> {
                     .flat_map(|p| std::mem::take(&mut p.kept))
                     .map(|(_, d)| (d.id.clone(), d))
                     .collect();
-                let (changed, sealed) = resolve(docs, &base, &fts.analyzer);
+                let (changed, sealed) = resolve(docs, &base, &mut cx);
                 touched.insert(idx.clone(), changed.into_iter().collect());
                 by_index.insert(idx.clone(), sealed);
                 prepared_for.insert(idx, prepared);
