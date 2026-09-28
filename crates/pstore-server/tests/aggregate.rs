@@ -14,10 +14,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use pstore_blob::{Accounted, MemoryStore};
+use pstore_blob::{Accounted, MemoryStore, OpClass};
 use pstore_server::Api;
 use pstore_testkit::depth::DepthCounting;
-use pstore_types::LaneId;
+use pstore_types::{LaneId, TenantId};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,15 +30,25 @@ type A = Arc<Api<Store>>;
 struct World {
     depth: Store,
     apis: Vec<A>,
+    stores: Vec<Accounted<Store>>,
 }
 
 fn world(lanes: &[u64]) -> World {
     let depth = DepthCounting::new(MemoryStore::new());
+    let stores: Vec<Accounted<Store>> = lanes
+        .iter()
+        .map(|_| Accounted::new(depth.clone()))
+        .collect();
     let apis = lanes
         .iter()
-        .map(|l| Api::new(Accounted::new(depth.clone()), LaneId(*l)).unwrap())
+        .zip(&stores)
+        .map(|(l, s)| Api::new(s.clone(), LaneId(*l)).unwrap())
         .collect();
-    World { depth, apis }
+    World {
+        depth,
+        apis,
+        stores,
+    }
 }
 
 async fn send(
@@ -569,4 +579,70 @@ async fn an_aggregations_top_k_is_bounded_as_an_orders_is() {
     assert!(body["error"]["message"].as_str().unwrap().contains("top_k"));
     q["top_k"] = json!(10_000);
     query(a, &q).await;
+}
+
+#[tokio::test]
+async fn unfolded_hits_counts_only_rows_aggregated() {
+    // Code review round 2: an unfolded row whose group falls outside the top_k is not counted.
+    let w = world(&[1]);
+    let a = &w.apis[0];
+    let mut model = Model::new();
+    let keyed = |id: &str, k: &str| {
+        let mut m = Map::new();
+        m.insert("k".into(), json!(k));
+        (id.to_owned(), m)
+    };
+    upsert(a, &mut model, &[keyed("f", "a")], true).await;
+    fold(a).await;
+    upsert(a, &mut model, &[keyed("u", "z")], false).await;
+    let q = json!({"aggregate_by": {"n": ["Count", "id"]}, "group_by": ["k"], "top_k": 1});
+    let got = query(a, &q).await;
+    assert_eq!(got["aggregation_groups"], json!([{"k": "a", "n": 1}]));
+    assert_eq!(got["meta"]["unfolded_hits"], 0, "{got}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bounded_hit_on_a_reaped_segment_falls_back() {
+    // As M11.2's queries do: a failed read from the `bounded` cache is re-run fresh. Only the
+    // full path reads a segment, so only it can fail on a reaped one: an unfiltered count is
+    // HEAD's arithmetic and answers from the cached HEAD, which is `bounded` doing its job.
+    for q in [{
+        let mut f = count();
+        f["filters"] = json!(["price", "Gt", 0]);
+        f
+    }] {
+        let w = world(&[1, 2]);
+        let (a, b) = (&w.apis[0], &w.apis[1]);
+        upsert(a, &mut Model::new(), &rows(0..20), true).await;
+        fold(a).await;
+        let mut bounded = q.clone();
+        bounded["consistency"] = json!("bounded");
+        bounded["max_staleness_ms"] = json!(60_000);
+        query(b, &bounded).await;
+        let (s, body, _) = send(a, "DELETE", "/v1/indexes/docs", &json!({}), None).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let (s, body, _) = send(a, "POST", "/v1/admin/gc?retention=0", &json!({}), None).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let (s, body, _) = send(b, "POST", "/v1/indexes/docs/query", &bounded, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{q}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_strong_aggregation_is_not_run_twice() {
+    let w = world(&[1, 2]);
+    let (a, b) = (&w.apis[0], &w.apis[1]);
+    upsert(a, &mut Model::new(), &rows(0..20), true).await;
+    fold(a).await;
+    upsert(a, &mut Model::new(), &rows(20..21), true).await;
+    let reads = || w.stores[1].count(TenantId(31), OpClass::Read);
+    let mut strong = count();
+    strong["consistency"] = json!("strong");
+    strong["filters"] = json!(["price", "Gt", 0]);
+    let before = reads();
+    let (s, body, _) = send(b, "POST", "/v1/indexes/docs/query", &strong, None).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    // HEAD, the registry, the probe of the one registered lane, and the segment's open and
+    // block read beside it -- once. Measured on the code this pins; a retry would double it.
+    assert_eq!(reads() - before, 5);
 }

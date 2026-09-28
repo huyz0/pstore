@@ -472,6 +472,15 @@ mod tests {
             Key::of(Some(&Value::Int(5))),
             Key::of(Some(&Value::DateTime(5)))
         );
+        // Within a group, by value: two datetimes, bools or strings are not one key.
+        for (lo, hi) in [
+            (Value::DateTime(1), Value::DateTime(5)),
+            (Value::Bool(false), Value::Bool(true)),
+            (Value::Str("a".into()), Value::Str("b".into())),
+            (Value::Int(1), Value::Float(1.5)),
+        ] {
+            assert!(Key::of(Some(&lo)) < Key::of(Some(&hi)), "{lo:?} < {hi:?}");
+        }
         // 2^60 as a float is integral and inside i64: reported as the integer, exactly.
         let big = 2f64.powi(60);
         assert_eq!(
