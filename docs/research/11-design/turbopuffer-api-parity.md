@@ -65,7 +65,7 @@ M9 milestones is the order in which the difference has to be closed.
 | turbopuffer | pstore today | Gap → milestone |
 |---|---|---|
 | `string, int, uint, float, uuid, datetime, bool`, arrays of each, `[N]f16`, `[N]f32`, `{}f16` (sparse), `[][N]f32` | `Int(i64)`, `Str` in the engine; one dense `f32` field and `text` over HTTP | M9a: `int`, `string`. **M9h**: `float`, `bool`, `datetime`, arrays |
-| `full_text_search`: tokenizer versions, 18 languages, stemming, stopwords, case, ASCII folding, `k1`, `b` | one analyzer: split on non-alphanumerics, lowercase; `k1 = 1.2`, `b = 0.75` | **M14**: an analyzer is part of the segment format, and changing one is a reindex |
+| `full_text_search`: tokenizer versions, 18 languages, stemming, stopwords, case, ASCII folding, `k1`, `b` | one analyzer: split on non-alphanumerics, lowercase; `k1 = 1.2`, `b = 0.75` | **M14**: an analyzer is part of the index's schema in HEAD, and segments are built under it, so changing one is a reindex. (This row said "part of the segment format" until the M14 spec review: the format does not change.) |
 | `GET`/`POST /v1/namespaces/{ns}/schema` | `PATCH …/schema` refuses by design (M7d) | Kept: a schema change is a new index (M7d's argument) |
 
 ## Namespaces
