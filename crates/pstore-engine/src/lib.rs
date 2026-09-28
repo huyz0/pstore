@@ -172,6 +172,9 @@ pub enum Consistency {
     Eventual,
     /// Every durable write any process acknowledged before its HEAD read, or a refusal.
     Strong,
+    /// A HEAD this engine read no longer ago than this, and has committed nothing since,
+    /// with this process's own writes (M11.2). Skips the HEAD request when it has one.
+    Bounded(std::time::Duration),
 }
 
 /// What a process has flushed and not yet seen folded (M9i.1).
@@ -594,6 +597,9 @@ pub struct Answer {
     /// That manifest's lane watermarks, keyed by lane: how far each lane is folded into what
     /// was served. What a `session` read is checked against (M11.1), at no request.
     pub watermarks: BTreeMap<u64, u64>,
+    /// How old that manifest was when served: zero unless a `bounded` read took it from the
+    /// cache (M11.2).
+    pub staleness: std::time::Duration,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -614,6 +620,18 @@ enum Folded {
     Missing,
 }
 
+/// A query's HEAD and the unfolded rows consistent with it.
+struct Fetched {
+    at: head::HeadAt,
+    fresh: Option<FreshView>,
+    /// For `Strong`: the registered lanes, read beside HEAD.
+    lanes: Option<Vec<LaneId>>,
+    /// How old `at` was: zero unless it came from the `bounded` cache (M11.2).
+    staleness: std::time::Duration,
+    /// Whether it came from that cache, so a failure can fall back to a fresh read.
+    hit: bool,
+}
+
 /// What [`Engine::ordered`] returns (M9e).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ordered {
@@ -628,6 +646,8 @@ pub struct Ordered {
     pub epoch: Epoch,
     /// That manifest's lane watermarks, as [`Answer::watermarks`] (M11.1).
     pub watermarks: BTreeMap<u64, u64>,
+    /// As [`Answer::staleness`] (M11.2).
+    pub staleness: std::time::Duration,
 }
 
 /// What HEAD knows about one index, without reading a single segment.
@@ -668,7 +688,13 @@ pub struct Engine<S> {
     /// since, so a stale entry is caught at the flush — which re-reads once per process — and
     /// the fold is the final authority. Populated by every path that already reads HEAD, so
     /// consulting it costs nothing.
-    schemas: Mutex<Option<BTreeMap<String, head::IndexSchema>>>,
+    ///
+    /// ⚠️ **Monotonic by epoch** (M11.2): a `bounded` read may serve an older HEAD than one this
+    /// engine already recorded, and must not roll the door's check back to it.
+    schemas: Mutex<Option<(Epoch, BTreeMap<String, head::IndexSchema>)>>,
+    /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
+    /// Filled by nothing else, so no other read pays to clone HEAD.
+    head_cache: Mutex<Option<(tokio::time::Instant, head::HeadAt)>>,
     /// Serialises this lane's flushes against each other.
     ///
     /// ⚠️ Not contention control — a lane is single-writer by definition. This *enforces*
@@ -783,6 +809,7 @@ impl<S: BlobStore> Engine<S> {
             mem: Mutex::new(Memtable::default()),
             seq: Mutex::new(None),
             schemas: Mutex::new(None),
+            head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
@@ -831,7 +858,9 @@ impl<S: BlobStore> Engine<S> {
             .schemas
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache = Some(head.schemas.clone());
+        if cache.as_ref().is_none_or(|(epoch, _)| head.epoch >= *epoch) {
+            *cache = Some((head.epoch, head.schemas.clone()));
+        }
     }
 
     /// Whether this process has never read a HEAD.
@@ -853,6 +882,7 @@ impl<S: BlobStore> Engine<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()?
+            .1
             .get(index)
             .cloned()
     }
@@ -2596,14 +2626,67 @@ impl<S: BlobStore> Engine<S> {
         top_k: usize,
         consistency: Consistency,
     ) -> Result<Answer, EngineError> {
+        // ⚠️ A read served from the `bounded` cache that fails is retried once from a fresh
+        // HEAD (M11.2): `gc` may have reaped a segment the cached HEAD still names.
+        let mut hit = false;
+        let first = self
+            .query_once(
+                index,
+                prefetch,
+                filter,
+                fusion,
+                top_k,
+                consistency,
+                true,
+                &mut hit,
+            )
+            .await;
+        match first {
+            Err(_) if hit => {
+                self.forget_head();
+                self.query_once(
+                    index,
+                    prefetch,
+                    filter,
+                    fusion,
+                    top_k,
+                    consistency,
+                    false,
+                    &mut hit,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, passed on"
+    )]
+    async fn query_once(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
-        let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
-        let (answer, settled) = futures_util::future::try_join(
-            self.answer(index, &at, fresh, prefetch, filter, fusion, top_k),
-            self.settled(&at.head, lanes.as_deref()),
+        let got = self
+            .head_and_fresh_as(index, consistency, allow_hit)
+            .await?;
+        *hit = got.hit;
+        let (mut answer, settled) = futures_util::future::try_join(
+            self.answer(index, &got.at, got.fresh, prefetch, filter, fusion, top_k),
+            self.settled(&got.at.head, got.lanes.as_deref()),
         )
         .await?;
+        answer.staleness = got.staleness;
         if settled {
             Ok(answer)
         } else {
@@ -2663,6 +2746,7 @@ impl<S: BlobStore> Engine<S> {
                 segments: refs,
                 epoch: at.head.epoch,
                 watermarks: at.head.watermarks.clone(),
+                staleness: std::time::Duration::ZERO,
             });
         }
 
@@ -2689,6 +2773,7 @@ impl<S: BlobStore> Engine<S> {
             segments: refs,
             epoch: at.head.epoch,
             watermarks: at.head.watermarks.clone(),
+            staleness: std::time::Duration::ZERO,
         })
     }
 
@@ -2700,25 +2785,87 @@ impl<S: BlobStore> Engine<S> {
         &self,
         index: &str,
         consistency: Consistency,
-    ) -> Result<(head::HeadAt, Option<FreshView>, Option<Vec<LaneId>>), EngineError> {
+        allow_hit: bool,
+    ) -> Result<Fetched, EngineError> {
         let mut lanes = None;
         for attempt in 0..STALE_HEAD_RETRIES {
-            let at = if consistency == Consistency::Strong && attempt == 0 {
-                let (at, live) = futures_util::future::try_join(
-                    head::read(&*self.store, self.tenant),
-                    lanes::live(&*self.store, self.tenant),
-                )
-                .await?;
-                lanes = Some(live);
-                at
-            } else {
-                head::read(&*self.store, self.tenant).await?
+            let mut staleness = std::time::Duration::ZERO;
+            let mut hit = false;
+            let at = match consistency {
+                Consistency::Strong if attempt == 0 => {
+                    let (at, live) = futures_util::future::try_join(
+                        head::read(&*self.store, self.tenant),
+                        lanes::live(&*self.store, self.tenant),
+                    )
+                    .await?;
+                    lanes = Some(live);
+                    at
+                }
+                // ⚠️ Only the first attempt may hit: a hit `fresh_view` refuses -- this engine
+                // pruned past it -- is retried as a miss, which refills the cache (M11.2).
+                Consistency::Bounded(max) => {
+                    match self.cached_head(max).filter(|_| allow_hit && attempt == 0) {
+                        Some((at, age)) => {
+                            staleness = age;
+                            hit = true;
+                            at
+                        }
+                        None => self.read_head_caching().await?,
+                    }
+                }
+                _ => head::read(&*self.store, self.tenant).await?,
             };
             if let Some(view) = self.fresh_view(index, self.watermark(&at.head)).await? {
-                return Ok((at, view, lanes));
+                return Ok(Fetched {
+                    at,
+                    fresh: view,
+                    lanes,
+                    staleness,
+                    hit,
+                });
             }
         }
         Err(EngineError::Lost)
+    }
+
+    /// The cached HEAD and its age, when it is no older than `max` and this engine has
+    /// committed nothing since it was read (M11.2). A commit of its own -- a fold, a drop, a
+    /// compaction, a `gc` -- changes what it would answer, and a drop does not even prune.
+    fn cached_head(&self, max: std::time::Duration) -> Option<(head::HeadAt, std::time::Duration)> {
+        let committed = self.epoch();
+        let cache = self
+            .head_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (read, at) = cache.as_ref()?;
+        let age = read.elapsed();
+        (age <= max && committed <= at.head.epoch).then(|| (at.clone(), age))
+    }
+
+    /// Reads HEAD and caches it, stamped with the instant **before** the GET so its age is
+    /// never understated -- unless a concurrent read already cached a newer one (M11.2).
+    async fn read_head_caching(&self) -> Result<head::HeadAt, EngineError> {
+        let read = tokio::time::Instant::now();
+        let at = head::read(&*self.store, self.tenant).await?;
+        let mut cache = self
+            .head_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache
+            .as_ref()
+            .is_none_or(|(_, held)| at.head.epoch >= held.head.epoch)
+        {
+            *cache = Some((read, at.clone()));
+        }
+        Ok(at)
+    }
+
+    /// Forgets the cached HEAD, after a read served from it failed (M11.2).
+    fn forget_head(&self) {
+        *self
+            .head_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Whether no registered lane holds a bundle `head` has not folded (M9i.2): one `head`
@@ -2860,6 +3007,7 @@ impl<S: BlobStore> Engine<S> {
                 segments: refs,
                 epoch: then.epoch,
                 watermarks: then.watermarks.clone(),
+                staleness: std::time::Duration::ZERO,
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -2895,6 +3043,7 @@ impl<S: BlobStore> Engine<S> {
             segments: refs,
             epoch: then.epoch,
             watermarks: then.watermarks.clone(),
+            staleness: std::time::Duration::ZERO,
         })
     }
 
@@ -2954,7 +3103,59 @@ impl<S: BlobStore> Engine<S> {
                 "strong with as_of: a past epoch is already exactly what it is".to_owned(),
             ));
         }
+        // As `query_filtered_as`: a failed read from the `bounded` cache retries fresh (M11.2).
+        let mut hit = false;
+        let first = self
+            .ordered_once(
+                index,
+                by,
+                filter,
+                offset,
+                limit,
+                as_of,
+                consistency,
+                true,
+                &mut hit,
+            )
+            .await;
+        match first {
+            Err(_) if hit => {
+                self.forget_head();
+                self.ordered_once(
+                    index,
+                    by,
+                    filter,
+                    offset,
+                    limit,
+                    as_of,
+                    consistency,
+                    false,
+                    &mut hit,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, its level, and the cache's say"
+    )]
+    async fn ordered_once(
+        &self,
+        index: &str,
+        by: &pstore_query::OrderBy,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<Ordered, EngineError> {
         let mut settle: Option<(Head, Vec<LaneId>)> = None;
+        let mut staleness = std::time::Duration::ZERO;
         let (refs, targets, unfolded, shadow, epoch, watermarks) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
@@ -2972,7 +3173,12 @@ impl<S: BlobStore> Engine<S> {
                 )
             }
             None => {
-                let (at, fresh, lanes) = self.head_and_fresh_as(index, consistency).await?;
+                let got = self
+                    .head_and_fresh_as(index, consistency, allow_hit)
+                    .await?;
+                *hit = got.hit;
+                staleness = got.staleness;
+                let (at, fresh, lanes) = (got.at, got.fresh, got.lanes);
                 self.remember_schemas(&at.head);
                 // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
                 if let Some(lanes) = lanes {
@@ -3036,6 +3242,7 @@ impl<S: BlobStore> Engine<S> {
             exists,
             epoch,
             watermarks,
+            staleness,
         })
     }
 

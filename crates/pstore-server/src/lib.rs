@@ -649,6 +649,7 @@ const REFUSAL_CODES: &[&str] = &[
     "version_conflict",
     "storage_unavailable",
     "not_folded",
+    "bad_session",
     "internal",
 ];
 
@@ -656,11 +657,6 @@ const REFUSAL_CODES: &[&str] = &[
 #[derive(Debug, Clone, Copy)]
 struct RefusalCode(&'static str);
 
-/// Who the caller says it is.
-///
-/// ⚠️ **Never defaulted.** `unwrap_or(TenantId(0))` is a cross-tenant data leak that passes
-/// every single-tenant test in the suite, so the absence of a header is a refusal and the
-/// type system does not offer a second option.
 /// The request's session token (M11.1), or an empty one when it carries none.
 fn session_of(headers: &HeaderMap, tenant: TenantId) -> Result<session::Token, ApiError> {
     let Some(v) = headers.get(SESSION_HEADER) else {
@@ -685,6 +681,11 @@ fn with_session(body: impl IntoResponse, token: &str) -> Response {
     res
 }
 
+/// Who the caller says it is.
+///
+/// ⚠️ **Never defaulted.** `unwrap_or(TenantId(0))` is a cross-tenant data leak that passes
+/// every single-tenant test in the suite, so the absence of a header is a refusal and the
+/// type system does not offer a second option.
 fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
     let refuse = || {
         ApiError::new(
@@ -825,6 +826,7 @@ async fn query_index<S: BlobStore + 'static>(
                     cost: api.spend(tenant).since(before),
                     consistency: got.consistency,
                     session: session.clone(),
+                    staleness_ms: got.staleness_ms,
                 },
             }),
             &session,
@@ -859,6 +861,7 @@ async fn query_index<S: BlobStore + 'static>(
                 cost: api.spend(tenant).since(before),
                 consistencies: got.iter().map(|g| g.consistency).collect(),
                 session: session.clone(),
+                staleness_ms: got.iter().map(|g| g.staleness_ms).collect(),
             },
             results: got.into_iter().map(|g| g.results).collect(),
         }),
@@ -939,7 +942,13 @@ enum Level {
     Strong,
     /// Every durable write its session token names, from a HEAD no older than the token's.
     Session,
+    /// A HEAD no older than this that this process already read, and its own writes (M11.2).
+    Bounded(std::time::Duration),
 }
+
+/// The loosest bound a `bounded` read may ask for: D-39's fold age. Past it, one process
+/// could serve a single HEAD indefinitely (M11.2, spec review).
+const MAX_STALENESS_MS: u64 = 3_600_000;
 
 /// A query's consistency: `eventual` unless it asks for `strong` or `session`, and refused
 /// for anything else -- a level it cannot promise is never served as one it can.
@@ -950,20 +959,42 @@ fn level(req: &QueryRequest) -> Result<Level, ApiError> {
             Some("eventual") => Level::Eventual,
             Some("strong") => Level::Strong,
             Some("session") => Level::Session,
+            Some("bounded") => Level::Bounded(staleness(req)?),
             _ => {
                 return Err(ApiError::bad_request(format!(
-                    "consistency {v} is not eventual, strong or session; bounded is not \
-                     offered yet"
+                    "consistency {v} is not eventual, strong, session or bounded"
                 )));
             }
         },
     };
+    let bound = req.max_staleness_ms.as_ref().is_some_and(|v| !v.is_null());
+    if bound && !matches!(level, Level::Bounded(_)) {
+        return Err(ApiError::bad_request(
+            "max_staleness_ms without consistency bounded",
+        ));
+    }
     if level != Level::Eventual && req.as_of.is_some() {
         return Err(ApiError::bad_request(
-            "strong or session with as_of: a past epoch is already exactly what it is",
+            "strong, session or bounded with as_of: a past epoch is already exactly what it is",
         ));
     }
     Ok(level)
+}
+
+/// A `bounded` read's tolerance (M11.2): an integer number of milliseconds up to
+/// [`MAX_STALENESS_MS`], and required.
+fn staleness(req: &QueryRequest) -> Result<std::time::Duration, ApiError> {
+    req.max_staleness_ms
+        .as_ref()
+        .and_then(serde_json::Value::as_u64)
+        .filter(|ms| *ms <= MAX_STALENESS_MS)
+        .map(std::time::Duration::from_millis)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "consistency bounded needs max_staleness_ms, an integer from 0 to \
+                 {MAX_STALENESS_MS}"
+            ))
+        })
 }
 
 fn level_name(level: Level) -> &'static str {
@@ -971,6 +1002,7 @@ fn level_name(level: Level) -> &'static str {
         Level::Eventual => "eventual",
         Level::Strong => "strong",
         Level::Session => "session",
+        Level::Bounded(_) => "bounded",
     }
 }
 
@@ -981,6 +1013,7 @@ fn engine_level(level: Level, token: &session::Token) -> pstore_engine::Consiste
         Level::Strong => pstore_engine::Consistency::Strong,
         Level::Session if token.overflow => pstore_engine::Consistency::Strong,
         Level::Eventual | Level::Session => pstore_engine::Consistency::Eventual,
+        Level::Bounded(max) => pstore_engine::Consistency::Bounded(max),
     }
 }
 
@@ -1036,6 +1069,8 @@ struct Answered {
     unfolded_hits: usize,
     /// The session token to send back (M11.1).
     token: session::Token,
+    /// How old the HEAD served was (M11.2).
+    staleness_ms: u64,
 }
 
 /// Runs a planned query.
@@ -1089,6 +1124,7 @@ async fn run<E: BlobStore>(
             }
             return Ok(Answered {
                 token,
+                staleness_ms: millis(got.staleness),
                 results: got
                     .rows
                     .into_iter()
@@ -1159,7 +1195,13 @@ async fn run<E: BlobStore>(
         unfolded_hits,
         consistency: level_name(level),
         token,
+        staleness_ms: millis(answer.staleness),
     })
+}
+
+/// Whole milliseconds, saturating.
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// How a query's legs combine (M9g.1), or why the request cannot mean it.

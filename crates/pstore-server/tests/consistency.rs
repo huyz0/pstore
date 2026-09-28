@@ -427,8 +427,8 @@ async fn what_consistency_cannot_mean_is_refused() {
     write(a, 108, "x").await;
     for c in [
         json!("Strong"),
-        json!("bounded"),
-        // M11.1 gave "session" a meaning; its miscased spelling still has none.
+        // M11.1 and M11.2 gave "session" and "bounded" meanings; miscased, they still have none.
+        json!("Bounded"),
         json!("Session"),
         json!(1),
         json!({"mode": "strong"}),

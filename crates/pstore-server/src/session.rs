@@ -64,17 +64,22 @@ impl Token {
         let (Some(head), Some(tail)) = (b.get(..HEADER), b.get(HEADER..)) else {
             return Err(format!("{} bytes is shorter than a token", b.len()));
         };
-        let word = |at: usize, len: usize| -> u128 {
-            head.get(at..at + len).map_or(0, |s| {
-                s.iter()
-                    .rev()
-                    .fold(0u128, |acc, byte| (acc << 8) | u128::from(*byte))
-            })
-        };
+        // Little-endian integers at fixed offsets; the slices are the lengths named, so the
+        // conversions cannot fail, and a zero stands in only for a short buffer checked above.
+        let tenant_at = u128::from_le_bytes(
+            head.get(1..17)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 16]),
+        );
+        let epoch = u64::from_le_bytes(
+            head.get(17..25)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
         if head.first() != Some(&VERSION) {
             return Err(format!("version {:?} is not {VERSION}", head.first()));
         }
-        if word(1, 16) != tenant {
+        if tenant_at != tenant {
             return Err("minted for another tenant".to_owned());
         }
         let n = usize::from(head.get(HEADER - 1).copied().unwrap_or(0));
@@ -84,11 +89,7 @@ impl Token {
         if tail.len() != n * 16 {
             return Err(format!("{} entry bytes for {n} entries", tail.len()));
         }
-        let u64_at = |s: &[u8]| -> u64 {
-            s.iter()
-                .rev()
-                .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte))
-        };
+        let u64_at = |s: &[u8]| -> u64 { u64::from_le_bytes(s.try_into().unwrap_or([0; 8])) };
         let entries = tail
             .chunks_exact(16)
             .map(|e| e.split_at(8))
@@ -96,7 +97,7 @@ impl Token {
             .collect();
         Ok(Self {
             tenant,
-            epoch: word(17, 8) as u64,
+            epoch,
             overflow: head.get(HEADER - 2).is_some_and(|f| f & OVERFLOW != 0),
             entries,
         })

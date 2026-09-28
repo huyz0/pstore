@@ -302,16 +302,41 @@ async fn a_bad_session_is_refused() {
 async fn a_multi_query_checks_its_session_subqueries() {
     let w = apis(&[1, 2]);
     let (a, b) = (&w[0], &w[1]);
+    // The index exists for B first, so the eventual sub-query answers rather than 404s.
+    write(a, "w", true, None).await;
+    a.fold_due(&FoldPolicy {
+        period: Duration::from_secs(1),
+        age: Duration::ZERO,
+        bytes: 1 << 20,
+    })
+    .await;
     let t = write(a, "x", true, None).await;
-    let multi = json!({"queries": [q("session"), q("eventual")]});
+    // `session` second, so a merge that keeps only the first sub-query's token is caught.
+    let multi = json!({"queries": [q("eventual"), q("session")]});
     let (s, _, body) = query(b, &multi, Some(&t)).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     b.fold_due(&requested_only()).await;
     let (s, h, body) = query(b, &multi, Some(&t)).await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(body["results"][0][0]["id"], "x");
-    assert_eq!(body["meta"]["session"], json!(h[HEADER].to_str().unwrap()));
-    assert_eq!(decode(h[HEADER].to_str().unwrap()).len(), 27);
+    assert!(
+        body["results"][1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "x"),
+        "{body}"
+    );
+    let merged = h[HEADER].to_str().unwrap();
+    assert_eq!(body["meta"]["session"], json!(merged));
+    assert_eq!(decode(merged).len(), 27);
+    let newest = body["meta"]["epochs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_u64().unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(epoch_of(merged), newest, "the merge keeps the newest epoch");
 }
 
 /// A store whose bundle PUTs take a while, so concurrent durable writes queue behind one flush
@@ -471,4 +496,35 @@ async fn a_token_is_not_trusted_by_a_restarted_process_on_its_lane() {
     let (s, _, body) = query(&after, &q("session"), Some(&t)).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(ids(&body), ["x", "y"]);
+}
+
+#[tokio::test]
+async fn clearing_overflow_keeps_the_readers_own_unfolded_writes() {
+    let lanes: Vec<u64> = (1..=18).collect();
+    let w = apis(&lanes);
+    let mut t: Option<String> = None;
+    for (i, api) in w[..17].iter().enumerate() {
+        t = Some(write(api, &format!("d{i:02}"), true, t.as_deref()).await);
+    }
+    // A refused strong read requests the fold that folds every lane.
+    let (s, _, _) = query(&w[0], &q("strong"), None).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "nothing is folded yet");
+    w[0].fold_due(&requested_only()).await;
+    // Lane 1 now holds a durable write only its own process has in memory.
+    let t = write(&w[0], "z", true, t.as_deref()).await;
+    assert_eq!(decode(&t)[25] & 1, 1, "still overflowed");
+    let (s, h, body) = query(&w[0], &q("session"), Some(&t)).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let back = h[HEADER].to_str().unwrap().to_owned();
+    let raw = decode(&back);
+    assert_eq!(raw[25] & 1, 0, "overflow cleared");
+    assert_eq!(raw[26], 1, "and lane 1 named: {raw:?}");
+    // So another process must still wait for `z`.
+    let reader = &w[17];
+    let (s, _, body) = query(reader, &q("session"), Some(&back)).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    reader.fold_due(&requested_only()).await;
+    let (s, _, body) = query(reader, &q("session"), Some(&back)).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(ids(&body).contains(&"z".to_owned()));
 }

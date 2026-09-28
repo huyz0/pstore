@@ -44,6 +44,17 @@ acknowledged write.
 - **Cost:** 1–2 Rseq. **Latency floor:** ~1 blob RTT (~10–30 ms).
 
 ### `bounded(max_staleness_ms)`
+
+> ⚠️ **Corrected by [M11.2](../../milestones/M11/SPEC.md).** Shipped as
+> `consistency: "bounded"` with `max_staleness_ms`, capped at one hour.
+> - **Where the HEAD comes from.** The cache is one HEAD per engine, filled only by `bounded`
+>   reads. A hit also requires that this engine has committed nothing since the read.
+> - **Recovery.** A hit that fails, for example on a segment `gc` reaped, re-runs once from
+>   a fresh HEAD.
+> - **Staleness is reported.** Every response carries `meta.staleness_ms`, which is 0 when
+>   the query read HEAD itself.
+> - **Own writes.** They stay visible: a cached HEAD older than a prune this engine made is
+>   never paired with its memtable.
 Serve from the cached epoch if it was validated within `max_staleness_ms`; otherwise
 revalidate. The client names its own tolerance.
 - **Cost:** 0 requests on the fast path. **Latency floor:** cache speed (~1 ms).

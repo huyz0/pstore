@@ -196,9 +196,14 @@ pub struct QueryRequest {
     /// Documents of a `rank_by` order to skip (M9e). Refused without `rank_by`.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// `"eventual"` (the default, and `null`) or `"strong"` (M9i.2). Anything else is refused.
+    /// `"eventual"` (the default, and `null`), `"strong"` (M9i.2), `"session"` (M11.1) or
+    /// `"bounded"` (M11.2). Anything else is refused.
     #[serde(default)]
     pub consistency: Option<serde_json::Value>,
+    /// With `consistency: "bounded"` only: how old a HEAD may be served (M11.2). Taken raw,
+    /// so a string or a fraction is refused rather than coerced.
+    #[serde(default)]
+    pub max_staleness_ms: Option<serde_json::Value>,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -251,6 +256,9 @@ pub struct QueryMeta {
     pub consistency: &'static str,
     /// The session token, as the `x-pstore-session` header carries it (M11.1).
     pub session: String,
+    /// How old the HEAD served was: zero unless a `bounded` read took it from the cache
+    /// (M11.2). Design rule 10: every response carries the epoch and staleness it was served at.
+    pub staleness_ms: u64,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g).
@@ -297,6 +305,8 @@ pub struct MultiQueryMeta {
     pub consistencies: Vec<&'static str>,
     /// The session token, merged over every query (M11.1).
     pub session: String,
+    /// Each query's `staleness_ms` (M11.2).
+    pub staleness_ms: Vec<u64>,
 }
 
 /// The answer to a query.
