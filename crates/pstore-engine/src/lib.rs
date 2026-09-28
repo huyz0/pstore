@@ -418,6 +418,16 @@ const OP_PATCH: i64 = 1;
 const OP_COND_UPSERT: i64 = 2;
 /// A delete applied only if the current version admits the condition.
 const OP_COND_DELETE: i64 = 3;
+/// A delete of every row whose current version admits the filter in `$cond` (M13.2).
+const OP_DELETE_BY_FILTER: i64 = 4;
+/// A patch of every row whose current version admits the filter in `$cond` (M13.2).
+const OP_PATCH_BY_FILTER: i64 = 5;
+
+/// Whether an operation applies by filter rather than to its id (M13.2). Its id is empty,
+/// and means nothing.
+fn is_by_filter(d: &Document) -> bool {
+    matches!(op_code(d), Some(OP_DELETE_BY_FILTER | OP_PATCH_BY_FILTER))
+}
 
 fn op_code(d: &Document) -> Option<i64> {
     match d.attrs.get(OP_ATTR) {
@@ -434,7 +444,16 @@ fn is_deferred(d: &Document) -> bool {
 /// Whether an operation carries no full row -- a delete, conditional or not, or a patch -- so
 /// nothing about it can say what width, metric or text an index has.
 fn is_rowless(d: &Document) -> bool {
-    is_tombstone(d) || op_code(d) == Some(OP_PATCH)
+    is_tombstone(d) || op_code(d) == Some(OP_PATCH) || is_by_filter(d)
+}
+
+/// `cond` as a deferred operation carries it, or a refusal when the fold could not read it
+/// back -- nested too deeply -- and would skip the operation silently (code review, M13.1).
+fn encoded(cond: &pstore_query::Predicate) -> Result<String, EngineError> {
+    let s = pstore_query::condition::encode(cond);
+    pstore_query::condition::decode(&s)
+        .map(|_| s)
+        .ok_or_else(|| EngineError::Format("a condition nests too deeply".to_owned()))
 }
 
 /// A deferred operation's condition: `Some(None)` for none, `None` for one that cannot be
@@ -489,6 +508,10 @@ fn resolve(
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for op in ops {
+        if is_by_filter(&op) {
+            by_filter(&op, base, &mut state, &mut order);
+            continue;
+        }
         let id = op.id.clone();
         let current = match state.get(&id) {
             Some(v) => v.clone(),
@@ -534,6 +557,95 @@ fn resolve(
 /// How many segments a fold resolving deferred operations reads at once (M13).
 const PREPARE_WIDTH: usize = 4;
 
+/// A patch's attributes as its operation carries them: what it sets, `$unset`, and `$op`.
+///
+/// # Errors
+/// An attribute name that is empty or begins `$`, or a value no segment can store.
+fn patch_attrs(p: Patch) -> Result<BTreeMap<String, pstore_format::Value>, EngineError> {
+    if let Some(name) = p
+        .set
+        .keys()
+        .chain(&p.unset)
+        .find(|k| k.is_empty() || k.starts_with('$'))
+    {
+        return Err(EngineError::Format(format!(
+            "patch of {}: attribute `{name}` is reserved",
+            p.id
+        )));
+    }
+    let mut attrs = p.set;
+    pstore_format::check_storable(&Document {
+        id: p.id.clone(),
+        vectors: BTreeMap::new(),
+        attrs: attrs.clone(),
+    })
+    .map_err(|e| EngineError::Format(format!("patch of {}: {e}", p.id)))?;
+    attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
+    if !p.unset.is_empty() {
+        attrs.insert(
+            UNSET_ATTR.to_owned(),
+            pstore_format::Value::Array(
+                p.unset.into_iter().map(pstore_format::Value::Str).collect(),
+            ),
+        );
+    }
+    Ok(attrs)
+}
+
+/// A by-filter operation (M13.2): `attrs` marked with its kind and filter, under the empty id.
+fn by_filter_op(
+    code: i64,
+    filter: String,
+    mut attrs: BTreeMap<String, pstore_format::Value>,
+) -> Document {
+    attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(code));
+    attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(filter));
+    Document {
+        id: String::new(),
+        vectors: BTreeMap::new(),
+        attrs,
+    }
+}
+
+/// Applies one by-filter operation (M13.2) to every id whose current version -- this fold's
+/// state, else `base` -- its filter admits, in id order. A filter that cannot be read admits
+/// nothing; a patch that changes nothing touches nothing, as a per-id one does.
+fn by_filter(
+    op: &Document,
+    base: &std::collections::HashMap<String, Document>,
+    state: &mut std::collections::HashMap<String, Option<Document>>,
+    order: &mut Vec<String>,
+) {
+    let Some(Some(filter)) = condition_of(op) else {
+        return;
+    };
+    let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let current = match state.get(&id) {
+            Some(v) => v.clone(),
+            None => base.get(&id).cloned(),
+        };
+        let Some(c) = current.filter(|c| filter.admits(&c.id, &c.attrs)) else {
+            continue;
+        };
+        let next = if op_code(op) == Some(OP_DELETE_BY_FILTER) {
+            None
+        } else {
+            let m = merged(c.clone(), op);
+            if m == c {
+                continue;
+            }
+            Some(m)
+        };
+        if !state.contains_key(&id) {
+            order.push(id.clone());
+        }
+        state.insert(id, next);
+    }
+}
+
 /// One segment's rows as a fold reads them to supersede ids -- and, with vectors, to find the
 /// base versions deferred operations resolve against (M13).
 struct Prepared {
@@ -541,6 +653,10 @@ struct Prepared {
     old: Option<String>,
     deleted: std::collections::HashSet<usize>,
     rows: Vec<(usize, Document)>,
+    /// The whole rows `keep` kept, vectors included, by position (M13). Apart from `rows`,
+    /// which then hold ids alone: a filter re-evaluated over an id-only row -- `Absent`, a
+    /// `Not` -- would admit a row whose attributes were merely dropped.
+    kept: Vec<(usize, Document)>,
 }
 
 /// A patch of one row (M13): attributes to set, and names to remove.
@@ -1322,7 +1438,7 @@ impl<S: BlobStore> Engine<S> {
     /// upsert is, and invisible until the fold that decides it.
     ///
     /// # Errors
-    /// As [`Self::write_as`].
+    /// As [`Self::write_as`]; and a condition nested too deeply for the fold to read.
     pub async fn write_if(
         &self,
         index: &str,
@@ -1330,7 +1446,7 @@ impl<S: BlobStore> Engine<S> {
         metric: Metric,
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
-        let mark = pstore_query::condition::encode(cond);
+        let mark = encoded(cond)?;
         self.write_marked(index, docs, metric, Some(mark)).await
     }
 
@@ -1340,48 +1456,24 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// # Errors
     /// An attribute name that is empty or begins `$`, which are reserved; or a value no
-    /// segment can store, as [`Self::write`] refuses it.
+    /// segment can store, as [`Self::write`] refuses it; or a condition nested too deeply for
+    /// the fold to read.
     pub async fn patch(
         &self,
         index: &str,
         patches: Vec<Patch>,
         cond: Option<&pstore_query::Predicate>,
     ) -> Result<(), EngineError> {
-        let cond = cond.map(pstore_query::condition::encode);
+        let cond = cond.map(encoded).transpose()?;
         let mut ops = Vec::with_capacity(patches.len());
         for p in patches {
-            if let Some(name) = p
-                .set
-                .keys()
-                .chain(&p.unset)
-                .find(|k| k.is_empty() || k.starts_with('$'))
-            {
-                return Err(EngineError::Format(format!(
-                    "patch of {}: attribute `{name}` is reserved",
-                    p.id
-                )));
-            }
-            let mut attrs = p.set;
-            pstore_format::check_storable(&Document {
-                id: p.id.clone(),
-                vectors: BTreeMap::new(),
-                attrs: attrs.clone(),
-            })
-            .map_err(|e| EngineError::Format(format!("patch of {}: {e}", p.id)))?;
-            attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
-            if !p.unset.is_empty() {
-                attrs.insert(
-                    UNSET_ATTR.to_owned(),
-                    pstore_format::Value::Array(
-                        p.unset.into_iter().map(pstore_format::Value::Str).collect(),
-                    ),
-                );
-            }
+            let id = p.id.clone();
+            let mut attrs = patch_attrs(p)?;
             if let Some(c) = &cond {
                 attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
             }
             ops.push(Document {
-                id: p.id,
+                id,
                 vectors: BTreeMap::new(),
                 attrs,
             });
@@ -1393,14 +1485,14 @@ impl<S: BlobStore> Engine<S> {
     /// Deletes `ids` at the fold only where the current version admits `cond` (M13).
     ///
     /// # Errors
-    /// None today; the signature matches [`Self::delete`]'s.
+    /// A condition nested too deeply for the fold to read.
     pub async fn delete_if(
         &self,
         index: &str,
         ids: Vec<String>,
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
-        let mark = pstore_query::condition::encode(cond);
+        let mark = encoded(cond)?;
         let ops = ids
             .into_iter()
             .map(|id| {
@@ -1417,6 +1509,42 @@ impl<S: BlobStore> Engine<S> {
             })
             .collect();
         self.mem().buffer(index, ops);
+        Ok(())
+    }
+
+    /// Deletes, at the fold, every row of `index` whose current version `filter` admits
+    /// (M13.2): folded rows, and rows this fold's earlier operations made. Invisible until
+    /// that fold.
+    ///
+    /// # Errors
+    /// A filter nested too deeply for the fold to read.
+    pub async fn delete_by_filter(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+    ) -> Result<(), EngineError> {
+        let op = by_filter_op(OP_DELETE_BY_FILTER, encoded(filter)?, BTreeMap::new());
+        self.mem().buffer(index, vec![op]);
+        Ok(())
+    }
+
+    /// Patches, at the fold, every row of `index` whose current version `filter` admits
+    /// (M13.2), as [`Self::patch`] patches one: `set` and `unset` of `patch`, whose id is
+    /// ignored.
+    ///
+    /// # Errors
+    /// As [`Self::patch`].
+    pub async fn patch_by_filter(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+        patch: Patch,
+    ) -> Result<(), EngineError> {
+        let mark = encoded(filter)?;
+        let mut attrs = patch_attrs(patch)?;
+        attrs.remove(OP_ATTR);
+        self.mem()
+            .buffer(index, vec![by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)]);
         Ok(())
     }
 
@@ -2142,19 +2270,27 @@ impl<S: BlobStore> Engine<S> {
                 let docs = by_index.remove(&idx).unwrap_or_default();
                 let needed: std::collections::HashSet<&str> = docs
                     .iter()
-                    .filter(|d| is_deferred(d))
+                    .filter(|d| is_deferred(d) && !is_by_filter(d))
                     .map(|d| d.id.as_str())
                     .collect();
-                let keep = |d: &Document| needed.contains(d.id.as_str());
+                // M13.2: and every row a by-filter operation's filter admits. A filter that
+                // cannot be read admits nothing, as `resolve` reads it.
+                let filters: Vec<pstore_query::Predicate> = docs
+                    .iter()
+                    .filter(|d| is_by_filter(d))
+                    .filter_map(|d| condition_of(d).flatten())
+                    .collect();
+                let keep = |d: &Document| {
+                    needed.contains(d.id.as_str())
+                        || filters.iter().any(|f| f.admits(&d.id, &d.attrs))
+                };
                 let prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
                 let base: std::collections::HashMap<String, Document> = prepared
                     .iter()
                     .flat_map(|p| {
-                        p.rows
+                        p.kept
                             .iter()
-                            .filter(|(row, d)| {
-                                !p.deleted.contains(row) && needed.contains(d.id.as_str())
-                            })
+                            .filter(|(row, _)| !p.deleted.contains(row))
                             .map(|(_, d)| (d.id.clone(), d.clone()))
                     })
                     .collect();
@@ -2367,23 +2503,28 @@ impl<S: BlobStore> Engine<S> {
                     })
                     .await;
                 let (seg, deleted) = (seg?, before?);
+                let mut kept = Vec::new();
                 let rows: Vec<(usize, Document)> = if let Some(keep) = keep {
-                    seg.scan(&*self.store, &key, None)
+                    let mut rows = Vec::new();
+                    for (row, d) in seg
+                        .scan(&*self.store, &key, None)
                         .await?
                         .into_iter()
-                        .map(|d| {
-                            if keep(&d) {
-                                d
-                            } else {
-                                Document {
-                                    id: d.id,
-                                    vectors: BTreeMap::new(),
-                                    attrs: BTreeMap::new(),
-                                }
-                            }
-                        })
                         .enumerate()
-                        .collect()
+                    {
+                        rows.push((
+                            row,
+                            Document {
+                                id: d.id.clone(),
+                                vectors: BTreeMap::new(),
+                                attrs: BTreeMap::new(),
+                            },
+                        ));
+                        if keep(&d) {
+                            kept.push((row, d));
+                        }
+                    }
+                    rows
                 } else {
                     seg.rows_where(&*self.store, &key, |_| true).await?
                 };
@@ -2392,6 +2533,7 @@ impl<S: BlobStore> Engine<S> {
                     old,
                     deleted,
                     rows,
+                    kept,
                 })
             })
             .collect();

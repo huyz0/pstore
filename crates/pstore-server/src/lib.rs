@@ -767,34 +767,73 @@ fn patches_of(
         }
     }
     rows.into_iter()
-        .map(|(id, attrs)| {
-            let unset: Vec<String> = attrs
-                .iter()
-                .filter(|(_, v)| v.is_null())
-                .map(|(k, _)| k.clone())
-                .collect();
-            let set: serde_json::Map<String, serde_json::Value> =
-                attrs.into_iter().filter(|(_, v)| !v.is_null()).collect();
-            // Converted as a document's attributes are: every refusal of one is a patch's too.
-            let as_doc: types::DocumentIn = serde_json::from_value(
-                serde_json::json!({"id": id, "vector": [], "attributes": set}),
-            )
-            .map_err(|e| ApiError::bad_request(format!("patch of {id}: {e}")))?;
-            for name in &unset {
-                if name.is_empty() || name.starts_with('$') || name == pstore_query::ID_ATTRIBUTE {
-                    return Err(ApiError::bad_request(format!(
-                        "patch of {id}: attribute `{name}` is reserved"
-                    )));
-                }
-            }
-            let doc = to_document(&as_doc, dated)?;
-            Ok(pstore_engine::Patch {
-                id,
-                set: doc.attrs,
-                unset,
-            })
-        })
+        .map(|(id, attrs)| patch_of(id, attrs, dated))
         .collect()
+}
+
+/// One patch of `id`: `attributes` converted as a document's are, `null` removing one.
+fn patch_of(
+    id: String,
+    attrs: serde_json::Map<String, serde_json::Value>,
+    dated: &std::collections::BTreeSet<String>,
+) -> Result<pstore_engine::Patch, ApiError> {
+    let unset: Vec<String> = attrs
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| k.clone())
+        .collect();
+    let set: serde_json::Map<String, serde_json::Value> =
+        attrs.into_iter().filter(|(_, v)| !v.is_null()).collect();
+    // Converted as a document's attributes are: every refusal of one is a patch's too.
+    let as_doc: types::DocumentIn =
+        serde_json::from_value(serde_json::json!({"id": id, "vector": [], "attributes": set}))
+            .map_err(|e| ApiError::bad_request(format!("patch of {id}: {e}")))?;
+    for name in &unset {
+        if name.is_empty() || name.starts_with('$') || name == pstore_query::ID_ATTRIBUTE {
+            return Err(ApiError::bad_request(format!(
+                "patch of {id}: attribute `{name}` is reserved"
+            )));
+        }
+    }
+    let doc = to_document(&as_doc, dated)?;
+    Ok(pstore_engine::Patch {
+        id,
+        set: doc.attrs,
+        unset,
+    })
+}
+
+/// The filter a write names under `name` (M13): parsed as a query's is, and refused when the
+/// fold could not read it back -- one nested too deeply (code review, M13.1).
+fn write_filter(name: &str, v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
+    let p = predicate(v).map_err(|e| ApiError::bad_request(format!("{name}: {}", e.message)))?;
+    pstore_query::condition::decode(&pstore_query::condition::encode(&p))
+        .map(|_| p)
+        .ok_or_else(|| ApiError::bad_request(format!("{name}: the filter nests too deeply")))
+}
+
+/// `patch_by_filter` (M13.2): `{"filters": .., "attributes": {..}}`, both required.
+fn patch_by_filter_of(
+    v: &serde_json::Value,
+    dated: &std::collections::BTreeSet<String>,
+) -> Result<(pstore_query::Predicate, pstore_engine::Patch), ApiError> {
+    let bad = || {
+        ApiError::bad_request(
+            "patch_by_filter is {\"filters\": <filter>, \"attributes\": {..}}, both required",
+        )
+    };
+    let o = v.as_object().ok_or_else(bad)?;
+    if o.len() != 2 {
+        return Err(bad());
+    }
+    let (Some(f), Some(serde_json::Value::Object(attrs))) = (o.get("filters"), o.get("attributes"))
+    else {
+        return Err(bad());
+    };
+    let filter = write_filter("patch_by_filter", f)?;
+    let patch = patch_of(String::new(), attrs.clone(), dated)
+        .map_err(|e| ApiError::bad_request(format!("patch_by_filter: {}", e.message)))?;
+    Ok((filter, patch))
 }
 
 /// `PUT /v1/indexes/{index}/documents`.
@@ -812,7 +851,22 @@ async fn write_documents<S: BlobStore + 'static>(
     let req: WriteRequest = parse_write(&body)?;
     let dated = declared_datetimes(&req)?;
     let patches = patches_of(&req, &dated)?;
-    if req.documents.is_empty() && req.deletes.is_empty() && patches.is_empty() {
+    let delete_by = req
+        .delete_by_filter
+        .as_ref()
+        .map(|v| write_filter("delete_by_filter", v))
+        .transpose()?;
+    let patch_by = req
+        .patch_by_filter
+        .as_ref()
+        .map(|v| patch_by_filter_of(v, &dated))
+        .transpose()?;
+    if req.documents.is_empty()
+        && req.deletes.is_empty()
+        && patches.is_empty()
+        && delete_by.is_none()
+        && patch_by.is_none()
+    {
         return Err(ApiError::bad_request(
             "a write with no documents, patches or deletes",
         ));
@@ -824,15 +878,7 @@ async fn write_documents<S: BlobStore + 'static>(
                 if any {
                     // A condition travels to the fold encoded; one the fold could not decode
                     // would admit nothing there, so it is refused here (code review, M13.1).
-                    predicate(v).and_then(|p| {
-                        pstore_query::condition::decode(&pstore_query::condition::encode(&p))
-                            .map(|_| p)
-                            .ok_or_else(|| {
-                                ApiError::bad_request(format!(
-                                    "{name}: the filter nests too deeply"
-                                ))
-                            })
-                    })
+                    write_filter(name, v)
                 } else {
                     Err(ApiError::bad_request(format!(
                         "{name} with no operations of its kind to apply to"
@@ -854,7 +900,11 @@ async fn write_documents<S: BlobStore + 'static>(
     )?;
     // ⚠️ **Deferred operations are durable only** (M13, spec review M4): a batched one would sit
     // where no fold reads it and no probe finds it, so a strong read here could miss it.
-    let deferred = !patches.is_empty() || upsert_if.is_some() || delete_if.is_some();
+    let deferred = !patches.is_empty()
+        || upsert_if.is_some()
+        || delete_if.is_some()
+        || delete_by.is_some()
+        || patch_by.is_some();
     if deferred && !matches!(req.durability, types::Durability::Durable) {
         return Err(ApiError::bad_request(
             "patches and conditional writes are durable only: they are applied at a fold, which \
@@ -920,6 +970,14 @@ async fn write_documents<S: BlobStore + 'static>(
     match &delete_if {
         Some(c) => engine.delete_if(&index, req.deletes, c).await?,
         None => engine.delete(&index, req.deletes).await?,
+    }
+    // Then the by-filter operations (M13.2), each one deferred operation: a patch, then a
+    // delete, so a request that does both deletes what it patched into matching.
+    if let Some((filter, patch)) = patch_by {
+        engine.patch_by_filter(&index, &filter, patch).await?;
+    }
+    if let Some(filter) = &delete_by {
+        engine.delete_by_filter(&index, filter).await?;
     }
     let durable = matches!(req.durability, types::Durability::Durable);
     if durable {

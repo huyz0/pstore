@@ -96,6 +96,14 @@ pub struct WriteRequest {
     /// A filter each of `deletes` applies only if the id's current version admits (M13).
     #[serde(default)]
     pub delete_condition: Option<serde_json::Value>,
+    /// Deletes every row whose current version at the fold admits this filter (M13.2), after
+    /// the request's other operations.
+    #[serde(default)]
+    pub delete_by_filter: Option<serde_json::Value>,
+    /// `{"filters": .., "attributes": {..}}`: patches every row whose current version at the
+    /// fold admits the filter (M13.2), before `delete_by_filter`.
+    #[serde(default)]
+    pub patch_by_filter: Option<serde_json::Value>,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.

@@ -146,3 +146,66 @@ async fn a_patch_of_a_value_no_segment_stores_is_refused() {
         "a refused patch was buffered"
     );
 }
+
+#[tokio::test]
+async fn a_condition_the_fold_cannot_read_is_refused_at_the_call() {
+    // Deeper than the encoding carries: the fold would read it as admitting nothing, and
+    // the operation would vanish after being acknowledged (code review round 2, M13.1).
+    let mut deep = Predicate::Cmp("a".to_owned(), Op::Eq, Value::Int(1));
+    for _ in 0..80 {
+        deep = Predicate::Not(Box::new(deep));
+    }
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(54), LaneId(1));
+    let x = || Document::new("x", vec![1.0, 0.5]);
+    let patch = Patch {
+        id: "x".to_owned(),
+        set: BTreeMap::from([("a".to_owned(), Value::Int(2))]),
+        unset: vec![],
+    };
+    assert!(
+        e.write_if("idx", vec![x()], Metric::DotProduct, &deep)
+            .await
+            .is_err()
+    );
+    assert!(e.patch("idx", vec![patch], Some(&deep)).await.is_err());
+    assert!(
+        e.delete_if("idx", vec!["x".to_owned()], &deep)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        e.flush().await.unwrap(),
+        None,
+        "a refused operation was buffered"
+    );
+}
+
+#[tokio::test]
+async fn a_by_filter_operation_judges_whole_rows_not_the_ids_a_fold_keeps() {
+    // The fold keeps whole rows only where an operation needs them, and ids alone for the
+    // rest. `Absent` admits an id-only row, so a filter judged there would delete `x`.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(55), LaneId(1));
+    let row = |id: &str, k: &str| {
+        let mut d = Document::new(id, vec![1.0, 0.5]);
+        d.attrs.insert(k.to_owned(), Value::Int(1));
+        d
+    };
+    e.write("idx", vec![row("x", "a"), row("y", "b")])
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.delete_by_filter("idx", &Predicate::Absent("a".to_owned()))
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let ids: Vec<String> = e
+        .scan("idx", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(ids, ["x"]);
+}
