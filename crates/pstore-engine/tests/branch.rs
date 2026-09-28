@@ -96,8 +96,25 @@ async fn a_branch_equals_its_source_and_then_diverges() {
     assert!(src.contains_key("r0010") && !dest.contains_key("r0010"));
     assert!(!src.contains_key("r0110") && dest.contains_key("r0110"));
     assert!(dest.contains_key("new") && !src.contains_key("new"));
-    // `dest` compacted, then dropped, then GC: `src` answers as before.
-    e.compact("dest").await.unwrap();
+    // A scan reads each index's own vectors too.
+    for (index, want) in [("src", &src), ("dest", &dest)] {
+        let scanned: Vec<String> = e
+            .scan(index, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(scanned.len(), want.len(), "{index}");
+        assert!(scanned.iter().all(|id| want.contains_key(id)), "{index}");
+    }
+    // Each compacts under its own vectors -- a merge that read the other's would drop the
+    // wrong rows, or abandon itself as though a fold had changed them.
+    for (index, want) in [("dest", &dest), ("src", &src)] {
+        assert!(e.compact(index).await.unwrap().is_some(), "{index}");
+        assert_eq!(&rows(&e, index, None).await.unwrap(), want, "{index}");
+    }
+    // `dest` dropped, then GC: `src` answers as before.
     e.delete_index("dest").await.unwrap();
     e.gc(0).await.unwrap();
     assert_eq!(rows(&e, "src", None).await.unwrap(), src);
@@ -305,4 +322,29 @@ async fn a_branch_that_loses_its_cas_buries_its_copies() {
         "the lost attempt's three copies are buried: {buried:?}"
     );
     assert_eq!(rows(&e, "dest", None).await, rows(&e, "src", None).await);
+}
+
+#[tokio::test]
+async fn an_index_whose_name_holds_seg_owns_its_segments() {
+    // Only a branch's names are checked, so an index may be named `a/seg/b`: its segments'
+    // keys hold `/seg/` twice, and the owner is read up to the last one -- or it would borrow
+    // its own segments, and every delete vector written before M16 would be lost to it.
+    let store = Arc::new(MemoryStore::new());
+    let e = engine(&store);
+    let name = "a/seg/b";
+    seeded(&e, name).await;
+    let head = e.head_for_test().await;
+    let segs: Vec<&String> = head.indexes[name].iter().map(|r| &r.key).collect();
+    assert_eq!(head.deletes.len(), 3);
+    assert!(
+        head.deletes.keys().all(|k| segs.contains(&k)),
+        "{:?}",
+        head.deletes.keys()
+    );
+    // And compaction buries the segments themselves, which GC then reaps.
+    e.compact(name).await.unwrap().unwrap();
+    e.gc(0).await.unwrap();
+    for k in segs {
+        assert!(store.get(&Key::new(k.clone())).await.is_err(), "{k} kept");
+    }
 }

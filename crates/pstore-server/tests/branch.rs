@@ -166,3 +166,121 @@ async fn what_a_branch_cannot_mean_is_refused() {
         "{b}"
     );
 }
+
+/// The ids `q` answers on `index`, sorted, and the `n` of `d07` if it answers it.
+async fn answer(a: &A, index: &str, q: &Value) -> (Vec<String>, Option<i64>) {
+    let (s, b) = send(a, "POST", &format!("/v1/indexes/{index}/query"), q).await;
+    assert_eq!(s, StatusCode::OK, "{q}: {b}");
+    let rows = b["results"].as_array().unwrap();
+    let mut ids: Vec<String> = rows
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    let n = rows
+        .iter()
+        .find(|r| r["id"] == "d07")
+        .and_then(|r| r["attributes"]["n"].as_i64());
+    (ids, n)
+}
+
+#[tokio::test]
+async fn a_branch_and_its_source_diverge_on_every_read_path() {
+    // After the branch each deletes, patches and deletes by filter in the segments they
+    // share, and every way of reading must see its own index's deletes and no other's.
+    let a = api();
+    let docs: Vec<Value> = (0..20)
+        .map(|i| {
+            json!({"id": format!("d{i:02}"), "vector": [1.0, 0.5], "text": "word",
+                   "attributes": {"n": i}})
+        })
+        .collect();
+    let (s, b) = put(
+        &a,
+        "src",
+        &json!({"durability": "durable", "documents": docs}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = put(&a, "dest", &json!({"branch_from_namespace": "src"})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let born = b["epoch"].as_u64().unwrap();
+    // A delete in `src` alone rewrites `src`'s vectors and none of `dest`'s.
+    let updated = |st: Value| st["updated_epoch"].as_u64().unwrap();
+    let (_, st) = send(&a, "GET", "/v1/indexes/dest", &json!({})).await;
+    let dest_before = updated(st);
+    let (s, b) = put(
+        &a,
+        "src",
+        &json!({"durability": "durable", "deletes": ["d09"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, b) = send(&a, "POST", "/v1/admin/fold", &json!({})).await;
+    let first = b["epoch"].as_u64().unwrap();
+    for (index, want) in [("src", first), ("dest", dest_before)] {
+        let (_, st) = send(&a, "GET", &format!("/v1/indexes/{index}"), &json!({})).await;
+        assert_eq!(updated(st), want, "{index}");
+    }
+    for (index, body) in [
+        ("src", json!({"durability": "durable", "deletes": ["d05"]})),
+        ("dest", json!({"durability": "durable", "deletes": ["d06"]})),
+        (
+            "dest",
+            json!({"durability": "durable", "patch_rows": [{"id": "d07", "attributes": {"n": 100}}]}),
+        ),
+        (
+            "src",
+            json!({"durability": "durable", "delete_by_filter": ["n", "Eq", 8]}),
+        ),
+    ] {
+        let (s, b) = put(&a, index, &body).await;
+        assert_eq!(s, StatusCode::OK, "{index} {body}: {b}");
+    }
+    let (s, b) = send(&a, "POST", "/v1/admin/fold", &json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let now = b["epoch"].as_u64().unwrap();
+    let all: Vec<String> = (0..20).map(|i| format!("d{i:02}")).collect();
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|i| !gone.contains(&i.as_str()))
+            .cloned()
+            .collect()
+    };
+    for (index, want, n) in [
+        // Four gone from `src` and three from `dest` (`d07`'s old version is the third), so
+        // a count read through the other index's vectors differs.
+        ("src", without(&["d05", "d08", "d09"]), 7),
+        ("dest", without(&["d06"]), 100),
+    ] {
+        for (path, q) in [
+            ("ordered", json!({"rank_by": ["id", "asc"], "top_k": 1000})),
+            ("vector", json!({"vector": [1.0, 0.5], "top_k": 1000})),
+            ("text", json!({"text": "word", "top_k": 1000})),
+            (
+                "as_of",
+                json!({"vector": [1.0, 0.5], "top_k": 1000, "as_of": now}),
+            ),
+        ] {
+            let mut q = q;
+            q["include_attributes"] = json!(true);
+            let (ids, got) = answer(&a, index, &q).await;
+            assert_eq!(ids, want, "{index} {path}");
+            assert_eq!(got, Some(n), "{index} {path}");
+        }
+        let (s, b) = send(
+            &a,
+            "POST",
+            &format!("/v1/indexes/{index}/query"),
+            &json!({"aggregate_by": {"c": ["Count", "id"]}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["aggregations"]["c"], want.len() as u64, "{index} count");
+        let (_, st) = send(&a, "GET", &format!("/v1/indexes/{index}"), &json!({})).await;
+        assert_eq!(st["documents"], want.len() as u64, "{index} stats: {st}");
+    }
+    // And the branch's past at its birth is its source's then.
+    let q = json!({"vector": [1.0, 0.5], "top_k": 1000, "as_of": born});
+    assert_eq!(answer(&a, "dest", &q).await.0, all);
+}

@@ -777,7 +777,9 @@ fn key_index(key: &str) -> Option<String> {
     if !key.ends_with(".seg") {
         return None;
     }
-    let (before, _) = key.split_once("/seg/")?;
+    // ⚠️ The LAST `/seg/` (M16 code review): an index name may hold one, and its segments
+    // would otherwise read as borrowed from the index named by the prefix before it.
+    let (before, _) = key.rsplit_once("/seg/")?;
     let (_, index) = before.split_once("/idx/")?;
     (!index.is_empty()).then(|| index.to_owned())
 }
