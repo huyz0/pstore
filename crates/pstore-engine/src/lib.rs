@@ -503,7 +503,12 @@ fn resolve(
         let next: Option<Option<Document>> = match op_code(&op) {
             None if is_tombstone(&op) => Some(None),
             None => Some(Some(op)),
-            Some(OP_PATCH) => current.filter(&admits).map(|c| Some(merged(c, &op))),
+            // A patch that changes nothing touches nothing (code review, M13.1): no delete
+            // vector, and no segment row, for a version that is already what it would write.
+            Some(OP_PATCH) => current
+                .filter(&admits)
+                .and_then(|c| Some(merged(c.clone(), &op)).filter(|m| *m != c))
+                .map(Some),
             Some(OP_COND_UPSERT) => current
                 .as_ref()
                 .is_none_or(&admits)
@@ -525,6 +530,9 @@ fn resolve(
         .collect();
     (order, sealed)
 }
+
+/// How many segments a fold resolving deferred operations reads at once (M13).
+const PREPARE_WIDTH: usize = 4;
 
 /// One segment's rows as a fold reads them to supersede ids -- and, with vectors, to find the
 /// base versions deferred operations resolve against (M13).
@@ -1331,7 +1339,8 @@ impl<S: BlobStore> Engine<S> {
     /// ignored. Invisible until that fold.
     ///
     /// # Errors
-    /// An attribute name that is empty or begins `$`, which are reserved.
+    /// An attribute name that is empty or begins `$`, which are reserved; or a value no
+    /// segment can store, as [`Self::write`] refuses it.
     pub async fn patch(
         &self,
         index: &str,
@@ -1353,6 +1362,12 @@ impl<S: BlobStore> Engine<S> {
                 )));
             }
             let mut attrs = p.set;
+            pstore_format::check_storable(&Document {
+                id: p.id.clone(),
+                vectors: BTreeMap::new(),
+                attrs: attrs.clone(),
+            })
+            .map_err(|e| EngineError::Format(format!("patch of {}: {e}", p.id)))?;
             attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
             if !p.unset.is_empty() {
                 attrs.insert(
@@ -2130,7 +2145,8 @@ impl<S: BlobStore> Engine<S> {
                     .filter(|d| is_deferred(d))
                     .map(|d| d.id.as_str())
                     .collect();
-                let prepared = self.prepare(&at.head, &idx, true).await?;
+                let keep = |d: &Document| needed.contains(d.id.as_str());
+                let prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
                 let base: std::collections::HashMap<String, Document> = prepared
                     .iter()
                     .flat_map(|p| {
@@ -2158,7 +2174,7 @@ impl<S: BlobStore> Engine<S> {
             for (idx, ids) in &touched {
                 let prepared = match prepared_for.remove(idx) {
                     Some(p) => p,
-                    None => self.prepare(&at.head, idx, false).await?,
+                    None => self.prepare(&at.head, idx, None).await?,
                 };
                 self.supersede(&mut next, prepared, ids).await?;
             }
@@ -2309,52 +2325,80 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// Every existing segment of `index` with its delete vector and rows -- ids and attributes,
-    /// and with `vectors` the rows' vectors too (M13) -- one open and one coalesced read each,
-    /// all in parallel.
+    /// one open and one coalesced read each, all in parallel. With `keep` (M13), whole rows,
+    /// vectors included, for those it keeps and ids alone for the rest, at most
+    /// [`PREPARE_WIDTH`] segments at a time.
     ///
-    /// ⚠️ With vectors it is `Segment::scan` with **no filter**, and that is load-bearing: `scan`
+    /// ⚠️ With `keep` it is `Segment::scan` with **no filter**, and that is load-bearing: `scan`
     /// returns rows without their positions, so list order is row position only when every
     /// block is read. A filtered scan here would shift every delete this fold writes.
+    ///
+    /// ⚠️ **The width and the id-only rows bound the fold's memory** (code review, M13.1): a
+    /// full scan decodes every vector of a segment, and all of an index's segments at once
+    /// would hold the index. What survives the scan is the rows deferred operations name.
     async fn prepare(
         &self,
         head: &Head,
         index: &str,
-        vectors: bool,
+        keep: Option<&(dyn Fn(&Document) -> bool + Sync)>,
     ) -> Result<Vec<Prepared>, EngineError> {
+        use futures_util::{StreamExt, TryStreamExt};
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
-        futures_util::future::try_join_all(refs.iter().map(|r| async move {
-            let key = Key::new(r.key.clone());
-            let old = head.deletes.get(&r.key).map(|(k, _)| k.clone());
-            let (seg, before) =
-                futures_util::future::join(Segment::open(&*self.store, &key), async {
-                    match &old {
-                        Some(k) => self
-                            .store
-                            .get(&Key::new(k.clone()))
-                            .await
-                            .map(|raw| pstore_query::deletes::decode(&raw)),
-                        None => Ok(std::collections::HashSet::new()),
-                    }
+        let width = if keep.is_some() {
+            PREPARE_WIDTH
+        } else {
+            refs.len().max(1)
+        };
+        let reads: Vec<_> = refs
+            .iter()
+            .map(|r| async move {
+                let key = Key::new(r.key.clone());
+                let old = head.deletes.get(&r.key).map(|(k, _)| k.clone());
+                let (seg, before) =
+                    futures_util::future::join(Segment::open(&*self.store, &key), async {
+                        match &old {
+                            Some(k) => self
+                                .store
+                                .get(&Key::new(k.clone()))
+                                .await
+                                .map(|raw| pstore_query::deletes::decode(&raw)),
+                            None => Ok(std::collections::HashSet::new()),
+                        }
+                    })
+                    .await;
+                let (seg, deleted) = (seg?, before?);
+                let rows: Vec<(usize, Document)> = if let Some(keep) = keep {
+                    seg.scan(&*self.store, &key, None)
+                        .await?
+                        .into_iter()
+                        .map(|d| {
+                            if keep(&d) {
+                                d
+                            } else {
+                                Document {
+                                    id: d.id,
+                                    vectors: BTreeMap::new(),
+                                    attrs: BTreeMap::new(),
+                                }
+                            }
+                        })
+                        .enumerate()
+                        .collect()
+                } else {
+                    seg.rows_where(&*self.store, &key, |_| true).await?
+                };
+                Ok::<_, EngineError>(Prepared {
+                    key: r.key.clone(),
+                    old,
+                    deleted,
+                    rows,
                 })
-                .await;
-            let (seg, deleted) = (seg?, before?);
-            let rows: Vec<(usize, Document)> = if vectors {
-                seg.scan(&*self.store, &key, None)
-                    .await?
-                    .into_iter()
-                    .enumerate()
-                    .collect()
-            } else {
-                seg.rows_where(&*self.store, &key, |_| true).await?
-            };
-            Ok::<_, EngineError>(Prepared {
-                key: r.key.clone(),
-                old,
-                deleted,
-                rows,
             })
-        }))
-        .await
+            .collect();
+        futures_util::stream::iter(reads)
+            .buffered(width)
+            .try_collect()
+            .await
     }
 
     /// Reaps objects dereferenced more than `retention` epochs ago.

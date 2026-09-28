@@ -82,3 +82,67 @@ async fn a_conditional_upsert_is_judged_by_the_reject_pass() {
     assert_eq!(stats.documents, 1);
     assert_eq!(stats.schema.unwrap().client_dims(), 2);
 }
+
+#[tokio::test]
+async fn a_patch_after_a_delete_supersedes_the_right_row_across_blocks() {
+    // Positions come from an unfiltered scan in row order; a shift would supersede a
+    // neighbour. 300 rows span several blocks; an earlier row is already deleted.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(52), LaneId(1));
+    let docs: Vec<Document> = (0..300)
+        .map(|i| {
+            let mut d = Document::new(format!("d{i:05}"), vec![1.0, 0.5]);
+            d.attrs.insert("n".to_owned(), Value::Int(i));
+            d.attrs.insert("m".to_owned(), Value::Int(2 * i));
+            d
+        })
+        .collect();
+    let vectors = docs[200].vectors.clone();
+    e.write("idx", docs).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.delete("idx", vec!["d00010".to_owned()]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let patch = Patch {
+        id: "d00200".to_owned(),
+        set: BTreeMap::from([("n".to_owned(), Value::Int(-1))]),
+        unset: vec![],
+    };
+    e.patch("idx", vec![patch], None).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let mut rows: Vec<Document> = e.scan("idx", None).await.unwrap();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(rows.len(), 299);
+    for r in &rows {
+        let i: i64 = r.id[1..].parse().unwrap();
+        let want = if i == 200 { -1 } else { i };
+        assert_eq!(r.attrs.get("n"), Some(&Value::Int(want)), "{}", r.id);
+        assert_eq!(r.attrs.get("m"), Some(&Value::Int(2 * i)), "{}", r.id);
+    }
+    // The patched row is its whole base version, vector included, with `n` set.
+    let patched = rows.iter().find(|r| r.id == "d00200").unwrap();
+    assert_eq!(patched.vectors, vectors);
+}
+
+#[tokio::test]
+async fn a_patch_of_a_value_no_segment_stores_is_refused() {
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(53), LaneId(1));
+    for bad in [
+        Value::Float(f64::NAN),
+        Value::Array(vec![Value::Array(vec![])]),
+    ] {
+        let patch = Patch {
+            id: "x".to_owned(),
+            set: BTreeMap::from([("a".to_owned(), bad.clone())]),
+            unset: vec![],
+        };
+        let got = e.patch("idx", vec![patch], None).await;
+        assert!(got.is_err(), "{bad:?} was accepted");
+    }
+    assert_eq!(
+        e.flush().await.unwrap(),
+        None,
+        "a refused patch was buffered"
+    );
+}

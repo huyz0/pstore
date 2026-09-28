@@ -378,7 +378,7 @@ async fn a_plain_fold_reads_what_it_did_before_m13() {
 }
 
 #[tokio::test]
-async fn a_patch_costs_one_put_and_a_plain_fold_no_more_reads() {
+async fn a_patch_costs_one_put() {
     let w = apis(&[1]);
     let a = &w[0];
     seeded(a).await;
@@ -405,6 +405,14 @@ async fn what_a_patch_cannot_mean_is_refused() {
         (
             json!({"patch_columns": {"id": ["x", "y"], "a": [1]}}),
             "patch_columns",
+        ),
+        (
+            json!({"patch_columns": {"id": ["x"], "vector": [[1.0, 0.5]]}}),
+            "vector",
+        ),
+        (
+            json!({"patch_rows": [{"id": "x", "attributes": {"a": 1}}], "patch_condition": deep()}),
+            "nests too deeply",
         ),
         (
             json!({"patch_rows": [{"id": "x", "attributes": {"a": 1}}], "patch_condition": "a"}),
@@ -435,4 +443,53 @@ async fn what_a_patch_cannot_mean_is_refused() {
     let (s, b, _) = send(a, "PUT", "/v1/indexes/docs/documents", &batched, None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
     assert!(b["error"]["message"].as_str().unwrap().contains("durable"));
+}
+
+/// A filter nested deeper than a condition's encoding carries.
+fn deep() -> Value {
+    let mut f = json!(["a", "Eq", 1]);
+    for _ in 0..80 {
+        f = json!(["Not", f]);
+    }
+    f
+}
+
+#[tokio::test]
+async fn a_missing_id_meets_each_kind_as_the_table_says() {
+    let w = apis(&[1]);
+    let a = &w[0];
+    seeded(a).await;
+    let before = updated(a).await;
+    // A patch and a conditional delete of an id with no version do nothing, and a patch that
+    // changes nothing touches nothing: the segment is not rewritten.
+    write(
+        a,
+        json!({"patch_rows": [{"id": "gone", "attributes": {"a": 1}}]}),
+    )
+    .await;
+    write(
+        a,
+        json!({"deletes": ["gone"], "delete_condition": ["a", "Eq", 1]}),
+    )
+    .await;
+    write(
+        a,
+        json!({"patch_rows": [{"id": "x", "attributes": {"a": 1, "zz": null}}]}),
+    )
+    .await;
+    fold(a).await;
+    assert_eq!(
+        updated(a).await,
+        before,
+        "an operation on nothing touched something"
+    );
+    assert_eq!(rows(a).await.len(), 2);
+    // A conditional upsert of an id with no version inserts it, whatever the condition.
+    write(
+        a,
+        json!({"documents": [doc("gone", json!({"a": 8}))], "upsert_condition": ["a", "Eq", 100]}),
+    )
+    .await;
+    fold(a).await;
+    assert_eq!(rows(a).await["gone"], json!({"a": 8}));
 }

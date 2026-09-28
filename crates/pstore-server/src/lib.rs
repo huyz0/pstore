@@ -746,6 +746,11 @@ fn patches_of(
             .ok_or_else(|| bad("an `id` column is required"))?;
         let mut columns = Vec::new();
         for (name, col) in cols.iter().filter(|(n, _)| *n != "id") {
+            if name == "vector" {
+                return Err(bad(
+                    "a patch carries no vector; upsert the rows to change them",
+                ));
+            }
             let col = col
                 .as_array()
                 .filter(|c| c.len() == ids.len())
@@ -817,7 +822,17 @@ async fn write_documents<S: BlobStore + 'static>(
         v.as_ref()
             .map(|v| {
                 if any {
-                    predicate(v)
+                    // A condition travels to the fold encoded; one the fold could not decode
+                    // would admit nothing there, so it is refused here (code review, M13.1).
+                    predicate(v).and_then(|p| {
+                        pstore_query::condition::decode(&pstore_query::condition::encode(&p))
+                            .map(|_| p)
+                            .ok_or_else(|| {
+                                ApiError::bad_request(format!(
+                                    "{name}: the filter nests too deeply"
+                                ))
+                            })
+                    })
                 } else {
                     Err(ApiError::bad_request(format!(
                         "{name} with no operations of its kind to apply to"
