@@ -1163,6 +1163,7 @@ dependencies = [
  "pstore-blob",
  "pstore-testkit",
  "pstore-types",
+ "regex-syntax",
  "rust-stemmers",
  "thiserror",
  "tokio",
@@ -1229,6 +1230,7 @@ dependencies = [
  "pstore-testkit",
  "pstore-types",
  "regex",
+ "regex-syntax",
  "thiserror",
  "tokio",
 ]

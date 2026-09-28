@@ -22,6 +22,7 @@ pub struct SegmentWriter {
     write_fields: bool,
     write_text_fields: bool,
     text_fields: Vec<String>,
+    trigram_attrs: Vec<String>,
     rows_per_block: usize,
     /// Whether sealed blocks carry zone maps. Cleared only by [`Self::seal_segment`]'s
     /// fallback, for a segment whose integer attribute names cannot fit the index.
@@ -60,6 +61,7 @@ impl SegmentWriter {
             index_budget: INDEX_BUDGET,
             write_fields: true,
             write_text_fields: true,
+            trigram_attrs: Vec::new(),
             text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
             zone_maps: true,
@@ -134,6 +136,17 @@ impl SegmentWriter {
     #[must_use]
     pub fn with_text_fields(mut self, names: &[String]) -> Self {
         self.text_fields = names.to_vec();
+        self
+    }
+
+    /// Sketches these string attributes' trigrams per block (M15.2), in what the block index
+    /// leaves of the meta region's budget -- or not at all, when it leaves too little.
+    #[must_use]
+    pub fn with_trigram_attrs(mut self, names: &[String]) -> Self {
+        let mut names = names.to_vec();
+        names.sort();
+        names.dedup();
+        self.trigram_attrs = names;
         self
     }
 
@@ -529,6 +542,38 @@ impl SegmentWriter {
             self.rows_per_block = self.rows_per_block.saturating_mul(2);
         };
 
+        // M15.2: the sketch takes only what the block index left, less its own directory
+        // entry, so a declaration never coarsens a block (spec review, M15). `bits` halves to
+        // fit; below the minimum there is no sketch, which prunes nothing and is sound.
+        let sketch = if self.trigram_attrs.is_empty() {
+            Vec::new()
+        } else {
+            let spare = target.saturating_sub(idx.len()).saturating_sub(ENTRY);
+            let blocks = self.blocks.len();
+            let mut bits = crate::trigram::MAX_BITS;
+            while bits >= crate::trigram::MIN_BITS
+                && crate::trigram::Sketch::encoded_len(&self.trigram_attrs, blocks, bits) > spare
+            {
+                bits /= 2;
+            }
+            if bits < crate::trigram::MIN_BITS {
+                Vec::new()
+            } else {
+                let chunks: Vec<&[Document]> = docs.chunks(self.rows_per_block).collect();
+                crate::trigram::Sketch::build(&self.trigram_attrs, blocks, bits, |attr, b| {
+                    chunks
+                        .get(b)
+                        .into_iter()
+                        .flat_map(|rows| rows.iter())
+                        .filter_map(|d| match d.attrs.get(attr) {
+                            Some(crate::Value::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .encode()
+            }
+        };
         let mut out = self.body;
         for (id, body) in &bodies {
             dir.push((*id, out.len() as u64, body.len() as u64));
@@ -564,6 +609,9 @@ impl SegmentWriter {
         }
         if !text_bytes.is_empty() {
             inline.push((Section::TextFields, &text_bytes));
+        }
+        if !sketch.is_empty() {
+            inline.push((Section::TrigramSketch, &sketch));
         }
         inline.push((Section::Blocks, &idx.0));
         for (section, bytes) in &inline {
@@ -607,7 +655,13 @@ impl SegmentWriter {
         // open silently costs a second round trip — and every query built on it a fourth.
         debug_assert_eq!(
             meta.len(),
-            overhead + idx.len(),
+            overhead
+                + idx.len()
+                + if sketch.is_empty() {
+                    0
+                } else {
+                    ENTRY + sketch.len()
+                },
             "the overhead above is wrong"
         );
         let fits = meta.len() <= self.index_budget;

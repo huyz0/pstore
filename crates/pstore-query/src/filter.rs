@@ -79,6 +79,8 @@ pub struct Pattern {
     kind: PatternKind,
     source: String,
     re: regex::Regex,
+    /// The folded trigrams every match must contain (M15.2): what prunes a block.
+    required: Vec<pstore_format::trigram::Trigram>,
 }
 
 /// The longest source a pattern may have, in bytes (M15).
@@ -111,10 +113,31 @@ impl Pattern {
             .size_limit(COMPILED_LIMIT)
             .build()
             .map_err(|e| e.to_string())?;
+        let runs = match kind {
+            PatternKind::Glob | PatternKind::IGlob => glob_runs(source),
+            PatternKind::Regex => regex_syntax::Parser::new()
+                .parse(source)
+                .map(|h| {
+                    let mut out = Vec::new();
+                    hir_runs(&h, &mut out);
+                    out
+                })
+                // Unparsed here though compiled there: require nothing, which is sound.
+                .unwrap_or_default(),
+        };
+        let mut required = Vec::new();
+        for run in runs {
+            for t in pstore_format::trigram::trigrams(&run) {
+                if !required.contains(&t) {
+                    required.push(t);
+                }
+            }
+        }
         Ok(Self {
             kind,
             source: source.to_owned(),
             re,
+            required,
         })
     }
 
@@ -128,6 +151,63 @@ impl Pattern {
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+}
+
+/// A glob's literal runs (M15.2): what lies between its wildcards and classes, escapes
+/// included in the run.
+fn glob_runs(glob: &str) -> Vec<String> {
+    let mut runs = vec![String::new()];
+    let mut it = glob.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '*' | '?' => runs.push(String::new()),
+            '[' => {
+                for c in it.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+                runs.push(String::new());
+            }
+            '\\' => {
+                if let (Some(n), Some(run)) = (it.next(), runs.last_mut()) {
+                    run.push(n);
+                }
+            }
+            c => {
+                if let Some(run) = runs.last_mut() {
+                    run.push(c);
+                }
+            }
+        }
+    }
+    runs
+}
+
+/// The literal runs every match of `h` contains (M15.2), conservatively: only literals that
+/// are adjacent in a concatenation join. A capture, or a repetition of at least one, is its
+/// own requirement and never joins its neighbours; anything else requires nothing.
+fn hir_runs(h: &regex_syntax::hir::Hir, out: &mut Vec<String>) {
+    use regex_syntax::hir::HirKind;
+    let lit = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    match h.kind() {
+        HirKind::Literal(l) => out.push(lit(&l.0)),
+        HirKind::Capture(c) => hir_runs(&c.sub, out),
+        HirKind::Repetition(r) if r.min >= 1 => hir_runs(&r.sub, out),
+        HirKind::Concat(items) => {
+            let mut run = String::new();
+            for item in items {
+                if let HirKind::Literal(l) = item.kind() {
+                    run.push_str(&lit(&l.0));
+                } else {
+                    out.push(std::mem::take(&mut run));
+                    hir_runs(item, out);
+                }
+            }
+            out.push(run);
+        }
+        _ => {}
     }
 }
 
@@ -376,9 +456,25 @@ impl Predicate {
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
             Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
-            // Tokens have no zone: every block could hold a match (M14.2). Nor, until M15.2's
-            // sketch, do patterns.
-            Self::Tokens(..) | Self::Pattern(..) | Self::Fuzzy(..) => true,
+            // Tokens have no zone: every block could hold a match (M14.2).
+            Self::Tokens(..) => true,
+            // M15.2: a block whose sketch lacks a required trigram holds no match. No sketch,
+            // or no filter for the attribute, rules nothing out.
+            Self::Pattern(name, p) => zones
+                .sketch
+                .as_ref()
+                .is_none_or(|(s, b)| s.may_hold(name, *b, &p.required)),
+            // The q-gram lemma: within k edits, a value keeps all but at most 3k of `v`'s
+            // distinct trigrams, so a block holding fewer cannot match.
+            Self::Fuzzy(name, v, k) => {
+                let tris = pstore_format::trigram::trigrams(v);
+                let need = tris.len().saturating_sub(3 * usize::from(*k));
+                need == 0
+                    || zones
+                        .sketch
+                        .as_ref()
+                        .is_none_or(|(s, b)| s.held(name, *b, &tris).is_none_or(|n| n >= need))
+            }
         }
     }
 }

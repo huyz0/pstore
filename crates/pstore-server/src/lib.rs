@@ -861,7 +861,10 @@ async fn write_documents<S: BlobStore + 'static>(
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let req: WriteRequest = parse_write(&body)?;
     let dated = declared_datetimes(&req)?;
-    let fts = declared_fts(&req)?;
+    let declared = pstore_engine::Declared {
+        fts: declared_fts(&req)?,
+        trigram: declared_trigram(&req)?,
+    };
     let patches = patches_of(&req, &dated)?;
     let delete_by = req
         .delete_by_filter
@@ -968,15 +971,9 @@ async fn write_documents<S: BlobStore + 'static>(
         .collect::<Result<_, _>>()?;
     let written = docs.len();
     if !docs.is_empty() {
-        match (&upsert_if, &fts) {
-            (Some(c), f) => {
-                engine
-                    .write_if_with(&index, docs, metric, c, f.as_ref())
-                    .await?
-            }
-            (None, Some(f)) => engine.write_with(&index, docs, metric, f).await?,
-            (None, None) => engine.write_as(&index, docs, metric).await?,
-        }
+        engine
+            .write_declared(&index, docs, metric, upsert_if.as_ref(), &declared)
+            .await?;
     }
     // Then the patches, then the deletes (M13): a later operation on an id wins.
     let patched = patches.len();
@@ -1733,6 +1730,7 @@ async fn index_summary<S: BlobStore + 'static>(
             distance_metric: sc.metric.name(),
             text_field: sc.text_field,
             full_text_search: fts_json(&sc.fts),
+            regex: sc.trigram,
         }),
         rejected_rows: s.rejected_rows,
         updated_epoch: s.updated_epoch.map(|e| e.0),
@@ -2025,7 +2023,7 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
     for (name, ty) in schema {
         // An object naming `full_text_search` is a full-text declaration (M14), which
         // `declared_fts` reads; any other object is refused below, with a datetime's message.
-        if ty.get("full_text_search").is_some() {
+        if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
         if ty.as_str() != Some("datetime") {
@@ -2063,17 +2061,21 @@ fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullTe
         let Some(decl) = decl.as_object() else {
             continue;
         };
+        if let Some(k) = decl
+            .keys()
+            .find(|k| !["type", "full_text_search", "regex"].contains(&k.as_str()))
+        {
+            return Err(bad(format!("{name:?}: unknown key {k:?}")));
+        }
+        // M15.2: a `regex` declaration alone is `declared_trigram`'s.
+        if decl.get("full_text_search").is_none() {
+            continue;
+        }
         if name != pstore_format::text::DEFAULT_TEXT_FIELD {
             return Err(bad(format!(
                 "{name:?}: full_text_search is on the text field `{}` only",
                 pstore_format::text::DEFAULT_TEXT_FIELD
             )));
-        }
-        if let Some(k) = decl
-            .keys()
-            .find(|k| *k != "type" && *k != "full_text_search")
-        {
-            return Err(bad(format!("{name:?}: unknown key {k:?}")));
         }
         if decl.get("type").is_some_and(|t| t != "string") {
             return Err(bad(format!("{name:?}: the text field's type is string")));
@@ -2145,6 +2147,45 @@ fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullTe
         out = Some(fts);
     }
     Ok(out)
+}
+
+/// The attributes a write declares `"regex": true` on (M15.2), sorted, or `None` for none.
+/// `"regex": false` is not a declaration.
+fn declared_trigram(req: &WriteRequest) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(schema) = req.schema.as_ref().and_then(serde_json::Value::as_object) else {
+        return Ok(None);
+    };
+    let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
+    let mut names = Vec::new();
+    for (name, decl) in schema {
+        let Some(flag) = decl.get("regex") else {
+            continue;
+        };
+        let on = flag
+            .as_bool()
+            .ok_or_else(|| bad(format!("{name:?}: regex is true or false")))?;
+        if name == pstore_query::ID_ATTRIBUTE {
+            return Err(bad(
+                "\"id\" cannot be declared regex: it is not sketched".to_owned()
+            ));
+        }
+        if decl.get("type").is_some_and(|t| t != "string") {
+            return Err(bad(format!("{name:?}: a regex attribute's type is string")));
+        }
+        if on {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    if req.documents.is_empty() {
+        return Err(bad(
+            "regex is declared and the write has no documents".to_owned()
+        ));
+    }
+    names.sort();
+    Ok(Some(names))
 }
 
 /// A full-text schema as `GET /v1/indexes/{index}` reports it (M14).

@@ -20,6 +20,8 @@ thiserror    = "2"
 # M14: the Snowball stemmers for an index's declared language, and NFKD for ASCII folding.
 rust-stemmers         = "1.2"
 unicode-normalization = "0.1"
+# M15: simple case folding for the trigram sketch -- the tables `(?i)` itself uses.
+regex-syntax          = { version = "0.8", default-features = false, features = ["std", "unicode-case"] }
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }

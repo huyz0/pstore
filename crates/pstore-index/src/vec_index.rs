@@ -261,10 +261,12 @@ pub fn try_build_all(
         sparse_field,
         text_field,
         &pstore_format::text::Analyzer::default(),
+        &[],
     )
 }
 
-/// [`try_build_all`], analyzing the text field under `analyzer` (M14).
+/// [`try_build_all`], analyzing the text field under `analyzer` (M14), and sketching the
+/// `trigram` attributes (M15.2).
 ///
 /// # Errors
 /// As [`try_build_all`].
@@ -275,9 +277,11 @@ pub fn try_build_all_with(
     sparse_field: Option<&str>,
     text_field: Option<&str>,
     analyzer: &pstore_format::text::Analyzer,
+    trigram: &[String],
 ) -> Result<Built, pstore_format::FormatError> {
     let (w, centroids, order, dictionary, text_dictionary) =
         assemble(docs, params, field, sparse_field, text_field, analyzer);
+    let w = w.with_trigram_attrs(trigram);
     Ok(Built {
         segment: w.try_finish()?,
         centroids,

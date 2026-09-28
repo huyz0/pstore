@@ -128,6 +128,23 @@ impl Segment {
         };
         seg.fields = seg.decode_fields(&idx_bytes, meta_offset)?;
         seg.text_fields = seg.decode_text_fields(&idx_bytes, meta_offset)?;
+        // M15.2: each block's zones carry the sketch and their place in it.
+        if let Some(span) = seg.section(Section::TrigramSketch) {
+            let lo = span.start.checked_sub(meta_offset).unwrap_or(u64::MAX) as usize;
+            let raw = idx_bytes
+                .get(lo..lo.saturating_add((span.end - span.start) as usize))
+                .ok_or(FormatError::Truncated)?;
+            let sketch = crate::trigram::Sketch::decode(raw)?;
+            if sketch.block_count() != seg.blocks.len() {
+                return Err(FormatError::Corrupt(
+                    "a trigram sketch for another block count",
+                ));
+            }
+            let sketch = std::sync::Arc::new(sketch);
+            for (i, b) in seg.blocks.iter_mut().enumerate() {
+                b.zones.sketch = Some((std::sync::Arc::clone(&sketch), i));
+            }
+        }
         Ok(seg)
     }
 

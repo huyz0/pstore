@@ -203,6 +203,7 @@ async fn the_metric_survives_a_head_round_trip() {
                 text_field: String::new(),
                 metric,
                 fts: pstore_format::text::FullText::default(),
+                trigram: Vec::new(),
             },
         );
     }

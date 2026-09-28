@@ -18,6 +18,8 @@ pstore-index  = { path = "../pstore-index" }
 thiserror     = "2"
 # M15: Regex, and Glob compiled to it.
 regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
+# M15.2: the parsed pattern, for the literals every match must contain.
+regex-syntax  = { version = "0.8", default-features = false, features = ["std", "unicode"] }
 
 [dev-dependencies]
 bytes          = "1"

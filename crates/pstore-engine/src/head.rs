@@ -38,6 +38,8 @@ pub struct IndexSchema {
     /// How its text becomes terms, and BM25's `k1` and `b` (M14). The default is every index's
     /// before M14.
     pub fts: pstore_format::text::FullText,
+    /// The attributes whose trigrams each segment sketches (M15.2), sorted; empty for none.
+    pub trigram: Vec<String>,
 }
 
 impl IndexSchema {
@@ -297,7 +299,7 @@ impl Head {
         // M14: each schema's full-text schema, live then dropped (by position), when it is
         // not the default every older index has -- so a HEAD of default schemas is byte for
         // byte what the encoder before M14 wrote.
-        let fts: Vec<(u8, u32, &IndexSchema, Option<&String>)> = self
+        let all: Vec<(u8, u32, &IndexSchema, Option<&String>)> = self
             .schemas
             .iter()
             .map(|(name, s)| (0u8, 0u32, s, Some(name)))
@@ -307,17 +309,39 @@ impl Head {
                     .enumerate()
                     .map(|(i, (_, _, s))| (1u8, i as u32, s, None)),
             )
+            .collect();
+        let put_ref = |out: &mut Vec<u8>, kind: u8, at: u32, name: Option<&String>| {
+            out.push(kind);
+            match name {
+                Some(n) => put_str(out, n),
+                None => out.extend_from_slice(&at.to_le_bytes()),
+            }
+        };
+        let fts: Vec<_> = all
+            .iter()
             .filter(|(_, _, s, _)| s.fts != pstore_format::text::FullText::default())
             .collect();
-        if !fts.is_empty() {
+        let trigram: Vec<_> = all
+            .iter()
+            .filter(|(_, _, s, _)| !s.trigram.is_empty())
+            .collect();
+        // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
+        // one is -- otherwise the later count would be read as the earlier one's.
+        if !fts.is_empty() || !trigram.is_empty() {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in fts {
-                out.push(kind);
-                match name {
-                    Some(n) => put_str(&mut out, n),
-                    None => out.extend_from_slice(&at.to_le_bytes()),
-                }
+                put_ref(&mut out, *kind, *at, *name);
                 put_str(&mut out, &s.fts.encode());
+            }
+        }
+        if !trigram.is_empty() {
+            out.extend_from_slice(&(trigram.len() as u32).to_le_bytes());
+            for (kind, at, s, name) in trigram {
+                put_ref(&mut out, *kind, *at, *name);
+                out.extend_from_slice(&(s.trigram.len() as u32).to_le_bytes());
+                for n in &s.trigram {
+                    put_str(&mut out, n);
+                }
             }
         }
         out
@@ -377,6 +401,7 @@ impl Head {
                     text_field: c.string()?,
                     metric: Metric::DotProduct,
                     fts: pstore_format::text::FullText::default(),
+                    trigram: Vec::new(),
                 },
             );
         }
@@ -431,6 +456,7 @@ impl Head {
                     text_field,
                     metric,
                     fts: pstore_format::text::FullText::default(),
+                    trigram: Vec::new(),
                 },
             ));
         }
@@ -454,6 +480,31 @@ impl Head {
             .ok_or(EngineError::CorruptHead)?;
             schema.fts = pstore_format::text::FullText::decode(&c.string()?)
                 .ok_or(EngineError::CorruptHead)?;
+        }
+        // M15.2: each schema's trigram set, addressed as the full-text section addresses it.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let kind = c.u8()?;
+            let schema = match kind {
+                0 => {
+                    let name = c.string()?;
+                    h.schemas.get_mut(&name)
+                }
+                1 => {
+                    let at = c.u32()? as usize;
+                    h.dropped.get_mut(at).map(|(_, _, s)| s)
+                }
+                _ => None,
+            }
+            .ok_or(EngineError::CorruptHead)?;
+            let n = c.u32()?;
+            let mut names = Vec::with_capacity((n as usize).min(64));
+            for _ in 0..n {
+                names.push(c.string()?);
+            }
+            schema.trigram = names;
         }
         Ok(h)
     }

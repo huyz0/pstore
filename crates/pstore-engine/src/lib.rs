@@ -388,6 +388,8 @@ struct Fresh {
     /// The full-text schema the segment was analyzed under (M14): the index's, else the first
     /// an unfolded row declared, else the default.
     fts: FullText,
+    /// The attributes it sketched (M15.2), by the same rule.
+    trigram: Vec<String>,
 }
 
 /// The attribute name marking a tombstone (M9c.2): **empty**, which the write door refuses and
@@ -710,6 +712,47 @@ fn fts_of(d: &Document) -> Option<FullText> {
     }
 }
 
+/// The reserved attribute a row carries its write's declared trigram set in (M15.2): the
+/// attribute names, sorted. As `$fts`, absent is no opinion.
+const TRGM_ATTR: &str = "$trgm";
+
+/// The trigram set a row's write declared, or `None`.
+fn trgm_of(d: &Document) -> Option<Vec<String>> {
+    match d.attrs.get(TRGM_ATTR) {
+        Some(pstore_format::Value::Array(names)) => names
+            .iter()
+            .map(|n| match n {
+                pstore_format::Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// A trigram-set conflict, from what the index has and what a row declares.
+fn trgm_conflict(index: &str, expected: &[String], got: &[String]) -> EngineError {
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "the regex-indexed attributes",
+        expected: format!(
+            "[{}]. They are fixed when the index is created: a different set is a reindex, \
+             by copying the rows into a new index",
+            expected.join(", ")
+        ),
+        got: format!("[{}]", got.join(", ")),
+    }
+}
+
+/// What a write declares about its index's schema (M14, M15.2). `None` is no opinion.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Declared {
+    /// The analyzer and BM25 parameters.
+    pub fts: Option<FullText>,
+    /// The attributes whose trigrams are sketched, sorted and distinct.
+    pub trigram: Option<Vec<String>>,
+}
+
 /// A full-text schema as a refusal names it.
 fn describe(f: &FullText) -> String {
     let a = &f.analyzer;
@@ -744,6 +787,7 @@ fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError
 fn stripped(mut d: Document) -> Document {
     d.attrs.remove(METRIC_ATTR);
     d.attrs.remove(FTS_ATTR);
+    d.attrs.remove(TRGM_ATTR);
     d
 }
 
@@ -1283,6 +1327,11 @@ impl<S: BlobStore> Engine<S> {
                 .filter(|d| !is_rowless(d))
                 .find_map(fts_of)
                 .unwrap_or_default(),
+            trigram: docs
+                .iter()
+                .filter(|d| !is_rowless(d))
+                .find_map(trgm_of)
+                .unwrap_or_default(),
         }
     }
 
@@ -1325,6 +1374,12 @@ impl<S: BlobStore> Engine<S> {
             && f != schema.fts
         {
             return Some(fts_conflict(index, &schema.fts, &f));
+        }
+        // M15.2: and a declared trigram set, the same way.
+        if let Some(t) = trgm_of(doc)
+            && t != schema.trigram
+        {
+            return Some(trgm_conflict(index, &schema.trigram, &t));
         }
         let dims = doc.vector().len() as u32;
         if dims != schema.dims {
@@ -1429,6 +1484,7 @@ impl<S: BlobStore> Engine<S> {
         docs: &[Document],
         text_field: &str,
         fts: &FullText,
+        trigram: &[String],
     ) -> Result<(), EngineError> {
         let sparse = sparse_field_of(docs);
         let wants_text = docs.iter().any(|d| {
@@ -1455,6 +1511,7 @@ impl<S: BlobStore> Engine<S> {
             sparse.as_deref(),
             wants_text.then_some(text_field),
             &fts.analyzer,
+            trigram,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
@@ -1509,7 +1566,26 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
     ) -> Result<(), EngineError> {
-        self.write_marked(index, docs, metric, None, None).await
+        self.write_marked(index, docs, metric, None, &Declared::default())
+            .await
+    }
+
+    /// Writes `docs` as [`Self::write_if`] does when `cond` is given and [`Self::write_as`]
+    /// otherwise, declaring `declared` of the index's schema (M14, M15.2).
+    ///
+    /// # Errors
+    /// As those, and a declaration the index's schema, or an unfolded write of this process,
+    /// contradicts.
+    pub async fn write_declared(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+        cond: Option<&pstore_query::Predicate>,
+        declared: &Declared,
+    ) -> Result<(), EngineError> {
+        let mark = cond.map(encoded).transpose()?;
+        self.write_marked(index, docs, metric, mark, declared).await
     }
 
     /// [`Self::write_as`], declaring the index's full-text schema (M14): it becomes the
@@ -1525,7 +1601,11 @@ impl<S: BlobStore> Engine<S> {
         metric: Metric,
         fts: &FullText,
     ) -> Result<(), EngineError> {
-        self.write_marked(index, docs, metric, None, Some(fts))
+        let declared = Declared {
+            fts: Some(*fts),
+            trigram: None,
+        };
+        self.write_marked(index, docs, metric, None, &declared)
             .await
     }
 
@@ -1543,7 +1623,7 @@ impl<S: BlobStore> Engine<S> {
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
         let mark = encoded(cond)?;
-        self.write_marked(index, docs, metric, Some(mark), None)
+        self.write_marked(index, docs, metric, Some(mark), &Declared::default())
             .await
     }
 
@@ -1560,7 +1640,11 @@ impl<S: BlobStore> Engine<S> {
         fts: Option<&FullText>,
     ) -> Result<(), EngineError> {
         let mark = encoded(cond)?;
-        self.write_marked(index, docs, metric, Some(mark), fts)
+        let declared = Declared {
+            fts: fts.copied(),
+            trigram: None,
+        };
+        self.write_marked(index, docs, metric, Some(mark), &declared)
             .await
     }
 
@@ -1668,7 +1752,7 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
         mark: Option<String>,
-        fts: Option<&FullText>,
+        declared: &Declared,
     ) -> Result<(), EngineError> {
         let mut docs = docs;
         for d in &mut docs {
@@ -1693,9 +1777,17 @@ impl<S: BlobStore> Engine<S> {
                     pstore_format::Value::Int(metric.code()),
                 );
             }
-            if let Some(f) = fts {
+            if let Some(f) = &declared.fts {
                 d.attrs
                     .insert(FTS_ATTR.to_owned(), pstore_format::Value::Str(f.encode()));
+            }
+            if let Some(t) = &declared.trigram {
+                d.attrs.insert(
+                    TRGM_ATTR.to_owned(),
+                    pstore_format::Value::Array(
+                        t.iter().cloned().map(pstore_format::Value::Str).collect(),
+                    ),
+                );
             }
             if let Some(c) = &mark {
                 d.attrs.insert(
@@ -1803,6 +1895,19 @@ impl<S: BlobStore> Engine<S> {
             && let Some(f) = docs.iter().filter_map(fts_of).find(|f| *f != k)
         {
             return Some(fts_conflict(index, &k, &f));
+        }
+        let declared = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .chain(docs.iter())
+            .find_map(trgm_of);
+        if let Some(k) = declared
+            && let Some(t) = docs.iter().filter_map(trgm_of).find(|t| *t != k)
+        {
+            return Some(trgm_conflict(index, &k, &t));
         }
         // ⚠️ And one metric (M9d), on the same rung: cosine and dot have one width.
         if let Some((known_metric, _)) = known
@@ -2474,6 +2579,7 @@ impl<S: BlobStore> Engine<S> {
                     // were already judged by the declared one.
                     if let Some(c) = created.get(idx) {
                         schema.fts = c.fts;
+                        schema.trigram.clone_from(&c.trigram);
                     }
                     next.schemas.insert(idx.clone(), schema);
                 }
@@ -2481,8 +2587,15 @@ impl<S: BlobStore> Engine<S> {
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.
                 let sealed: Vec<Document> = docs.iter().cloned().map(stripped).collect();
                 // M14: under the index's analyzer, which this fold may have just recorded.
-                let fts = next.schemas.get(idx).map(|s| s.fts).unwrap_or_default();
-                self.seal(&seg_key, &sealed, &self.text_field, &fts).await?;
+                let schema = next.schemas.get(idx).cloned().unwrap_or_default();
+                self.seal(
+                    &seg_key,
+                    &sealed,
+                    &self.text_field,
+                    &schema.fts,
+                    &schema.trigram,
+                )
+                .await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -2982,18 +3095,15 @@ impl<S: BlobStore> Engine<S> {
         };
 
         // M14: a merge re-analyzes, so under the index's analyzer -- never the default.
-        let fts = at
-            .head
-            .schemas
-            .get(index)
-            .map(|s| s.fts)
-            .unwrap_or_default();
+        let schema = at.head.schemas.get(index).cloned().unwrap_or_default();
+        let (fts, trigram) = (schema.fts, schema.trigram);
         let mut out_key = self.compacted_key(at.head.epoch.next(), index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
         // ⚠️ None when every input row is deleted (M9c.2): the merge then only removes.
         let empty = rows.is_empty();
         if !empty {
-            self.seal(&out_key, &rows, text_field, &fts).await?;
+            self.seal(&out_key, &rows, text_field, &fts, &trigram)
+                .await?;
         }
         // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
         // buried rather than left for M6e's orphan sweeper.
@@ -3012,7 +3122,7 @@ impl<S: BlobStore> Engine<S> {
             // no rebuild, and the invariant every past epoch depends on holds by construction.
             let want = self.compacted_key(at.head.epoch.next(), index);
             if want != out_key && !empty {
-                self.seal(&want, &rows, text_field, &fts).await?;
+                self.seal(&want, &rows, text_field, &fts, &trigram).await?;
                 stale.push(out_key.clone());
                 out_key = want;
             }
@@ -3159,7 +3269,7 @@ impl<S: BlobStore> Engine<S> {
         &self,
         index: &str,
         watermark: u64,
-        schema: Option<FullText>,
+        schema: Option<&head::IndexSchema>,
     ) -> Result<Option<Option<FreshView>>, EngineError> {
         let (generation, ops) = {
             let mut m = self.mem();
@@ -3178,7 +3288,13 @@ impl<S: BlobStore> Engine<S> {
         };
         // M14: analyzed as the folded half is, and before any fold as the first declaration.
         let fts = schema
+            .map(|s| s.fts)
             .or_else(|| ops.iter().find_map(fts_of))
+            .unwrap_or_default();
+        // M15.2: sketched as the folded half is, before any fold as the first declaration.
+        let trigram = schema
+            .map(|s| s.trigram.clone())
+            .or_else(|| ops.iter().find_map(trgm_of))
             .unwrap_or_default();
         let mut slot = self.fresh.lock().await;
         // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
@@ -3188,6 +3304,7 @@ impl<S: BlobStore> Engine<S> {
             && f.generation == generation
             && f.index == index
             && f.fts == fts
+            && f.trigram == trigram
         {
             return Ok(Some(Some(f.view())));
         }
@@ -3216,6 +3333,7 @@ impl<S: BlobStore> Engine<S> {
                 shadow,
                 metric,
                 fts,
+                trigram,
             };
             let view = fresh.view();
             *slot = Some(fresh);
@@ -3240,6 +3358,7 @@ impl<S: BlobStore> Engine<S> {
             sparse.as_deref(),
             wants_text.then_some(self.text_field.as_str()),
             &fts.analyzer,
+            &trigram,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
@@ -3287,6 +3406,7 @@ impl<S: BlobStore> Engine<S> {
             shadow,
             metric,
             fts,
+            trigram,
         };
         let view = fresh.view();
         *slot = Some(fresh);
@@ -3564,7 +3684,7 @@ impl<S: BlobStore> Engine<S> {
                 }
                 _ => head::read(&*self.store, self.tenant).await?,
             };
-            let schema = at.head.schemas.get(index).map(|s| s.fts);
+            let schema = at.head.schemas.get(index);
             if let Some(view) = self
                 .fresh_view(index, self.watermark(&at.head), schema)
                 .await?

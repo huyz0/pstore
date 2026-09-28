@@ -168,6 +168,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             text_field: "body".to_owned(),
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
+            trigram: Vec::new(),
         },
     );
     h.schemas.insert(
@@ -177,6 +178,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             text_field: String::new(),
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
+            trigram: Vec::new(),
         },
     );
     h.schema_rejects.insert("alpha".to_owned(), 17);
@@ -236,6 +238,7 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
             text_field: String::new(),
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
+            trigram: Vec::new(),
         },
     );
     h.reaped_before = 77;
@@ -287,6 +290,7 @@ fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
         text_field: "body".to_owned(),
         metric,
         fts: pstore_format::text::FullText::default(),
+        trigram: Vec::new(),
     };
     let mut h = populated();
     h.dropped.push((
@@ -331,6 +335,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             text_field: "text".to_owned(),
             metric: pstore_engine::Metric::DotProduct,
             fts: FullText::default(),
+            trigram: Vec::new(),
         },
     );
     h.dropped.push((
@@ -341,6 +346,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             text_field: "text".to_owned(),
             metric: pstore_engine::Metric::DotProduct,
             fts: FullText::default(),
+            trigram: Vec::new(),
         },
     ));
     let before = h.encode();
@@ -362,5 +368,35 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
     assert_eq!(Head::decode(&full).unwrap(), h);
     for cut in before.len() + 1..full.len() {
         assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
+    }
+}
+
+#[test]
+fn a_trigram_set_round_trips_with_and_without_full_text() {
+    // M15.2's trailing section follows M14's, whose count is written -- as 0 -- whenever a
+    // trigram section follows, or the trigram count would be read as the full-text one's.
+    use pstore_format::text::FullText;
+    let schema = |fts: FullText, trigram: &[&str]| pstore_engine::IndexSchema {
+        dims: 4,
+        text_field: "text".to_owned(),
+        metric: pstore_engine::Metric::DotProduct,
+        fts,
+        trigram: trigram.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    let stem = FullText {
+        analyzer: pstore_format::text::Analyzer {
+            stemming: true,
+            ..pstore_format::text::Analyzer::default()
+        },
+        ..FullText::default()
+    };
+    for fts in [FullText::default(), stem] {
+        let mut h = populated();
+        h.schemas
+            .insert("alpha".to_owned(), schema(fts, &["s", "t"]));
+        h.dropped
+            .push(("gone".to_owned(), 9, schema(FullText::default(), &["u"])));
+        let full = h.encode();
+        assert_eq!(Head::decode(&full).unwrap(), h, "{fts:?}");
     }
 }

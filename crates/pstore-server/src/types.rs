@@ -369,6 +369,8 @@ pub struct Schema {
     pub text_field: String,
     /// The analyzer and BM25 parameters its text is indexed and scored with (M14).
     pub full_text_search: serde_json::Value,
+    /// The attributes whose trigrams are sketched (M15.2), sorted.
+    pub regex: Vec<String>,
 }
 
 /// One index, as `GET /v1/indexes/{id}` reports it.

@@ -188,6 +188,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                                 text_field: String::new(),
                                 metric: pstore_engine::Metric::DotProduct,
                                 fts: pstore_format::text::FullText::default(),
+                                trigram: Vec::new(),
                             },
                         )
                     })

@@ -21,6 +21,7 @@ mod docs;
 mod reader;
 pub mod sparse;
 pub mod text;
+pub mod trigram;
 mod writer;
 
 pub use docs::{decode_docs, decode_rows, encode_docs, encode_rows};
@@ -107,6 +108,12 @@ pub enum Section {
     /// and every segment built without replication. It is written only when a row is actually
     /// duplicated, so an unreplicated segment's bytes do not move.
     IndexRows = 15,
+    /// The trigram sketch (M15.2): a Bloom filter per block per declared attribute, in the
+    /// meta region so the open round reads it. See [`trigram::Sketch`].
+    ///
+    /// ⚠️ **Absent means nothing is sketched**: every segment before M15, every segment with no
+    /// declared attribute, and every one whose block index left no room. It prunes nothing.
+    TrigramSketch = 16,
 }
 
 /// How a vector field is laid out in a segment.
@@ -611,6 +618,8 @@ pub struct Zones {
     /// and an absent int zone rules nothing out, as before M9h.1. A typed zone-free segment
     /// has no zone at all, so there the int side rules nothing out either.
     pub complete: bool,
+    /// The segment's trigram sketch and this block's place in it (M15.2), when it has one.
+    pub sketch: Option<(std::sync::Arc<trigram::Sketch>, usize)>,
 }
 
 impl Zones {
