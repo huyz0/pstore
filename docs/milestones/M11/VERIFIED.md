@@ -99,13 +99,22 @@ because `max_staleness_ms` without `bounded` was accepted.
    - lower depth under `DepthCounting`;
    - `staleness_ms` of 1000 after a paused advance of 1000 ms;
    - the same ids.
-2. **A miss reads it** — `a_miss_past_the_bound_reads_head`: past the bound, eventual's reads
-   and `staleness_ms` 0. The miss refills the cache, and the next read within the bound is a
-   hit.
+2. **A miss reads it** — `a_miss_past_the_bound_reads_head`:
+   - exactly on the bound, still a hit, with `staleness_ms` 500. This was added at code review,
+     against the `<=` to `<` mutant;
+   - past the bound, eventual's reads and `staleness_ms` 0;
+   - the miss refills the cache, and the next read within the bound is a hit.
 3. **Stale, and says so** — `a_hit_is_stale_and_says_so`: another process's folded write is
    missing from a hit, which reports the cached epoch; past the bound, it is answered.
 4. **Own writes stay visible** — `a_hit_still_answers_this_processs_own_writes`: this process's
    batched write, then its durable write and fold, each within the bound.
+   - Its fold ends the hit by the commit check, so it never reached the prune fallback (code
+     review, M1). It now also asserts a hit on a HEAD at the engine's own last-committed epoch
+     (`staleness_ms` 10), against the `committed <=` to `<` mutant.
+   - The prune fallback itself is `a_hit_this_engine_has_pruned_past_is_read_fresh`: B folds
+     A's durable write, an eventual read on A prunes it, and a bounded read on A answers it
+     with `staleness_ms` 0. With the `attempt == 0` guard removed by hand, it failed: the
+     refused hit repeated until `Lost`.
    - 4b: `its_own_commit_ends_a_hit`. A drop through the same process makes the next bounded
      read 404. With the commit check removed by hand, it failed.
    - 4c: `a_hit_on_a_reaped_segment_falls_back_to_a_fresh_read`, which covers both query
@@ -114,4 +123,27 @@ because `max_staleness_ms` without `bounded` was accepted.
      .seg").
 5. **Refusals** — `what_bounded_cannot_mean_is_refused`: without a bound, a bound without
    bounded, -1, "5", 1.5, null, 3,600,001, and with as_of.
-6. **Gates** — see the M11 commit.
+6. **Gates**
+   - `./scripts/mutants.sh --check . --in-diff <every source change since M11.1's sweep>`:
+     **47 tested in 56m, 32 caught, 12 unviable, 3 missed.**
+     - Two misses: `Err(_) if hit` became `if true`, in `query_filtered_as` and in
+       `ordered_as`. A failed read that did not hit the cache would be retried and pay
+       twice. `a_refused_strong_read_is_not_run_twice`
+       (`cargo test -p pstore-server --test consistency`) now pins a refused strong read at 3
+       reads and 0 LISTs, for both shapes. With each guard set to `true` by hand, it read 6.
+     - ⚠️ **One miss is recorded, not killed**: `Strong if attempt == 0` became `if true` in
+       `head_and_fresh_as`. That guard is M9i.2's, and M11.2's restructuring only moved it.
+       Its only effect is one more registry GET, and only on the rare retry where
+       `fresh_view` refuses a strong read's HEAD, which no test here can force without a
+       race harness. It is effectively equivalent, not verified killed.
+   - `./scripts/mutants.sh --check 'unfolded_next' --file crates/pstore-engine/src/lib.rs`
+     re-checked M11.1's two misses after the overflow test landed: **6 tested, 5 caught, 1
+     missed** (`>` became `>=`, which would leave an entry that is already covered). The
+     overflow test's reader now writes, and must return an empty token after the fold; with
+     `>=` by hand, it failed.
+   - Spec review: two rounds. Round 1 blocked twice: on a drop by this engine served from the
+     cache, and on a reaped segment being a permanent 500. Round 2 passed.
+   - Code review: two rounds. Round 1 had two majors: the prune fallback was unreached, and
+     there were likely survivors. Round 2 passed.
+     - Minor, not taken: a hit clones the whole `HeadAt` rather than an `Arc`.
+   - `./scripts/gates.sh` on this tree: all seventeen PASS.

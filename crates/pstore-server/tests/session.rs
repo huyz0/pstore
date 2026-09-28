@@ -245,15 +245,17 @@ async fn a_session_across_seventeen_lanes_overflows_into_strong() {
     assert_eq!(n.len(), 27);
 
     let reader = &w[17];
+    // The reader has written too: once folded, its own lane needs no entry either.
+    write(reader, "r", true, None).await;
     let (s, _, body) = query(reader, &q("session"), Some(&t)).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(reader.fold_due(&requested_only()).await.folded, 1);
     let (s, h, body) = query(reader, &q("session"), Some(&t)).await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(ids(&body).len(), 17);
+    assert_eq!(ids(&body).len(), 18);
     let back = decode(h[HEADER].to_str().unwrap());
     assert_eq!(back[25] & 1, 0, "overflow cleared");
-    assert_eq!(back[26], 0, "the reader holds nothing unfolded");
+    assert_eq!(back[26], 0, "the reader's own writes are folded: no entry");
 }
 
 #[tokio::test]

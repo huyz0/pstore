@@ -480,3 +480,22 @@ fn the_research_is_corrected_where_it_promised_otherwise() {
     assert!(read("11-design/turbopuffer-api-parity.md").contains("landed in [M11.1]"));
     assert!(read("11-design/api-design.md").contains("`503 not_folded`"));
 }
+
+#[tokio::test]
+async fn a_refused_strong_read_is_not_run_twice() {
+    // M11.2: only a read served from the `bounded` cache is retried on failure. A refused
+    // strong read retried as well would pay its HEAD, registry and probes twice.
+    let w = world(&[1, 2]);
+    write(&w.apis[0], 110, "x").await;
+    let mut costs = Vec::new();
+    for q in [relevance(Some("strong")), ranked(Some("strong"))] {
+        let before = w.reads(110);
+        let (s, _, b) = query(&w.apis[1], 110, &q).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        let after = w.reads(110);
+        costs.push((after.0 - before.0, after.2 - before.2));
+    }
+    // HEAD, the registry, and one probe of the one registered lane; no LIST. Measured on the
+    // code this pins.
+    assert_eq!(costs, [(3, 0), (3, 0)]);
+}
