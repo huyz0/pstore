@@ -573,6 +573,35 @@ pub(crate) type Mask = std::collections::HashSet<usize>;
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_regex_compiles_to_at_most_one_mebibyte() {
+        // The limit is stated, not the crate's default: the smallest `\w{n}` refused is the
+        // first one past 1 MiB compiled, and the one before it is within.
+        let source = |n: usize| format!("\\w{{{n}}}");
+        let n = (1..=4096)
+            .find(|n| Pattern::new(PatternKind::Regex, &source(*n)).is_err())
+            .expect("no size refused");
+        let within = |n: usize| {
+            regex::RegexBuilder::new(&source(n))
+                .size_limit(1 << 20)
+                .build()
+                .is_ok()
+        };
+        assert!(n > 1 && within(n - 1) && !within(n), "refused from {n}");
+    }
+
+    #[test]
+    fn two_patterns_are_equal_by_kind_and_source() {
+        let p = |kind| Pattern::new(kind, "a*").unwrap();
+        assert_eq!(p(PatternKind::Glob), p(PatternKind::Glob));
+        assert_ne!(p(PatternKind::Glob), p(PatternKind::IGlob));
+        assert_ne!(p(PatternKind::Glob), p(PatternKind::Regex));
+        assert_ne!(
+            p(PatternKind::Glob),
+            Pattern::new(PatternKind::Glob, "a?").unwrap()
+        );
+    }
+
     fn zones(pairs: &[(&str, i64, i64)]) -> Zones {
         Zones {
             ints: pairs

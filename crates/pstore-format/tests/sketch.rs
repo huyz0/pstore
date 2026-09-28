@@ -106,3 +106,34 @@ fn a_sketch_round_trips_and_a_truncated_one_is_refused() {
     // Folded: `STAR` holds what `ſtar` does.
     assert!(sketch.may_hold("s", 2, &pstore_format::trigram::trigrams("STAR")));
 }
+
+#[test]
+fn a_sketch_never_costs_the_open_a_second_read() {
+    // Every budget at which the undeclared segment fits the one suffix read, the declared one
+    // fits too, with the same blocks: the sketch takes only what the index left, less its own
+    // directory entry. Stepped a byte at a time, so the window a missing entry opens is hit.
+    let build = |budget: usize, declared: bool| {
+        let mut w = SegmentWriter::new(64).with_index_budget(budget);
+        if declared {
+            w = w.with_trigram_attrs(&["s".to_owned()]);
+        }
+        for d in docs(200) {
+            w.push(d);
+        }
+        w.try_finish()
+    };
+    let mut sketched = 0;
+    for budget in 100..1_500 {
+        let Ok(plain) = build(budget, false) else {
+            continue;
+        };
+        let declared = build(budget, true)
+            .unwrap_or_else(|e| panic!("at a budget of {budget}: {e}"));
+        let has = declared.len() != plain.len();
+        sketched += usize::from(has);
+        if !has {
+            assert_eq!(declared, plain, "at a budget of {budget}");
+        }
+    }
+    assert!(sketched > 0, "no budget left room for a sketch");
+}
