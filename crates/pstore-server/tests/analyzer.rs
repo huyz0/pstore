@@ -450,3 +450,39 @@ async fn what_an_analyzer_cannot_mean_is_refused() {
         "{b}"
     );
 }
+
+#[tokio::test]
+async fn a_declaration_superseded_in_its_creating_fold_still_fixes_the_analyzer() {
+    // Code review, M14 B1: the schema is implied from every operation the creating fold
+    // read, not from the rows left after the newest version and deletes are resolved.
+    let stem = Some(json!({"stemming": true}));
+    // A declared row replaced by an undeclared one.
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, &[("1", "runs")], stem.clone()).await;
+    ok_put(a, &[("1", "he runs")], None).await;
+    assert_eq!(ids(a, "running").await, ["1"], "before the fold");
+    fold(a).await;
+    assert_eq!(ids(a, "running").await, ["1"], "after the fold");
+    assert_eq!(
+        stats(a).await["schema"]["full_text_search"]["stemming"],
+        true
+    );
+    // A declared row deleted, beside an undeclared one.
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, &[("1", "runs")], stem.clone()).await;
+    ok_put(a, &[("2", "she runs")], None).await;
+    let (s, b) = send(
+        a,
+        "PUT",
+        "/v1/indexes/docs/documents",
+        &json!({"durability": "durable", "deletes": ["1"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(a).await;
+    assert_eq!(ids(a, "running").await, ["2"]);
+    // And a later declaration of the same analyzer is no conflict.
+    ok_put(a, &[("3", "we ran")], stem).await;
+}

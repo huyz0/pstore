@@ -2023,8 +2023,9 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
     let mut out = std::collections::BTreeSet::new();
     for (name, ty) in schema {
-        // An object is a full-text declaration (M14), which `declared_fts` reads.
-        if ty.is_object() {
+        // An object naming `full_text_search` is a full-text declaration (M14), which
+        // `declared_fts` reads; any other object is refused below, with a datetime's message.
+        if ty.get("full_text_search").is_some() {
             continue;
         }
         if ty.as_str() != Some("datetime") {

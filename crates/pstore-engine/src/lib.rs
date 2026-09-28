@@ -2408,7 +2408,9 @@ impl<S: BlobStore> Engine<S> {
                     .head
                     .schemas
                     .get(&idx)
-                    .map_or_else(|| self.implied(&docs).fts, |s| s.fts);
+                    .or_else(|| created.get(&idx))
+                    .map(|s| s.fts)
+                    .unwrap_or_default();
                 let needed: std::collections::HashSet<&str> = docs
                     .iter()
                     .filter(|d| is_deferred(d) && !is_by_filter(d))
@@ -2464,7 +2466,16 @@ impl<S: BlobStore> Engine<S> {
                 // vectors records no text field, so a differently-configured process may
                 // still fold into it.
                 if !next.schemas.contains_key(idx) {
-                    next.schemas.insert(idx.clone(), self.implied(docs));
+                    let mut schema = self.implied(docs);
+                    // ⚠️ **The analyzer from every operation this fold read** (code review,
+                    // M14 B1), not from the rows left after resolution: `$fts` absent is no
+                    // opinion, so a declaring row superseded or deleted in this fold would
+                    // otherwise leave the default -- and the reject pass and the conditions
+                    // were already judged by the declared one.
+                    if let Some(c) = created.get(idx) {
+                        schema.fts = c.fts;
+                    }
+                    next.schemas.insert(idx.clone(), schema);
                 }
                 let seg_key = self.segment_key(next.epoch, idx);
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.

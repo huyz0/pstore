@@ -6,7 +6,7 @@
 //! ever travels from this process's writer to a fold, so it has no version but its tags. A
 //! tag it does not know decodes as `None`, never as a different predicate.
 
-use crate::filter::{Op, Predicate, TokenOp};
+use crate::filter::{Bound, Op, Predicate, TokenOp};
 use pstore_format::Value;
 
 /// Deeper than any filter a client writes: bounds the decoder's recursion.
@@ -135,10 +135,10 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
             put_str(b, text);
             match analyzer {
                 None => b.push(0),
-                Some(an) => {
+                Some(bound) => {
                     b.push(1);
                     let full = pstore_format::text::FullText {
-                        analyzer: *an,
+                        analyzer: *bound.analyzer(),
                         ..pstore_format::text::FullText::default()
                     };
                     put_str(b, &full.encode());
@@ -253,7 +253,10 @@ impl Reader<'_> {
                 let text = self.string()?;
                 let analyzer = match self.u8()? {
                     0 => None,
-                    1 => Some(pstore_format::text::FullText::decode(&self.string()?)?.analyzer),
+                    1 => Some(Bound::new(
+                        pstore_format::text::FullText::decode(&self.string()?)?.analyzer,
+                        &text,
+                    )),
                     _ => return None,
                 };
                 Predicate::Tokens(a, op, text, analyzer)
@@ -290,11 +293,14 @@ mod tests {
                 a(),
                 TokenOp::Sequence,
                 "Häuser".into(),
-                Some(pstore_format::text::Analyzer {
-                    language: pstore_format::text::Language::German,
-                    stemming: true,
-                    ..pstore_format::text::Analyzer::default()
-                }),
+                Some(Bound::new(
+                    pstore_format::text::Analyzer {
+                        language: pstore_format::text::Language::German,
+                        stemming: true,
+                        ..pstore_format::text::Analyzer::default()
+                    },
+                    "Häuser",
+                )),
             ),
         ])
     }

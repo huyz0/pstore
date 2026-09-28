@@ -37,6 +37,31 @@ pub enum TokenOp {
     Sequence,
 }
 
+/// A token predicate's analyzer, and its text already analyzed by it (M14.2): analyzed once
+/// when bound, never once per row (code review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    analyzer: pstore_format::text::Analyzer,
+    query: Vec<String>,
+}
+
+impl Bound {
+    /// `text` analyzed by `analyzer`.
+    #[must_use]
+    pub fn new(analyzer: pstore_format::text::Analyzer, text: &str) -> Self {
+        Self {
+            analyzer,
+            query: pstore_format::text::analyze(&analyzer, text),
+        }
+    }
+
+    /// The analyzer it was bound to.
+    #[must_use]
+    pub fn analyzer(&self) -> &pstore_format::text::Analyzer {
+        &self.analyzer
+    }
+}
+
 /// A predicate over one document's id and attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
@@ -63,29 +88,42 @@ pub enum Predicate {
     /// included (spec review round 2): answering as the default analyzer, or as "everything"
     /// under a `Not`, would be a wrong answer from a missed bind that no test could tell
     /// from a right one on a default index.
-    Tokens(
-        String,
-        TokenOp,
-        String,
-        Option<pstore_format::text::Analyzer>,
-    ),
+    Tokens(String, TokenOp, String, Option<Bound>),
 }
 
 impl Predicate {
     /// Whether a document with this id and these attributes is admitted: only when the whole
     /// predicate is known true.
+    ///
+    /// ⚠️ **Three-valued, checked once**: a predicate holding an unbound token predicate is
+    /// unknown whatever encloses it, `Not` included, so it admits nothing -- and every other
+    /// predicate is two-valued, so it evaluates short-circuiting (code review: collecting
+    /// every child's value per row cost every filter, not only token ones).
     #[must_use]
     pub fn admits(&self, id: &str, attrs: &BTreeMap<String, Value>) -> bool {
-        self.eval(id, attrs) == Some(true)
+        !self.unbound() && self.holds(id, attrs)
+    }
+
+    /// Whether a token predicate anywhere in it is unbound.
+    fn unbound(&self) -> bool {
+        match self {
+            Self::Tokens(.., b) => b.is_none(),
+            Self::And(ps) | Self::Or(ps) => ps.iter().any(Self::unbound),
+            Self::Not(p) => p.unbound(),
+            _ => false,
+        }
     }
 
     /// This predicate with every token predicate in it bound to `analyzer` (M14.2).
     #[must_use]
     pub fn bound(&self, analyzer: &pstore_format::text::Analyzer) -> Self {
         match self {
-            Self::Tokens(name, op, text, _) => {
-                Self::Tokens(name.clone(), *op, text.clone(), Some(*analyzer))
-            }
+            Self::Tokens(name, op, text, _) => Self::Tokens(
+                name.clone(),
+                *op,
+                text.clone(),
+                Some(Bound::new(*analyzer, text)),
+            ),
             Self::And(all) => Self::And(all.iter().map(|p| p.bound(analyzer)).collect()),
             Self::Or(any) => Self::Or(any.iter().map(|p| p.bound(analyzer)).collect()),
             Self::Not(p) => Self::Not(Box::new(p.bound(analyzer))),
@@ -93,10 +131,8 @@ impl Predicate {
         }
     }
 
-    /// Three-valued: `None` when an unbound token predicate is anywhere in it. Strictly --
-    /// `And(false, unknown)` is unknown too, so no enclosing `Not` can turn a missed bind into
-    /// an answer.
-    fn eval(&self, id: &str, attrs: &BTreeMap<String, Value>) -> Option<bool> {
+    /// Two-valued, for a predicate [`Self::admits`] has found fully bound.
+    fn holds(&self, id: &str, attrs: &BTreeMap<String, Value>) -> bool {
         let get = |name: &str| -> Option<Value> {
             if name == ID {
                 Some(Value::Str(id.to_owned()))
@@ -104,7 +140,7 @@ impl Predicate {
                 attrs.get(name).cloned()
             }
         };
-        Some(match self {
+        match self {
             Self::Cmp(name, op, want) => get(name).is_some_and(|have| compare(&have, *op, want)),
             Self::Absent(name) => get(name).is_none(),
             Self::In(name, set) => {
@@ -116,33 +152,19 @@ impl Predicate {
                     .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
                 _ => false,
             },
-            Self::And(all) => {
-                let known = all
-                    .iter()
-                    .map(|p| p.eval(id, attrs))
-                    .collect::<Option<Vec<bool>>>()?;
-                return Some(known.into_iter().all(|b| b));
-            }
-            Self::Or(any) => {
-                let known = any
-                    .iter()
-                    .map(|p| p.eval(id, attrs))
-                    .collect::<Option<Vec<bool>>>()?;
-                return Some(known.into_iter().any(|b| b));
-            }
-            Self::Not(p) => return p.eval(id, attrs).map(|b| !b),
-            Self::Tokens(name, op, text, analyzer) => {
-                let a = analyzer.as_ref()?;
-                return Some(match get(name) {
-                    Some(Value::Str(s)) => tokens_match(
-                        *op,
-                        &pstore_format::text::analyze(a, text),
-                        &pstore_format::text::analyze(a, &s),
-                    ),
-                    _ => false,
-                });
-            }
-        })
+            Self::And(all) => all.iter().all(|p| p.holds(id, attrs)),
+            Self::Or(any) => any.iter().any(|p| p.holds(id, attrs)),
+            Self::Not(p) => !p.holds(id, attrs),
+            // Unbound never reaches here: `admits` checked first.
+            Self::Tokens(name, op, _, bound) => match (get(name), bound) {
+                (Some(Value::Str(s)), Some(b)) => tokens_match(
+                    *op,
+                    &b.query,
+                    &pstore_format::text::analyze(&b.analyzer, &s),
+                ),
+                _ => false,
+            },
+        }
     }
 
     /// Whether a block with these zone maps **could** hold an admitted row. `false` only
