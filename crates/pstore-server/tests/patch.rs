@@ -400,7 +400,11 @@ async fn what_a_patch_cannot_mean_is_refused() {
     for (body, why) in [
         (
             json!({"patch_rows": [{"id": "x", "vector": [1.0, 0.5], "attributes": {}}]}),
-            "vector",
+            "carries no vector",
+        ),
+        (
+            json!({"patch_rows": [{"id": "x", "extra": 1, "attributes": {}}]}),
+            "unknown field extra",
         ),
         (
             json!({"patch_columns": {"id": ["x", "y"], "a": [1]}}),
@@ -438,11 +442,19 @@ async fn what_a_patch_cannot_mean_is_refused() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(msg.contains(why), "{body}: {msg:?} does not name {why:?}");
     }
-    let batched =
-        json!({"durability": "batched", "patch_rows": [{"id": "x", "attributes": {"a": 1}}]});
-    let (s, b, _) = send(a, "PUT", "/v1/indexes/docs/documents", &batched, None).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
-    assert!(b["error"]["message"].as_str().unwrap().contains("durable"));
+    // Every deferred kind is durable only (M13 sweep: each clause of the rule is its own).
+    for batched in [
+        json!({"durability": "batched", "patch_rows": [{"id": "x", "attributes": {"a": 1}}]}),
+        json!({"durability": "batched", "documents": [doc("x", json!({}))], "upsert_condition": ["a", "Eq", 1]}),
+        json!({"durability": "batched", "deletes": ["x"], "delete_condition": ["a", "Eq", 1]}),
+    ] {
+        let (s, b, _) = send(a, "PUT", "/v1/indexes/docs/documents", &batched, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{batched}: {b}");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("durable"),
+            "{b}"
+        );
+    }
 }
 
 /// A filter nested deeper than a condition's encoding carries.

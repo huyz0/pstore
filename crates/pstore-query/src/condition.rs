@@ -368,6 +368,12 @@ mod tests {
             edge = Predicate::Not(Box::new(edge));
         }
         assert_eq!(decode(&encode(&edge)), Some(edge));
+        // Through `And` as through `Not`: every level counts (M13 sweep).
+        let mut and = Predicate::And(vec![]);
+        for _ in 0..=MAX_DEPTH {
+            and = Predicate::And(vec![and]);
+        }
+        assert_eq!(decode(&encode(&and)), None);
         // Nested past the bound.
         let mut deep = Predicate::And(vec![]);
         for _ in 0..=MAX_DEPTH {

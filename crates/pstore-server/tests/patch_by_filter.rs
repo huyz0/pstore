@@ -211,6 +211,10 @@ async fn what_a_by_filter_operation_cannot_mean_is_refused() {
             json!({"durability": "batched", "delete_by_filter": ["n", "Eq", 1]}),
             "durable",
         ),
+        (
+            json!({"durability": "batched", "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": {"a": 1}}}),
+            "durable",
+        ),
     ] {
         let (s, b) = send(a, "PUT", "/v1/indexes/docs/documents", &body).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{body} was accepted: {b}");
