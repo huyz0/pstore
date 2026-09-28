@@ -2642,8 +2642,9 @@ impl<S: BlobStore> Engine<S> {
             )
             .await;
         match first {
+            // No hit on the retry, and its miss replaces the cached HEAD: a fresh one is never
+            // older than the one it replaces (code review: forgetting it first changed nothing).
             Err(_) if hit => {
-                self.forget_head();
                 self.query_once(
                     index,
                     prefetch,
@@ -2858,14 +2859,6 @@ impl<S: BlobStore> Engine<S> {
             *cache = Some((read, at.clone()));
         }
         Ok(at)
-    }
-
-    /// Forgets the cached HEAD, after a read served from it failed (M11.2).
-    fn forget_head(&self) {
-        *self
-            .head_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Whether no registered lane holds a bundle `head` has not folded (M9i.2): one `head`
@@ -3120,7 +3113,6 @@ impl<S: BlobStore> Engine<S> {
             .await;
         match first {
             Err(_) if hit => {
-                self.forget_head();
                 self.ordered_once(
                     index,
                     by,

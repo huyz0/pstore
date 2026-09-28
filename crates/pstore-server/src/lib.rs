@@ -1199,9 +1199,10 @@ async fn run<E: BlobStore>(
     })
 }
 
-/// Whole milliseconds, saturating.
+/// Milliseconds, rounded **up** and saturating: a staleness is never understated (M11.2).
 fn millis(d: std::time::Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+    let partial = u128::from(!d.subsec_nanos().is_multiple_of(1_000_000));
+    u64::try_from(d.as_millis() + partial).unwrap_or(u64::MAX)
 }
 
 /// How a query's legs combine (M9g.1), or why the request cannot mean it.
@@ -2186,6 +2187,16 @@ mod tests {
             Some(pstore_query::Prefetch::Dense { tune, .. }) => *tune,
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_staleness_is_rounded_up_and_saturates() {
+        use std::time::Duration;
+        assert_eq!(millis(Duration::ZERO), 0);
+        assert_eq!(millis(Duration::from_millis(7)), 7);
+        assert_eq!(millis(Duration::from_micros(999_900)), 1000);
+        assert_eq!(millis(Duration::from_nanos(1)), 1);
+        assert_eq!(millis(Duration::from_secs(u64::MAX)), u64::MAX);
     }
 
     #[test]

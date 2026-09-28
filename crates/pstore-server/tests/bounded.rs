@@ -141,7 +141,11 @@ async fn a_miss_past_the_bound_reads_head() {
     write(a, "x", true).await;
     fold(a).await;
     query(b, &bounded(relevance(), 500)).await;
-    tokio::time::advance(Duration::from_millis(501)).await;
+    // Exactly on the bound is still within it.
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let edge = query(b, &bounded(relevance(), 500)).await;
+    assert_eq!(edge["meta"]["staleness_ms"], 500, "{edge}");
+    tokio::time::advance(Duration::from_millis(1)).await;
     let eventual = query(b, &relevance()).await;
     let miss = query(b, &bounded(relevance(), 500)).await;
     assert_eq!(reads(&miss), reads(&eventual));
@@ -186,6 +190,30 @@ async fn a_hit_still_answers_this_processs_own_writes() {
     fold(a).await;
     let after = query(a, &bounded(relevance(), 60_000)).await;
     assert_eq!(ids(&after), ["batched", "durable", "x"], "{after}");
+    // Its own commit ended the old hit, and the miss cached a HEAD at that commit's epoch:
+    // a HEAD as new as this engine's last commit is one it may hit.
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let hit = query(a, &bounded(relevance(), 60_000)).await;
+    assert_eq!(hit["meta"]["staleness_ms"], 10, "{hit}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hit_this_engine_has_pruned_past_is_read_fresh() {
+    // Another process folds this one's durable write, and an eventual read here prunes it
+    // from memory. The cached HEAD predates that fold and this engine committed nothing, so
+    // only `fresh_view` refusing the pairing -- then a miss -- keeps the write visible.
+    let w = world(&[1, 2]);
+    let (a, b) = (&w.apis[0], &w.apis[1]);
+    write(a, "w", true).await;
+    fold(a).await;
+    query(a, &bounded(relevance(), 60_000)).await;
+    write(a, "x", true).await;
+    let (s, body) = send(b, "POST", "/v1/admin/fold", &json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(ids(&query(a, &relevance()).await), ["w", "x"]);
+    let got = query(a, &bounded(relevance(), 60_000)).await;
+    assert_eq!(ids(&got), ["w", "x"], "{got}");
+    assert_eq!(got["meta"]["staleness_ms"], 0, "read fresh");
 }
 
 #[tokio::test]
