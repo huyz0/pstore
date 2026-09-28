@@ -230,3 +230,34 @@ async fn a_by_filter_filter_the_fold_cannot_read_is_refused_at_the_call() {
         "a refused operation was buffered"
     );
 }
+
+#[tokio::test]
+async fn a_patch_of_a_reserved_name_is_refused() {
+    // The engine's own door, which the API's never lets a `$` name reach (M13 sweep).
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(57), LaneId(1));
+    for name in ["$op", ""] {
+        let set = Patch {
+            id: "x".to_owned(),
+            set: BTreeMap::from([(name.to_owned(), Value::Int(1))]),
+            unset: vec![],
+        };
+        let unset = Patch {
+            id: "x".to_owned(),
+            set: BTreeMap::new(),
+            unset: vec![name.to_owned()],
+        };
+        assert!(
+            e.patch("idx", vec![set], None).await.is_err(),
+            "set {name:?}"
+        );
+        assert!(
+            e.patch("idx", vec![unset], None).await.is_err(),
+            "unset {name:?}"
+        );
+    }
+    assert_eq!(
+        e.flush().await.unwrap(),
+        None,
+        "a refused patch was buffered"
+    );
+}

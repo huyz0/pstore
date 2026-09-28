@@ -367,6 +367,8 @@ pub struct Schema {
     pub distance_metric: &'static str,
     /// The attribute the text index is built over, or empty if the index carries no text.
     pub text_field: String,
+    /// The analyzer and BM25 parameters its text is indexed and scored with (M14).
+    pub full_text_search: serde_json::Value,
 }
 
 /// One index, as `GET /v1/indexes/{id}` reports it.

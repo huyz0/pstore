@@ -212,7 +212,7 @@ async fn main() {
                     .await
                     .expect("open");
                 let stats = idx.summary();
-                let terms = text::analyze(qtext);
+                let terms = text::analyze(&text::Analyzer::default(), qtext);
                 for (row, score) in idx
                     .search(&store, &t.segment, &terms, &stats, 10)
                     .await

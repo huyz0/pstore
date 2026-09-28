@@ -173,6 +173,27 @@ impl TextIndex {
         stats: &Stats,
         k: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
+        self.search_with(store, key, terms, stats, k, K1, B).await
+    }
+
+    /// [`Self::search`], scored with an index's own `k1` and `b` (M14).
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "search's, and the two BM25 parameters"
+    )]
+    pub async fn search_with<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        terms: &[String],
+        stats: &Stats,
+        k: usize,
+        k1: f32,
+        b: f32,
+    ) -> Result<Vec<(usize, f32)>, FormatError> {
         let entries = self.entries(terms);
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -221,12 +242,12 @@ impl TextIndex {
                     // corpus that has no scale, which is a different score rather than a
                     // degenerate one.
                     let norm = if avgdl > 0.0 {
-                        K1 * (1.0 - B + B * len / avgdl)
+                        k1 * (1.0 - b + b * len / avgdl)
                     } else {
-                        K1 * (1.0 - B)
+                        k1 * (1.0 - b)
                     };
                     let tf = tf as f32;
-                    *scores.entry(row).or_insert(0.0) += idf * (tf * (K1 + 1.0)) / (tf + norm);
+                    *scores.entry(row).or_insert(0.0) += idf * (tf * (k1 + 1.0)) / (tf + norm);
                 }
             }
             let mut scored: Vec<(usize, f32)> =

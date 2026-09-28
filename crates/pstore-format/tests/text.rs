@@ -49,12 +49,21 @@ fn the_analyzer_lowercases_and_splits_on_non_alphanumeric() {
     // it MUST do is be a function of the text alone, because changing it changes every
     // posting and therefore requires reindexing.
     assert_eq!(
-        text::analyze("the Quick, quick brown dog!"),
+        text::analyze(&text::Analyzer::default(), "the Quick, quick brown dog!"),
         ["the", "quick", "quick", "brown", "dog"]
     );
-    assert_eq!(text::analyze("FOX and dog"), ["fox", "and", "dog"]);
-    assert_eq!(text::analyze("  ---  "), Vec::<String>::new());
-    assert_eq!(text::analyze("a1 b_2"), ["a1", "b", "2"]);
+    assert_eq!(
+        text::analyze(&text::Analyzer::default(), "FOX and dog"),
+        ["fox", "and", "dog"]
+    );
+    assert_eq!(
+        text::analyze(&text::Analyzer::default(), "  ---  "),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        text::analyze(&text::Analyzer::default(), "a1 b_2"),
+        ["a1", "b", "2"]
+    );
 }
 
 #[test]
@@ -70,7 +79,7 @@ fn a_text_field_round_trips() {
         let Some(Value::Str(body)) = d.attrs.get(text::DEFAULT_TEXT_FIELD) else {
             panic!("fixture has no text")
         };
-        let tokens = text::analyze(body);
+        let tokens = text::analyze(&text::Analyzer::default(), body);
         assert_eq!(
             built.fieldnorms[row],
             tokens.len() as u32,

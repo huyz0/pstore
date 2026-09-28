@@ -9,6 +9,7 @@ pub use bundle::Entry;
 pub use head::{Head, HeadAt, IndexSchema, Metric, SegmentRef, TimeTravel};
 
 use pstore_blob::{BlobStore, Key};
+use pstore_format::text::FullText;
 use pstore_format::{Document, Filter, Segment};
 use pstore_types::{Epoch, LaneId, Seq, TenantId};
 use std::collections::BTreeMap;
@@ -384,6 +385,9 @@ struct Fresh {
     /// The metric the unfolded rows were written under, when there are any (M9d): what a query
     /// of an index with no schema yet transforms by.
     metric: Option<Metric>,
+    /// The full-text schema the segment was analyzed under (M14): the index's, else the first
+    /// an unfolded row declared, else the default.
+    fts: FullText,
 }
 
 /// The attribute name marking a tombstone (M9c.2): **empty**, which the write door refuses and
@@ -682,9 +686,54 @@ fn metric_of(d: &Document) -> Metric {
     }
 }
 
-/// The row as it is sealed and served: without its metric.
+/// The reserved attribute a row carries its declared full-text schema in, from the write to
+/// the fold (M14): [`FullText::encode`]'s line. Written for **every** declaration, the
+/// default included, because absent means something else: no opinion.
+const FTS_ATTR: &str = "$fts";
+
+/// The full-text schema a row's write declared, or `None` when it declared none -- which
+/// agrees with any schema, and means the default only to [`Engine::implied`].
+fn fts_of(d: &Document) -> Option<FullText> {
+    match d.attrs.get(FTS_ATTR) {
+        Some(pstore_format::Value::Str(s)) => FullText::decode(s),
+        _ => None,
+    }
+}
+
+/// A full-text schema as a refusal names it.
+fn describe(f: &FullText) -> String {
+    let a = &f.analyzer;
+    format!(
+        "language {}, stemming {}, remove_stopwords {}, case_sensitive {}, ascii_folding {}, \
+         k1 {}, b {}",
+        a.language.name(),
+        a.stemming,
+        a.remove_stopwords,
+        a.case_sensitive,
+        a.ascii_folding,
+        f.k1,
+        f.b
+    )
+}
+
+/// An analyzer conflict, from what the index has and what a row declares.
+fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError {
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "the analyzer",
+        expected: format!(
+            "{}. An analyzer is fixed when its index is created: a different one is a \
+             reindex, by copying the rows into a new index",
+            describe(expected)
+        ),
+        got: describe(got),
+    }
+}
+
+/// The row as it is sealed and served: without its metric or its declared analyzer.
 fn stripped(mut d: Document) -> Document {
     d.attrs.remove(METRIC_ATTR);
+    d.attrs.remove(FTS_ATTR);
     d
 }
 
@@ -794,6 +843,7 @@ struct FreshView {
     store: Arc<pstore_blob::MemoryStore>,
     shadow: std::collections::HashSet<String>,
     metric: Option<Metric>,
+    fts: FullText,
 }
 
 impl Fresh {
@@ -804,6 +854,7 @@ impl Fresh {
             store: Arc::clone(&self.store),
             shadow: self.shadow.clone(),
             metric: self.metric,
+            fts: self.fts,
         }
     }
 }
@@ -1212,6 +1263,13 @@ impl<S: BlobStore> Engine<S> {
                 String::new()
             },
             metric: first.map(metric_of).unwrap_or_default(),
+            // M14: the first declaration in the fold, else the default. Only here does an
+            // undeclared row mean the default.
+            fts: docs
+                .iter()
+                .filter(|d| !is_rowless(d))
+                .find_map(fts_of)
+                .unwrap_or_default(),
         }
     }
 
@@ -1248,6 +1306,12 @@ impl<S: BlobStore> Engine<S> {
                 expected: schema.metric.name().to_owned(),
                 got: metric.name().to_owned(),
             });
+        }
+        // M14: a declared analyzer must be the schema's; an undeclared row has no opinion.
+        if let Some(f) = fts_of(doc)
+            && f != schema.fts
+        {
+            return Some(fts_conflict(index, &schema.fts, &f));
         }
         let dims = doc.vector().len() as u32;
         if dims != schema.dims {
@@ -1351,6 +1415,7 @@ impl<S: BlobStore> Engine<S> {
         key: &Key,
         docs: &[Document],
         text_field: &str,
+        fts: &FullText,
     ) -> Result<(), EngineError> {
         let sparse = sparse_field_of(docs);
         let wants_text = docs.iter().any(|d| {
@@ -1370,12 +1435,13 @@ impl<S: BlobStore> Engine<S> {
         // at the default probe width of 8 replication buys **0.0000** recall and costs bytes
         // (0.841 MB against 0.769). What it buys is query bytes at small `p` — 0.9610 @ 0.288
         // MB at p=2 — and lowering `p` is a decision with its own measurement.
-        let built = pstore_index::vec_index::try_build_all(
+        let built = pstore_index::vec_index::try_build_all_with(
             docs,
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
             wants_text.then_some(text_field),
+            &fts.analyzer,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
@@ -1430,7 +1496,24 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
     ) -> Result<(), EngineError> {
-        self.write_marked(index, docs, metric, None).await
+        self.write_marked(index, docs, metric, None, None).await
+    }
+
+    /// [`Self::write_as`], declaring the index's full-text schema (M14): it becomes the
+    /// schema's at the index's first fold, and must equal it after.
+    ///
+    /// # Errors
+    /// As [`Self::write_as`]; and a declaration that differs from the index's schema, or from
+    /// one an unfolded write of this process declared.
+    pub async fn write_with(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+        fts: &FullText,
+    ) -> Result<(), EngineError> {
+        self.write_marked(index, docs, metric, None, Some(fts))
+            .await
     }
 
     /// [`Self::write_as`], applied at the fold only if each row's current version, when it has
@@ -1447,7 +1530,25 @@ impl<S: BlobStore> Engine<S> {
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
         let mark = encoded(cond)?;
-        self.write_marked(index, docs, metric, Some(mark)).await
+        self.write_marked(index, docs, metric, Some(mark), None)
+            .await
+    }
+
+    /// [`Self::write_if`], declaring the index's full-text schema as [`Self::write_with`] does.
+    ///
+    /// # Errors
+    /// As [`Self::write_if`] and [`Self::write_with`].
+    pub async fn write_if_with(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        metric: Metric,
+        cond: &pstore_query::Predicate,
+        fts: Option<&FullText>,
+    ) -> Result<(), EngineError> {
+        let mark = encoded(cond)?;
+        self.write_marked(index, docs, metric, Some(mark), fts)
+            .await
     }
 
     /// Patches rows at the fold (M13): each sets and removes attributes of its id's current
@@ -1554,6 +1655,7 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
         mark: Option<String>,
+        fts: Option<&FullText>,
     ) -> Result<(), EngineError> {
         let mut docs = docs;
         for d in &mut docs {
@@ -1577,6 +1679,10 @@ impl<S: BlobStore> Engine<S> {
                     METRIC_ATTR.to_owned(),
                     pstore_format::Value::Int(metric.code()),
                 );
+            }
+            if let Some(f) = fts {
+                d.attrs
+                    .insert(FTS_ATTR.to_owned(), pstore_format::Value::Str(f.encode()));
             }
             if let Some(c) = &mark {
                 d.attrs.insert(
@@ -1670,6 +1776,21 @@ impl<S: BlobStore> Engine<S> {
             .find(|d| !is_rowless(d))
             .or_else(|| docs.iter().find(|d| !is_rowless(d)))
             .map(|d| (metric_of(d), d.vector().len()));
+        // M14: and one analyzer, on the same rung -- the first row that DECLARES one, since an
+        // undeclared row has no opinion to compare.
+        let declared = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .chain(docs.iter())
+            .find_map(fts_of);
+        if let Some(k) = declared
+            && let Some(f) = docs.iter().filter_map(fts_of).find(|f| *f != k)
+        {
+            return Some(fts_conflict(index, &k, &f));
+        }
         // ⚠️ And one metric (M9d), on the same rung: cosine and dot have one width.
         if let Some((known_metric, _)) = known
             && known_metric != metric
@@ -2328,7 +2449,9 @@ impl<S: BlobStore> Engine<S> {
                 let seg_key = self.segment_key(next.epoch, idx);
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.
                 let sealed: Vec<Document> = docs.iter().cloned().map(stripped).collect();
-                self.seal(&seg_key, &sealed, &self.text_field).await?;
+                // M14: under the index's analyzer, which this fold may have just recorded.
+                let fts = next.schemas.get(idx).map(|s| s.fts).unwrap_or_default();
+                self.seal(&seg_key, &sealed, &self.text_field, &fts).await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -2827,12 +2950,19 @@ impl<S: BlobStore> Engine<S> {
             }
         };
 
+        // M14: a merge re-analyzes, so under the index's analyzer -- never the default.
+        let fts = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.fts)
+            .unwrap_or_default();
         let mut out_key = self.compacted_key(at.head.epoch.next(), index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
         // ⚠️ None when every input row is deleted (M9c.2): the merge then only removes.
         let empty = rows.is_empty();
         if !empty {
-            self.seal(&out_key, &rows, text_field).await?;
+            self.seal(&out_key, &rows, text_field, &fts).await?;
         }
         // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
         // buried rather than left for M6e's orphan sweeper.
@@ -2851,7 +2981,7 @@ impl<S: BlobStore> Engine<S> {
             // no rebuild, and the invariant every past epoch depends on holds by construction.
             let want = self.compacted_key(at.head.epoch.next(), index);
             if want != out_key && !empty {
-                self.seal(&want, &rows, text_field).await?;
+                self.seal(&want, &rows, text_field, &fts).await?;
                 stale.push(out_key.clone());
                 out_key = want;
             }
@@ -2998,6 +3128,7 @@ impl<S: BlobStore> Engine<S> {
         &self,
         index: &str,
         watermark: u64,
+        schema: Option<FullText>,
     ) -> Result<Option<Option<FreshView>>, EngineError> {
         let (generation, ops) = {
             let mut m = self.mem();
@@ -3014,6 +3145,10 @@ impl<S: BlobStore> Engine<S> {
                 .collect();
             (m.generation, ops)
         };
+        // M14: analyzed as the folded half is, and before any fold as the first declaration.
+        let fts = schema
+            .or_else(|| ops.iter().find_map(fts_of))
+            .unwrap_or_default();
         let mut slot = self.fresh.lock().await;
         // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
         // rows and store afterwards let a concurrent query on another index replace the cached
@@ -3021,6 +3156,7 @@ impl<S: BlobStore> Engine<S> {
         if let Some(f) = slot.as_ref()
             && f.generation == generation
             && f.index == index
+            && f.fts == fts
         {
             return Ok(Some(Some(f.view())));
         }
@@ -3048,6 +3184,7 @@ impl<S: BlobStore> Engine<S> {
                 rows,
                 shadow,
                 metric,
+                fts,
             };
             let view = fresh.view();
             *slot = Some(fresh);
@@ -3065,12 +3202,13 @@ impl<S: BlobStore> Engine<S> {
                 Some(pstore_format::Value::Str(s)) if !s.is_empty()
             )
         });
-        let built = pstore_index::vec_index::try_build_all(
+        let built = pstore_index::vec_index::try_build_all_with(
             &rows,
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
             wants_text.then_some(self.text_field.as_str()),
+            &fts.analyzer,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
@@ -3117,6 +3255,7 @@ impl<S: BlobStore> Engine<S> {
             rows: ordered,
             shadow,
             metric,
+            fts,
         };
         let view = fresh.view();
         *slot = Some(fresh);
@@ -3280,13 +3419,27 @@ impl<S: BlobStore> Engine<S> {
 
         // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
         // even when every such operation was a delete and there is no fresh segment at all.
-        let (unfolded, fresh_store, shadow, fresh_metric) = match fresh {
+        let (unfolded, fresh_store, shadow, fresh_metric, fresh_fts) = match fresh {
             Some(v) => {
                 targets.extend(v.target);
-                (v.rows, Some(v.store), v.shadow, v.metric)
+                (v.rows, Some(v.store), v.shadow, v.metric, Some(v.fts))
             }
-            None => (Vec::new(), None, std::collections::HashSet::new(), None),
+            None => (
+                Vec::new(),
+                None,
+                std::collections::HashSet::new(),
+                None,
+                None,
+            ),
         };
+        // M14: the same rule as the metric's, and the fresh segment was built by it.
+        let fts = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.fts)
+            .or(fresh_fts)
+            .unwrap_or_default();
         // From the HEAD already read, or -- an index not yet folded -- from its unfolded rows.
         let metric = at
             .head
@@ -3320,7 +3473,7 @@ impl<S: BlobStore> Engine<S> {
             fresh: fresh_store,
         };
         let resolved = pstore_query::query_rows_filtered(
-            &store, &targets, prefetch, filter, &shadow, fusion, top_k,
+            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k,
         )
         .await
         .map_err(|e| query_error(metric, e))?;
@@ -3377,7 +3530,11 @@ impl<S: BlobStore> Engine<S> {
                 }
                 _ => head::read(&*self.store, self.tenant).await?,
             };
-            if let Some(view) = self.fresh_view(index, self.watermark(&at.head)).await? {
+            let schema = at.head.schemas.get(index).map(|s| s.fts);
+            if let Some(view) = self
+                .fresh_view(index, self.watermark(&at.head), schema)
+                .await?
+            {
                 return Ok(Fetched {
                     at,
                     fresh: view,
@@ -3593,12 +3750,14 @@ impl<S: BlobStore> Engine<S> {
         let unfolded_at = refs.len();
         // A schema is immutable while its index lives (M9d); across a drop, the dropped one
         // (M9f.2).
-        let metric = metric_at(&at.head, index, epoch);
+        let schema = schema_at(&at.head, index, epoch);
+        let metric = schema.metric;
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
             &*self.store,
             &targets,
             &prefetch,
+            &schema.fts,
             filter,
             &std::collections::HashSet::new(),
             fusion,
@@ -4100,18 +4259,19 @@ fn split_rows(
     (hits, ids, attributes, dists)
 }
 
-/// The metric `index` had at `epoch` (M9f.2): the schema of the first drop of that name after
+/// The schema `index` had at `epoch` (M9f.2): the schema of the first drop of that name after
 /// the epoch, if it was dropped since -- the present schema is then another index's, or none --
-/// and otherwise the present one.
-fn metric_at(head: &Head, index: &str, epoch: Epoch) -> Metric {
+/// and otherwise the present one. Whole: its metric, and its full-text schema (M14), which a
+/// past query analyzes and scores by.
+fn schema_at(head: &Head, index: &str, epoch: Epoch) -> head::IndexSchema {
     head.dropped
         .iter()
         // `>` and `>=` agree: `as_of` the drop's own epoch finds no segment of the index to
         // score, so which schema it would use is never observed (mutation sweep, equivalent).
         .filter(|(name, dropped, _)| name == index && *dropped > epoch.0)
         .min_by_key(|(_, dropped, _)| *dropped)
-        .map(|(_, _, schema)| schema.metric)
-        .or_else(|| head.schemas.get(index).map(|s| s.metric))
+        .map(|(_, _, schema)| schema.clone())
+        .or_else(|| head.schemas.get(index).cloned())
         .unwrap_or_default()
 }
 

@@ -235,7 +235,7 @@ async fn text_gate() {
     let Some(Value::Str(body)) = docs[11].attrs.get(text::DEFAULT_TEXT_FIELD) else {
         panic!("fixture has no text")
     };
-    let mut query = text::analyze(body);
+    let mut query = text::analyze(&text::Analyzer::default(), body);
     query.sort();
     query.dedup();
     query.truncate(3);

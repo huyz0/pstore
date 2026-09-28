@@ -861,6 +861,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let req: WriteRequest = parse_write(&body)?;
     let dated = declared_datetimes(&req)?;
+    let fts = declared_fts(&req)?;
     let patches = patches_of(&req, &dated)?;
     let delete_by = req
         .delete_by_filter
@@ -967,9 +968,14 @@ async fn write_documents<S: BlobStore + 'static>(
         .collect::<Result<_, _>>()?;
     let written = docs.len();
     if !docs.is_empty() {
-        match &upsert_if {
-            Some(c) => engine.write_if(&index, docs, metric, c).await?,
-            None => engine.write_as(&index, docs, metric).await?,
+        match (&upsert_if, &fts) {
+            (Some(c), f) => {
+                engine
+                    .write_if_with(&index, docs, metric, c, f.as_ref())
+                    .await?
+            }
+            (None, Some(f)) => engine.write_with(&index, docs, metric, f).await?,
+            (None, None) => engine.write_as(&index, docs, metric).await?,
         }
     }
     // Then the patches, then the deletes (M13): a later operation on an id wins.
@@ -1726,6 +1732,7 @@ async fn index_summary<S: BlobStore + 'static>(
             dims: sc.client_dims(),
             distance_metric: sc.metric.name(),
             text_field: sc.text_field,
+            full_text_search: fts_json(&sc.fts),
         }),
         rejected_rows: s.rejected_rows,
         updated_epoch: s.updated_epoch.map(|e| e.0),
@@ -2016,6 +2023,10 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
     let mut out = std::collections::BTreeSet::new();
     for (name, ty) in schema {
+        // An object is a full-text declaration (M14), which `declared_fts` reads.
+        if ty.is_object() {
+            continue;
+        }
         if ty.as_str() != Some("datetime") {
             return Err(bad(format!(
                 "{name:?} is declared {ty}; datetime is the one type a write declares"
@@ -2036,6 +2047,118 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
         out.insert(name.clone());
     }
     Ok(out)
+}
+
+/// The full-text schema a write declares (M14): `{"<text field>": {"type": "string",
+/// "full_text_search": true | {options}}}` in its `schema` map, or `None`.
+fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullText>, ApiError> {
+    use pstore_format::text::{FullText, Language};
+    let Some(schema) = req.schema.as_ref().and_then(serde_json::Value::as_object) else {
+        return Ok(None);
+    };
+    let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
+    let mut out = None;
+    for (name, decl) in schema {
+        let Some(decl) = decl.as_object() else {
+            continue;
+        };
+        if name != pstore_format::text::DEFAULT_TEXT_FIELD {
+            return Err(bad(format!(
+                "{name:?}: full_text_search is on the text field `{}` only",
+                pstore_format::text::DEFAULT_TEXT_FIELD
+            )));
+        }
+        if let Some(k) = decl
+            .keys()
+            .find(|k| *k != "type" && *k != "full_text_search")
+        {
+            return Err(bad(format!("{name:?}: unknown key {k:?}")));
+        }
+        if decl.get("type").is_some_and(|t| t != "string") {
+            return Err(bad(format!("{name:?}: the text field's type is string")));
+        }
+        let mut fts = FullText::default();
+        match decl.get("full_text_search") {
+            Some(serde_json::Value::Bool(true)) => {}
+            Some(serde_json::Value::Object(opts)) => {
+                let flag = |v: &serde_json::Value, k: &str| {
+                    v.as_bool()
+                        .ok_or_else(|| bad(format!("full_text_search: {k} is true or false")))
+                };
+                let param = |v: &serde_json::Value, k: &str, hi: f64| {
+                    v.as_f64()
+                        .filter(|x| (0.0..=hi).contains(x))
+                        // `+ 0.0` so `-0.0` is stored, and compared, as `0`.
+                        .map(|x| x as f32 + 0.0)
+                        .ok_or_else(|| {
+                            bad(format!(
+                                "full_text_search: {k} must be a number in [0, {hi}]"
+                            ))
+                        })
+                };
+                for (k, v) in opts {
+                    let a = &mut fts.analyzer;
+                    match k.as_str() {
+                        "tokenizer" => {
+                            if v != "word_v1" {
+                                return Err(bad(format!(
+                                    "full_text_search: tokenizer {v} is not word_v1, the one \
+                                     tokenizer"
+                                )));
+                            }
+                        }
+                        "language" => {
+                            a.language = v.as_str().and_then(Language::parse).ok_or_else(|| {
+                                bad(format!(
+                                    "full_text_search: language {v} is not one of {}",
+                                    Language::ALL.map(Language::name).join(", ")
+                                ))
+                            })?;
+                        }
+                        "stemming" => a.stemming = flag(v, k)?,
+                        "remove_stopwords" => a.remove_stopwords = flag(v, k)?,
+                        "case_sensitive" => a.case_sensitive = flag(v, k)?,
+                        "ascii_folding" => a.ascii_folding = flag(v, k)?,
+                        "k1" => fts.k1 = param(v, k, 3.0)?,
+                        "b" => fts.b = param(v, k, 1.0)?,
+                        _ => return Err(bad(format!("full_text_search: unknown option {k:?}"))),
+                    }
+                }
+                if fts.analyzer.remove_stopwords && fts.analyzer.language != Language::English {
+                    return Err(bad(
+                        "full_text_search: remove_stopwords is English only".to_owned()
+                    ));
+                }
+            }
+            _ => {
+                return Err(bad(
+                    "full_text_search is true, or an object of options".to_owned()
+                ));
+            }
+        }
+        if req.documents.is_empty() {
+            return Err(bad(
+                "full_text_search is declared and the write has no documents".to_owned(),
+            ));
+        }
+        out = Some(fts);
+    }
+    Ok(out)
+}
+
+/// A full-text schema as `GET /v1/indexes/{index}` reports it (M14).
+fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
+    let a = &f.analyzer;
+    serde_json::json!({
+        "tokenizer": "word_v1",
+        "language": a.language.name(),
+        "stemming": a.stemming,
+        "remove_stopwords": a.remove_stopwords,
+        "case_sensitive": a.case_sensitive,
+        "ascii_folding": a.ascii_folding,
+        "k1": f.k1,
+        "b": f.b,
+    })
 }
 
 fn to_document(

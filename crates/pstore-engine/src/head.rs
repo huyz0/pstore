@@ -35,6 +35,9 @@ pub struct IndexSchema {
     pub text_field: String,
     /// How its vectors are compared (M9d). `dims` is the **stored** width, which this adds to.
     pub metric: Metric,
+    /// How its text becomes terms, and BM25's `k1` and `b` (M14). The default is every index's
+    /// before M14.
+    pub fts: pstore_format::text::FullText,
 }
 
 impl IndexSchema {
@@ -291,6 +294,32 @@ impl Head {
             put_str(&mut out, &schema.text_field);
             out.push(schema.metric.code() as u8);
         }
+        // M14: each schema's full-text schema, live then dropped (by position), when it is
+        // not the default every older index has -- so a HEAD of default schemas is byte for
+        // byte what the encoder before M14 wrote.
+        let fts: Vec<(u8, u32, &IndexSchema, Option<&String>)> = self
+            .schemas
+            .iter()
+            .map(|(name, s)| (0u8, 0u32, s, Some(name)))
+            .chain(
+                self.dropped
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, _, s))| (1u8, i as u32, s, None)),
+            )
+            .filter(|(_, _, s, _)| s.fts != pstore_format::text::FullText::default())
+            .collect();
+        if !fts.is_empty() {
+            out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
+            for (kind, at, s, name) in fts {
+                out.push(kind);
+                match name {
+                    Some(n) => put_str(&mut out, n),
+                    None => out.extend_from_slice(&at.to_le_bytes()),
+                }
+                put_str(&mut out, &s.fts.encode());
+            }
+        }
         out
     }
 
@@ -347,6 +376,7 @@ impl Head {
                     dims: c.u32()?,
                     text_field: c.string()?,
                     metric: Metric::DotProduct,
+                    fts: pstore_format::text::FullText::default(),
                 },
             );
         }
@@ -400,8 +430,30 @@ impl Head {
                     dims,
                     text_field,
                     metric,
+                    fts: pstore_format::text::FullText::default(),
                 },
             ));
+        }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let kind = c.u8()?;
+            let schema = match kind {
+                0 => {
+                    let name = c.string()?;
+                    h.schemas.get_mut(&name)
+                }
+                1 => {
+                    let at = c.u32()? as usize;
+                    h.dropped.get_mut(at).map(|(_, _, s)| s)
+                }
+                _ => None,
+            }
+            // Full text belongs to a schema; one naming none is not a HEAD this wrote.
+            .ok_or(EngineError::CorruptHead)?;
+            schema.fts = pstore_format::text::FullText::decode(&c.string()?)
+                .ok_or(EngineError::CorruptHead)?;
         }
         Ok(h)
     }

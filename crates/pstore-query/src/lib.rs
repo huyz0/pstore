@@ -24,4 +24,4 @@ pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, ag
 pub use filter::{ID as ID_ATTRIBUTE, Op, Predicate};
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
 pub use order::{OrderBy, Selector, select};
-pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered};
+pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered, query_with};

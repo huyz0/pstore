@@ -254,8 +254,30 @@ pub fn try_build_all(
     sparse_field: Option<&str>,
     text_field: Option<&str>,
 ) -> Result<Built, pstore_format::FormatError> {
+    try_build_all_with(
+        docs,
+        params,
+        field,
+        sparse_field,
+        text_field,
+        &pstore_format::text::Analyzer::default(),
+    )
+}
+
+/// [`try_build_all`], analyzing the text field under `analyzer` (M14).
+///
+/// # Errors
+/// As [`try_build_all`].
+pub fn try_build_all_with(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+    text_field: Option<&str>,
+    analyzer: &pstore_format::text::Analyzer,
+) -> Result<Built, pstore_format::FormatError> {
     let (w, centroids, order, dictionary, text_dictionary) =
-        assemble(docs, params, field, sparse_field, text_field);
+        assemble(docs, params, field, sparse_field, text_field, analyzer);
     Ok(Built {
         segment: w.try_finish()?,
         centroids,
@@ -279,8 +301,14 @@ pub fn build_all(
     sparse_field: Option<&str>,
     text_field: Option<&str>,
 ) -> Built {
-    let (w, centroids, order, dictionary, text_dictionary) =
-        assemble(docs, params, field, sparse_field, text_field);
+    let (w, centroids, order, dictionary, text_dictionary) = assemble(
+        docs,
+        params,
+        field,
+        sparse_field,
+        text_field,
+        &pstore_format::text::Analyzer::default(),
+    );
     Built {
         // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
         // document through `d.vector()`, so anything the format cannot store was lost before
@@ -307,6 +335,7 @@ fn assemble(
     field: &str,
     sparse_field: Option<&str>,
     text_field: Option<&str>,
+    analyzer: &pstore_format::text::Analyzer,
 ) -> (
     SegmentWriter,
     Option<Centroids>,
@@ -410,7 +439,7 @@ fn assemble(
     let sparse = sparse_field.map(|name| {
         pstore_format::sparse::build(&rows, name, pstore_format::sparse::DEFAULT_ENCODING)
     });
-    let text = text_field.map(|name| pstore_format::text::build(&rows, name));
+    let text = text_field.map(|name| pstore_format::text::build_with(&rows, name, analyzer));
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
     let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
     // ⚠️ **Between `RaBitQ` and `Sq8`, and the order is load-bearing.** Body sections are laid

@@ -202,6 +202,7 @@ async fn the_metric_survives_a_head_round_trip() {
                 dims: 3,
                 text_field: String::new(),
                 metric,
+                fts: pstore_format::text::FullText::default(),
             },
         );
     }

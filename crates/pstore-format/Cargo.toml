@@ -17,6 +17,9 @@ async-trait  = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 bytes        = "1"
 thiserror    = "2"
+# M14: the Snowball stemmers for an index's declared language, and NFKD for ASCII folding.
+rust-stemmers         = "1.2"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }

@@ -167,6 +167,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             dims: 384,
             text_field: "body".to_owned(),
             metric: pstore_engine::Metric::DotProduct,
+            fts: pstore_format::text::FullText::default(),
         },
     );
     h.schemas.insert(
@@ -175,6 +176,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             dims: 4,
             text_field: String::new(),
             metric: pstore_engine::Metric::DotProduct,
+            fts: pstore_format::text::FullText::default(),
         },
     );
     h.schema_rejects.insert("alpha".to_owned(), 17);
@@ -233,6 +235,7 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
             dims: 4,
             text_field: String::new(),
             metric: pstore_engine::Metric::DotProduct,
+            fts: pstore_format::text::FullText::default(),
         },
     );
     h.reaped_before = 77;
@@ -283,6 +286,7 @@ fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
         dims: 3,
         text_field: "body".to_owned(),
         metric,
+        fts: pstore_format::text::FullText::default(),
     };
     let mut h = populated();
     h.dropped.push((
@@ -311,4 +315,52 @@ fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
     reaped.record_reap(7);
     assert_eq!(reaped.dropped.len(), 1, "a horizon at the drop reaps it");
     assert_eq!(reaped.dropped[0].1, 9);
+}
+
+#[test]
+fn a_full_text_schema_round_trips_live_and_dropped() {
+    // M14's trailing section: written only for a non-default full-text schema, so a HEAD of
+    // defaults is the bytes an older encoder wrote, and decodes as the default.
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let mut h = populated();
+    let live = "alpha".to_owned();
+    h.schemas.insert(
+        live.clone(),
+        pstore_engine::IndexSchema {
+            dims: 4,
+            text_field: "text".to_owned(),
+            metric: pstore_engine::Metric::DotProduct,
+            fts: FullText::default(),
+        },
+    );
+    h.dropped.push((
+        "gone".to_owned(),
+        9,
+        pstore_engine::IndexSchema {
+            dims: 3,
+            text_field: "text".to_owned(),
+            metric: pstore_engine::Metric::DotProduct,
+            fts: FullText::default(),
+        },
+    ));
+    let before = h.encode();
+    assert_eq!(Head::decode(&before).unwrap(), h);
+
+    h.schemas.get_mut(&live).unwrap().fts = FullText {
+        analyzer: Analyzer {
+            language: Language::German,
+            stemming: true,
+            ..Analyzer::default()
+        },
+        k1: 2.0,
+        b: 0.5,
+    };
+    // A dropped schema whose analyzer is the default but whose `b` is not: written too.
+    h.dropped[0].2.fts.b = 0.1;
+    let full = h.encode();
+    assert!(full.starts_with(&before), "the section is not trailing");
+    assert_eq!(Head::decode(&full).unwrap(), h);
+    for cut in before.len() + 1..full.len() {
+        assert!(Head::decode(&full[..cut]).is_err(), "cut at {cut} decoded");
+    }
 }

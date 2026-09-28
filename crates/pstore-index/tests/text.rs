@@ -79,7 +79,7 @@ fn oracle(docs: &[Document], query: &[&str], k: usize) -> Vec<(usize, f32)> {
     let bodies: Vec<Vec<String>> = docs
         .iter()
         .map(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
-            Some(Value::Str(s)) => text::analyze(s),
+            Some(Value::Str(s)) => text::analyze(&text::Analyzer::default(), s),
             _ => Vec::new(),
         })
         .collect();
@@ -156,7 +156,7 @@ fn queries(docs: &[Document], n: usize) -> Vec<Vec<String>> {
             let Some(Value::Str(s)) = d.attrs.get(text::DEFAULT_TEXT_FIELD) else {
                 return Vec::new();
             };
-            let mut terms = text::analyze(s);
+            let mut terms = text::analyze(&text::Analyzer::default(), s);
             terms.sort();
             terms.dedup();
             terms.truncate(3);
@@ -320,7 +320,7 @@ async fn statistics_are_a_property_of_the_corpus_not_of_a_query() {
     let tokens: u64 = docs
         .iter()
         .map(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
-            Some(Value::Str(b)) => text::analyze(b).len() as u64,
+            Some(Value::Str(b)) => text::analyze(&text::Analyzer::default(), b).len() as u64,
             _ => 0,
         })
         .sum();
@@ -333,7 +333,9 @@ async fn statistics_are_a_property_of_the_corpus_not_of_a_query() {
     let by_hand = docs
         .iter()
         .filter(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
-            Some(Value::Str(b)) => text::analyze(b).iter().any(|t| t == "t0"),
+            Some(Value::Str(b)) => text::analyze(&text::Analyzer::default(), b)
+                .iter()
+                .any(|t| t == "t0"),
             _ => false,
         })
         .count() as u32;
@@ -550,7 +552,7 @@ async fn an_empty_corpus_scores_without_a_length_term() {
     let bodies: Vec<Vec<String>> = docs
         .iter()
         .map(|d| match d.attrs.get(text::DEFAULT_TEXT_FIELD) {
-            Some(Value::Str(t)) => text::analyze(t),
+            Some(Value::Str(t)) => text::analyze(&text::Analyzer::default(), t),
             _ => Vec::new(),
         })
         .collect();

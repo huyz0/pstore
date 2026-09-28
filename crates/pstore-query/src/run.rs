@@ -3,6 +3,7 @@
 use crate::filter::{Mask, Predicate};
 use crate::fuse::{Fusion, Hit, fuse};
 use pstore_blob::{BlobStore, Key};
+use pstore_format::text::FullText;
 use pstore_format::{Document, FormatError, Segment};
 use pstore_index::sparse::SparseIndex;
 use pstore_index::text::{Stats, TextIndex};
@@ -119,10 +120,34 @@ pub async fn query<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
+    query_with(
+        store,
+        targets,
+        prefetch,
+        &FullText::default(),
+        fusion,
+        top_k,
+    )
+    .await
+}
+
+/// [`query`], analyzing and scoring text legs by an index's full-text schema (M14).
+///
+/// # Errors
+/// As [`query`].
+pub async fn query_with<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    text: &FullText,
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<Vec<Hit>, QueryError> {
     Ok(run(
         store,
         targets,
         prefetch,
+        text,
         None,
         &std::collections::HashSet::new(),
         fusion,
@@ -137,10 +162,15 @@ pub async fn query<S: BlobStore>(
 /// ⚠️ Separated from [`query`] for one reason: an id lives in a block of a segment this
 /// function has already opened, and a caller that re-opens it pays a round trip per segment
 /// for something already in hand.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
 async fn run<S: BlobStore>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
+    text: &FullText,
     filter: Option<&Predicate>,
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
@@ -219,7 +249,7 @@ async fn run<S: BlobStore>(
                     } else {
                         r.widened(hidden, o.segment.row_count())
                     };
-                    leg(store, &t.segment, o, &r, i, stats)
+                    leg(store, &t.segment, o, &r, i, stats, text)
                         .await
                         .map(|hits| (i, j, hits))
                 })
@@ -414,17 +444,24 @@ async fn summed<S: BlobStore>(
 ///
 /// # Errors
 /// As [`query`], plus a block that cannot be read or decoded.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
 pub async fn query_rows_filtered<S: BlobStore>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
+    text: &FullText,
     filter: Option<&Predicate>,
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
-    let (hits, opened, known, dense) =
-        run(store, targets, prefetch, filter, shadow, fusion, top_k).await?;
+    let (hits, opened, known, dense) = run(
+        store, targets, prefetch, text, filter, shadow, fusion, top_k,
+    )
+    .await?;
     Ok(resolve_rows(store, targets, &opened, &hits, known)
         .await?
         .into_iter()
@@ -736,6 +773,7 @@ async fn leg<S: BlobStore>(
     r: &Runnable<'_>,
     segment: usize,
     stats: &Stats,
+    text: &FullText,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
         Runnable::Text {
@@ -758,8 +796,11 @@ async fn leg<S: BlobStore>(
             // handed forward by name, and scoring against a per-segment summary is wrong
             // exactly when the query's discriminating term is the one whose frequency
             // differs between segments — which M5c measured.
-            let terms = pstore_format::text::analyze(query);
-            let hits = idx.search(store, key, &terms, stats, *limit).await?;
+            // M14: under the index's analyzer, scored with its `k1` and `b`.
+            let terms = pstore_format::text::analyze(&text.analyzer, query);
+            let hits = idx
+                .search_with(store, key, &terms, stats, *limit, text.k1, text.b)
+                .await?;
             Ok(hits
                 .into_iter()
                 .map(|(row, score)| Hit {

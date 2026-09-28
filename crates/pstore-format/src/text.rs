@@ -23,16 +23,266 @@ use crate::{Document, Value};
 /// fieldnorm is unambiguous and there is no second field to lose silently.
 pub const DEFAULT_TEXT_FIELD: &str = "text";
 
-/// Tokens, lowercased, split on anything that is not alphanumeric.
+/// A language the Snowball stemmers cover (M14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(missing_docs, reason = "each variant is the language it names")]
+pub enum Language {
+    Arabic,
+    Danish,
+    Dutch,
+    #[default]
+    English,
+    Finnish,
+    French,
+    German,
+    Greek,
+    Hungarian,
+    Italian,
+    Norwegian,
+    Portuguese,
+    Romanian,
+    Russian,
+    Spanish,
+    Swedish,
+    Tamil,
+    Turkish,
+}
+
+impl Language {
+    /// Every language, in the order their names sort.
+    pub const ALL: [Self; 18] = [
+        Self::Arabic,
+        Self::Danish,
+        Self::Dutch,
+        Self::English,
+        Self::Finnish,
+        Self::French,
+        Self::German,
+        Self::Greek,
+        Self::Hungarian,
+        Self::Italian,
+        Self::Norwegian,
+        Self::Portuguese,
+        Self::Romanian,
+        Self::Russian,
+        Self::Spanish,
+        Self::Swedish,
+        Self::Tamil,
+        Self::Turkish,
+    ];
+
+    /// Its wire name: lowercase English.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Arabic => "arabic",
+            Self::Danish => "danish",
+            Self::Dutch => "dutch",
+            Self::English => "english",
+            Self::Finnish => "finnish",
+            Self::French => "french",
+            Self::German => "german",
+            Self::Greek => "greek",
+            Self::Hungarian => "hungarian",
+            Self::Italian => "italian",
+            Self::Norwegian => "norwegian",
+            Self::Portuguese => "portuguese",
+            Self::Romanian => "romanian",
+            Self::Russian => "russian",
+            Self::Spanish => "spanish",
+            Self::Swedish => "swedish",
+            Self::Tamil => "tamil",
+            Self::Turkish => "turkish",
+        }
+    }
+
+    /// The language a wire name names, or `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.name() == name)
+    }
+
+    fn algorithm(self) -> rust_stemmers::Algorithm {
+        use rust_stemmers::Algorithm as A;
+        match self {
+            Self::Arabic => A::Arabic,
+            Self::Danish => A::Danish,
+            Self::Dutch => A::Dutch,
+            Self::English => A::English,
+            Self::Finnish => A::Finnish,
+            Self::French => A::French,
+            Self::German => A::German,
+            Self::Greek => A::Greek,
+            Self::Hungarian => A::Hungarian,
+            Self::Italian => A::Italian,
+            Self::Norwegian => A::Norwegian,
+            Self::Portuguese => A::Portuguese,
+            Self::Romanian => A::Romanian,
+            Self::Russian => A::Russian,
+            Self::Spanish => A::Spanish,
+            Self::Swedish => A::Swedish,
+            Self::Tamil => A::Tamil,
+            Self::Turkish => A::Turkish,
+        }
+    }
+}
+
+/// How text becomes terms (M14): an index's, fixed in its schema when the index is created.
 ///
-/// ⚠️ Deliberately this small. Stemming, stopwords and language rules are quality knobs, and
-/// a knob chosen without an eval set is noise. What analysis **must** be is a pure function of
-/// the text: changing it changes every posting, so it is a reindex rather than a setting.
+/// ⚠️ **The default is the analyzer before M14**, byte for byte: split on anything that is
+/// not alphanumeric, lowercase, nothing else. Every index that declares nothing, and every
+/// segment written before M14, was analyzed that way -- so it is not a default that can
+/// ever change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent option of the wire's `full_text_search`"
+)]
+pub struct Analyzer {
+    /// The stemmer's language, and what `remove_stopwords` needs to be English.
+    pub language: Language,
+    /// Reduce each token to its Snowball stem.
+    pub stemming: bool,
+    /// Drop the Lucene English stopwords.
+    pub remove_stopwords: bool,
+    /// Keep case rather than lowercasing.
+    pub case_sensitive: bool,
+    /// NFKD, then drop combining marks: `é` becomes `e`.
+    pub ascii_folding: bool,
+}
+
+/// Lucene's English stopword set.
+const STOPWORDS: [&str; 33] = [
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
+];
+
+/// An analyzer and the BM25 parameters that score its terms (M14): all of what an index's
+/// schema says about full text.
+///
+/// ⚠️ **Equal by bits**, so equality is an equivalence: a declaration is compared with the
+/// stored schema after both are `f32`, which is what makes re-declaring `1.2` equal to it.
+#[derive(Debug, Clone, Copy)]
+pub struct FullText {
+    /// How text becomes terms.
+    pub analyzer: Analyzer,
+    /// BM25's term-frequency saturation, in `[0, 3]`.
+    pub k1: f32,
+    /// BM25's length normalisation, in `[0, 1]`.
+    pub b: f32,
+}
+
+impl PartialEq for FullText {
+    fn eq(&self, other: &Self) -> bool {
+        self.analyzer == other.analyzer
+            && self.k1.to_bits() == other.k1.to_bits()
+            && self.b.to_bits() == other.b.to_bits()
+    }
+}
+
+impl Eq for FullText {}
+
+impl Default for FullText {
+    fn default() -> Self {
+        Self {
+            analyzer: Analyzer::default(),
+            k1: 1.2,
+            b: 0.75,
+        }
+    }
+}
+
+impl FullText {
+    /// A single line [`Self::decode`] reads back exactly: `k1` and `b` as their bits, so a
+    /// declaration compares equal to what was stored.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let a = &self.analyzer;
+        format!(
+            "v1;{};{}{}{}{};{:08x};{:08x}",
+            a.language.name(),
+            u8::from(a.stemming),
+            u8::from(a.remove_stopwords),
+            u8::from(a.case_sensitive),
+            u8::from(a.ascii_folding),
+            self.k1.to_bits(),
+            self.b.to_bits()
+        )
+    }
+
+    /// The full-text schema [`Self::encode`] wrote, or `None` for anything else.
+    #[must_use]
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split(';');
+        if parts.next()? != "v1" {
+            return None;
+        }
+        let language = Language::parse(parts.next()?)?;
+        let flags: Vec<bool> = parts
+            .next()?
+            .chars()
+            .map(|c| match c {
+                '0' => Some(false),
+                '1' => Some(true),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let [stemming, remove_stopwords, case_sensitive, ascii_folding] = flags.as_slice() else {
+            return None;
+        };
+        let bits = |p: Option<&str>| p.and_then(|h| u32::from_str_radix(h, 16).ok());
+        let k1 = f32::from_bits(bits(parts.next())?);
+        let b = f32::from_bits(bits(parts.next())?);
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            analyzer: Analyzer {
+                language,
+                stemming: *stemming,
+                remove_stopwords: *remove_stopwords,
+                case_sensitive: *case_sensitive,
+                ascii_folding: *ascii_folding,
+            },
+            k1,
+            b,
+        })
+    }
+}
+
+/// The terms `s` becomes under `a`: split, case, fold, stopwords, stem -- in that order.
+///
+/// ⚠️ Stopwords compare after case and folding, so a `case_sensitive` index keeps `The`, and
+/// Snowball stems lowercase input, so it leaves `Running` whole there. Stated in the spec,
+/// not repaired: repairing it is a different analyzer, and analyzers are fixed per index.
 #[must_use]
-pub fn analyze(s: &str) -> Vec<String> {
+pub fn analyze(a: &Analyzer, s: &str) -> Vec<String> {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    let stemmer = a
+        .stemming
+        .then(|| rust_stemmers::Stemmer::create(a.language.algorithm()));
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
+        .map(|t| {
+            if a.case_sensitive {
+                t.to_owned()
+            } else {
+                t.to_lowercase()
+            }
+        })
+        .map(|t| {
+            if a.ascii_folding {
+                t.nfkd().filter(|c| !is_combining_mark(*c)).collect()
+            } else {
+                t
+            }
+        })
+        .filter(|t| !(a.remove_stopwords && STOPWORDS.contains(&t.as_str())))
+        .map(|t| match &stemmer {
+            Some(st) => st.stem(&t).into_owned(),
+            None => t,
+        })
         .collect()
 }
 
@@ -96,12 +346,18 @@ pub fn dict_key(segment: &pstore_blob::Key) -> pstore_blob::Key {
 /// wrong document — with scores that are internally consistent and a top-k that looks fine.
 #[must_use]
 pub fn build(docs: &[Document], field: &str) -> Built {
+    build_with(docs, field, &Analyzer::default())
+}
+
+/// [`build`], analyzing under `analyzer` (M14).
+#[must_use]
+pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built {
     let mut by_term: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
         std::collections::BTreeMap::new();
     let mut fieldnorms = Vec::with_capacity(docs.len());
     for (row, d) in docs.iter().enumerate() {
         let tokens = match d.attrs.get(field) {
-            Some(Value::Str(s)) => analyze(s),
+            Some(Value::Str(s)) => analyze(analyzer, s),
             _ => Vec::new(),
         };
         fieldnorms.push(tokens.len() as u32);
