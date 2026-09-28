@@ -428,7 +428,8 @@ async fn what_consistency_cannot_mean_is_refused() {
     for c in [
         json!("Strong"),
         json!("bounded"),
-        json!("session"),
+        // M11.1 gave "session" a meaning; its miscased spelling still has none.
+        json!("Session"),
         json!(1),
         json!({"mode": "strong"}),
     ] {
@@ -476,6 +477,6 @@ fn the_research_is_corrected_where_it_promised_otherwise() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research");
     let read = |p: &str| std::fs::read_to_string(format!("{root}/{p}")).unwrap();
     assert!(read("03-metadata-consistency/consistency-model.md").contains("Corrected by [M9i.2]"));
-    assert!(read("11-design/turbopuffer-api-parity.md").contains("are **deferred** (BACKLOG)"));
+    assert!(read("11-design/turbopuffer-api-parity.md").contains("landed in [M11.1]"));
     assert!(read("11-design/api-design.md").contains("`503 not_folded`"));
 }

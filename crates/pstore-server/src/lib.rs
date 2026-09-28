@@ -28,6 +28,7 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod session;
 mod types;
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
@@ -440,6 +441,10 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
+
+    fn bad_session(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_session", message)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -656,6 +661,30 @@ struct RefusalCode(&'static str);
 /// ⚠️ **Never defaulted.** `unwrap_or(TenantId(0))` is a cross-tenant data leak that passes
 /// every single-tenant test in the suite, so the absence of a header is a refusal and the
 /// type system does not offer a second option.
+/// The request's session token (M11.1), or an empty one when it carries none.
+fn session_of(headers: &HeaderMap, tenant: TenantId) -> Result<session::Token, ApiError> {
+    let Some(v) = headers.get(SESSION_HEADER) else {
+        return Ok(session::Token::empty(tenant.0));
+    };
+    let text = v
+        .to_str()
+        .map_err(|e| ApiError::bad_session(format!("x-pstore-session: {e}")))?;
+    session::Token::decode(text, tenant.0)
+        .map_err(|e| ApiError::bad_session(format!("x-pstore-session: {e}")))
+}
+
+/// Where the session token travels, both ways (M11.1).
+const SESSION_HEADER: &str = "x-pstore-session";
+
+/// A response carrying `token` in [`SESSION_HEADER`].
+fn with_session(body: impl IntoResponse, token: &str) -> Response {
+    let mut res = body.into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(token) {
+        res.headers_mut().insert(SESSION_HEADER, v);
+    }
+    res
+}
+
 fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
     let refuse = || {
         ApiError::new(
@@ -678,8 +707,9 @@ async fn write_documents<S: BlobStore + 'static>(
     Path(index): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<axum::Json<WriteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
+    let mut token = session_of(&headers, tenant)?;
     // ⚠️ Parsed here rather than by the `Json` extractor, because the extractor's own
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
@@ -742,14 +772,26 @@ async fn write_documents<S: BlobStore + 'static>(
     let durable = matches!(req.durability, types::Durability::Durable);
     if durable {
         engine.flush().await?;
+        // ⚠️ **The engine's next sequence, not this flush's own** (M11.1, spec review B1): a
+        // concurrent request's flush may have written these rows already, and this one then
+        // flushed nothing. Every bundle the engine wrote is below its next sequence.
+        if let Some(next) = engine.next_seq() {
+            token.wrote(engine.lane().0, next);
+        }
     }
-    Ok(axum::Json(WriteResponse {
-        epoch: engine.epoch().0,
-        documents_written: written,
-        documents_deleted: deleted,
-        durable,
-        cost: api.spend(tenant).since(before),
-    }))
+    token.saw(engine.epoch().0);
+    let session = token.encode();
+    Ok(with_session(
+        axum::Json(WriteResponse {
+            epoch: engine.epoch().0,
+            documents_written: written,
+            documents_deleted: deleted,
+            durable,
+            cost: api.spend(tenant).since(before),
+            session: session.clone(),
+        }),
+        &session,
+    ))
 }
 
 /// `POST /v1/indexes/{index}/query`.
@@ -760,6 +802,7 @@ async fn query_index<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
+    let token = session_of(&headers, tenant)?;
     let raw: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
     // ⚠️ Every query is planned -- every refusal found -- before any runs (M9g): one refused
@@ -770,18 +813,22 @@ async fn query_index<S: BlobStore + 'static>(
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let got = api
-            .requesting(tenant, run(&engine, &index, &req, plan).await)
+            .requesting(tenant, run(&engine, &index, &req, plan, &token).await)
             .await?;
-        return Ok(axum::Json(QueryResponse {
-            results: got.results,
-            meta: QueryMeta {
-                epoch: got.epoch,
-                unfolded_hits: got.unfolded_hits,
-                cost: api.spend(tenant).since(before),
-                consistency: got.consistency,
-            },
-        })
-        .into_response());
+        let session = got.token.encode();
+        return Ok(with_session(
+            axum::Json(QueryResponse {
+                results: got.results,
+                meta: QueryMeta {
+                    epoch: got.epoch,
+                    unfolded_hits: got.unfolded_hits,
+                    cost: api.spend(tenant).since(before),
+                    consistency: got.consistency,
+                    session: session.clone(),
+                },
+            }),
+            &session,
+        ));
     };
     let reqs = multi_query(&raw, subs)?;
     let plans = reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
@@ -791,20 +838,32 @@ async fn query_index<S: BlobStore + 'static>(
     let got = futures_util::future::try_join_all(
         reqs.iter()
             .zip(plans)
-            .map(|(req, plan)| run(&engine, &index, req, plan)),
+            .map(|(req, plan)| run(&engine, &index, req, plan, &token)),
     )
     .await;
     let got = api.requesting(tenant, got).await?;
-    Ok(axum::Json(MultiQueryResponse {
-        meta: MultiQueryMeta {
-            epochs: got.iter().map(|g| g.epoch).collect(),
-            unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
-            cost: api.spend(tenant).since(before),
-            consistencies: got.iter().map(|g| g.consistency).collect(),
-        },
-        results: got.into_iter().map(|g| g.results).collect(),
-    })
-    .into_response())
+    // From the sub-queries' own tokens, never the request's: each already carries it, less
+    // the entries its HEAD covers, and merging the request's back would restore them.
+    let mut merged = got
+        .first()
+        .map_or_else(|| token.clone(), |g| g.token.clone());
+    for g in got.iter().skip(1) {
+        merged.merge(&g.token);
+    }
+    let session = merged.encode();
+    Ok(with_session(
+        axum::Json(MultiQueryResponse {
+            meta: MultiQueryMeta {
+                epochs: got.iter().map(|g| g.epoch).collect(),
+                unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
+                cost: api.spend(tenant).since(before),
+                consistencies: got.iter().map(|g| g.consistency).collect(),
+                session: session.clone(),
+            },
+            results: got.into_iter().map(|g| g.results).collect(),
+        }),
+        &session,
+    ))
 }
 
 /// The most queries one request may carry (M9g), turbopuffer's bound.
@@ -871,36 +930,102 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     Ok(Plan::Ranked(legs, filter, fusion))
 }
 
-/// A query's consistency (M9i.2): `eventual` unless it asks for `strong`, and refused for
-/// anything else -- a level it cannot promise is never served as one it can.
-fn level(req: &QueryRequest) -> Result<pstore_engine::Consistency, ApiError> {
-    use pstore_engine::Consistency;
+/// What a query asked to reflect (M9i.2, M11.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The HEAD it reads and this process's own writes.
+    Eventual,
+    /// Every durable write any process acknowledged before its HEAD read, or a refusal.
+    Strong,
+    /// Every durable write its session token names, from a HEAD no older than the token's.
+    Session,
+}
+
+/// A query's consistency: `eventual` unless it asks for `strong` or `session`, and refused
+/// for anything else -- a level it cannot promise is never served as one it can.
+fn level(req: &QueryRequest) -> Result<Level, ApiError> {
     let level = match &req.consistency {
-        None | Some(serde_json::Value::Null) => Consistency::Eventual,
+        None | Some(serde_json::Value::Null) => Level::Eventual,
         Some(v) => match v.as_str() {
-            Some("eventual") => Consistency::Eventual,
-            Some("strong") => Consistency::Strong,
+            Some("eventual") => Level::Eventual,
+            Some("strong") => Level::Strong,
+            Some("session") => Level::Session,
             _ => {
                 return Err(ApiError::bad_request(format!(
-                    "consistency {v} is not eventual or strong; session and bounded are not \
+                    "consistency {v} is not eventual, strong or session; bounded is not \
                      offered yet"
                 )));
             }
         },
     };
-    if level == Consistency::Strong && req.as_of.is_some() {
+    if level != Level::Eventual && req.as_of.is_some() {
         return Err(ApiError::bad_request(
-            "strong with as_of: a past epoch is already exactly what it is",
+            "strong or session with as_of: a past epoch is already exactly what it is",
         ));
     }
     Ok(level)
 }
 
-fn level_name(level: pstore_engine::Consistency) -> &'static str {
+fn level_name(level: Level) -> &'static str {
     match level {
-        pstore_engine::Consistency::Eventual => "eventual",
-        pstore_engine::Consistency::Strong => "strong",
+        Level::Eventual => "eventual",
+        Level::Strong => "strong",
+        Level::Session => "session",
     }
+}
+
+/// What the engine is asked to do for `level`: a session whose token overflowed names no
+/// lane, so it must cover every acknowledged write -- which is `strong` (M11.1).
+fn engine_level(level: Level, token: &session::Token) -> pstore_engine::Consistency {
+    match level {
+        Level::Strong => pstore_engine::Consistency::Strong,
+        Level::Session if token.overflow => pstore_engine::Consistency::Strong,
+        Level::Eventual | Level::Session => pstore_engine::Consistency::Eventual,
+    }
+}
+
+/// Checks a served answer against the session token and returns the token to send back
+/// (M11.1). Reads nothing: `watermarks` are the served HEAD's, and the rest is memory.
+///
+/// ⚠️ An uncovered entry is `not_folded`, so the handler requests a fold exactly as for a
+/// refused `strong` read (M9i.2).
+fn after_read<E: BlobStore>(
+    engine: &Engine<E>,
+    level: Level,
+    token: &session::Token,
+    served: u64,
+    watermarks: &std::collections::BTreeMap<u64, u64>,
+) -> Result<session::Token, ApiError> {
+    if level == Level::Session {
+        if token.epoch > served {
+            return Err(ApiError::bad_session(format!(
+                "the token has seen epoch {}, and this store is at {served}: it did not come \
+                 from here",
+                token.epoch
+            )));
+        }
+        if token
+            .entries
+            .iter()
+            .any(|(lane, next)| !engine.covers(watermarks, LaneId(*lane), *next))
+        {
+            return Err(EngineError::NotFolded.into());
+        }
+    }
+    let mut out = token.clone();
+    out.saw(served);
+    // Folded into what was served, so into every later HEAD: watermarks only grow.
+    out.entries
+        .retain(|lane, next| watermarks.get(lane).copied().unwrap_or(0) < *next);
+    if engine_level(level, token) == pstore_engine::Consistency::Strong && out.overflow {
+        // A strong read found nothing unfolded but this engine's own bundles, which only this
+        // process holds: the one lane the cleared token must still name.
+        out.overflow = false;
+        if let Some(next) = engine.unfolded_next(watermarks) {
+            out.wrote(engine.lane().0, next);
+        }
+    }
+    Ok(out)
 }
 
 /// One query's answer, before it becomes a response.
@@ -909,6 +1034,8 @@ struct Answered {
     results: Vec<ResultRow>,
     epoch: u64,
     unfolded_hits: usize,
+    /// The session token to send back (M11.1).
+    token: session::Token,
 }
 
 /// Runs a planned query.
@@ -923,6 +1050,7 @@ async fn run<E: BlobStore>(
     index: &str,
     req: &QueryRequest,
     plan: Plan,
+    token: &session::Token,
 ) -> Result<Answered, ApiError> {
     let missing = || {
         ApiError::new(
@@ -931,7 +1059,16 @@ async fn run<E: BlobStore>(
             format!("this tenant has no index {index}"),
         )
     };
-    let consistency = level(req)?;
+    let level = level(req)?;
+    let consistency = engine_level(level, token);
+    // A past epoch is what it is: the token passes through untouched.
+    let checked = |served: u64, watermarks: &std::collections::BTreeMap<u64, u64>| {
+        if req.as_of.is_some() {
+            Ok(token.clone())
+        } else {
+            after_read(engine, level, token, served, watermarks)
+        }
+    };
     let (legs, filter, fusion) = match plan {
         Plan::Ordered(by, filter) => {
             let got = engine
@@ -945,10 +1082,13 @@ async fn run<E: BlobStore>(
                     consistency,
                 )
                 .await?;
+            // ⚠️ Before "no such index": the session's unfolded write may be what creates it.
+            let token = checked(got.epoch.0, &got.watermarks)?;
             if !got.exists {
                 return Err(missing());
             }
             return Ok(Answered {
+                token,
                 results: got
                     .rows
                     .into_iter()
@@ -961,7 +1101,7 @@ async fn run<E: BlobStore>(
                     .collect(),
                 epoch: got.epoch.0,
                 unfolded_hits: got.unfolded,
-                consistency: level_name(consistency),
+                consistency: level_name(level),
             });
         }
         Plan::Ranked(legs, filter, fusion) => (legs, filter, fusion),
@@ -992,6 +1132,7 @@ async fn run<E: BlobStore>(
                 .await?
         }
     };
+    let token = checked(answer.epoch.0, &answer.watermarks)?;
     if answer.segments.is_empty() && answer.unfolded.is_empty() {
         return Err(missing());
     }
@@ -1016,7 +1157,8 @@ async fn run<E: BlobStore>(
             .collect(),
         epoch: answer.epoch.0,
         unfolded_hits,
-        consistency: level_name(consistency),
+        consistency: level_name(level),
+        token,
     })
 }
 

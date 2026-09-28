@@ -51,6 +51,13 @@ revalidate. The client names its own tolerance.
   *"up to about one hour"* and is not client-controllable.
 
 ### `at_token(read_token)`
+
+> ⚠️ **Corrected by [M11.1](../../milestones/M11/SPEC.md).** Shipped as
+> `consistency: "session"` with the `x-pstore-session` header. A node behind the token
+> **refuses** (`503 not_folded`, a fold requested) rather than blocking. The check costs no
+> request: the HEAD the query already read, and this process's own memtable. It covers the
+> session's own **durable** writes and never serves a HEAD older than the token's epoch. It
+> does not promise what another process's memtable happened to show.
 The client passes the opaque token returned by its last write. The node serves at ≥ that
 epoch/watermark, blocking or refreshing if behind. Gives **read-your-writes and monotonic
 reads at bounded-mode cost**, because the common case is that the cached view is already

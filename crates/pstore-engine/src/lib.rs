@@ -591,6 +591,9 @@ pub struct Answer {
     /// 0 on a process that only reads and stale on one another process has folded past.
     /// Rows at [`Self::unfolded_at`] are this process's unfolded writes, newer than it.
     pub epoch: Epoch,
+    /// That manifest's lane watermarks, keyed by lane: how far each lane is folded into what
+    /// was served. What a `session` read is checked against (M11.1), at no request.
+    pub watermarks: BTreeMap<u64, u64>,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -623,6 +626,8 @@ pub struct Ordered {
     pub exists: bool,
     /// The epoch of the manifest the rows came from, as [`Answer::epoch`] (M10).
     pub epoch: Epoch,
+    /// That manifest's lane watermarks, as [`Answer::watermarks`] (M11.1).
+    pub watermarks: BTreeMap<u64, u64>,
 }
 
 /// What HEAD knows about one index, without reading a single segment.
@@ -2657,6 +2662,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded_at,
                 segments: refs,
                 epoch: at.head.epoch,
+                watermarks: at.head.watermarks.clone(),
             });
         }
 
@@ -2682,6 +2688,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded_at,
             segments: refs,
             epoch: at.head.epoch,
+            watermarks: at.head.watermarks.clone(),
         })
     }
 
@@ -2752,6 +2759,51 @@ impl<S: BlobStore> Engine<S> {
             .all(|clean| clean))
     }
 
+    /// This engine's lane.
+    #[must_use]
+    pub fn lane(&self) -> LaneId {
+        self.lane
+    }
+
+    /// Whether an answer served from a manifest with `watermarks` reflects every bundle of
+    /// `lane` below `next` (M11.1): folded into it, or -- this engine's own lane only -- held
+    /// in its memtable. The own-lane rule is [`Self::settled`]'s (M9j): a predecessor's
+    /// bundles below the resume point are in neither until HEAD folds them. Reads nothing.
+    #[must_use]
+    pub fn covers(&self, watermarks: &BTreeMap<u64, u64>, lane: LaneId, next: u64) -> bool {
+        let folded = watermarks.get(&lane.0).copied().unwrap_or(0);
+        if folded >= next {
+            return true;
+        }
+        let own = *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(own, Some(r) if lane == self.lane && folded >= r.at && next <= r.next.0)
+    }
+
+    /// This engine's next sequence on its lane, once its first flush has resumed the lane:
+    /// every bundle it has written is below it (M11.1).
+    #[must_use]
+    pub fn next_seq(&self) -> Option<u64> {
+        self.seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|r| r.next.0)
+    }
+
+    /// This engine's next sequence, when it has written bundles `watermarks` has not folded
+    /// (M11.1): what a session that read here must still require of another process.
+    #[must_use]
+    pub fn unfolded_next(&self, watermarks: &BTreeMap<u64, u64>) -> Option<u64> {
+        let folded = watermarks.get(&self.lane.0).copied().unwrap_or(0);
+        let own = *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        own.map(|r| r.next.0).filter(|next| *next > folded)
+    }
+
     /// How far HEAD has folded this engine's own lane.
     fn watermark(&self, head: &Head) -> u64 {
         head.watermarks.get(&self.lane.0).copied().unwrap_or(0)
@@ -2807,6 +2859,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded_at: 0,
                 segments: refs,
                 epoch: then.epoch,
+                watermarks: then.watermarks.clone(),
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -2841,6 +2894,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded_at,
             segments: refs,
             epoch: then.epoch,
+            watermarks: then.watermarks.clone(),
         })
     }
 
@@ -2901,7 +2955,7 @@ impl<S: BlobStore> Engine<S> {
             ));
         }
         let mut settle: Option<(Head, Vec<LaneId>)> = None;
-        let (refs, targets, unfolded, shadow, epoch) = match as_of {
+        let (refs, targets, unfolded, shadow, epoch, watermarks) = match as_of {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 self.remember_schemas(&at.head);
@@ -2914,6 +2968,7 @@ impl<S: BlobStore> Engine<S> {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     then.epoch,
+                    then.watermarks.clone(),
                 )
             }
             None => {
@@ -2929,7 +2984,14 @@ impl<S: BlobStore> Engine<S> {
                     || (Vec::new(), std::collections::HashSet::new()),
                     |v| (v.rows, v.shadow),
                 );
-                (refs, targets, rows, shadow, at.head.epoch)
+                (
+                    refs,
+                    targets,
+                    rows,
+                    shadow,
+                    at.head.epoch,
+                    at.head.watermarks.clone(),
+                )
             }
         };
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
@@ -2973,6 +3035,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded,
             exists,
             epoch,
+            watermarks,
         })
     }
 

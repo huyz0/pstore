@@ -147,6 +147,8 @@ pub struct WriteResponse {
     pub durable: bool,
     /// What it cost.
     pub cost: Cost,
+    /// The session token, as the `x-pstore-session` header carries it (M11.1).
+    pub session: String,
 }
 
 /// `POST /v1/indexes/{id}/query`.
@@ -247,6 +249,8 @@ pub struct QueryMeta {
     pub cost: Cost,
     /// The level served: `eventual` or `strong` (M9i.2).
     pub consistency: &'static str,
+    /// The session token, as the `x-pstore-session` header carries it (M11.1).
+    pub session: String,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g).
@@ -291,6 +295,8 @@ pub struct MultiQueryMeta {
     pub cost: Cost,
     /// Each query's level served (M9i.2).
     pub consistencies: Vec<&'static str>,
+    /// The session token, merged over every query (M11.1).
+    pub session: String,
 }
 
 /// The answer to a query.

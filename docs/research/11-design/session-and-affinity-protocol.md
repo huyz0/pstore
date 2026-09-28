@@ -30,6 +30,20 @@ Neither uses it for **routing**, which is where we add something.
 
 ## 3. The token
 
+> ⚠️ **Corrected by [M11.1](../../milestones/M11/SPEC.md).** What ships is the consistency
+> half only, without a MAC or a `hint`:
+> - **The layout** is `version ‖ tenant ‖ epoch ‖ flags ‖ n ‖ n × (lane, next)`: one
+>   tenant-level epoch, as OQ-121 leans, and one entry per lane the session durably wrote.
+>   There are no per-index entries, because the tenant is the commit unit.
+> - **Overflow.** Past 16 lanes the token overflows, and a read of it runs as `strong`. The
+>   LRU cap below would drop a write the session made.
+> - **No MAC.** §6's MAC bounds a *wait*, and this server never waits on a token: a
+>   `session` read it cannot cover is refused (`503 not_folded`) and a fold is requested,
+>   exactly as for `strong`. A forged token can only refuse its own reads.
+> - **No `hint`.** The hint, and the MAC with it, arrive when a server routes.
+> - **Not the default** (D-69 below). `eventual` stays the default while OQ-125 is open,
+>   and a default of `session` would refuse every `as_of` read.
+
 ```
 pstore_session := base64( version ‖ tenant_id ‖ [ (index_id, epoch, lane_watermark) ] ‖ hint ‖ mac )
 ```
