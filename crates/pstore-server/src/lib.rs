@@ -995,6 +995,12 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
             "label {label} is also a group_by attribute: a group would carry it twice"
         )));
     }
+    // As an order's: the bound on what one query holds per segment (code review).
+    if req.top_k > MAX_ORDERED {
+        return Err(ApiError::bad_request(format!(
+            "top_k may be at most {MAX_ORDERED} groups for an aggregation"
+        )));
+    }
     Ok(Some(pstore_query::AggregateSpec {
         labels: out,
         group_by,

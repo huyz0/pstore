@@ -541,3 +541,32 @@ async fn what_an_aggregation_cannot_mean_is_refused() {
         assert!(msg.contains(why), "{q}: {msg:?} does not name {why:?}");
     }
 }
+
+#[tokio::test]
+async fn an_unfolded_delete_alone_takes_the_full_path() {
+    // Code review, M2: a reader whose only unfolded operation is a delete of a folded id.
+    let w = world(&[1, 2]);
+    let (a, b) = (&w.apis[0], &w.apis[1]);
+    let mut model = Model::new();
+    upsert(a, &mut model, &rows(0..50), true).await;
+    fold(a).await;
+    delete(b, &mut model, &["d00007"], false).await;
+    let got = query(b, &count()).await;
+    assert_eq!(got["aggregations"]["n"], model.len() as u64, "{got}");
+    assert_eq!(got["aggregations"]["n"], 49);
+}
+
+#[tokio::test]
+async fn an_aggregations_top_k_is_bounded_as_an_orders_is() {
+    let w = world(&[1]);
+    let a = &w.apis[0];
+    upsert(a, &mut Model::new(), &rows(0..3), true).await;
+    let mut q = count();
+    q["group_by"] = json!(["color"]);
+    q["top_k"] = json!(10_001);
+    let (s, body, _) = send(a, "POST", "/v1/indexes/docs/query", &q, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("top_k"));
+    q["top_k"] = json!(10_000);
+    query(a, &q).await;
+}

@@ -220,8 +220,9 @@ impl Aggregator {
         true
     }
 
-    /// Offers a row the filter admitted.
-    pub fn offer(&mut self, doc: &Document) {
+    /// Offers a row the filter admitted. Whether it was aggregated: `false` when its key is
+    /// not among the `top_k` smallest.
+    pub fn offer(&mut self, doc: &Document) -> bool {
         let key: Vec<Key> = self
             .spec
             .group_by
@@ -229,11 +230,11 @@ impl Aggregator {
             .map(|a| Key::of(doc.attrs.get(a)))
             .collect();
         if !self.admit(&key) {
-            return;
+            return false;
         }
         let spec = Arc::clone(&self.spec);
         let Some(accs) = self.groups.get_mut(&key) else {
-            return;
+            return false;
         };
         for ((_, agg), acc) in spec.labels.iter().zip(accs.iter_mut()) {
             match agg {
@@ -249,6 +250,7 @@ impl Aggregator {
                 },
             }
         }
+        true
     }
 
     /// Counts `rows` rows without offering them: HEAD's arithmetic, for the fast path. Only
@@ -349,7 +351,9 @@ pub async fn aggregate<S: BlobStore>(
         filter,
         shadow,
         || blank.empty_like(),
-        |a: &mut Aggregator, doc: Document| a.offer(&doc),
+        |a: &mut Aggregator, doc: Document| {
+            a.offer(&doc);
+        },
     )
     .await?;
     for part in parts {

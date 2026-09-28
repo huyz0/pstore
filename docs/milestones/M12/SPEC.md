@@ -31,8 +31,10 @@ through the API means paging every id out of it.
 - The integers are summed exactly, in `i128`.
 - With no float among the values, the sum is an integer. Outside the `i64` range, it is
   reported as the nearest `f64`.
-- With any float, the sum is an `f64`, the integers converted, summed in the order the rows
-  are visited. That order is not stable across folds, so the last bits may differ.
+- With any float, the sum is an `f64`: the floats summed in the order the rows are visited,
+  plus the exact integer sum converted once (code review: the implementation is more exact
+  than "each integer converted" and the spec follows it). The visit order is not stable across
+  folds, so the last bits may differ.
 - A sum over no numeric value is `0`.
 - A float sum that overflows to ±∞ is reported as `null`, since JSON cannot carry it (spec
   review).
@@ -42,7 +44,8 @@ through the API means paging every id out of it.
 - With it: `"aggregation_groups": [{"color": "red", "n": 3, "total": 9}, …]`. Groups are
   in ascending key order, and there are at most `top_k` of them.
 - `meta` is a query's: `epoch`, `consistency`, `cost`, `session` and `staleness_ms`.
-  `unfolded_hits` is the number of the process's unfolded rows the aggregation counted.
+  `unfolded_hits` is the number of the process's unfolded rows the aggregation counted: an
+  admitted row whose group fell outside the `top_k` smallest was not counted (code review).
 
 **What a group is.**
 - A group's key is the tuple of its rows' `group_by` values, absent as `null`.
@@ -81,7 +84,10 @@ through the API means paging every id out of it.
 - **When** (spec review, M3): the decision is made on the fresh view from the **same**
   `head_and_fresh_as` call as the full path, never on the memtable read beforehand. With
   any unfolded row or delete for the index in that view, it takes the full path.
-- **As of a past epoch:** it counts `Head::as_of`'s segments and deletes.
+- **Live reads only** (code review, B1): `Head::as_of` rebuilds a buried segment and a buried
+  delete vector with a count of 0. So a past epoch's arithmetic is wrong after a compaction,
+  a drop or a replaced vector, and an `as_of` count takes the full path, which reads the
+  vectors themselves.
 - **An index with no segment and nothing unfolded** is `404`, on both paths, as for an order
   (`exists`).
 - **Levels** (spec review, M2): every level runs as on the full path. `strong` still probes
@@ -104,6 +110,7 @@ here asks for.
 - an unknown aggregate, or `Sum` of `id`;
 - 0 or more than 16 labels, or 0 or more than 8 `group_by` attributes;
 - a label equal to a `group_by` attribute;
+- `top_k` over 10,000, an order's bound (code review);
 - an aggregation inside a multi-query. That is deferred, because a multi-query's results are
   lists of rows.
 
@@ -133,7 +140,10 @@ here asks for.
    - costs exactly **1 read**, and equals the full path's count;
    - with one unfolded write, or one unfolded delete, takes the full path and still equals
      brute force;
-   - `as_of` a past epoch equals brute force over that epoch's rows;
+   - `as_of` a past epoch, after the segments that held it were compacted, equals brute force
+     over that epoch's rows (code review, B1);
+   - with only an unfolded delete, on a reader holding nothing else, it takes the full path
+     and equals brute force (code review, M2);
    - a missing index is `404`.
 4. **Depth.** With a filter, an aggregation's depth is at most 3.
 5. **Consistency.** On the fast-path shape and on a filtered one:

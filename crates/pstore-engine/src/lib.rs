@@ -3381,7 +3381,11 @@ impl<S: BlobStore> Engine<S> {
         let scope = self
             .scope(index, as_of, consistency, allow_hit, hit)
             .await?;
-        let fast = filter.is_none()
+        // ⚠️ **Live reads only** (code review, B1): `Head::as_of` rebuilds a buried segment and a
+        // buried delete vector with a count of 0, so a past epoch's arithmetic is wrong after a
+        // compaction or a replaced vector. The full path reads the vectors themselves.
+        let fast = as_of.is_none()
+            && filter.is_none()
             && spec.counts_rows_only()
             && scope.unfolded.is_empty()
             && scope.shadow.is_empty();
@@ -3413,8 +3417,9 @@ impl<S: BlobStore> Engine<S> {
         let exists = !scope.refs.is_empty() || !scope.unfolded.is_empty();
         let mut unfolded = 0;
         for d in &scope.unfolded {
-            if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
-                aggregator.offer(d);
+            // Counted only when its group was kept (code review): a row whose key fell outside
+            // the `top_k` smallest was not aggregated.
+            if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) && aggregator.offer(d) {
                 unfolded += 1;
             }
         }
