@@ -2225,6 +2225,22 @@ fn to_document(
 /// ⚠️ **Refused, never guessed.** A clause this cannot read is a 400, not dropped: a filter
 /// silently ignored answers with documents the caller excluded.
 fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
+    let p = clause(v)?;
+    // M15: every pattern is compiled, and a regex may compile to a megabyte.
+    if p.patterns() > MAX_PATTERNS {
+        return Err(ApiError::bad_request(format!(
+            "malformed filter: a filter holds at most {MAX_PATTERNS} patterns, and this holds {}",
+            p.patterns()
+        )));
+    }
+    Ok(p)
+}
+
+/// The most `Glob`, `IGlob`, `Regex` and `Fuzzy` clauses one filter may hold (M15).
+const MAX_PATTERNS: usize = 16;
+
+/// One clause of a filter, recursively: [`predicate`] without the pattern cap.
+fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
     use pstore_query::{Op, Predicate};
     let bad = |why: String| ApiError::bad_request(format!("malformed filter {v}: {why}"));
     let arr = v
@@ -2235,14 +2251,14 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
             let list = clauses
                 .as_array()
                 .ok_or_else(|| bad(format!("{op} takes an array of filters")))?;
-            let parts = list.iter().map(predicate).collect::<Result<Vec<_>, _>>()?;
+            let parts = list.iter().map(clause).collect::<Result<Vec<_>, _>>()?;
             Ok(if op == "And" {
                 Predicate::And(parts)
             } else {
                 Predicate::Or(parts)
             })
         }
-        [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(predicate(inner)?))),
+        [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(clause(inner)?))),
         [attr, op, value] => {
             let attr = attr
                 .as_str()
@@ -2312,6 +2328,43 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
                         _ => pstore_query::TokenOp::Sequence,
                     };
                     Ok(Predicate::Tokens(attr, how, text.to_owned(), None))
+                }
+                // M15: patterns, compiled here once; a refusal names the operator.
+                "Glob" | "NotGlob" | "IGlob" | "NotIGlob" | "Regex" => {
+                    let source = value
+                        .as_str()
+                        .ok_or_else(|| bad(format!("{op} takes a string pattern")))?;
+                    let kind = match op {
+                        "Glob" | "NotGlob" => pstore_query::PatternKind::Glob,
+                        "IGlob" | "NotIGlob" => pstore_query::PatternKind::IGlob,
+                        _ => pstore_query::PatternKind::Regex,
+                    };
+                    let p = pstore_query::Pattern::new(kind, source)
+                        .map_err(|e| bad(format!("{op}: {e}")))?;
+                    let p = Predicate::Pattern(attr, p);
+                    Ok(if op.starts_with("Not") {
+                        Predicate::Not(Box::new(p))
+                    } else {
+                        p
+                    })
+                }
+                "Fuzzy" => {
+                    let o = value.as_object().filter(|o| o.len() == 2).ok_or_else(|| {
+                        bad("Fuzzy takes {\"value\": <string>, \"max_edits\": 0..=2}".to_owned())
+                    })?;
+                    let v = o
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|v| v.chars().count() <= 256)
+                        .ok_or_else(|| {
+                            bad("Fuzzy's value is a string of at most 256 characters".to_owned())
+                        })?;
+                    let k = o
+                        .get("max_edits")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|k| *k <= 2)
+                        .ok_or_else(|| bad("Fuzzy's max_edits is 0, 1 or 2".to_owned()))?;
+                    Ok(Predicate::Fuzzy(attr, v.to_owned(), k as u8))
                 }
                 other => Err(bad(format!("unknown operator {other}"))),
             }

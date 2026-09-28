@@ -21,7 +21,9 @@ mod order;
 mod run;
 
 pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
-pub use filter::{Bound, ID as ID_ATTRIBUTE, Op, Predicate, TokenOp};
+pub use filter::{
+    Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Op, Pattern, PatternKind, Predicate, TokenOp,
+};
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
 pub use order::{OrderBy, Selector, select};
 pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered, query_with};

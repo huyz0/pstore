@@ -62,6 +62,149 @@ impl Bound {
     }
 }
 
+/// Which pattern language a [`Pattern`] was written in (M15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternKind {
+    /// A Unix glob over the whole value.
+    Glob,
+    /// [`PatternKind::Glob`], case-insensitive by simple case folding.
+    IGlob,
+    /// A `regex` crate pattern, unanchored.
+    Regex,
+}
+
+/// A pattern compiled once, when parsed (M15). Equal by kind and source.
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    kind: PatternKind,
+    source: String,
+    re: regex::Regex,
+}
+
+/// The longest source a pattern may have, in bytes (M15).
+pub const MAX_PATTERN: usize = 4096;
+/// The most a compiled pattern may take (M15), set rather than left to the crate's default.
+const COMPILED_LIMIT: usize = 1 << 20;
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.source == other.source
+    }
+}
+
+impl Pattern {
+    /// `source` as `kind` reads it, compiled -- or why it cannot be.
+    ///
+    /// # Errors
+    /// A source longer than [`MAX_PATTERN`], a glob with an unterminated `[` or a trailing
+    /// `\`, or a regex that does not compile within the size limit.
+    pub fn new(kind: PatternKind, source: &str) -> Result<Self, String> {
+        if source.len() > MAX_PATTERN {
+            return Err(format!("a pattern is at most {MAX_PATTERN} bytes"));
+        }
+        let re = match kind {
+            PatternKind::Regex => source.to_owned(),
+            PatternKind::Glob => glob_regex(source, false)?,
+            PatternKind::IGlob => glob_regex(source, true)?,
+        };
+        let re = regex::RegexBuilder::new(&re)
+            .size_limit(COMPILED_LIMIT)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            kind,
+            source: source.to_owned(),
+            re,
+        })
+    }
+
+    /// Its language.
+    #[must_use]
+    pub fn kind(&self) -> PatternKind {
+        self.kind
+    }
+
+    /// Its source, as written.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+}
+
+/// A character as a regex literal, escaped whatever it is.
+fn lit(c: char) -> String {
+    if c.is_alphanumeric() {
+        c.to_string()
+    } else {
+        format!("\\x{{{:x}}}", c as u32)
+    }
+}
+
+/// A glob as a regex over the whole value: `*` is any run, `?` any character -- `/` and a
+/// newline included -- `[..]` and `[!..]` classes with ranges, and `\` escapes.
+fn glob_regex(glob: &str, ci: bool) -> Result<String, String> {
+    let mut out = String::from(if ci { "(?is)\\A" } else { "(?s)\\A" });
+    let mut it = glob.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '\\' => out.push_str(&lit(it.next().ok_or("a glob ends in an escape")?)),
+            '[' => {
+                let mut class = String::from("[");
+                let mut first = true;
+                loop {
+                    let c = it.next().ok_or("a glob has an unterminated [")?;
+                    match c {
+                        ']' if !first => break,
+                        '!' if first => class.push('^'),
+                        '-' if !first && !class.ends_with('[') && !class.ends_with('^') => {
+                            class.push('-');
+                        }
+                        c => class.push_str(&lit(c)),
+                    }
+                    first = false;
+                }
+                class.push(']');
+                out.push_str(&class);
+            }
+            c => out.push_str(&lit(c)),
+        }
+    }
+    out.push_str("\\z");
+    Ok(out)
+}
+
+/// Whether `a` is within `k` edits of `b`, in characters (M15): a band of width `2k+1`, and
+/// out at once when the lengths differ by more.
+fn within(a: &[char], b: &[char], k: usize) -> bool {
+    if a.len().abs_diff(b.len()) > k {
+        return false;
+    }
+    let inf = usize::MAX / 2;
+    let mut prev: Vec<usize> = (0..=b.len())
+        .map(|j| if j <= k { j } else { inf })
+        .collect();
+    for (i, ca) in (1..).zip(a) {
+        let mut row = vec![inf; b.len() + 1];
+        if let Some(first) = row.first_mut().filter(|_| i <= k) {
+            *first = i;
+        }
+        for j in i.saturating_sub(k).max(1)..=(i + k).min(b.len()) {
+            let (Some(&diag), Some(&up), Some(&left), Some(cb)) =
+                (prev.get(j - 1), prev.get(j), row.get(j - 1), b.get(j - 1))
+            else {
+                continue;
+            };
+            if let Some(cell) = row.get_mut(j) {
+                *cell = (diag + usize::from(ca != cb)).min(up + 1).min(left + 1);
+            }
+        }
+        prev = row;
+    }
+    prev.last().is_some_and(|d| *d <= k)
+}
+
 /// A predicate over one document's id and attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
@@ -89,6 +232,10 @@ pub enum Predicate {
     /// under a `Not`, would be a wrong answer from a missed bind that no test could tell
     /// from a right one on a default index.
     Tokens(String, TokenOp, String, Option<Bound>),
+    /// A scalar string attribute the pattern matches (M15). Anything else is false.
+    Pattern(String, Pattern),
+    /// A scalar string attribute within `k` edits of the value (M15). Anything else is false.
+    Fuzzy(String, String, u8),
 }
 
 impl Predicate {
@@ -164,6 +311,29 @@ impl Predicate {
                 ),
                 _ => false,
             },
+            Self::Pattern(name, p) => match get(name) {
+                Some(Value::Str(s)) => p.re.is_match(&s),
+                _ => false,
+            },
+            Self::Fuzzy(name, v, k) => match get(name) {
+                Some(Value::Str(s)) => within(
+                    &s.chars().collect::<Vec<_>>(),
+                    &v.chars().collect::<Vec<_>>(),
+                    usize::from(*k),
+                ),
+                _ => false,
+            },
+        }
+    }
+
+    /// How many patterns it holds, fuzzy ones included (M15): what the door caps.
+    #[must_use]
+    pub fn patterns(&self) -> usize {
+        match self {
+            Self::Pattern(..) | Self::Fuzzy(..) => 1,
+            Self::And(ps) | Self::Or(ps) => ps.iter().map(Self::patterns).sum(),
+            Self::Not(p) => p.patterns(),
+            _ => 0,
         }
     }
 
@@ -206,8 +376,9 @@ impl Predicate {
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
             Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
-            // Tokens have no zone: every block could hold a match (M14.2).
-            Self::Tokens(..) => true,
+            // Tokens have no zone: every block could hold a match (M14.2). Nor, until M15.2's
+            // sketch, do patterns.
+            Self::Tokens(..) | Self::Pattern(..) | Self::Fuzzy(..) => true,
         }
     }
 }

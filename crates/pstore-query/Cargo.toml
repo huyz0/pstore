@@ -16,6 +16,8 @@ pstore-blob   = { path = "../pstore-blob" }
 pstore-format = { path = "../pstore-format" }
 pstore-index  = { path = "../pstore-index" }
 thiserror     = "2"
+# M15: Regex, and Glob compiled to it.
+regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
 
 [dev-dependencies]
 bytes          = "1"

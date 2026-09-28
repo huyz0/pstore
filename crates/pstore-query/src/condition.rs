@@ -6,7 +6,7 @@
 //! ever travels from this process's writer to a fold, so it has no version but its tags. A
 //! tag it does not know decodes as `None`, never as a different predicate.
 
-use crate::filter::{Bound, Op, Predicate, TokenOp};
+use crate::filter::{Bound, Op, Pattern, PatternKind, Predicate, TokenOp};
 use pstore_format::Value;
 
 /// Deeper than any filter a client writes: bounds the decoder's recursion.
@@ -122,6 +122,23 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
         Predicate::Not(q) => {
             b.push(6);
             put_pred(b, q);
+        }
+        // M15: the kind and the source; `decode` compiles it again.
+        Predicate::Pattern(a, p) => {
+            b.push(8);
+            put_str(b, a);
+            b.push(match p.kind() {
+                PatternKind::Glob => 0,
+                PatternKind::IGlob => 1,
+                PatternKind::Regex => 2,
+            });
+            put_str(b, p.source());
+        }
+        Predicate::Fuzzy(a, v, k) => {
+            b.push(9);
+            put_str(b, a);
+            put_str(b, v);
+            b.push(*k);
         }
         // M14.2: the operator, the text, and the analyzer when one is bound.
         Predicate::Tokens(a, op, text, analyzer) => {
@@ -242,6 +259,17 @@ impl Reader<'_> {
                 }
             }
             6 => Predicate::Not(Box::new(self.pred(depth + 1)?)),
+            8 => {
+                let a = self.string()?;
+                let kind = match self.u8()? {
+                    0 => PatternKind::Glob,
+                    1 => PatternKind::IGlob,
+                    2 => PatternKind::Regex,
+                    _ => return None,
+                };
+                Predicate::Pattern(a, Pattern::new(kind, &self.string()?).ok()?)
+            }
+            9 => Predicate::Fuzzy(self.string()?, self.string()?, self.u8()?),
             7 => {
                 let a = self.string()?;
                 let op = match self.u8()? {
@@ -288,6 +316,10 @@ mod tests {
             Predicate::Or(vec![]),
             Predicate::Not(Box::new(Predicate::And(vec![]))),
             Predicate::Tokens(a(), TokenOp::All, "x y".into(), None),
+            Predicate::Pattern(a(), Pattern::new(PatternKind::Glob, "a*[!b]?").unwrap()),
+            Predicate::Pattern(a(), Pattern::new(PatternKind::IGlob, "ſ*").unwrap()),
+            Predicate::Pattern(a(), Pattern::new(PatternKind::Regex, "^(?i)σ.k$").unwrap()),
+            Predicate::Fuzzy(a(), "ſσk".into(), 2),
             Predicate::Tokens(a(), TokenOp::Any, String::new(), None),
             Predicate::Tokens(
                 a(),

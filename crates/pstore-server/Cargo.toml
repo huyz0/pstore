@@ -41,3 +41,5 @@ tokio         = { version = "1", features = ["io-util", "test-util"] }
 http-body-util = "0.1"
 async-trait   = "0.1"
 bytes         = "1"
+# M15: the regex oracle a pattern filter is checked against.
+regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
