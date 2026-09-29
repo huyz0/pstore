@@ -237,6 +237,9 @@ pub(crate) fn scoped(index: &str, segment: &str) -> String {
 
 /// The segment and index a scoped key names, or `None` for any other key (M16). As a
 /// graveyard entry it is a **marker**: `index` stopped naming a borrowed `segment`.
+///
+/// A delete vector's key built on a scoped key is `None` too: its tail after `.br-` carries
+/// the vector's `.{epoch}-{lane}.dv`, which is not hex.
 #[must_use]
 pub(crate) fn unscoped(key: &str) -> Option<(&str, String)> {
     let (segment, hex) = key.rsplit_once(".br-")?;
@@ -635,9 +638,7 @@ impl Head {
             for key in keys {
                 // M16: a marker is a borrowed segment its branch stopped naming, and belongs
                 // to the branch -- not to the index its path names.
-                if let Some((segment, index)) = unscoped(key)
-                    && !key.ends_with(".dv")
-                {
+                if let Some((segment, index)) = unscoped(key) {
                     if key_epoch(segment).is_some_and(|born| born <= epoch.0) {
                         out.indexes.entry(index).or_default().push(SegmentRef {
                             key: segment.to_owned(),

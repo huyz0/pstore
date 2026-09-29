@@ -1652,27 +1652,6 @@ impl<S: BlobStore> Engine<S> {
             .await
     }
 
-    /// [`Self::write_if`], declaring the index's full-text schema as [`Self::write_with`] does.
-    ///
-    /// # Errors
-    /// As [`Self::write_if`] and [`Self::write_with`].
-    pub async fn write_if_with(
-        &self,
-        index: &str,
-        docs: Vec<Document>,
-        metric: Metric,
-        cond: &pstore_query::Predicate,
-        fts: Option<&FullText>,
-    ) -> Result<(), EngineError> {
-        let mark = encoded(cond)?;
-        let declared = Declared {
-            fts: fts.copied(),
-            trigram: None,
-        };
-        self.write_marked(index, docs, metric, Some(mark), &declared)
-            .await
-    }
-
     /// Patches rows at the fold (M13): each sets and removes attributes of its id's current
     /// version -- if `cond`, when given, admits it -- and a patch of an id with no version is
     /// ignored. Invisible until that fold.
@@ -3035,7 +3014,7 @@ impl<S: BlobStore> Engine<S> {
             // it is a burial of the segment.
             let object = |k: &String| -> String {
                 match head::unscoped(k) {
-                    Some((segment, _)) if !k.ends_with(".dv") => segment.to_owned(),
+                    Some((segment, _)) => segment.to_owned(),
                     _ => k.clone(),
                 }
             };

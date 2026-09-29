@@ -348,3 +348,28 @@ async fn an_index_whose_name_holds_seg_owns_its_segments() {
         assert!(store.get(&Key::new(k.clone())).await.is_err(), "{k} kept");
     }
 }
+
+#[tokio::test]
+async fn a_destination_exists_by_any_one_of_its_marks_and_not_by_a_delete() {
+    // Each mark alone refuses: named by HEAD, or holding this process's unfolded rows. A
+    // buffered delete is no row, so it does not.
+    let store = Arc::new(MemoryStore::new());
+    let e = engine(&store);
+    seeded(&e, "src").await;
+    e.write("other", vec![doc("o", 1)]).await.unwrap();
+    fold(&e).await;
+    e.write("unfolded", vec![doc("u", 1)]).await.unwrap();
+    for (from, dest) in [("other", "src"), ("src", "unfolded")] {
+        let err = e.branch(from, dest).await;
+        assert!(
+            matches!(&err, Err(pstore_engine::EngineError::Refused(m)) if m.contains("exists")),
+            "{dest}: {err:?}"
+        );
+    }
+    e.delete("deleted", vec!["x".into()]).await.unwrap();
+    e.branch("src", "deleted").await.unwrap();
+    assert_eq!(
+        rows(&e, "deleted", None).await.unwrap(),
+        rows(&e, "src", None).await.unwrap()
+    );
+}

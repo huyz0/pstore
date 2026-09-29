@@ -210,3 +210,29 @@ async fn a_gc_that_keeps_contending_reports_contention_not_a_lost_race() {
         store.refused()
     );
 }
+
+#[tokio::test]
+async fn a_branch_that_keeps_contending_reports_contention_not_a_lost_race() {
+    // M16's commit loop carries the same guard.
+    let store = Arc::new(ArmedContention::default());
+    let t = TenantId(643);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    e.write("src", (0..6).map(doc).collect()).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    store.arm();
+    let err = e
+        .branch("src", "dest")
+        .await
+        .expect_err("a branch committed against a backend refusing every CAS");
+    assert!(
+        matches!(err, EngineError::Contended),
+        "the branch loop reported {err:?} rather than what it saw"
+    );
+    assert!(
+        store.refused() > 1,
+        "the branch gave up after {} refusal(s)",
+        store.refused()
+    );
+}
