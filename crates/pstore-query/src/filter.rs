@@ -635,6 +635,28 @@ mod tests {
     }
 
     #[test]
+    fn every_pattern_counts_toward_the_cap_through_every_combinator() {
+        let glob = || {
+            Predicate::Pattern(
+                "a".to_owned(),
+                Pattern::new(PatternKind::Glob, "x*").unwrap(),
+            )
+        };
+        let fuzzy = || Predicate::Fuzzy("a".to_owned(), "abc".to_owned(), 1);
+        let not = |p| Predicate::Not(Box::new(p));
+        assert_eq!(glob().patterns(), 1);
+        assert_eq!(not(glob()).patterns(), 1);
+        assert_eq!(not(not(fuzzy())).patterns(), 1);
+        let tree = Predicate::And(vec![
+            glob(),
+            Predicate::Or(vec![not(fuzzy()), eq("n", 1), glob()]),
+            not(Predicate::And(vec![glob(), fuzzy()])),
+        ]);
+        assert_eq!(tree.patterns(), 5);
+        assert_eq!(eq("n", 1).patterns(), 0);
+    }
+
+    #[test]
     fn two_patterns_are_equal_by_kind_and_source() {
         let p = |kind| Pattern::new(kind, "a*").unwrap();
         assert_eq!(p(PatternKind::Glob), p(PatternKind::Glob));
