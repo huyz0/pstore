@@ -94,7 +94,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-30` decoupling re-clustering from data compaction ·
 `OQ-31` compaction fairness under heavy-tailed index sizes ·
 `OQ-32` roaring vs ribbon for delete vectors ·
-`OQ-33` branch refcounting in deep branch trees ·
+~~`OQ-33`~~ **answered** by [M16](../../milestones/M16/SPEC.md): "named by HEAD" is the reference count at any depth, and GC waits for a key's last burial ·
 `OQ-34` epochs public or internal ·
 `OQ-36` exact-scan threshold ·
 `OQ-37` centroid hierarchy above 1M centroids ·

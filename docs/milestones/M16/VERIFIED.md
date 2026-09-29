@@ -68,7 +68,26 @@ wire's hook removed.
    `an_index_whose_name_holds_seg_owns_its_segments` came from code review M1: an index named
    `a/seg/b`, which only a branch's names forbid, owns its segments. It failed on the first
    `/seg/`.
-9. **Gates** — NOT-RUN yet: M16's sweep follows M14's and M15's.
+9. **Gates.** `./scripts/mutants.sh --check . --in-diff` over M15's and M16's source
+   together (`5c7f4f1..3196cb4`), swept in a worktree at `3196cb4` in four shards. Container
+   restarts and a background time limit cut the fourth, so it ran as pieces 12 to 15 of 16:
+   cargo-mutants shards in contiguous slices, so those pieces are exactly the fourth shard.
+   - 381 mutants: 302 caught, 43 unviable, 2 timeouts, 34 missed. The two timeouts are
+     `glob_class`'s `+=` as `*=`, which hang and so are caught.
+   - Every miss is accounted for in its shard's commit (`889923e`, `1e36dc1`, `3725e0f`,
+     `3dc12c8`, `11db3c9`):
+     - 28 are killed by tests added for them and seen failing, for example
+       `a_regex_requires_its_literal_runs_and_nothing_optional`,
+       `a_trigram_sets_the_bits_fnv_1a_names` and
+       `the_widest_sketch_that_fits_is_chosen_and_an_exact_fit_fits`. Three of those 28 were
+       not re-run one by one: `encoded_len`'s five mutants are one formula, and two were
+       re-run against `a_sketch_is_as_long_as_its_encoded_len_says`.
+     - 4 were in code nothing called, `Sketch::attrs` and `Engine::write_if_with`, and that
+       code is removed.
+     - 2 are equivalent. One is a guard that `unscoped` already implies, and it is removed.
+       The other is `fresh_view`'s trigram comparison, which decides only whether an
+       in-memory view is reused; a sketch never changes an answer.
+   - `./scripts/gates.sh` on `11db3c9`: all seventeen PASS.
 
 Spec review took two rounds. Code review took two rounds: round 1 blocked on two majors, the
 owner read to the first `/seg/` and read paths left untested on a diverged branch; round 2

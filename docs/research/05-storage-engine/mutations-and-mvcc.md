@@ -112,13 +112,13 @@ This keeps TTL from generating write traffic.
 | Update | same as insert: amortized 1/batch W |
 | Point delete | same as insert |
 | Bulk delete of 1M rows | 1 W (one delete vector) + 1 commit |
-| Branch an index | **1 W** |
+| Branch an index | **1 W** — ⚠️ *Corrected by [M16](../../milestones/M16/SPEC.md):* plus 1 read of HEAD, and 1 GET and 1 PUT per segment carrying deletes, because each index keeps its own delete vectors for the segments it shares. Never per row |
 | Time-travel read | same as a normal read at that epoch |
 
 ## Open questions raised
 
 - OQ-32: Roaring vs. Ribbon/BitMagic for delete vectors at our sizes.
-- OQ-33: Branch refcounting under deep branch trees (branch of a branch of a branch).
+- ~~OQ-33~~ **Answered by [M16](../../milestones/M16/SPEC.md):** no reference count and no lineage object. "Named by HEAD" is an exact reference count at any depth, and GC reaps a shared segment only after the last index to let it go has buried it.
 - OQ-34: Should we expose epochs as public API (real time travel) or keep them internal?
   Leaning public — it is a differentiator and costs nothing.
 
