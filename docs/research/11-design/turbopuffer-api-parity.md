@@ -48,7 +48,7 @@ M9 milestones is the order in which the difference has to be closed.
 |---|---|---|
 | `include_attributes: bool \| [names]`, `exclude_attributes` | `{id, score}` only | **M9a** — at **zero extra requests**: the blocks that resolve ids already carry attributes |
 | `filters`: `Eq NotEq In NotIn Lt Lte Gt Gte And Or Not` | none over HTTP (the engine has `Eq`, `Gt`, `Lt` on an exact-scan path) | **M9b** — prefiltered clustered ANN is the architecture's advantage ([`filtering.md`](../06-indexing/filtering.md)) |
-| `Contains`, `ContainsAny`, `Any*` (arrays), `Glob`, `IGlob`, `Regex`, `Fuzzy` | none | Arrays with M9h; glob/regex need the trigram index (refused today as `Unimplemented`) — **M15** |
+| `Contains`, `ContainsAny`, `Any*` (arrays), `Glob`, `IGlob`, `Regex`, `Fuzzy` | each, per row; a declared attribute's blocks pruned by a trigram sketch | Arrays with M9h. **Landed in [M15](../../milestones/M15/SPEC.md)**: evaluated per row everywhere a filter runs, at most 16 per filter, and `"regex": true` builds a per-block trigram sketch that prunes and never changes an answer |
 | `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence` | each, under the index's analyzer | **Landed in [M14](../../milestones/M14/SPEC.md).2**: three-valued, so a predicate not yet bound to an analyzer admits nothing, even under `Not` |
 | `rank_by: [attr, "ANN", vec]`, `"kNN"` (exact) | ANN only; exact only below 25,000 rows | **M9d** exposes `kNN` (the `Rerank::Exact` rung already exists) |
 | `rank_by: [attr, "BM25", q]`, `Sum`, `Max`, `Product`, `Saturate`, `Decay` | one BM25 field, RRF-fused with the vector leg | **M9g** |
