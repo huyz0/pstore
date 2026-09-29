@@ -839,3 +839,21 @@ pub(crate) async fn commit<S: BlobStore>(
         Err(CasError::Io(e)) => Err(EngineError::Blob(e)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_scoped_segment_key_unscopes() {
+        let seg = "0046/tnt/70/idx/a/seg/L0/00000000000000000001-0000000000000001.seg";
+        let key = scoped("b.x", seg);
+        assert_eq!(unscoped(&key), Some((seg, "b.x".to_owned())));
+        // Not a segment before the tag, an odd-length tag, a tag that is not hex, and a
+        // delete vector built on a scoped key: none is a scoped key.
+        assert_eq!(unscoped("0046/tnt/70/wal/1/7.br-6162"), None);
+        assert_eq!(unscoped(&format!("{seg}.br-616")), None);
+        assert_eq!(unscoped(&format!("{seg}.br-zz")), None);
+        assert_eq!(unscoped(&dv_key(&key, 3, 1)), None);
+    }
+}

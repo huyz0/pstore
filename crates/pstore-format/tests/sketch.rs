@@ -137,3 +137,55 @@ fn a_sketch_never_costs_the_open_a_second_read() {
     }
     assert!(sketched > 0, "no budget left room for a sketch");
 }
+
+#[test]
+fn a_sketch_is_as_long_as_its_encoded_len_says() {
+    // The writer sizes the sketch by `encoded_len` without building it, so the two must agree.
+    for attrs in [vec!["s"], vec!["a", "longer_name", "é"]] {
+        let attrs: Vec<String> = attrs.iter().map(|s| (*s).to_owned()).collect();
+        for blocks in [1, 3, 7] {
+            for bits in [64, 128, 1024, 2048] {
+                let built = Sketch::build(&attrs, blocks, bits, |_, _| vec!["abcd".to_owned()]);
+                assert_eq!(
+                    built.encode().len(),
+                    Sketch::encoded_len(&attrs, blocks, bits),
+                    "{attrs:?} {blocks} {bits}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_trigram_sets_the_bits_fnv_1a_names() {
+    // The hash is part of the format: a sketch written by one build is read by the next. Its
+    // bits are checked against FNV-1a 64 computed here, over the folded trigram's UTF-8,
+    // with the offset basis XORed with each seed.
+    let fnv = |seed: u64, bytes: &[u8]| {
+        let mut h = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    };
+    // 2,048 bits, so the positions keep eleven bits of the hash rather than six.
+    for (value, folded) in [("abc", "ABC"), ("ſtä", "STÄ")] {
+        let sketch = Sketch::build(&["s".to_owned()], 1, 2048, |_, _| vec![value.to_owned()]);
+        let bytes = sketch.encode();
+        // The count, the name, `bits` and the block count, then the one 256-byte filter.
+        let filter = &bytes[17..];
+        assert_eq!(filter.len(), 256);
+        let set: Vec<u64> = (0..2048)
+            .filter(|p| filter[p / 8] & (1 << (p % 8)) != 0)
+            .map(|p| p as u64)
+            .collect();
+        let mut want: Vec<u64> = [0u64, 0x9e37_79b9]
+            .iter()
+            .map(|seed| fnv(*seed, folded.as_bytes()) % 2048)
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(set, want, "{value}");
+    }
+}
