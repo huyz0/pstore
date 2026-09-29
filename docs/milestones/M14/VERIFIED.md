@@ -89,7 +89,7 @@ first-written tests failed with "unknown operator".
    and with `Not` of unbound answering.
 5. `a_token_predicate_adds_no_round`: filtered depth equals unfiltered, 3 for an ordered
    query. The criterion was amended, because a ranked query is 4 deep with no filter at all.
-6. **Gates** — as M14.1's line 7, which covers both tasks.
+6. **Gates** — `./scripts/gates.sh` and the sweep, as M14.1's line 7 records for both tasks.
 
 Spec review took two rounds: round 1 had seven majors, and round 2 one major (`Not` of
 unbound), which was fixed. Code review took two rounds: round 1 blocked on B1, and round 2
