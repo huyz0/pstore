@@ -281,6 +281,14 @@ async fn what_a_pattern_cannot_mean_is_refused() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(msg.contains(why), "{f}: {msg:?} does not name {why:?}");
     }
+    // Sixteen is the cap, not past it.
+    let sixteen = json!([
+        "Or",
+        (0..16)
+            .map(|i| json!(["s", "Glob", format!("{i}*")]))
+            .collect::<Vec<_>>()
+    ]);
+    ids(&a, &sixteen).await;
 }
 
 #[tokio::test]
