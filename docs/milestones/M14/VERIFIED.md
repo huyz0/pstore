@@ -50,7 +50,19 @@ line and running the named test.
      head`): a HEAD of defaults is a byte prefix, and a cut inside the section is refused. It
      failed with the section unread.
 6. **Refusals** — `what_an_analyzer_cannot_mean_is_refused`.
-7. **Gates** — NOT-RUN yet: the M14 sweep follows M13's, which is still running.
+7. **Gates.** `./scripts/gates.sh` on `3196cb4`: all seventeen PASS.
+   - `./scripts/mutants.sh --check . --in-diff` over the source diff `b9030e7..e613bff`,
+     swept in a worktree at `e613bff`. That is M14's source plus M13.2's review fixes
+     (`97cbb7f`), which M13's close said would be swept with M14: 328 mutants, 173 caught, 149 unviable, 6 missed.
+   - Each miss was killed by hand against a test added for it and seen failing:
+     - `describe` returning an empty string, and returning `"xyzzy"`:
+       `an_analyzer_is_fixed_when_its_index_is_created` now names both analyzers;
+     - `prepare`'s `&&` as `||`: `a_patch_never_resurrects_a_row_a_delete_vector_buries`;
+     - `fresh_view`'s `==` as `!=`:
+       `the_fresh_view_follows_an_analyzer_another_process_recorded`;
+     - `declared_fts`'s `+ 0.0` as `- 0.0`: `a_negative_zero_parameter_is_zero`;
+     - `declared_fts`'s tokenizer arm deleted: the named `word_v1` is accepted in
+       `an_analyzer_is_fixed_when_its_index_is_created`.
 
 ## M14.2 — token predicates
 
@@ -77,7 +89,7 @@ first-written tests failed with "unknown operator".
    and with `Not` of unbound answering.
 5. `a_token_predicate_adds_no_round`: filtered depth equals unfiltered, 3 for an ordered
    query. The criterion was amended, because a ranked query is 4 deep with no filter at all.
-6. **Gates** — NOT-RUN yet, as M14.1's line 7.
+6. **Gates** — as M14.1's line 7, which covers both tasks.
 
 Spec review took two rounds: round 1 had seven majors, and round 2 one major (`Not` of
 unbound), which was fixed. Code review took two rounds: round 1 blocked on B1, and round 2
