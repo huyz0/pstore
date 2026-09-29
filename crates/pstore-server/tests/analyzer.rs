@@ -329,6 +329,13 @@ async fn an_analyzer_is_fixed_when_its_index_is_created() {
         Some(json!({"stemming": true, "k1": 1.2, "b": 0.75})),
     )
     .await;
+    // So is the one tokenizer, named.
+    ok_put(
+        a,
+        &[("y", "she ran")],
+        Some(json!({"stemming": true, "tokenizer": "word_v1"})),
+    )
+    .await;
     // Undeclared: accepted, and analyzed with the schema's analyzer.
     ok_put(a, &[("z", "they are running")], None).await;
     fold(a).await;
@@ -490,4 +497,15 @@ async fn a_declaration_superseded_in_its_creating_fold_still_fixes_the_analyzer(
     assert_eq!(ids(a, "running").await, ["2"]);
     // And a later declaration of the same analyzer is no conflict.
     ok_put(a, &[("3", "we ran")], stem).await;
+}
+
+#[tokio::test]
+async fn a_negative_zero_parameter_is_zero() {
+    // Analyzers compare bitwise, so `-0.0` must be stored as `0`, or it would conflict with
+    // the `0` it equals.
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(a, &[("r", "he runs")], Some(json!({"b": 0}))).await;
+    fold(a).await;
+    ok_put(a, &[("s", "she runs")], Some(json!({"b": -0.0}))).await;
 }
