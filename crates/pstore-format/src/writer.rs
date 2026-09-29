@@ -550,15 +550,7 @@ impl SegmentWriter {
         } else {
             let spare = target.saturating_sub(idx.len()).saturating_sub(ENTRY);
             let blocks = self.blocks.len();
-            let mut bits = crate::trigram::MAX_BITS;
-            while bits >= crate::trigram::MIN_BITS
-                && crate::trigram::Sketch::encoded_len(&self.trigram_attrs, blocks, bits) > spare
-            {
-                bits /= 2;
-            }
-            if bits < crate::trigram::MIN_BITS {
-                Vec::new()
-            } else {
+            if let Some(bits) = crate::trigram::Sketch::widest(&self.trigram_attrs, blocks, spare) {
                 let chunks: Vec<&[Document]> = docs.chunks(self.rows_per_block).collect();
                 crate::trigram::Sketch::build(&self.trigram_attrs, blocks, bits, |attr, b| {
                     chunks
@@ -572,6 +564,8 @@ impl SegmentWriter {
                         .collect()
                 })
                 .encode()
+            } else {
+                Vec::new()
             }
         };
         let mut out = self.body;

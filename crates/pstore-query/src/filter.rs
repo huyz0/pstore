@@ -603,6 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn a_regex_requires_its_literal_runs_and_nothing_optional() {
+        let required = |r: &str| {
+            let mut got: Vec<String> = Pattern::new(PatternKind::Regex, r)
+                .unwrap()
+                .required
+                .iter()
+                .map(|t| t.iter().collect())
+                .collect();
+            got.sort();
+            got
+        };
+        // A concatenation's runs; a capture's; a repetition of at least one.
+        assert_eq!(required("abcd.wxyz"), ["ABC", "BCD", "WXY", "XYZ"]);
+        assert_eq!(required("q(abc)q"), ["ABC"]);
+        assert_eq!(required("(abc)+"), ["ABC"]);
+        assert_eq!(required("(abc){2,}"), ["ABC"]);
+        // A repetition that may be empty requires nothing.
+        assert!(required("(abc)*").is_empty());
+        assert!(required("(abc)?").is_empty());
+        assert!(required("x(abc){0,3}y").is_empty());
+    }
+
+    #[test]
+    fn a_bang_negates_a_glob_class_only_first() {
+        let m = |g: &str, s: &str| Pattern::new(PatternKind::Glob, g).unwrap().re.is_match(s);
+        assert!(m("[!a]", "b") && !m("[!a]", "a"));
+        assert!(m("[a!]", "!") && m("[a!]", "a") && !m("[a!]", "b"));
+        assert!(m("[!!]", "a") && !m("[!!]", "!"));
+        assert!(m("[]!]", "!") && m("[]!]", "]"));
+    }
+
+    #[test]
     fn two_patterns_are_equal_by_kind_and_source() {
         let p = |kind| Pattern::new(kind, "a*").unwrap();
         assert_eq!(p(PatternKind::Glob), p(PatternKind::Glob));

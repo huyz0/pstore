@@ -189,3 +189,51 @@ fn a_trigram_sets_the_bits_fnv_1a_names() {
         assert_eq!(set, want, "{value}");
     }
 }
+
+#[test]
+fn the_widest_sketch_that_fits_is_chosen_and_an_exact_fit_fits() {
+    let attrs = vec!["s".to_owned()];
+    let len = |bits| Sketch::encoded_len(&attrs, 3, bits);
+    for bits in [64, 128, 256, 512, 1024, 2048] {
+        assert_eq!(
+            Sketch::widest(&attrs, 3, len(bits)),
+            Some(bits),
+            "exactly {bits}"
+        );
+        assert_eq!(
+            Sketch::widest(&attrs, 3, len(bits) + 1),
+            Some(bits),
+            "{bits} and a byte"
+        );
+    }
+    for bits in [128, 256, 512, 1024, 2048] {
+        assert_eq!(
+            Sketch::widest(&attrs, 3, len(bits) - 1),
+            Some(bits / 2),
+            "under {bits}"
+        );
+    }
+    assert_eq!(Sketch::widest(&attrs, 3, len(64) - 1), None);
+    assert_eq!(Sketch::widest(&attrs, 3, usize::MAX), Some(2048));
+}
+
+#[test]
+fn a_sketch_of_a_width_that_is_no_power_of_two_or_out_of_range_is_refused() {
+    // Lengths kept consistent, so only the width itself can refuse it: 64 bits over three
+    // blocks is 24 bytes, as 96 over two and 192 over one are; 4,096 over one is 512.
+    let bytes = Sketch::build(&["s".to_owned()], 3, 64, |_, _| vec!["abcd".to_owned()]).encode();
+    let with = |bits: u32, blocks: u32, filters: usize| {
+        let mut b = bytes[..9].to_vec();
+        b.extend(bits.to_le_bytes());
+        b.extend(blocks.to_le_bytes());
+        b.extend(vec![0u8; filters]);
+        b
+    };
+    assert!(Sketch::decode(&with(64, 3, 24)).is_ok());
+    for (bits, blocks, filters) in [(96, 2, 24), (192, 1, 24), (4096, 1, 512), (32, 6, 24)] {
+        assert!(
+            Sketch::decode(&with(bits, blocks, filters)).is_err(),
+            "{bits} bits accepted"
+        );
+    }
+}

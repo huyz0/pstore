@@ -126,6 +126,18 @@ impl Sketch {
         4 + names + 4 + 4 + attrs.len() * blocks * (bits / 8) as usize
     }
 
+    /// The widest filters -- a power of two from [`MAX_BITS`] down to [`MIN_BITS`] -- whose
+    /// sketch of `attrs` over `blocks` fits in `spare` bytes, or `None` when even the narrowest
+    /// does not.
+    #[must_use]
+    pub fn widest(attrs: &[String], blocks: usize, spare: usize) -> Option<u32> {
+        let mut bits = MAX_BITS;
+        while bits >= MIN_BITS && Self::encoded_len(attrs, blocks, bits) > spare {
+            bits /= 2;
+        }
+        (bits >= MIN_BITS).then_some(bits)
+    }
+
     /// Its bytes: the names, `bits`, the block count, then each attribute's filters.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -213,11 +225,6 @@ impl Sketch {
     #[must_use]
     pub fn block_count(&self) -> usize {
         self.blocks
-    }
-
-    /// The attributes it has filters for.
-    pub fn attrs(&self) -> impl Iterator<Item = &str> {
-        self.filters.keys().map(String::as_str)
     }
 }
 
