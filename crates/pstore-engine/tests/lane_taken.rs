@@ -444,3 +444,24 @@ async fn another_writers_bundle_where_a_write_is_unresolved_is_lane_taken() {
     // A's row was never durable, and stays A's to read.
     assert!(ids(&a).await.contains(&"a1".to_owned()));
 }
+
+#[tokio::test]
+async fn another_writer_where_a_write_was_found_absent_is_lane_taken() {
+    // A's write at 1 fails before landing, and its read finds nothing there, so A will write 1
+    // again. B takes 1 first. A's attempt meets `Lost`, and B's bytes are not A's.
+    let store = Arc::new(Unreliable::default());
+    let a = Engine::new(Arc::clone(&store), T, LANE);
+    a.write("idx", vec![doc("a0")]).await.unwrap();
+    assert_eq!(a.flush().await.unwrap(), Some(Seq(0)));
+    a.write("idx", vec![doc("a1")]).await.unwrap();
+    store.fail_before.store(true, Ordering::SeqCst);
+    a.flush().await.expect_err("the failed write was reported");
+    let b = Engine::new(Arc::clone(&store), T, LANE);
+    b.write("idx", vec![doc("b1")]).await.unwrap();
+    assert_eq!(b.flush().await.unwrap(), Some(Seq(1)));
+    let err = a.flush().await.expect_err("A took B's bundle for its own");
+    assert!(
+        matches!(err, EngineError::LaneTaken { lane: 1, seq: 1 }),
+        "{err:?}"
+    );
+}
