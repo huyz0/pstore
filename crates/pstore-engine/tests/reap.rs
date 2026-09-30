@@ -223,23 +223,46 @@ async fn records_stay_bounded_when_nothing_reaps() {
     // may only make a commit look younger, never older. Past the cap by a margin.
     let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(187), LaneId(1));
     let mut last = Epoch(0);
+    let mut first = Epoch(0);
     for i in 0..1100 {
         last = commit(&e, &format!("d{i}")).await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        if i == 9 {
-            // Below the cap every commit two seconds apart keeps its own record.
-            assert_eq!(e.reapable_len_for_test(), 10);
+        match i {
+            0 => first = last,
+            // Below the cap every commit two seconds apart keeps its own record, up to the cap
+            // itself.
+            9 => assert_eq!(e.reapable_len_for_test(), 10),
+            1023 => assert_eq!(e.reapable_len_for_test(), 1024),
+            1024 => {
+                // One past the cap thins to the odd positions of 1025: the front, every other
+                // record, and the last.
+                assert_eq!(e.reapable_len_for_test(), 513);
+                // The front survives: exactly the first commit is `age` old.
+                assert_eq!(e.reap_due(Duration::from_secs(2 * 1025)), Some(first));
+            }
+            _ => {}
         }
     }
-    // Thinned past the cap, not emptied.
-    assert!(
-        (512..=1024).contains(&e.reapable_len_for_test()),
-        "{}",
-        e.reapable_len_for_test()
-    );
+    assert_eq!(e.reapable_len_for_test(), 513 + 75);
     assert!(e.reap_due(Duration::from_secs(2)) <= Some(last));
     tokio::time::advance(HOUR).await;
     assert_eq!(e.reap_due(HOUR), Some(last));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_record_takes_the_commits_of_the_second_after_its_first() {
+    // A bucket is anchored at its first commit: a commit under a second after that joins it,
+    // and one exactly a second after starts the next.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(189), LaneId(1));
+    commit(&e, "a").await;
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let joined = commit(&e, "b").await;
+    assert_eq!(e.reapable_len_for_test(), 1);
+    // The bucket took the later epoch.
+    assert_eq!(e.reap_due(Duration::ZERO), Some(joined));
+    tokio::time::advance(Duration::from_millis(500)).await;
+    commit(&e, "c").await;
+    assert_eq!(e.reapable_len_for_test(), 2);
 }
 
 #[tokio::test(start_paused = true)]
