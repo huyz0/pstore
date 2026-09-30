@@ -368,6 +368,13 @@ impl BlobStore for Held {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        // A bundle is created conditionally since M17: the flush's write is held here now.
+        let hold =
+            key.as_str().ends_with(".bundle") && std::mem::take(&mut *self.armed.lock().unwrap());
+        if hold {
+            self.arrived.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        }
         self.inner.put_conditional(key, body, pre).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {

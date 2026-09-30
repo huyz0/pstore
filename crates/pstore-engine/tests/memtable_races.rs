@@ -111,6 +111,10 @@ impl BlobStore for Held {
         if key.as_str().ends_with("/HEAD") {
             self.hold(Hold::Commit).await;
         }
+        // A bundle is created conditionally since M17: the flush's write is held here now.
+        if key.as_str().ends_with(".bundle") {
+            self.hold(Hold::Bundle).await;
+        }
         self.inner.put_conditional(key, body, pre).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {

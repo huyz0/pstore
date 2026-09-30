@@ -57,6 +57,19 @@ pub enum EngineError {
     /// A segment could not be read.
     #[error("format error: {0}")]
     Format(String),
+    /// Another process writes this engine's lane (M17): a bundle was already at the sequence
+    /// this engine would create, or HEAD's watermark for the lane is past it. Nothing was
+    /// written, and every later flush answers the same until the process restarts.
+    #[error(
+        "lane {lane} is written by another process: sequence {seq} is taken; give each \
+         process its own lane (PSTORE_LANE)"
+    )]
+    LaneTaken {
+        /// The lane.
+        lane: u64,
+        /// The sequence this engine would have written.
+        seq: u64,
+    },
     /// A request the engine will not carry out, and why (M16): a client's error.
     #[error("{0}")]
     Refused(String),
@@ -1134,6 +1147,11 @@ pub struct Engine<S> {
     /// a failure of the lower one would leave a gap the tail probe stops at. Cheap to
     /// hold, because the thing it excludes should never happen.
     flushing: tokio::sync::Mutex<()>,
+    /// The highest watermark any HEAD this engine read gave its own lane (M17). Recorded where
+    /// HEAD is read; compared only by the flush, under `flushing`.
+    lane_seen: std::sync::atomic::AtomicU64,
+    /// A bundle write whose outcome is unknown (M17), resolved before anything else is written.
+    uncertain: Mutex<Option<Uncertain>>,
     committed: Mutex<Epoch>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
@@ -1163,6 +1181,18 @@ pub struct Engine<S> {
     /// write no postings. The merged segment would carry every row and no text index, with
     /// nothing reporting an error. `compact` takes the name from its inputs instead.
     text_field: String,
+}
+
+/// A bundle write whose outcome is unknown (M17): the sequence, the exact bytes, and how many
+/// rows of each index it took from the front of `pending`.
+#[derive(Debug, Clone)]
+struct Uncertain {
+    seq: Seq,
+    body: bytes::Bytes,
+    counts: BTreeMap<String, usize>,
+    /// A read found it absent and the watermark below it: the next first attempt goes there,
+    /// and a `Lost` there is compared with these bytes, since the PUT may land late.
+    absent: bool,
 }
 
 /// A lane as this engine resumed it (M9j, BACKLOG row 39).
@@ -1242,6 +1272,8 @@ impl<S: BlobStore> Engine<S> {
             schemas: Mutex::new(None),
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
+            lane_seen: std::sync::atomic::AtomicU64::new(0),
+            uncertain: Mutex::new(None),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
@@ -2195,19 +2227,46 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// `RA = 1 W` for the batch, and for every index in it.
     pub async fn flush(&self) -> Result<Option<Seq>, EngineError> {
-        self.flush_inner(true).await
+        self.flush_inner(true, None::<std::future::Ready<()>>).await
+    }
+
+    /// [`Self::flush`], with `interfere` awaited after the bundle lands and before `next`
+    /// advances (M17), so a test can run a fold in that window.
+    #[doc(hidden)]
+    pub async fn flush_with_interference_for_test(
+        &self,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Option<Seq>, EngineError> {
+        self.flush_inner(true, Some(interfere)).await
     }
 
     /// Flushes **without** the schema check, for a test that needs contradicting rows to be
     /// durable — the state the fold must survive without stopping the tenant.
     #[doc(hidden)]
     pub async fn flush_without_schema_check_for_test(&self) -> Result<Option<Seq>, EngineError> {
-        self.flush_inner(false).await
+        self.flush_inner(false, None::<std::future::Ready<()>>)
+            .await
     }
 
-    async fn flush_inner(&self, check: bool) -> Result<Option<Seq>, EngineError> {
+    async fn flush_inner(
+        &self,
+        check: bool,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Option<Seq>, EngineError> {
         require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
+        // M17: a write whose outcome is unknown is resolved before anything else is written.
+        let record = self.uncertain().clone();
+        let mut landed = None;
+        if let Some(rec) = record.as_ref().filter(|r| !r.absent) {
+            if self.resolve_uncertain(rec).await? {
+                self.landed(rec.seq, &rec.counts, rec.body.len() as u64);
+                *self.uncertain() = None;
+                landed = Some(rec.seq);
+            } else if let Some(r) = self.uncertain().as_mut() {
+                r.absent = true;
+            }
+        }
         // ⚠️ A SNAPSHOT, not a take (M9c.1, row 35): the rows stay in `pending`, visible,
         // while their bundle is written, and move only once it has landed. Writes arriving
         // meanwhile append behind them; flushes are serialized by `flushing`, so the rows this
@@ -2215,7 +2274,7 @@ impl<S: BlobStore> Engine<S> {
         let pending = {
             let m = self.mem();
             if m.pending.is_empty() {
-                return Ok(None);
+                return Ok(landed);
             }
             m.pending.clone()
         };
@@ -2248,15 +2307,113 @@ impl<S: BlobStore> Engine<S> {
             Some(l) => l.next,
             None => self.resume(watermark).await?,
         };
+        // ⚠️ **Decided here, under the flush lock, and never where HEAD is read** (M17, spec
+        // review N1): a fold may commit a watermark past the bundle this flush writes before
+        // the flush has advanced `next`, so the same comparison made in `prune_to` would mark
+        // a lane taken that nothing else writes. Here every bundle this engine wrote is below
+        // `next`, so a watermark past it is another process's.
+        if self.lane_seen.load(std::sync::atomic::Ordering::SeqCst) > seq.0 {
+            return Err(self.taken(seq));
+        }
         // The one PUT. ⚠️ **On failure the sequence is not consumed, and this is load-bearing**
         // (OQ-91). A lane is recovered by probing forward from the last watermark until a key is
         // missing, so a lane must be DENSE: the first absent sequence is taken as the end.
         // Burning a number on a failed write punches a permanent hole, and every bundle after
         // it -- all acknowledged, all durable -- becomes invisible to every future reader. Found
         // by the OQ-91 scenario losing two acknowledged rows on seed 0, not by reading this code.
-        let body = bundle::encode(&pending);
-        let size = body.len() as u64;
-        self.store.put(&self.lane_key(seq), body.into()).await?;
+        //
+        // ⚠️ **Created, never replaced** (M17): an unconditional PUT let a second process on
+        // this lane overwrite a bundle whose rows were acknowledged as durable.
+        let body = bytes::Bytes::from(bundle::encode(&pending));
+        let counts: BTreeMap<String, usize> =
+            pending.iter().map(|(i, d)| (i.clone(), d.len())).collect();
+        let key = self.lane_key(seq);
+        match self
+            .store
+            .put_conditional(&key, body.clone(), pstore_blob::Precondition::NotExists)
+            .await
+        {
+            Ok(_) => {}
+            Err(pstore_blob::CasError::Contended) => return Err(EngineError::Contended),
+            // Never attempted here, so another process wrote it -- unless an earlier attempt
+            // at this sequence timed out and landed late (spec review N3): then its bytes say.
+            Err(pstore_blob::CasError::Lost) => {
+                let late = record.filter(|r| r.absent && r.seq == seq);
+                if let Some(rec) = late
+                    && self.store.get(&key).await? == rec.body
+                {
+                    self.landed(rec.seq, &rec.counts, rec.body.len() as u64);
+                    *self.uncertain() = None;
+                    return Ok(Some(seq));
+                }
+                return Err(self.taken(seq));
+            }
+            // It may have landed. The record is kept until a read says, so nothing is written
+            // over it; a read that fails too leaves it for the next flush.
+            Err(pstore_blob::CasError::Io(e)) => {
+                let rec = Uncertain {
+                    seq,
+                    body,
+                    counts,
+                    absent: false,
+                };
+                *self.uncertain() = Some(rec.clone());
+                if self.resolve_uncertain(&rec).await? {
+                    self.landed(seq, &rec.counts, rec.body.len() as u64);
+                    *self.uncertain() = None;
+                    return Ok(Some(seq));
+                }
+                // Nothing landed. At most one first attempt per flush: this one fails.
+                if let Some(r) = self.uncertain().as_mut() {
+                    r.absent = true;
+                }
+                return Err(EngineError::Blob(e));
+            }
+        }
+        *self.uncertain() = None;
+        if let Some(f) = interfere {
+            f.await;
+        }
+        self.landed(seq, &counts, body.len() as u64);
+        Ok(Some(seq))
+    }
+
+    /// The uncertain-write record (M17).
+    fn uncertain(&self) -> std::sync::MutexGuard<'_, Option<Uncertain>> {
+        self.uncertain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether an uncertain write landed (M17): its bundle byte-for-byte, or -- when absent --
+    /// `false` if HEAD's watermark for this lane is not past it. Anything else is another
+    /// process's: another bundle there, or one folded and reaped, whose it was unknowable.
+    async fn resolve_uncertain(&self, rec: &Uncertain) -> Result<bool, EngineError> {
+        match self.store.get(&self.lane_key(rec.seq)).await {
+            Ok(bytes) if bytes == rec.body => Ok(true),
+            Ok(_) => Err(self.taken(rec.seq)),
+            Err(pstore_blob::BlobError::NotFound(_)) => {
+                let at = head::read(&*self.store, self.tenant).await?;
+                if self.watermark(&at.head) > rec.seq.0 {
+                    Err(self.taken(rec.seq))
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn taken(&self, seq: Seq) -> EngineError {
+        EngineError::LaneTaken {
+            lane: self.lane.0,
+            seq: seq.0,
+        }
+    }
+
+    /// A bundle at `seq` holding the first `counts` rows of each index's `pending` has landed:
+    /// the sequence is taken, and the rows move to `durable`.
+    fn landed(&self, seq: Seq, counts: &BTreeMap<String, usize>, size: u64) {
         {
             let mut s = self
                 .seq
@@ -2271,12 +2428,9 @@ impl<S: BlobStore> Engine<S> {
         // the same order, so a cached fresh segment built before the move is still exact.
         let mut m = self.mem();
         let mut batch: BTreeMap<String, Vec<Document>> = BTreeMap::new();
-        for (idx, docs) in &pending {
+        for (idx, n) in counts {
             if let Some(rows) = m.pending.get_mut(idx) {
-                batch.insert(
-                    idx.clone(),
-                    rows.drain(..docs.len().min(rows.len())).collect(),
-                );
+                batch.insert(idx.clone(), rows.drain(..(*n).min(rows.len())).collect());
                 if rows.is_empty() {
                     m.pending.remove(idx);
                 }
@@ -2290,7 +2444,6 @@ impl<S: BlobStore> Engine<S> {
         // where the rows are in `pending` AND a segment -- a query returns them twice. Residual.
         m.durable.push((seq.0, batch));
         m.stamps.insert(seq.0, (tokio::time::Instant::now(), size));
-        Ok(Some(seq))
     }
 
     /// Replays **every lane's** unfolded WAL bundles into segments and commits them.
@@ -2824,6 +2977,11 @@ impl<S: BlobStore> Engine<S> {
                         let mut m = self.mem();
                         m.pending.remove(x);
                         m.generation += 1;
+                        // M17: an uncertain write's rows of it are gone too, so resolving it
+                        // must not drain the index's newer rows in their place.
+                        if let Some(r) = self.uncertain().as_mut() {
+                            r.counts.remove(x);
+                        }
                     }
                     // A fold that recorded a schema is the moment this process learns it, so
                     // the door refuses against the committed state rather than the one read
@@ -4023,8 +4181,13 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// How far HEAD has folded this engine's own lane.
+    /// This lane's watermark in `head` -- and, since every path that prunes or resumes asks this,
+    /// the one place a HEAD read records it for the flush's lane check (M17).
     fn watermark(&self, head: &Head) -> u64 {
-        head.watermarks.get(&self.lane.0).copied().unwrap_or(0)
+        let w = head.watermarks.get(&self.lane.0).copied().unwrap_or(0);
+        self.lane_seen
+            .fetch_max(w, std::sync::atomic::Ordering::SeqCst);
+        w
     }
 
     /// The same query, against the manifest as it stood at `epoch`.

@@ -121,7 +121,12 @@ impl BlobStore for Switch {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
-        self.inner.put_conditional(key, body, pre).await
+        // A bundle is created conditionally since M17, so its write is held here too.
+        let out = self.inner.put_conditional(key, body, pre).await;
+        if key.as_str().ends_with(".bundle") {
+            self.maybe_hold(key).await;
+        }
+        out
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
         self.inner.delete_batch(keys).await

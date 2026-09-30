@@ -54,9 +54,10 @@ exists, it is resolved before anything else is written, under the flush lock:
 - The API's first flush after a lost acknowledgement therefore succeeds. A client never sees
   one unless the read that resolves it also fails.
 
-**Any HEAD read also informs the lane check.** Every HEAD this engine reads is already
-passed to `prune_to`, and `prune_to` now also records the highest watermark it has seen for
-this lane. It decides nothing itself: a fold can commit a watermark past a bundle this engine
+**Any HEAD read also informs the lane check.** Every path that reads HEAD already asks it
+for this lane's watermark, to prune or to resume. The approved spec said `prune_to`, which
+`scan` skips. Asking now also records the highest watermark seen for this lane. That
+records nothing more and decides nothing: a fold can commit a watermark past a bundle this engine
 wrote before the flush that wrote it has advanced `next`.
 
 The check runs at the start of `flush_inner`, under the flush lock, after any record is
@@ -120,7 +121,7 @@ success path's cost; `batched` writes, which were never promised to survive a pr
 | 6 | the rows are taken as landed | the watermark check removed |
 | 7 | `Contended` is not produced | `Contended` read as `Lost` or as `Io` |
 | 8 | no `lane_taken` code | the mapping dropped |
-| 9 | the lane is marked taken | the check made in `prune_to`, or before the lane has resumed |
+| 9 | the lane is marked taken | the check made where HEAD is read, or before the lane has resumed |
 | 10 | as 1 | a read on the success path, or on `Lost` |
 
 Every existing test of lanes, the fold's recovery and OQ-91's scenario passes unchanged.

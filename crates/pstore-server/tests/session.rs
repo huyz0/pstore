@@ -381,6 +381,10 @@ impl BlobStore for Slow {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        // A bundle is created conditionally since M17: the flush's write is slowed here now.
+        if key.as_str().ends_with(".bundle") {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
         self.0.put_conditional(key, body, pre).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {

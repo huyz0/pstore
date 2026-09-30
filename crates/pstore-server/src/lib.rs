@@ -486,6 +486,13 @@ impl From<EngineError> for ApiError {
             // from the message which bound it crossed. Without this arm it is a `500`.
             // M9i.2: a strong read that met another process's unfolded write. Retryable once a
             // fold commits it, which the handler asks for.
+            // M17: an operator's misconfiguration, not the client's -- two processes given
+            // one lane. Loud, and named, so the fix is in the message.
+            EngineError::LaneTaken { .. } => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lane_taken",
+                e.to_string(),
+            ),
             EngineError::NotFolded => Self {
                 retry_after: Some(1),
                 ..Self::new(
