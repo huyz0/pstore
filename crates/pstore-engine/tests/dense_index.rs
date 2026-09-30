@@ -315,3 +315,45 @@ async fn an_over_wide_segment_is_refused_by_the_fold() {
         "the refused fold committed a HEAD anyway"
     );
 }
+
+#[tokio::test]
+async fn gc_reaps_a_segments_centroid_table_with_it() {
+    // GC derives a reaped segment's sidecars rather than listing them; the centroid table is
+    // one, written beside every segment above the exact-scan threshold.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(705);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1)).with_index_params(
+        pstore_index::cluster::Params {
+            target_list_size: 40,
+            exact_scan_threshold: 100,
+            ..pstore_index::cluster::Params::default()
+        },
+    );
+    for batch in 0..2 {
+        e.write("idx", (batch * 200..batch * 200 + 200).map(doc).collect())
+            .await
+            .unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    let merged: Vec<Key> = segments(&store, t, "idx")
+        .await
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    for k in &merged {
+        assert!(
+            store.get(&vec_index::centroid_key(k)).await.is_ok(),
+            "no .cen written"
+        );
+    }
+    e.compact("idx").await.unwrap().unwrap();
+    e.gc(0).await.unwrap();
+    for k in &merged {
+        assert!(
+            store.get(&vec_index::centroid_key(k)).await.is_err(),
+            "{} survived its segment",
+            vec_index::centroid_key(k).as_str()
+        );
+    }
+}

@@ -3387,6 +3387,9 @@ impl<S: BlobStore> Engine<S> {
                 if k.as_str().ends_with(".seg") {
                     batch.push(pstore_format::sparse::dict_key(k));
                     batch.push(pstore_format::text::dict_key(k));
+                    // And the centroid table (code review, M19): every segment above the
+                    // exact-scan threshold has one, and GC reaped none of them.
+                    batch.push(pstore_index::vec_index::centroid_key(k));
                 }
             }
 
