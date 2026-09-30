@@ -118,6 +118,9 @@ struct Unreliable {
     fail_before: Arc<AtomicBool>,
     contend: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    /// Answer the next bundle write `Io` without writing it, and keep it to land later.
+    delay: Arc<AtomicBool>,
+    delayed: Arc<std::sync::Mutex<Option<(Key, Bytes)>>>,
 }
 
 fn is_bundle(key: &Key) -> bool {
@@ -165,6 +168,12 @@ impl BlobStore for Unreliable {
     ) -> Result<PutOutcome, CasError> {
         if is_bundle(key) && self.contend.swap(false, Ordering::SeqCst) {
             return Err(CasError::Contended);
+        }
+        if is_bundle(key) && self.delay.swap(false, Ordering::SeqCst) {
+            *self.delayed.lock().unwrap() = Some((key.clone(), body));
+            return Err(CasError::Io(
+                "timed out; the write is still in flight".to_owned(),
+            ));
         }
         if is_bundle(key) && self.fail_before.swap(false, Ordering::SeqCst) {
             return Err(CasError::Io("refused before writing".to_owned()));
@@ -384,4 +393,28 @@ async fn a_fold_inside_a_flush_is_no_second_writer() {
     ids(&late).await;
     late.write("idx", vec![doc("r3")]).await.unwrap();
     assert_eq!(late.flush().await.unwrap(), Some(Seq(3)));
+}
+
+#[tokio::test]
+async fn a_write_that_lands_late_is_its_own_not_a_second_writer() {
+    // The PUT times out and is still in flight: the resolving read finds nothing, so the flush
+    // fails. Then it lands. The next flush's first attempt there meets `Lost`, and the bytes
+    // say it was this process's own.
+    let store = Arc::new(Unreliable::default());
+    let e = Engine::new(Arc::clone(&store), T, LANE);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    store.delay.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("a timed-out write was reported as landed");
+    let (key, body) = store.delayed.lock().unwrap().take().unwrap();
+    store.inner.put(&key, body).await.unwrap();
+    e.write("idx", vec![doc("r2")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(1)));
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(2)));
+    let fresh = Engine::new(Arc::clone(&store), T, LaneId(9));
+    fresh.fold().await.unwrap();
+    assert_eq!(ids(&fresh).await, ["r0", "r1", "r2"]);
 }
