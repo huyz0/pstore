@@ -67,6 +67,16 @@ request. A first resume needs no check, because it probes forward from the water
 was folded and reaped before this process flushed again, so creating at a free key below
 the watermark would lose rows.
 
+**Amended by code review (round 1):**
+- `LaneTaken` is **sticky**. The refusal records the lane as past its sequence, so a process
+  told once never creates at that key later, even after the other writer's bundle there is
+  folded and reaped.
+- A record keeps **every** attempt at its sequence, with each attempt's bytes and counts,
+  because two attempts can both be in flight and the first can land last.
+- A record found absent is resolved again, with one GET, once a HEAD shows the lane past its
+  sequence: it may have landed late and been folded. `Lost` on a late landing goes through
+  the same resolution, so a bundle folded and reaped by then is judged by the watermark.
+
 **`LaneTaken` is loud and stays loud.** It consumes nothing, and the rows stay pending and
 visible to this process's reads. The API answers **500** with code `lane_taken`, and its
 message names the lane and `PSTORE_LANE`. The operator restarts the process: M9j's resume

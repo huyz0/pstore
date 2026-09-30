@@ -465,3 +465,88 @@ async fn another_writer_where_a_write_was_found_absent_is_lane_taken() {
         "{err:?}"
     );
 }
+
+#[tokio::test]
+async fn a_lane_found_taken_stays_taken_after_the_collision_is_reaped() {
+    // A learns its lane is taken, then only writes. B's bundles are folded and reaped, so A's
+    // key is free again -- and creating there would put A's rows below the watermark, unread.
+    let acct = Accounted::new(MemoryStore::new());
+    let a = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE);
+    let b = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE);
+    a.write("idx", vec![doc("a0")]).await.unwrap();
+    assert_eq!(a.flush().await.unwrap(), Some(Seq(0)));
+    b.write("idx", vec![doc("b1")]).await.unwrap();
+    assert_eq!(b.flush().await.unwrap(), Some(Seq(1)));
+    a.write("idx", vec![doc("a1")]).await.unwrap();
+    assert!(matches!(
+        a.flush().await,
+        Err(EngineError::LaneTaken { seq: 1, .. })
+    ));
+    for id in ["b2", "b3"] {
+        b.write("idx", vec![doc(id)]).await.unwrap();
+        b.flush().await.unwrap();
+    }
+    b.fold().await.unwrap();
+    b.compact("idx").await.unwrap();
+    b.gc(0).await.unwrap();
+    let view = acct.as_tenant(T);
+    assert!(
+        view.get(&bundle_key(T, LANE, Seq(1))).await.is_err(),
+        "not reaped"
+    );
+    let writes = acct.count(T, OpClass::Write);
+    let err = a.flush().await.expect_err("A created below the watermark");
+    assert!(matches!(err, EngineError::LaneTaken { .. }), "{err:?}");
+    assert_eq!(acct.count(T, OpClass::Write), writes, "a PUT was issued");
+}
+
+#[tokio::test]
+async fn the_first_of_two_timed_out_writes_landing_late_is_its_own() {
+    let store = Arc::new(Unreliable::default());
+    let e = Engine::new(Arc::clone(&store), T, LANE);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    // The first attempt at 1 times out in flight; the second fails outright.
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    store.delay.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("a timed-out write was reported as landed");
+    e.write("idx", vec![doc("r2")]).await.unwrap();
+    store.fail_before.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("a failed write was reported as landed");
+    // Then the first lands.
+    let (key, body) = store.delayed.lock().unwrap().take().unwrap();
+    store.inner.put(&key, body).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(1)));
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(2)));
+    let fresh = Engine::new(Arc::clone(&store), T, LaneId(9));
+    fresh.fold().await.unwrap();
+    assert_eq!(ids(&fresh).await, ["r0", "r1", "r2"]);
+}
+
+#[tokio::test]
+async fn a_late_write_folded_before_its_retry_is_its_own() {
+    // The write found absent lands late and is folded; this engine reads that HEAD. One GET
+    // says the bundle is its own, so the watermark past it is no second writer.
+    let store = Arc::new(Unreliable::default());
+    let e = Engine::new(Arc::clone(&store), T, LANE);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    store.delay.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("a timed-out write was reported as landed");
+    let (key, body) = store.delayed.lock().unwrap().take().unwrap();
+    store.inner.put(&key, body).await.unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(9));
+    other.fold().await.unwrap();
+    ids(&e).await;
+    e.write("idx", vec![doc("r2")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(2)));
+    other.fold().await.unwrap();
+    assert_eq!(ids(&other).await, ["r0", "r1", "r2"]);
+}

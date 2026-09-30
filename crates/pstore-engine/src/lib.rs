@@ -1183,20 +1183,27 @@ pub struct Engine<S> {
     text_field: String,
 }
 
-/// A bundle write whose outcome is unknown (M17): the sequence, the exact bytes, and how many
-/// rows of each index it took from the front of `pending`.
+/// A bundle write whose outcome is unknown (M17): its sequence, and every attempt at it --
+/// the exact bytes, and how many rows of each index it took from the front of `pending`.
+///
+/// ⚠️ **Every attempt, not the last** (code review, M17): two attempts at one sequence can both
+/// time out in flight, and the first can land after the second. Its bytes are this process's.
 #[derive(Debug, Clone)]
 struct Uncertain {
     seq: Seq,
-    body: bytes::Bytes,
-    counts: BTreeMap<String, usize>,
-    /// A read found it absent and the watermark below it: the next first attempt goes there,
-    /// and a `Lost` there is compared with these bytes, since the PUT may land late.
+    attempts: Vec<Attempt>,
+    /// A read found it absent and the watermark not past it: the next first attempt goes there,
+    /// and a `Lost` there is resolved against these attempts, since one may land late.
     absent: bool,
 }
 
-/// A lane as this engine resumed it (M9j, BACKLOG row 39).
-///
+/// One write of a bundle (M17).
+#[derive(Debug, Clone)]
+struct Attempt {
+    body: bytes::Bytes,
+    counts: BTreeMap<String, usize>,
+}
+
 /// ⚠️ **A lane outlives the process writing it.** `deploy.md` keeps `PSTORE_LANE` stable
 /// across restarts, so a process starting at sequence 0 overwrote bundles its predecessor
 /// had written -- folded ones, which no fold reads again, and unfolded ones, which destroyed
@@ -2256,11 +2263,14 @@ impl<S: BlobStore> Engine<S> {
         require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
         // M17: a write whose outcome is unknown is resolved before anything else is written.
+        // One found absent is resolved again once a HEAD shows the lane past it (code review,
+        // M17): it may have landed late and been folded, and one GET says whose it was.
         let record = self.uncertain().clone();
         let mut landed = None;
-        if let Some(rec) = record.as_ref().filter(|r| !r.absent) {
-            if self.resolve_uncertain(rec).await? {
-                self.landed(rec.seq, &rec.counts, rec.body.len() as u64);
+        let seen = self.lane_seen.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(rec) = record.as_ref().filter(|r| !r.absent || seen > r.seq.0) {
+            if let Some(a) = self.resolve_uncertain(rec).await? {
+                self.landed(rec.seq, &a.counts, a.body.len() as u64);
                 *self.uncertain() = None;
                 landed = Some(rec.seq);
             } else if let Some(r) = self.uncertain().as_mut() {
@@ -2340,9 +2350,9 @@ impl<S: BlobStore> Engine<S> {
             Err(pstore_blob::CasError::Lost) => {
                 let late = record.filter(|r| r.absent && r.seq == seq);
                 if let Some(rec) = late
-                    && self.store.get(&key).await? == rec.body
+                    && let Some(a) = self.resolve_uncertain(&rec).await?
                 {
-                    self.landed(rec.seq, &rec.counts, rec.body.len() as u64);
+                    self.landed(rec.seq, &a.counts, a.body.len() as u64);
                     *self.uncertain() = None;
                     return Ok(Some(seq));
                 }
@@ -2351,15 +2361,28 @@ impl<S: BlobStore> Engine<S> {
             // It may have landed. The record is kept until a read says, so nothing is written
             // over it; a read that fails too leaves it for the next flush.
             Err(pstore_blob::CasError::Io(e)) => {
-                let rec = Uncertain {
-                    seq,
-                    body,
-                    counts,
-                    absent: false,
+                let rec = {
+                    let mut slot = self.uncertain();
+                    let attempt = Attempt { body, counts };
+                    match slot.as_mut().filter(|r| r.seq == seq) {
+                        Some(r) => {
+                            r.attempts.push(attempt);
+                            r.absent = false;
+                        }
+                        None => {
+                            *slot = Some(Uncertain {
+                                seq,
+                                attempts: vec![attempt],
+                                absent: false,
+                            });
+                        }
+                    }
+                    slot.clone()
                 };
-                *self.uncertain() = Some(rec.clone());
-                if self.resolve_uncertain(&rec).await? {
-                    self.landed(seq, &rec.counts, rec.body.len() as u64);
+                if let Some(rec) = rec
+                    && let Some(a) = self.resolve_uncertain(&rec).await?
+                {
+                    self.landed(seq, &a.counts, a.body.len() as u64);
                     *self.uncertain() = None;
                     return Ok(Some(seq));
                 }
@@ -2385,26 +2408,35 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Whether an uncertain write landed (M17): its bundle byte-for-byte, or -- when absent --
-    /// `false` if HEAD's watermark for this lane is not past it. Anything else is another
-    /// process's: another bundle there, or one folded and reaped, whose it was unknowable.
-    async fn resolve_uncertain(&self, rec: &Uncertain) -> Result<bool, EngineError> {
+    /// Which attempt at an uncertain write landed (M17): the one whose bytes the bundle is --
+    /// or, when it is absent, `None` if HEAD's watermark for this lane is not past it. Anything
+    /// else is another process's: other bytes there, or one folded and reaped, whose it was
+    /// unknowable.
+    async fn resolve_uncertain(&self, rec: &Uncertain) -> Result<Option<Attempt>, EngineError> {
         match self.store.get(&self.lane_key(rec.seq)).await {
-            Ok(bytes) if bytes == rec.body => Ok(true),
-            Ok(_) => Err(self.taken(rec.seq)),
+            Ok(bytes) => match rec.attempts.iter().find(|a| a.body == bytes) {
+                Some(a) => Ok(Some(a.clone())),
+                None => Err(self.taken(rec.seq)),
+            },
             Err(pstore_blob::BlobError::NotFound(_)) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 if self.watermark(&at.head) > rec.seq.0 {
                     Err(self.taken(rec.seq))
                 } else {
-                    Ok(false)
+                    Ok(None)
                 }
             }
             Err(e) => Err(e.into()),
         }
     }
 
+    /// `LaneTaken` at `seq` -- and **sticky** (code review, M17): the lane is recorded as past
+    /// `seq`, so every later flush refuses without a request. Otherwise, once the other
+    /// writer's bundle there is folded and reaped, a flush would create at the free key below
+    /// the watermark, and its rows would never be folded.
     fn taken(&self, seq: Seq) -> EngineError {
+        self.lane_seen
+            .fetch_max(seq.0 + 1, std::sync::atomic::Ordering::SeqCst);
         EngineError::LaneTaken {
             lane: self.lane.0,
             seq: seq.0,
@@ -2980,7 +3012,9 @@ impl<S: BlobStore> Engine<S> {
                         // M17: an uncertain write's rows of it are gone too, so resolving it
                         // must not drain the index's newer rows in their place.
                         if let Some(r) = self.uncertain().as_mut() {
-                            r.counts.remove(x);
+                            for a in &mut r.attempts {
+                                a.counts.remove(x);
+                            }
                         }
                     }
                     // A fold that recorded a schema is the moment this process learns it, so
