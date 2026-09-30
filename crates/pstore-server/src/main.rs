@@ -92,7 +92,7 @@ async fn run<S: BlobStore + 'static>(
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    match serve_folding(api, listener, shutdown, config.fold).await {
+    match serve_folding(api, listener, shutdown, config.fold, config.gc).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("pstore-server: {e}");

@@ -56,12 +56,17 @@ a bundle, so another process simply does not see the write yet.
 bundles until some process writes that tenant again or you call `POST /v1/admin/fold` for it.
 A fold is tenant-wide, so any live writer of the tenant folds a dead writer's bundles too.
 
-### `reap` — nothing collects garbage on a timer
+### `reap` — a scheduled reap runs, for the tenants each server committed to
 
-Call `POST /v1/admin/gc` on a schedule. Segments buried by a fold or a compaction are kept —
-and billed — until something asks for them to be removed. ⚠️ The reap is also what bounds time
-travel: a query before the reap horizon is refused rather than answered wrongly, so how often
-you reap **is** your retention policy.
+Each server reaps, on its own, every tenant it committed to once that commit is an hour old
+([M18](milestones/M18/SPEC.md); `PSTORE_GC_*` below). It reaps through the highest epoch it
+committed that long ago, so anything a reader of the last hour could still need is kept.
+⚠️ The reap is also what bounds time travel: a query before the reap horizon is refused rather
+than answered wrongly, so `PSTORE_GC_AGE_S` **is** your retention policy.
+
+⚠️ **What is still yours:** a process remembers only the commits it made since it started. A
+tenant nothing commits to after a restart keeps its buried segments, billed, until something
+commits there again or you call `POST /v1/admin/gc` for it.
 
 ### `tls` — the server speaks HTTP in the clear
 
@@ -91,6 +96,9 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_FOLD_PERIOD_MS` | `1000` | How often the fold loop looks. Looking costs no request. |
 | `PSTORE_FOLD_AGE_S` | `3600` | A tenant is folded once its oldest unfolded write is this old. Shorter means faster visibility to other processes, and more folds: D-39 prices it. |
 | `PSTORE_FOLD_BYTES` | `1048576` | ...or once its unfolded bundles total this many bytes. |
+| `PSTORE_GC` | on | Exactly `off` disables the scheduled reap; anything else is refused. |
+| `PSTORE_GC_PERIOD_MS` | `1000` | How often the reap loop looks. Looking costs no request. |
+| `PSTORE_GC_AGE_S` | `3600` | How long a buried object is kept, and so how far back `as_of` reaches. Below an hour, a `bounded` read's cached HEAD can name a reaped object; the read retries fresh, at the cost of a request. |
 
 ## Observability
 

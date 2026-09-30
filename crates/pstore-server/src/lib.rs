@@ -51,8 +51,9 @@ pub const UNSCHEDULED: [Duty; 4] = [
     },
     Duty {
         id: "reap",
-        instead: "call POST /v1/admin/gc on a schedule; buried segments are kept until \
-                  something asks for them to be removed, and they are billed meanwhile",
+        instead: "a scheduled reap runs inside each server (M18), for the tenants that server \
+                  committed to; a tenant nothing commits to after a restart keeps its buried \
+                  objects until something does, or until someone calls POST /v1/admin/gc",
     },
     Duty {
         id: "tls",
@@ -110,6 +111,9 @@ pub struct Api<S> {
     backoff: Mutex<HashMap<TenantId, (tokio::time::Instant, std::time::Duration)>>,
     /// Tenants a refused `strong` read asked a fold of (M9i.2). A set: many refusals, one fold.
     requested: Mutex<std::collections::HashSet<TenantId>>,
+    /// Per tenant, when its next scheduled reap may run after a failure, and the delay that
+    /// set it (M18).
+    reap_backoff: Mutex<HashMap<TenantId, (tokio::time::Instant, std::time::Duration)>>,
 }
 
 /// When a scheduled fold runs (M9i.1): D-39's triggers, size or age, never a fixed timer.
@@ -150,6 +154,40 @@ pub struct FoldTick {
 /// Folds at once, at most, per tick.
 const FOLD_CONCURRENCY: usize = 4;
 
+/// When a scheduled reap runs (M18): a tenant is due once a commit this process made there is
+/// `age` old, and it is reaped through the highest such epoch. Decided from memory, never by
+/// reading HEAD, so an idle tenant costs no request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcPolicy {
+    /// How often the loop looks. Looking costs no request.
+    pub period: std::time::Duration,
+    /// How long a buried object is kept: `compaction.md`'s retention window.
+    pub age: std::time::Duration,
+}
+
+impl Default for GcPolicy {
+    /// `compaction.md`'s window: about an hour.
+    fn default() -> Self {
+        Self {
+            period: std::time::Duration::from_secs(1),
+            age: std::time::Duration::from_secs(3600),
+        }
+    }
+}
+
+/// What one [`Api::reap_due`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReapTick {
+    /// Tenants reaped, whether or not the reap found anything.
+    pub reaped: usize,
+    /// Objects those reaps deleted.
+    pub objects: usize,
+    /// Tenants whose reap failed; each now backs off, and keeps what made it due.
+    pub failed: usize,
+    /// Due tenants skipped because they are still backing off.
+    pub deferred: usize,
+}
+
 /// Per-route and per-refusal counters. ⚠️ **No tenant dimension**: 1M tenants × four request
 /// classes is four million series, which is how a metrics endpoint takes down the thing it
 /// observes. A tenant's own numbers go to that tenant, in every response it gets.
@@ -189,6 +227,7 @@ impl<S: BlobStore + 'static> Api<S> {
             http: Mutex::new(Http::default()),
             backoff: Mutex::new(HashMap::new()),
             requested: Mutex::new(std::collections::HashSet::new()),
+            reap_backoff: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -221,6 +260,85 @@ impl<S: BlobStore + 'static> Api<S> {
     pub async fn fold_due(&self, policy: &FoldPolicy) -> FoldTick {
         self.fold_tick(policy, &std::sync::atomic::AtomicBool::new(false))
             .await
+    }
+
+    /// Reaps every tenant a scheduled reap is due for (M18): one whose engine committed something
+    /// at least `policy.age` ago, through the highest such epoch.
+    ///
+    /// ⚠️ **Decided from memory**, as [`Self::fold_due`] is: a tenant this process has committed
+    /// nothing to, or nothing old enough, costs no request. A failed reap backs off, doubling
+    /// from `period` up to `age`, and keeps the records that made it due.
+    pub async fn reap_due(&self, policy: &GcPolicy) -> ReapTick {
+        self.reap_tick(policy, &std::sync::atomic::AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::reap_due`], starting no tenant's reap once `halt` is set.
+    async fn reap_tick(&self, policy: &GcPolicy, halt: &std::sync::atomic::AtomicBool) -> ReapTick {
+        use futures_util::StreamExt;
+        let engines: Vec<(TenantId, Arc<Engine<TenantView<S>>>)> = self
+            .engines
+            .lock()
+            .await
+            .iter()
+            .map(|(t, e)| (*t, Arc::clone(e)))
+            .collect();
+        let now = tokio::time::Instant::now();
+        let mut tick = ReapTick::default();
+        let mut due = Vec::new();
+        for (tenant, engine) in engines {
+            let Some(horizon) = engine.reap_due(policy.age) else {
+                continue;
+            };
+            let waiting = self
+                .reap_backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&tenant)
+                .is_some_and(|(until, _)| now < *until);
+            if waiting {
+                tick.deferred += 1;
+                continue;
+            }
+            due.push((tenant, engine, horizon));
+        }
+        let results: Vec<_> = futures_util::stream::iter(due)
+            .map(|(tenant, engine, horizon)| async move {
+                if halt.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                Some((tenant, engine.gc_through(horizon).await))
+            })
+            .buffer_unordered(FOLD_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        let mut backoff = self
+            .reap_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (tenant, outcome) in results {
+            match outcome {
+                Ok(n) => {
+                    backoff.remove(&tenant);
+                    tick.reaped += 1;
+                    tick.objects += n;
+                }
+                Err(_) => {
+                    tick.failed += 1;
+                    let delay = backoff
+                        .get(&tenant)
+                        .map_or(policy.period, |(_, d)| d.saturating_mul(2))
+                        .min(policy.age);
+                    let now = tokio::time::Instant::now();
+                    let until = now
+                        .checked_add(delay)
+                        .unwrap_or_else(|| now + std::time::Duration::from_secs(10 * 365 * 86_400));
+                    backoff.insert(tenant, (until, delay));
+                }
+            }
+        }
+        tick
     }
 
     /// [`Self::fold_due`], starting no tenant's fold once `halt` is set: the ones already in
@@ -2619,6 +2737,8 @@ pub struct Config {
     pub credentials: Option<(String, String)>,
     /// The scheduled fold's policy, or `None` when `PSTORE_FOLD=off` (M9i.1).
     pub fold: Option<FoldPolicy>,
+    /// The scheduled reap's policy, or `None` when `PSTORE_GC=off` (M18).
+    pub gc: Option<GcPolicy>,
 }
 
 /// Where a server keeps its data.
@@ -2749,6 +2869,7 @@ impl Config {
             bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
             fold: fold_policy(&get)?,
+            gc: gc_policy(&get)?,
         })
     }
 }
@@ -2788,6 +2909,38 @@ fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolic
     Ok(on.then_some(policy))
 }
 
+/// The scheduled reap's policy from `PSTORE_GC`, `PSTORE_GC_PERIOD_MS` and `PSTORE_GC_AGE_S`
+/// (M18), refused by name as the fold's are -- and validated even when `off`.
+fn gc_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<GcPolicy>, ConfigError> {
+    let on = match get("PSTORE_GC").as_deref() {
+        None => true,
+        Some("off") => false,
+        Some(other) => {
+            return Err(ConfigError::Fold(
+                "PSTORE_GC",
+                other.to_owned(),
+                "unset, or off to leave reaping to the operator",
+            ));
+        }
+    };
+    let positive = |var: &'static str| -> Result<Option<u64>, ConfigError> {
+        get(var)
+            .map(|v| {
+                v.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(ConfigError::Fold(var, v, "a positive integer"))
+            })
+            .transpose()
+    };
+    let d = GcPolicy::default();
+    let policy = GcPolicy {
+        period: positive("PSTORE_GC_PERIOD_MS")?.map_or(d.period, std::time::Duration::from_millis),
+        age: positive("PSTORE_GC_AGE_S")?.map_or(d.age, std::time::Duration::from_secs),
+    };
+    Ok(on.then_some(policy))
+}
+
 /// Runs [`Api::fold_due`] every `policy.period` until `stop` resolves (M9i.1).
 ///
 /// ⚠️ **Ticks never overlap**: a tick is awaited, then the loop sleeps. When `stop` resolves
@@ -2818,8 +2971,37 @@ pub async fn run_folds<S: BlobStore + 'static>(
     }
 }
 
-/// [`serve`], with the scheduled fold running beside it when `fold` is set (M9i.1). One
-/// signal stops both, and the fold loop has returned before this does.
+/// Runs [`Api::reap_due`] every `policy.period` until `stop` resolves (M18), as [`run_folds`]
+/// runs folds: ticks never overlap, and a stop mid-tick starts no further reap and awaits those
+/// in flight, each of which commits by CAS or not at all.
+pub async fn run_reaps<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    policy: GcPolicy,
+    stop: impl std::future::Future<Output = ()> + Send,
+) {
+    let halt = std::sync::atomic::AtomicBool::new(false);
+    tokio::pin!(stop);
+    loop {
+        let tick = api.reap_tick(&policy, &halt);
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut stop => {
+                halt.store(true, std::sync::atomic::Ordering::SeqCst);
+                tick.await;
+                return;
+            }
+            _ = &mut tick => {}
+        }
+        tokio::select! {
+            () = &mut stop => return,
+            () = tokio::time::sleep(policy.period) => {}
+        }
+    }
+}
+
+/// [`serve`], with the scheduled fold running beside it when `fold` is set (M9i.1), and the
+/// scheduled reap when `gc` is (M18). One signal stops all three, and both loops have returned
+/// before this does.
 ///
 /// # Errors
 /// If the server stops with an I/O error.
@@ -2828,12 +3010,19 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     fold: Option<FoldPolicy>,
+    gc: Option<GcPolicy>,
 ) -> std::io::Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let tx = Arc::new(tx);
     let folds = fold.map(|policy| {
         let mut rx = rx.clone();
         tokio::spawn(run_folds(Arc::clone(&api), policy, async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+        }))
+    });
+    let reaps = gc.map(|policy| {
+        let mut rx = rx.clone();
+        tokio::spawn(run_reaps(Arc::clone(&api), policy, async move {
             let _ = rx.wait_for(|stopped| *stopped).await;
         }))
     });
@@ -2847,6 +3036,9 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     let _ = tx.send(true);
     if let Some(folds) = folds {
         let _ = folds.await;
+    }
+    if let Some(reaps) = reaps {
+        let _ = reaps.await;
     }
     served
 }

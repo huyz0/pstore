@@ -55,6 +55,10 @@ objects for about an hour, then delete them.
   - `PSTORE_GC_AGE_S` and `PSTORE_GC_PERIOD_MS` set the policy. Anything that is not a
     positive integer is refused by name, as `PSTORE_FOLD_*` values are.
 
+**What the operator is told** (added at implementation): the `reap` duty in
+`UNSCHEDULED`, and `deploy.md`'s section on it, now describe the scheduled reap and what
+stays theirs. `deploy.md`'s environment table gains the three `PSTORE_GC*` variables.
+
 **Does not change:** what `gc` deletes, or when it refuses; the graveyard's format; the admin
 endpoint; any request made by a write or a query.
 

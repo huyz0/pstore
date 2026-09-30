@@ -1152,6 +1152,9 @@ pub struct Engine<S> {
     lane_seen: std::sync::atomic::AtomicU64,
     /// A bundle write whose outcome is unknown (M17), resolved before anything else is written.
     uncertain: Mutex<Option<Uncertain>>,
+    /// Each commit this engine made, and when (M18): what a scheduled reap may take once it is
+    /// old enough. Never a reap's own commit.
+    reapable: Mutex<Vec<(tokio::time::Instant, Epoch)>>,
     committed: Mutex<Epoch>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
@@ -1283,6 +1286,7 @@ impl<S: BlobStore> Engine<S> {
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             uncertain: Mutex::new(None),
+            reapable: Mutex::new(Vec::new()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
@@ -2677,6 +2681,7 @@ impl<S: BlobStore> Engine<S> {
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
+                    self.record_reapable(epoch);
                     return Ok(epoch);
                 }
                 Err(EngineError::Lost | EngineError::Contended)
@@ -3030,6 +3035,7 @@ impl<S: BlobStore> Engine<S> {
                     // lane was probed has a sequence at or past the new watermark and stays.
                     self.mem().prune(self.watermark(&next));
                     self.record_commit(epoch);
+                    self.record_reapable(epoch);
                     return Ok(Folded::Committed(epoch));
                 }
                 Err(EngineError::Lost | EngineError::Contended)
@@ -3169,6 +3175,47 @@ impl<S: BlobStore> Engine<S> {
             .await
     }
 
+    /// The highest epoch this engine committed at least `age` ago (M18): what a scheduled reap
+    /// may reap through. **Reads only memory**, so an idle tenant costs no request.
+    ///
+    /// ⚠️ Safe by time, not by epoch count: epochs are totally ordered in time, so every HEAD at
+    /// or below it was committed at least `age` ago, and a reader still holding one has been
+    /// reading for longer than `age`.
+    #[must_use]
+    pub fn reap_due(&self, age: std::time::Duration) -> Option<Epoch> {
+        let now = tokio::time::Instant::now();
+        self.reapable()
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) >= age)
+            .map(|(_, e)| *e)
+            .max()
+    }
+
+    /// Reaps graveyard entries buried at or below `horizon` (M18), and then forgets the commits
+    /// that made them due -- **whether or not it found any**: a record kept after a reap with
+    /// nothing to do would make every tick read HEAD forever.
+    ///
+    /// # Errors
+    /// As [`Self::gc`].
+    pub async fn gc_through(&self, horizon: Epoch) -> Result<usize, EngineError> {
+        let reaped = self.gc_inner(|_| horizon.0).await?;
+        self.reapable().retain(|(_, e)| *e > horizon);
+        Ok(reaped)
+    }
+
+    fn reapable(&self) -> std::sync::MutexGuard<'_, Vec<(tokio::time::Instant, Epoch)>> {
+        self.reapable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records a commit a scheduled reap may later take (M18). ⚠️ Called **after** the CAS
+    /// returns, so a slow commit only looks younger -- and never for a reap's own commit, or
+    /// each reap would make the next one due.
+    fn record_reapable(&self, epoch: Epoch) {
+        self.reapable().push((tokio::time::Instant::now(), epoch));
+    }
+
     /// Reaps objects dereferenced more than `retention` epochs ago.
     ///
     /// **Zero LIST.** GC works from the manifest's graveyard, which records each key at
@@ -3179,16 +3226,23 @@ impl<S: BlobStore> Engine<S> {
     /// `retention` is a number of epochs, not a duration. A reader that read HEAD at
     /// epoch *e* may take arbitrarily long to finish scanning, so what protects it is not
     /// elapsed time but the guarantee that nothing referenced at *e* is reaped until the
-    /// tenant has committed `retention` further epochs.
+    /// tenant has committed `retention` further epochs. The scheduled reap (M18) takes the
+    /// other form, a duration: [`Self::gc_through`] the epoch [`Self::reap_due`] names.
     ///
     /// Returns how many objects were reaped.
     pub async fn gc(&self, retention: u64) -> Result<usize, EngineError> {
+        self.gc_inner(|epoch| epoch.saturating_sub(retention)).await
+    }
+
+    /// `gc`'s body, with the horizon a function of each attempt's HEAD epoch (M18), so neither
+    /// form reads HEAD twice.
+    async fn gc_inner(&self, horizon_of: impl Fn(u64) -> u64) -> Result<usize, EngineError> {
         require_fencing(&*self.store)?;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
             // Everything dereferenced at an epoch this old is beyond the reach of any
             // reader the window promises to protect.
-            let horizon = at.head.epoch.0.saturating_sub(retention);
+            let horizon = horizon_of(at.head.epoch.0).min(at.head.epoch.0);
             let due: Vec<u64> = at
                 .head
                 .graveyard
@@ -3571,6 +3625,7 @@ impl<S: BlobStore> Engine<S> {
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
+                    self.record_reapable(epoch);
                     return Ok(Some(epoch));
                 }
                 Err(e @ (EngineError::Lost | EngineError::Contended))
