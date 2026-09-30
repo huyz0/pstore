@@ -68,7 +68,9 @@ added later was seen failing first, as noted below.
       Before that, the fifteen mutations in M17's test plan were run by hand, and each fails a
       test. One more, clearing the record after a successful write, is equivalent: a record left
       behind names a sequence this process has already written.
-    - `./scripts/gates.sh` — NOT-RUN yet: it runs at M19's close, over all three.
+    - The combined sweep: `./scripts/mutants.sh --check . --in-diff` over the source diff `dafd60f..f52bf9a` (M17's remainder, M18 and M19), in a worktree at `f52bf9a`, in four shards: 83 mutants, 54 caught, 10 unviable, 19 missed. None of the misses is in M17's code; M18's and M19's
+      ledgers account for them.
+    - `./scripts/gates.sh` passed, all 17 gates, at `1e580e4`: the source swept, plus the tests that kill the misses.
 
 Spec review took two rounds. Code review took three: round 1 blocked on two majors (the
 refusal was not sticky, and the record kept only the last attempt); round 2 passed; round 3
