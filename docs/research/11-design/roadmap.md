@@ -174,8 +174,10 @@ strategy" — known *before* M3 hardens around it.
 | add/remove 50% of the fleet, zero data movement | **met** — `a_fleet_change_copies_nothing` ([M4a](../../milestones/M4a/VERIFIED.md) criterion 7) |
 | a measured, bounded cache dip | **met** — sequential depth 2 → 1 on the first query ([M4d](../../milestones/M4d/VERIFIED.md) criterion 15) |
 
-⚠️ **Not built, and named rather than omitted:** the NVMe cache tier (D-23), so a rolling
-restart still flushes every cache; and the cross-AZ probe mesh (D-82) and blob health bulletin
+⚠️ **Not built, and named rather than omitted:** ~~the NVMe cache tier (D-23), so a rolling
+restart still flushes every cache~~ -- built by [M20](../../milestones/M20/VERIFIED.md) as a
+disk tier on any local directory, measured only on a cloud container (`provisional`); and the
+cross-AZ probe mesh (D-82) and blob health bulletin
 (D-83) as running subsystems — the gray-failure *decisions* ship, their transports need a
 query path and a real multi-AZ deployment.
 

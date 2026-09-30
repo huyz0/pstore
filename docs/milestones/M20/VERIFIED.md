@@ -84,7 +84,23 @@ read_cache`.
     `sealing_one_key_twice_writes_the_same_bytes` (`cargo test -p pstore-engine --test
     abandon`): the twin committed the key ours sealed, and every byte, sidecars included, is
     the same. It passed on the tree as it was, so M20 went ahead.
-15. **Gates** — NOT-RUN yet: the sweep over `56e454c..7adaf8f`'s source is in progress.
+15. **Gates.**
+    - `./scripts/mutants.sh --check . --in-diff` over the source diff `56e454c..7adaf8f`, in
+      a worktree at `7adaf8f`, in four shards: 127 mutants, 72 caught, 34 unviable,
+      6 timeouts, 15 missed.
+      - Seven are killed by tests added after the sweep, each run by hand: `Scanning`'s four
+        pass-through forms (`everything_but_a_classed_read_is_forwarded_unchanged`),
+        `CacheCore`'s `Debug` (`a_core_says_what_its_disk_is_doing`), and the memory split
+        (`the_memory_budget_is_split_a_tenth_a_tenth_and_the_rest`). That last test also
+        fails outright with the two mutants that timed out in `shares`.
+      - The emptying's `NotFound` guard as `true` could not be provoked under root. The guard
+        is gone (`2f69c10`): only directories that exist are deleted, and any error bypasses.
+      - Seven are **equivalent**. `sync_dir` as a no-op makes the emptying durable across a
+        crash, which no test can observe short of one. Six mutants of `estimated_size`:
+        `foyer` uses it only to choose among disk engines, and there is one.
+    - The source changed after that sweep (`7adaf8f..2f69c10`, `disk.rs` and `main.rs`) was
+      swept too: 1 mutant, unviable.
+    - `./scripts/gates.sh` passed, all 17 gates, at `2f69c10`.
 
 Spec review took two rounds: round 1 blocked on three blockers and six majors, and round 2
 approved after a text fix. Code review took two: round 1 blocked on one major (criterion 3's
