@@ -1537,6 +1537,11 @@ impl<S: BlobStore> Engine<S> {
         bundle_key(self.tenant, self.lane, seq)
     }
 
+    /// This engine's store, for a pass that must not fill a read cache (D-50).
+    fn scanning(&self) -> pstore_blob::Scanning<S> {
+        pstore_blob::Scanning::new(Arc::clone(&self.store))
+    }
+
     fn segment_key(&self, epoch: Epoch, index: &str) -> Key {
         Key::new(format!(
             "{:04x}/tnt/{}/idx/{index}/seg/L0/{:020}-{:016x}.seg",
@@ -3176,7 +3181,7 @@ impl<S: BlobStore> Engine<S> {
                 let rows: Vec<(usize, Document)> = if let Some(keep) = keep {
                     let mut rows = Vec::new();
                     for (row, d) in seg
-                        .scan(&*self.store, &key, None)
+                        .scan(&self.scanning(), &key, None)
                         .await?
                         .into_iter()
                         .enumerate()
@@ -3196,7 +3201,7 @@ impl<S: BlobStore> Engine<S> {
                     }
                     rows
                 } else {
-                    seg.rows_where(&*self.store, &key, |_| true).await?
+                    seg.rows_where(&self.scanning(), &key, |_| true).await?
                 };
                 Ok::<_, EngineError>(Prepared {
                     key: dv,
@@ -3526,11 +3531,11 @@ impl<S: BlobStore> Engine<S> {
         filter: Option<&Filter>,
     ) -> Result<Vec<Document>, EngineError> {
         let Some((dv, _)) = vector else {
-            return Ok(seg.scan(&*self.store, key, filter).await?);
+            return Ok(seg.scan(&self.scanning(), key, filter).await?);
         };
         let (raw, rows) = futures_util::future::join(
             self.store.get(&Key::new(dv.clone())),
-            seg.rows_where(&*self.store, key, |zones| {
+            seg.rows_where(&self.scanning(), key, |zones| {
                 filter.is_none_or(|f| {
                     // The legacy filter matches structurally: only int rows, which the int
                     // zone covers whole.

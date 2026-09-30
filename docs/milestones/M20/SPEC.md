@@ -120,8 +120,13 @@ updated to match.
 9. **Scans do not admit, and do hit.**
    - A cold compaction, and a cold `Engine::scan`, leave the bulk arena's memory and disk
      entries unchanged. A query admits.
-   - After a query has warmed a segment's blocks, a compaction reading those blocks costs no
-     range read for them.
+   - A `Scan` read of a range a bulk read admitted costs no request, from memory and from
+     disk, and a `Scan` hit on disk is not promoted.
+   - ⚠️ **Amended at implementation.** This bullet first said a compaction is served what a
+     query warmed. The cache keys by the exact range requested, and today a query reads a
+     segment's data section whole (`0..4110`) while a scan reads it block by block
+     (`0..826, 826..1690, …`). So no engine path shares a range between the two, and that
+     test could not pass. What is checkable is that a `Scan` lookup probes bulk.
 10. **Reopening is bounded.** A full 256 MiB tier reopens in under 1 s here, measured by
     `a_full_tier_reopens_within_a_second`. That test is `#[ignore]`d, because wall-clock time is
     not deterministic and a mutation sweep would rerun it. It is run by hand with

@@ -122,7 +122,7 @@ impl Tiers {
         match class {
             Class::Pinned => &self.pinned,
             Class::Meta => &self.meta,
-            Class::Bulk => &self.bulk,
+            Class::Bulk | Class::Scan => &self.bulk,
         }
     }
 

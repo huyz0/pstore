@@ -28,6 +28,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
+pstore-cache   = { path = "../pstore-cache" }
 # A test that has to be a correct store until a point, and a contending one after it, has to
 # implement `BlobStore` itself -- `Flaky::always_contended` refuses the setup too.
 async-trait    = "0.1.92"

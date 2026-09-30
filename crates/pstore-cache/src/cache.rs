@@ -145,7 +145,8 @@ impl CacheCore {
         match class {
             Class::Pinned => (&self.pinned, self.quota_pinned),
             Class::Meta => (&self.meta, self.quota_meta),
-            Class::Bulk => (&self.bulk, self.quota_bulk),
+            // A scan is served from bulk, and never admitted (`admit`).
+            Class::Bulk | Class::Scan => (&self.bulk, self.quota_bulk),
         }
     }
 
@@ -168,12 +169,18 @@ impl CacheCore {
             return Some(hit);
         }
         let hit = self.disk.as_ref()?.get(id, class).await?;
-        let (arena, quota) = self.arena(class);
-        arena.lock().await.admit(id.clone(), hit.clone(), quota);
+        if class != Class::Scan {
+            let (arena, quota) = self.arena(class);
+            arena.lock().await.admit(id.clone(), hit.clone(), quota);
+        }
         Some(hit)
     }
 
+    /// ⚠️ A [`Class::Scan`] read is never admitted, to either tier (D-50).
     async fn admit(&self, id: Id, bytes: Bytes, class: Class) {
+        if class == Class::Scan {
+            return;
+        }
         if let Some(d) = &self.disk {
             d.insert(&id, &bytes, class);
         }

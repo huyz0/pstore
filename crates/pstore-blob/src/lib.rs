@@ -13,6 +13,7 @@ mod faulty;
 mod memory;
 #[cfg(feature = "object_store")]
 mod object_store_backend;
+mod scanning;
 mod store;
 mod types;
 
@@ -23,5 +24,6 @@ pub use faulty::{Faults, Faulty};
 pub use memory::{MemoryStore, TagStyle};
 #[cfg(feature = "object_store")]
 pub use object_store_backend::ObjectStoreBackend;
+pub use scanning::Scanning;
 pub use store::{BlobStore, Class};
 pub use types::{BlobError, Capabilities, CasError, Key, Precondition, PutOutcome, Support};

@@ -629,3 +629,64 @@ async fn a_tier_of_another_format_is_emptied() {
     );
     core.close().await;
 }
+
+#[tokio::test]
+async fn a_scan_is_served_from_bulk_and_admits_nothing() {
+    // D-50: a scan's miss is fetched and not admitted, to either tier; its hit is served from
+    // what a bulk read admitted.
+    let dir = Dir::new("scan");
+    let acct = store(2, 4096, 53).await;
+    let core = open(&dir.0, "A").await;
+    let c = over(&acct, &core);
+    c.get_range_as(&key(0), 0..512, Class::Bulk).await.unwrap();
+    let before = (reads(&acct), c.resident_in(Class::Bulk));
+    assert_eq!(
+        c.get_range_as(&key(0), 0..512, Class::Scan).await.unwrap(),
+        body(4096, 53).slice(0..512)
+    );
+    c.get_ranges_as(&key(0), std::slice::from_ref(&(0..512)), Class::Scan)
+        .await
+        .unwrap();
+    assert_eq!(
+        (reads(&acct), c.resident_in(Class::Bulk)),
+        before,
+        "a scan missed bulk"
+    );
+    // A miss: fetched, and nowhere afterwards.
+    c.get_range_as(&key(1), 0..512, Class::Scan).await.unwrap();
+    c.get_ranges_as(&key(1), &[1024..1536, 2048..2560], Class::Scan)
+        .await
+        .unwrap();
+    assert_eq!(c.resident_in(Class::Bulk), before.1, "a scan was admitted");
+    core.close().await;
+    let core = open(&dir.0, "A").await;
+    let c = over(&acct, &core);
+    let r = reads(&acct);
+    c.get_range_as(&key(1), 0..512, Class::Bulk).await.unwrap();
+    assert_eq!(reads(&acct), r + 1, "a scan reached the disk");
+    // A scan served from disk is not promoted into memory either.
+    let held = c.resident_in(Class::Bulk);
+    c.get_range_as(&key(0), 0..512, Class::Scan).await.unwrap();
+    assert_eq!(reads(&acct), r + 1, "a scan missed the disk's bulk");
+    assert_eq!(
+        c.resident_in(Class::Bulk),
+        held,
+        "a scan's disk hit was promoted"
+    );
+    core.close().await;
+}
+
+#[tokio::test]
+async fn a_scan_is_served_from_the_memory_tiers_bulk() {
+    // Memory only, so a disk cannot answer for a memory tier that looked in the wrong place.
+    let acct = store(1, 4096, 59).await;
+    let core = Arc::new(CacheCore::memory(RAM));
+    let c = over(&acct, &core);
+    c.get_range_as(&key(0), 0..512, Class::Bulk).await.unwrap();
+    let r = reads(&acct);
+    c.get_range_as(&key(0), 0..512, Class::Scan).await.unwrap();
+    c.get_ranges_as(&key(0), std::slice::from_ref(&(0..512)), Class::Scan)
+        .await
+        .unwrap();
+    assert_eq!(reads(&acct), r, "a scan missed the memory tier's bulk");
+}

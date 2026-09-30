@@ -27,6 +27,11 @@ pub enum Class {
     /// an un-hinted read is assumed evictable, which is the safe direction to be wrong in.
     #[default]
     Bulk,
+    /// A bulk read by a pass that reads every block of what it touches, once: a compaction,
+    /// a fold's delete pass, a full scan. ⚠️ **Served from the cache, never admitted to it**
+    /// (D-50): admitted, one compaction would walk every query's working set out of the bulk
+    /// tier, and spend the device's write budget doing it.
+    Scan,
 }
 
 /// The only way pstore touches durable storage.
