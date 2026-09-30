@@ -2605,11 +2605,29 @@ impl<S: BlobStore> Engine<S> {
         self.branch_inner(src, dest, Some(interfere)).await
     }
 
+    /// [`Self::branch`]'s body, with everything it wrote buried when it gives up (M19).
     async fn branch_inner(
         &self,
         src: &str,
         dest: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Epoch, EngineError> {
+        let mut written = Vec::new();
+        let out = self
+            .branch_attempts(src, dest, interfere, &mut written)
+            .await;
+        if out.is_err() {
+            self.bury_abandoned(&written).await;
+        }
+        out
+    }
+
+    async fn branch_attempts(
+        &self,
+        src: &str,
+        dest: &str,
+        interfere: Option<impl Future<Output = ()> + Send>,
+        written: &mut Vec<String>,
     ) -> Result<Epoch, EngineError> {
         require_fencing(&*self.store)?;
         let named = |n: &str| {
@@ -2678,6 +2696,8 @@ impl<S: BlobStore> Engine<S> {
                 let bytes = self.store.get(&Key::new(from.clone())).await?;
                 let to = head::dv_ref(dest, &r.key);
                 let key = head::dv_key(&to, next.epoch.0, self.lane.0);
+                // Recorded before the PUT, so one that fails partway is buried too (M19).
+                written.push(key.clone());
                 self.store.put(&Key::new(key.clone()), bytes).await?;
                 copies.push(key.clone());
                 next.deletes.insert(to, (key, *rows));
@@ -3527,10 +3547,89 @@ impl<S: BlobStore> Engine<S> {
             .collect())
     }
 
+    /// Buries objects abandoned work wrote (M19), by a commit of its own: each key under its own
+    /// key epoch, as M7e buries a retry's stale keys, so `as_of` never resurrects it.
+    ///
+    /// ⚠️ **Never a key the HEAD it commits names.** Compaction and branch keys are derived from
+    /// the epoch, the lane and the index alone, so a winner on this lane may have written -- and
+    /// committed -- the very key given up here. Best effort: if the burial cannot land, the
+    /// objects stay unnamed, as they did before M19, and the caller's outcome is unchanged.
+    async fn bury_abandoned(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let Ok(at) = head::read(&*self.store, self.tenant).await else {
+                return;
+            };
+            let live: std::collections::HashSet<&str> = at
+                .head
+                .indexes
+                .values()
+                .flatten()
+                .map(|r| r.key.as_str())
+                .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
+                .collect();
+            let buried: std::collections::HashSet<&str> = at
+                .head
+                .graveyard
+                .values()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            let due: Vec<&String> = keys
+                .iter()
+                .filter(|k| !live.contains(k.as_str()) && !buried.contains(k.as_str()))
+                .collect();
+            if due.is_empty() {
+                return;
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            for k in due {
+                let born = head::dv_of(k)
+                    .map(|(_, e)| e)
+                    .or_else(|| head::key_epoch(k))
+                    .unwrap_or(next.epoch.0);
+                next.graveyard.entry(born).or_default().push(k.clone());
+            }
+            match head::commit(&*self.store, self.tenant, &at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    self.record_reapable(epoch);
+                    return;
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// [`Self::compact`]'s body, with every key it sealed buried when it gives up (M19): a
+    /// discard, the loop running out, or any error. Only a commit that landed keeps them.
     async fn compact_inner(
         &self,
         index: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Option<Epoch>, EngineError> {
+        let mut written = Vec::new();
+        let out = self.compact_attempts(index, interfere, &mut written).await;
+        if !matches!(out, Ok(Some(_))) {
+            self.bury_abandoned(&written).await;
+        }
+        out
+    }
+
+    async fn compact_attempts(
+        &self,
+        index: &str,
+        interfere: Option<impl Future<Output = ()> + Send>,
+        written: &mut Vec<String>,
     ) -> Result<Option<Epoch>, EngineError> {
         require_fencing(&*self.store)?;
         let at = head::read(&*self.store, self.tenant).await?;
@@ -3600,6 +3699,8 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ None when every input row is deleted (M9c.2): the merge then only removes.
         let empty = rows.is_empty();
         if !empty {
+            // Recorded before the seal, so one that fails partway is buried too (M19).
+            written.push(out_key.as_str().to_owned());
             self.seal(&out_key, &rows, text_field, &fts, &trigram)
                 .await?;
         }
@@ -3620,6 +3721,7 @@ impl<S: BlobStore> Engine<S> {
             // no rebuild, and the invariant every past epoch depends on holds by construction.
             let want = self.compacted_key(at.head.epoch.next(), index);
             if want != out_key && !empty {
+                written.push(want.as_str().to_owned());
                 self.seal(&want, &rows, text_field, &fts, &trigram).await?;
                 stale.push(out_key.clone());
                 out_key = want;
