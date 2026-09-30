@@ -64,12 +64,18 @@ two processes never share foyer's files, and no lock is needed.
 - A foyer error on lookup is a miss; on insert, it is dropped.
 
 **D-50: scans do not admit.** `Class` gains `Scan`.
-- On a hit, a `Scan` read is served from the cache. On a miss, it fetches **without
-  admitting**, to either tier.
+- A `Scan` lookup probes the **bulk** arena, in both tiers, so a hit is served. A miss fetches
+  **without admitting**, to either tier.
 - The engine wraps its store in a `Scanning` adapter for the reads made by compaction, the
-  fold's delete and upsert pass, and `Engine::scan`. The adapter maps each read to its `_as`
-  form with `Class::Scan`.
-- The existing match sites on `Class` gain the arm, and `Accounted` counts `Scan` with `Bulk`.
+  fold's delete and upsert pass, and `Engine::scan`.
+  - The adapter re-classes **only bulk and unclassed reads** as `Scan`. Meta and pinned reads
+    (a segment's footer, its sidecars, centroids) keep their class and admit as usual,
+    since they are small and read again.
+  - It overrides `get_range`, `get_ranges`, `get_suffix` and each `_as` form. The trait's
+    default `get_ranges` coalesces into a classless `get_range`, which would be admitted as
+    bulk.
+- The two match sites on `Class` (`Caching::arena`, and pstore-meter's pass-through) gain the
+  arm.
 
 **Configuration.**
 - `PSTORE_CACHE_DIR` turns the cache on.
@@ -98,20 +104,28 @@ updated to match.
    - With `identity` deleted, reopened under A: nothing served.
 4. **Quotas hold on disk.** A meta entry is admitted, then twice the bulk share of bulk
    entries. After a reopen, the meta entry is a hit at 0 requests.
-5. **Corruption is a miss.** One byte of a tier data file is flipped, and the tier reopened.
-   The read answers the store's bytes at the uncached count.
+5. **Corruption is a miss.** One byte inside a cached value is flipped: the value's bytes
+   are found by searching the tier's data files, not guessed at in padding. After a reopen,
+   the read answers the store's bytes at the uncached count.
 6. **A broken disk bypasses.**
    - A directory path that is a regular file: `Bypassed`, and correct reads at the uncached
      count. `Api::with_cache` starts over it.
    - The tier's data files truncated under an open core: correct reads.
 7. **A hit is not billed.** Through the API, the second identical query costs
    `blob_reads == 1`.
-8. **`get` is never cached, on disk either**: two `get`s around a reopen make 2 requests. And
-   `Range(k,0,n)`, `Whole(k)` and `Suffix(k,n)` are three distinct entries.
-9. **Scans do not admit.** A compaction, and an `Engine::scan`, leave memory and disk entry
-   counts unchanged. A query admits.
-10. **Reopening is bounded.** A full 256 MiB tier reopens in under 1 s here. The measured
-    number is recorded as `provisional`.
+8. **`get` is never cached, on disk either**: two `get`s around a reopen make 2 requests.
+   - `Range(k,0,n)`, `Whole(k)` and `Suffix(k,n)` are three distinct entries.
+   - An entry of 4 MiB + 1 byte is a memory hit, and after a reopen a disk miss, with no
+     error.
+9. **Scans do not admit, and do hit.**
+   - A cold compaction, and a cold `Engine::scan`, leave the bulk arena's memory and disk
+     entries unchanged. A query admits.
+   - After a query has warmed a segment's blocks, a compaction reading those blocks costs no
+     range read for them.
+10. **Reopening is bounded.** A full 256 MiB tier reopens in under 1 s here, measured by
+    `a_full_tier_reopens_within_a_second`. That test is `#[ignore]`d, because wall-clock time is
+    not deterministic and a mutation sweep would rerun it. It is run by hand with
+    `--ignored`, and its number is recorded as `provisional`. It is not a gate.
 11. **One directory per lane.** Cores for lanes 1 and 2 on one directory share no file.
 12. **Configured by name.**
     - No `PSTORE_CACHE_DIR` means `Config.cache` is `None`.
@@ -138,7 +152,7 @@ updated to match.
 | 6 | open panics or a read errors | a disk error propagated |
 | 7 | a hit billed | the cache under accounting |
 | 8 | the second `get` hits; ids collide | `get` admitted; a string-joined key |
-| 9 | the compaction admits | the adapter unused; `Scan` admitted |
+| 9 | the compaction admits; the warmed compaction reads again | the adapter unused; `Scan` admitted; `Scan` never probing bulk; a `get_ranges` override missing |
 | 10 | — (a bound) | — |
 | 11 | lanes share files | the lane dropped from the path |
 | 12 | the variables are ignored | the parse, the defaults, each refusal |
@@ -160,10 +174,11 @@ updated to match.
   relies on three things: a committed key is not rewritten, since epochs only grow; an
   uncommitted key is never read; and nothing deletes HEAD. Two known exceptions:
   - M19's same-lane compaction, which criterion 14 pins;
-  - a paused process on a lane whose restarted successor has committed, whose unconditional
-    segment PUT can overwrite a live segment. That is
-    [BACKLOG](../BACKLOG.md) row 24's residue. The cache makes it last longer; it does not
-    create it.
+  - a process paused between its HEAD read and its segment PUT, on a lane whose restarted
+    successor has since committed that key. Its unconditional PUT overwrites a live
+    segment. That is new [BACKLOG](../BACKLOG.md) row 44, an existing bug of the store: the
+    cache makes it last longer, and does not create it. foyer's key check keeps the lane
+    directory itself safe.
 - **Recovery reads every block header** (criterion 10). At NVMe scale that is D-23's cost,
   and it is left to M21 or later.
 - **foyer preallocates its budget**, and endurance throttling (disk-space-management.md §7)
@@ -174,6 +189,7 @@ updated to match.
 ## Tasks
 
 - **M20.1** — `CacheCore`, the disk tier, the identity check and emptying, the bypass, and
-  `close`, in `pstore-cache`.
+  `close`, in `pstore-cache`. Also the D-23 deviation banner in `affinity-and-coldstart.md`,
+  and BACKLOG rows 44 (the paused segment PUT) and 45 (the `Vec` LRU).
 - **M20.2** — `Class::Scan`, and the engine's `Scanning` adapter.
 - **M20.3** — `Api::with_cache`, `Config.cache`, the store id, `main.rs`, and `deploy.md`.
