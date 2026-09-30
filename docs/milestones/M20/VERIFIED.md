@@ -2,9 +2,8 @@
 
 One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-verified.py`.
 
-⚠️ **Where this ran:** a Linux x86-64 cloud container (4 cores, a virtual disk, `cargo-mutants`
-27.1.0). The one number below is `provisional`: a local directory stands in for the NVMe
-device D-23 means, which is enough for every correctness property and no absolute latency.
+⚠️ **Where this ran:** a Linux x86-64 cloud container (4 cores, `cargo-mutants` 27.1.0). A local
+directory stands in for D-23's NVMe device: enough for correctness, and every number `provisional`.
 
 Tests are in `cargo test -p pstore-cache --test disk`, `cargo test -p pstore-engine --test
 scan_cache`, `cargo test -p pstore-blob --test scanning` and `cargo test -p pstore-server --test
