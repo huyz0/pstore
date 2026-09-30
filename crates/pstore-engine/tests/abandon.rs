@@ -38,6 +38,8 @@ struct Store {
     head_cas: Arc<std::sync::atomic::AtomicU64>,
     /// HEAD commits to let through before answering one `Contended`; `u64::MAX` for never.
     contend_after: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether every HEAD commit from now on answers `Lost`.
+    lose_all: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -95,6 +97,9 @@ impl BlobStore for Store {
     ) -> Result<PutOutcome, CasError> {
         if key.as_str().ends_with("/HEAD") {
             self.head_cas.fetch_add(1, Ordering::SeqCst);
+            if self.lose_all.load(Ordering::SeqCst) {
+                return Err(CasError::Lost);
+            }
             let left = self.contend_after.load(Ordering::SeqCst);
             if left == 0 {
                 self.contend_after.store(u64::MAX, Ordering::SeqCst);
@@ -493,4 +498,29 @@ async fn an_abandonment_costs_one_read_and_one_commit() {
             "contended: {contended}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_burial_that_keeps_losing_gives_up_after_its_last_attempt() {
+    // Every commit after the winner's loses. The loser's commit loses and it re-reads HEAD
+    // (1 CAS, 1 read). The burial reads HEAD, then makes its 24 attempts, re-reading after
+    // each lost one but the last: a read after the last attempt is spent on nothing.
+    let store = Store::new();
+    let (e, w) = (engine(&store, 1), engine(&store, 2));
+    seeded(&e, "idx", &["a", "b"]).await;
+    let after = Arc::new(Mutex::new((0, 0)));
+    let out = e
+        .compact_with_interference_for_test("idx", async {
+            w.compact("idx").await.unwrap().unwrap();
+            *after.lock().unwrap() = store.counts();
+            store.lose_all.store(true, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+    assert!(out.is_none());
+    let (r, c) = *after.lock().unwrap();
+    assert_eq!(
+        (store.counts().0 - r, store.counts().1 - c),
+        (1 + 1 + 23, 1 + 24)
+    );
 }
