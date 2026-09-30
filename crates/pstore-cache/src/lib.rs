@@ -22,15 +22,25 @@
 //! passes every hit-rate test there is. `get` therefore passes straight through, and the
 //! centroid table (which uses it) stays uncached until an explicit immutability marker exists.
 //!
+//! ## Two tiers, one core (M20)
+//!
+//! A [`CacheCore`] holds the state, and every tenant's [`Caching`] view shares it: each key
+//! names its tenant, so one budget serves them all. It has a memory tier with a **quota per
+//! class** (D-21: a bulk burst evicts only bulk), and optionally a disk tier behind it, one
+//! `foyer` instance per class with the same shares (D-22). The disk tier survives a restart
+//! (D-23), is emptied when the store behind its directory changes, and degrades to the store
+//! when the disk fails. A `Caching` with no core forwards every call verbatim.
+//!
 //! ## What this is not
 //!
-//! Eviction here is a plain LRU over bytes. **D-21 requires class-aware admission** so that a
-//! burst of bulk traffic cannot evict the centroid table every query needs, and this does not
-//! implement it. Shipping this and calling caching done would leave exactly the failure D-21
-//! was written to prevent.
+//! **Endurance throttling** (`disk-space-management.md` §7) is not configured, and the
+//! memory tier's LRU is a `Vec` (BACKLOG row 45). And D-23's "do not scan the directory" is
+//! not met: `foyer` reads every block header on open (M20's ledger bounds it).
 
 #![forbid(unsafe_code)]
 
 mod cache;
+mod disk;
 
-pub use cache::Caching;
+pub use cache::{CacheCore, Caching, DiskState};
+pub use disk::{DEFAULT_BLOCK, DiskConfig};

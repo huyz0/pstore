@@ -44,6 +44,11 @@ turbopuffer's published figures for 1M documents:
 > 10,000 cold caches. Design the on-disk cache format for fast reopen (index the cache
 > directory in a small persistent file; do not scan it).
 
+> ⚠️ **Deviated from by [M20](../../milestones/M20/SPEC.md).** The disk tier is `foyer` (D-22),
+> whose recovery reads every block header on open rather than one index file. Measured on a
+> cloud container at 256 MiB: 18 ms, `provisional`. At NVMe scale that read is the cost this
+> decision warned of. The survival half of D-23 holds: a restart is not a flush.
+
 ## The two-hop question
 
 Routing forwards a request from the receiving node to a placement node (~0.2 ms intra-AZ).

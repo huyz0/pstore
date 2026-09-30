@@ -113,6 +113,13 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | ~~22~~ | ⚠️ **`scripts/review.sh`'s round counter is keyed on the branch name and never resets. DONE** ([M7b](M7b/VERIFIED.md)). so on a long-lived `main` it accumulates rounds across unrelated tasks. Observed during [M0c](M0c/VERIFIED.md): it reported "round 4 of hard budget 4" for a change whose review had not started, and computed its "delta since round 3" against a sha four commits stale — handing the reviewer an already-committed diff instead of the staged one. The next change on `main` will be **refused at round 5** for rounds spent on other work. ⚠️ The budget itself is right and is why the loop terminates; what is wrong is what it counts. Key it on the staged tree, or reset it when HEAD moves. ⚠️ **Reset when HEAD moves, and explicitly not keyed on the staged tree** — the staged tree is what *changes* between rounds, so keying on it would reset the budget on every fix and delete the mechanism. `${TAG}.base` records the HEAD the review started on. The delta is now `git write-tree` to `git write-tree`, so round *N* diffs what round *N-1* actually reviewed rather than the worktree against a sha. | [M0c](M0c/VERIFIED.md) | S |
 
+## Opened by M20
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 44 | ⚠️ **A process paused between its HEAD read and its segment PUT can overwrite a live segment.** Segment keys derive from the epoch and the lane, and a segment PUT is unconditional. A process that pauses there, on a lane whose restarted successor has since committed that key, overwrites it with other rows when it wakes. Found by M20's spec review. The read cache makes the damage last longer; it does not create it. The fix is the one bundles got in M17: create segments if absent, and treat a refusal as another writer. | [M20](M20/SPEC.md) | M |
+| 45 | **The memory tier's LRU is a `Vec`**, whose touch is O(entries). Since M20 one core is shared by every tenant, so this is a cost that grows with the whole node's working set, not a correctness issue. | [M20](M20/SPEC.md) | S |
+
 ## Opened by M19
 
 | # | Task | From | Size |
