@@ -524,3 +524,49 @@ async fn a_burial_that_keeps_losing_gives_up_after_its_last_attempt() {
         (1 + 1 + 23, 1 + 24)
     );
 }
+
+/// Every object in the store, with its bytes.
+async fn bytes_of(store: &Store) -> std::collections::BTreeMap<String, Bytes> {
+    let mut out = std::collections::BTreeMap::new();
+    for k in objects(store).await {
+        out.insert(k.clone(), store.inner.get(&Key::new(k)).await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn sealing_one_key_twice_writes_the_same_bytes() {
+    // M20's read cache keeps a key's bytes for as long as its disk does, so a key two same-lane
+    // compactions both seal must be sealed identically: the loser's PUT lands on the winner's
+    // committed segment and sidecars.
+    let store = Store::new();
+    let (e, twin) = (engine(&store, 1), engine(&store, 1));
+    seeded(&e, "idx", &["a", "b", "c"]).await;
+    let before = objects(&store).await;
+    let sealed = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let got = e
+        .compact_with_interference_for_test("idx", async {
+            // Ours has sealed; the twin seals the same keys and commits them.
+            *sealed.lock().unwrap() = bytes_of(&store).await;
+            twin.compact("idx").await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(got, None);
+    let ours = sealed.lock().unwrap().clone();
+    let after = bytes_of(&store).await;
+    let new: Vec<&String> = ours.keys().filter(|k| !before.contains(*k)).collect();
+    assert!(
+        new.iter().any(|k| k.ends_with(".seg")),
+        "nothing sealed: {new:?}"
+    );
+    // The twin committed the very segment ours sealed, so its PUT landed on ours.
+    let live = named(&e.head_for_test().await);
+    assert!(
+        new.iter().any(|k| k.ends_with(".seg") && live.contains(*k)),
+        "the twin committed another key"
+    );
+    for k in new {
+        assert_eq!(after.get(k), ours.get(k), "{k} was sealed with other bytes");
+    }
+}
