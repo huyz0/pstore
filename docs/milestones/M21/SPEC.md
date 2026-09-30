@@ -23,7 +23,8 @@ API of [`load-and-hotspots.md`](../../research/04-cluster/load-and-hotspots.md) 
 1. One fresh HEAD read (`head::read`, 1 request).
 2. Per segment HEAD names, together: `Segment::open`; the delete vector if HEAD names one; the
    centroid table if its `SegmentRef.rows` ≥ this engine's `exact_scan_threshold` and the
-   schema's `dims` > 0, the fold's own predicate (`vec_index.rs:357`).
+   schema's `dims` > 0. That approximates the fold's predicate (`vec_index.rs:357`), which
+   uses each segment's own dimension; see Risks.
 3. Per segment, from its index section: the sparse dictionary if a field names
    `SparsePostings`, the text dictionary if `has_text()`.
 
@@ -61,7 +62,7 @@ No `classes` parameter: D-44 fixes them. No whole-tenant warm. No routing.
 3. **A warm reads only what exists.** Index of k segments below the threshold, no dv, no sparse
    or text field: exactly **1 + k** reads, `fetched == 0`. No 404.
 4. **Each sidecar that exists is warmed.** Two segments, one of exactly `exact_scan_threshold`
-   rows, both with sparse and text fields, one with a delete vector: `fetched == 6`, and
+   rows and one below it, both with sparse and text fields, one with a delete vector: `fetched == 6`, and
    criterion 1 holds.
 5. **Depth ≤ 3**, by `DepthCounting`, for k ≥ 2 segments within `INDEX_BUDGET`. Engine-written
    segments always are (`try_finish` refuses more); an overflowing index section would add one.
@@ -85,7 +86,7 @@ first on a stub `warm` that reads HEAD only.
 | 2 | `a_warm_admits_no_bulk` | the data section or postings read; opening by `scan` |
 | 3 | `a_warm_reads_only_what_exists` | centroids or dictionaries fetched unconditionally; `dims > 0` dropped |
 | 4 | `every_sidecar_that_exists_is_warmed` | `>=` as `>` at the threshold; the dv skipped; a dictionary kind skipped |
-| 5 | `a_warm_is_three_rounds_deep` (k = 3) | segments warmed in a serial loop; dictionaries awaited before round 2 ends |
+| 5 | `a_warm_is_three_rounds_deep` (k = 3) | segments warmed in a serial loop |
 | 6 | `a_second_warm_costs_head_alone` | a read that bypasses the cache (`get` for `get_immutable`) |
 | 7 | `a_warm_survives_a_restart` | the warm filling a memory-only path, so the disk tier misses on reopen |
 
@@ -106,9 +107,9 @@ Per explicit call, scaling with one index's segments: the shape of its first que
 
 - **A warm on one process, a query on another.** Nothing routes a tenant; stated in `deploy.md`.
   Nothing automated reveals it.
-- **Writer and warmer parameters differ.** A segment clustered below this engine's threshold has
-  centroids the warm skips: a cold read later, never a wrong answer. No test mixes them, so
-  nothing reveals it.
+- **The centroid predicate is approximate.** A writer with a lower threshold, or a HEAD with
+  no schema, leaves a table the warm skips; a segment with no vectors in a dense index costs
+  one 404. A cold read or a wasted one, never a wrong answer, and no test mixes them.
 - **A cache too small for the metadata** evicts what it warmed. Criterion 1 assumes room;
   `fetched` against class residency is how an operator sees it.
 - **Abuse.** Repeated warms cost one billed HEAD read each.
