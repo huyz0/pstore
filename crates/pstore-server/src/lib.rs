@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use pstore_blob::{Accounted, BlobStore, OpClass, TenantView};
+use pstore_cache::{CacheCore, Caching};
 use pstore_engine::{Engine, EngineError};
 use pstore_format::Document;
 use pstore_types::{LaneId, TenantId};
@@ -88,6 +89,9 @@ pub enum StartupError {
     },
 }
 
+/// A tenant's engine: its view of the store, read through the process's cache (M20).
+type Tenant<S> = Engine<Caching<TenantView<S>>>;
+
 /// One process's serving state: the store, the lane it writes on, and one engine per tenant.
 ///
 /// ⚠️ **One `Engine` per tenant, held forever.** The engine owns the memtable that makes a
@@ -99,7 +103,9 @@ pub enum StartupError {
 pub struct Api<S> {
     store: Accounted<S>,
     lane: LaneId,
-    engines: tokio::sync::Mutex<HashMap<TenantId, Arc<Engine<TenantView<S>>>>>,
+    /// The read cache every tenant's view shares, or `None` for an uncached server (M20).
+    cache: Option<Arc<CacheCore>>,
+    engines: tokio::sync::Mutex<HashMap<TenantId, Arc<Tenant<S>>>>,
     /// What `GET /metrics` reports about this process's own traffic.
     ///
     /// ⚠️ **On the `Api`, not in a static.** A process-global counter would make the refusal
@@ -209,6 +215,29 @@ impl<S: BlobStore + 'static> Api<S> {
     /// is anything but `Supported`. **Zero requests**: it reads the profile the store already
     /// carries and probes nothing.
     pub fn new(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, None)
+    }
+
+    /// [`Api::new`], reading every tenant's segments through `cache` (M20).
+    ///
+    /// ⚠️ The cache wraps each tenant's view of the accounted store, so a hit never reaches
+    /// the accounting and is never billed.
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_cache(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Arc<CacheCore>,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, Some(cache))
+    }
+
+    fn build(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Option<Arc<CacheCore>>,
+    ) -> Result<Arc<Self>, StartupError> {
         // ⚠️ `Accounted` is not itself a `BlobStore` — a tenant view is — so the profile is
         // read through one. It is the same underlying backend's, and reading it costs nothing.
         let probe = store.as_tenant(TenantId(0));
@@ -223,6 +252,7 @@ impl<S: BlobStore + 'static> Api<S> {
         Ok(Arc::new(Self {
             store,
             lane,
+            cache,
             engines: tokio::sync::Mutex::new(HashMap::new()),
             http: Mutex::new(Http::default()),
             backoff: Mutex::new(HashMap::new()),
@@ -276,7 +306,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// [`Self::reap_due`], starting no tenant's reap once `halt` is set.
     async fn reap_tick(&self, policy: &GcPolicy, halt: &std::sync::atomic::AtomicBool) -> ReapTick {
         use futures_util::StreamExt;
-        let engines: Vec<(TenantId, Arc<Engine<TenantView<S>>>)> = self
+        let engines: Vec<(TenantId, Arc<Tenant<S>>)> = self
             .engines
             .lock()
             .await
@@ -349,7 +379,7 @@ impl<S: BlobStore + 'static> Api<S> {
         halt: &std::sync::atomic::AtomicBool,
     ) -> FoldTick {
         use futures_util::StreamExt;
-        let engines: Vec<(TenantId, Arc<Engine<TenantView<S>>>)> = self
+        let engines: Vec<(TenantId, Arc<Tenant<S>>)> = self
             .engines
             .lock()
             .await
@@ -478,11 +508,14 @@ impl<S: BlobStore + 'static> Api<S> {
     }
 
     /// The engine for `tenant`, built on first use.
-    async fn engine(&self, tenant: TenantId) -> Arc<Engine<TenantView<S>>> {
+    async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
         let mut engines = self.engines.lock().await;
         Arc::clone(engines.entry(tenant).or_insert_with(|| {
             Arc::new(Engine::new(
-                Arc::new(self.store.as_tenant(tenant)),
+                Arc::new(Caching::over(
+                    Arc::new(self.store.as_tenant(tenant)),
+                    self.cache.clone(),
+                )),
                 tenant,
                 self.lane,
             ))
@@ -2739,6 +2772,19 @@ pub struct Config {
     pub fold: Option<FoldPolicy>,
     /// The scheduled reap's policy, or `None` when `PSTORE_GC=off` (M18).
     pub gc: Option<GcPolicy>,
+    /// The read cache, or `None` when `PSTORE_CACHE_DIR` is unset (M20).
+    pub cache: Option<CacheConfig>,
+}
+
+/// Where the read cache keeps its disk tier, and how large each tier is (M20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// `PSTORE_CACHE_DIR`. The tier lives in `<dir>/lane-<n>`.
+    pub dir: std::path::PathBuf,
+    /// `PSTORE_CACHE_RAM_BYTES`, 256 MiB by default.
+    pub ram: usize,
+    /// `PSTORE_CACHE_DISK_BYTES`, 4 GiB by default.
+    pub disk: usize,
 }
 
 /// Where a server keeps its data.
@@ -2831,6 +2877,9 @@ pub enum ConfigError {
     /// A scheduled-fold variable that is not what it must be (M9i.1).
     #[error("{0}={1} is refused: {2}")]
     Fold(&'static str, String, &'static str),
+    /// A `PSTORE_CACHE_*` value that cannot be used (M20).
+    #[error("{0}={1} is refused: {2}")]
+    Cache(&'static str, String, &'static str),
 }
 
 impl Config {
@@ -2870,6 +2919,7 @@ impl Config {
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
             fold: fold_policy(&get)?,
             gc: gc_policy(&get)?,
+            cache: cache_config(&get, backend)?,
         })
     }
 }
@@ -2907,6 +2957,58 @@ fn fold_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<FoldPolic
         bytes: positive("PSTORE_FOLD_BYTES")?.unwrap_or(d.bytes),
     };
     Ok(on.then_some(policy))
+}
+
+/// The read cache from `PSTORE_CACHE_DIR`, `PSTORE_CACHE_RAM_BYTES` and
+/// `PSTORE_CACHE_DISK_BYTES` (M20). Each value is refused by name, as the fold's are.
+fn cache_config(
+    get: &impl Fn(&str) -> Option<String>,
+    backend: Backend,
+) -> Result<Option<CacheConfig>, ConfigError> {
+    let bytes = |var: &'static str| -> Result<Option<usize>, ConfigError> {
+        get(var)
+            .map(|v| {
+                v.parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(ConfigError::Cache(var, v, "a positive integer"))
+            })
+            .transpose()
+    };
+    let (ram, disk) = (
+        bytes("PSTORE_CACHE_RAM_BYTES")?,
+        bytes("PSTORE_CACHE_DISK_BYTES")?,
+    );
+    let Some(dir) = get("PSTORE_CACHE_DIR") else {
+        // ⚠️ A size with no directory is a setting that does nothing, and says nothing.
+        for (var, v) in [
+            ("PSTORE_CACHE_RAM_BYTES", ram),
+            ("PSTORE_CACHE_DISK_BYTES", disk),
+        ] {
+            if let Some(n) = v {
+                return Err(ConfigError::Cache(
+                    var,
+                    n.to_string(),
+                    "set only with PSTORE_CACHE_DIR",
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    if backend == Backend::Memory {
+        // ⚠️ A memory store is new and empty at every start, and its epochs restart: its keys
+        // repeat with other bytes, which a cache that survives the restart would serve.
+        return Err(ConfigError::Cache(
+            "PSTORE_CACHE_DIR",
+            dir,
+            "not with PSTORE_BACKEND=memory, whose keys repeat across restarts",
+        ));
+    }
+    Ok(Some(CacheConfig {
+        dir: dir.into(),
+        ram: ram.unwrap_or(256 << 20),
+        disk: disk.unwrap_or(4 << 30),
+    }))
 }
 
 /// The scheduled reap's policy from `PSTORE_GC`, `PSTORE_GC_PERIOD_MS` and `PSTORE_GC_AGE_S`
@@ -3059,6 +3161,71 @@ pub async fn serve<S: BlobStore + 'static>(
     axum::serve(listener, api.router())
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// The read cache `config` asks for over `store`, or `None` when it asks for none (M20).
+///
+/// ⚠️ **One GET at startup**, plus one conditional PUT and one GET the first time any node
+/// meets the store: the store id. Per node, never per tenant. The disk tier itself never
+/// fails to open: a directory it cannot use leaves the cache memory only.
+///
+/// # Errors
+/// The store id could not be read or created.
+pub async fn open_cache<S: BlobStore>(
+    store: &Accounted<S>,
+    config: &Config,
+) -> Result<Option<Arc<CacheCore>>, pstore_blob::BlobError> {
+    let Some(c) = &config.cache else {
+        return Ok(None);
+    };
+    let identity = store_identity(store, &config.endpoint, &config.bucket).await?;
+    let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
+    Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+}
+
+/// Where a store keeps the id its read caches are validated by (M20).
+const STORE_ID: &str = "_pstore/store-id";
+
+/// The identity the read cache records for an S3 store (M20): its endpoint, its bucket, and
+/// the random id the store itself holds at `_pstore/store-id`.
+///
+/// # Errors
+/// A read or write of the id failed.
+pub async fn store_identity<S: BlobStore>(
+    store: &Accounted<S>,
+    endpoint: &str,
+    bucket: &str,
+) -> Result<String, pstore_blob::BlobError> {
+    // ⚠️ Outside every tenant: `_pstore/` is no tenant's prefix, which is four hex digits.
+    let view = store.as_tenant(TenantId(0));
+    let key = pstore_blob::Key::new(STORE_ID);
+    let id = match view.get(&key).await {
+        Ok(raw) => raw,
+        Err(pstore_blob::BlobError::NotFound(_)) => {
+            let mut bits = [0u8; 16];
+            getrandom::fill(&mut bits)
+                .map_err(|e| pstore_blob::BlobError::Other(format!("no randomness: {e}")))?;
+            let fresh: String = bits.iter().map(|b| format!("{b:02x}")).collect();
+            // Create-if-absent: two nodes starting at once agree on whichever landed.
+            match view
+                .put_conditional(
+                    &key,
+                    axum::body::Bytes::from(fresh.clone()),
+                    pstore_blob::Precondition::NotExists,
+                )
+                .await
+            {
+                Ok(_) => axum::body::Bytes::from(fresh),
+                Err(pstore_blob::CasError::Lost) => view.get(&key).await?,
+                Err(e) => return Err(pstore_blob::BlobError::Other(e.to_string())),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(format!(
+        "s3 {endpoint} {bucket} {}",
+        String::from_utf8_lossy(&id)
+    ))
 }
 
 #[cfg(test)]

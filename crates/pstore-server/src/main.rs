@@ -6,7 +6,7 @@
 //! being wrong about is in the library.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
-use pstore_server::{Api, Backend, Config, s3_capabilities, serve_folding};
+use pstore_server::{Api, Backend, Config, open_cache, s3_capabilities, serve_folding};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -68,7 +68,18 @@ async fn run<S: BlobStore + 'static>(
     store: Accounted<S>,
     config: &Config,
 ) -> std::process::ExitCode {
-    let api = match Api::new(store, config.lane) {
+    let cache = match open_cache(&store, config).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pstore-server: cannot read the store id the read cache needs: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let built = match &cache {
+        Some(c) => Api::with_cache(store, config.lane, Arc::clone(c)),
+        None => Api::new(store, config.lane),
+    };
+    let api = match built {
         Ok(a) => a,
         Err(e) => {
             // ⚠️ The refusal criterion 3 rests on. An operator who has not run the
@@ -86,13 +97,24 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     eprintln!(
-        "pstore-server: listening on {}, lane {:?}, backend {:?}, profile {:?}, fold {:?}",
-        config.bind, config.lane, config.backend, config.profile, config.fold
+        "pstore-server: listening on {}, lane {:?}, backend {:?}, profile {:?}, fold {:?}, cache {:?}",
+        config.bind,
+        config.lane,
+        config.backend,
+        config.profile,
+        config.fold,
+        cache.as_ref().map(|c| c.disk_state())
     );
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    match serve_folding(api, listener, shutdown, config.fold, config.gc).await {
+    let served = serve_folding(api, listener, shutdown, config.fold, config.gc).await;
+    // ⚠️ After the server has stopped: the disk tier's writes in flight are flushed, or a
+    // deploy would lose them every time (M20).
+    if let Some(c) = &cache {
+        c.close().await;
+    }
+    match served {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("pstore-server: {e}");

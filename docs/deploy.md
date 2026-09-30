@@ -37,6 +37,26 @@ first flush to a tenant resumes the lane where it ended: it reads HEAD's waterma
 lane, then probes forward from it, with no LIST. Those probes are the first flush's only
 extra cost, 8 parallel reads.
 
+## A read cache that survives a restart
+
+Set `PSTORE_CACHE_DIR` to a local directory and the server reads segments through a memory
+tier and a disk tier behind it ([M20](milestones/M20/SPEC.md)). A restart keeps the disk tier,
+so a deploy is not a fleet-wide cold start. Unset, the server is uncached.
+
+- **One directory per lane.** The tier lives in `<dir>/lane-<n>`, so several server processes
+  on one host may share `PSTORE_CACHE_DIR`: their lanes differ, so their files do too.
+- **Size it as the budget it is.** The disk tier preallocates `PSTORE_CACHE_DISK_BYTES` as files
+  at start. Endurance throttling is not configured yet.
+- **It records which store filled it.** Each start reads the bucket's store id at
+  `_pstore/store-id`, creating it the first time: one GET, or one conditional PUT and a GET.
+  A directory recorded for any other store, or a recreated bucket, is emptied before it serves
+  anything. ⚠️ **A bucket restored from a backup keeps its old id.** Empty the cache directory
+  by hand when you restore one, or the tier may serve objects the restore removed.
+- **A broken disk degrades.** A directory the server cannot use leaves it memory-only, which it
+  prints at start as `Bypassed`. It never refuses to serve over it.
+- **Not with `PSTORE_BACKEND=memory`,** which is refused. A memory store is new at every start
+  and its keys repeat, with other bytes.
+
 ## Unscheduled duties
 
 ⚠️ **The ids below are checked against `pstore_server::UNSCHEDULED`**, served at
@@ -99,6 +119,9 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_GC` | on | Exactly `off` disables the scheduled reap; anything else is refused. |
 | `PSTORE_GC_PERIOD_MS` | `1000` | How often the reap loop looks. Looking costs no request. |
 | `PSTORE_GC_AGE_S` | `3600` | How long a buried object is kept, and so how far back `as_of` reaches. Below an hour, a `bounded` read's cached HEAD can name a reaped object; the read retries fresh, at the cost of a request. |
+| `PSTORE_CACHE_DIR` | — | Turns on the read cache (above). Refused with `PSTORE_BACKEND=memory`. |
+| `PSTORE_CACHE_RAM_BYTES` | `268435456` | The memory tier, split by class: a tenth each for centroid tables and segment metadata, the rest bulk. Refused without `PSTORE_CACHE_DIR`. |
+| `PSTORE_CACHE_DISK_BYTES` | `4294967296` | The disk tier, split the same way and preallocated. Refused without `PSTORE_CACHE_DIR`. |
 
 ## Observability
 

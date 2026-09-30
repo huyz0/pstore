@@ -119,6 +119,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 |---|---|---|---|
 | 44 | ⚠️ **A process paused between its HEAD read and its segment PUT can overwrite a live segment.** Segment keys derive from the epoch and the lane, and a segment PUT is unconditional. A process that pauses there, on a lane whose restarted successor has since committed that key, overwrites it with other rows when it wakes. Found by M20's spec review. The read cache makes the damage last longer; it does not create it. The fix is the one bundles got in M17: create segments if absent, and treat a refusal as another writer. | [M20](M20/SPEC.md) | M |
 | 45 | **The memory tier's LRU is a `Vec`**, whose touch is O(entries). Since M20 one core is shared by every tenant, so this is a cost that grows with the whole node's working set, not a correctness issue. | [M20](M20/SPEC.md) | S |
+| 46 | ⚠️ **A vector query pays a read per small segment for a centroid table that does not exist.** Below `EXACT_SCAN_THRESHOLD` (25,000 rows) a segment has no `.cen`, and the query learns that from a 404, every time. A read cache cannot keep a 404, since only an object can be validated, so this survives M20 and is most of a warm query's cost for most tenants. The fix is a **format** change: a segment's footer says whether its centroid table exists. | [M20](M20/SPEC.md) | S |
 
 ## Opened by M19
 

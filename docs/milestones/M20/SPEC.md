@@ -93,7 +93,10 @@ updated to match.
 
 1. **A restart is not a flush.** `Api::with_cache` answers a query, and its core is closed. A
    new `Api` over a new core on the same directory answers identically, at
-   `cost.blob_reads == 1` (HEAD alone).
+   `cost.blob_reads == 1` (HEAD alone), plus one read per segment a vector query opens that
+   has no centroid table. ⚠️ Amended at implementation: below `EXACT_SCAN_THRESHOLD` a segment
+   has none, the query's `get_immutable` of it is a 404, and no cache keeps a 404 (BACKLOG
+   row 46).
 2. **Warm answers equal cold ones.** Hits and their order are equal to an uncached `Api`'s,
    before and after a reopen.
 3. **Another store's directory serves nothing.**
@@ -111,8 +114,8 @@ updated to match.
    - A directory path that is a regular file: `Bypassed`, and correct reads at the uncached
      count. `Api::with_cache` starts over it.
    - The tier's data files truncated under an open core: correct reads.
-7. **A hit is not billed.** Through the API, the second identical query costs
-   `blob_reads == 1`.
+7. **A hit is not billed.** Through the API, the second identical query costs what criterion 1
+   does.
 8. **`get` is never cached, on disk either**: two `get`s around a reopen make 2 requests.
    - `Range(k,0,n)`, `Whole(k)` and `Suffix(k,n)` are three distinct entries.
    - An entry of 4 MiB + 1 byte is a memory hit, and after a reopen a disk miss, with no
@@ -122,11 +125,8 @@ updated to match.
      entries unchanged. A query admits.
    - A `Scan` read of a range a bulk read admitted costs no request, from memory and from
      disk, and a `Scan` hit on disk is not promoted.
-   - ⚠️ **Amended at implementation.** This bullet first said a compaction is served what a
-     query warmed. The cache keys by the exact range requested, and today a query reads a
-     segment's data section whole (`0..4110`) while a scan reads it block by block
-     (`0..826, 826..1690, …`). So no engine path shares a range between the two, and that
-     test could not pass. What is checkable is that a `Scan` lookup probes bulk.
+   - ⚠️ **Amended at implementation**, from "a compaction is served what a query warmed": a
+     query reads a data section whole, a scan by block, and the cache keys by exact range.
 10. **Reopening is bounded.** A full 256 MiB tier reopens in under 1 s here, measured by
     `a_full_tier_reopens_within_a_second`. That test is `#[ignore]`d, because wall-clock time is
     not deterministic and a mutation sweep would rerun it. It is run by hand with
