@@ -12,7 +12,8 @@ fails a test: two only after tests were added for them (in 5 and 7).
 
 1. **A discarded compaction** — `a_discarded_compaction_is_buried`: every orphan buried at its own
    key epoch, the past unchanged, `gc(0)` taking it and its sidecars, and the live rows kept. It
-   failed with the discard not burying, and with the first seal or a re-seal not recorded.
+   failed with the first seal or a re-seal not recorded, and with keys buried at the committing
+   epoch.
 2. **A moved delete vector** — `a_compaction_whose_delete_vector_moved_is_buried`, which failed
    the same ways.
 3. **A refused branch retry** — `a_refused_branch_retry_is_buried`: the copy buried at its own
