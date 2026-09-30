@@ -22,27 +22,31 @@
 ## Delta
 
 **Abandoned work is buried by one commit of its own.** When a compaction or a branch gives up
-after writing objects, it commits a HEAD that differs from the one it holds only by those
-keys. Each key is added to the graveyard **under its own key epoch**, exactly as M7e buries a
-retry's stale keys. The burial commit:
-- is a CAS on a fresh HEAD, retried on `Lost` up to `MAX_COMMIT_ATTEMPTS`, as any commit is;
-- is recorded for the scheduled reap (M18), since it buries something;
-- never changes what the abandoning call returns. `Ok(None)` stays `Ok(None)`, and an error
-  stays that error. If the burial itself cannot land, the objects stay unnamed, as today.
-
-**Which exits bury:**
-- a compaction, after sealing: the discard (`Ok(None)`), and the loop running out, with every
-  key it sealed (`out_key` and `stale`);
-- a branch, after an attempt wrote copies: a refusal on a retry, and the loop running out,
-  with every copy it wrote (`stale` and the last attempt's `copies`).
-
-A merge with no rows sealed nothing, and a branch of a source with no deletes wrote nothing.
-Neither commits a burial.
+after writing objects, it reads HEAD fresh and commits one that differs only by those keys. Each
+key is added to the graveyard **under its own key epoch**, exactly as M7e buries a retry's stale
+keys, so `as_of` never resurrects it.
+- **Every exit after writing buries, except a commit that landed.** That covers the discard
+  (`Ok(None)`), the loop running out, a refusal on a retry, and any error, including a `?`
+  after sealing or a copy PUT failing partway. The written keys are collected as they are
+  written, and the burial runs in one place, around the whole body.
+- **A key the HEAD being committed still names is never buried.** Compaction and branch keys
+  are derived from the epoch, the lane and the index alone, so a winner on the same lane can
+  have written, and committed, the very key the loser wrote. The burial drops every key named
+  by that HEAD's `indexes` and every value of its `deletes`. This is checked in memory. GC's
+  live check would keep the object anyway, but a live key in the graveyard is a contradiction
+  `as_of`'s dedup would hide.
+- The burial CAS is retried on `Lost` against a fresh HEAD, up to `MAX_COMMIT_ATTEMPTS`. It is
+  recorded for the scheduled reap (M18).
+- It never changes what the abandoning call returns. If it cannot land, the objects stay
+  unnamed, as today.
+- A merge that sealed nothing, and a branch that copied nothing, commit no burial.
 
 **Does not change:** the success paths, their costs, or what they bury; `as_of`; the graveyard's
 format; the orphan sweeper's job, which stays whatever a crash leaves.
 
 ## Acceptance criteria
+
+The other writer below is on a **different lane**, unless the criterion says otherwise.
 
 1. **A discarded compaction is buried.** Another compaction of the same index commits first,
    through `compact_with_interference_for_test`, and ours returns `Ok(None)`.
@@ -52,14 +56,16 @@ format; the orphan sweeper's job, which stays whatever a crash leaves.
 2. **A compaction whose delete vector moved** (a fold deletes a row of an input meanwhile)
    is discarded and buried the same way.
 3. **A refused branch retry is buried.** A branch's first attempt loses its CAS after copying
-   a delete vector, and `dest` is created meanwhile, so the retry is refused.
-   - The copies are in the graveyard, and `gc(0)` removes them.
-   - `dest`'s own rows are untouched.
-4. **The past is unchanged.** For each scenario, `as_of` at every epoch from before the
-   abandonment answers exactly as it did before the burial commit.
-5. **Cost.** The abandoning call costs what it did before, plus 1 CAS, and 1 HEAD read per
-   `Lost` retry of that CAS. A merge that sealed nothing, and a success, add nothing.
-6. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
+   a delete vector, and `dest` is created meanwhile, so the retry is refused. The copies are
+   in the graveyard, `gc(0)` removes them, and `dest`'s rows are untouched.
+4. **The past is unchanged.** For each scenario, `as_of` answers exactly as it did before the
+   burial commit, at every buried key's own key epoch and at every epoch up to the burial.
+5. **A same-lane winner's key is not buried.** Two compactions on one lane seal the same key,
+   and the winner commits it. The loser's burial leaves that key out, and `gc(0)` keeps it.
+6. **Cost.** An abandoning call costs what it did before, plus 1 HEAD read and 1 CAS, plus
+   1 read and 1 CAS per `Lost` retry of that CAS. A merge that sealed nothing, and a success,
+   add nothing.
+7. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
 
 ## Test plan
 
@@ -69,13 +75,14 @@ format; the orphan sweeper's job, which stays whatever a crash leaves.
 | 2 | as 1 | the second discard path not burying |
 | 3 | the copies are not buried | the refusal not burying; `copies` left out |
 | 4 | a past epoch answers with the discarded merge | burying at the committing epoch in place of the key epoch |
-| 5 | an extra request on a success | a burial commit on a path that wrote nothing |
+| 5 | the winner's key is in the graveyard | the live-key filter removed |
+| 6 | an extra request on a success | a burial on a path that wrote nothing, or on success |
 
 ## RA budget
 
-The success paths are unchanged. An abandoned compaction or branch adds 1 CAS, plus 1 R per
-`Lost` retry. That happens only when optimistic work lost, never per row, and never on a query
-or a write.
+The success paths are unchanged. An abandoned compaction or branch adds 1 R and 1 CAS, plus
+1 R and 1 CAS per `Lost` retry. That happens only when optimistic work lost, never per row,
+and never on a query or a write.
 
 ## Risks
 
