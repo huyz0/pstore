@@ -283,6 +283,8 @@ async fn a_write_that_never_landed_is_written_again_at_its_sequence() {
     let e = Engine::new(Arc::clone(&store), T, LANE);
     e.write("idx", vec![doc("r0")]).await.unwrap();
     assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    // Folded, so the watermark is exactly the sequence the failed write was at.
+    e.fold().await.unwrap();
     e.write("idx", vec![doc("r1")]).await.unwrap();
     store.fail_before.store(true, Ordering::SeqCst);
     store.fail_read.store(true, Ordering::SeqCst);
@@ -417,4 +419,28 @@ async fn a_write_that_lands_late_is_its_own_not_a_second_writer() {
     let fresh = Engine::new(Arc::clone(&store), T, LaneId(9));
     fresh.fold().await.unwrap();
     assert_eq!(ids(&fresh).await, ["r0", "r1", "r2"]);
+}
+
+#[tokio::test]
+async fn another_writers_bundle_where_a_write_is_unresolved_is_lane_taken() {
+    // A's write at 1 fails before landing, and so does the read that would tell. B, on the
+    // same lane, then writes 1. A's resolution finds a bundle there that is not its bytes.
+    let store = Arc::new(Unreliable::default());
+    let a = Engine::new(Arc::clone(&store), T, LANE);
+    a.write("idx", vec![doc("a0")]).await.unwrap();
+    assert_eq!(a.flush().await.unwrap(), Some(Seq(0)));
+    a.write("idx", vec![doc("a1")]).await.unwrap();
+    store.fail_before.store(true, Ordering::SeqCst);
+    store.fail_read.store(true, Ordering::SeqCst);
+    a.flush().await.expect_err("the failed write was reported");
+    let b = Engine::new(Arc::clone(&store), T, LANE);
+    b.write("idx", vec![doc("b1")]).await.unwrap();
+    assert_eq!(b.flush().await.unwrap(), Some(Seq(1)));
+    let err = a.flush().await.expect_err("A took B's bundle for its own");
+    assert!(
+        matches!(err, EngineError::LaneTaken { lane: 1, seq: 1 }),
+        "{err:?}"
+    );
+    // A's row was never durable, and stays A's to read.
+    assert!(ids(&a).await.contains(&"a1".to_owned()));
 }
