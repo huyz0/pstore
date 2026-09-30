@@ -1,129 +1,179 @@
 # M20 — A read cache that survives a restart
 
-**Serves:** D-23 (the disk cache survives a restart and is validated by key), D-21 (class
-quotas, now on disk too), D-22 (`foyer` for the disk tier). It is the tier `hint_cache_warm`
-needs, which moves to M21.
+**Serves:** D-23 (the disk cache survives a restart), D-21 (class quotas, now on disk too),
+D-22 (`foyer` for the disk tier), D-50 (scans bypass the cache). It is the tier
+`hint_cache_warm` needs, which moves to M21.
 
 ## What is true today
 
 - `pstore-cache::Caching` is an in-memory LRU with one quota per class. It caches ranges and
   suffixes, and whole objects only through `get_immutable`. It refuses `get`.
-- **The server uses no cache at all.** Every query pays every range read, and a restart has
-  nothing to lose.
-- There is no disk tier. [`roadmap.md`](../../research/11-design/roadmap.md) names it as not
-  built: "a rolling restart still flushes every cache".
+- **The server uses no cache at all**, and there is no disk tier.
+  [`roadmap.md`](../../research/11-design/roadmap.md) says so: "a rolling restart still
+  flushes every cache".
 
 ## Delta
 
-**A disk tier behind the memory tier.** `Caching` gains an optional `DiskTier`, opened on a
-local directory with a byte budget.
-- A memory miss reads the disk tier. A disk miss fetches from the store and admits the bytes
-  to both tiers. The singleflight is unchanged.
-- **One `foyer` hybrid cache per class**, in its own subdirectory, each holding its class's
-  share of the disk budget. The shares are the memory tier's: a tenth for pinned, a tenth for
-  meta, and the rest for bulk. A bulk burst can evict only bulk entries, on disk as in memory
-  (D-21).
-- `foyer`'s own memory tier is sized to its minimum; ours stays in front of it.
-- Entries are written to disk on admission (`WriteOnInsertion`), so a crash loses only
-  writes still in flight.
-- **Reopening recovers entries** (`RecoverMode::Quiet`). It reads the tier's own files only,
-  never the blob store.
+**A shared core, a disk tier, and one read path.**
+- The cache's state moves into `CacheCore`, which is shared. `Caching::over(inner,
+  Option<Arc<CacheCore>>)` wraps one tenant's view.
+- With no core, it forwards every call verbatim. `Api` always builds engines over
+  `Caching<TenantView<S>>`, so that `Api::new` (no core) and `Api::with_cache(store, lane,
+  core)` share one engine type.
+- `CacheCore::open(dir, ram, disk, identity)` puts the disk tier behind the memory tier:
+  - It is **one `foyer` hybrid cache per class**, each in its own subdirectory, with the
+    memory tier's shares of the disk budget: a tenth pinned, a tenth meta, the rest bulk
+    (D-21). The block size is 4 MiB, and an entry larger than a block is not admitted to
+    disk.
+  - A memory miss reads the disk tier. A disk miss fetches from the store and admits the bytes
+    to both tiers. Disk lookups run **outside** the memory tier's lock, and concurrently for
+    the ranges of one call. The singleflight is unchanged.
+  - Entries are written on admission (`WriteOnInsertion`).
+  - The foyer key is `Id` itself, encoded structurally as a tag plus fields, never as a joined
+    string.
+- `CacheCore::close()` flushes and closes the tier. `main.rs` calls it on shutdown.
 
-**Validated by key, and by store.** A cached key's bytes never change: see Risks. What does
-change is the store behind the directory, so the directory holds an `identity` file. It names
-the backend, and the endpoint and bucket for S3.
-- An `identity` that differs, or is missing, **empties the tier before it serves anything**.
-- The file is written once the tier is empty.
+**Recovery, and what it trusts.**
+- Reopening recovers entries (`RecoverMode::Quiet`) from the tier's files alone, with no
+  blob request.
+- foyer checks each entry's checksum on read, and a mismatch is a miss (block engine
+  `load`). The tier relies on that for torn and corrupt entries.
+- ⚠️ **Deviates from D-23's "index the directory in a small file; do not scan it".** foyer's
+  recovery reads every block header. A banner on D-23 records it, and criterion 10 bounds it.
 
-**A broken disk degrades, never fails.** If the directory cannot be opened, or a disk read or
-write fails, the tier is bypassed: the read goes to the store, as it would uncached.
-- A failure to open leaves the process RAM-only, with `DiskTier::state()` reporting
-  `Bypassed(reason)`.
-- A failed disk read counts as a miss.
+**Validated by store.** The directory holds an `identity` file with the string the caller
+passes. The server passes:
+- the endpoint, the bucket, and a **store id**: a random 128-bit value at `_pstore/store-id`,
+  read once at startup and created if absent with create-if-absent.
+  - A bucket wiped and recreated gets a new id, so its old entries are never served.
+  - A bucket **restored from backup** keeps the old id; `deploy.md` says to empty the
+    directory.
+- `Backend::Memory` with `PSTORE_CACHE_DIR` is **refused by name**. Each start is a new empty
+  store whose epochs restart, so its keys repeat with other bytes.
 
-**Shared across tenants, outside each tenant's accounting.** The state moves into a shared
-`Arc<CacheCore>`. `Caching::over(inner, core)` wraps one tenant's view.
-- Every cached key names its tenant, so one core serves every tenant.
-- A hit is never billed to the tenant, because accounting sits under the cache
-  ("`Caching<Accounted<_>>`", this crate's own doc).
-- `Api::with_cache(store, lane, core)` builds each engine over `Caching<TenantView<S>>`.
-  `Api::new` keeps today's uncached stack, so no existing request count moves.
+An `identity` that differs, or is missing, **empties the tier before it serves anything**:
+1. delete the class subdirectories, and sync the directory;
+2. then write and sync `identity`.
+
+**One directory per lane.** The tier opens `<dir>/lane-<n>`. A lane has a single writer, so
+two processes never share foyer's files, and no lock is needed.
+
+**A broken disk degrades, never fails.**
+- A directory that cannot be opened leaves the core RAM-only, reporting
+  `DiskState::Bypassed(reason)`.
+- A foyer error on lookup is a miss; on insert, it is dropped.
+
+**D-50: scans do not admit.** `Class` gains `Scan`.
+- On a hit, a `Scan` read is served from the cache. On a miss, it fetches **without
+  admitting**, to either tier.
+- The engine wraps its store in a `Scanning` adapter for the reads made by compaction, the
+  fold's delete and upsert pass, and `Engine::scan`. The adapter maps each read to its `_as`
+  form with `Class::Scan`.
+- The existing match sites on `Class` gain the arm, and `Accounted` counts `Scan` with `Bulk`.
 
 **Configuration.**
 - `PSTORE_CACHE_DIR` turns the cache on.
-- `PSTORE_CACHE_RAM_BYTES` sets the memory budget (default 256 MiB), and
-  `PSTORE_CACHE_DISK_BYTES` the disk budget (default 4 GiB).
-- A value that is not a positive integer is refused by name, as `PSTORE_GC_*` values are.
-- Without `PSTORE_CACHE_DIR` the server is uncached, as today.
-- `deploy.md` gains the three rows, and a section on sizing and on sharing a directory.
+- `PSTORE_CACHE_RAM_BYTES` defaults to 256 MiB, and `PSTORE_CACHE_DISK_BYTES` to 4 GiB.
+- A value that is not a positive integer is refused by name. A `*_BYTES` value without the
+  directory is also refused by name.
+- Without the directory the server is uncached, as today.
+- `deploy.md` gains the rows, the lane subdirectory, and the backup-restore rule.
 
-**Does not change:** what is cacheable (`get` is still refused, on disk too); any write;
-HEAD reads; the request counts of an uncached server; D-50's scan bypass, which the
-engine's classes already carry.
+**Does not change:** what is cacheable (`get` is still refused, on disk too); any write; HEAD
+reads; the request counts of an uncached `Api`. The crate docs (`lib.rs`, `cache.rs`) are
+updated to match.
 
 ## Acceptance criteria
 
-1. **A restart is not a flush.** A server over a cache directory answers a query. A new
-   `Api` over a new `CacheCore` on the same directory answers the same query identically. It
-   costs 1 HEAD read and **0** range or suffix reads, from `Accounted`'s counters.
-2. **Warm answers equal cold ones.** Queries repeated through the cache, before and after
-   a reopen, give answers equal to an uncached server's over the same store.
-3. **Another store's directory serves nothing.** A directory filled for store A, then opened
-   for store B, which holds a different object at the same key: B's answer is B's, and B
-   pays the uncached request count.
-4. **Quotas hold on disk.** A meta entry is admitted, then a bulk burst of twice the bulk
-   share. After a reopen, the meta entry is a hit, at 0 requests.
-5. **A broken directory bypasses.** A cache opened on a path that is a regular file
-   reports `Bypassed`, and every read answers correctly at the uncached request count.
-   `Api::with_cache` starts over it.
-6. **A hit is not billed.** Through the API, the second identical query's `cost` shows
-   0 range reads.
-7. **`get` is never cached, on disk either.** Two `get`s of one key, around a reopen, make
-   2 requests.
-8. **Configured by name.** `PSTORE_CACHE_DIR` absent means `Config.cache` is `None`. Each
-   invalid `PSTORE_CACHE_*_BYTES` is refused, naming the variable. The defaults are as stated.
-9. **Sealing is deterministic.** Two engines on the same lane compact identical HEADs
-   (same writes, same order, separate stores). Their merged segments, and each sidecar,
-   are byte-identical.
-10. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
+1. **A restart is not a flush.** `Api::with_cache` answers a query, and its core is closed. A
+   new `Api` over a new core on the same directory answers identically, at
+   `cost.blob_reads == 1` (HEAD alone).
+2. **Warm answers equal cold ones.** Hits and their order are equal to an uncached `Api`'s,
+   before and after a reopen.
+3. **Another store's directory serves nothing.**
+   - A directory filled under identity A, opened under B: a read of the same key fetches B's
+     object.
+   - Opened under B, closed with nothing inserted, then reopened under B: still no entry of
+     A's.
+   - With `identity` deleted, reopened under A: nothing served.
+4. **Quotas hold on disk.** A meta entry is admitted, then twice the bulk share of bulk
+   entries. After a reopen, the meta entry is a hit at 0 requests.
+5. **Corruption is a miss.** One byte of a tier data file is flipped, and the tier reopened.
+   The read answers the store's bytes at the uncached count.
+6. **A broken disk bypasses.**
+   - A directory path that is a regular file: `Bypassed`, and correct reads at the uncached
+     count. `Api::with_cache` starts over it.
+   - The tier's data files truncated under an open core: correct reads.
+7. **A hit is not billed.** Through the API, the second identical query costs
+   `blob_reads == 1`.
+8. **`get` is never cached, on disk either**: two `get`s around a reopen make 2 requests. And
+   `Range(k,0,n)`, `Whole(k)` and `Suffix(k,n)` are three distinct entries.
+9. **Scans do not admit.** A compaction, and an `Engine::scan`, leave memory and disk entry
+   counts unchanged. A query admits.
+10. **Reopening is bounded.** A full 256 MiB tier reopens in under 1 s here. The measured
+    number is recorded as `provisional`.
+11. **One directory per lane.** Cores for lanes 1 and 2 on one directory share no file.
+12. **Configured by name.**
+    - No `PSTORE_CACHE_DIR` means `Config.cache` is `None`.
+    - Each invalid `*_BYTES`, a `*_BYTES` without the directory, and `Backend::Memory` with
+      the directory are each refused by name.
+    - The store id is created once and read back unchanged.
+13. **Uncached is unchanged.** The server suite's request counts pass under `Api::new`
+    unchanged. `the_uncached_api_repeats_its_reads` pins a repeated query at the same count.
+14. **Sealing a key twice writes the same bytes.** Two compactions on one lane seal one key:
+    the second through `compact_with_interference_for_test`, on one store. The segment and
+    each sidecar are byte-identical before and after the loser's PUT. If this fails, M20
+    stops.
+15. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
 
 ## Test plan
 
 | # | Fails first | Mutation it catches |
 |---|---|---|
-| 1 | the reopened query reads its ranges again | the disk tier not consulted on a memory miss; not admitted on fetch; recovery off |
-| 2 | — (guards 1 against serving wrong bytes) | a disk hit returning another key's or range's bytes |
-| 3 | B is served A's bytes | the identity not compared; compared but not emptied |
-| 4 | the meta entry is gone | one shared disk instance; a class's share swapped |
-| 5 | opening panics or errors | a disk error propagated in place of a bypass |
-| 6 | a hit billed a range read | the cache under accounting, not over it |
-| 7 | the second `get` is a hit | `get` admitted to disk |
-| 8 | the variables are ignored | the parse, the defaults, the refusal |
-| 9 | — (a guard: it may pass first; if it fails, sealing is fixed before M20.1) | iteration order of a hash map reaching a sealed byte |
+| 1 | the reopened query reads its ranges again | disk not consulted; not admitted; recovery off; `close` not flushing |
+| 2 | — (guards 1) | a disk hit returning another entry's bytes |
+| 3 | B is served A's bytes | identity not compared; recovery merely disabled rather than files deleted; missing read as a match |
+| 4 | the meta entry is gone | one shared disk instance; shares swapped |
+| 5 | the flipped entry is served | — (relies on foyer; pins it across upgrades) |
+| 6 | open panics or a read errors | a disk error propagated |
+| 7 | a hit billed | the cache under accounting |
+| 8 | the second `get` hits; ids collide | `get` admitted; a string-joined key |
+| 9 | the compaction admits | the adapter unused; `Scan` admitted |
+| 10 | — (a bound) | — |
+| 11 | lanes share files | the lane dropped from the path |
+| 12 | the variables are ignored | the parse, the defaults, each refusal |
+| 13 | a repeated uncached query costs less | a core-less `Caching` caching |
+| 14 | — (a guard) | hash-map order reaching a sealed byte |
 
 ## RA budget
 
-A hit costs 0 requests; a miss costs what it does today. Reopening a directory costs 0 blob
-requests and no LIST: it reads local files only. HEAD is never cached, so a query's depth
-is unchanged cold, and one round of range reads shallower warm (M4d measured 2 → 1).
+- A hit costs 0 requests; a miss costs what it does today.
+- Reopening costs 0 blob requests and no LIST.
+- Startup with a cache costs 1 GET, plus 1 conditional PUT and 1 GET the first time ever. That
+  is per node, never per tenant.
+- HEAD is never cached, so cold depth is unchanged. Warm depth is one round shallower (M4d
+  measured 2 → 1).
 
 ## Risks
 
-- **A key whose bytes change would be served stale, for as long as the disk keeps it.** The
-  cache relies on three things: a committed key is never rewritten, since epochs only grow;
-  an uncommitted one is never read, so it is never cached; and nothing deletes a tenant's
-  HEAD. The one exception known is M19's same-lane case, where two compactions write the same
-  key. It is safe only if both write the same bytes, which criterion 9 pins. A new writer of a
-  derived key must keep that property, or give the key a content hash.
-- **`foyer` recovery reads each block header** on open. That is local I/O proportional to the
-  device, not a LIST. Measured on this container: 12 ms for 64 MiB. That is `provisional`,
-  and it is not the scale D-23 means.
-- **`foyer` preallocates its whole budget** as files, so disk use is the budget from the start.
-- **Endurance and throttling** (disk-space-management.md §7) are not configured here. Any
-  number measured on this container is `provisional`.
+- **A key whose bytes change is served stale**, for as long as the disk keeps it. The cache
+  relies on three things: a committed key is not rewritten, since epochs only grow; an
+  uncommitted key is never read; and nothing deletes HEAD. Two known exceptions:
+  - M19's same-lane compaction, which criterion 14 pins;
+  - a paused process on a lane whose restarted successor has committed, whose unconditional
+    segment PUT can overwrite a live segment. That is
+    [BACKLOG](../BACKLOG.md) row 24's residue. The cache makes it last longer; it does not
+    create it.
+- **Recovery reads every block header** (criterion 10). At NVMe scale that is D-23's cost,
+  and it is left to M21 or later.
+- **foyer preallocates its budget**, and endurance throttling (disk-space-management.md §7)
+  is not configured. Every number measured here is `provisional`.
+- **The memory tier's LRU is a `Vec`**, whose touch is O(entries), and it is now shared. That
+  is a cost, not a correctness issue. It is recorded as a backlog row, not changed here.
 
 ## Tasks
 
-- **M20.1** — the disk tier, the identity check and the bypass in `pstore-cache`, with
-  `CacheCore` shared.
-- **M20.2** — `Api::with_cache`, `Config.cache`, and `main.rs` and `deploy.md`.
+- **M20.1** — `CacheCore`, the disk tier, the identity check and emptying, the bypass, and
+  `close`, in `pstore-cache`.
+- **M20.2** — `Class::Scan`, and the engine's `Scanning` adapter.
+- **M20.3** — `Api::with_cache`, `Config.cache`, the store id, `main.rs`, and `deploy.md`.
