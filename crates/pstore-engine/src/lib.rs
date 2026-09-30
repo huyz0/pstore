@@ -2370,8 +2370,10 @@ impl<S: BlobStore> Engine<S> {
             // Never attempted here, so another process wrote it -- unless an earlier attempt
             // at this sequence timed out and landed late (spec review N3): then its bytes say.
             Err(pstore_blob::CasError::Lost) => {
-                let late = record.filter(|r| r.absent && r.seq == seq);
-                if let Some(rec) = late
+                // A record still here is one found absent, at this sequence: a non-absent one
+                // was resolved above, and `next` moves only as a record is cleared.
+                debug_assert!(record.as_ref().is_none_or(|r| r.absent && r.seq == seq));
+                if let Some(rec) = record
                     && let Some(a) = self.resolve_uncertain(&rec).await?
                 {
                     self.landed(rec.seq, &a.counts, a.body.len() as u64);
