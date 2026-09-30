@@ -25,6 +25,11 @@ pub fn bundle_key(tenant: TenantId, lane: LaneId, seq: Seq) -> Key {
     ))
 }
 
+/// The most commit records an engine keeps for its scheduled reap (M18). Past it, the oldest is
+/// dropped: the next record is later in time and in epoch, so it stands for both, and only
+/// makes their commits look younger.
+const MAX_REAPABLE: usize = 1024;
+
 /// How many times a commit rebases before giving up.
 ///
 /// Bounded on purpose: a commit that cannot land after this many rebases is reporting
@@ -1154,7 +1159,7 @@ pub struct Engine<S> {
     uncertain: Mutex<Option<Uncertain>>,
     /// Each commit this engine made, and when (M18): what a scheduled reap may take once it is
     /// old enough. Never a reap's own commit.
-    reapable: Mutex<Vec<(tokio::time::Instant, Epoch)>>,
+    reapable: Mutex<std::collections::VecDeque<(tokio::time::Instant, Epoch)>>,
     committed: Mutex<Epoch>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
@@ -1286,7 +1291,7 @@ impl<S: BlobStore> Engine<S> {
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             uncertain: Mutex::new(None),
-            reapable: Mutex::new(Vec::new()),
+            reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
@@ -3184,11 +3189,19 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn reap_due(&self, age: std::time::Duration) -> Option<Epoch> {
         let now = tokio::time::Instant::now();
+        // In time order, so the due ones are a prefix: nothing past it is scanned.
         self.reapable()
             .iter()
-            .filter(|(at, _)| now.saturating_duration_since(*at) >= age)
+            .take_while(|(at, _)| now.saturating_duration_since(*at) >= age)
             .map(|(_, e)| *e)
-            .max()
+            .last()
+    }
+
+    /// How many commit records this engine holds (M18).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reapable_len_for_test(&self) -> usize {
+        self.reapable().len()
     }
 
     /// Reaps graveyard entries buried at or below `horizon` (M18), and then forgets the commits
@@ -3203,7 +3216,9 @@ impl<S: BlobStore> Engine<S> {
         Ok(reaped)
     }
 
-    fn reapable(&self) -> std::sync::MutexGuard<'_, Vec<(tokio::time::Instant, Epoch)>> {
+    fn reapable(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(tokio::time::Instant, Epoch)>> {
         self.reapable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3212,8 +3227,26 @@ impl<S: BlobStore> Engine<S> {
     /// Records a commit a scheduled reap may later take (M18). ⚠️ Called **after** the CAS
     /// returns, so a slow commit only looks younger -- and never for a reap's own commit, or
     /// each reap would make the next one due.
+    ///
+    /// ⚠️ **Bounded, and only ever conservatively** (code review, M18): with no reap scheduled,
+    /// nothing drains the records. A commit within a second of the last record replaces it, and
+    /// past [`MAX_REAPABLE`] the oldest is dropped. In both cases the record that stays is the
+    /// LATER instant and epoch, so a commit can only look younger: a reap may come later,
+    /// never earlier.
     fn record_reapable(&self, epoch: Epoch) {
-        self.reapable().push((tokio::time::Instant::now(), epoch));
+        let now = tokio::time::Instant::now();
+        let mut r = self.reapable();
+        match r.back_mut() {
+            Some(last)
+                if now.saturating_duration_since(last.0) < std::time::Duration::from_secs(1) =>
+            {
+                *last = (now, epoch);
+            }
+            _ => r.push_back((now, epoch)),
+        }
+        if r.len() > MAX_REAPABLE {
+            r.pop_front();
+        }
     }
 
     /// Reaps objects dereferenced more than `retention` epochs ago.

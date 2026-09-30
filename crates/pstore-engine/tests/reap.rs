@@ -126,3 +126,113 @@ async fn gc_by_retention_still_reads_head_once() {
     assert!(e.gc(0).await.unwrap() > 0);
     assert_eq!(acct.count(t, OpClass::Read) - reads, 1);
 }
+
+/// Every key under `index`'s own path.
+async fn keys_of(store: &MemoryStore, index: &str) -> Vec<String> {
+    store
+        .list_unrestricted(&Key::new(String::new()))
+        .await
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .filter(|k| k.contains(&format!("/idx/{index}/")))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_kind_of_commit_is_reaped_on_schedule() {
+    // Each engine makes one kind of commit and nothing else, so only that commit can make the
+    // tenant due -- and the reap must take what it buried.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(185);
+    let seed = Engine::new(Arc::clone(&store), t, LaneId(1));
+    for id in ["a", "b"] {
+        commit(&seed, id).await;
+    }
+    seed.delete("idx", vec!["a".into()]).await.unwrap();
+    seed.flush().await.unwrap();
+    seed.fold().await.unwrap();
+    seed.write("gone", vec![doc("g")]).await.unwrap();
+    seed.flush().await.unwrap();
+    seed.fold().await.unwrap();
+    let before: Vec<String> = keys_of(&store, "idx").await;
+
+    let compacting = Engine::new(Arc::clone(&store), t, LaneId(2));
+    let compacted = compacting.compact("idx").await.unwrap().unwrap();
+    let dropping = Engine::new(Arc::clone(&store), t, LaneId(3));
+    let dropped = dropping.delete_index("gone").await.unwrap().unwrap();
+    let branching = Engine::new(Arc::clone(&store), t, LaneId(4));
+    let branched = branching.branch("idx", "copy").await.unwrap();
+    tokio::time::advance(HOUR).await;
+    for (e, epoch) in [
+        (&compacting, compacted),
+        (&dropping, dropped),
+        (&branching, branched),
+    ] {
+        assert_eq!(e.reap_due(HOUR), Some(epoch), "a commit was not recorded");
+    }
+    // The drop's reap takes the dropped index; the compaction's takes the merged inputs,
+    // their delete vector and their sidecars. Reaped in epoch order, as ticks would.
+    for (e, epoch) in [(&compacting, compacted), (&dropping, dropped)] {
+        e.gc_through(epoch).await.unwrap();
+    }
+    assert!(
+        keys_of(&store, "gone").await.is_empty(),
+        "the dropped index survived"
+    );
+    let after = keys_of(&store, "idx").await;
+    let survivors: Vec<&String> = before.iter().filter(|k| after.contains(k)).collect();
+    assert!(
+        survivors.is_empty(),
+        "the compacted inputs survived: {survivors:?}"
+    );
+    // A branch buries nothing; its reap finds nothing, and forgets the record.
+    assert_eq!(branching.gc_through(branched).await.unwrap(), 0);
+    assert_eq!(branching.reap_due(HOUR), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_scheduled_reap_costs_what_gc_does() {
+    let acct = Accounted::new(MemoryStore::new());
+    let t = TenantId(186);
+    let e = Engine::new(Arc::new(acct.as_tenant(t)), t, LaneId(1));
+    commit(&e, "a").await;
+    tokio::time::advance(HOUR).await;
+    let horizon = e.reap_due(HOUR).unwrap();
+    let count = |c| acct.count(t, c);
+    let (r, w, d) = (
+        count(OpClass::Read),
+        count(OpClass::Write),
+        count(OpClass::Delete),
+    );
+    assert!(e.gc_through(horizon).await.unwrap() > 0);
+    // One read of HEAD, one delete batch, and one CAS.
+    assert_eq!(
+        (
+            count(OpClass::Read) - r,
+            count(OpClass::Delete) - d,
+            count(OpClass::Write) - w
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn records_stay_bounded_when_nothing_reaps() {
+    // With no reap scheduled, commits must not keep a record each forever -- and what is kept
+    // may only make a commit look younger, never older. Past the cap by a margin.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(187), LaneId(1));
+    let mut last = Epoch(0);
+    for i in 0..1100 {
+        last = commit(&e, &format!("d{i}")).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+    }
+    assert!(
+        e.reapable_len_for_test() <= 1024,
+        "{}",
+        e.reapable_len_for_test()
+    );
+    assert!(e.reap_due(Duration::from_secs(2)) <= Some(last));
+    tokio::time::advance(HOUR).await;
+    assert_eq!(e.reap_due(HOUR), Some(last));
+}

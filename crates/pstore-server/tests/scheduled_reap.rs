@@ -360,3 +360,29 @@ fn the_reap_is_configured_by_name() {
     .unwrap_err();
     assert!(e.to_string().contains("PSTORE_GC_AGE_S"), "{e}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_reap_backoff_doubles_to_its_cap() {
+    let w = world();
+    let p = GcPolicy {
+        period: Duration::from_secs(1),
+        age: Duration::from_secs(64),
+    };
+    commit(&w.api, 78, "a").await;
+    tokio::time::advance(p.age).await;
+    w.switch.refuse_commits.store(true, Ordering::SeqCst);
+    // Doubling: attempts at 0, 1, 3, 7, 15, 31, 63 -- seven in the first 64 ticks, not 64.
+    let mut failed = 0;
+    for _ in 0..64 {
+        failed += w.api.reap_due(&p).await.failed;
+        tokio::time::advance(p.period).await;
+    }
+    assert!((5..=8).contains(&failed), "{failed} attempts in 64 ticks");
+    // Capped at `age`: one a minute from then on, not ever rarer.
+    let mut late = 0;
+    for _ in 0..(64 * 4) {
+        late += w.api.reap_due(&p).await.failed;
+        tokio::time::advance(p.period).await;
+    }
+    assert!((3..=5).contains(&late), "{late} attempts in four ages");
+}
