@@ -1204,6 +1204,8 @@ struct Attempt {
     counts: BTreeMap<String, usize>,
 }
 
+/// A lane as this engine resumed it (M9j, BACKLOG row 39).
+///
 /// ⚠️ **A lane outlives the process writing it.** `deploy.md` keeps `PSTORE_LANE` stable
 /// across restarts, so a process starting at sequence 0 overwrote bundles its predecessor
 /// had written -- folded ones, which no fold reads again, and unfolded ones, which destroyed
@@ -2437,6 +2439,9 @@ impl<S: BlobStore> Engine<S> {
     fn taken(&self, seq: Seq) -> EngineError {
         self.lane_seen
             .fetch_max(seq.0 + 1, std::sync::atomic::Ordering::SeqCst);
+        // And nothing is left to resolve: a taken lane refuses without a request (code review
+        // round 2, M17), where a record kept here would spend a GET on every refusal.
+        *self.uncertain() = None;
         EngineError::LaneTaken {
             lane: self.lane.0,
             seq: seq.0,
