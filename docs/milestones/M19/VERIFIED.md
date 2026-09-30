@@ -38,7 +38,12 @@ fails a test: two only after tests were added for them (in 5 and 7).
    - Code review also found that GC never reaped a segment's centroid table. That fix is its own
      commit (`e63f00d`), with `gc_reaps_a_segments_centroid_table_with_it`
      (`cargo test -p pstore-engine --test dense_index`), seen failing first.
-8. **Gates** — NOT-RUN yet: swept with M17's remainder and M18, then `./scripts/gates.sh`.
+8. **Gates.**
+   - `./scripts/mutants.sh --check . --in-diff` over the source diff `dafd60f..f52bf9a` (M17's remainder, M18 and M19), in a worktree at `f52bf9a`, in four shards: 83 mutants, 54 caught, 10 unviable, 19 missed. Four are M19's: the burial's retry guard as `true`, `<=`, `+ 1` and `/ 1`. Each
+     re-reads HEAD after the last lost CAS, a read spent on nothing.
+     `a_burial_that_keeps_losing_gives_up_after_its_last_attempt` counts 25 reads and 25 CASes.
+     Each mutant, applied by hand, fails it.
+   - `./scripts/gates.sh` passed, all 17 gates, at `1e580e4`: the source swept, plus the tests that kill the misses.
 
 Spec review took two rounds. Code review took two: round 1 blocked on two majors (a contended
 burial re-read HEAD; GC leaked centroid tables); round 2 passed.
