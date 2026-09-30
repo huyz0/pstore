@@ -2288,6 +2288,9 @@ impl<S: BlobStore> Engine<S> {
                 r.absent = true;
             }
         }
+        // ⚠️ **The record as it now stands** (sweep, M17): the resolution may have just marked it
+        // absent, and a late PUT landing after that read meets the retry below as `Lost`.
+        let record = self.uncertain().clone();
         // ⚠️ A SNAPSHOT, not a take (M9c.1, row 35): the rows stay in `pending`, visible,
         // while their bundle is written, and move only once it has landed. Writes arriving
         // meanwhile append behind them; flushes are serialized by `flushing`, so the rows this

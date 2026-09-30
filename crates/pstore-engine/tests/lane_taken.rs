@@ -121,6 +121,8 @@ struct Unreliable {
     /// Answer the next bundle write `Io` without writing it, and keep it to land later.
     delay: Arc<AtomicBool>,
     delayed: Arc<std::sync::Mutex<Option<(Key, Bytes)>>>,
+    /// Land the delayed write when HEAD is next read: between a resolution's GET and its retry.
+    land_on_head: Arc<AtomicBool>,
 }
 
 fn is_bundle(key: &Key) -> bool {
@@ -149,6 +151,10 @@ impl BlobStore for Unreliable {
         self.inner.get_suffix(key, n).await
     }
     async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+        if key.as_str().ends_with("/HEAD") && self.land_on_head.swap(false, Ordering::SeqCst) {
+            let (k, b) = self.delayed.lock().unwrap().take().unwrap();
+            self.inner.put(&k, b).await?;
+        }
         self.inner.get_with_tag(key).await
     }
     async fn get_tag(&self, key: &Key) -> Result<Option<CasTag>, BlobError> {
@@ -549,4 +555,48 @@ async fn a_late_write_folded_before_its_retry_is_its_own() {
     assert_eq!(e.flush().await.unwrap(), Some(Seq(2)));
     other.fold().await.unwrap();
     assert_eq!(ids(&other).await, ["r0", "r1", "r2"]);
+}
+
+#[tokio::test]
+async fn a_write_landing_during_its_own_resolution_is_its_own() {
+    // The resolution reads the bundle as absent; the late PUT lands while it reads HEAD; the
+    // retry then meets `Lost`, and the record as it now stands -- absent -- says whose.
+    let store = Arc::new(Unreliable::default());
+    let e = Engine::new(Arc::clone(&store), T, LANE);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    store.delay.store(true, Ordering::SeqCst);
+    store.fail_read.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("an unresolved write was reported as landed");
+    store.land_on_head.store(true, Ordering::SeqCst);
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(1)));
+    let fresh = Engine::new(Arc::clone(&store), T, LaneId(9));
+    fresh.fold().await.unwrap();
+    assert_eq!(ids(&fresh).await, ["r0", "r1"]);
+}
+
+#[tokio::test]
+async fn an_absent_write_at_the_watermark_costs_one_put() {
+    // Nothing in HEAD says the lane moved past it, so no read is spent resolving it again.
+    let switches = Unreliable::default();
+    let acct = Accounted::new(switches.clone());
+    let e = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    e.fold().await.unwrap();
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    switches.fail_before.store(true, Ordering::SeqCst);
+    e.flush().await.expect_err("the failed write was reported");
+    let (w, r) = (acct.count(T, OpClass::Write), acct.count(T, OpClass::Read));
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(1)));
+    assert_eq!(
+        (
+            acct.count(T, OpClass::Write) - w,
+            acct.count(T, OpClass::Read) - r
+        ),
+        (1, 0)
+    );
 }
