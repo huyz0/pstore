@@ -236,3 +236,33 @@ async fn records_stay_bounded_when_nothing_reaps() {
     tokio::time::advance(HOUR).await;
     assert_eq!(e.reap_due(HOUR), Some(last));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_tenant_committing_faster_than_a_second_is_still_reaped() {
+    // Merging commits a second apart must not slide the record forward for ever.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(188), LaneId(1));
+    let age = Duration::from_secs(60);
+    for i in 0..140 {
+        commit(&e, &format!("d{i}")).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+    }
+    assert!(e.reap_due(age).is_some(), "a busy tenant is never due");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tenant_past_the_record_cap_is_still_reaped() {
+    // At a commit every two seconds the cap is reached before an hour passes; what it drops
+    // must not be the oldest, or nothing ever grows an hour old.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(189), LaneId(1));
+    let mut due = 0;
+    for i in 0..2000 {
+        commit(&e, &format!("d{i}")).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        if let Some(h) = e.reap_due(HOUR) {
+            e.gc_through(h).await.unwrap();
+            due += 1;
+        }
+    }
+    assert!(due > 0, "a busy tenant past the cap is never due");
+    assert!(e.reapable_len_for_test() <= 1024);
+}

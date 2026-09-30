@@ -25,10 +25,18 @@ pub fn bundle_key(tenant: TenantId, lane: LaneId, seq: Seq) -> Key {
     ))
 }
 
-/// The most commit records an engine keeps for its scheduled reap (M18). Past it, the oldest is
-/// dropped: the next record is later in time and in epoch, so it stands for both, and only
-/// makes their commits look younger.
+/// The most commit records an engine keeps for its scheduled reap (M18). Past it, every other
+/// interior record is dropped, never the front: see `Engine::record_reapable`.
 const MAX_REAPABLE: usize = 1024;
+
+/// Commits a scheduled reap may take (M18): a bucket anchored at its first commit's instant,
+/// holding the latest instant and highest epoch of the commits it absorbed.
+#[derive(Debug, Clone, Copy)]
+struct Reapable {
+    start: tokio::time::Instant,
+    at: tokio::time::Instant,
+    epoch: Epoch,
+}
 
 /// How many times a commit rebases before giving up.
 ///
@@ -1159,7 +1167,7 @@ pub struct Engine<S> {
     uncertain: Mutex<Option<Uncertain>>,
     /// Each commit this engine made, and when (M18): what a scheduled reap may take once it is
     /// old enough. Never a reap's own commit.
-    reapable: Mutex<std::collections::VecDeque<(tokio::time::Instant, Epoch)>>,
+    reapable: Mutex<std::collections::VecDeque<Reapable>>,
     committed: Mutex<Epoch>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
@@ -3195,8 +3203,8 @@ impl<S: BlobStore> Engine<S> {
         // In time order, so the due ones are a prefix: nothing past it is scanned.
         self.reapable()
             .iter()
-            .take_while(|(at, _)| now.saturating_duration_since(*at) >= age)
-            .map(|(_, e)| *e)
+            .take_while(|r| now.saturating_duration_since(r.at) >= age)
+            .map(|r| r.epoch)
             .last()
     }
 
@@ -3215,13 +3223,11 @@ impl<S: BlobStore> Engine<S> {
     /// As [`Self::gc`].
     pub async fn gc_through(&self, horizon: Epoch) -> Result<usize, EngineError> {
         let reaped = self.gc_inner(|_| horizon.0).await?;
-        self.reapable().retain(|(_, e)| *e > horizon);
+        self.reapable().retain(|r| r.epoch > horizon);
         Ok(reaped)
     }
 
-    fn reapable(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(tokio::time::Instant, Epoch)>> {
+    fn reapable(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<Reapable>> {
         self.reapable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3231,24 +3237,42 @@ impl<S: BlobStore> Engine<S> {
     /// returns, so a slow commit only looks younger -- and never for a reap's own commit, or
     /// each reap would make the next one due.
     ///
-    /// ⚠️ **Bounded, and only ever conservatively** (code review, M18): with no reap scheduled,
-    /// nothing drains the records. A commit within a second of the last record replaces it, and
-    /// past [`MAX_REAPABLE`] the oldest is dropped. In both cases the record that stays is the
-    /// LATER instant and epoch, so a commit can only look younger: a reap may come later,
-    /// never earlier.
+    /// ⚠️ **Bounded, conservative, and live** (code review, M18, two rounds): with no reap
+    /// scheduled nothing drains the records, so:
+    /// - a record is a bucket **anchored at its first commit**: commits within a second of that
+    ///   start join it, raising its instant and its epoch -- so it cannot slide forward for
+    ///   ever, and a tenant committing every half second still has records that grow old;
+    /// - past [`MAX_REAPABLE`] every other interior record is dropped, **never the front**:
+    ///   each dropped one's successor is later in time and in epoch and stands for it, and the
+    ///   front keeps ageing until a reap takes it.
+    ///
+    /// Every merge keeps the later instant and the higher epoch, so a commit can only look
+    /// younger: a reap may come later, never earlier.
     fn record_reapable(&self, epoch: Epoch) {
-        let now = tokio::time::Instant::now();
         let mut r = self.reapable();
+        let now = tokio::time::Instant::now();
         match r.back_mut() {
             Some(last)
-                if now.saturating_duration_since(last.0) < std::time::Duration::from_secs(1) =>
+                if now.saturating_duration_since(last.start)
+                    < std::time::Duration::from_secs(1) =>
             {
-                *last = (now, epoch);
+                last.at = last.at.max(now);
+                last.epoch = last.epoch.max(epoch);
             }
-            _ => r.push_back((now, epoch)),
+            _ => r.push_back(Reapable {
+                start: now,
+                at: now,
+                epoch,
+            }),
         }
         if r.len() > MAX_REAPABLE {
-            r.pop_front();
+            let mut i = 0;
+            r.retain(|_| {
+                i += 1;
+                // Keep the front, and every other record after it; the last is always kept,
+                // and the one after each dropped record stands for it.
+                i == 1 || i % 2 == 1 || i == MAX_REAPABLE + 1
+            });
         }
     }
 
