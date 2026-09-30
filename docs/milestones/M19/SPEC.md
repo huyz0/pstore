@@ -60,12 +60,17 @@ The other writer below is on a **different lane**, unless the criterion says oth
    in the graveyard, `gc(0)` removes them, and `dest`'s rows are untouched.
 4. **The past is unchanged.** For each scenario, `as_of` answers exactly as it did before the
    burial commit, at every buried key's own key epoch and at every epoch up to the burial.
-5. **A same-lane winner's key is not buried.** Two compactions on one lane seal the same key,
-   and the winner commits it. The loser's burial leaves that key out, and `gc(0)` keeps it.
-6. **Cost.** An abandoning call costs what it did before, plus 1 HEAD read and 1 CAS, plus
-   1 read and 1 CAS per `Lost` retry of that CAS. A merge that sealed nothing, and a success,
-   add nothing.
-7. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
+5. **A same-lane winner's key is not buried.**
+   - Two compactions on one lane seal the same key, and the winner commits it. The loser's
+     burial leaves that key out, and `gc(0)` keeps it.
+   - The same holds for a branch's delete-vector copy that a same-lane winner committed: the
+     `deletes` half of the filter.
+6. **An error exit buries too.** A retry's re-seal fails with a store error after the first
+   seal landed. The call returns that error, and the first seal is in the graveyard.
+7. **Cost.** An abandoning call costs what it did before, plus 1 HEAD read and 1 CAS, plus
+   1 read and 1 CAS per `Lost` retry of that CAS, and 1 CAS per `Contended` one. A merge that
+   sealed nothing, and a success, add nothing.
+8. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
 
 ## Test plan
 
@@ -75,8 +80,9 @@ The other writer below is on a **different lane**, unless the criterion says oth
 | 2 | as 1 | the second discard path not burying |
 | 3 | the copies are not buried | the refusal not burying; `copies` left out |
 | 4 | a past epoch answers with the discarded merge | burying at the committing epoch in place of the key epoch |
-| 5 | the winner's key is in the graveyard | the live-key filter removed |
-| 6 | an extra request on a success | a burial on a path that wrote nothing, or on success |
+| 5 | the winner's key is in the graveyard | either half of the live-key filter removed |
+| 6 | the first seal is not buried | the burial wrapped around only the `Ok` exits |
+| 7 | an extra request on a success | a burial on a path that wrote nothing, or on success |
 
 ## RA budget
 
