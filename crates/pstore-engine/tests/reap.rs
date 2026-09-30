@@ -226,9 +226,14 @@ async fn records_stay_bounded_when_nothing_reaps() {
     for i in 0..1100 {
         last = commit(&e, &format!("d{i}")).await;
         tokio::time::advance(Duration::from_secs(2)).await;
+        if i == 9 {
+            // Below the cap every commit two seconds apart keeps its own record.
+            assert_eq!(e.reapable_len_for_test(), 10);
+        }
     }
+    // Thinned past the cap, not emptied.
     assert!(
-        e.reapable_len_for_test() <= 1024,
+        (512..=1024).contains(&e.reapable_len_for_test()),
         "{}",
         e.reapable_len_for_test()
     );
