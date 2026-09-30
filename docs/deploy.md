@@ -46,7 +46,10 @@ so a deploy is not a fleet-wide cold start. Unset, the server is uncached.
 - **One directory per lane.** The tier lives in `<dir>/lane-<n>`, so several server processes
   on one host may share `PSTORE_CACHE_DIR`: their lanes differ, so their files do too.
 - **Size it as the budget it is.** The disk tier preallocates `PSTORE_CACHE_DISK_BYTES` as files
-  at start. Endurance throttling is not configured yet.
+  at start, in 4 MiB blocks, with at least two blocks per class: 24 MiB is the floor, whatever
+  the variable says. Endurance throttling is not configured yet.
+- **Stop it with SIGTERM or Ctrl-C.** Either flushes the disk tier's writes in flight; a
+  SIGKILL loses them, and costs only those.
 - **It records which store filled it.** Each start reads the bucket's store id at
   `_pstore/store-id`, creating it the first time: one GET, or one conditional PUT and a GET.
   A directory recorded for any other store, or a recreated bucket, is emptied before it serves

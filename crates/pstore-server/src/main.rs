@@ -105,9 +105,7 @@ async fn run<S: BlobStore + 'static>(
         config.fold,
         cache.as_ref().map(|c| c.disk_state())
     );
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    let shutdown = stopped();
     let served = serve_folding(api, listener, shutdown, config.fold, config.gc).await;
     // ⚠️ After the server has stopped: the disk tier's writes in flight are flushed, or a
     // deploy would lose them every time (M20).
@@ -120,5 +118,32 @@ async fn run<S: BlobStore + 'static>(
             eprintln!("pstore-server: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM where there is one.
+///
+/// ⚠️ SIGTERM is what an orchestrator sends on every deploy. Stopping only on Ctrl-C, a deploy
+/// killed the process before the read cache's writes in flight were flushed (M20's code
+/// review), and before the fold and reap loops were awaited.
+async fn stopped() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

@@ -154,16 +154,17 @@ async fn a_tier_emptied_for_another_store_stays_empty() {
     // not merely unrecovered, or the next open under a matching identity serves them.
     let dir = Dir::new("emptied");
     let a = store(1, 4096, 1).await;
+    let b = store(1, 4096, 99).await;
     let core = open(&dir.0, "A").await;
     over(&a, &core).get_range(&key(0), 0..4096).await.unwrap();
     core.close().await;
     open(&dir.0, "B").await.close().await;
-    open(&dir.0, "B").await.close().await;
-    // Back under A: nothing of A's survived B's emptying.
-    let core = open(&dir.0, "A").await;
-    let before = reads(&a);
-    over(&a, &core).get_range(&key(0), 0..4096).await.unwrap();
-    assert_eq!(reads(&a), before + 1, "an entry survived the emptying");
+    // Reopened under B, which now matches what the directory records: B's bytes, at B's cost.
+    let core = open(&dir.0, "B").await;
+    let before = reads(&b);
+    let got = over(&b, &core).get_range(&key(0), 0..4096).await.unwrap();
+    assert_eq!(got, body(4096, 99), "an entry of A's survived B's emptying");
+    assert_eq!(reads(&b), before + 1);
     core.close().await;
 }
 
@@ -207,6 +208,14 @@ async fn a_bulk_burst_leaves_meta_on_disk() {
         meta
     );
     assert_eq!(reads(&acct), before, "the bulk burst evicted meta on disk");
+    // Bulk holds its own share: the burst's newest 12 MiB are all on disk. A bulk tier given
+    // meta's 4 MiB share would hold a third of that.
+    for i in n - 48..n {
+        c.get_range_as(&key(i), 0..(BLOCK as u64 / 4 - 4096), Class::Bulk)
+            .await
+            .unwrap();
+    }
+    assert_eq!(reads(&acct), before, "bulk lost its share of the disk");
     // And the burst did evict: its first entries are gone.
     c.get_range_as(&key(0), 0..(BLOCK as u64 / 4 - 4096), Class::Bulk)
         .await
