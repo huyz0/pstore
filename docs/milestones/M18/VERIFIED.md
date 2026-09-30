@@ -58,8 +58,22 @@ Engine tests are in `cargo test -p pstore-engine --test reap`, and server tests 
      doubling removed, and with the cap removed.
 8. **Cost.** `a_scheduled_reap_costs_what_gc_does`: 1 read, 1 delete batch, 1 CAS.
    `gc_by_retention_still_reads_head_once`.
-9. **Gates** — NOT-RUN yet: swept with M17's remainder and M19, then `./scripts/gates.sh` at
-   M19's close.
+9. **Gates.**
+   - `./scripts/mutants.sh --check . --in-diff` over the source diff `dafd60f..f52bf9a` (M17's remainder, M18 and M19), in a worktree at `f52bf9a`, in four shards: 83 mutants, 54 caught, 10 unviable, 19 missed. Fifteen are M18's:
+     - `reapable_len_for_test` as 0 and as 1: the bound test checked only from above. It now
+       counts exactly 10 records, then 1024 at the cap, 513 one past it, and 588 at the end,
+       with the front still due (`records_stay_bounded_when_nothing_reaps`).
+     - Seven in `record_reapable`: the bucket guard removed or compared `==` or `<=`, the cap
+       compared `==` or `>=`, and the thinning keeping even positions or using `/`. They are
+       killed by those exact counts, and by `a_record_takes_the_commits_of_the_second_after_its_first`.
+     - `now < until` as `<=` in `reap_tick`: `a_reap_is_retried_the_moment_its_backoff_ends`
+       (`cargo test -p pstore-server --test scheduled_reap`).
+     - Five in `reap_tick`'s overflow fallback are **equivalent**: the fallback is unreachable.
+       A delay is at most `age`, and a reap is due only once a record is `age` old, so `now`
+       is already past `age` and `now + delay` cannot overflow an `Instant`. The fold loop's
+       copy is reachable, because a fold is due by bytes, and it has its own test.
+     - Each killed mutant was applied by hand, and each fails its test.
+   - `./scripts/gates.sh` passed, all 17 gates, at `1e580e4`: the source swept, plus the tests that kill the misses.
 
 Spec review took two rounds. Code review took three: round 1 blocked on two majors (the records
 unbounded; commit kinds untested); round 2 blocked on liveness in round 1's bound; round 3
