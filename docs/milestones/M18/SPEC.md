@@ -23,6 +23,8 @@ objects for about an hour, then delete them.
   a drop or a branch. The instant is taken after the CAS returns, so a slow or retried commit
   can only make it look younger.
 - **A reap's own commit is never recorded**, or each reap would make the next one due.
+  `record_commit` still runs for it: `epoch()`, `meta.epoch` and the cached-HEAD
+  invalidation depend on it. Only the reap schedule skips it.
 - `Engine::reap_due(age)` returns the highest recorded epoch at least `age` old, or `None`.
   It reads only memory.
 
@@ -59,7 +61,8 @@ endpoint; any request made by a write or a query.
 ## Acceptance criteria
 
 1. **Idle costs nothing.** A tick over tenants that have committed nothing, or nothing older
-   than `age`, issues no request. After a reap, the tick `age` later issues no request.
+   than `age`, issues no request. After a reap, with no commit since, the tick `age` later
+   issues no request.
    That holds whether the reap found work or found nothing, for example a tenant that has
    only branched.
 2. **Due reaps.**
@@ -77,8 +80,9 @@ endpoint; any request made by a write or a query.
    - `PSTORE_GC=off` runs no reap.
    - An invalid `PSTORE_GC_*` value is refused, naming the variable.
    - The reap loop has returned when `serve_folding` returns.
-7. **A failed reap backs off, and keeps its records.** A store that refuses the reap's CAS: the
-   next tick inside the backoff does not retry, and a later one reaps.
+7. **A failed reap backs off, and keeps its records.** A store refuses the reap's CAS. The next
+   tick inside the backoff does not retry, and a later one reaps. Each tick's failures are
+   counted in its result (`ReapTick.failed`), as `FoldTick` counts the fold's.
 8. **Cost.** A due reap costs exactly what `gc` does: 1 HEAD read, one delete batch per
    `max_batch_delete` keys (sidecars included), and 1 CAS. `gc` itself gains no request.
 9. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
@@ -112,6 +116,8 @@ requests scale with the commits that buried objects, never with elapsed time.
   and they stop once the fault is fixed or the process restarts.
 - **`PSTORE_GC_AGE_S` below `bounded`'s staleness (1 hour)** lets a cached HEAD name reaped
   objects. The read that fails retries fresh (M11.2), so this costs a request, never an answer.
+- **A restart forgets the records.** An idle tenant's buried objects then wait until something
+  commits there again, and that commit's horizon reaps them. They are delayed, never lost.
 - **A process that never commits never reaps**, even if others' objects are due. Whoever
   committed them reaps them.
 - **Time travel** now reaches back about `age`, where it reached back to the beginning. That
