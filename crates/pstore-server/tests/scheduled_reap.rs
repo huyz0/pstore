@@ -260,6 +260,21 @@ async fn a_failed_reap_backs_off_keeps_its_records_and_recovers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reap_is_retried_the_moment_its_backoff_ends() {
+    // The backoff holds a reap until `period` has passed, and not a tick longer.
+    let w = world();
+    commit(&w.api, 79, "a").await;
+    tokio::time::advance(HOUR).await;
+    w.switch.refuse_commits.store(true, Ordering::SeqCst);
+    let p = policy(HOUR);
+    assert_eq!(w.api.reap_due(&p).await.failed, 1);
+    tokio::time::advance(p.period).await;
+    w.switch.refuse_commits.store(false, Ordering::SeqCst);
+    let tick = w.api.reap_due(&p).await;
+    assert_eq!((tick.reaped, tick.deferred), (1, 0), "{tick:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_loop_reaps_on_its_own_and_stops() {
     let w = world();
     commit(&w.api, 75, "a").await;
