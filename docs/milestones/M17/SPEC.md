@@ -25,7 +25,10 @@ can honour this. A failed write still never consumes a sequence (OQ-91).
 - **Created:** as today. The rows move to `durable`, and the next sequence is taken.
 - **`Lost`** (an object is already there): this process has never attempted that sequence, so
   another process writes this lane. The flush fails with `EngineError::LaneTaken { lane, seq }`
-  and consumes nothing. It makes no read.
+  and consumes nothing. It makes no read. The one exception is a sequence whose earlier attempt
+  resolved as absent: a PUT timed out, and may land late. There, `Lost` gets one GET, compared
+  with that attempt's bytes. Equal bytes mean the late PUT landed: its rows are durable, as in
+  the resolution below. The bytes are kept until a later write at that sequence succeeds.
 - **`Contended`** (the backend could not evaluate the condition): nothing is written or
   consumed. The flush fails with `EngineError::Contended`, which the API already answers
   **409**. The rows stay pending for the next flush, at the same sequence.
@@ -51,10 +54,15 @@ exists, it is resolved before anything else is written, under the flush lock:
 - The API's first flush after a lost acknowledgement therefore succeeds. A client never sees
   one unless the read that resolves it also fails.
 
-**Any HEAD read also checks the lane.** Every HEAD this engine reads is already passed to
-`prune_to`. If its watermark for this lane is past the next sequence this engine would write,
-and no record accounts for it, another process has written this lane. Every later flush
-answers `LaneTaken` without a request. This covers the case where the other writer's bundle
+**Any HEAD read also informs the lane check.** Every HEAD this engine reads is already
+passed to `prune_to`, and `prune_to` now also records the highest watermark it has seen for
+this lane. It decides nothing itself: a fold can commit a watermark past a bundle this engine
+wrote before the flush that wrote it has advanced `next`.
+
+The check runs at the start of `flush_inner`, under the flush lock, after any record is
+resolved, and only once the lane has resumed. It fails when the recorded watermark is past
+`next`: another process has written this lane. Every later flush answers `LaneTaken` without a
+request. A first resume needs no check, because it probes forward from the watermark. This covers the case where the other writer's bundle
 was folded and reaped before this process flushed again, so creating at a free key below
 the watermark would lose rows.
 
@@ -93,9 +101,12 @@ success path's cost; `batched` writes, which were never promised to survive a pr
    same sequence, and the API answers 409.
 8. **The API names it:** a durable write meeting `LaneTaken` answers `500 lane_taken`, naming
    the lane and `PSTORE_LANE`.
-9. **Cost:** a flush that creates its bundle issues exactly 1 PUT and no read, and `LaneTaken`
+9. **No false alarm from a concurrent fold.** A fold commits, through a new `flush_with_interference_for_test` hook like `branch`'s,
+   between a flush's PUT and its advance of `next`. Then a query reads that HEAD. The next
+   flush succeeds. A process that queries before its first flush also flushes normally.
+10. **Cost:** a flush that creates its bundle issues exactly 1 PUT and no read, and `LaneTaken`
    from a collision issues 1 PUT and no read.
-10. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
+11. `./scripts/gates.sh` passes, and `./scripts/mutants.sh` misses 0.
 
 ## Test plan
 
@@ -109,7 +120,8 @@ success path's cost; `batched` writes, which were never promised to survive a pr
 | 6 | the rows are taken as landed | the watermark check removed |
 | 7 | `Contended` is not produced | `Contended` read as `Lost` or as `Io` |
 | 8 | no `lane_taken` code | the mapping dropped |
-| 9 | as 1 | a read on the success path, or on `Lost` |
+| 9 | the lane is marked taken | the check made in `prune_to`, or before the lane has resumed |
+| 10 | as 1 | a read on the success path, or on `Lost` |
 
 Every existing test of lanes, the fold's recovery and OQ-91's scenario passes unchanged.
 
