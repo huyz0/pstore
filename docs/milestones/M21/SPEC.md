@@ -6,132 +6,115 @@ API of [`load-and-hotspots.md`](../../research/04-cluster/load-and-hotspots.md) 
 
 ## What is true today
 
-- M20 gave the server a read cache that survives a restart (`PSTORE_CACHE_DIR`). It fills only
-  on demand: the first query on each segment pays its open round in blob requests.
-- A query's **open round** (`pstore_query::run::open`) reads, per segment and in one round: the
-  footer and index section (`Class::Meta`), the delete vector, the centroid table, and the
-  sparse and text dictionaries its legs need (`Class::Pinned`). Everything after it is bulk.
-- [`turbopuffer-api-parity.md`](../../research/11-design/turbopuffer-api-parity.md) lists
-  `hint_cache_warm` as a gap, assigned to M21.
-- `pstore-server` has no placement routing: `pstore-cluster` is not wired into it. A request
-  reaches whichever process the client or load balancer picked.
+- M20's read cache (`PSTORE_CACHE_DIR`) fills only on demand: the first query on each segment
+  pays that segment's open round in blob requests.
+- A query's open round (`pstore_query::run::open`) reads the footer and index section (`Meta`),
+  the delete vector, and, **chosen by its legs and not by the segment**, the centroid table
+  and the sparse and text dictionaries (`Pinned`). An absent one is a 404, which no cache keeps
+  ([BACKLOG](../BACKLOG.md) row 46).
+- `VecIndex::warm` exists and fetches centroids unconditionally, paying that 404 per small
+  segment. It is not reused.
+- `pstore-server` routes nothing: a request reaches whichever process the client picked.
 
 ## Delta
 
-**Engine.** `Engine::warm(index) -> Result<Warmed, EngineError>`:
+**Engine.** `Engine::warm(index) -> Result<Warmed, EngineError>`, three rounds:
 
-1. Reads HEAD **fresh**, as a `strong` query does. There is no engine error for an unknown
-   index today (the server decides from what a read found), so `Warmed` says whether HEAD
-   names the index at all: a segment list or a schema for it.
-2. Round 2, for every segment HEAD names, together: `Segment::open` (footer, and the index
-   section's range read when it is too large for the suffix) and the delete vector, if HEAD
-   names one.
-3. Round 3, from what each footer says, together:
-   - the centroid table, **only if** the segment has a dense field and at least
-     `exact_scan_threshold` rows (this engine's own cluster parameter). Below it none was
-     written (D-10); a query learns that from a 404 (BACKLOG row 46), and a warm must not
-     pay one per small segment;
-   - the sparse dictionary, only if a field's layout names `SparsePostings`;
-   - the text dictionary, only if `has_text()`.
-4. `Warmed { known, segments, fetched }`: whether HEAD names the index, the segments opened,
-   and the sidecars fetched.
+1. One fresh HEAD read (`head::read`, 1 request).
+2. Per segment HEAD names, together: `Segment::open`; the delete vector if HEAD names one; the
+   centroid table if its `SegmentRef.rows` ≥ this engine's `exact_scan_threshold` and the
+   schema's `dims` > 0, the fold's own predicate (`vec_index.rs:357`).
+3. Per segment, from its index section: the sparse dictionary if a field names
+   `SparsePostings`, the text dictionary if `has_text()`.
 
-Every read goes through the engine's store with the class a query uses, so it lands in the
-cache exactly as that query's would. **No bulk read, ever** (D-44): not the data section, not
-postings, not `IndexRows`. The unfolded memtable and bundles are not touched: they are not
-cached, and a query reads them fresh anyway.
+`Warmed { exists, segments, fetched }`. `exists` is decided as a query decides it: HEAD names
+segments of the index, or this process holds unfolded rows for it. `fetched` counts sidecars
+(delete vectors, centroid tables, dictionaries), not footers. Every read uses the class a query
+uses, so it lands in the cache as that query's would. **No bulk read** (D-44): no data section,
+postings or `IndexRows`. Delete vectors are outside D-44's classes 1–4 but `Pinned` in the code,
+and every query reads them; they are warmed.
 
-**Server.** `POST /v1/indexes/{index}/warm`, empty body, the tenant header as every endpoint:
+**Server.** `POST /v1/indexes/{index}/warm`, empty body, the usual tenant header:
 
-- `200 {"segments": n, "fetched": m, "meta": {"cost": {...}}}` with the same `cost` block a
-  query reports, from the tenant's accounting. **It is billed**, as the corpus says to charge
-  for it: a warm spends blob requests and cache space.
-- `404 index_not_found` when HEAD does not name the index. An index that exists only in
-  unfolded writes is `200` with `segments: 0`: it has nothing a cache holds.
-- `409 no_read_cache` when the server was started without `PSTORE_CACHE_DIR`: a warm there
-  would fetch and discard, spending the tenant's requests for nothing.
-- **Synchronous.** It is metadata only, three rounds deep, so it returns when warm rather
-  than accepting a job nothing tracks. turbopuffer's is asynchronous because it warms bulk.
+- `200 {"segments", "fetched", "meta": {"cost"}}`, cost from the tenant's accounting: a warm is
+  **billed**, as the corpus says to charge for it. Unfolded-only: `200`, `segments: 0`.
+- `404 index_not_found` when `exists` is false.
+- `409 no_read_cache`, with **no request issued**, when the `Api` has no cache: a warm there
+  fetches and discards.
+- Synchronous: metadata only, three rounds, so it returns warm. turbopuffer's is asynchronous
+  because it warms bulk.
 
-**Docs.** `deploy.md`: a warm warms **the process that serves it**, and nothing routes a
-tenant to that process, so a client warms each process it will query (or every one behind its
-load balancer). `turbopuffer-api-parity.md`'s row points here.
+**Docs.** `deploy.md`: a warm warms the process that serves it, so a client warms each process
+it will query. The parity row points here.
 
-**Not changed:** the query path, the cache, the format, D-50's scan handling, any other
-endpoint. No `classes` parameter: D-44 fixes the classes, and `vectors` is refused by design,
-not offered. No warming of a whole tenant in one call. No placement or forwarding.
+**Not changed:** the query path (row 46's 404s stay), the cache, the format, any other endpoint.
+No `classes` parameter: D-44 fixes them. No whole-tenant warm. No routing.
 
 ## Acceptance criteria
 
-1. **A warmed index's queries open without a request.** After `warm`, a dense, a sparse, a
-   text, a filtered and a `rank_by` query on the index issue **0** `Meta` and **0** `Pinned`
-   reads to the store beneath the cache, on a cache with room for them.
+1. **A warmed index's queries open with no Meta read.** After `warm`, a dense, sparse, text,
+   filtered and `rank_by` query each issue **0** `Meta` reads beneath the cache, and every
+   `Pinned` read that reaches the store is a 404 for a key the index lacks (row 46). Each costs
+   exactly what it costs on a second run with no warm (M20's `queries_and_warm_cost` baseline).
 2. **A warm admits no bulk.** During `warm`, **0** `Bulk` or unclassed ranged reads reach the
-   store, and the cache's bulk residency is unchanged.
-3. **A warm reads only what exists.** On an index of segments below `exact_scan_threshold`,
-   with no sparse and no text field, a warm issues exactly **1 + k** reads for k segments
-   without delete vectors: HEAD and the k footers. No centroid, dictionary or 404.
-4. **Each sidecar that exists is warmed.** An index with a clustered segment, a sparse field,
-   a text field and a delete vector: `fetched` counts each, and criterion 1 holds for it.
-5. **Depth is bounded.** A warm's sequential blob depth is **≤ 3**, asserted by the testkit's
-   depth-counting store.
-6. **A second warm is HEAD alone.** Warming a warm index costs exactly **1** read.
-7. **It survives a restart.** Warm, close the cache, reopen it: criterion 1 still holds.
-8. **The endpoint.** `200` with `segments`, `fetched` and a `cost` equal to the tenant's
-   accounted reads during the call; `404 index_not_found`; `409 no_read_cache` on an `Api`
-   without a cache, having issued **0** requests.
-9. **Nothing else changes.** Every existing test of `pstore-server`, `pstore-engine` and
-   `pstore-cache` passes unchanged.
+   store, and bulk residency is unchanged.
+3. **A warm reads only what exists.** Index of k segments below the threshold, no dv, no sparse
+   or text field: exactly **1 + k** reads, `fetched == 0`. No 404.
+4. **Each sidecar that exists is warmed.** Two segments, one of exactly `exact_scan_threshold`
+   rows, both with sparse and text fields, one with a delete vector: `fetched == 6`, and
+   criterion 1 holds.
+5. **Depth ≤ 3**, by `DepthCounting`, for k ≥ 2 segments within `INDEX_BUDGET`. Engine-written
+   segments always are (`try_finish` refuses more); an overflowing index section would add one.
+6. **A second warm costs 1 read** (HEAD).
+7. **It survives a restart.** With a disk tier: warm, close, reopen; criterion 1 holds.
+8. **The endpoint.** `200` with `segments`, `fetched`, and `cost.blob_reads` equal to the
+   tenant's accounted reads in the call; unfolded-only `200` with `segments: 0`;
+   `404 index_not_found`; `409 no_read_cache` after 0 requests.
+9. **Nothing else changes.** Existing `pstore-server`, `pstore-engine`, `pstore-cache` tests pass.
 10. **Gates.** `./scripts/mutants.sh` over the diff, and `./scripts/gates.sh`, green.
 
 ## Test plan
 
-Engine tests in `crates/pstore-engine/tests/warm.rs`, over a store that records each read's
-class (as `pstore-blob/tests/scanning.rs`'s `Classes`), beneath a `Caching` with a core.
-
-| # | Test (fails first on a stub `warm` that reads HEAD only) | Mutation it catches |
-|---|---|---|
-| 1 | `a_warmed_index_opens_without_a_request`: each modality, 0 `Meta`/`Pinned` reads after | a sidecar kind skipped; footers not opened; `Pinned` fetched as `Bulk` |
-| 2 | `a_warm_admits_no_bulk` | the data section or postings read; `Segment::scan` used to open |
-| 3 | `a_warm_reads_only_what_exists`: exact count 1 + k | centroids fetched unconditionally; dictionaries fetched unconditionally; threshold compared the wrong way |
-| 4 | `every_sidecar_that_exists_is_warmed`: `fetched` and zero-cost queries | the delete vector skipped; one dictionary kind skipped |
-| 5 | `a_warm_is_three_rounds_deep` (`DepthCounting`) | dictionaries fetched one segment at a time; round 3 awaited per segment |
-| 6 | `a_second_warm_costs_head_alone` | a warm that bypasses the cache (`get` instead of `get_immutable`) |
-| 7 | `a_warm_survives_a_restart` | none new; pins the composition with M20 |
-
-Server tests in `crates/pstore-server/tests/warm.rs`:
+`crates/pstore-engine/tests/warm.rs`, over a store recording each read's class and outcome
+(as `pstore-blob/tests/scanning.rs`'s `Classes`) beneath a `Caching` with a core. Each fails
+first on a stub `warm` that reads HEAD only.
 
 | # | Test | Mutation it catches |
 |---|---|---|
-| 8 | `warm_reports_and_bills`, `warm_of_a_missing_index_is_404`, `warm_without_a_cache_is_409_and_free` | route missing; cost not reported or from the wrong tenant; the 409 check after the HEAD read |
-| 9 | the existing suites, unchanged | — |
+| 1 | `a_warmed_index_opens_without_a_meta_read` | footers not opened; a sidecar kind skipped; wrong class |
+| 2 | `a_warm_admits_no_bulk` | the data section or postings read; opening by `scan` |
+| 3 | `a_warm_reads_only_what_exists` | centroids or dictionaries fetched unconditionally; `dims > 0` dropped |
+| 4 | `every_sidecar_that_exists_is_warmed` | `>=` as `>` at the threshold; the dv skipped; a dictionary kind skipped |
+| 5 | `a_warm_is_three_rounds_deep` (k = 3) | segments warmed in a serial loop; dictionaries awaited before round 2 ends |
+| 6 | `a_second_warm_costs_head_alone` | a read that bypasses the cache (`get` for `get_immutable`) |
+| 7 | `a_warm_survives_a_restart` | the warm filling a memory-only path, so the disk tier misses on reopen |
+
+`crates/pstore-server/tests/warm.rs`: `warm_reports_and_bills`, `warm_of_an_unfolded_index_is_empty`,
+`warm_of_a_missing_index_is_404`, `warm_without_a_cache_is_409_and_free`. Mutations: route
+missing; cost absent or another tenant's; existence from HEAD alone; the 409 after HEAD.
 
 ## RA budget
 
 | Operation | W | Rseq | Rpar | List |
 |---|---|---|---|---|
-| `warm`, cold | 0 | ≤ 3 | 1 + per segment: footer (+1 if its index section overflows the suffix), + dv, + centroids if clustered, + one per dictionary | 0 |
-| `warm`, already warm | 0 | 1 | 1 (HEAD) | 0 |
-| every other operation | unchanged | | | |
+| `warm`, cold | 0 | ≤ 3 | 1 + per segment: footer, + dv, + centroids if clustered, + one per dictionary | 0 |
+| `warm`, warm | 0 | 1 | 1 | 0 |
 
-Requests scale with the segments of the one index named, per explicit call: the same shape
-as that index's first query, never with records or elapsed time.
+Per explicit call, scaling with one index's segments: the shape of its first query. Other ops unchanged.
 
 ## Risks
 
-- **A warm on one process, a query on another.** Without routing, a warm helps only if the
-  client reaches the same process. Revealed by nothing automated; stated in `deploy.md`.
-- **Parameters differ between writer and warmer.** A segment built with a lower
-  `exact_scan_threshold` than this engine's has centroids the warm skips. The cost is a cold
-  centroid read later, never a wrong answer. Revealed by criterion 1 failing if tests mix them.
-- **A cache too small for the index's metadata** evicts what it warmed. Criterion 1 holds only
-  "on a cache with room"; a warm larger than the Meta or Pinned quota is a sizing question,
-  and `fetched` against residency is how an operator sees it.
-- **Abuse.** A client can warm repeatedly; each warm after the first is one billed HEAD read.
+- **A warm on one process, a query on another.** Nothing routes a tenant; stated in `deploy.md`.
+  Nothing automated reveals it.
+- **Writer and warmer parameters differ.** A segment clustered below this engine's threshold has
+  centroids the warm skips: a cold read later, never a wrong answer. No test mixes them, so
+  nothing reveals it.
+- **A cache too small for the metadata** evicts what it warmed. Criterion 1 assumes room;
+  `fetched` against class residency is how an operator sees it.
+- **Abuse.** Repeated warms cost one billed HEAD read each.
 
 ## Tasks
 
 - **M21.1** — `Engine::warm` and its engine tests (criteria 1–7).
-- **M21.2** — `POST /v1/indexes/{index}/warm`, its server tests, `deploy.md`, the parity row
-  (criteria 8–9).
+- **M21.2** — the endpoint, its server tests, `deploy.md`, the parity row (criteria 8–9).
 - **M21.3** — ledger, sweep, gates, close (criterion 10).
