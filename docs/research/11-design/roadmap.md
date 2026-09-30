@@ -508,7 +508,10 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M14 | **Full-text analyzer options**: tokenizer versions, languages, stemming, stopwords, case, ASCII folding, `k1`/`b`; and `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence` | An analyzer is part of the segment format, and changing one is a reindex |
 | M15 | **`Glob`, `IGlob`, `Regex`, `Fuzzy`** over a trigram index | Refused as `Unimplemented` today; after M14, which settles what a token is |
 | M16 | **`copy_from_namespace`, `branch_from_namespace`** (OQ-33) | Branching is one PUT by design; it waits for a caller |
-| M17 | **`hint_cache_warm`** | Needs the NVMe tier (D-23), which does not exist yet |
+| M17 | **Two writers on one lane fail loudly** ([BACKLOG](../../milestones/BACKLOG.md) row 24): a bundle is created, never replaced | Acknowledged `durable` writes can vanish today with no error; data loss before features |
+| M18 | **A scheduled reap** (BACKLOG row 31): the server runs GC on a timer, as M9i runs the fold | Nothing bounds the graveyard, or the `as_of` window every open pays for |
+| M19 | **A discarded compaction buries its output** (BACKLOG row 30), as a lost branch buries its copies | Each retry of a discarded compaction leaks a segment nothing can name |
+| M20 | **`hint_cache_warm`** | Needs the NVMe tier (D-23), which does not exist yet. The server wires in no read cache at all (`pstore-cache` is unused), so there is nothing to warm. ⚠️ Was M17 until M17 was specified: backlog rows that lose or leak data went first |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
