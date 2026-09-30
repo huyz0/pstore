@@ -699,3 +699,38 @@ async fn a_scan_is_served_from_the_memory_tiers_bulk() {
         .unwrap();
     assert_eq!(reads(&acct), r, "a scan missed the memory tier's bulk");
 }
+
+#[test]
+fn the_memory_budget_is_split_a_tenth_a_tenth_and_the_rest() {
+    // 1,000 bytes: 100 pinned, 100 meta, 800 bulk.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let acct = store(1, 4096, 61).await;
+        let core = Arc::new(CacheCore::memory(1000));
+        let c = over(&acct, &core);
+        for (class, fits) in [(Class::Pinned, 100), (Class::Meta, 100), (Class::Bulk, 800)] {
+            c.get_range_as(&key(0), 0..fits, class).await.unwrap();
+            assert_eq!(c.resident_in(class), fits as usize, "{class:?}");
+            c.get_range_as(&key(0), 1..fits + 2, class).await.unwrap();
+            assert_eq!(
+                c.resident_in(class),
+                fits as usize,
+                "{class:?} took past its share"
+            );
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_core_says_what_its_disk_is_doing() {
+    let core = CacheCore::memory(1000);
+    let shown = format!("{core:?}");
+    assert!(shown.starts_with("CacheCore"), "{shown}");
+    assert!(shown.contains("Off"), "{shown}");
+    let dir = Dir::new("debug");
+    let core = open(&dir.0, "A").await;
+    assert!(format!("{core:?}").contains("Open"), "{core:?}");
+    core.close().await;
+}

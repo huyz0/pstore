@@ -136,3 +136,36 @@ async fn bulk_and_unclassed_reads_arrive_as_scans_and_others_unchanged() {
     // And a `get`, which names no class and is never cached, passes through.
     assert_eq!(s.get(&k).await.unwrap().len(), 64);
 }
+
+#[tokio::test]
+async fn everything_but_a_classed_read_is_forwarded_unchanged() {
+    let inner = Arc::new(Classes::default());
+    let s = Scanning::new(Arc::clone(&inner));
+    let k = Key::new("dir/seg");
+    s.put(&k, Bytes::from(vec![1u8; 64])).await.unwrap();
+    assert_eq!(s.head(&k).await.unwrap(), 64);
+    assert_eq!(
+        s.get_tag(&k).await.unwrap(),
+        inner.get_tag(&k).await.unwrap()
+    );
+    assert!(s.get_tag(&k).await.unwrap().is_some());
+    assert_eq!(s.get_with_tag(&k).await.unwrap().0.len(), 64);
+    assert_eq!(
+        s.list_unrestricted(&Key::new("dir/")).await.unwrap(),
+        vec![k.clone()]
+    );
+    s.put_conditional(
+        &Key::new("dir/new"),
+        Bytes::from("x"),
+        Precondition::NotExists,
+    )
+    .await
+    .unwrap();
+    assert_eq!(inner.get(&Key::new("dir/new")).await.unwrap(), "x");
+    s.delete_batch(std::slice::from_ref(&k)).await.unwrap();
+    assert!(
+        inner.get(&k).await.is_err(),
+        "the delete did not reach the store"
+    );
+    assert!(s.capabilities() == inner.capabilities());
+}
