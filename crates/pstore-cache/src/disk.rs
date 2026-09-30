@@ -86,12 +86,11 @@ impl Tiers {
         if recorded.as_deref() != Some(want.as_str()) {
             // ⚠️ Delete, then sync, then record. Recorded first, a crash before the delete
             // would leave another store's entries under this store's name.
-            for class in CLASSES {
-                match std::fs::remove_dir_all(root.join(class)) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(format!("emptying {}: {e}", root.display())),
-                }
+            // Any failure to delete is fatal, so the tier bypasses rather than serve what it
+            // could not remove. One writer per lane directory, so nothing races the check.
+            for class in CLASSES.map(|c| root.join(c)).iter().filter(|d| d.exists()) {
+                std::fs::remove_dir_all(class)
+                    .map_err(|e| format!("emptying {}: {e}", class.display()))?;
             }
             sync_dir(&root);
             write_synced(&identity, want.as_bytes())
