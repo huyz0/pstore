@@ -3269,9 +3269,10 @@ impl<S: BlobStore> Engine<S> {
             let mut i = 0;
             r.retain(|_| {
                 i += 1;
-                // Keep the front, and every other record after it; the last is always kept,
-                // and the one after each dropped record stands for it.
-                i == 1 || i % 2 == 1 || i == MAX_REAPABLE + 1
+                // Odd positions: the front, every other record after it, and -- the queue being
+                // MAX_REAPABLE + 1 long here -- the last. The one after each dropped record
+                // stands for it.
+                i % 2 == 1
             });
         }
     }
