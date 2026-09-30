@@ -3561,10 +3561,10 @@ impl<S: BlobStore> Engine<S> {
         if keys.is_empty() {
             return;
         }
+        let Ok(mut at) = head::read(&*self.store, self.tenant).await else {
+            return;
+        };
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
-            let Ok(at) = head::read(&*self.store, self.tenant).await else {
-                return;
-            };
             let live: std::collections::HashSet<&str> = at
                 .head
                 .indexes
@@ -3580,7 +3580,8 @@ impl<S: BlobStore> Engine<S> {
                 .flatten()
                 .map(String::as_str)
                 .collect();
-            let due: Vec<&String> = keys
+            // A set: a branch's retry can derive, and record, the same copy key twice.
+            let due: std::collections::BTreeSet<&String> = keys
                 .iter()
                 .filter(|k| !live.contains(k.as_str()) && !buried.contains(k.as_str()))
                 .collect();
@@ -3603,9 +3604,16 @@ impl<S: BlobStore> Engine<S> {
                     self.record_reapable(epoch);
                     return;
                 }
-                Err(EngineError::Lost | EngineError::Contended)
+                // Re-read only on `Lost`: `Contended` says the HEAD held is still current.
+                Err(e @ (EngineError::Lost | EngineError::Contended))
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
+                    if matches!(e, EngineError::Lost) {
+                        let Ok(fresh) = head::read(&*self.store, self.tenant).await else {
+                            return;
+                        };
+                        at = fresh;
+                    }
                     backoff(self.lane, attempt).await;
                 }
                 Err(_) => return,

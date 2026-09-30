@@ -35,6 +35,24 @@ struct Store {
     inner: MemoryStore,
     refuse_seal: Arc<AtomicBool>,
     head_reads: Arc<std::sync::atomic::AtomicU64>,
+    head_cas: Arc<std::sync::atomic::AtomicU64>,
+    /// HEAD commits to let through before answering one `Contended`; `u64::MAX` for never.
+    contend_after: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Store {
+    fn new() -> Self {
+        let s = Self::default();
+        s.contend_after.store(u64::MAX, Ordering::SeqCst);
+        s
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        (
+            self.head_reads.load(Ordering::SeqCst),
+            self.head_cas.load(Ordering::SeqCst),
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -75,6 +93,17 @@ impl BlobStore for Store {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        if key.as_str().ends_with("/HEAD") {
+            self.head_cas.fetch_add(1, Ordering::SeqCst);
+            let left = self.contend_after.load(Ordering::SeqCst);
+            if left == 0 {
+                self.contend_after.store(u64::MAX, Ordering::SeqCst);
+                return Err(CasError::Contended);
+            }
+            if left != u64::MAX {
+                self.contend_after.store(left - 1, Ordering::SeqCst);
+            }
+        }
         self.inner.put_conditional(key, body, pre).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
@@ -231,7 +260,7 @@ async fn capture(e: &Engine<Store>, index: &str, past: &Past) {
 
 #[tokio::test]
 async fn a_discarded_compaction_is_buried() {
-    let store = Store::default();
+    let store = Store::new();
     let (e, w) = (engine(&store, 1), engine(&store, 2));
     seeded(&e, "idx", &["a", "b", "c"]).await;
     let before = objects(&store).await;
@@ -251,7 +280,7 @@ async fn a_discarded_compaction_is_buried() {
 
 #[tokio::test]
 async fn a_compaction_whose_delete_vector_moved_is_buried() {
-    let store = Store::default();
+    let store = Store::new();
     let (e, w) = (engine(&store, 1), engine(&store, 2));
     seeded(&e, "idx", &["a", "b", "c"]).await;
     let before = objects(&store).await;
@@ -271,7 +300,7 @@ async fn a_compaction_whose_delete_vector_moved_is_buried() {
 
 #[tokio::test]
 async fn a_refused_branch_retry_is_buried() {
-    let store = Store::default();
+    let store = Store::new();
     let (e, w) = (engine(&store, 1), engine(&store, 2));
     seeded(&e, "src", &["a", "b"]).await;
     e.delete("src", vec!["a".into()]).await.unwrap();
@@ -301,7 +330,7 @@ async fn a_refused_branch_retry_is_buried() {
 #[tokio::test]
 async fn a_same_lane_winners_key_is_not_buried() {
     // Both compactions derive the same key from the same HEAD; the winner commits it.
-    let store = Store::default();
+    let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "idx", &["a", "b"]).await;
     let got = e
@@ -321,7 +350,7 @@ async fn a_same_lane_winners_key_is_not_buried() {
 
 #[tokio::test]
 async fn a_same_lane_winners_copies_are_not_buried() {
-    let store = Store::default();
+    let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "src", &["a", "b"]).await;
     e.delete("src", vec!["a".into()]).await.unwrap();
@@ -350,7 +379,7 @@ async fn a_same_lane_winners_copies_are_not_buried() {
 async fn an_error_after_sealing_buries_the_seal() {
     // Another index's fold moves the epoch, so the retry re-seals at a new key -- and that
     // PUT fails. The first seal is buried, and the error is what the call returns.
-    let store = Store::default();
+    let store = Store::new();
     let (e, w) = (engine(&store, 1), engine(&store, 2));
     seeded(&e, "idx", &["a", "b"]).await;
     let before = objects(&store).await;
@@ -371,7 +400,7 @@ async fn an_error_after_sealing_buries_the_seal() {
 
 #[tokio::test]
 async fn nothing_written_and_success_commit_no_burial() {
-    let store = Store::default();
+    let store = Store::new();
     let (e, w) = (engine(&store, 1), engine(&store, 2));
     // A merge of fully deleted rows seals nothing; discarded, it commits nothing more.
     seeded(&e, "gone", &["a", "b"]).await;
@@ -380,13 +409,18 @@ async fn nothing_written_and_success_commit_no_burial() {
         .unwrap();
     fold(&e).await;
     let winner = Arc::new(Mutex::new(Epoch(0)));
+    let after = Arc::new(Mutex::new((0, 0)));
     let got = e
         .compact_with_interference_for_test("gone", async {
             *winner.lock().unwrap() = w.compact("gone").await.unwrap().unwrap();
+            *after.lock().unwrap() = store.counts();
         })
         .await
         .unwrap();
     assert_eq!(got, None);
+    // Its commit lost, it re-read HEAD and discarded -- and read nothing more.
+    let (r, c) = *after.lock().unwrap();
+    assert_eq!((store.counts().0 - r, store.counts().1 - c), (1, 1));
     assert_eq!(e.head_for_test().await.epoch, *winner.lock().unwrap());
     // A compaction that lands commits once, and reads HEAD once.
     seeded(&e, "idx", &["a", "b"]).await;
@@ -406,7 +440,7 @@ async fn nothing_written_and_success_commit_no_burial() {
 async fn a_key_already_buried_is_not_buried_twice() {
     // The same-lane winner commits the key both compactions sealed, and then compacts it away
     // itself, burying it. The loser's burial finds it buried already.
-    let store = Store::default();
+    let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "idx", &["a", "b"]).await;
     let won: Arc<Mutex<Option<String>>> = Arc::default();
@@ -430,4 +464,33 @@ async fn a_key_already_buried_is_not_buried_twice() {
         .filter(|g| **g == k)
         .count();
     assert_eq!(entries, 1, "{k} buried {entries} times");
+}
+
+#[tokio::test]
+async fn an_abandonment_costs_one_read_and_one_commit() {
+    // After the winner: the loser's commit loses (1 CAS), it re-reads HEAD (1 read) and
+    // discards. The burial then reads HEAD once and commits once -- and a `Contended` answer
+    // is retried on the HEAD it holds, costing a CAS and no read.
+    for contended in [false, true] {
+        let store = Store::new();
+        let (e, w) = (engine(&store, 1), engine(&store, 2));
+        seeded(&e, "idx", &["a", "b"]).await;
+        let after = Arc::new(Mutex::new((0, 0)));
+        e.compact_with_interference_for_test("idx", async {
+            w.compact("idx").await.unwrap().unwrap();
+            *after.lock().unwrap() = store.counts();
+            if contended {
+                store.contend_after.store(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+        let (r, c) = *after.lock().unwrap();
+        let want = if contended { (2, 3) } else { (2, 2) };
+        assert_eq!(
+            (store.counts().0 - r, store.counts().1 - c),
+            want,
+            "contended: {contended}"
+        );
+    }
 }
