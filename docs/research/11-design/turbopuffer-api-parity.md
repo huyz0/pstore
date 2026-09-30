@@ -75,7 +75,7 @@ M9 milestones is the order in which the difference has to be closed.
 | `GET /v1/namespaces?prefix&cursor&page_size` | `GET /v1/indexes`, unpaginated | **M9f** |
 | `DELETE /v2/namespaces/{ns}` | none, and the engine has no delete-index path | **M9f** |
 | `GET …/metadata`: `approx_row_count`, bytes, `created_at`, index status | `GET /v1/indexes/{index}`: segments, documents, epoch, `unfolded`, schema | **M9f** adds the missing fields |
-| `hint_cache_warm` | none | **M20**: needs the NVMe tier (D-23) |
+| `hint_cache_warm` | none | **M21**: needs M20's disk tier (D-23) |
 | `_debug/recall` | `scripts/recall.sh`, offline | Deferred: ours is a CI gate, not an endpoint |
 | pinning, read-only | none | Declined: a replica provisioned for one namespace is a node holding that namespace, against AGENTS.md's "nodes own nothing" |
 
@@ -103,7 +103,7 @@ The order is by dependency, then by what a client notices first:
 - M14, full-text analyzer options;
 - M15, glob, regex and fuzzy matching;
 - M16, copy and branch;
-- M20, cache warming. (M17 to M19 are backlog rows that lose or leak data.)
+- M21, cache warming. (M17 to M19 are backlog rows that lose or leak data; M20 is the disk tier it warms.)
 
 **Not planned,** with the reason in the tables above: highlighting and embedding, CMEK,
 sharding, pinning, and `_debug/recall`.
