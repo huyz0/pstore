@@ -40,7 +40,7 @@ It is pull-based and run by the destination.
    replaced or dropped, including a vector whose source segment no longer has one.
 5. A lost CAS goes back to 2 and reuses the copies. **A replication that fails** is left out
    and its copies are buried, while the rest commit. Failures include a source read error, an
-   unknown store, or 24 remaps without settling. Copies unused, or mapped by a rival's
+   unknown store, or 24 consecutive remaps that copied nothing new. Copies unused, or mapped by a rival's
    commit, are buried under their own epochs (M19).
 
 A replica shows the source's **folded** state.
@@ -67,7 +67,7 @@ replications**, over any `BlobStore`. A create-once `{spread}/jobs/{name}/CONFIG
 - **`reconcile` is the only path that adds or removes an entry.** It reads the shard, then the
   dest HEAD, then CASes the shard on the tag it read. There is an entry iff HEAD has a
   running replication, carrying HEAD's `gen` and keeping its claim. A new entry is claimed
-  for the caller while it is under `max`. A lost CAS repeats. `claim` and `renew` never add
+  for the caller only if its worker runs and is under `max`. A lost CAS repeats. `claim` and `renew` never add
   an entry, and keep `gen`.
   - A HEAD change after the shard read changes its tag before its own reconcile writes, so
     the last reconcile to commit read the latest HEAD. No grace period, no clock.
@@ -84,10 +84,10 @@ replications**, over any `BlobStore`. A create-once `{spread}/jobs/{name}/CONFIG
 - It renews each held shard every `ttl/3` (TTL 120 s); a tenant lost, or with nothing
   running (then reconciled), is dropped.
 - Per held tenant it runs a sync every `period` (1 s), doubling up to `idle` (60 s) while
-  nothing changes. At most 4 segments are in flight per worker.
+  nothing changes or a replication keeps failing. At most 4 segments in flight per worker.
 - Notes go to `{spread}/tnt/{t}/REPLSTATUS`, `dest -> {last_commit_ms, last_error ≤256 B}`,
-  PUT only after a commit or a changed error, at most once per `ttl/3`. Deleted with the
-  tenant's last replication.
+  PUT only after a commit or a changed error, at most once per `ttl/3`, never once HEAD
+  shows none. Deleted with the last replication; a racing worker may leave one orphan.
 - Env: `PSTORE_REPLICATION=off`, `_SCAN_S`, `_TTL_S`, `_MAX`, `_IDLE_S`.
 
 **Remote sources** are read-only S3-compatible stores (GCS through its S3 interoperability
@@ -98,7 +98,7 @@ configure the same sources; one without `n` notes `unknown_store` for that repli
 **API**, tenant header as usual. A job is `(tenant, dest)`; a source may feed many.
 - `PUT /v1/indexes/{dest}/replication` with `{"source": {"index", "tenant"?, "store"?}}` →
   `201`.
-- `GET …/replication` → state, source, applied epoch, segments, rows, rejected, `queued`,
+- `GET …/replication` (reconciles a stale entry, so it may write) → state, source, applied epoch, segments, rows, rejected, `queued`,
   claim owner and expiry, last success, and last error.
 - `POST …/replication/pause` and `…/resume`, both idempotent → `200`.
 - `DELETE …/replication` → `200 {epoch}`.
@@ -134,9 +134,9 @@ broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the 
 5. **Read-only.** Each replica refusal holds. A row past a stale door is not served and is
    counted in `rejected`. After cancel, writes succeed and `as_of` below the cancel is `404`.
 6. **Pause fences.** A sync racing a pause does not commit. After a resume with an idle
-   source, the first sync commits nothing and costs criterion 2's read. Cancel likewise.
+   source, the first sync commits nothing (one dest HEAD read more), the next costs criterion 2's. Cancel likewise.
    One failing replication does not stop its sibling's commit. A replication created on a
-   held tenant syncs within one `ttl/3`.
+   held tenant syncs within `ttl/3 + period`.
 7. **Queue.** `claim` takes unclaimed, expired and own entries, honours `max`, and skips live
    foreign ones. `renew` drops a lost entry. `CONFIG` is created once, and its `S` is
    honoured.
