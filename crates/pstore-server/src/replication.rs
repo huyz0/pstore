@@ -132,6 +132,9 @@ fn tenant_of_id(id: &str) -> Option<TenantId> {
     u128::from_str_radix(id, 16).ok().map(TenantId)
 }
 
+/// The note a tenant-wide sync failure is recorded under, which a status falls back to.
+const TENANT_NOTE: &str = "*";
+
 /// What `last_error` may hold.
 const NOTE_BYTES: usize = 256;
 
@@ -272,14 +275,22 @@ impl<S: BlobStore + 'static> Api<S> {
         let reg = self.register_for(tenant).await?;
         let engine = self.engine(tenant).await;
         let policy = self.policy();
-        let claim = (self.replicating.worker.load(Ordering::SeqCst)
-            && self.replicating.held.load(Ordering::SeqCst) < policy.max)
-            .then(|| Claim {
-                owner: self.lane.0,
-                expires_ms: self
-                    .now_ms()
-                    .saturating_add(u64::try_from(policy.ttl.as_millis()).unwrap_or(u64::MAX)),
-            });
+        // ⚠️ A slot is reserved before the claim is offered, so two control calls racing a
+        // tick cannot both claim past `max` on a stale count (code review M1).
+        let reserved = self.replicating.worker.load(Ordering::SeqCst)
+            && self
+                .replicating
+                .held
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
+                    (h < policy.max).then_some(h + 1)
+                })
+                .is_ok();
+        let claim = reserved.then(|| Claim {
+            owner: self.lane.0,
+            expires_ms: self
+                .now_ms()
+                .saturating_add(u64::try_from(policy.ttl.as_millis()).unwrap_or(u64::MAX)),
+        });
         let entry = reg
             .reconcile(
                 &id_of(tenant),
@@ -296,14 +307,17 @@ impl<S: BlobStore + 'static> Api<S> {
                 touch,
             )
             .await?;
-        if let Some(e) = entry
-            && e.claim.is_some_and(|c| c.owner == self.lane.0)
-        {
+        // Handed to the worker only when THIS call's claim is the one written; otherwise the
+        // reserved slot is given back.
+        let ours = claim.is_some() && entry.is_some_and(|e| e.claim == claim);
+        if ours && let Some(e) = entry {
             self.replicating
                 .adopted
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((tenant, reg.shard_of(&id_of(tenant)), e.generation));
+        } else if reserved {
+            self.replicating.held.fetch_sub(1, Ordering::SeqCst);
         }
         Ok(entry)
     }
@@ -376,9 +390,9 @@ impl<S: BlobStore + 'static> Api<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         for (tenant, shard, generation) in adopted {
-            if !w.held.contains_key(&tenant) && w.held.len() < policy.max {
-                w.held
-                    .insert(tenant, held(shard, generation, now, policy.period));
+            // Its slot was reserved when the claim was made.
+            if let std::collections::btree_map::Entry::Vacant(v) = w.held.entry(tenant) {
+                v.insert(held(shard, generation, now, policy.period));
                 w.renew_at.entry(shard).or_insert(now + renew_every);
                 tick.claimed += 1;
             }
@@ -398,18 +412,31 @@ impl<S: BlobStore + 'static> Api<S> {
         if !scan.is_empty() {
             w.next_scan = Some(now + policy.scan);
         }
-        let room = policy.max.saturating_sub(w.held.len());
-        let claimed = futures_util::future::join_all(
-            scan.iter()
-                .map(|s| reg.claim(*s, self.lane.0, self.now_ms(), ttl_ms, room)),
-        )
-        .await;
+        // ⚠️ **One shard at a time, the room shrinking as it fills** (code review B1): the start
+        // scan reads every shard, and the same room handed to each would take `max` from every
+        // one of them. Sequential, so S round trips -- once, at start.
+        let mut claimed = Vec::with_capacity(scan.len());
+        let mut taken = 0;
+        for s in &scan {
+            let room = policy.max.saturating_sub(w.held.len() + taken);
+            let got = reg
+                .claim(*s, self.lane.0, self.now_ms(), ttl_ms, room)
+                .await;
+            if let Ok(g) = &got {
+                taken += g
+                    .keys()
+                    .filter(|id| tenant_of_id(id).is_some_and(|t| !w.held.contains_key(&t)))
+                    .count();
+            }
+            claimed.push(got);
+        }
         for (shard, got) in scan.iter().zip(claimed) {
             let Ok(got) = got else { continue };
             for (id, e) in got {
                 let Some(tenant) = tenant_of_id(&id) else {
                     continue;
                 };
+                let full = w.held.len() >= policy.max;
                 match w.held.get_mut(&tenant) {
                     Some(h) if h.generation != e.generation => {
                         h.generation = e.generation;
@@ -417,6 +444,8 @@ impl<S: BlobStore + 'static> Api<S> {
                         h.due = now;
                     }
                     Some(_) => {}
+                    // Past `max`, it is not held: the next renewal of this shard releases it.
+                    None if full => continue,
                     None => {
                         w.held
                             .insert(tenant, held(*shard, e.generation, now, policy.period));
@@ -427,38 +456,7 @@ impl<S: BlobStore + 'static> Api<S> {
             }
         }
 
-        // Renew: one CAS per held shard per `ttl / 3`. A tenant it lost, or whose entry is
-        // gone, is dropped; a changed `gen` re-reads HEAD at the next sync.
-        let due: Vec<u16> = w
-            .renew_at
-            .iter()
-            .filter(|(_, at)| now >= **at)
-            .map(|(s, _)| *s)
-            .collect();
-        for shard in due {
-            let Ok(kept) = reg.renew(shard, self.lane.0, self.now_ms(), ttl_ms).await else {
-                continue;
-            };
-            w.renew_at.insert(shard, now + renew_every);
-            w.held.retain(|t, h| {
-                if h.shard != shard {
-                    return true;
-                }
-                match kept.get(&id_of(*t)) {
-                    None => false,
-                    Some(e) => {
-                        if e.generation != h.generation {
-                            h.generation = e.generation;
-                            h.st.invalidate();
-                            h.due = now;
-                        }
-                        true
-                    }
-                }
-            });
-        }
-        let shards: std::collections::BTreeSet<u16> = w.held.values().map(|h| h.shard).collect();
-        w.renew_at.retain(|s, _| shards.contains(s));
+        self.renew_due(w, reg).await;
 
         // Sync each due tenant, one at a time: the engine's copy bound is then the worker's.
         let due: Vec<TenantId> = w
@@ -469,6 +467,9 @@ impl<S: BlobStore + 'static> Api<S> {
             .collect();
         let mut gone = Vec::new();
         for tenant in due {
+            // Before every sync, not once a tick: a long copy must not let every other claim
+            // lapse behind it (code review M2).
+            self.renew_due(w, reg).await;
             let Some(h) = w.held.get_mut(&tenant) else {
                 continue;
             };
@@ -499,13 +500,25 @@ impl<S: BlobStore + 'static> Api<S> {
                     for (d, why) in &out.failed {
                         h.notes.entry(d.clone()).or_default().last_error = Some(clipped(why));
                     }
+                    // Only what runs now: a cancelled name re-created must not show its past.
+                    h.notes.retain(|d, _| {
+                        out.committed.contains(d)
+                            || out.current.contains(d)
+                            || out.failed.contains_key(d)
+                    });
                     !out.committed.is_empty()
                 }
                 Err(e) => {
+                    // The whole tenant's sync failed: recorded for every replication, under
+                    // `*` when it has none yet, which a status falls back to.
                     let why = clipped(&e.to_string());
                     for n in h.notes.values_mut() {
                         n.last_error = Some(why.clone());
                     }
+                    h.notes
+                        .entry(TENANT_NOTE.to_owned())
+                        .or_default()
+                        .last_error = Some(why);
                     false
                 }
             };
@@ -538,8 +551,65 @@ impl<S: BlobStore + 'static> Api<S> {
             let _ = self.reconcile(tenant, false).await;
         }
         tick.held = w.held.len();
-        self.replicating.held.store(tick.held, Ordering::SeqCst);
+        let pending = self
+            .replicating
+            .adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        self.replicating
+            .held
+            .store(tick.held + pending, Ordering::SeqCst);
         tick
+    }
+
+    /// Renews each held shard whose time has come: one CAS per shard per `ttl / 3`, keeping
+    /// exactly the tenants held there and releasing the rest. A tenant it lost, or whose
+    /// entry is gone, is dropped; a changed `gen` re-reads HEAD at the next sync.
+    async fn renew_due(&self, w: &mut Worker, reg: &Register<TenantView<S>>) {
+        let policy = self.policy();
+        let now = Instant::now();
+        let ttl_ms = u64::try_from(policy.ttl.as_millis()).unwrap_or(u64::MAX);
+        let renew_every = policy.ttl / 3;
+        let due: Vec<u16> = w
+            .renew_at
+            .iter()
+            .filter(|(_, at)| now >= **at)
+            .map(|(s, _)| *s)
+            .collect();
+        for shard in due {
+            let keep: std::collections::BTreeSet<String> = w
+                .held
+                .iter()
+                .filter(|(_, h)| h.shard == shard)
+                .map(|(t, _)| id_of(*t))
+                .collect();
+            let Ok(kept) = reg
+                .renew(shard, self.lane.0, self.now_ms(), ttl_ms, &keep)
+                .await
+            else {
+                continue;
+            };
+            w.renew_at.insert(shard, now + renew_every);
+            w.held.retain(|t, h| {
+                if h.shard != shard {
+                    return true;
+                }
+                match kept.get(&id_of(*t)) {
+                    None => false,
+                    Some(e) => {
+                        if e.generation != h.generation {
+                            h.generation = e.generation;
+                            h.st.invalidate();
+                            h.due = now;
+                        }
+                        true
+                    }
+                }
+            });
+        }
+        let shards: std::collections::BTreeSet<u16> = w.held.values().map(|h| h.shard).collect();
+        w.renew_at.retain(|s, _| shards.contains(s));
     }
 
     /// A replication's status (spec § API): its HEAD record and index stats, its register
@@ -578,9 +648,10 @@ impl<S: BlobStore + 'static> Api<S> {
         if repair && entry.map(|e| e.generation) != generation {
             entry = self.reconcile(tenant, false).await?;
         }
+        let mut notes = notes.map_err(|e| EngineError::Blob(e.to_string()))?;
         let note = notes
-            .map_err(|e| EngineError::Blob(e.to_string()))?
             .remove(dest)
+            .or_else(|| notes.remove(TENANT_NOTE))
             .unwrap_or_default();
         let mut out = describe(dest, &r);
         out.insert(
@@ -685,7 +756,10 @@ pub(crate) async fn create<S: BlobStore + 'static>(
         .await
         .create_replication(&dest, source, &*from)
         .await?;
-    api.reconcile(tenant, true).await?;
+    // ⚠️ After the HEAD CAS the change has happened: a register that cannot be reached leaves
+    // the entry stale -- `queued` says so, and a `GET` repairs it -- never a 503 for a create
+    // that took (code review m3).
+    let _ = api.reconcile(tenant, true).await;
     let out = api.status_of(tenant, &dest, false).await?;
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
 }
@@ -708,7 +782,7 @@ pub(crate) async fn pause<S: BlobStore + 'static>(
 ) -> Result<axum::Json<Value>, ApiError> {
     let tenant = tenant_of(&headers)?;
     api.engine(tenant).await.pause_replication(&dest).await?;
-    api.reconcile(tenant, true).await?;
+    let _ = api.reconcile(tenant, true).await;
     Ok(axum::Json(api.status_of(tenant, &dest, false).await?))
 }
 
@@ -720,7 +794,7 @@ pub(crate) async fn resume<S: BlobStore + 'static>(
 ) -> Result<axum::Json<Value>, ApiError> {
     let tenant = tenant_of(&headers)?;
     api.engine(tenant).await.resume_replication(&dest).await?;
-    api.reconcile(tenant, true).await?;
+    let _ = api.reconcile(tenant, true).await;
     Ok(axum::Json(api.status_of(tenant, &dest, false).await?))
 }
 
@@ -733,7 +807,7 @@ pub(crate) async fn cancel<S: BlobStore + 'static>(
     let tenant = tenant_of(&headers)?;
     let engine = api.engine(tenant).await;
     let epoch = engine.cancel_replication(&dest).await?;
-    api.reconcile(tenant, true).await?;
+    let _ = api.reconcile(tenant, true).await;
     // The notes go with the last replication. A worker that committed just before may write
     // them back once: one orphan per tenant, reused if the tenant replicates again.
     if engine.replications().await?.is_empty() {

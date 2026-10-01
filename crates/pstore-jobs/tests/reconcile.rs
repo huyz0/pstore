@@ -161,7 +161,15 @@ async fn run(
                     reg.reconcile(ID, want, None, false).await.unwrap();
                 }
                 Act::Renew => {
-                    reg.renew(shard, 99, 0, 1_000).await.unwrap();
+                    reg.renew(
+                        shard,
+                        99,
+                        0,
+                        1_000,
+                        &std::collections::BTreeSet::from([ID.to_owned()]),
+                    )
+                    .await
+                    .unwrap();
                 }
                 Act::Claim => {
                     reg.claim(shard, 98, 10, 1_000, 5).await.unwrap();

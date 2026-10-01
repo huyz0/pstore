@@ -336,7 +336,13 @@ async fn claim_of_nothing_new_writes_nothing() {
         .unwrap();
     let before = store.cas();
     assert!(other.claim(0, 1, 0, TTL, 10).await.unwrap().is_empty());
-    assert!(other.renew(0, 1, 0, TTL).await.unwrap().is_empty());
+    assert!(
+        other
+            .renew(0, 1, 0, TTL, &BTreeSet::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(store.cas(), before);
 }
 
@@ -345,7 +351,7 @@ async fn claim_and_renew_never_add_an_entry() {
     let store = Counting::new();
     let reg = open(&store, 1).await;
     reg.claim(0, 1, 0, TTL, 10).await.unwrap();
-    reg.renew(0, 1, 0, TTL).await.unwrap();
+    reg.renew(0, 1, 0, TTL, &BTreeSet::new()).await.unwrap();
     assert!(reg.read(0).await.unwrap().entries.is_empty());
 }
 
@@ -373,7 +379,10 @@ async fn renew_extends_its_own_and_drops_what_it_lost() {
         .map(|(k, _)| k.clone())
         .collect();
     assert_eq!(taken.len(), 1);
-    let held = reg.renew(0, 1, TTL, TTL).await.unwrap();
+    let held = reg
+        .renew(0, 1, TTL, TTL, &ids.iter().cloned().collect())
+        .await
+        .unwrap();
     assert_eq!(held.len(), 1, "{held:?}");
     let kept = held.keys().next().unwrap();
     assert!(kept != &ids[0] && kept != &taken[0]);
@@ -381,6 +390,41 @@ async fn renew_extends_its_own_and_drops_what_it_lost() {
     // Renew keeps `gen`: it never overwrites what a reconcile wrote.
     assert_eq!(held[kept].generation, 1);
     assert_eq!(reg.read(0).await.unwrap().entries.len(), 2);
+}
+
+#[tokio::test]
+async fn renew_releases_what_the_worker_no_longer_holds() {
+    // A worker that dropped a tenant -- over its max, or told to -- must not keep it from
+    // everyone else by renewing it with the rest.
+    let store = Counting::new();
+    let reg = open(&store, 1).await;
+    for id in ["a", "b"] {
+        add(
+            &reg,
+            id,
+            1,
+            Some(Claim {
+                owner: 1,
+                expires_ms: 100,
+            }),
+        )
+        .await;
+    }
+    let held = reg
+        .renew(0, 1, 50, TTL, &BTreeSet::from(["a".to_owned()]))
+        .await
+        .unwrap();
+    assert_eq!(held.keys().collect::<Vec<_>>(), ["a"]);
+    let shard = reg.read(0).await.unwrap();
+    assert_eq!(shard.entries["a"].claim.unwrap().expires_ms, 50 + TTL);
+    assert_eq!(shard.entries["b"].claim, None, "kept from everyone else");
+    // And another worker takes it at once.
+    assert!(
+        reg.claim(0, 2, 60, TTL, 10)
+            .await
+            .unwrap()
+            .contains_key("b")
+    );
 }
 
 #[tokio::test]
@@ -397,7 +441,10 @@ async fn renew_still_holds_its_own_lapsed_claim_nobody_took() {
         }),
     )
     .await;
-    let held = reg.renew(0, 1, 500, TTL).await.unwrap();
+    let held = reg
+        .renew(0, 1, 500, TTL, &BTreeSet::from(["t1".to_owned()]))
+        .await
+        .unwrap();
     assert_eq!(held["t1"].claim.unwrap().expires_ms, 500 + TTL);
 }
 
@@ -480,7 +527,7 @@ async fn a_refused_read_is_an_error_and_nothing_is_written() {
         .await;
     assert!(matches!(r, Err(JobsError::Blob(_))), "{r:?}");
     assert!(reg.claim(0, 1, 0, TTL, 10).await.is_err());
-    assert!(reg.renew(0, 1, 0, TTL).await.is_err());
+    assert!(reg.renew(0, 1, 0, TTL, &BTreeSet::new()).await.is_err());
     assert_eq!(store.cas(), before);
 }
 
@@ -491,7 +538,7 @@ async fn nothing_lists() {
     add(&reg, "t1", 1, None).await;
     for s in 0..4 {
         reg.claim(s, 1, 0, TTL, 10).await.unwrap();
-        reg.renew(s, 1, 0, TTL).await.unwrap();
+        reg.renew(s, 1, 0, TTL, &BTreeSet::new()).await.unwrap();
     }
     assert_eq!(
         store.counts.lists.load(std::sync::atomic::Ordering::SeqCst),

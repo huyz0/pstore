@@ -318,8 +318,13 @@ impl<S: BlobStore> Register<S> {
         .await
     }
 
-    /// Extends `owner`'s claims in `shard`, and returns what it still holds: an entry removed,
-    /// or taken by another owner, is gone from the answer. **Never adds an entry.**
+    /// Extends `owner`'s claims in `shard` on the ids in `keep`, **releases** its claims on
+    /// any other, and returns what it still holds: an entry removed, or taken by another
+    /// owner, is gone from the answer. **Never adds an entry.**
+    ///
+    /// ⚠️ Releasing is what makes a worker's `max` a bound (code review): a claim the worker
+    /// does not hold -- one it skipped at its max, or one a control call made for it while
+    /// full -- would otherwise be renewed with the rest, and kept from every other worker.
     ///
     /// # Errors
     /// If the store refuses, or every attempt loses.
@@ -329,15 +334,16 @@ impl<S: BlobStore> Register<S> {
         owner: u64,
         now_ms: u64,
         ttl_ms: u64,
+        keep: &std::collections::BTreeSet<String>,
     ) -> Result<BTreeMap<String, Entry>, JobsError> {
         let held = Claim {
             owner,
             expires_ms: now_ms.saturating_add(ttl_ms),
         };
         self.update(shard, |s| {
-            for e in s.entries.values_mut() {
+            for (id, e) in &mut s.entries {
                 if e.claim.is_some_and(|c| c.owner == owner) {
-                    e.claim = Some(held);
+                    e.claim = keep.contains(id).then_some(held);
                 }
             }
             mine(s, owner)

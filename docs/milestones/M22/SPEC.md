@@ -111,10 +111,8 @@ Refusals: `400 bad_request` (name, self-source, unknown store), `409 index_exist
 `409 replica_read_only` (write or branch into), `409 replication_active` (drop),
 `409 replica_no_history` (`as_of`).
 
-**Docs.** A correction banner on `ownership-and-leases.md` § Work scheduling: opt-in
-cross-tenant work derives from no manifest a node holds, so M22 adds a register; not a
-broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the parity row.
-
+**Docs.** `deploy.md`, the parity row, and a banner on `ownership-and-leases.md`: M22 adds a
+register, not a broker.
 **Unchanged:** non-replica queries, folds, GC and branches; write-path requests. No LIST.
 
 ## Acceptance criteria
@@ -176,7 +174,8 @@ broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the 
   1 dest HEAD GET, then per new segment 1 GET and ≤3 sidecar GETs followed by their PUTs,
   then per changed vector a GET and a PUT, then 1 CAS. Depth 5, in the background.
 - **Control:** create = source GET, HEAD GET+CAS, reconcile (2 GETs+CAS); pause, resume,
-  cancel = HEAD GET+CAS, reconcile. Status 3 parallel GETs; list 1 GET. No LIST.
+  cancel = HEAD GET+CAS, reconcile. ⚠️ Amended at M22.3: create, pause and resume then answer
+  with a status (3 GETs), cancel with a HEAD GET (+ a DELETE on the last). List 1 GET.
 - **Worker:** one GET per `scan` even with no jobs (1,000 GET/s across 10,000 nodes: nodes).
   One `REPLSTATUS` PUT per tenant per `ttl/3` at most, and only while commits or errors
   change: zero when idle.
@@ -187,7 +186,8 @@ broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the 
 
 ## Risks
 
-- **Takeover** after a crash: ≤ `ttl + S·scan`, ~13 min at defaults with one survivor.
+- **Takeover** after a crash: ≤ `ttl + S·scan`, ~13 min at defaults with one survivor. One
+  sync longer than `2·ttl/3` lets the worker's claims lapse (renewal waits between syncs).
 - **Ceiling:** 64 shards × ~2,000 tenants ≈ 140 KB a shard; beyond, choose `S` at first use.
 - **A stale cached HEAD** may serve a row past a stale door; **a regressed source HEAD**
   (disaster recovery) stops at the `>` check: cancel, recreate. **No auth exists**: any

@@ -674,6 +674,7 @@ fn the_worker_and_its_sources_are_configured_from_the_environment() {
         ("PSTORE_REPLICATION_TTL_S", "x"),
         ("PSTORE_REPLICATION_MAX", "0"),
         ("PSTORE_REPLICATION_SHARDS", "70000"),
+        ("PSTORE_REPLICATION_TTL_S", "2"),
     ] {
         assert!(
             matches!(
@@ -727,6 +728,11 @@ fn the_worker_and_its_sources_are_configured_from_the_environment() {
             ("PSTORE_SOURCE_EU_ACCESS_KEY", "k"),
         ],
         vec![("PSTORE_SOURCES", "e u")],
+        vec![
+            ("PSTORE_SOURCES", "eu,EU"),
+            ("PSTORE_SOURCE_EU_ENDPOINT", "https://x"),
+            ("PSTORE_SOURCE_EU_BUCKET", "b"),
+        ],
         vec![
             ("PSTORE_SOURCES", "eu,eu"),
             ("PSTORE_SOURCE_EU_ENDPOINT", "https://x"),
@@ -998,4 +1004,76 @@ async fn a_remote_sources_reads_are_billed_to_the_replicas_tenant() {
         "nothing billed to the tenant"
     );
     assert_eq!(api.source_reads_for_test("far", TenantId(0)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn max_bounds_every_worker_and_the_rest_is_shared() {
+    // More work than one worker may hold, all unclaimed: the first worker's start scan reads
+    // every shard and must still stop at `max` (code review B1), and the rest goes to the
+    // others.
+    let world = World::new();
+    let four = ReplicationPolicy { max: 4, ..policy() };
+    let control = world.api_with(9, four);
+    ten_jobs(&world, &control).await;
+    let mut workers: Vec<(A, Worker)> = (1..=3)
+        .map(|l| (world.api_with(l, four), Worker::default()))
+        .collect();
+    run(&mut workers, 60, Duration::from_secs(1)).await;
+    let held = holders(&control).await;
+    let mut per: BTreeMap<u64, usize> = BTreeMap::new();
+    for o in held.values() {
+        *per.entry(o.expect("a tenant nobody holds")).or_default() += 1;
+    }
+    assert!(per.values().all(|n| *n <= 4), "{per:?}");
+    assert_eq!(per.values().sum::<usize>(), 10, "{per:?}");
+    assert_eq!(per.len(), 3, "the work was not shared: {per:?}");
+    for t in tenants() {
+        assert_eq!(
+            rows(&control, t, "dst").await.unwrap().len(),
+            10,
+            "tenant {t}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_with_a_lower_max_holds_no_more_than_it() {
+    // The lane's claims from before a restart come back with the start scan whatever the
+    // room; past the new `max` they are not held, and the next renewal releases them.
+    let world = World::new();
+    let control = world.api(9);
+    ten_jobs(&world, &control).await;
+    let mut before = vec![(world.api(1), Worker::default())];
+    run(&mut before, 2, Duration::from_secs(1)).await;
+    assert!(holders(&control).await.values().all(|o| *o == Some(1)));
+    let two = ReplicationPolicy { max: 2, ..policy() };
+    let (after, mut aw) = (world.api_with(1, two), Worker::default());
+    let tick = after.replication_tick(&mut aw).await;
+    assert!(tick.held <= 2, "{tick:?}");
+    // The rest go to others: released at the next renewal of a shard it still holds in, or
+    // lapsed after `ttl` in one it holds nothing in -- within `ttl + S·scan` either way.
+    let (other, mut ow) = (world.api(2), Worker::default());
+    let renew = usize::try_from((policy().ttl / 3).as_secs()).unwrap() + 1;
+    for _ in 0..renew {
+        after.replication_tick(&mut aw).await;
+        other.replication_tick(&mut ow).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let bound = policy().ttl + policy().scan * u32::from(policy().shards);
+    for _ in 0..bound.as_secs() {
+        after.replication_tick(&mut aw).await;
+        other.replication_tick(&mut ow).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let held = holders(&control).await;
+    assert_eq!(
+        held.values().filter(|o| **o == Some(1)).count(),
+        2,
+        "{held:?}"
+    );
+    assert_eq!(
+        held.values().filter(|o| **o == Some(2)).count(),
+        8,
+        "{held:?}"
+    );
 }

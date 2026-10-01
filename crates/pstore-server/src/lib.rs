@@ -3060,7 +3060,18 @@ fn replication_policy(
     };
     let policy = ReplicationPolicy {
         scan: positive("PSTORE_REPLICATION_SCAN_S")?.map_or(d.scan, secs),
-        ttl: positive("PSTORE_REPLICATION_TTL_S")?.map_or(d.ttl, secs),
+        ttl: match positive("PSTORE_REPLICATION_TTL_S")? {
+            None => d.ttl,
+            // Renewed every third of it, by a loop that looks once a second.
+            Some(n) if n < 3 => {
+                return Err(ConfigError::Replication(
+                    "PSTORE_REPLICATION_TTL_S",
+                    n.to_string(),
+                    "at least 3: a claim is renewed every third of it",
+                ));
+            }
+            Some(n) => secs(n),
+        },
         max: positive("PSTORE_REPLICATION_MAX")?
             .map_or(d.max, |n| usize::try_from(n).unwrap_or(usize::MAX)),
         idle: positive("PSTORE_REPLICATION_IDLE_S")?.map_or(d.idle, secs),
@@ -3084,7 +3095,7 @@ fn source_configs(get: &impl Fn(&str) -> Option<String>) -> Result<Vec<SourceCon
                 "a source name is letters, digits and _",
             ));
         }
-        if out.iter().any(|s| s.name == name) {
+        if out.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
             return Err(ConfigError::Source(name.to_owned(), "named twice"));
         }
         let var = |k: &str| get(&format!("PSTORE_SOURCE_{}_{k}", name.to_ascii_uppercase()));
