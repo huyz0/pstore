@@ -304,7 +304,7 @@ impl<S: BlobStore> Register<S> {
                     // is left alone -- renewal extends it, and a scan that rewrote it would be
                     // a write per scan (M22.3).
                     Some(c) if c.owner == owner && c.expires_ms <= now_ms => e.claim = Some(held),
-                    Some(c) if c.owner == owner => {}
+                    // Live, its own or another's: left alone.
                     Some(c) if c.expires_ms > now_ms => {}
                     _ if taken < room => {
                         e.claim = Some(held);

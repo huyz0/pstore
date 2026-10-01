@@ -36,6 +36,8 @@ pub(crate) struct Counting {
     pub(crate) counts: Arc<Counts>,
     /// Ordinals of conditional writes refused as `Contended`.
     pub(crate) contend: Arc<Mutex<BTreeSet<u64>>>,
+    /// Every conditional write loses, as to a writer that always lands first.
+    pub(crate) lose_all: Arc<std::sync::atomic::AtomicBool>,
     /// Every read fails: a backend that is down.
     pub(crate) refuse_reads: Arc<std::sync::atomic::AtomicBool>,
     seen: Arc<AtomicU64>,
@@ -54,6 +56,7 @@ impl Counting {
             counts: Arc::new(Counts::default()),
             contend: Arc::new(Mutex::new(BTreeSet::new())),
             refuse_reads: Arc::default(),
+            lose_all: Arc::default(),
             seen: Arc::new(AtomicU64::new(0)),
             gate: None,
         }
@@ -142,6 +145,9 @@ impl BlobStore for Counting {
         self.counts.cas.fetch_add(1, Ordering::SeqCst);
         if self.contend.lock().unwrap().contains(&n) {
             return Err(CasError::Contended);
+        }
+        if self.lose_all.load(Ordering::SeqCst) {
+            return Err(CasError::Lost);
         }
         self.inner.put_conditional(key, body, pre).await
     }

@@ -1077,3 +1077,37 @@ async fn a_restart_with_a_lower_max_holds_no_more_than_it() {
         "{held:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_renewal_keeps_a_claim_made_for_the_worker_before_it_adopts_it() {
+    // Code review round 2, R1: a create claims tenant B for this worker mid-tick; a renewal
+    // of B's shard runs before the next tick adopts B, and must not release its claim.
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..4).await;
+    let src = json!({"index": "src", "tenant": SRC.to_string()});
+    let shard = |t: u64| pstore_jobs::fnv1a(format!("{:032x}", u128::from(t)).as_bytes()) % 4;
+    let a = 100u64;
+    let b = (101..1_000).find(|t| shard(*t) == shard(a)).unwrap();
+    create(&api, a, "dst", src.clone()).await;
+    let mut w = Worker::default();
+    api.replication_tick(&mut w).await;
+    create(&api, b, "dst", src).await;
+    assert_eq!(
+        api.replication_entry_for_test(TenantId(u128::from(b)))
+            .await
+            .unwrap()
+            .1,
+        Some(1)
+    );
+    tokio::time::advance(policy().ttl / 3 + Duration::from_secs(1)).await;
+    api.renew_for_test(&mut w).await;
+    assert_eq!(
+        api.replication_entry_for_test(TenantId(u128::from(b)))
+            .await
+            .unwrap()
+            .1,
+        Some(1),
+        "the renewal released a claim the worker had not adopted yet"
+    );
+}

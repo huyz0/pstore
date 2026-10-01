@@ -291,7 +291,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 .now_ms()
                 .saturating_add(u64::try_from(policy.ttl.as_millis()).unwrap_or(u64::MAX)),
         });
-        let entry = reg
+        let entry = match reg
             .reconcile(
                 &id_of(tenant),
                 || {
@@ -306,10 +306,23 @@ impl<S: BlobStore + 'static> Api<S> {
                 claim,
                 touch,
             )
-            .await?;
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                // The reserved slot goes back with the failure (code review round 2, m8).
+                if reserved {
+                    self.replicating.held.fetch_sub(1, Ordering::SeqCst);
+                }
+                return Err(e.into());
+            }
+        };
         // Handed to the worker only when THIS call's claim is the one written; otherwise the
         // reserved slot is given back.
-        let ours = claim.is_some() && entry.is_some_and(|e| e.claim == claim);
+        // An existing claim by this lane counts too: the worker's own cleanup reconciling a
+        // tenant that runs again keeps the claim it had, and must get the tenant back (m7).
+        let ours = claim.is_some()
+            && entry.is_some_and(|e| e.claim.is_some_and(|c| c.owner == self.lane.0));
         if ours && let Some(e) = entry {
             self.replicating
                 .adopted
@@ -330,6 +343,14 @@ impl<S: BlobStore + 'static> Api<S> {
             let _ = reg
                 .reconcile(&id_of(tenant), || async { Ok(None) }, None, true)
                 .await;
+        }
+    }
+
+    /// Runs only the worker's renewal of its due shards. Not part of the API.
+    #[doc(hidden)]
+    pub async fn renew_for_test(&self, w: &mut Worker) {
+        if let Ok(reg) = self.register().await {
+            self.renew_due(w, reg).await;
         }
     }
 
@@ -578,11 +599,25 @@ impl<S: BlobStore + 'static> Api<S> {
             .map(|(s, _)| *s)
             .collect();
         for shard in due {
+            // Held here, and handed over but not yet adopted: a control call can claim for
+            // this worker mid-tick, and a renewal must not release that claim before the next
+            // tick adopts it.
+            let pending: Vec<TenantId> = self
+                .replicating
+                .adopted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(_, s, _)| *s == shard)
+                .map(|(t, _, _)| *t)
+                .collect();
             let keep: std::collections::BTreeSet<String> = w
                 .held
                 .iter()
                 .filter(|(_, h)| h.shard == shard)
-                .map(|(t, _)| id_of(*t))
+                .map(|(t, _)| *t)
+                .chain(pending)
+                .map(id_of)
                 .collect();
             let Ok(kept) = reg
                 .renew(shard, self.lane.0, self.now_ms(), ttl_ms, &keep)

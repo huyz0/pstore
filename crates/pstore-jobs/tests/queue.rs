@@ -15,6 +15,7 @@ use common::Counting;
 use pstore_jobs::{Claim, Entry, JobsError, Register, fnv1a};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 const TTL: u64 = 1_000;
 
@@ -544,4 +545,73 @@ async fn nothing_lists() {
         store.counts.lists.load(std::sync::atomic::Ordering::SeqCst),
         0
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_write_gives_up_after_its_attempts_and_waits_between_them() {
+    use pstore_jobs::MAX_ATTEMPTS;
+    // Always contended: retried as it was, exactly MAX_ATTEMPTS times, then refused.
+    let store = Counting::new();
+    let reg = open(&store, 1).await;
+    let base = store.cas();
+    store.contend_at(&(base..base + 1_000).collect::<Vec<_>>());
+    let start = tokio::time::Instant::now();
+    let r = reg
+        .reconcile("t1", || async { Ok(Some(1)) }, None, true)
+        .await;
+    assert!(matches!(r, Err(JobsError::Contended)), "{r:?}");
+    assert_eq!(store.cas() - base, u64::from(MAX_ATTEMPTS));
+    // And it waited, longer each time: 2 + 4 + ... ms, capped at 64.
+    assert!(
+        start.elapsed() >= Duration::from_millis(2 + 4 + 8 + 16 + 32),
+        "{:?}",
+        start.elapsed()
+    );
+    // Always lost: re-read and retried, exactly as many times, by every operation.
+    let store = Counting::new();
+    let reg = open(&store, 1).await;
+    // Claimed by 1 and lapsed, so a claim and a renewal each have something to write.
+    add(
+        &reg,
+        "t1",
+        1,
+        Some(Claim {
+            owner: 1,
+            expires_ms: 0,
+        }),
+    )
+    .await;
+    store
+        .lose_all
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for op in 0..3 {
+        let base = store.cas();
+        let r = match op {
+            0 => reg
+                .reconcile("t1", || async { Ok(Some(2)) }, None, false)
+                .await
+                .map(|_| ()),
+            1 => reg.claim(0, 1, 10, TTL, 10).await.map(|_| ()),
+            _ => reg
+                .renew(0, 1, 10, TTL, &BTreeSet::from(["t1".to_owned()]))
+                .await
+                .map(|_| ()),
+        };
+        assert!(matches!(r, Err(JobsError::Contended)), "op {op}: {r:?}");
+        assert_eq!(store.cas() - base, u64::from(MAX_ATTEMPTS), "op {op}");
+    }
+}
+
+#[tokio::test]
+async fn keys_carry_the_published_partition_prefix() {
+    // The prefix spreads a register over a bucket's partitions; derived from the name and
+    // shard alone, so every process lands on the same keys.
+    let reg = open(&Counting::new(), 4).await;
+    for shard in 0..4u16 {
+        let want = format!(
+            "{:04x}/jobs/rep/{shard:04x}/QUEUE",
+            fnv1a(format!("rep/{shard}").as_bytes()) & 0xffff
+        );
+        assert_eq!(reg.shard_key(shard).as_str(), want);
+    }
 }
