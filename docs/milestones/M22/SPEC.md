@@ -70,7 +70,8 @@ replications**, over any `BlobStore`. A create-once `{spread}/jobs/{name}/CONFIG
   for the caller only if its worker runs and is under `max`. A lost CAS repeats. `claim` and `renew` never add
   an entry, and keep `gen`.
   - A HEAD change after the shard read changes its tag before its own reconcile writes, so
-    the last reconcile to commit read the latest HEAD. No grace period, no clock.
+    the last reconcile to commit read the latest HEAD. ⚠️ Amended at M22.1: so a control's
+    reconcile **always writes** (a touch), and every write bumps a `version` (ETag ABA).
   - Create, pause, resume and cancel each CAS HEAD and then reconcile. A crash in between
     leaves the entry stale until the next control call or **status**, which reconciles
     whenever `queued` disagrees with HEAD.
