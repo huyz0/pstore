@@ -514,7 +514,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M18 | **A scheduled reap** (BACKLOG row 31): the server runs GC on a timer, as M9i runs the fold | Nothing bounds the graveyard, or the `as_of` window every open pays for |
 | M19 | **A discarded compaction buries its output** (BACKLOG row 30), as a lost branch buries its copies | Each retry of a discarded compaction leaks a segment nothing can name |
 | M20 | **A read cache that survives a restart** ([SPEC](../../milestones/M20/SPEC.md)): the disk tier D-23 calls mandatory, behind the memory tier, wired into the server | The server wires in no read cache at all (`pstore-cache` is unused), and a restart flushes whatever a node holds. Tested on a local directory: correctness needs a disk, not NVMe, and any number measured there is `provisional` |
-| M21 | **`hint_cache_warm`** | Needs M20's tier to warm. ⚠️ Was M17, then M20: backlog rows that lose or leak data went first, then the tier it warms |
+| M21 | **`hint_cache_warm`** ([VERIFIED](../../milestones/M21/VERIFIED.md)): `POST /v1/indexes/{index}/warm`, metadata only (D-44) | Needs M20's tier to warm. ⚠️ Was M17, then M20: backlog rows that lose or leak data went first, then the tier it warms |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.

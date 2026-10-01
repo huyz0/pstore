@@ -48,7 +48,10 @@ pstore-server --test warm`.
      fails without the prune.
 9. **Nothing else changes.** `cargo test -p pstore-engine -p pstore-server` passes, every
    existing test unchanged; `pstore-cache` is untouched by the diff.
-10. **Gates** — NOT-RUN yet: the sweep over `715c74f..785a45e`'s source is in progress.
+10. **Gates.** `./scripts/mutants.sh --check . --in-diff` over the source diff
+    `715c74f..785a45e`, in a worktree: 18 mutants, 12 caught, 6 unviable, 0 missed. The code
+    review's source change (`785a45e..5ec7023`): 6 mutants, 5 caught, 1 unviable.
+    `./scripts/gates.sh` passed, all 17 gates, at `7d49825`.
 
 Spec review took two rounds: round 1 blocked on two blockers and four majors, and round 2
 approved. Code review took two: round 1 passed with one major (existence without the prune),
