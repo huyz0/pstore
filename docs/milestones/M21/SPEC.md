@@ -55,8 +55,9 @@ No `classes` parameter: D-44 fixes them. No whole-tenant warm. No routing.
 
 1. **A warmed index's queries open with no Meta read.** After `warm`, a dense, sparse, text,
    filtered and `rank_by` query each issue **0** `Meta` reads beneath the cache, and every
-   `Pinned` read that reaches the store is a 404 for a key the index lacks (row 46). Each costs
-   exactly what it costs on a second run with no warm (M20's `queries_and_warm_cost` baseline).
+   `Pinned` read that reaches the store is a 404 for a key the index lacks (row 46). Each issues
+   exactly the metadata reads of a second run with no warm. ⚠️ Amended at implementation, from
+   "costs exactly": a warm leaves bulk cold by design, so only metadata reads can be equal.
 2. **A warm admits no bulk.** During `warm`, **0** `Bulk` or unclassed ranged reads reach the
    store, and bulk residency is unchanged.
 3. **A warm reads only what exists.** Index of k segments below the threshold, no dv, no sparse
