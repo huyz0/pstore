@@ -305,6 +305,7 @@ async fn a_served_process_reaps_and_stops_with_its_signal() {
         },
         None,
         Some(quick),
+        false,
     ));
     commit(&w.api, 76, "a").await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

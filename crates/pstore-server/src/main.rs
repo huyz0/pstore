@@ -6,7 +6,9 @@
 //! being wrong about is in the library.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
-use pstore_server::{Api, Backend, Config, open_cache, s3_capabilities, serve_folding};
+use pstore_server::{
+    Api, Backend, Config, Profile, SourceConfig, open_cache, s3_capabilities, serve_folding,
+};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -36,15 +38,33 @@ async fn main() -> std::process::ExitCode {
 /// reach MinIO and an in-VPC endpoint. TLS to a real bucket is the default because the URL
 /// scheme decides it.
 fn s3(config: &Config) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
+    bucket(
+        &config.endpoint,
+        &config.bucket,
+        config.credentials.as_ref(),
+        &env("PSTORE_REGION", "us-east-1"),
+        config.profile,
+    )
+}
+
+/// One S3-compatible bucket.
+///
+/// ⚠️ The credentials are applied only when the operator gave both. Unset, `AmazonS3Builder`
+/// uses its own provider chain -- which is how an instance profile or a service-account role
+/// works, and the only way this image is usable on EC2 or EKS. `Config` decides; this applies.
+fn bucket(
+    endpoint: &str,
+    name: &str,
+    credentials: Option<&(String, String)>,
+    region: &str,
+    profile: Profile,
+) -> Result<ObjectStoreBackend, Box<dyn std::error::Error>> {
     let mut builder = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(&config.endpoint)
-        .with_bucket_name(&config.bucket)
+        .with_endpoint(endpoint)
+        .with_bucket_name(name)
         .with_allow_http(true)
-        .with_region(env("PSTORE_REGION", "us-east-1"));
-    // ⚠️ Only when the operator gave both. Unset, `AmazonS3Builder` uses its own provider
-    // chain -- which is how an instance profile or a service-account role works, and the only
-    // way this image is usable on EC2 or EKS. `Config` decides; this applies.
-    if let Some((key, secret)) = &config.credentials {
+        .with_region(region);
+    if let Some((key, secret)) = credentials {
         builder = builder
             .with_access_key_id(key)
             .with_secret_access_key(secret);
@@ -52,8 +72,20 @@ fn s3(config: &Config) -> Result<impl BlobStore, Box<dyn std::error::Error>> {
     let s3 = builder.build()?;
     Ok(ObjectStoreBackend::new(
         Arc::new(s3),
-        s3_capabilities(&config.endpoint, config.profile),
+        s3_capabilities(endpoint, profile),
     ))
+}
+
+/// A replication source (M22): read only, so it needs no fencing and no profile.
+fn source(s: &SourceConfig) -> Result<Arc<dyn BlobStore>, Box<dyn std::error::Error>> {
+    let b = bucket(
+        &s.endpoint,
+        &s.bucket,
+        s.credentials.as_ref(),
+        &s.region,
+        Profile::Unprobed,
+    )?;
+    Ok(Arc::new(b))
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -89,6 +121,22 @@ async fn run<S: BlobStore + 'static>(
             return std::process::ExitCode::FAILURE;
         }
     };
+    let mut sources = std::collections::BTreeMap::new();
+    for s in &config.sources {
+        match source(s) {
+            Ok(store) => {
+                sources.insert(s.name.clone(), store);
+            }
+            Err(e) => {
+                eprintln!(
+                    "pstore-server: cannot open replication source {}: {e}",
+                    s.name
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    api.configure_replication(config.replication.unwrap_or_default(), sources);
     let listener = match tokio::net::TcpListener::bind(&config.bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -106,7 +154,15 @@ async fn run<S: BlobStore + 'static>(
         cache.as_ref().map(|c| c.disk_state())
     );
     let shutdown = stopped();
-    let served = serve_folding(api, listener, shutdown, config.fold, config.gc).await;
+    let served = serve_folding(
+        api,
+        listener,
+        shutdown,
+        config.fold,
+        config.gc,
+        config.replication.is_some(),
+    )
+    .await;
     // ⚠️ After the server has stopped: the disk tier's writes in flight are flushed, or a
     // deploy would lose them every time (M20).
     if let Some(c) = &cache {

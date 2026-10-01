@@ -88,6 +88,14 @@ Examples: "L0 has 12 segments, threshold is 8 ⇒ compact"; "shard 7 has 30% tom
 rewrite"; "unindexed WAL is 200 MB ⇒ build segments"; "epoch 400 is unreferenced and older
 than the retention window ⇒ GC".
 
+> ⚠️ **Corrected by [M22](../../milestones/M22/SPEC.md).** Replication jobs are work no node
+> can derive from state it holds: a job lives in one tenant's HEAD, and finding which of a
+> million tenants have one would take a LIST or a read of every HEAD. M22 adds a **register**
+> of tenants with running jobs (`pstore-jobs`): sharded, CAS-written, in the bucket. It is not
+> a broker -- no address, no master, no liveness protocol -- and its claims are advisory, by
+> Design rule 12 below. Everything else here still holds: compaction, GC and folds still have
+> no queue.
+
 Because `needed_work` is a **pure function of state the node already holds**, there is no
 queue, no dispatcher, no scheduler state to lose, and nothing to recover after a crash. The
 work list regenerates itself from the manifest, always. This is the single most important

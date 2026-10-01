@@ -18,6 +18,7 @@ pstore-format = { path = "../pstore-format" }
 pstore-index  = { path = "../pstore-index" }
 pstore-query  = { path = "../pstore-query" }
 pstore-types  = { path = "../pstore-types" }
+pstore-jobs   = { path = "../pstore-jobs" }
 # ⚠️ `axum` lives here and nowhere else, by the same argument that confines `object_store`
 # to `pstore-blob`: a transport in a library crate is a transport every crate above it
 # inherits, and the engine must stay callable without one.

@@ -1565,6 +1565,7 @@ dependencies = [
  "pstore-engine",
  "pstore-format",
  "pstore-index",
+ "pstore-jobs",
  "pstore-query",
  "pstore-testkit",
  "pstore-types",

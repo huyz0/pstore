@@ -473,6 +473,7 @@ async fn a_served_process_folds_and_stops_with_its_signal() {
         },
         Some(quick),
         None,
+        false,
     ));
     write(&a, 52, &["x"], true).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

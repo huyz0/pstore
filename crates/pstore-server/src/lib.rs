@@ -29,8 +29,10 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod replication;
 mod session;
 mod types;
+pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
     MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema,
@@ -120,6 +122,9 @@ pub struct Api<S> {
     /// Per tenant, when its next scheduled reap may run after a failure, and the delay that
     /// set it (M18).
     reap_backoff: Mutex<HashMap<TenantId, (tokio::time::Instant, std::time::Duration)>>,
+    /// Replication (M22): its policy and named sources, the register of tenants with running
+    /// replications, and what this process's worker holds.
+    replicating: replication::Replicating<S>,
 }
 
 /// When a scheduled fold runs (M9i.1): D-39's triggers, size or age, never a fixed timer.
@@ -258,6 +263,7 @@ impl<S: BlobStore + 'static> Api<S> {
             backoff: Mutex::new(HashMap::new()),
             requested: Mutex::new(std::collections::HashSet::new()),
             reap_backoff: Mutex::new(HashMap::new()),
+            replicating: replication::Replicating::default(),
         }))
     }
 
@@ -493,6 +499,21 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
             .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
+            .route("/v1/replications", get(replication::list::<S>))
+            .route(
+                "/v1/indexes/{index}/replication",
+                put(replication::create::<S>)
+                    .get(replication::status::<S>)
+                    .delete(replication::cancel::<S>),
+            )
+            .route(
+                "/v1/indexes/{index}/replication/pause",
+                post(replication::pause::<S>),
+            )
+            .route(
+                "/v1/indexes/{index}/replication/resume",
+                post(replication::resume::<S>),
+            )
             .route(
                 "/v1/indexes/{index}/schema",
                 axum::routing::patch(patch_schema),
@@ -667,6 +688,21 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            // M22: each replication rule by its own name.
+            EngineError::Replica(r) => {
+                use pstore_engine::ReplicaRefusal as R;
+                let (status, code) = match &r {
+                    R::IndexExists(_) => (StatusCode::CONFLICT, "index_exists"),
+                    R::Exists(_) => (StatusCode::CONFLICT, "replication_exists"),
+                    R::SourceNotFound(_) => (StatusCode::NOT_FOUND, "source_not_found"),
+                    R::NotFound(_) => (StatusCode::NOT_FOUND, "replication_not_found"),
+                    R::ReadOnly(_) => (StatusCode::CONFLICT, "replica_read_only"),
+                    R::Active(_) => (StatusCode::CONFLICT, "replication_active"),
+                    R::NoHistory(_) => (StatusCode::CONFLICT, "replica_no_history"),
+                    R::Invalid(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+                };
+                Self::new(status, code, r.to_string())
+            }
             EngineError::BackendCannotFence { .. } => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
@@ -2810,6 +2846,26 @@ pub struct Config {
     pub gc: Option<GcPolicy>,
     /// The read cache, or `None` when `PSTORE_CACHE_DIR` is unset (M20).
     pub cache: Option<CacheConfig>,
+    /// The replication worker's policy, or `None` with `PSTORE_REPLICATION=off` (M22).
+    pub replication: Option<ReplicationPolicy>,
+    /// The named remote stores a replication may read, from `PSTORE_SOURCES` (M22).
+    pub sources: Vec<SourceConfig>,
+}
+
+/// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
+/// through its S3 interoperability endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceConfig {
+    /// The name a replication's `source.store` gives.
+    pub name: String,
+    /// `PSTORE_SOURCE_<NAME>_ENDPOINT`.
+    pub endpoint: String,
+    /// `PSTORE_SOURCE_<NAME>_BUCKET`.
+    pub bucket: String,
+    /// `PSTORE_SOURCE_<NAME>_ACCESS_KEY` and `_SECRET_KEY`, both or neither.
+    pub credentials: Option<(String, String)>,
+    /// `PSTORE_SOURCE_<NAME>_REGION`, `us-east-1` unset.
+    pub region: String,
 }
 
 /// Where the read cache keeps its disk tier, and how large each tier is (M20).
@@ -2916,6 +2972,12 @@ pub enum ConfigError {
     /// A `PSTORE_CACHE_*` value that cannot be used (M20).
     #[error("{0}={1} is refused: {2}")]
     Cache(&'static str, String, &'static str),
+    /// A `PSTORE_REPLICATION*` value that is not what it must be (M22).
+    #[error("{0}={1} is refused: {2}")]
+    Replication(&'static str, String, &'static str),
+    /// A replication source that is not fully configured (M22).
+    #[error("replication source {0:?}: {1}")]
+    Source(String, &'static str),
 }
 
 impl Config {
@@ -2956,8 +3018,103 @@ impl Config {
             fold: fold_policy(&get)?,
             gc: gc_policy(&get)?,
             cache: cache_config(&get, backend)?,
+            replication: replication_policy(&get)?,
+            sources: source_configs(&get)?,
         })
     }
+}
+
+/// The replication worker's policy (M22): unset is the default, `off` is none, and anything
+/// else is refused by name, as the fold's values are.
+fn replication_policy(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ReplicationPolicy>, ConfigError> {
+    let on = match get("PSTORE_REPLICATION").as_deref() {
+        None => true,
+        Some("off") => false,
+        Some(other) => {
+            return Err(ConfigError::Replication(
+                "PSTORE_REPLICATION",
+                other.to_owned(),
+                "unset, or off to run no replication worker",
+            ));
+        }
+    };
+    let positive = |var: &'static str| -> Result<Option<u64>, ConfigError> {
+        get(var)
+            .map(|v| {
+                v.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(ConfigError::Replication(var, v, "a positive integer"))
+            })
+            .transpose()
+    };
+    let d = ReplicationPolicy::default();
+    let secs = std::time::Duration::from_secs;
+    let shards = match positive("PSTORE_REPLICATION_SHARDS")? {
+        None => d.shards,
+        Some(n) => u16::try_from(n).map_err(|_| {
+            ConfigError::Replication("PSTORE_REPLICATION_SHARDS", n.to_string(), "at most 65535")
+        })?,
+    };
+    let policy = ReplicationPolicy {
+        scan: positive("PSTORE_REPLICATION_SCAN_S")?.map_or(d.scan, secs),
+        ttl: positive("PSTORE_REPLICATION_TTL_S")?.map_or(d.ttl, secs),
+        max: positive("PSTORE_REPLICATION_MAX")?
+            .map_or(d.max, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        idle: positive("PSTORE_REPLICATION_IDLE_S")?.map_or(d.idle, secs),
+        shards,
+        ..d
+    };
+    Ok(on.then_some(policy))
+}
+
+/// The named sources in `PSTORE_SOURCES` (M22), each refused by name when it lacks its
+/// endpoint or bucket, has half its credentials, or repeats a name.
+fn source_configs(get: &impl Fn(&str) -> Option<String>) -> Result<Vec<SourceConfig>, ConfigError> {
+    let Some(names) = get("PSTORE_SOURCES") else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<SourceConfig> = Vec::new();
+    for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(ConfigError::Source(
+                name.to_owned(),
+                "a source name is letters, digits and _",
+            ));
+        }
+        if out.iter().any(|s| s.name == name) {
+            return Err(ConfigError::Source(name.to_owned(), "named twice"));
+        }
+        let var = |k: &str| get(&format!("PSTORE_SOURCE_{}_{k}", name.to_ascii_uppercase()));
+        let endpoint = var("ENDPOINT").ok_or(ConfigError::Source(
+            name.to_owned(),
+            "PSTORE_SOURCE_<NAME>_ENDPOINT is required",
+        ))?;
+        let bucket = var("BUCKET").ok_or(ConfigError::Source(
+            name.to_owned(),
+            "PSTORE_SOURCE_<NAME>_BUCKET is required",
+        ))?;
+        let credentials = match (var("ACCESS_KEY"), var("SECRET_KEY")) {
+            (Some(k), Some(s)) => Some((k, s)),
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::Source(
+                    name.to_owned(),
+                    "_ACCESS_KEY and _SECRET_KEY are given together or not at all",
+                ));
+            }
+        };
+        out.push(SourceConfig {
+            name: name.to_owned(),
+            endpoint,
+            bucket,
+            credentials,
+            region: var("REGION").unwrap_or_else(|| "us-east-1".to_owned()),
+        });
+    }
+    Ok(out)
 }
 
 /// The scheduled fold's policy from the environment (M9i.1). Unset is the default; anything
@@ -3149,6 +3306,7 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     fold: Option<FoldPolicy>,
     gc: Option<GcPolicy>,
+    replicate: bool,
 ) -> std::io::Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let tx = Arc::new(tx);
@@ -3161,6 +3319,13 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     let reaps = gc.map(|policy| {
         let mut rx = rx.clone();
         tokio::spawn(run_reaps(Arc::clone(&api), policy, async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+        }))
+    });
+    // M22: the replication worker, under the same signal.
+    let replication = replicate.then(|| {
+        let mut rx = rx.clone();
+        tokio::spawn(run_replication(Arc::clone(&api), async move {
             let _ = rx.wait_for(|stopped| *stopped).await;
         }))
     });
@@ -3177,6 +3342,9 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     }
     if let Some(reaps) = reaps {
         let _ = reaps.await;
+    }
+    if let Some(r) = replication {
+        let _ = r.await;
     }
     served
 }

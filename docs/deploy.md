@@ -73,6 +73,35 @@ one read.
   balancer, addressed directly.
 - Without `PSTORE_CACHE_DIR` it is refused with `409 no_read_cache` and costs nothing.
 
+## Replication
+
+An index can follow another index, in the same tenant, another tenant, or another bucket
+([M22](milestones/M22/SPEC.md)). `PUT /v1/indexes/{dest}/replication` with
+`{"source": {"index": "src", "tenant": "71", "store": "eu"}}` creates the job; `tenant`
+defaults to the caller's and `store` to this server's own bucket. `GET` reads its status,
+`POST …/pause` and `…/resume` stop and restart it, `DELETE` cancels it, and
+`GET /v1/replications` lists a tenant's jobs.
+
+- **Pull-based.** A worker in each server copies what the replica lacks from its source and
+  commits it to the replica's HEAD. The replica shows the source's **folded** state, so a
+  source write reaches it after the source folds, then within one sync interval.
+- **Read-only.** A replica refuses writes, a drop, compaction and `as_of` (`409`) until its
+  replication is cancelled; it then stays as a normal index.
+- **Work is found in a register** kept in this bucket. A new job is claimed by the server that
+  created it; a crashed server's jobs are taken over within `TTL + SHARDS × SCAN` (about
+  13 minutes at the defaults with one survivor). Claims are advisory: two servers on one job
+  waste copies and never corrupt the replica.
+- ⚠️ **Polling costs requests over time.** Each held tenant reads each of its distinct sources'
+  HEADs once per sync interval -- one GET a minute when idle -- billed to the replica's tenant.
+  Every worker also reads one register shard per `SCAN`, with or without work.
+- ⚠️ **Every server must name the same sources.** A worker without the store a job names
+  records `unknown_store` in that job's `last_error` and keeps the claim.
+- ⚠️ **No auth**: any tenant header may name any source index in any configured store (see
+  `auth` below).
+
+A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
+HMAC keys. It is only ever read.
+
 ## Unscheduled duties
 
 ⚠️ **The ids below are checked against `pstore_server::UNSCHEDULED`**, served at
@@ -138,6 +167,16 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_CACHE_DIR` | — | Turns on the read cache (above). Refused with `PSTORE_BACKEND=memory`. |
 | `PSTORE_CACHE_RAM_BYTES` | `268435456` | The memory tier, split by class: a tenth each for centroid tables and segment metadata, the rest bulk. Refused without `PSTORE_CACHE_DIR`. |
 | `PSTORE_CACHE_DISK_BYTES` | `4294967296` | The disk tier, split the same way and preallocated. Refused without `PSTORE_CACHE_DIR`. |
+| `PSTORE_REPLICATION` | on | Exactly `off` runs no replication worker; this server still serves the job API. |
+| `PSTORE_REPLICATION_SCAN_S` | `10` | How often a worker reads one more register shard. |
+| `PSTORE_REPLICATION_TTL_S` | `120` | How long a claim lasts unrenewed; renewed every third of it. |
+| `PSTORE_REPLICATION_MAX` | `64` | Tenants one worker holds at most. |
+| `PSTORE_REPLICATION_IDLE_S` | `60` | The sync interval of a tenant whose sources do not change. |
+| `PSTORE_REPLICATION_SHARDS` | `64` | The register's shard count, **fixed when the register is first created**: about 2,000 tenants with jobs per shard. |
+| `PSTORE_SOURCES` | — | Comma-separated names of remote source stores, each configured by the variables below. |
+| `PSTORE_SOURCE_<NAME>_ENDPOINT` / `_BUCKET` | — | Required for each name. |
+| `PSTORE_SOURCE_<NAME>_ACCESS_KEY` / `_SECRET_KEY` | the provider's credential chain | Both or neither; half a pair is refused. |
+| `PSTORE_SOURCE_<NAME>_REGION` | `us-east-1` | |
 
 ## Observability
 

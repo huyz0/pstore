@@ -37,6 +37,7 @@ M9 milestones is the order in which the difference has to be closed.
 | `distance_metric`: `cosine_distance`, `euclidean_squared` | **dot product only**, not selectable | **M9d**, recorded in HEAD's schema like `dims` |
 | `schema` inline in a write | inferred at first fold, immutable (M7d) | M9a accepts types by inference; declared schemas with M9h |
 | `copy_from_namespace`, `branch_from_namespace` | one operation: the new index shares the source's segments | **Landed in [M16](../../milestones/M16/SPEC.md)**: one HEAD CAS after a fold, plus a GET and a PUT per segment carrying deletes. `copy_from_namespace` is the same operation, since a physical copy of immutable segments buys nothing |
+| Continuous replication, across tenants or buckets | none | **[M22](../../milestones/M22/SPEC.md)**: pull-based replication jobs -- create, list, status, pause, resume, cancel -- run by workers that find work in a sharded register in the bucket. A replica is read-only and shows its source's folded state |
 | ids: string ≤ 64 bytes, u64, UUID (*snippet*) | any string | M9c bounds it, because the id becomes a lookup key |
 | base64 vectors | JSON arrays only | D-36 wants it; small, with M9d |
 | durable on return; group commit ~1 s | `durable` or `batched` (process memory until a later durable write) | Kept: `durability` is a client choice by design (D34) |
