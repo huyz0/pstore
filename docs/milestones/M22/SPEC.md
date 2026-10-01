@@ -1,177 +1,213 @@
 # M22 — Replication jobs: pull-based index replication, listed, paused, resumed, cancelled
 
-**Serves:** OQ-135 (async replication of immutable objects), for one index at a time; the
-copy row of [`turbopuffer-api-parity.md`](../../research/11-design/turbopuffer-api-parity.md),
-which M16 answered only within a tenant; Design rule 12 of
-[`ownership-and-leases.md`](../../research/04-cluster/ownership-and-leases.md).
+**Serves:** OQ-135 (async replication of immutable objects), one index at a time; the copy row
+of [`turbopuffer-api-parity.md`](../../research/11-design/turbopuffer-api-parity.md), which M16
+answered within a tenant only; Design rule 12 of [`ownership-and-leases.md`](../../research/04-cluster/ownership-and-leases.md).
 
 ## What is true today
 
-- `copy_from_namespace` (M16) is one-shot and same-tenant: `dest` borrows `src`'s keys, and
-  nothing follows `src` afterwards. No path reads another tenant's HEAD or another bucket.
-- A segment's bytes name no key, tenant or index. Its sidecars are derived from its key
-  (`.cen`, `.sdict`, `.tdict`). A delete vector's row count only grows while its segment lives.
-- Nodes find work in state they already hold. Nothing finds work across tenants without a
-  LIST, and the server does not use the catalog.
+- M16's copy is one-shot and same-tenant. Nothing reads another tenant's HEAD or bucket.
+- A segment's bytes name no key, tenant or index. Its sidecars are derived from its key, and
+  its footer says which dictionaries it has (`Engine::warm` reads that).
+- No node can find cross-tenant work without a LIST. The catalog's create-once root and
+  shard registers (`pstore-catalog`) are the precedent for a sharded register.
 
 ## Delta
 
-**HEAD.** A trailing `replicas` section, after `branched`: `dest -> Replica { source:
-{store, tenant, index}, state: running|paused, run: u64, applied: Option<(src_epoch,
-fingerprint)> }`. `fingerprint` hashes the source index's keys, delete counts and schema. A
-HEAD with no replica is byte for byte what M21 wrote.
+**HEAD** gains a trailing `replications` section, after `branched`: `dest ->
+{source: {store, tenant, index}, state: running|paused, run, applied: (src_epoch,
+fingerprint)?, rejected}`. `run` is the epoch that last set `running`. `fingerprint` is
+FNV-1a 64 over the source index's segment keys, its delete-vector keys and its schema.
+`rejected` counts rows refused (below). A HEAD with none is byte for byte M21's.
 
-**Sync, `Engine::replicate(source, dest, run, known)`.** Pull-based, run by the destination.
-1. Read the source tenant's HEAD from `source`, the local store or a named remote one. If
-   the source index's fingerprint equals `known`, stop: **1 request**.
-2. Read the dest HEAD. Stop unless `replicas[dest]` is `running` with this `run`. If the
-   source index does not exist, stop with an error.
-3. Copy each source segment that has no dest segment yet, with its sidecars that exist, to
-   `…/idx/{dest}/seg/R/{E:020}-{lane:016x}-{h:016x}.seg`. `E` is the dest epoch read plus
-   one, and `h` is FNV-1a 64 of the source key. A dest segment's `h` names its source, so
-   no map is stored. Copy each delete vector whose source count exceeds the dest's, to
-   `dv_key(dest_seg, E, lane)`.
-4. Commit by CAS: `indexes[dest]` becomes the mapped source refs in source order;
-   `schemas[dest]` becomes the source schema; and `applied` is recorded. Dest segments and
-   vectors the source no longer names are buried. A lost CAS re-reads the dest HEAD and
-   retries steps 2–4, reusing every copy. A sync that gives up buries what it wrote (M19).
+**Sync**, `Engine::replicate(sources, known)`, of all of one tenant's running replications.
+It is pull-based and run by the destination.
+1. Read each distinct source HEAD, in parallel. A replication whose fingerprint equals
+   `known[(dest, run)]` is skipped; when all are, stop. This costs **1 read per distinct
+   source**.
+2. Read the dest HEAD. Keep the replications that are `running` with the expected `run`, and
+   whose source index exists.
+3. Copy, at most 4 segments in flight, each source segment that no dest segment maps.
+   - It goes to `…/idx/{dest}/seg/R/{E:020}-{lane:016x}-{h:016x}.seg`, where `E` is the dest
+     epoch read plus one and `h` is FNV-1a of the source key. The footer's expected
+     dictionaries go with it. A `.cen` goes with it if present (D-10: absent means scan
+     exactly).
+   - A source delete vector whose key's hash `g` differs from the one the dest's vector key
+     carries is copied to `{dest_seg}.{E:020}-{lane:016x}-{g:016x}.dv`, which `dv_of` still
+     parses.
+   - Any 404 re-reads that source's HEAD and remaps, keeping every copy. A sidecar 404 stands
+     only if that fresh HEAD still names the segment.
+4. Commit everything in one CAS. Each replication must still be `running` with the same
+   `run`, and its `src_epoch` must be **greater** than `applied`'s, so a slower worker never
+   rolls a replica back. Each one sets `indexes[dest]` to the mapped refs in source order,
+   sets `schemas[dest]`, records `applied`, and buries the dest segments and vectors it
+   replaced or dropped.
+5. A lost CAS goes back to 2 and reuses the copies. Copies the commit does not use, or that a
+   rival's commit already mapped, are buried under their own epochs. Giving up buries
+   everything written (M19).
 
-A replica's state is the source's **folded** state: unfolded source rows arrive after the
-source folds.
+A replica shows the source's **folded** state.
 
-**Replica rules.** While `replicas` names `dest`:
-- Writes, patches, deletes and a branch into `dest` are refused. The write door's check
-  uses the cached HEAD, and the fold counts rows that slipped past a stale door as rejects.
-- `delete_index(dest)` and `compact(dest)` are refused. `as_of` on `dest` is refused,
-  because copy keys carry `E`, not their commit epoch.
-- Cancel writes `branched[dest] = epoch`, so `dest`'s history starts there (M16's rule). It
-  is a normal index afterwards.
+**Replica rules.** While `replications` names `dest`:
+- Every write into `dest`, tombstones and patches included, is refused at the door (cached
+  HEAD) and at the flush. The fold drops any that slipped past a stale door and counts them in
+  `rejected`. A query of `dest` ignores unfolded rows.
+- Refused: `delete_index(dest)`, `compact(dest)`, a branch into `dest`, and `as_of` on `dest`,
+  since copies carry `E`, not their commit epoch. Each is checked on every commit attempt's
+  HEAD.
+- Allowed: a branch from `dest`, by M16's rules.
+- Cancel sets `branched[dest] = epoch`, so `dest`'s history starts there, and leaves a normal
+  index.
+- Create refuses `dest` by branch's rule: it exists, has unfolded rows or rejects, or is in
+  `dropped`.
 
-**Queue, new crate `pstore-jobs`.** A sharded job queue over any `BlobStore`.
-- A create-once `{spread}/jobs/{name}/CONFIG` fixes the shard count `S`. Its default is
-  64, set by `PSTORE_REPLICATION_SHARDS` before first use; resharding is not supported.
-- Each shard is one JSON object, `{spread}/jobs/{name}/{shard:04x}/QUEUE`, written only by
-  CAS: `id -> Entry { run, enqueued_ms, claim: Option<{owner, expires_ms}>, note:
-  {last_ok_ms, last_error} }`. A job's shard is FNV-1a(`id`) mod `S`.
-- Operations, each one CAS loop on one shard: `enqueue`, which upserts, and replaces only
-  a different `run`; `dequeue(id, run)`, which leaves another run's entry alone; `claim`
-  (owner, max), which takes entries unclaimed, expired or already this owner's; `renew`
-  (owner, notes), which drops entries removed, re-run or taken; and `read`.
-- **Only runnable jobs are queued.** Invariant: a `running` replica has an entry with its
-  `run`. Create and resume enqueue, then CAS HEAD, then enqueue again. Pause and cancel CAS
-  HEAD first, then `dequeue(id, run)`. A worker dequeues an entry whose HEAD replica is
-  gone, paused or re-run, but only if the entry is older than `grace` (300 s).
-- **Claims are advisory (Design rule 12).** Two workers syncing one job waste copies and
-  never corrupt: each commit is a CAS on a HEAD that states `running` and `run`. A pause is
-  therefore effective when its CAS lands, whoever holds the claim.
+**Queue**, a new crate `pstore-jobs`: a sharded register of **tenants with runnable
+replications**, over any `BlobStore`.
+- A create-once `{spread}/jobs/{name}/CONFIG` fixes `S`. The default is 64, and
+  `PSTORE_REPLICATION_SHARDS` applies only on first use.
+- Each shard is a JSON object at `{spread}/jobs/{name}/{shard:04x}/QUEUE`, written only by CAS.
+  It maps `{tenant:032x}` to `{claim: {owner, expires_ms}?}`, about 60 B per entry. A
+  tenant's shard is FNV-1a(`id`) mod `S`.
+- Operations: `claim(shard, owner, max)` takes entries unclaimed, expired or already this
+  owner's; `renew(shard, owner)` returns what it still holds; and `reconcile(id, wanted)`.
+- **`reconcile` is the only path that adds or removes an entry.** It reads the shard, then the
+  dest HEAD, then CASes the shard on the tag it read, with an entry iff the HEAD has a
+  running replication. A lost CAS repeats.
+  - A HEAD change that lands after the shard read changes the shard's tag before its own
+    reconcile writes, so the last reconcile to commit read the latest HEAD. No grace period
+    and no clock are involved.
+  - Create, pause, resume and cancel each CAS HEAD and then reconcile. A crash in between is a
+    failed request: the client retries, and every control call is idempotent and
+    reconciles.
+- **Claims are advisory (Design rule 12).** Each commit is a CAS on a HEAD that states
+  `running`, `run` and `applied`, so two holders waste copies and never corrupt. A pause is
+  effective when its CAS lands.
 
-**Worker** in `pstore-server`, beside the fold and reap loops, owned by this process's lane:
-- At start, one parallel read of every shard, reclaiming this lane's claims.
-- Then, every `scan` (10 s), it reads one random shard and claims up to `max_jobs` (64).
-- It renews each shard it holds a claim in every `ttl/3` (TTL 120 s), and syncs each held
-  job, at most 4 at a time.
-- A job's interval is `period` (1 s), doubling while unchanged up to `idle` (60 s).
-- On create, the serving process claims the job when under `max_jobs`.
-- Env: `PSTORE_REPLICATION=off`, `_SCAN_S`, `_TTL_S`, `_MAX_JOBS`, `_IDLE_S`.
+**Worker** in `pstore-server`, beside fold and reap, owned by this process's lane.
+- At start it reads every shard in one parallel round, reclaiming this lane's claims.
+- Then it reads one shard per `scan` (10 s), in a rotating order offset by the lane, claiming
+  up to `max` tenants (64).
+- It renews each held shard every `ttl/3` (TTL 120 s), and drops a tenant it lost or that has
+  no running replication (and reconciles it).
+- Per held tenant it runs a sync every `period` (1 s), doubling up to `idle` (60 s) while
+  nothing changes.
+- Status notes go to `{spread}/tnt/{t}/REPLSTATUS`: `dest -> {last_ok_ms, last_error ≤256 B}`,
+  PUT on change at most every `ttl/3`.
+- Env: `PSTORE_REPLICATION=off`, `_SCAN_S`, `_TTL_S`, `_MAX`, `_IDLE_S`.
 
-**Remote sources** are read-only S3-compatible stores (GCS via its S3 interoperability
+**Remote sources** are read-only S3-compatible stores (GCS through its S3 interoperability
 endpoint). A source named `n` is configured by `PSTORE_SOURCE_<N>_ENDPOINT`, `_BUCKET`,
-`_ACCESS_KEY`, `_SECRET_KEY` and `_REGION`, all listed in `PSTORE_SOURCES=n,…`.
+`_ACCESS_KEY`, `_SECRET_KEY` and `_REGION`, all listed in `PSTORE_SOURCES`. Every worker must
+configure the same sources; one without `n` notes `unknown_store` for that replication.
 
-**API**, tenant header as usual. `{dest}` names the job, so one job per dest index, and a
-source may feed many.
-- `PUT /v1/indexes/{dest}/replication` with `{"source": {"index", "tenant"?, "store"?}}`
-  → `201`.
-- `GET /v1/indexes/{dest}/replication` → status: state, source, applied source epoch,
-  segments, rows, claim owner and expiry, last success, last error.
-- `POST …/replication/pause` and `…/resume` → `200`, both idempotent. Resume also restores
-  a missing entry.
+**API**, tenant header as usual. A job is `(tenant, dest)`, so there is one per dest index,
+and a source may feed many.
+- `PUT /v1/indexes/{dest}/replication` with `{"source": {"index", "tenant"?, "store"?}}` →
+  `201`.
+- `GET …/replication` → state, source, applied epoch, segments, rows, rejected, `queued`,
+  claim owner and expiry, last success, and last error.
+- `POST …/replication/pause` and `…/resume`, both idempotent → `200`.
 - `DELETE …/replication` → `200 {epoch}`.
-- `GET /v1/replications` → the tenant's jobs, from HEAD alone.
+- `GET /v1/replications` → the tenant's jobs, after one HEAD read.
 
 Refusals, by name:
 - `400 bad_request`: a name outside the pattern; the source is the dest itself; an unknown
   store.
-- `409 index_exists`, `409 replication_exists`, and `404 source_not_found`.
-- `404 replication_not_found`.
-- `409 replica_read_only`: a write, delete or branch into a replica.
+- `409 index_exists`, `409 replication_exists`, `404 source_not_found`,
+  `404 replication_not_found`.
+- `409 replica_read_only`: a write or branch into a replica.
 - `409 replication_active`: dropping a replica.
 - `409 replica_no_history`: `as_of` on a replica.
 
-**Does not change:** queries of any index, a replica's included; folds, GC and branches of
-non-replicas; the write path's requests. Nothing routes; there is no LIST on any path.
+**Docs.** A correction banner on `ownership-and-leases.md` § Work scheduling: opt-in
+cross-tenant work is not derivable from any manifest a node holds, so M22 adds a register of
+it. It is not a broker: it has no address, no master and no liveness protocol, and claims are
+advisory. `deploy.md` and the parity row are updated too.
+
+**Does not change:** any query of a non-replica, the write path's requests, and the fold, GC
+and branch of non-replicas. There is no LIST anywhere.
 
 ## Acceptance criteria
 
-1. **Follows.** Same-tenant, cross-tenant and remote-store: after any source write, delete,
-   compaction, drop-and-recreate or branch-borrowed segment, plus a source fold and one sync,
-   every query kind on `dest` equals it on the source, deleted rows included.
-2. **Incremental.** A sync after one new source segment copies exactly that segment and its
-   existing sidecars. A sync after deletes in one segment copies one vector and no segment.
-   With no change, a sync costs **1** read and nothing else.
-3. **GC-safe.** Segments the source compacted away are buried in the dest, and `gc(0)` reaps
-   them. Source GC does not break the dest. A lost dest CAS reuses its copies, and an
-   abandoned sync leaves nothing unburied.
-4. **Read-only.** Each replica refusal above holds, including a row past a stale door, which
-   is counted as a reject. After cancel, writes succeed and `as_of` below the cancel is `404`.
-5. **Pause fences.** A sync whose commit races a pause (interference hook) does not commit,
-   and none commits after pause returns. Resume continues from `applied`. Cancel likewise.
-6. **Queue.** `enqueue`, `dequeue(run)`, `claim`, expiry takeover, own-lane reclaim and
-   `renew` dropping lost entries each hold. Two workers on one shard, with injected CAS
-   contention, claim each entry once. `CONFIG` is created once and its `S` honoured.
-7. **Invariant.** Across every interleaving of create, pause, resume and cancel steps (a
-   bounded exhaustive test), a `running` replica ends with an entry of its `run`. A paused
-   or cancelled one ends without one, or with one the grace cleanup removes.
-8. **Workers.** Three workers with ten jobs: every job converges. Each job is held by at
-   most one live worker after claims settle. A killed worker's jobs move within `ttl` plus
-   `S·scan/N`.
-9. **API.** Each endpoint's success and refusal codes. Status fields match HEAD and queue.
-   List returns every job after one HEAD read.
-10. **Cost.** Steady state per worker: one shard read per `scan`, one CAS per held shard per
-    `ttl/3`, and one read per job per interval, by the request counter.
-11. **Gates.** `./scripts/mutants.sh` over the diff misses 0; `./scripts/gates.sh` green.
+1. **Follows.** For a same-tenant, cross-tenant and remote source: after source writes,
+   deletes, compaction, a drop-and-recreate, a drop-and-re-branch of its parent, and a
+   borrowed segment, then a source fold and a sync, every query kind on `dest` equals the
+   source's, deleted rows included.
+2. **Incremental.** One new source segment copies exactly it and its expected sidecars. A
+   delete in one segment copies one vector and no segment. With no change, a sync costs **1**
+   read per distinct source.
+3. **GC-safe.** Source compaction then `gc(0)` on both tenants: dest answers unchanged, and
+   the replaced dest segments are buried and reaped. A source segment reaped mid-copy
+   remaps without losing copies. A branch from `dest`, then a sync that drops a shared
+   segment, then `gc(0)`: the branch answers unchanged. A lost CAS reuses copies; a rival's
+   duplicate and an abandoned sync's copies are buried.
+4. **No regress.** A commit from a source HEAD older than `applied` is refused
+   (interference hook).
+5. **Read-only.** Each replica refusal holds. A row past a stale door is not served and is
+   counted in `rejected`. After cancel, writes succeed and `as_of` below the cancel is `404`.
+6. **Pause fences.** A sync racing a pause does not commit, and resume continues from
+   `applied`. Cancel likewise.
+7. **Queue.** `claim` takes unclaimed, expired and own entries, honours `max`, and skips live
+   foreign ones. `renew` drops a lost entry. `CONFIG` is created once, and its `S` is
+   honoured.
+8. **Reconcile.** Across every interleaving of control steps (HEAD CAS, shard read, HEAD read,
+   shard CAS) for two controllers and a worker (bounded, exhaustive), the shard ends with an
+   entry iff HEAD has a running replication.
+9. **Workers.** Three workers and ten tenants under paused tokio time: all converge, and a
+   tenant is held by one live worker after one `ttl`. A killed worker's tenants are reclaimed
+   within `ttl + S·scan`.
+10. **API.** Each endpoint's success and refusal codes. Status matches HEAD, the shard and
+    the notes. List costs one read.
+11. **Cost.** By the request counter, a worker's steady state is one shard read per `scan`,
+    one CAS per held shard per `ttl/3`, and criterion 2's reads per tenant per interval.
+12. **Gates.** `./scripts/mutants.sh` over the diff misses 0; `./scripts/gates.sh` is green.
 
 ## Test plan
 
-| # | File, test that fails first | Mutation it catches |
+| # | Test that fails first | Mutation it catches |
 |---|---|---|
-| 1 | `engine/tests/replicate.rs` — `follows_*` per source kind | a source dv read by plain key; schema not copied; refs out of source order |
-| 2 | same — `a_sync_copies_only_what_changed`, `an_idle_sync_reads_once` | known fingerprint ignored; sidecars copied unconditionally; dv count compared `>=` |
-| 3 | same — `compacted_sources_are_buried`, `a_lost_cas_reuses_copies` | removed refs not buried; copies re-made per attempt; abandoned copies leaked |
-| 4 | same, and `server/tests/replication.rs` — `replica_*_refused` | each refusal dropped; the fold folding a replica's rows |
-| 5 | engine — `a_pause_fences_a_racing_sync` | commit without checking state or `run` |
-| 6 | `jobs/tests/queue.rs` | expiry `<` as `<=`; claim ignoring max; dequeue ignoring run; renew keeping lost |
-| 7 | `jobs/tests/interleavings.rs` | resume without the trailing enqueue; cleanup without grace |
-| 8 | `server/tests/replication.rs` — `workers_converge`, `a_dead_workers_jobs_move` | no expiry takeover; renew skipped |
-| 9 | server — one test per endpoint | each status code and field |
-| 10 | server — `worker_steady_state_cost` | a HEAD read per idle job per tick; scan of every shard |
+| 1 | `engine/tests/replicate.rs` `follows_*` | dv by plain key; schema not copied; order lost; dv decided by count |
+| 2 | same, `copies_only_what_changed`, `idle_sync_reads_once` | `known` ignored; dictionaries unconditional |
+| 3 | same, `gc_*`, `branch_from_replica_survives`, `lost_cas_reuses_copies` | no burial; recopy per attempt; leak |
+| 4 | same, `an_older_source_never_commits` | the `>` check dropped or made `>=` |
+| 5 | same and `server/tests/replication.rs`, `replica_*_refused` | each refusal dropped; the fold keeping rows |
+| 6 | engine, `a_pause_fences_a_racing_sync` | commit without the state or `run` check |
+| 7 | `jobs/tests/queue.rs` | expiry `<` as `<=`; `max` ignored; foreign claim taken |
+| 8 | `jobs/tests/reconcile.rs` | HEAD read before the shard read; an unconditional shard write |
+| 9 | server, `workers_converge`, `a_dead_workers_tenants_move` | no takeover; renew skipped |
+| 10 | server, one per endpoint | each code and field |
+| 11 | server, `worker_steady_state_cost` | a read per replication instead of per source; every shard scanned |
 
 ## RA budget
 
-- **Sync:** 1 GET when unchanged. Otherwise 2 GETs (both HEADs), then in parallel per new
-  segment 4 GETs (the segment and three sidecars, 404s included) and up to 4 PUTs, and a GET
-  and PUT per changed vector, then 1 CAS. Depth 4. Background work, never a user path.
-- **Control:** create is 1 source read, 2 shard CAS and 1 HEAD CAS. Pause is 1 HEAD CAS and
-  1 shard CAS. Status is 2 GETs in parallel. List is 1 GET. No LIST anywhere.
-- **⚠️ Polling is per job per time.** This is the "never scales with elapsed time per index"
-  rule, broken on purpose: the user asked for pull-based replication. The cost is bounded,
-  opt-in and billed to the dest tenant: an idle job is 1,440 reads a day at `idle` = 60 s.
+- **Sync:** idle costs 1 GET per distinct source. Otherwise the source reads come first, then
+  1 dest HEAD GET, then per new segment 1 GET and ≤3 sidecar GETs followed by their PUTs,
+  then per changed vector a GET and a PUT, then 1 CAS. Depth 5, in the background.
+- **Control:** create is 1 source GET, 1 HEAD GET plus CAS, and reconcile (2 GETs plus 1
+  CAS). Pause, resume and cancel are a HEAD GET plus CAS, then reconcile. Status is 3 GETs
+  in parallel. List is 1 GET. No LIST.
+- **Worker:** per worker, one GET per `scan` even with no jobs, which is 1,000 GET/s across
+  10,000 nodes. It scales with nodes.
+- **⚠️ Polling is per tenant per source per time**, which breaks "never per elapsed time"
+  on purpose: the user asked for pull-based replication. It is opt-in and billed to the dest
+  tenant, at ≤1,440 reads a day per idle source at `idle` = 60 s. Dest commits are at most 1
+  CAS/s per tenant, below the per-key ceiling.
 
 ## Risks
 
-- **Clock skew** only delays a claim's takeover, by Design rule 12. The CAS keeps data correct.
-- **A lost queue entry** stalls a running job until a resume, without data loss. Status
-  shows `claimed_by: null`, and resume repairs it.
-- **Memory:** a segment is copied whole (GET then PUT), so a worker holds up to 4 segments.
-- **Same-tenant replicas copy bytes** that M16 could share. That is accepted for one code
-  path; the dest owns its keys, so the source's GC never reaches them.
-- **No auth exists**, so any tenant header can replicate any source. That is today's posture
-  for every read, recorded so the auth duty covers it.
-- **Shard size:** about 150 bytes per entry, so 64 shards hold about 100k jobs at about
-  240 KB each. More needs a larger `S` at first use.
+- **Takeover** after a crash is bounded by `ttl + S·scan`, about 13 min at the defaults with
+  one survivor. A larger `S` needs a longer `scan` or more workers.
+- **Ceiling:** 64 shards × about 2,000 tenants is about 120 KB per shard. More needs a larger
+  `S` chosen at first use, because there is no resharding.
+- **A source HEAD that regresses** (disaster recovery) stops its replicas at the `>` check.
+  Recovery is cancel, then create again.
+- **No auth exists**, so any tenant header may name any source. That is today's posture for
+  every read, recorded for the auth duty.
+- **Same-tenant replicas copy bytes** that M16 could share, so the dest's GC never depends on
+  the source's.
 
 ## Tasks
 
-- **M22.1** — `pstore-jobs`: the queue, with tests 6 and 7.
-- **M22.2** — engine: `replicas`, `replicate`, and the replica rules, with tests 1–5.
-- **M22.3** — server: the worker, remote sources and the API, with tests 8–10, plus docs.
+- **M22.1** — `pstore-jobs`: register, claims and reconcile, with tests 7 and 8.
+- **M22.2** — engine: `replications`, `replicate` and the replica rules, with tests 1–6.
+- **M22.3** — server: the worker, remote sources, the API and docs, with tests 9–11.
