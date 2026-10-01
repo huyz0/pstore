@@ -188,10 +188,8 @@ and branch of non-replicas. There is no LIST anywhere.
 
 ## Risks
 
-- **Takeover** after a crash is bounded by `ttl + S·scan`, about 13 min at the defaults with
-  one survivor. A larger `S` needs a longer `scan` or more workers.
-- **Ceiling:** 64 shards × about 2,000 tenants is about 120 KB per shard. More needs a larger
-  `S` chosen at first use, because there is no resharding.
+- **Takeover** after a crash: ≤ `ttl + S·scan`, ~13 min at defaults with one survivor.
+- **Ceiling:** 64 shards × ~2,000 tenants ≈ 120 KB a shard; beyond, choose `S` at first use.
 - **A regressed source HEAD** (disaster recovery) stops at the `>` check: cancel, recreate.
 - **No auth exists**: any tenant header may name any source, as for every read today.
 - **Same-tenant replicas copy bytes** M16 could share, so dest GC never depends on source GC.
