@@ -117,14 +117,40 @@ async fn refusing_reads_refuses_every_kind_of_read() {
     // working would model a backend that does not exist -- and would hide the engine's
     // most important decision, whether a missing key is a gap or an outage.
     let s = Flaky::refusing_reads();
-    assert!(s.get(&k("a")).await.is_err());
-    assert!(s.get_range(&k("a"), 0..4).await.is_err());
-    assert!(s.get_suffix(&k("a"), 4).await.is_err());
-    assert!(s.get_with_tag(&k("a")).await.is_err());
-    assert!(s.head(&k("a")).await.is_err());
     // Writes still work: this models a backend that cannot serve reads, not one that is
     // gone, and conflating the two would make the scenario untargetable.
-    assert!(s.put(&k("a"), Bytes::from_static(b"x")).await.is_ok());
+    assert!(
+        s.put(&k("a"), Bytes::from_static(b"abcdefgh"))
+            .await
+            .is_ok()
+    );
+    // ⚠️ Of a key that EXISTS, and refused as injected: reading a missing key fails with
+    // `NotFound` whatever the injector does, which is how this test once passed with the
+    // injector disabled (M21's confirming sweep of M8i).
+    let injected = |e: BlobError| matches!(e, BlobError::Other(_));
+    assert!(injected(s.get(&k("a")).await.unwrap_err()));
+    assert!(injected(s.get_range(&k("a"), 0..4).await.unwrap_err()));
+    assert!(injected(s.get_suffix(&k("a"), 4).await.unwrap_err()));
+    assert!(injected(s.get_with_tag(&k("a")).await.unwrap_err()));
+    assert!(injected(s.head(&k("a")).await.unwrap_err()));
+}
+
+#[tokio::test]
+async fn refusing_reads_at_refuses_only_those_reads() {
+    let s = Flaky::refusing_reads_at(&[1]);
+    s.put(&k("a"), Bytes::from_static(b"x")).await.unwrap();
+    assert!(s.get(&k("a")).await.is_ok(), "read 0 refused");
+    assert!(
+        matches!(s.get(&k("a")).await, Err(BlobError::Other(_))),
+        "read 1 not refused"
+    );
+    assert!(s.get(&k("a")).await.is_ok(), "read 2 refused");
+}
+
+#[tokio::test]
+async fn never_missing_finds_every_key() {
+    let s = Flaky::never_missing();
+    assert!(s.head(&k("absent")).await.is_ok());
 }
 
 #[tokio::test]
@@ -188,6 +214,8 @@ async fn an_unarmed_gate_does_not_block() {
         .await
         .unwrap();
     }
+    // A write that waited at the barrier for peers would have timed out and said so.
+    assert!(s.raced(), "an unarmed write waited at the barrier");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -226,6 +254,7 @@ async fn a_gate_does_not_hold_writers_after_its_quota() {
     )
     .await
     .unwrap();
+    assert!(s.raced(), "a write past the quota waited at the barrier");
 }
 
 #[tokio::test(start_paused = true)]

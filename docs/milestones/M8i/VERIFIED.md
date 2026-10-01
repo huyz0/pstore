@@ -45,5 +45,11 @@ mutant's log was read for the test that FAILED — the test named below, in ever
 12. **The deletion** — `refusing_reads` sets only `reads_fail`; `cargo mutants --list` over
     testkit goes from 303 to **301**, the two missing being the two deleted-field mutants.
     `refusing_reads_refuses_every_kind_of_read` passes (`cargo test -p pstore-testkit`).
-13. **The confirming sweep** — NOT-RUN yet: pending the sweep on this tree.
+13. **The confirming sweep** — run late, after M21, on `55a2d02`, scoped to `pstore-testkit`'s own
+    tests: stricter than the criterion's command, never looser. 301 mutants: 221 caught,
+    73 unviable, 1 timeout, **6 missed**. `refusing_reads_refuses_every_kind_of_read` read a
+    key it never wrote, so `NotFound` passed it with the injector off; it now reads a key
+    that exists and requires the injected error. `refusing_reads_at_refuses_only_those_reads`,
+    `never_missing_finds_every_key`, and a `raced()` assertion in both gate tests close the
+    other five. Each of the six, applied by hand, now fails a test: **0 missed**.
 14. **The full gate** — `./scripts/gates.sh` on this tree: all fifteen gates PASS.
