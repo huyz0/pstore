@@ -60,6 +60,18 @@ so a deploy is not a fleet-wide cold start. Unset, the server is uncached.
 - **Not with `PSTORE_BACKEND=memory`,** which is refused. A memory store is new at every start
   and its keys repeat, with other bytes.
 
+### Warming before a burst
+
+`POST /v1/indexes/{index}/warm` fetches one index's metadata into the read cache: segment
+footers, delete vectors, centroid tables and dictionaries, never the vectors or postings
+themselves ([M21](milestones/M21/SPEC.md), D-44). It is billed like a query and returns when
+done, at most three sequential requests deep. A second warm costs one read.
+
+- ⚠️ **It warms the process that serves it.** Nothing routes a tenant to a particular server,
+  so warm every process the burst will reach: for example, once per server behind the load
+  balancer, addressed directly.
+- Without `PSTORE_CACHE_DIR` it is refused with `409 no_read_cache` and costs nothing.
+
 ## Unscheduled duties
 
 ⚠️ **The ids below are checked against `pstore_server::UNSCHEDULED`**, served at

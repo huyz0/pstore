@@ -460,6 +460,25 @@ pub struct FoldResponse {
     pub cost: Cost,
 }
 
+/// `POST /v1/indexes/{index}/warm` (M21).
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmResponse {
+    /// The segments whose metadata is now cached.
+    pub segments: usize,
+    /// The sidecars fetched beside their footers: delete vectors, centroid tables and
+    /// dictionaries.
+    pub fetched: usize,
+    /// What it cost, as a query reports it.
+    pub meta: WarmMeta,
+}
+
+/// [`WarmResponse`]'s `meta`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmMeta {
+    /// The blob requests the warm spent, billed to the tenant.
+    pub cost: Cost,
+}
+
 /// The body of every refusal.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {

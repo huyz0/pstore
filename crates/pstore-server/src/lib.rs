@@ -34,7 +34,7 @@ mod types;
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
     MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema,
-    TextIn, WriteRequest, WriteResponse,
+    TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -492,6 +492,7 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
+            .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
             .route(
                 "/v1/indexes/{index}/schema",
                 axum::routing::patch(patch_schema),
@@ -2069,6 +2070,41 @@ async fn fold_tenant<S: BlobStore + 'static>(
     Ok(axum::Json(FoldResponse {
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// `POST /v1/indexes/{index}/warm` (M21): `index`'s metadata into this process's read cache,
+/// never its bulk (D-44). Billed. `404` for an index that does not exist, and `409`, before
+/// any request, on a server without a cache: there a warm would fetch and discard.
+async fn warm_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<WarmResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    if api.cache.is_none() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "no_read_cache",
+            "this server has no read cache to warm; start it with PSTORE_CACHE_DIR".to_owned(),
+        ));
+    }
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let warmed = engine.warm(&index).await?;
+    if !warmed.exists {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found",
+            format!("this tenant has no index {index}"),
+        ));
+    }
+    Ok(axum::Json(WarmResponse {
+        segments: warmed.segments,
+        fetched: warmed.fetched,
+        meta: WarmMeta {
+            cost: api.spend(tenant).since(before),
+        },
     }))
 }
 
