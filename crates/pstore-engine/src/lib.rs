@@ -1071,6 +1071,18 @@ struct Scope {
     fts: FullText,
 }
 
+/// What [`Engine::warm`] did (M21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Warmed {
+    /// Whether the index exists, as a query decides it: HEAD names segments of it, or this
+    /// process holds unfolded rows for it that are not deletes.
+    pub exists: bool,
+    /// The segments opened.
+    pub segments: usize,
+    /// The sidecars fetched: delete vectors, centroid tables and dictionaries. Not footers.
+    pub fetched: usize,
+}
+
 /// What [`Engine::aggregate_as`] returns (M12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregated {
@@ -2040,6 +2052,69 @@ impl<S: BlobStore> Engine<S> {
         names.sort_unstable();
         names.dedup();
         names
+    }
+
+    /// Fetches `index`'s metadata into the read cache beneath this engine (M21): one fresh
+    /// HEAD read, then every segment's footer and delete vector and, where they exist, its
+    /// centroid table and dictionaries. Never a bulk read (D-44).
+    ///
+    /// # Errors
+    /// If HEAD or a segment cannot be read.
+    pub async fn warm(&self, index: &str) -> Result<Warmed, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
+        // As a query decides it (M9c): segments, or unfolded rows that are not deletes.
+        let exists = !refs.is_empty() || {
+            let m = self.mem();
+            let ops: Vec<Document> = m
+                .durable_rows(index)
+                .chain(m.pending.get(index).into_iter().flatten())
+                .filter(|d| !is_deferred(d))
+                .cloned()
+                .collect();
+            newest(ops).iter().any(|d| !is_tombstone(d))
+        };
+        // ⚠️ From HEAD, not the footer, so it rides round 2: a segment of fewer rows, or an
+        // index of no dimension, has no centroid table (D-10), and asking costs a 404 a cache
+        // cannot keep (BACKLOG row 46). It approximates the fold's own predicate.
+        let dims = at.head.schemas.get(index).map_or(0, |s| s.dims);
+        let threshold = self.params.exact_scan_threshold;
+        let targets = segment_targets(index, &refs, &at.head.deletes, false);
+        let store = &*self.store;
+        let fetched = futures_util::future::try_join_all(refs.iter().zip(&targets).map(
+            |(r, t)| async move {
+                let clustered = dims > 0 && r.rows as usize >= threshold;
+                // Round 2: the footer, the delete vector, the centroid table, together.
+                let (seg, dv, cen) = futures_util::future::join3(
+                    Segment::open(store, &t.segment),
+                    sidecar(store, t.deleted.as_ref()),
+                    sidecar(store, clustered.then_some(&t.centroids)),
+                )
+                .await;
+                let seg = seg?;
+                // Round 3: the dictionaries the index section says exist.
+                let sparse = seg
+                    .sparse_field()
+                    .map(|_| pstore_format::sparse::dict_key(&t.segment));
+                let text = seg
+                    .has_text()
+                    .then(|| pstore_format::text::dict_key(&t.segment));
+                let (sd, td) = futures_util::future::join(
+                    sidecar(store, sparse.as_ref()),
+                    sidecar(store, text.as_ref()),
+                )
+                .await;
+                Ok::<_, EngineError>([dv?, cen?, sd?, td?].into_iter().filter(|f| *f).count())
+            },
+        ))
+        .await?
+        .into_iter()
+        .sum();
+        Ok(Warmed {
+            exists,
+            segments: refs.len(),
+            fetched,
+        })
     }
 
     /// The oldest epoch `as_of` can still answer, from the HEAD it reads. **One read.**
@@ -5012,6 +5087,19 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
         .collect();
     names.sort_unstable();
     names.first().map(|s| (*s).to_owned())
+}
+
+/// Fetches one immutable sidecar as a query does, so the cache keeps it (M21). `true` when it
+/// was there; an absent one is no error, as a query does not treat it as one.
+async fn sidecar<S: BlobStore>(store: &S, key: Option<&Key>) -> Result<bool, EngineError> {
+    let Some(key) = key else {
+        return Ok(false);
+    };
+    match store.get_immutable(key, pstore_blob::Class::Pinned).await {
+        Ok(_) => Ok(true),
+        Err(pstore_blob::BlobError::NotFound(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Query targets for HEAD's segments, each with its delete vector (M9c.2).
