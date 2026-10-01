@@ -5,12 +5,9 @@ of [`turbopuffer-api-parity.md`](../../research/11-design/turbopuffer-api-parity
 answered within a tenant only; Design rule 12 of [`ownership-and-leases.md`](../../research/04-cluster/ownership-and-leases.md).
 
 ## What is true today
-
 - M16's copy is one-shot and same-tenant. Nothing reads another tenant's HEAD or bucket.
-- A segment's bytes name no key, tenant or index. Its sidecars are derived from its key, and
-  its footer says which dictionaries it has (`Engine::warm` reads that).
-- No node finds cross-tenant work without a LIST; `pstore-catalog`'s create-once root and
-  shard registers are the precedent for a sharded register.
+- Segment bytes name no key, tenant or index; sidecars derive from the key; the footer names
+  the dictionaries. `pstore-catalog`'s create-once root and registers are the precedent here.
 
 ## Delta
 
@@ -23,31 +20,30 @@ FNV-1a 64 over the source index's segment keys, its delete-vector keys and its s
 **Sync**, `Engine::replicate(sources, known)`, of all of one tenant's running replications.
 It is pull-based and run by the destination.
 1. Read each distinct source HEAD, in parallel. A replication whose fingerprint equals
-   `known[(dest, run)]` is skipped; when all are, stop. This costs **1 read per distinct
-   source**.
-2. Read the dest HEAD. Keep the replications that are `running` with the expected `run`, and
-   whose source index exists.
+   `known[(dest, run)]` is skipped; when all are, stop: **1 read per distinct source**.
+2. Read the dest HEAD. Keep the replications `running` in **this** HEAD whose source index
+   exists. One whose source fingerprint equals `applied`'s is current: seed `known` and keep
+   it out of the commit.
 3. Copy, at most 4 segments in flight, each source segment that no dest segment maps.
-   - It goes to `…/idx/{dest}/seg/R/{E:020}-{lane:016x}-{h:016x}.seg`, where `E` is the dest
-     epoch read plus one and `h` is FNV-1a of the source key. The footer's expected
-     dictionaries go with it. A `.cen` goes with it if present (D-10: absent means scan
-     exactly).
+   - To `…/idx/{dest}/seg/R/{E:020}-{lane:016x}-{h:016x}.seg`: `E` the dest epoch read plus
+     one, `h` FNV-1a of the source key. The footer's dictionaries go with it, and a `.cen`
+     if present (D-10: absent means scan exactly).
    - A source delete vector whose key's hash `g` differs from the one the dest's vector key
      carries is copied to `{dest_seg}.{E:020}-{lane:016x}-{g:016x}.dv`, which `dv_of` still
      parses.
    - Any 404 re-reads that source's HEAD and remaps, keeping every copy. A sidecar 404 stands
      only if that fresh HEAD still names the segment.
-4. Commit everything in one CAS. Each replication must still be `running` with the same
-   `run`, and its `src_epoch` must be **greater** than `applied`'s, so a slower worker never
-   rolls a replica back. Each one sets `indexes[dest]` to the mapped refs in source order,
+4. Commit the rest in one CAS. **Per replication**, it is included only if it is still
+   `running` and its `src_epoch` is **greater** than `applied`'s, so a slower worker never
+   rolls it back. Each included one sets `indexes[dest]` to the mapped refs in source order,
    sets `schemas[dest]`, records `applied`, and buries the dest segments and vectors it
-   replaced or dropped.
-5. A lost CAS goes back to 2 and reuses the copies. Copies the commit does not use, or that a
-   rival's commit already mapped, are buried under their own epochs. Giving up buries
-   everything written (M19).
+   replaced or dropped, including a vector whose source segment no longer has one.
+5. A lost CAS goes back to 2 and reuses the copies. **A replication that fails** is left out
+   and its copies are buried, while the rest commit. Failures include a source read error, an
+   unknown store, or 24 remaps without settling. Copies unused, or mapped by a rival's
+   commit, are buried under their own epochs (M19).
 
 A replica shows the source's **folded** state.
-
 **Replica rules.** While `replications` names `dest`:
 - Every write into `dest`, tombstones and patches included, is refused at the door (cached
   HEAD) and at the flush. The fold drops any that slipped past a stale door and counts them in
@@ -56,42 +52,42 @@ A replica shows the source's **folded** state.
   since copies carry `E`, not their commit epoch. Each is checked on every commit attempt's
   HEAD.
 - Allowed: a branch from `dest`, by M16's rules.
-- Cancel sets `branched[dest] = epoch`, so `dest`'s history starts there, and leaves a normal
-  index.
-- Create refuses `dest` by branch's rule: it exists, has unfolded rows or rejects, or is in
-  `dropped`.
+- Cancel sets `branched[dest] = epoch` (history starts there) and leaves a normal index.
+- Create refuses `dest` by branch's rule: exists, unfolded rows or rejects, or `dropped`.
 
-**Queue**, a new crate `pstore-jobs`: a sharded register of **tenants with runnable
-replications**, over any `BlobStore`.
-- A create-once `{spread}/jobs/{name}/CONFIG` fixes `S`. The default is 64, and
-  `PSTORE_REPLICATION_SHARDS` applies only on first use.
+**Queue**, new crate `pstore-jobs`: a sharded register of **tenants with runnable
+replications**, over any `BlobStore`. A create-once `{spread}/jobs/{name}/CONFIG` fixes `S`
+(default 64; `PSTORE_REPLICATION_SHARDS` applies only on first use).
 - Each shard is a JSON object at `{spread}/jobs/{name}/{shard:04x}/QUEUE`, written only by CAS.
-  It maps `{tenant:032x}` to `{claim: {owner, expires_ms}?}`, about 60 B per entry. A
-  tenant's shard is FNV-1a(`id`) mod `S`.
+  It maps `{tenant:032x}` to `{gen, claim: {owner, expires_ms}?}`, about 70 B per entry.
+  `gen` is FNV-1a of HEAD's running `(dest, run)` set, and a holder that sees it change
+  re-reads HEAD. A tenant's shard is FNV-1a(`id`) mod `S`.
 - Operations: `claim(shard, owner, max)` takes entries unclaimed, expired or already this
   owner's; `renew(shard, owner)` returns what it still holds; and `reconcile(id, wanted)`.
 - **`reconcile` is the only path that adds or removes an entry.** It reads the shard, then the
-  dest HEAD, then CASes the shard on the tag it read, with an entry iff the HEAD has a
-  running replication. A lost CAS repeats.
-  - A HEAD change that lands after the shard read changes the shard's tag before its own
-    reconcile writes, so the last reconcile to commit read the latest HEAD. No grace period
-    and no clock are involved.
-  - Create, pause, resume and cancel each CAS HEAD and then reconcile. A crash in between is a
-    failed request: the client retries, and every control call is idempotent and
-    reconciles.
+  dest HEAD, then CASes the shard on the tag it read. There is an entry iff HEAD has a
+  running replication, carrying HEAD's `gen` and keeping its claim. A new entry is claimed
+  for the caller while it is under `max`. A lost CAS repeats. `claim` and `renew` never add
+  an entry, and keep `gen`.
+  - A HEAD change after the shard read changes its tag before its own reconcile writes, so
+    the last reconcile to commit read the latest HEAD. No grace period, no clock.
+  - Create, pause, resume and cancel each CAS HEAD and then reconcile. A crash in between
+    leaves the entry stale until the next control call or **status**, which reconciles
+    whenever `queued` disagrees with HEAD.
 - **Claims are advisory (Design rule 12).** Each commit is a CAS on a HEAD that states
   `running`, `run` and `applied`, so two holders waste copies and never corrupt. A pause is
   effective when its CAS lands.
 
 **Worker** in `pstore-server`, beside fold and reap, owned by this process's lane.
-- At start it reads every shard in one parallel round, reclaiming its lane's claims.
+- At start, one parallel read of every shard reclaims its lane's claims.
 - Then one shard per `scan` (10 s), rotating, offset by the lane, claiming up to `max` (64).
 - It renews each held shard every `ttl/3` (TTL 120 s); a tenant lost, or with nothing
   running (then reconciled), is dropped.
 - Per held tenant it runs a sync every `period` (1 s), doubling up to `idle` (60 s) while
-  nothing changes.
-- Status notes go to `{spread}/tnt/{t}/REPLSTATUS`: `dest -> {last_ok_ms, last_error ≤256 B}`,
-  PUT on change at most every `ttl/3`.
+  nothing changes. At most 4 segments are in flight per worker.
+- Notes go to `{spread}/tnt/{t}/REPLSTATUS`, `dest -> {last_commit_ms, last_error ≤256 B}`,
+  PUT only after a commit or a changed error, at most once per `ttl/3`. Deleted with the
+  tenant's last replication.
 - Env: `PSTORE_REPLICATION=off`, `_SCAN_S`, `_TTL_S`, `_MAX`, `_IDLE_S`.
 
 **Remote sources** are read-only S3-compatible stores (GCS through its S3 interoperability
@@ -99,8 +95,7 @@ endpoint). A source named `n` is configured by `PSTORE_SOURCE_<N>_ENDPOINT`, `_B
 `_ACCESS_KEY`, `_SECRET_KEY` and `_REGION`, all listed in `PSTORE_SOURCES`. Every worker must
 configure the same sources; one without `n` notes `unknown_store` for that replication.
 
-**API**, tenant header as usual. A job is `(tenant, dest)`, so there is one per dest index,
-and a source may feed many.
+**API**, tenant header as usual. A job is `(tenant, dest)`; a source may feed many.
 - `PUT /v1/indexes/{dest}/replication` with `{"source": {"index", "tenant"?, "store"?}}` →
   `201`.
 - `GET …/replication` → state, source, applied epoch, segments, rows, rejected, `queued`,
@@ -118,20 +113,19 @@ Refusals: `400 bad_request` (name, self-source, unknown store), `409 index_exist
 cross-tenant work derives from no manifest a node holds, so M22 adds a register; not a
 broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the parity row.
 
-**Does not change:** any query of a non-replica, the write path's requests, and the fold, GC
-and branch of non-replicas. There is no LIST anywhere.
+**Unchanged:** non-replica queries, folds, GC and branches; write-path requests. No LIST.
 
 ## Acceptance criteria
 
-1. **Follows.** For a same-tenant, cross-tenant and remote source: after source writes,
-   deletes, compaction, a drop-and-recreate, a drop-and-re-branch of its parent, and a
-   borrowed segment, then a source fold and a sync, every query kind on `dest` equals the
-   source's, deleted rows included.
+1. **Follows.** Same-tenant, cross-tenant and remote sources: after writes, deletes,
+   compaction, drop-and-recreate, re-branch of its parent, and a borrowed segment, then a
+   source fold and a sync, every query kind on `dest` equals the source's.
 2. **Incremental.** One new source segment copies exactly it and its expected sidecars. A
    delete in one segment copies one vector and no segment. With no change, a sync costs **1**
    read per distinct source.
 3. **GC-safe.** Source compaction then `gc(0)` on both tenants: dest answers unchanged, and
-   the replaced dest segments are buried and reaped. A source segment reaped mid-copy
+   the replaced dest segments are buried and reaped. A re-branch from a parent with no deletes
+   buries the dest's vector. A source segment reaped mid-copy
    remaps without losing copies. A branch from `dest`, then a sync that drops a shared
    segment, then `gc(0)`: the branch answers unchanged. A lost CAS reuses copies; a rival's
    duplicate and an abandoned sync's copies are buried.
@@ -139,8 +133,10 @@ and branch of non-replicas. There is no LIST anywhere.
    (interference hook).
 5. **Read-only.** Each replica refusal holds. A row past a stale door is not served and is
    counted in `rejected`. After cancel, writes succeed and `as_of` below the cancel is `404`.
-6. **Pause fences.** A sync racing a pause does not commit, and resume continues from
-   `applied`. Cancel likewise.
+6. **Pause fences.** A sync racing a pause does not commit. After a resume with an idle
+   source, the first sync commits nothing and costs criterion 2's read. Cancel likewise.
+   One failing replication does not stop its sibling's commit. A replication created on a
+   held tenant syncs within one `ttl/3`.
 7. **Queue.** `claim` takes unclaimed, expired and own entries, honours `max`, and skips live
    foreign ones. `renew` drops a lost entry. `CONFIG` is created once, and its `S` is
    honoured.
@@ -149,7 +145,7 @@ and branch of non-replicas. There is no LIST anywhere.
    entry iff HEAD has a running replication.
 9. **Workers.** Three workers and ten tenants under paused tokio time: all converge, and a
    tenant is held by one live worker after one `ttl`. A killed worker's tenants are reclaimed
-   within `ttl + S·scan`.
+   within `ttl + S·scan`. A new tenant is claimed by its creator at once.
 10. **API.** Each endpoint's success and refusal codes. Status matches HEAD, the shard and
     the notes. List costs one read.
 11. **Cost.** By the request counter, a worker's steady state is one shard read per `scan`,
@@ -165,9 +161,9 @@ and branch of non-replicas. There is no LIST anywhere.
 | 3 | same, `gc_*`, `branch_from_replica_survives`, `lost_cas_reuses_copies` | no burial; recopy per attempt; leak |
 | 4 | same, `an_older_source_never_commits` | the `>` check dropped or made `>=` |
 | 5 | same and `server/tests/replication.rs`, `replica_*_refused` | each refusal dropped; the fold keeping rows |
-| 6 | engine, `a_pause_fences_a_racing_sync` | commit without the state or `run` check |
+| 6 | engine, `a_pause_fences_a_racing_sync`, `resume_after_idle`, `one_failure_isolated`; server, `a_new_replication_on_a_held_tenant` | no state check; `>` all-or-nothing; `gen` unobserved |
 | 7 | `jobs/tests/queue.rs` | expiry `<` as `<=`; `max` ignored; foreign claim taken |
-| 8 | `jobs/tests/reconcile.rs` | HEAD read before the shard read; an unconditional shard write |
+| 8 | `jobs/tests/reconcile.rs` | HEAD read before the shard read; an unconditional shard write; renew re-adding |
 | 9 | server, `workers_converge`, `a_dead_workers_tenants_move` | no takeover; renew skipped |
 | 10 | server, one per endpoint | each code and field |
 | 11 | server, `worker_steady_state_cost` | a read per replication instead of per source; every shard scanned |
@@ -179,8 +175,9 @@ and branch of non-replicas. There is no LIST anywhere.
   then per changed vector a GET and a PUT, then 1 CAS. Depth 5, in the background.
 - **Control:** create = source GET, HEAD GET+CAS, reconcile (2 GETs+CAS); pause, resume,
   cancel = HEAD GET+CAS, reconcile. Status 3 parallel GETs; list 1 GET. No LIST.
-- **Worker:** per worker, one GET per `scan` even with no jobs, which is 1,000 GET/s across
-  10,000 nodes. It scales with nodes.
+- **Worker:** one GET per `scan` even with no jobs (1,000 GET/s across 10,000 nodes: nodes).
+  One `REPLSTATUS` PUT per tenant per `ttl/3` at most, and only while commits or errors
+  change: zero when idle.
 - **⚠️ Polling is per tenant per source per time**, which breaks "never per elapsed time"
   on purpose: the user asked for pull-based replication. It is opt-in and billed to the dest
   tenant, at ≤1,440 reads a day per idle source at `idle` = 60 s. Dest commits are at most 1
@@ -189,7 +186,8 @@ and branch of non-replicas. There is no LIST anywhere.
 ## Risks
 
 - **Takeover** after a crash: ≤ `ttl + S·scan`, ~13 min at defaults with one survivor.
-- **Ceiling:** 64 shards × ~2,000 tenants ≈ 120 KB a shard; beyond, choose `S` at first use.
+- **Ceiling:** 64 shards × ~2,000 tenants ≈ 140 KB a shard; beyond, choose `S` at first use.
+- **A stale HEAD cache** on an eventual read may serve a row that slipped a stale door.
 - **A regressed source HEAD** (disaster recovery) stops at the `>` check: cancel, recreate.
 - **No auth exists**: any tenant header may name any source, as for every read today.
 - **Same-tenant replicas copy bytes** M16 could share, so dest GC never depends on source GC.
