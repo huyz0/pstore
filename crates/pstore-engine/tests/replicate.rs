@@ -42,6 +42,10 @@ struct Hooked {
     hook: Arc<Mutex<Option<(String, Hook)>>>,
     /// The next read of a key containing this fails as an outage would, once.
     fail_once: Arc<Mutex<Option<String>>>,
+    /// The next this-many conditional writes are contended (a 409).
+    contend_next: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many conditional writes lose, as to a writer that landed first.
+    lose_next: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many conditional writes fail as an outage would.
     fail_cas: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -138,6 +142,28 @@ impl BlobStore for Hooked {
             .is_ok();
         if failing {
             return Err(CasError::Io("injected outage".to_owned()));
+        }
+        if self
+            .contend_next
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(CasError::Contended);
+        }
+        if self
+            .lose_next
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(CasError::Lost);
         }
         self.inner.put_conditional(key, body, pre).await
     }
@@ -533,6 +559,18 @@ async fn copies_only_what_changed() {
     assert_eq!(new.len(), 1, "{new:?}");
     assert!(new[0].ends_with(".dv"), "{new:?}");
     s.same("one delete").await;
+    // Another new segment: the vector already copied is recognised by the source key it
+    // carries, not copied again.
+    let before = after;
+    write(&s.src, "src", 60..70).await;
+    s.sync(&mut st).await;
+    let after = s.here.keys(&dst_prefix()).await;
+    let new: Vec<&String> = after.difference(&before).collect();
+    assert!(
+        new.iter().all(|k| !k.ends_with(".dv")),
+        "a vector was copied again: {new:?}"
+    );
+    s.same("a segment after a delete").await;
 }
 
 #[tokio::test]
@@ -1268,4 +1306,90 @@ async fn a_sync_that_cannot_reread_its_head_buries_what_it_wrote() {
     assert!(r.is_err(), "{r:?}");
     assert!(!s.here.keys(&dst_prefix()).await.is_empty());
     assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+}
+
+#[tokio::test]
+async fn create_refuses_every_name_a_branch_refuses() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..5).await;
+    let from = s.here.acct.as_tenant(DST);
+    let long = "x".repeat(129);
+    for bad in ["", ".", "..", "a/b", "a b", long.as_str()] {
+        let r = s
+            .dst
+            .create_replication(bad, ReplicaSource::local(SRC, "src"), &from)
+            .await;
+        assert!(
+            matches!(r, Err(EngineError::Replica(ReplicaRefusal::Invalid(_)))),
+            "{bad:?}: {r:?}"
+        );
+    }
+    // And a name with unfolded rows is taken, as a branch decides.
+    s.dst.write("pend", vec![doc("p", 1.0)]).await.unwrap();
+    refused(
+        s.dst
+            .create_replication("pend", ReplicaSource::local(SRC, "src"), &from)
+            .await,
+        &ReplicaRefusal::IndexExists("pend".to_owned()),
+    );
+}
+
+#[tokio::test]
+async fn a_control_call_retries_a_lost_commit_up_to_its_limit() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..5).await;
+    s.create().await;
+    // Every attempt but the last loses: it still lands.
+    s.here
+        .hooked
+        .lose_next
+        .store(23, std::sync::atomic::Ordering::SeqCst);
+    s.dst.pause_replication("dst").await.unwrap();
+    assert!(!s.dst.replications().await.unwrap()["dst"].running);
+    // Every attempt loses: it gives up, as lost.
+    s.here
+        .hooked
+        .lose_next
+        .store(24, std::sync::atomic::Ordering::SeqCst);
+    let r = s.dst.resume_replication("dst").await;
+    assert!(matches!(r, Err(EngineError::Lost)), "{r:?}");
+    assert!(!s.dst.replications().await.unwrap()["dst"].running);
+    // Every attempt contended: the last one's own error is what the caller sees.
+    s.here
+        .hooked
+        .contend_next
+        .store(24, std::sync::atomic::Ordering::SeqCst);
+    let r = s.dst.resume_replication("dst").await;
+    assert!(matches!(r, Err(EngineError::Contended)), "{r:?}");
+}
+
+#[tokio::test]
+async fn replication_status_answers_from_one_read() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let r0 = s.here.reads(DST);
+    let (r, stats, generation) = s.dst.replication_status("dst").await.unwrap().unwrap();
+    assert_eq!(s.here.reads(DST) - r0, 1);
+    assert!(r.running && r.applied.is_some(), "{r:?}");
+    let stats = stats.unwrap();
+    assert_eq!((stats.documents, stats.segments), (30, 1));
+    assert_eq!(generation, s.dst.replication_gen().await.unwrap());
+    assert!(generation.is_some());
+    assert!(s.dst.replication_status("nope").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_sync_after_the_plan_is_re_read_with_nothing_changed_is_idle() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..10).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    // A holder that saw the register's generation move re-reads the plan; the replication it
+    // already knows is still current, so the sync stops at the source read.
+    st.invalidate();
+    assert!(s.sync(&mut st).await.idle);
 }
