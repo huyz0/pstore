@@ -278,7 +278,8 @@ impl<S: BlobStore> Register<S> {
     }
 
     /// Claims, for `owner`, every entry of `shard` that is unclaimed or expired, up to `room`
-    /// of them, and refreshes `owner`'s own. Returns every entry `owner` now holds there.
+    /// of them, and re-takes `owner`'s own lapsed ones; its live ones it leaves to
+    /// [`Self::renew`]. Returns every entry `owner` now holds there.
     /// **Never adds an entry.**
     ///
     /// # Errors
@@ -299,8 +300,11 @@ impl<S: BlobStore> Register<S> {
             let mut taken = 0;
             for e in s.entries.values_mut() {
                 match e.claim {
-                    // Its own first: refreshing what it holds is not taking more.
-                    Some(c) if c.owner == owner => e.claim = Some(held),
+                    // Its own first: re-taking what it held is not taking more, and a live one
+                    // is left alone -- renewal extends it, and a scan that rewrote it would be
+                    // a write per scan (M22.3).
+                    Some(c) if c.owner == owner && c.expires_ms <= now_ms => e.claim = Some(held),
+                    Some(c) if c.owner == owner => {}
                     Some(c) if c.expires_ms > now_ms => {}
                     _ if taken < room => {
                         e.claim = Some(held);

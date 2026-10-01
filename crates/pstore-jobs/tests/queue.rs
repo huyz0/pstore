@@ -293,6 +293,27 @@ async fn claim_honours_room_and_never_counts_its_own() {
 }
 
 #[tokio::test]
+async fn claim_leaves_its_own_live_claims_alone() {
+    // A scan that finds only what this worker already holds writes nothing: renewal extends
+    // live claims, and a scan rewriting them would be a write per scan the spec does not
+    // count (found writing M22.3's cost test).
+    let store = Counting::new();
+    let reg = open(&store, 1).await;
+    let mine = Claim {
+        owner: 1,
+        expires_ms: 500,
+    };
+    add(&reg, "t1", 1, Some(mine)).await;
+    let before = store.cas();
+    let held = reg.claim(0, 1, 100, TTL, 10).await.unwrap();
+    assert_eq!(held["t1"].claim, Some(mine));
+    assert_eq!(store.cas(), before);
+    // Expiring at now, it has lapsed: re-taken, as a foreign one would be.
+    let held = reg.claim(0, 1, 500, TTL, 10).await.unwrap();
+    assert_eq!(held["t1"].claim.unwrap().expires_ms, 500 + TTL);
+}
+
+#[tokio::test]
 async fn claim_of_nothing_new_writes_nothing() {
     let store = Counting::new();
     let reg = open(&store, 1).await;
