@@ -9,8 +9,8 @@ answered within a tenant only; Design rule 12 of [`ownership-and-leases.md`](../
 - M16's copy is one-shot and same-tenant. Nothing reads another tenant's HEAD or bucket.
 - A segment's bytes name no key, tenant or index. Its sidecars are derived from its key, and
   its footer says which dictionaries it has (`Engine::warm` reads that).
-- No node can find cross-tenant work without a LIST. The catalog's create-once root and
-  shard registers (`pstore-catalog`) are the precedent for a sharded register.
+- No node finds cross-tenant work without a LIST; `pstore-catalog`'s create-once root and
+  shard registers are the precedent for a sharded register.
 
 ## Delta
 
@@ -84,11 +84,10 @@ replications**, over any `BlobStore`.
   effective when its CAS lands.
 
 **Worker** in `pstore-server`, beside fold and reap, owned by this process's lane.
-- At start it reads every shard in one parallel round, reclaiming this lane's claims.
-- Then it reads one shard per `scan` (10 s), in a rotating order offset by the lane, claiming
-  up to `max` tenants (64).
-- It renews each held shard every `ttl/3` (TTL 120 s), and drops a tenant it lost or that has
-  no running replication (and reconciles it).
+- At start it reads every shard in one parallel round, reclaiming its lane's claims.
+- Then one shard per `scan` (10 s), rotating, offset by the lane, claiming up to `max` (64).
+- It renews each held shard every `ttl/3` (TTL 120 s); a tenant lost, or with nothing
+  running (then reconciled), is dropped.
 - Per held tenant it runs a sync every `period` (1 s), doubling up to `idle` (60 s) while
   nothing changes.
 - Status notes go to `{spread}/tnt/{t}/REPLSTATUS`: `dest -> {last_ok_ms, last_error ≤256 B}`,
@@ -110,19 +109,14 @@ and a source may feed many.
 - `DELETE …/replication` → `200 {epoch}`.
 - `GET /v1/replications` → the tenant's jobs, after one HEAD read.
 
-Refusals, by name:
-- `400 bad_request`: a name outside the pattern; the source is the dest itself; an unknown
-  store.
-- `409 index_exists`, `409 replication_exists`, `404 source_not_found`,
-  `404 replication_not_found`.
-- `409 replica_read_only`: a write or branch into a replica.
-- `409 replication_active`: dropping a replica.
-- `409 replica_no_history`: `as_of` on a replica.
+Refusals: `400 bad_request` (name, self-source, unknown store), `409 index_exists`,
+`409 replication_exists`, `404 source_not_found`, `404 replication_not_found`,
+`409 replica_read_only` (write or branch into), `409 replication_active` (drop),
+`409 replica_no_history` (`as_of`).
 
 **Docs.** A correction banner on `ownership-and-leases.md` § Work scheduling: opt-in
-cross-tenant work is not derivable from any manifest a node holds, so M22 adds a register of
-it. It is not a broker: it has no address, no master and no liveness protocol, and claims are
-advisory. `deploy.md` and the parity row are updated too.
+cross-tenant work derives from no manifest a node holds, so M22 adds a register; not a
+broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the parity row.
 
 **Does not change:** any query of a non-replica, the write path's requests, and the fold, GC
 and branch of non-replicas. There is no LIST anywhere.
@@ -183,9 +177,8 @@ and branch of non-replicas. There is no LIST anywhere.
 - **Sync:** idle costs 1 GET per distinct source. Otherwise the source reads come first, then
   1 dest HEAD GET, then per new segment 1 GET and ≤3 sidecar GETs followed by their PUTs,
   then per changed vector a GET and a PUT, then 1 CAS. Depth 5, in the background.
-- **Control:** create is 1 source GET, 1 HEAD GET plus CAS, and reconcile (2 GETs plus 1
-  CAS). Pause, resume and cancel are a HEAD GET plus CAS, then reconcile. Status is 3 GETs
-  in parallel. List is 1 GET. No LIST.
+- **Control:** create = source GET, HEAD GET+CAS, reconcile (2 GETs+CAS); pause, resume,
+  cancel = HEAD GET+CAS, reconcile. Status 3 parallel GETs; list 1 GET. No LIST.
 - **Worker:** per worker, one GET per `scan` even with no jobs, which is 1,000 GET/s across
   10,000 nodes. It scales with nodes.
 - **⚠️ Polling is per tenant per source per time**, which breaks "never per elapsed time"
@@ -199,15 +192,12 @@ and branch of non-replicas. There is no LIST anywhere.
   one survivor. A larger `S` needs a longer `scan` or more workers.
 - **Ceiling:** 64 shards × about 2,000 tenants is about 120 KB per shard. More needs a larger
   `S` chosen at first use, because there is no resharding.
-- **A source HEAD that regresses** (disaster recovery) stops its replicas at the `>` check.
-  Recovery is cancel, then create again.
-- **No auth exists**, so any tenant header may name any source. That is today's posture for
-  every read, recorded for the auth duty.
-- **Same-tenant replicas copy bytes** that M16 could share, so the dest's GC never depends on
-  the source's.
+- **A regressed source HEAD** (disaster recovery) stops at the `>` check: cancel, recreate.
+- **No auth exists**: any tenant header may name any source, as for every read today.
+- **Same-tenant replicas copy bytes** M16 could share, so dest GC never depends on source GC.
 
 ## Tasks
 
-- **M22.1** — `pstore-jobs`: register, claims and reconcile, with tests 7 and 8.
-- **M22.2** — engine: `replications`, `replicate` and the replica rules, with tests 1–6.
-- **M22.3** — server: the worker, remote sources, the API and docs, with tests 9–11.
+- **M22.1** — `pstore-jobs`: register, claims, reconcile (tests 7, 8).
+- **M22.2** — engine: `replications`, `replicate`, replica rules (tests 1–6).
+- **M22.3** — server: worker, remote sources, API, docs (tests 9–11).
