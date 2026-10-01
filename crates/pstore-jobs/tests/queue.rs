@@ -62,6 +62,29 @@ async fn config_is_created_once_and_its_count_wins() {
 }
 
 #[tokio::test]
+async fn on_another_view_is_the_same_register_at_no_cost() {
+    let store = Counting::new();
+    let reg = open(&store, 8).await;
+    let other = store.recounted();
+    let view = reg.on(Arc::new(other.clone()));
+    assert_eq!(other.reads() + other.cas(), 0, "a view cost a request");
+    assert_eq!(view.shards(), 8);
+    assert_eq!(view.shard_key(3), reg.shard_key(3));
+    // Writes through the view land where the register reads.
+    view.reconcile("t1", || async { Ok(Some(4)) }, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        reg.read(reg.shard_of("t1")).await.unwrap().entries["t1"].generation,
+        4
+    );
+    assert!(
+        other.cas() > 0 && store.cas() == 1,
+        "billed to the wrong view"
+    );
+}
+
+#[tokio::test]
 async fn ids_spread_over_every_shard() {
     let reg = open(&Counting::new(), 8).await;
     let used: BTreeSet<u16> = (0..200).map(|i| reg.shard_of(&format!("t{i}"))).collect();

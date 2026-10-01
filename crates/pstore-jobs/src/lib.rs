@@ -167,6 +167,17 @@ impl<S: BlobStore> Register<S> {
         Err(JobsError::Contended)
     }
 
+    /// This register, read and written through `store` instead: the same name and shard
+    /// count, so a caller can bill each operation to whoever asked for it. **No request.**
+    #[must_use]
+    pub fn on<T: BlobStore>(&self, store: Arc<T>) -> Register<T> {
+        Register {
+            store,
+            name: self.name.clone(),
+            shards: self.shards,
+        }
+    }
+
     /// The shard count.
     #[must_use]
     pub fn shards(&self) -> u16 {

@@ -203,3 +203,77 @@ pub trait BlobStore: Send + Sync + 'static {
     /// committed. Making it awkward to reach for is the cheapest enforcement available.
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError>;
 }
+
+/// A store chosen at run time -- a replication source named by configuration (M22) -- is a
+/// store, so it can be accounted and billed like any other.
+///
+/// ⚠️ **Every method forwards, the defaulted ones too**: a default here would re-derive a
+/// classed read as an unclassed one, or re-plan a coalesced read the inner store plans
+/// differently, and the difference would be invisible until a cache or a request count
+/// disagreed.
+#[async_trait::async_trait]
+impl BlobStore for std::sync::Arc<dyn BlobStore> {
+    fn capabilities(&self) -> &Capabilities {
+        (**self).capabilities()
+    }
+    async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
+        (**self).get(key).await
+    }
+    async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, BlobError> {
+        (**self).get_range(key, range).await
+    }
+    async fn get_range_as(
+        &self,
+        key: &Key,
+        range: Range<u64>,
+        class: Class,
+    ) -> Result<Bytes, BlobError> {
+        (**self).get_range_as(key, range, class).await
+    }
+    async fn get_ranges_as(
+        &self,
+        key: &Key,
+        ranges: &[Range<u64>],
+        class: Class,
+    ) -> Result<Vec<Bytes>, BlobError> {
+        (**self).get_ranges_as(key, ranges, class).await
+    }
+    async fn get_immutable(&self, key: &Key, class: Class) -> Result<Bytes, BlobError> {
+        (**self).get_immutable(key, class).await
+    }
+    async fn get_ranges(&self, key: &Key, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, BlobError> {
+        (**self).get_ranges(key, ranges).await
+    }
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, BlobError> {
+        (**self).get_suffix(key, n).await
+    }
+    async fn get_suffix_as(&self, key: &Key, n: u64, class: Class) -> Result<Bytes, BlobError> {
+        (**self).get_suffix_as(key, n, class).await
+    }
+    async fn get_with_tag(&self, key: &Key) -> Result<(Bytes, CasTag), BlobError> {
+        (**self).get_with_tag(key).await
+    }
+    async fn get_tag(&self, key: &Key) -> Result<Option<pstore_types::CasTag>, BlobError> {
+        (**self).get_tag(key).await
+    }
+    async fn head(&self, key: &Key) -> Result<u64, BlobError> {
+        (**self).head(key).await
+    }
+    async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
+        (**self).put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &Key,
+        body: Bytes,
+        pre: Precondition,
+    ) -> Result<PutOutcome, CasError> {
+        (**self).put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+        (**self).delete_batch(keys).await
+    }
+    async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
+        (**self).list_unrestricted(prefix).await
+    }
+}

@@ -67,6 +67,14 @@ impl Counting {
         }
     }
 
+    /// The same store, counted apart: what a second tenant's view of it would bill.
+    pub(crate) fn recounted(&self) -> Self {
+        Self {
+            counts: Arc::default(),
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn contend_at(&self, ordinals: &[u64]) {
         self.contend.lock().unwrap().extend(ordinals);
     }
