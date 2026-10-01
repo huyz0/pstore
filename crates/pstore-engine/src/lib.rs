@@ -496,6 +496,39 @@ pub(crate) fn valid_name(n: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+/// `index`'s stats in `head`, or `None` when HEAD names no segment of it.
+pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
+    h.indexes.get(index).map(|refs| IndexStats {
+        // The newest commit that rewrote its segments or their delete vectors (M9f): both
+        // keys carry the epoch they were written at, and a retry re-derives them.
+        updated_epoch: refs
+            .iter()
+            .filter_map(|r| head::key_epoch(&r.key))
+            .chain(
+                refs.iter()
+                    .filter_map(|r| h.deletes.get(&head::dv_ref(index, &r.key)))
+                    .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
+            )
+            .max()
+            .map(Epoch),
+        segments: refs.len() as u64,
+        // Live rows: a segment's deleted rows are not documents (M9c.2).
+        documents: refs
+            .iter()
+            .map(|r| {
+                let gone = h
+                    .deletes
+                    .get(&head::dv_ref(index, &r.key))
+                    .map_or(0, |(_, n)| *n);
+                u64::from(r.rows.saturating_sub(gone))
+            })
+            .sum(),
+        epoch: h.epoch,
+        schema: h.schemas.get(index).cloned(),
+        rejected_rows: h.schema_rejects.get(index).copied().unwrap_or(0),
+    })
+}
+
 fn is_rowless(d: &Document) -> bool {
     is_tombstone(d) || op_code(d) == Some(OP_PATCH) || is_by_filter(d)
 }
@@ -2226,39 +2259,7 @@ impl<S: BlobStore> Engine<S> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.remember_schemas(&at.head);
         self.prune_to(&at.head);
-        Ok((
-            at.head.epoch,
-            at.head.indexes.get(index).map(|refs| IndexStats {
-                // The newest commit that rewrote its segments or their delete vectors (M9f): both
-                // keys carry the epoch they were written at, and a retry re-derives them.
-                updated_epoch: refs
-                    .iter()
-                    .filter_map(|r| head::key_epoch(&r.key))
-                    .chain(
-                        refs.iter()
-                            .filter_map(|r| at.head.deletes.get(&head::dv_ref(index, &r.key)))
-                            .filter_map(|(k, _)| head::dv_of(k).map(|(_, e)| e)),
-                    )
-                    .max()
-                    .map(Epoch),
-                segments: refs.len() as u64,
-                // Live rows: a segment's deleted rows are not documents (M9c.2).
-                documents: refs
-                    .iter()
-                    .map(|r| {
-                        let gone = at
-                            .head
-                            .deletes
-                            .get(&head::dv_ref(index, &r.key))
-                            .map_or(0, |(_, n)| *n);
-                        u64::from(r.rows.saturating_sub(gone))
-                    })
-                    .sum(),
-                epoch: at.head.epoch,
-                schema: at.head.schemas.get(index).cloned(),
-                rejected_rows: at.head.schema_rejects.get(index).copied().unwrap_or(0),
-            }),
-        ))
+        Ok((at.head.epoch, stats_of(&at.head, index)))
     }
 
     /// What this process has flushed and nobody is yet known to have folded (M9i.1): the

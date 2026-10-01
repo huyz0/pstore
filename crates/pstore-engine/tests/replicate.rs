@@ -1178,9 +1178,12 @@ async fn a_cached_plan_never_commits_another_sources_data() {
 async fn a_regressed_source_fails_without_copying() {
     let s = setup(Kind::CrossTenant);
     write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    // The HEAD restored later names two segments the replica will never have held: it is
+    // taken before a compaction, and nothing is collected, so both still exist.
     let head_key = Key::new(format!("{:04x}/tnt/{}/HEAD", SRC.0 as u16, SRC.0));
     let old = s.here.hooked.inner.get(&head_key).await.unwrap();
-    write(&s.src, "src", 30..60).await;
+    s.src.compact("src").await.unwrap();
     s.create().await;
     let mut st = SyncState::default();
     s.sync(&mut st).await;

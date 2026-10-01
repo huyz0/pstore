@@ -369,6 +369,27 @@ impl<S: BlobStore> Engine<S> {
         Ok(at.head.replications)
     }
 
+    /// `dest`'s replication and its index's stats, after one HEAD read: what a status
+    /// reports. `None` when `dest` has no replication.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn replication_status(
+        &self,
+        dest: &str,
+    ) -> Result<Option<(Replication, Option<crate::IndexStats>, Option<u64>)>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
+        let Some(r) = at.head.replications.get(dest).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            r,
+            crate::stats_of(&at.head, dest),
+            at.head.replication_gen(),
+        )))
+    }
+
     /// [`Head::replication_gen`] of the current HEAD, after one read.
     ///
     /// # Errors
@@ -933,12 +954,16 @@ impl<S: BlobStore> Engine<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(to.as_str().to_owned());
-        futures_util::future::try_join_all(
+        // Every PUT awaited, not the first failure: a PUT dropped in flight could still land
+        // after its key was buried and reaped (code review round 2).
+        let put = futures_util::future::join_all(
             puts.into_iter()
                 .map(|(k, b)| async move { self.store.put(&k, b).await }),
         )
-        .await
-        .map_err(|e| CopyErr::Failed(e.to_string()))?;
+        .await;
+        if let Some(Err(e)) = put.into_iter().find(Result::is_err) {
+            return Err(CopyErr::Failed(e.to_string()));
+        }
         Ok(absent)
     }
 }
