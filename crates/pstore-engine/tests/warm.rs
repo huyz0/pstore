@@ -515,3 +515,65 @@ async fn an_index_without_dense_vectors_has_no_centroids_to_ask_for() {
         "a warm paid a 404: {reads:?}"
     );
 }
+
+#[tokio::test]
+async fn an_index_another_process_folded_and_dropped_is_not_known() {
+    // A's memtable still holds a batch B folded and then dropped: a query on A prunes it
+    // against HEAD and finds no index, so a warm must too.
+    let store = Arc::new(Recorder::default());
+    let cache = Arc::new(Caching::new(Arc::clone(&store), 64 << 20));
+    let a = Engine::new(Arc::clone(&cache), T, LaneId(1));
+    let b = Engine::new(Arc::clone(&cache), T, LaneId(2));
+    a.write("x", vec![doc("x1".to_owned(), 1.0, false)])
+        .await
+        .unwrap();
+    a.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert!(b.delete_index("x").await.unwrap().is_some());
+    assert!(
+        !a.warm("x").await.unwrap().exists,
+        "a dropped index was warmed"
+    );
+}
+
+#[tokio::test]
+async fn sidecars_are_cached_as_pinned_and_footers_as_meta() {
+    let store = Arc::new(Recorder::default());
+    full(&store).await;
+    let cache = Arc::new(Caching::new(Arc::clone(&store), 64 << 20));
+    engine(&cache).warm("idx").await.unwrap();
+    assert!(cache.resident_in(Class::Pinned) > 0, "no sidecar is pinned");
+    assert!(cache.resident_in(Class::Meta) > 0, "no footer is meta");
+    // A query's own fills change neither: the warm put each where a query reads it from.
+    let (pinned, meta) = (
+        cache.resident_in(Class::Pinned),
+        cache.resident_in(Class::Meta),
+    );
+    every_query(&engine(&cache), true).await;
+    assert_eq!(
+        (
+            cache.resident_in(Class::Pinned),
+            cache.resident_in(Class::Meta)
+        ),
+        (pinned, meta)
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_delete_vector_fails_the_warm() {
+    // As it fails the query: answering without it would return rows it deletes.
+    let store = Arc::new(Recorder::default());
+    full(&store).await;
+    let dv: Vec<Key> = store
+        .inner
+        .list_unrestricted(&Key::new(""))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.as_str().ends_with(".dv"))
+        .collect();
+    assert_eq!(dv.len(), 1, "{dv:?}");
+    store.inner.delete_batch(&dv).await.unwrap();
+    let cache = Arc::new(Caching::new(Arc::clone(&store), 64 << 20));
+    assert!(engine(&cache).warm("idx").await.is_err());
+}

@@ -65,7 +65,8 @@ so a deploy is not a fleet-wide cold start. Unset, the server is uncached.
 `POST /v1/indexes/{index}/warm` fetches one index's metadata into the read cache: segment
 footers, delete vectors, centroid tables and dictionaries, never the vectors or postings
 themselves ([M21](milestones/M21/SPEC.md), D-44). It is billed like a query and returns when
-done, at most three sequential requests deep. A second warm costs one read.
+done, three sequential requests deep for any segment the server wrote. A second warm costs
+one read.
 
 - ⚠️ **It warms the process that serves it.** Nothing routes a tenant to a particular server,
   so warm every process the burst will reach: for example, once per server behind the load

@@ -2063,7 +2063,9 @@ impl<S: BlobStore> Engine<S> {
     pub async fn warm(&self, index: &str) -> Result<Warmed, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         let refs = at.head.indexes.get(index).cloned().unwrap_or_default();
-        // As a query decides it (M9c): segments, or unfolded rows that are not deletes.
+        // As a query decides it (M9c): segments, or unfolded rows that are not deletes, once
+        // the rows another fold already folded are pruned (code review).
+        self.prune_to(&at.head);
         let exists = !refs.is_empty() || {
             let m = self.mem();
             let ops: Vec<Document> = m
@@ -2087,8 +2089,8 @@ impl<S: BlobStore> Engine<S> {
                 // Round 2: the footer, the delete vector, the centroid table, together.
                 let (seg, dv, cen) = futures_util::future::join3(
                     Segment::open(store, &t.segment),
-                    sidecar(store, t.deleted.as_ref()),
-                    sidecar(store, clustered.then_some(&t.centroids)),
+                    sidecar(store, t.deleted.as_ref(), true),
+                    sidecar(store, clustered.then_some(&t.centroids), false),
                 )
                 .await;
                 let seg = seg?;
@@ -2100,8 +2102,8 @@ impl<S: BlobStore> Engine<S> {
                     .has_text()
                     .then(|| pstore_format::text::dict_key(&t.segment));
                 let (sd, td) = futures_util::future::join(
-                    sidecar(store, sparse.as_ref()),
-                    sidecar(store, text.as_ref()),
+                    sidecar(store, sparse.as_ref(), false),
+                    sidecar(store, text.as_ref(), false),
                 )
                 .await;
                 Ok::<_, EngineError>([dv?, cen?, sd?, td?].into_iter().filter(|f| *f).count())
@@ -5090,14 +5092,19 @@ fn sparse_field_of(docs: &[Document]) -> Option<String> {
 }
 
 /// Fetches one immutable sidecar as a query does, so the cache keeps it (M21). `true` when it
-/// was there; an absent one is no error, as a query does not treat it as one.
-async fn sidecar<S: BlobStore>(store: &S, key: Option<&Key>) -> Result<bool, EngineError> {
+/// was there. An absent one is no error unless it is `required`, as a query treats it: a
+/// delete vector HEAD names must be readable, a centroid table or dictionary need not be.
+async fn sidecar<S: BlobStore>(
+    store: &S,
+    key: Option<&Key>,
+    required: bool,
+) -> Result<bool, EngineError> {
     let Some(key) = key else {
         return Ok(false);
     };
     match store.get_immutable(key, pstore_blob::Class::Pinned).await {
         Ok(_) => Ok(true),
-        Err(pstore_blob::BlobError::NotFound(_)) => Ok(false),
+        Err(pstore_blob::BlobError::NotFound(_)) if !required => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
