@@ -195,6 +195,55 @@ pub struct Head {
     /// Each branch (M16), by the epoch it was made at: below it, the index did not exist.
     /// Pruned when GC's horizon reaches it, as `dropped` is.
     pub branched: BTreeMap<String, u64>,
+    /// Each replica index (M22), by name: what it follows and how far. ⚠️ A trailing section
+    /// after `branched`: absent means none.
+    pub replications: BTreeMap<String, Replication>,
+}
+
+/// Where a replica's source index lives (M22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaSource {
+    /// The named remote store, or empty for this process's own.
+    pub store: String,
+    /// The source's tenant.
+    pub tenant: pstore_types::TenantId,
+    /// The source index.
+    pub index: String,
+}
+
+impl ReplicaSource {
+    /// `index` of `tenant` in this process's own store.
+    #[must_use]
+    pub fn local(tenant: pstore_types::TenantId, index: &str) -> Self {
+        Self {
+            store: String::new(),
+            tenant,
+            index: index.to_owned(),
+        }
+    }
+}
+
+/// One replica index's replication (M22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replication {
+    /// What it follows.
+    pub source: ReplicaSource,
+    /// Whether it is followed now; `false` is paused.
+    pub running: bool,
+    /// The epoch that last set it running: a resume is a new run.
+    pub run: u64,
+    /// The source's epoch and fingerprint at the last sync that committed.
+    pub applied: Option<(u64, u64)>,
+    /// Rows written to the replica that a fold dropped (they slipped past a stale door).
+    pub rejected: u64,
+}
+
+/// FNV-1a 64: stable across builds and machines, which `std`'s hasher is not (M22).
+#[must_use]
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// Where a segment's delete vector written at `epoch` by `lane` lives (M9c): the segment's
@@ -380,7 +429,8 @@ impl Head {
             .collect();
         // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
         // one is -- otherwise the later count would be read as the earlier one's.
-        if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() {
+        let more = !self.replications.is_empty();
+        if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() || more {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in fts {
                 put_ref(&mut out, *kind, *at, *name);
@@ -388,7 +438,7 @@ impl Head {
             }
         }
         // M16: and the trigram count before the branches, by the same rule.
-        if !trigram.is_empty() || !self.branched.is_empty() {
+        if !trigram.is_empty() || !self.branched.is_empty() || more {
             out.extend_from_slice(&(trigram.len() as u32).to_le_bytes());
             for (kind, at, s, name) in trigram {
                 put_ref(&mut out, *kind, *at, *name);
@@ -398,14 +448,44 @@ impl Head {
                 }
             }
         }
-        if !self.branched.is_empty() {
+        if !self.branched.is_empty() || more {
             out.extend_from_slice(&(self.branched.len() as u32).to_le_bytes());
             for (name, epoch) in &self.branched {
                 put_str(&mut out, name);
                 out.extend_from_slice(&epoch.to_le_bytes());
             }
         }
+        // M22: the replications, last.
+        if more {
+            out.extend_from_slice(&(self.replications.len() as u32).to_le_bytes());
+            for (name, r) in &self.replications {
+                put_str(&mut out, name);
+                put_str(&mut out, &r.source.store);
+                out.extend_from_slice(&r.source.tenant.0.to_le_bytes());
+                put_str(&mut out, &r.source.index);
+                out.push(u8::from(r.running) | (u8::from(r.applied.is_some()) << 1));
+                out.extend_from_slice(&r.run.to_le_bytes());
+                if let Some((epoch, fp)) = r.applied {
+                    out.extend_from_slice(&epoch.to_le_bytes());
+                    out.extend_from_slice(&fp.to_le_bytes());
+                }
+                out.extend_from_slice(&r.rejected.to_le_bytes());
+            }
+        }
         out
+    }
+
+    /// A digest of the running replications' `(name, run)` set, or `None` when none runs
+    /// (M22): what a holder of the tenant's register entry compares to know it must re-read.
+    #[must_use]
+    pub fn replication_gen(&self) -> Option<u64> {
+        let mut bytes = Vec::new();
+        for (name, r) in self.replications.iter().filter(|(_, r)| r.running) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&r.run.to_le_bytes());
+        }
+        (!bytes.is_empty()).then(|| fnv1a(&bytes))
     }
 
     /// Decodes HEAD, refusing anything malformed.
@@ -573,6 +653,37 @@ impl Head {
         for _ in 0..c.u32()? {
             let name = c.string()?;
             h.branched.insert(name, c.u64()?);
+        }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let store = c.string()?;
+            let tenant = u128::from(c.u64()?) | (u128::from(c.u64()?) << 64);
+            let index = c.string()?;
+            let flags = c.u8()?;
+            let run = c.u64()?;
+            let applied = if flags & 2 != 0 {
+                Some((c.u64()?, c.u64()?))
+            } else {
+                None
+            };
+            let rejected = c.u64()?;
+            h.replications.insert(
+                name,
+                Replication {
+                    source: ReplicaSource {
+                        store,
+                        tenant: pstore_types::TenantId(tenant),
+                        index,
+                    },
+                    running: flags & 1 != 0,
+                    run,
+                    applied,
+                    rejected,
+                },
+            );
         }
         Ok(h)
     }
@@ -795,7 +906,7 @@ pub struct HeadAt {
 }
 
 /// Reads HEAD, or the empty state if the tenant has never committed.
-pub(crate) async fn read<S: BlobStore>(
+pub(crate) async fn read<S: BlobStore + ?Sized>(
     store: &S,
     tenant: pstore_types::TenantId,
 ) -> Result<HeadAt, EngineError> {

@@ -26,8 +26,9 @@ It is pull-based and run by the destination.
    it out of the commit.
 3. Copy, at most 4 segments in flight, each source segment that no dest segment maps.
    - To `…/idx/{dest}/seg/R/{E:020}-{lane:016x}-{h:016x}.seg`: `E` the dest epoch read plus
-     one, `h` FNV-1a of the source key. The footer's dictionaries go with it, and a `.cen`
-     if present (D-10: absent means scan exactly).
+     one, `h` FNV-1a of the source key. Its sidecars that exist go with it. ⚠️ Amended at
+     M22.2: every sidecar may be absent (an empty dictionary is never written), so none is
+     "expected" from the footer; the 404 rule below covers all three.
    - A source delete vector whose key's hash `g` differs from the one the dest's vector key
      carries is copied to `{dest_seg}.{E:020}-{lane:016x}-{g:016x}.dv`, which `dv_of` still
      parses.
@@ -40,13 +41,13 @@ It is pull-based and run by the destination.
    replaced or dropped, including a vector whose source segment no longer has one.
 5. A lost CAS goes back to 2 and reuses the copies. **A replication that fails** is left out
    and its copies are buried, while the rest commit. Failures include a source read error, an
-   unknown store, or 24 consecutive remaps that copied nothing new. Copies unused, or mapped by a rival's
-   commit, are buried under their own epochs (M19).
-
-A replica shows the source's **folded** state.
+   unknown store, or 24 consecutive remaps that copied nothing new. Copies unused, or mapped
+   by a rival's commit, are buried under their own epochs (M19). A replica shows the source's
+   **folded** state.
 **Replica rules.** While `replications` names `dest`:
 - Every write into `dest`, tombstones and patches included, is refused at the door (cached
-  HEAD) and at the flush. The fold drops any that slipped past a stale door and counts them in
+  HEAD, re-read before it stands). ⚠️ Amended at M22.2: not at the flush, which carries every
+  index and would fail innocent rows. The fold drops any that slipped past and counts them in
   `rejected`. A query of `dest` ignores unfolded rows.
 - Refused: `delete_index(dest)`, `compact(dest)`, a branch into `dest`, and `as_of` on `dest`,
   since copies carry `E`, not their commit epoch. Each is checked on every commit attempt's
@@ -188,10 +189,9 @@ broker (no address, master or liveness), claims advisory. Plus `deploy.md`, the 
 
 - **Takeover** after a crash: ≤ `ttl + S·scan`, ~13 min at defaults with one survivor.
 - **Ceiling:** 64 shards × ~2,000 tenants ≈ 140 KB a shard; beyond, choose `S` at first use.
-- **A stale HEAD cache** on an eventual read may serve a row that slipped a stale door.
-- **A regressed source HEAD** (disaster recovery) stops at the `>` check: cancel, recreate.
-- **No auth exists**: any tenant header may name any source, as for every read today.
-- **Same-tenant replicas copy bytes** M16 could share, so dest GC never depends on source GC.
+- **A stale cached HEAD** may serve a row past a stale door; **a regressed source HEAD**
+  (disaster recovery) stops at the `>` check: cancel, recreate. **No auth exists**: any
+  tenant may name any source. **Same-tenant copies** cost bytes M16 could share.
 
 ## Tasks
 

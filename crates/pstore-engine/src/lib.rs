@@ -4,9 +4,13 @@
 mod bundle;
 mod head;
 pub mod lanes;
+mod replica;
 
 pub use bundle::Entry;
-pub use head::{Head, HeadAt, IndexSchema, Metric, SegmentRef, TimeTravel};
+pub use head::{
+    Head, HeadAt, IndexSchema, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
+};
+pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
@@ -86,6 +90,10 @@ pub enum EngineError {
     /// A request the engine will not carry out, and why (M16): a client's error.
     #[error("{0}")]
     Refused(String),
+    /// A replication rule refused the request (M22), by name, so a server can map each to
+    /// its status.
+    #[error("{0}")]
+    Replica(ReplicaRefusal),
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
@@ -478,6 +486,16 @@ fn is_deferred(d: &Document) -> bool {
 
 /// Whether an operation carries no full row -- a delete, conditional or not, or a patch -- so
 /// nothing about it can say what width, metric or text an index has.
+/// Whether `n` may name an index that a branch or a replication creates (M16): it bounds key
+/// length and keeps `key_index` exact.
+pub(crate) fn valid_name(n: &str) -> bool {
+    (1..=128).contains(&n.len())
+        && n != "."
+        && n != ".."
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 fn is_rowless(d: &Document) -> bool {
     is_tombstone(d) || op_code(d) == Some(OP_PATCH) || is_by_filter(d)
 }
@@ -1161,6 +1179,10 @@ pub struct Engine<S> {
     /// ⚠️ **Monotonic by epoch** (M11.2): a `bounded` read may serve an older HEAD than one this
     /// engine already recorded, and must not roll the door's check back to it.
     schemas: Mutex<Option<(Epoch, BTreeMap<String, head::IndexSchema>)>>,
+    /// The replica indexes the last HEAD this process read named (M22), kept beside
+    /// `schemas` and by the same rule: an early refusal at zero requests, re-read before it
+    /// stands.
+    replica_names: Mutex<std::collections::BTreeSet<String>>,
     /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
     /// Filled by nothing else, so no other read pays to clone HEAD.
     head_cache: Mutex<Option<(tokio::time::Instant, head::HeadAt)>>,
@@ -1307,6 +1329,7 @@ impl<S: BlobStore> Engine<S> {
             mem: Mutex::new(Memtable::default()),
             seq: Mutex::new(None),
             schemas: Mutex::new(None),
+            replica_names: Mutex::new(std::collections::BTreeSet::new()),
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
@@ -1361,7 +1384,36 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.as_ref().is_none_or(|(epoch, _)| head.epoch >= *epoch) {
             *cache = Some((head.epoch, head.schemas.clone()));
+            *self
+                .replica_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                head.replications.keys().cloned().collect();
         }
+    }
+
+    /// Refuses a write into a replica index (M22): by what this process last read, at zero
+    /// requests; a refusal re-reads HEAD once before it stands, so another process's cancel
+    /// is seen. A process that has read nothing cannot know, and the fold drops what it lets
+    /// through.
+    async fn refuse_replica(&self, index: &str) -> Result<(), EngineError> {
+        let named = |e: &Self| {
+            e.replica_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(index)
+        };
+        if !named(self) {
+            return Ok(());
+        }
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
+        if at.head.replications.contains_key(index) {
+            return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                index.to_owned(),
+            )));
+        }
+        Ok(())
     }
 
     /// Whether this process has never read a HEAD.
@@ -1741,6 +1793,7 @@ impl<S: BlobStore> Engine<S> {
         patches: Vec<Patch>,
         cond: Option<&pstore_query::Predicate>,
     ) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         let cond = cond.map(encoded).transpose()?;
         let mut ops = Vec::with_capacity(patches.len());
         for p in patches {
@@ -1769,6 +1822,7 @@ impl<S: BlobStore> Engine<S> {
         ids: Vec<String>,
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         let mark = encoded(cond)?;
         let ops = ids
             .into_iter()
@@ -1800,6 +1854,7 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         filter: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         let op = by_filter_op(OP_DELETE_BY_FILTER, encoded(filter)?, BTreeMap::new());
         self.mem().buffer(index, vec![op]);
         Ok(())
@@ -1817,6 +1872,7 @@ impl<S: BlobStore> Engine<S> {
         filter: &pstore_query::Predicate,
         patch: Patch,
     ) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         let mark = encoded(filter)?;
         let mut attrs = patch_attrs(patch)?;
         attrs.remove(OP_ATTR);
@@ -1833,6 +1889,7 @@ impl<S: BlobStore> Engine<S> {
         mark: Option<String>,
         declared: &Declared,
     ) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         // `id` is no attribute a segment stores, so a sketch of it would describe nothing --
         // or a user attribute of that name, and prune `id` filters by it (code review, M15).
         if declared
@@ -2027,6 +2084,7 @@ impl<S: BlobStore> Engine<S> {
     /// # Errors
     /// None today; the signature matches [`Self::write`]'s.
     pub async fn delete(&self, index: &str, ids: Vec<String>) -> Result<(), EngineError> {
+        self.refuse_replica(index).await?;
         let ops = ids.into_iter().map(tombstone).collect();
         self.mem().buffer(index, ops);
         Ok(())
@@ -2712,15 +2770,8 @@ impl<S: BlobStore> Engine<S> {
         written: &mut Vec<String>,
     ) -> Result<Epoch, EngineError> {
         require_fencing(&*self.store)?;
-        let named = |n: &str| {
-            (1..=128).contains(&n.len())
-                && n != "."
-                && n != ".."
-                && n.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-        };
         for n in [src, dest] {
-            if !named(n) {
+            if !valid_name(n) {
                 return Err(EngineError::Refused(format!(
                     "a branch's index name {n:?} must match [A-Za-z0-9_.-]{{1,128}} and not be \
                      . or .."
@@ -2753,6 +2804,11 @@ impl<S: BlobStore> Engine<S> {
                     .chain(m.durable_rows(dest))
                     .any(|d| !is_rowless(d))
             };
+            if at.head.replications.contains_key(dest) {
+                return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                    dest.to_owned(),
+                )));
+            }
             if at.head.indexes.contains_key(dest)
                 || at.head.schema_rejects.contains_key(dest)
                 || pending
@@ -2894,6 +2950,12 @@ impl<S: BlobStore> Engine<S> {
             // read and before anything is sealed, so a missing index on the first attempt writes
             // nothing. Rows that are all deletes do not make an index exist, as queries decide.
             if let Some(x) = drop {
+                // M22: a replica is dropped by cancelling its replication first.
+                if at.head.replications.contains_key(x) {
+                    return Err(EngineError::Replica(replica::ReplicaRefusal::Active(
+                        x.to_owned(),
+                    )));
+                }
                 let rows = |docs: Option<&Vec<Document>>| {
                     docs.is_some_and(|d| d.iter().any(|d| !is_rowless(d)))
                 };
@@ -2910,7 +2972,20 @@ impl<S: BlobStore> Engine<S> {
                 // Before the reject pass, so none of its rows are counted as rejects.
                 by_index.remove(x);
             }
-            if by_index.is_empty() && drop.is_none() {
+            // ⚠️ M22: a replica takes no writes. A row that slipped past a door that had not
+            // read this HEAD is dropped here -- every kind, tombstones and patches too -- and
+            // counted on the replication, as a schema reject is counted on its index. The fold
+            // still commits, so the lane's watermark moves past it.
+            let mut replica_rows: BTreeMap<String, u64> = BTreeMap::new();
+            by_index.retain(|idx, docs| {
+                if at.head.replications.contains_key(idx) {
+                    replica_rows.insert(idx.clone(), docs.len() as u64);
+                    false
+                } else {
+                    true
+                }
+            });
+            if by_index.is_empty() && drop.is_none() && replica_rows.is_empty() {
                 self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
@@ -3094,6 +3169,11 @@ impl<S: BlobStore> Engine<S> {
             // discard that is indistinguishable from a bug. The API reports it per index.
             for (idx, n) in &rejects {
                 *next.schema_rejects.entry(idx.clone()).or_default() += *n;
+            }
+            for (idx, n) in &replica_rows {
+                if let Some(r) = next.replications.get_mut(idx) {
+                    r.rejected += *n;
+                }
             }
             for (lane, _, tail) in &spans {
                 if *tail > 0 {
@@ -3726,6 +3806,12 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<Option<Epoch>, EngineError> {
         require_fencing(&*self.store)?;
         let at = head::read(&*self.store, self.tenant).await?;
+        // M22: a replica's segments are its source's, mirrored; it merges nothing itself.
+        if at.head.replications.contains_key(index) {
+            return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                index.to_owned(),
+            )));
+        }
         let inputs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
         if inputs.len() < 2 {
             return Ok(None);
@@ -3931,10 +4017,12 @@ impl<S: BlobStore> Engine<S> {
             if !m.prune(self.watermark(&at.head)) {
                 continue;
             }
+            // M22: a replica's unfolded rows are never served (code review m1), as a query's.
+            let replica = at.head.replications.contains_key(index);
             let unfolded: Vec<Document> = m
                 .durable_rows(index)
                 .chain(m.pending.get(index).into_iter().flatten())
-                .filter(|d| !is_deferred(d))
+                .filter(|d| !is_deferred(d) && !replica)
                 .cloned()
                 .collect();
             drop(m);
@@ -4381,10 +4469,15 @@ impl<S: BlobStore> Engine<S> {
                 _ => head::read(&*self.store, self.tenant).await?,
             };
             let schema = at.head.schemas.get(index);
-            if let Some(view) = self
-                .fresh_view(index, self.watermark(&at.head), schema)
-                .await?
-            {
+            // M22: a replica serves its source's folded state and nothing unfolded -- a row
+            // that slipped past a stale door is never seen, and the fold drops it.
+            let fresh = if at.head.replications.contains_key(index) {
+                Some(None)
+            } else {
+                self.fresh_view(index, self.watermark(&at.head), schema)
+                    .await?
+            };
+            if let Some(view) = fresh {
                 return Ok(Fetched {
                     at,
                     fresh: view,
@@ -4577,6 +4670,11 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<Answer, EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.remember_schemas(&at.head);
+        if at.head.replications.contains_key(index) {
+            return Err(EngineError::Replica(replica::ReplicaRefusal::NoHistory(
+                index.to_owned(),
+            )));
+        }
         let then = at.head.as_of(epoch)?;
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
         // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
@@ -4818,6 +4916,11 @@ impl<S: BlobStore> Engine<S> {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 self.remember_schemas(&at.head);
+                if at.head.replications.contains_key(index) {
+                    return Err(EngineError::Replica(replica::ReplicaRefusal::NoHistory(
+                        index.to_owned(),
+                    )));
+                }
                 let then = at.head.as_of(epoch)?;
                 let fts = schema_at(&at.head, index, epoch).fts;
                 (
