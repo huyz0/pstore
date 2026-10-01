@@ -5,6 +5,10 @@ demonstrated it.
 
 Gate: `scripts/check-verified.py`.
 
+> ⚠️ **Superseded by [M20](../M20/VERIFIED.md).** The disk tier D-23 asks for now exists: a
+> restart is not a flush. It was tested on a local directory, not NVMe, so its one number is
+> `provisional`; the `NOT-RUN` below stays as the record of what M4d could not do.
+
 ⚠️ **All three phases are done. The NVMe tier (D-23) remains `NOT-RUN`**, so a rolling
 restart still flushes every cache — `affinity-and-coldstart.md` puts a full refill at ~10
 hours per node, and that is a real correctness gap for deploys, not a tidy omission.
