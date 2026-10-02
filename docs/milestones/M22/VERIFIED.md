@@ -65,7 +65,11 @@ Commands: `cargo test -p pstore-jobs`, `cargo test -p pstore-engine --test repli
 9. **Workers.** `three_workers_converge_and_share_the_work`, `a_dead_workers_tenants_move`
    (within `ttl + S·scan`), `a_creator_with_a_worker_claims_its_job_at_once`,
    `a_full_worker_does_not_claim_at_creation`, `a_worker_removes_an_entry_with_nothing_running`,
-   `a_paused_job_costs_nothing_once_its_claim_is_dropped`, `a_served_process_runs_its_worker`.
+   `a_paused_job_costs_nothing_once_its_claim_is_dropped`, `a_served_process_runs_its_worker`,
+   `max_bounds_every_worker_and_the_rest_is_shared`. Interleaved over a store that yields at
+   every request: `a_claim_made_during_a_tick_still_counts_against_max`,
+   `a_restart_racing_a_create_holds_no_more_than_max`, `every_slot_let_go_is_given_back`,
+   `an_abandoned_control_call_gives_its_reservation_back`.
 10. **API.** `a_job_is_created_followed_paused_resumed_listed_and_cancelled`,
     `every_refusal_is_named`, `the_list_costs_one_read`, `a_status_call_repairs_a_lost_entry`,
     `every_control_call_leaves_the_register_right_by_itself`,
@@ -76,10 +80,37 @@ Commands: `cargo test -p pstore-jobs`, `cargo test -p pstore-engine --test repli
     reads, 15 renewal reads and CASes, 10 source reads for two replicas of one source, and 0
     tenant writes. It found `claim` rewriting a worker's own live claims on every scan, which
     was fixed and given its own test.
-12. **Gates** — NOT-RUN yet: the sweep over the source diff and `./scripts/gates.sh` are in
-    progress.
+12. **Gates.** `./scripts/gates.sh` green on `ff897fe`: 17 of 17, run by the pre-commit hook.
+    The sweep over M22's source diff (`bb84c35..`) misses **0**, every miss closed by a test
+    or named equivalent below.
+    - ⚠️ **Not `./scripts/mutants.sh` itself.** It was `cargo mutants --in-diff` run directly,
+      one shard per crate, so each fits the two-hour limit on this container. Engine and
+      server shards ran only their M22 test files.
+    - Per shard:
+
+      | Shard | Mutants | Missed, then fixed | Equivalent | Timeouts |
+      |---|---|---|---|---|
+      | pstore-blob | 21 | 0 | 0 | 0 |
+      | pstore-jobs | 76 | 3 | 0 | 2 |
+      | pstore-engine | 187 | 15 + 12 | 6 | 0 |
+      | pstore-server | 222 | 11 + 7 + 2 | 0 | 1 |
+      | accounting rewrite (`ff897fe`) | 12 | 0 | 0 | 0 |
+
+    - The timeouts are endless retry loops, which cargo-mutants does not count as missed.
+    - Equivalent: `progress -= 1` (as non-zero as `+= 1`); `|` as `^` over HEAD's disjoint
+      bits; and a copy's epoch taken as the HEAD epoch, or one below it. Nothing parses a copy's epoch,
+      and every sync that copies ends in a commit or a burial commit, so any name taken from
+      the epoch is fresh.
+    - The sweep found the real over-claim that round 2 had accepted as minor (m8).
 
 Spec review took three rounds: round 1 blocked (2 blockers, 10 majors), round 2 blocked (2
 liveness holes), and round 3 approved. Code review: M22.1 passed in one round. M22.2 blocked in
-round 1 (a cached plan could commit another source's data) and passed in round 2. M22.3 is in
-review.
+round 1 (a cached plan could commit another source's data) and passed in round 2. M22.3 took
+the full four rounds:
+- Round 1 blocked: a starting worker could claim `max` from every shard.
+- Round 2 blocked: a renewal released a claim made mid-tick.
+- Round 3 passed.
+- Round 4 blocked on the sweep-driven accounting rewrite: a dropped control call leaked its slot.
+
+⚠️ That last fix, a drop guard, is **unreviewed**: four rounds is the cap. A test aborts creates
+at every point and fails with the guard disabled.
