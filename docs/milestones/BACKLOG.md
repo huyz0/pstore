@@ -139,13 +139,13 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 49 | **A compaction that commits can leak a segment whose sidecar create was refused.** `seal` abandons a name when a sidecar is refused, and moves on; the segment it created there stays in the call's record, which a compaction buries only when it does not commit. A refused sidecar needs a stale orphan under a name the segment won, so this is rare. The fix is the fold's: bury the call's record in the commit, through `bury_into`. Found by M23's code review as a minor. | [M23](M23/VERIFIED.md) | S |
+| ~~49~~ | **CLOSED by [M29](M29/VERIFIED.md)**: a compaction's commit buries its whole record through `bury_into`, as the fold's does, so a segment abandoned to a stale orphan's sidecar is buried and reaped. A lost attempt's seal, which nothing had pinned, is pinned too. | [M23](M23/VERIFIED.md) | S |
 
 ## Opened by M19
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 43 | **A `Contended` retry on a branch's success path buries a live copy key.** When a branch's commit lands on a retry after a `Contended` answer, a copy written by an earlier attempt at the same key can be in the graveyard and live at once. Safe: GC's live check keeps the object, and `as_of`'s dedup hides the contradiction. Found by M19's code review as a minor, and not changed there. | [M19](M19/VERIFIED.md) | S |
+| ~~43~~ | **CLOSED by [M23](M23/VERIFIED.md), pinned by [M29](M29/VERIFIED.md)**: a retry takes the next name, so a branch's retry never writes its first attempt's copy key again. A test makes the first commit `Contended`, and is red with M23 reverted. | [M19](M19/VERIFIED.md) | S |
 
 ## Opened by M8g
 
