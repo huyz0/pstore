@@ -145,9 +145,8 @@ async fn total_loss_stops_the_bytes_but_not_the_node() {
 #[tokio::test]
 async fn a_member_reports_its_own_zone() {
     // ⚠️ The zone is what makes a cell's roster a cell's roster: `main` keeps only peers whose
-    // zone matches its own. Pinned through the member's OWN entry, which is deterministic:
-    // two members in different zones do not learn each other's zone today -- a peer first
-    // learned from a seed, dial or probe keeps an empty zone (M8e's ledger records it open).
+    // zone matches its own. Pinned through the member's OWN entry, which is deterministic;
+    // `two_members_in_two_zones_learn_each_others_zone` pins a peer's (M24).
     // `contains`, not equality: a reused test port can deliver a stray probe.
     let port = free_port();
     let m = swim::start(
@@ -164,5 +163,33 @@ async fn a_member_reports_its_own_zone() {
     assert!(
         zoned.contains(&(m.self_addr(), "az-q".to_owned())),
         "a member in az-q did not report its own zone: {zoned:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_members_in_two_zones_learn_each_others_zone() {
+    // M24: a peer first learned from a seed has an empty zone, and its own record now fills
+    // it -- before M24 it never did, and each was missing from the other's cell roster.
+    let (pa, pb) = (free_port(), free_port());
+    let (a, b) = (format!("127.0.0.1:{pa}"), format!("127.0.0.1:{pb}"));
+    let ma = swim::start(&a, &a, "az-a", std::slice::from_ref(&b), 0.0, FAST)
+        .await
+        .expect("a member must start on loopback");
+    let mb = swim::start(&b, &b, "az-b", std::slice::from_ref(&a), 0.0, FAST)
+        .await
+        .expect("a member must start on loopback");
+    for _ in 0..200 {
+        let (za, zb) = (ma.members_zoned().await, mb.members_zoned().await);
+        if za.contains(&(b.clone(), "az-b".to_owned()))
+            && zb.contains(&(a.clone(), "az-a".to_owned()))
+        {
+            return;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    panic!(
+        "zones not learned: {:?} / {:?}",
+        ma.members_zoned().await,
+        mb.members_zoned().await
     );
 }

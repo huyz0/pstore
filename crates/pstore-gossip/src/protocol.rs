@@ -307,15 +307,30 @@ impl Protocol {
             let worse = m.incarnation == local.incarnation && rank(m.state) > rank(local.state);
             if newer || worse {
                 self.apply(m);
+            } else if m.incarnation == local.incarnation && self.cluster.fill_zone(&m.id, &m.zone) {
+                // ⚠️ M24: the peer's own record, at the incarnation already held, is how a peer
+                // learned from a probe gets its zone -- and only its zone. It is news, so it
+                // spreads, and every view converges on one checksum.
+                self.note_update(&m.id);
             }
         }
     }
 
-    /// Set a member to exactly what the winning record says.
+    /// Set a member to what the winning record says.
     ///
-    /// ⚠️ Takes the record's address and zone as well as its state — this is how a peer first
-    /// learned from a bare probe, with no zone, acquires one.
+    /// ⚠️ Takes the record's address and state, and its zone **unless** that would lose one
+    /// (M24). An empty zone means "unknown", never "none", so it never clears a known zone;
+    /// and a member declares its zone once per incarnation, so an equal one never moves it. A
+    /// record that wins and carries a zone over an empty one fills it, as any winner does.
     fn apply(&mut self, m: &Member) {
+        let mut m = m.clone();
+        if let Some(local) = self.cluster.member(&m.id)
+            && !local.zone.is_empty()
+            && (m.zone.is_empty() || m.incarnation == local.incarnation)
+        {
+            m.zone.clone_from(&local.zone);
+        }
+        let m = &m;
         self.cluster.upsert(m.clone());
         match m.state {
             // ⚠️ `refute` is the only path that raises an incarnation, and it never invents
@@ -556,6 +571,111 @@ mod tests {
             c.declare_dead(&nid(n));
         }
         Protocol::new(c)
+    }
+
+    /// `n`'s record as a peer would send it (M24).
+    fn record(n: u8, zone: &str, incarnation: u64, state: State) -> Member {
+        Member {
+            id: nid(n),
+            addr: format!("n{n}"),
+            zone: zone.to_owned(),
+            incarnation,
+            state,
+        }
+    }
+
+    /// Node 0, knowing node 1 at its address only, with an empty zone, as a probe leaves it.
+    fn probed() -> Protocol {
+        let mut c = Cluster::new(nid(0), "n0".to_owned(), "az-a".to_owned());
+        c.join(nid(1), "n1".to_owned(), String::new());
+        Protocol::new(c)
+    }
+
+    fn zone_of(p: &Protocol, n: u8) -> String {
+        p.cluster
+            .member(&nid(n))
+            .map(|m| m.zone.clone())
+            .unwrap_or_default()
+    }
+
+    fn honest(p: &Protocol) {
+        assert_eq!(p.cluster.checksum(), p.cluster.checksum_from_scratch());
+    }
+
+    #[test]
+    fn an_empty_zone_never_clears_a_known_one() {
+        let mut p = protocol(&[1], &[]);
+        // A worse state at an equal incarnation wins, and keeps the zone it had.
+        p.absorb(&[record(1, "", 0, State::Suspect)]);
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Suspect));
+        assert_eq!(zone_of(&p, 1), "az-a");
+        honest(&p);
+        // So does a higher incarnation.
+        p.absorb(&[record(1, "", 1, State::Alive)]);
+        assert_eq!(p.cluster.incarnation(&nid(1)), Some(1));
+        assert_eq!(zone_of(&p, 1), "az-a");
+        honest(&p);
+    }
+
+    #[test]
+    fn an_equal_incarnation_never_moves_a_zone() {
+        let mut p = protocol(&[1], &[]);
+        p.absorb(&[record(1, "az-z", 0, State::Alive)]);
+        assert_eq!(zone_of(&p, 1), "az-a");
+        p.absorb(&[record(1, "az-z", 0, State::Suspect)]);
+        assert_eq!(zone_of(&p, 1), "az-a", "a winning record moved the zone");
+        honest(&p);
+        p.absorb(&[record(1, "az-z", 1, State::Alive)]);
+        assert_eq!(zone_of(&p, 1), "az-z");
+        honest(&p);
+    }
+
+    #[test]
+    fn a_fill_never_revives() {
+        // Suspect: the zone is filled, and the suspicion still runs to its end.
+        let mut p = probed();
+        p.cluster.suspect(&nid(1));
+        p.suspected_at.insert(nid(1), p.tick);
+        p.absorb(&[record(1, "az-b", 0, State::Alive)]);
+        assert_eq!(zone_of(&p, 1), "az-b");
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Suspect));
+        assert_eq!(p.cluster.incarnation(&nid(1)), Some(0));
+        assert_eq!(p.suspected_at.get(&nid(1)), Some(&0));
+        honest(&p);
+        p.tick = suspect_timeout(p.cluster.len()) + 1;
+        p.bury_suspects();
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Dead));
+        // Dead: filled, and still dead.
+        let mut p = probed();
+        p.cluster.declare_dead(&nid(1));
+        p.absorb(&[record(1, "az-b", 0, State::Alive)]);
+        assert_eq!(zone_of(&p, 1), "az-b");
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Dead));
+        honest(&p);
+    }
+
+    #[test]
+    fn a_winning_record_fills_an_empty_zone() {
+        // Precedence wins, at an equal incarnation, over a member with no zone: the record is
+        // applied, and its zone with it (code review round 1, m-2).
+        let mut p = probed();
+        p.absorb(&[record(1, "az-b", 0, State::Suspect)]);
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Suspect));
+        assert_eq!(zone_of(&p, 1), "az-b");
+        honest(&p);
+    }
+
+    #[test]
+    fn a_fill_is_news_and_keeps_the_checksum() {
+        let mut p = probed();
+        while !p.piggyback().is_empty() {}
+        p.absorb(&[record(1, "az-b", 0, State::Alive)]);
+        honest(&p);
+        let carried = p.piggyback();
+        assert!(
+            carried.iter().any(|m| m.id == nid(1) && m.zone == "az-b"),
+            "the fill was not news: {carried:?}"
+        );
     }
 
     #[test]

@@ -123,6 +123,12 @@ outcome — confirming coverage needs `--list` with the same filter.
 | 47 | **A scan's miss claims the bulk singleflight gate and admits nothing**, so bulk readers waiting on it wake to a miss and each fetch again: N concurrent misses cost 1 + N requests instead of 1. A claim-free fetcher also removes whichever gate is there, possibly a later claimant's. Found by M20's code review as a minor; rare today, since a query and a scan share no range (M20 criterion 9's amendment). The fix: a scan fetches without claiming, and only the claimant removes its gate. | [M20](M20/SPEC.md) | S |
 | 48 | **The disk tier's lookup hash is std's `Hash` over `Id`**, which Rust does not promise is stable across releases. A toolchain upgrade that changes it makes every recovered entry miss: never wrong bytes, since foyer checks the key on load, but a silent full flush. Hash `Id` by hand over its structural encoding. Found by M20's code review. | [M20](M20/SPEC.md) | S |
 
+## Opened by M24
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 50 | **Under constant 10% loss a gossip fleet's checksums almost never agree.** Six members that know every zone from the start agree on one checksum in 7 of 400 simulated rounds (`pstore-gossip`'s lockstep `Sim`, every tenth datagram dropped), identically before and after M24: suspicions and their refutations raise incarnations faster than a `Sync` spreads them. Not a correctness failure -- members stay alive and every zone is learned -- but every disagreeing pair trades `Sync` datagrams, so the steady-state cost under loss is not the 74-byte checksum D-79's gossip was sized on. Needs a measurement of `Sync` bytes per round against loss before a fix is chosen. Found by M24's criterion 3. | [M24](M24/SPEC.md) | M |
+
 ## Opened by M23
 
 | # | Task | From | Size |

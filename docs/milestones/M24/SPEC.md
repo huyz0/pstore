@@ -51,7 +51,12 @@ holds.
    datagram: only checksums.
 3. **A fleet converges on every zone.** Six members over three zones, seeded from one member's
    address with an empty zone, loss-free: within 30 rounds every member holds every other's
-   zone, and the six checksums are equal. At a 10% drop rate, within 100 rounds.
+   zone, and the six checksums are equal. At a 10% drop rate, every member holds every zone
+   within 100 rounds. ⚠️ Amended at implementation, from "converges" at 10% loss: suspicion
+   churns under constant loss, and a fleet that knows every zone from the start agrees on a
+   checksum in 7 of 400 rounds, identically before and after M24. That is BACKLOG row 50. The
+   lossy half passes on the parent commit too: refutations raise incarnations, and a winning
+   record carries its zone in. Only the loss-free half tests M24.
 4. **An empty zone never clears a known one.** A `Suspect` record at an equal incarnation with an
    empty zone leaves the member `Suspect` with its zone. The same holds for a record with an
    empty zone at a higher incarnation.

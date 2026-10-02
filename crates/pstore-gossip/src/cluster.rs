@@ -215,13 +215,31 @@ impl Cluster {
 
     /// Insert or replace a member wholesale, from a record that won on incarnation.
     ///
-    /// ⚠️ Replaces the **address and zone** too, not only the state. A peer first learned from
-    /// a bare probe has an unknown zone — a `Ping` carries none, and putting one on every
-    /// probe would tax the steady state this crate exists to keep at 74 bytes. The first
-    /// authoritative `Member` record about it is what fills that in, and it can only do so if
-    /// this replaces rather than merges.
+    /// ⚠️ Replaces the **address and zone** too, not only the state. The caller decides the
+    /// zone first (M24): `Protocol::apply` never lets an empty one clear a known one, nor an
+    /// equal incarnation move one.
     pub fn upsert(&mut self, m: Member) {
         self.insert(m);
+    }
+
+    /// Fills a member's **empty** zone, and changes nothing else (M24).
+    ///
+    /// ⚠️ A peer first learned from a bare probe has an unknown zone -- a `Ping` carries none,
+    /// and putting one on every probe would tax the steady state this crate exists to keep at
+    /// 74 bytes. Its own record, at the same incarnation, never wins on precedence, so the zone
+    /// comes in here: never the state, which would let a stale `Alive` revive a suspect.
+    /// Answers whether it filled anything.
+    pub fn fill_zone(&mut self, id: &NodeId, zone: &str) -> bool {
+        let Some(m) = self.members.get(id) else {
+            return false;
+        };
+        if !m.zone.is_empty() || zone.is_empty() {
+            return false;
+        }
+        let mut next = m.clone();
+        zone.clone_into(&mut next.zone);
+        self.insert(next);
+        true
     }
 
     /// Mark a peer as having missed a probe.
