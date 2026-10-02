@@ -56,6 +56,9 @@ request count.
 4. **Lost attempts are still buried.** `a_paused_compaction_does_not_replace_a_live_segment`,
    `a_compaction_retried_at_its_own_epoch_does_not_reseal` and the M19 compaction tests pass
    unchanged.
+   - ⚠️ Amended at implementation: with the burial call removed, no existing test failed. So
+     `a_committed_compaction_buries_its_lost_attempts_seal` pins it: a lost CAS, a re-seal,
+     a commit, and the first seal buried and reaped.
 5. **Row 43 pinned.** A branch of a source with a delete vector, whose first commit answers
    `Contended` without landing, commits on its retry. The first attempt's copy key differs from
    the committed one, and is buried, then reaped. No key is both live and buried.

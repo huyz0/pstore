@@ -703,3 +703,111 @@ async fn a_suffixed_name_is_resolved_reaped_and_not_a_copy() {
         .collect();
     assert!(left.is_empty(), "GC left {left:?}");
 }
+
+#[tokio::test]
+async fn a_committed_compaction_buries_a_name_it_abandoned() {
+    // M29: a stale orphan holds the centroid table's name for the merge's first segment name.
+    // The merge creates its segment there, is refused the table, seals at the next name and
+    // commits. The segment at the first name is the merge's own, and must not leak.
+    let inner = Arc::new(MemoryStore::new());
+    let sa = Store::view(&inner);
+    let params = pstore_index::cluster::Params {
+        exact_scan_threshold: 1,
+        ..pstore_index::cluster::Params::default()
+    };
+    let w = World {
+        w: engine(&Store::view(&inner), 9),
+        a: engine(&sa, 1).with_index_params(params),
+        b: engine(&Store::view(&inner), 1),
+        sa,
+        inner,
+    };
+    for id in ["a", "b"] {
+        w.put("idx", &[id]).await;
+        w.w.fold().await.unwrap();
+    }
+    let epoch = w.head().await.epoch.0 + 1;
+    let abandoned = format!(
+        "{:04x}/tnt/{}/idx/idx/seg/L1/{epoch:020}-{:016x}.seg",
+        T.0 as u16, T.0, 1
+    );
+    let orphan = format!("{abandoned}.cen");
+    w.inner
+        .put(&Key::new(orphan.clone()), Bytes::from_static(b"not ours"))
+        .await
+        .unwrap();
+    assert_eq!(w.a.compact("idx").await.unwrap().map(|e| e.0), Some(epoch));
+
+    let head = w.head().await;
+    let live = segments(&head, "idx");
+    assert_eq!(live.len(), 1);
+    assert!(live[0].ends_with("_1.seg"), "{live:?}");
+    assert!(
+        w.bytes(&abandoned).await.is_some(),
+        "the merge did not create the abandoned segment"
+    );
+    assert!(
+        head.graveyard
+            .get(&epoch)
+            .is_some_and(|keys| keys.contains(&abandoned)),
+        "the abandoned segment leaked: {:?}",
+        head.graveyard
+    );
+    let grave = graveyard(&head);
+    for k in &live {
+        assert!(!grave.contains(k), "the live {k} was buried");
+    }
+    assert_eq!(
+        w.bytes(&orphan).await.unwrap(),
+        Bytes::from_static(b"not ours")
+    );
+
+    w.w.gc(0).await.unwrap();
+    assert!(
+        w.bytes(&abandoned).await.is_none(),
+        "GC kept the abandoned segment"
+    );
+    assert!(w.bytes(&orphan).await.is_none(), "GC kept its orphan table");
+    assert!(w.bytes(&live[0]).await.is_some());
+    assert_eq!(w.ids("idx").await, set(&["a", "b"]));
+}
+
+#[tokio::test]
+async fn a_committed_compaction_buries_its_lost_attempts_seal() {
+    // M29 criterion 4: another lane folds between A's seal and its commit, so A loses its CAS,
+    // re-seals at the next epoch, and commits. The first seal was never live, and is buried
+    // and reaped. No test pinned this before M29 (the burial call removed failed none).
+    let w = World::new();
+    for id in ["a", "b"] {
+        w.put("idx", &[id]).await;
+        w.w.fold().await.unwrap();
+    }
+    let before: BTreeSet<String> = w.objects().await.into_keys().collect();
+    let got =
+        w.a.compact_with_interference_for_test("idx", async {
+            w.put("idx", &["c"]).await;
+            w.w.fold().await.unwrap();
+        })
+        .await
+        .unwrap();
+    assert!(got.is_some(), "the retry did not commit");
+    let head = w.head().await;
+    let live: BTreeSet<String> = segments(&head, "idx").into_iter().collect();
+    let sealed: Vec<String> = w
+        .objects()
+        .await
+        .into_keys()
+        .filter(|k| !before.contains(k) && k.ends_with(".seg") && k.contains("/seg/L1/"))
+        .collect();
+    assert_eq!(sealed.len(), 2, "{sealed:?}");
+    let lost: Vec<&String> = sealed.iter().filter(|k| !live.contains(*k)).collect();
+    assert_eq!(lost.len(), 1, "{sealed:?}");
+    let grave = graveyard(&head);
+    assert!(grave.contains(lost[0]), "the lost attempt's seal leaked");
+    for k in &live {
+        assert!(!grave.contains(k), "the live {k} was buried");
+    }
+    w.w.gc(0).await.unwrap();
+    assert!(w.bytes(lost[0]).await.is_none(), "GC kept the lost seal");
+    assert_eq!(w.ids("idx").await, set(&["a", "b", "c"]));
+}

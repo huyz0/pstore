@@ -4298,9 +4298,6 @@ impl<S: BlobStore> Engine<S> {
                 .seal(names, &out_key, &rows, text_field, &fts, &trigram)
                 .await?;
         }
-        // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
-        // buried rather than left for M6e's orphan sweeper.
-        let mut stale: Vec<Key> = Vec::new();
         if let Some(f) = interfere {
             f.await;
         }
@@ -4327,7 +4324,6 @@ impl<S: BlobStore> Engine<S> {
                         &trigram,
                     )
                     .await?;
-                stale.push(out_key.clone());
                 out_key = key;
                 sealed_at = want;
             }
@@ -4380,17 +4376,14 @@ impl<S: BlobStore> Engine<S> {
                 .entry(next.epoch.0)
                 .or_default()
                 .extend(inputs.iter().map(|i| head::burial(index, &i.key)));
-            // ⚠️ **Buried under ITS OWN key epoch, not this one.** The graveyard means "was
-            // live, and stopped being referenced here"; a key that was never live has no such
-            // epoch, and burying it at the committing one would put it straight back into the
-            // arm that reconstructs a past manifest — the merge and its inputs, together.
-            for k in &stale {
-                let born = head::key_epoch(k.as_str()).unwrap_or(next.epoch.0);
-                next.graveyard
-                    .entry(born)
-                    .or_default()
-                    .push(k.as_str().to_owned());
-            }
+            // ⚠️ **Everything this call created, or may have, that `next` does not name** (M29),
+            // as the fold's commit does: a lost attempt's seal, and a segment whose name was
+            // abandoned when a stale orphan held one of its sidecars' names. Each is buried
+            // under ITS OWN key epoch, not this one: the graveyard means "was live, and stopped
+            // being referenced here", and a key that was never live has no such epoch -- at the
+            // committing one it would go straight back into the arm that reconstructs a past
+            // manifest, the merge and its inputs together. The merge itself is live in `next`.
+            bury_into(&mut next, &names.written);
 
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {

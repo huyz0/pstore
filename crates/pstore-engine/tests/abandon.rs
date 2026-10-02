@@ -598,3 +598,50 @@ async fn sealing_one_key_twice_writes_the_same_bytes() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_contended_branch_retry_buries_no_live_copy() {
+    // BACKLOG row 43: the first commit answers `Contended` without landing, and the retry
+    // commits. Since M23 the retry's copy takes the next name, so the first attempt's copy is
+    // a different key, buried and reaped, and nothing live is buried.
+    let store = Store::new();
+    let e = engine(&store, 1);
+    seeded(&e, "src", &["a", "b"]).await;
+    e.delete("src", vec!["a".into()]).await.unwrap();
+    fold(&e).await;
+    store.contend_after.store(0, Ordering::SeqCst);
+    let before = objects(&store).await;
+    e.branch("src", "dest").await.unwrap();
+
+    let head = e.head_for_test().await;
+    let copies: Vec<String> = objects(&store)
+        .await
+        .into_iter()
+        .filter(|k| !before.contains(k) && k.ends_with(".dv"))
+        .collect();
+    assert_eq!(copies.len(), 2, "{copies:?}");
+    let live = named(&head);
+    let (kept, first): (Vec<&String>, Vec<&String>) =
+        copies.iter().partition(|k| live.contains(*k));
+    assert_eq!((kept.len(), first.len()), (1, 1), "{copies:?}");
+    assert_ne!(kept[0], first[0]);
+    assert!(
+        buried_at(&head, first[0]).is_some(),
+        "the first attempt's copy leaked"
+    );
+    for k in &live {
+        assert_eq!(buried_at(&head, k), None, "the live {k} was buried");
+    }
+    e.gc(0).await.unwrap();
+    let left = objects(&store).await;
+    assert!(!left.contains(first[0]), "GC kept the first attempt's copy");
+    assert!(left.contains(kept[0]));
+    let ids: Vec<String> = e
+        .scan("dest", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(ids, ["b"]);
+}
