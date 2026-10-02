@@ -150,8 +150,10 @@ impl Tiers {
 
 const CLASSES: [&str; 3] = ["pinned", "meta", "bulk"];
 
-/// The version of the entry format below: bump it with any change to [`Id`]'s encoding.
-const FORMAT: &str = "pstore-cache/1";
+/// The version of the entry format below: bump it with any change to [`Id`]'s encoding, or to
+/// its hash. ⚠️ `/1` hashed a derived `Hash`; `/2` hashes the encoding (M28), so a directory
+/// filled under `/1` is emptied rather than left as entries no lookup can find.
+const FORMAT: &str = "pstore-cache/2";
 
 async fn tier(dir: &std::path::Path, bytes: usize, block: usize) -> Result<Tier, String> {
     let why = |e: &dyn std::fmt::Display| format!("{}: {e}", dir.display());
@@ -192,16 +194,40 @@ fn sync_dir(dir: &std::path::Path) {
     let _ = dir;
 }
 
+impl Id {
+    /// A tag, the key, and two numbers: what [`foyer::Code::encode`] writes, and what the
+    /// hash is taken over.
+    fn parts(&self) -> (u8, &str, u64, u64) {
+        match self {
+            Id::Range(k, a, b) => (0, k, *a, *b),
+            Id::Whole(k) => (1, k, 0, 0),
+            Id::Suffix(k, n) => (2, k, *n, 0),
+        }
+    }
+}
+
+/// ⚠️ **The encoding's bytes, in order, and nothing else** (M28). `foyer` files a disk entry
+/// under `XxHash64` of this, and recovers it by the same hash: a derived `Hash` feeds an
+/// `isize` discriminant and native-endian integers, which Rust does not promise to keep, so
+/// a toolchain upgrade could silently flush every disk tier. Streamed, not concatenated:
+/// `XxHash64` gives the same value however its input is split.
+impl std::hash::Hash for Id {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let (tag, key, a, b) = self.parts();
+        state.write(&[tag]);
+        state.write(&(key.len() as u64).to_le_bytes());
+        state.write(key.as_bytes());
+        state.write(&a.to_le_bytes());
+        state.write(&b.to_le_bytes());
+    }
+}
+
 /// The foyer key: `Id` encoded **structurally**, a tag then its fields, so no two shapes and
 /// no crafted key string can collide.
 impl foyer::Code for Id {
     fn encode(&self, w: &mut impl std::io::Write) -> foyer::Result<()> {
         let io = |e: std::io::Error| foyer::Error::io_error(e);
-        let (tag, key, a, b) = match self {
-            Id::Range(k, a, b) => (0u8, k, *a, *b),
-            Id::Whole(k) => (1, k, 0, 0),
-            Id::Suffix(k, n) => (2, k, *n, 0),
-        };
+        let (tag, key, a, b) = self.parts();
         w.write_all(&[tag]).map_err(io)?;
         w.write_all(&(key.len() as u64).to_le_bytes()).map_err(io)?;
         w.write_all(key.as_bytes()).map_err(io)?;
@@ -243,5 +269,23 @@ impl foyer::Code for Id {
             Id::Range(k, ..) | Id::Whole(k) | Id::Suffix(k, _) => k.len(),
         };
         1 + 8 + key + 16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Id;
+    use std::hash::BuildHasher as _;
+
+    /// M28 criterion 6: `foyer` finds a recovered entry by this hash, so it is pinned to bytes
+    /// this crate defines. Each literal is `XxHash64`, seed 0, of the `Id`'s 40-byte encoding,
+    /// computed by a reference implementation of the published algorithm, outside this code.
+    #[test]
+    fn the_disk_hash_is_the_encodings() {
+        let hash = |id: Id| foyer::DefaultHasher::default().hash_one(id);
+        let key = || "tnt/1/seg/a.seg".to_owned();
+        assert_eq!(hash(Id::Range(key(), 4096, 8192)), 0x9c77_4f0d_9145_8c19);
+        assert_eq!(hash(Id::Whole(key())), 0xc2ed_b142_b10c_2a82);
+        assert_eq!(hash(Id::Suffix(key(), 65536)), 0x881b_2410_f45f_4894);
     }
 }

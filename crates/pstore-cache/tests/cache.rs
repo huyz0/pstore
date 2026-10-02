@@ -696,3 +696,276 @@ async fn opening_a_segment_admits_its_index_as_meta() {
     pstore_format::Segment::open(&cache, &key).await.unwrap();
     assert_eq!(cache.resident_in(Class::Meta), before);
 }
+
+// ---- M28: the gate's owner, the scan's claim, and the LRU's model ----
+
+/// A store whose every range fetch is held until the test releases it, by index, to succeed
+/// or to fail. `Barriered` releases all at once and cannot fail; M28's orderings need both.
+#[derive(Debug, Default)]
+struct Held {
+    inner: MemoryStore,
+    calls: std::sync::Mutex<Vec<Option<tokio::sync::oneshot::Sender<bool>>>>,
+}
+
+impl Held {
+    fn calls(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+    /// Until `n` fetches have reached the store, or a bound that fails the test.
+    async fn until_calls(&self, n: usize) {
+        let wait = async {
+            while self.calls() < n {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .is_err()
+        {
+            panic!("{} fetches reached the store, not {n}", self.calls());
+        }
+    }
+    fn release(&self, i: usize, ok: bool) {
+        if let Some(tx) = self.calls.lock().unwrap()[i].take() {
+            let _ = tx.send(ok);
+        }
+    }
+    fn release_all(&self) {
+        for tx in self
+            .calls
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter_map(Option::take)
+        {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for Held {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &Key) -> Result<Bytes, pstore_blob::BlobError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &Key,
+        range: Range<u64>,
+    ) -> Result<Bytes, pstore_blob::BlobError> {
+        let held = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.calls.lock().unwrap().push(Some(tx));
+            rx
+        };
+        match held.await {
+            Ok(true) => self.inner.get_range(key, range).await,
+            _ => Err(pstore_blob::BlobError::Other(
+                "a held fetch failed".to_owned(),
+            )),
+        }
+    }
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<Bytes, pstore_blob::BlobError> {
+        self.inner.get_suffix(key, n).await
+    }
+    async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &Key,
+        body: Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &Key,
+        body: Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn get_with_tag(
+        &self,
+        key: &Key,
+    ) -> Result<(Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        self.inner.get_tag(key).await
+    }
+    async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+}
+
+type Read = tokio::task::JoinHandle<Result<Bytes, pstore_blob::BlobError>>;
+
+async fn held() -> (Arc<Held>, Arc<Caching<Held>>, Key) {
+    let key = Key::new("seg/held");
+    let store = Arc::new(Held::default());
+    store.inner.put(&key, body()).await.unwrap();
+    let cache = Arc::new(Caching::new(Arc::clone(&store), 1 << 20));
+    (store, cache, key)
+}
+
+fn read(cache: &Arc<Caching<Held>>, key: &Key, class: Class) -> Read {
+    let (c, k) = (Arc::clone(cache), key.clone());
+    tokio::spawn(async move { c.get_range_as(&k, 0..64, class).await })
+}
+
+/// Long enough for every spawned read to reach the cache and wait or fetch.
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// A read's answer, or a failed test if it never comes.
+async fn answer(r: Read) -> Result<Bytes, pstore_blob::BlobError> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), r)
+        .await
+        .expect("a read hung")
+        .unwrap()
+}
+
+/// Two bulk reads of the range, the second arriving while the first's fetch is held: one
+/// request between them, which is what a fresh claim costs.
+async fn a_fresh_claim_costs_one(store: &Held, cache: &Arc<Caching<Held>>, key: &Key) {
+    let before = store.calls();
+    let first = read(cache, key, Class::Bulk);
+    store.until_calls(before + 1).await;
+    let second = read(cache, key, Class::Bulk);
+    settle().await;
+    store.release_all();
+    assert_eq!(answer(first).await.unwrap().len(), 64);
+    assert_eq!(answer(second).await.unwrap().len(), 64);
+    assert_eq!(
+        store.calls(),
+        before + 1,
+        "a later pair of reads found no fresh claim"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_miss_costs_no_bulk_reader_a_request() {
+    let (store, cache, key) = held().await;
+    let scan = read(&cache, &key, Class::Scan);
+    store.until_calls(1).await;
+    let bulk: Vec<Read> = (0..8).map(|_| read(&cache, &key, Class::Bulk)).collect();
+    settle().await;
+    // Release whatever is held, as it arrives, until every read has answered.
+    let releaser = {
+        let s = Arc::clone(&store);
+        tokio::spawn(async move {
+            loop {
+                s.release_all();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    for r in std::iter::once(scan).chain(bulk) {
+        assert_eq!(answer(r).await.unwrap().len(), 64);
+    }
+    releaser.abort();
+    assert_eq!(
+        store.calls(),
+        2,
+        "bulk readers waiting on a scan's miss each fetched again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_free_fetch_leaves_the_claimants_gate() {
+    let (store, cache, key) = held().await;
+    let scan = read(&cache, &key, Class::Scan);
+    store.until_calls(1).await;
+    // A scan holds no claim, so this read claims and fetches beside it.
+    let claimant = read(&cache, &key, Class::Bulk);
+    store.until_calls(2).await;
+    store.release(0, true);
+    assert_eq!(answer(scan).await.unwrap().len(), 64);
+    // The scan finished first. The claimant's gate must still be there for this one.
+    let late = read(&cache, &key, Class::Bulk);
+    settle().await;
+    assert_eq!(
+        store.calls(),
+        2,
+        "a claim-free fetch removed the claimant's gate"
+    );
+    store.release_all();
+    assert_eq!(answer(claimant).await.unwrap().len(), 64);
+    assert_eq!(answer(late).await.unwrap().len(), 64);
+    assert_eq!(store.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_claim_releases_its_waiters_and_its_gate() {
+    let (store, cache, key) = held().await;
+    let claimant = read(&cache, &key, Class::Bulk);
+    store.until_calls(1).await;
+    // A scan waits on the gate, and admits nothing, so the range stays uncached.
+    let waiter = read(&cache, &key, Class::Scan);
+    settle().await;
+    assert_eq!(store.calls(), 1);
+    store.release(0, false);
+    assert!(answer(claimant).await.is_err());
+    store.until_calls(2).await;
+    store.release(1, true);
+    assert_eq!(answer(waiter).await.unwrap().len(), 64);
+    a_fresh_claim_costs_one(&store, &cache, &key).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_claim_releases_its_waiters() {
+    let (store, cache, key) = held().await;
+    let claimant = read(&cache, &key, Class::Bulk);
+    store.until_calls(1).await;
+    let waiter = read(&cache, &key, Class::Scan);
+    settle().await;
+    // As a server drops a handler whose client went away.
+    claimant.abort();
+    store.until_calls(2).await;
+    store.release(1, true);
+    assert_eq!(answer(waiter).await.unwrap().len(), 64);
+    a_fresh_claim_costs_one(&store, &cache, &key).await;
+}
+
+#[tokio::test]
+async fn eviction_follows_a_model_lru() {
+    // Room for four of eight ranges; every step checked against a model of what an LRU holds.
+    let ranges = spread(8);
+    let (cache, _, key) = fixture(4 * 64).await;
+    let mut model: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for (step, i) in [
+        // `0` is touched twice before evictions pass it: a second touch must move it again.
+        0, 1, 2, 3, 0, 3, 0, 4, 5, 6, //
+        1, 2, 1, 7, 3, 1, 5, 5, 0, 2,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cache.get_range(&key, ranges[i].clone()).await.unwrap();
+        model.retain(|&m| m != i);
+        model.push_back(i);
+        if model.len() > 4 {
+            model.pop_front();
+        }
+        for (j, r) in ranges.iter().enumerate() {
+            assert_eq!(
+                cache.holds(&key, r.clone()),
+                model.contains(&j),
+                "step {step}: range {j}, model {model:?}"
+            );
+        }
+        assert_eq!(cache.resident_bytes(), model.len() * 64, "step {step}");
+    }
+}

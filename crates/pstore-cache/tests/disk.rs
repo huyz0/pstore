@@ -734,3 +734,30 @@ async fn a_core_says_what_its_disk_is_doing() {
     assert!(format!("{core:?}").contains("Open"), "{core:?}");
     core.close().await;
 }
+
+#[tokio::test]
+async fn a_tier_of_the_previous_format_is_emptied() {
+    // M28: `pstore-cache/1` hashed a derived `Hash`, so its entries are filed under hashes this
+    // format no longer computes. Emptied on open, not left as entries nothing can find.
+    let dir = Dir::new("format-1");
+    let acct = store(1, 4096, 53).await;
+    let core = open(&dir.0, "A").await;
+    over(&acct, &core)
+        .get_range(&key(0), 0..4096)
+        .await
+        .unwrap();
+    core.close().await;
+    std::fs::write(dir.0.join("lane-1").join("identity"), "pstore-cache/1\nA").unwrap();
+    let core = open(&dir.0, "A").await;
+    let before = reads(&acct);
+    over(&acct, &core)
+        .get_range(&key(0), 0..4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        reads(&acct),
+        before + 1,
+        "a tier of the previous format was served"
+    );
+    core.close().await;
+}

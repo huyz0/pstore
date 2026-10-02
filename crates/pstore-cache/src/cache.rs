@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use pstore_blob::{BlobError, BlobStore, Capabilities, Class, Key, Precondition, PutOutcome};
 use pstore_types::CasTag;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -13,7 +13,10 @@ use tokio::sync::Mutex;
 /// ⚠️ The **requested** range, never the fetched one. `get_ranges` coalesces before fetching,
 /// so a span is an artefact of which ranges happened to be asked for together; keying on it
 /// means two callers wanting the same bytes miss each other.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// ⚠️ `Hash` is written by hand, over the disk tier's encoding (M28): `foyer` files an entry
+/// under its hash, and a derived one is not promised stable across Rust releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Id {
     /// An exact byte range of an object.
     Range(String, u64, u64),
@@ -40,8 +43,35 @@ pub struct CacheCore {
     quota_pinned: usize,
     quota_meta: usize,
     quota_bulk: usize,
+    /// Ranges a task is already fetching, one map per arena, so others wait rather than
+    /// duplicating the request. ⚠️ A `std` mutex, never held across an await, so a claim's
+    /// `Drop` can take it (M28): a cancelled claimant must still remove its gate.
+    gates: [std::sync::Mutex<Gates>; 3],
     disk: Option<crate::disk::Tiers>,
     state: DiskState,
+}
+
+type Gates = HashMap<Id, Arc<tokio::sync::Semaphore>>;
+
+/// A claimed fetch. Dropped -- on success, failure or cancellation -- it removes its gate and
+/// wakes every waiter. ⚠️ Only a claimant removes a gate (M28): a claim-free fetcher that
+/// removed one would remove a later claimant's, and the next arrival would fetch again.
+struct Claim<'a> {
+    gates: &'a std::sync::Mutex<Gates>,
+    id: Id,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+        // ⚠️ Release every waiter, not one. A permit per waiter would strand the rest until
+        // the next fetch, which is a deadlock that only appears under contention.
+        self.gate.close();
+    }
 }
 
 impl std::fmt::Debug for CacheCore {
@@ -106,6 +136,7 @@ impl CacheCore {
             quota_pinned: pinned,
             quota_meta: meta,
             quota_bulk: bulk,
+            gates: Default::default(),
             disk: None,
             state: DiskState::Off,
         }
@@ -150,10 +181,18 @@ impl CacheCore {
         }
     }
 
+    fn gates(&self, class: Class) -> &std::sync::Mutex<Gates> {
+        match class {
+            Class::Pinned => &self.gates[0],
+            Class::Meta => &self.gates[1],
+            Class::Bulk | Class::Scan => &self.gates[2],
+        }
+    }
+
     async fn lookup(&self, id: &Id, class: Class) -> Option<Bytes> {
         let (arena, _) = self.arena(class);
         let mut s = arena.lock().await;
-        let hit = s.entries.get(id).cloned();
+        let hit = s.entries.get(id).map(|(b, _)| b.clone());
         if hit.is_some() {
             s.touch(id);
         }
@@ -202,37 +241,40 @@ impl CacheCore {
         if let Some(hit) = self.find(&id, class).await {
             return Ok(hit);
         }
-        let (arena, _) = self.arena(class);
-        // Claim the fetch, or find the claim someone else made.
-        let gate = {
-            let mut s = arena.lock().await;
-            if let Some(g) = s.in_flight.get(&id) {
-                Some(Arc::clone(g))
-            } else {
-                s.in_flight
-                    .insert(id.clone(), Arc::new(tokio::sync::Semaphore::new(0)));
-                None
+        // Claim the fetch, or find the claim someone else made. ⚠️ A scan never claims
+        // (M28): it admits nothing, so readers waiting on its claim would wake to a miss and
+        // each fetch again. It still waits on a claim it finds, whose bytes are admitted.
+        let gates = self.gates(class);
+        let (waiting, claim) = {
+            let mut g = gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match g.get(&id) {
+                Some(gate) => (Some(Arc::clone(gate)), None),
+                None if class == Class::Scan => (None, None),
+                None => {
+                    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                    g.insert(id.clone(), Arc::clone(&gate));
+                    let id = id.clone();
+                    (None, Some(Claim { gates, id, gate }))
+                }
             }
         };
-        if let Some(gate) = gate {
+        if let Some(gate) = waiting {
             // Someone else is fetching. Wait for them, then read what they admitted.
             let _ = gate.acquire().await;
             if let Some(hit) = self.lookup(&id, class).await {
                 return Ok(hit);
             }
-            // Their fetch failed; ours is now the claim-free path.
+            // Their fetch failed, or was cancelled; ours is now the claim-free path.
         }
 
         let out = fetch().await;
         if let Ok(bytes) = &out {
             // Admitted before the waiters are released, so they find it.
-            self.admit(id.clone(), bytes.clone(), class).await;
+            self.admit(id, bytes.clone(), class).await;
         }
-        if let Some(gate) = arena.lock().await.in_flight.remove(&id) {
-            // ⚠️ Release every waiter, not one. A permit per waiter would strand the rest
-            // until the next fetch, which is a deadlock that only appears under contention.
-            gate.close();
-        }
+        drop(claim);
         out
     }
 }
@@ -301,20 +343,29 @@ impl<S: BlobStore> Caching<S> {
 
 #[derive(Debug, Default)]
 struct State {
-    entries: HashMap<Id, Bytes>,
-    /// Least-recently-used first. ⚠️ Its touch is O(entries), and since M20 one core is shared
-    /// by every tenant: a cost, recorded as BACKLOG row 45, not a correctness question.
-    order: Vec<Id>,
+    /// Each entry, with the tick it was last used at.
+    entries: HashMap<Id, (Bytes, u64)>,
+    /// Least-recently-used first, by tick (M28): a touch and an eviction are O(log entries).
+    /// One core serves every tenant on a node, so a `Vec`'s O(entries) grew with all of them.
+    order: BTreeMap<u64, Id>,
+    /// The last tick handed out. A `u64` once per use: at 10^9 a second, 584 years.
+    tick: u64,
     resident: usize,
-    /// Ranges a task is already fetching, so others wait rather than duplicating the request.
-    in_flight: HashMap<Id, Arc<tokio::sync::Semaphore>>,
 }
 
 impl State {
+    fn next(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
     fn touch(&mut self, id: &Id) {
-        if let Some(at) = self.order.iter().position(|x| x == id) {
-            let owned = self.order.remove(at);
-            self.order.push(owned);
+        let now = self.next();
+        if let Some((_, at)) = self.entries.get_mut(id) {
+            let then = std::mem::replace(at, now);
+            if let Some(owned) = self.order.remove(&then) {
+                self.order.insert(now, owned);
+            }
         }
     }
 
@@ -325,19 +376,19 @@ impl State {
         if bytes.len() > budget {
             return;
         }
-        if let Some(old) = self.entries.insert(id.clone(), bytes.clone()) {
+        let len = bytes.len();
+        let now = self.next();
+        if let Some((old, then)) = self.entries.insert(id.clone(), (bytes, now)) {
             self.resident = self.resident.saturating_sub(old.len());
-            self.touch(&id);
-        } else {
-            self.order.push(id);
+            self.order.remove(&then);
         }
-        self.resident = self.resident.saturating_add(bytes.len());
+        self.order.insert(now, id);
+        self.resident = self.resident.saturating_add(len);
         while self.resident > budget {
-            let Some(victim) = self.order.first().cloned() else {
+            let Some((_, victim)) = self.order.pop_first() else {
                 break;
             };
-            self.order.remove(0);
-            if let Some(gone) = self.entries.remove(&victim) {
+            if let Some((gone, _)) = self.entries.remove(&victim) {
                 self.resident = self.resident.saturating_sub(gone.len());
             }
         }
@@ -493,5 +544,50 @@ impl<S: BlobStore> BlobStore for Caching<S> {
 
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
         self.inner.list_unrestricted(prefix).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "assertions in tests are the reporting mechanism"
+    )]
+    use super::{Id, State};
+    use bytes::Bytes;
+
+    /// M28 criterion 5: 100 000 entries touched and then evicted, which a recency kept as a
+    /// `Vec` makes ~10^10 comparisons. ⚠️ A bound with a wide margin, checked as it goes so the
+    /// slow version fails at the bound rather than running for minutes.
+    #[test]
+    fn recency_is_logarithmic() {
+        const N: usize = 100_000;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let check = |i: usize| {
+            if i.is_multiple_of(1024) && std::time::Instant::now() > deadline {
+                panic!("recency is not O(log entries): past 20 s at step {i}");
+            }
+        };
+        let id = |i: usize| Id::Range(format!("k{i}"), 0, 1);
+        let one = Bytes::from_static(b"x");
+        let mut s = State::default();
+        for i in 0..N {
+            s.admit(id(i), one.clone(), N);
+            check(i);
+        }
+        // Touched newest first, so the oldest-touched is the newest admitted.
+        for i in (0..N).rev() {
+            s.touch(&id(i));
+            check(i);
+        }
+        for i in N..2 * N {
+            s.admit(id(i), one.clone(), N);
+            check(i);
+        }
+        assert_eq!(s.resident, N);
+        assert_eq!(s.entries.len(), N);
+        assert!(s.entries.contains_key(&id(2 * N - 1)));
+        assert!(!s.entries.contains_key(&id(0)));
     }
 }
