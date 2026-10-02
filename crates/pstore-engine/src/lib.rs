@@ -2386,17 +2386,24 @@ impl<S: BlobStore> Engine<S> {
         // index of no dimension, has no centroid table (D-10), and asking costs a 404 a cache
         // cannot keep (BACKLOG row 46). It approximates the fold's own predicate.
         let dims = at.head.schemas.get(index).map_or(0, |s| s.dims);
-        let threshold = self.params.exact_scan_threshold;
-        let targets = segment_targets(index, &refs, &at.head.deletes, false);
+        let targets = segment_targets(
+            index,
+            &refs,
+            &at.head.deletes,
+            false,
+            self.params.exact_scan_threshold,
+        );
         let store = &*self.store;
         let fetched = futures_util::future::try_join_all(refs.iter().zip(&targets).map(
             |(r, t)| async move {
-                let clustered = dims > 0 && r.rows as usize >= threshold;
+                // The shared predicate, then warm's own width term: it reads only the present
+                // HEAD, and a known count of 0 rows is never folded (M27).
+                let clustered = dims > 0 && r.rows > 0;
                 // Round 2: the footer, the delete vector, the centroid table, together.
                 let (seg, dv, cen) = futures_util::future::join3(
                     Segment::open(store, &t.segment),
                     sidecar(store, t.deleted.as_ref(), true),
-                    sidecar(store, clustered.then_some(&t.centroids), false),
+                    sidecar(store, t.centroids.as_ref().filter(|_| clustered), false),
                 )
                 .await;
                 let seg = seg?;
@@ -4589,7 +4596,11 @@ impl<S: BlobStore> Engine<S> {
         store.put(&key, built.segment).await?;
 
         let target = pstore_query::Target {
-            centroids: pstore_index::vec_index::centroid_key(&key),
+            // `None` when its own build made no table (M27): no read for a known 404.
+            centroids: built
+                .centroids
+                .is_some()
+                .then(|| pstore_index::vec_index::centroid_key(&key)),
             segment: key,
             deleted: None,
             shadowed: false,
@@ -4768,7 +4779,13 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
         // absent means "below the exact-scan threshold" rather than missing (D-10).
         let refs: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
-        let mut targets = segment_targets(index, &refs, &at.head.deletes, true);
+        let mut targets = segment_targets(
+            index,
+            &refs,
+            &at.head.deletes,
+            true,
+            self.params.exact_scan_threshold,
+        );
         let unfolded_at = targets.len();
 
         // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
@@ -5098,7 +5115,13 @@ impl<S: BlobStore> Engine<S> {
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
         // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
         // unfolded rows are newer than any past epoch.
-        let targets = segment_targets(index, &refs, &then.deletes, false);
+        let targets = segment_targets(
+            index,
+            &refs,
+            &then.deletes,
+            false,
+            self.params.exact_scan_threshold,
+        );
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -5387,7 +5410,13 @@ impl<S: BlobStore> Engine<S> {
             }
         };
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
-        let targets = segment_targets(index, &refs, &head.deletes, shadowed);
+        let targets = segment_targets(
+            index,
+            &refs,
+            &head.deletes,
+            shadowed,
+            self.params.exact_scan_threshold,
+        );
         // Live rows by HEAD's arithmetic, as `index_stats` counts documents: each segment's
         // rows less its deleted ones (M9c.2). What the count fast path answers from (M12).
         let live = refs
@@ -5631,18 +5660,31 @@ async fn sidecar<S: BlobStore>(
     }
 }
 
-/// Query targets for HEAD's segments, each with its delete vector (M9c.2).
+/// Whether a segment of `rows` rows, as HEAD records them, may have a centroid table (M27).
+///
+/// A fold or compaction builds one only at `threshold` rows or more (D-10), so below it the
+/// table cannot exist and asking costs a 404 no cache keeps (BACKLOG row 46). ⚠️ **`0` is
+/// unknown, not small:** nothing seals an empty segment, and `as_of`'s resurrected refs carry 0.
+/// No width term: on `as_of` over a dropped index the present HEAD has no schema to read one.
+fn may_have_centroids(rows: u32, threshold: usize) -> bool {
+    rows == 0 || rows as usize >= threshold
+}
+
+/// Query targets for HEAD's segments, each with its delete vector (M9c.2), and its centroid
+/// table only where one may exist (M27).
 fn segment_targets(
     index: &str,
     refs: &[SegmentRef],
     deletes: &BTreeMap<String, (String, u32)>,
     shadowed: bool,
+    threshold: usize,
 ) -> Vec<pstore_query::Target> {
     refs.iter()
         .map(|r| {
             let segment = Key::new(r.key.clone());
             pstore_query::Target {
-                centroids: pstore_index::vec_index::centroid_key(&segment),
+                centroids: may_have_centroids(r.rows, threshold)
+                    .then(|| pstore_index::vec_index::centroid_key(&segment)),
                 deleted: deletes
                     .get(&head::dv_ref(index, &r.key))
                     .map(|(key, _)| Key::new(key.clone())),

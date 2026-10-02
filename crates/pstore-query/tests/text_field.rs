@@ -79,7 +79,7 @@ fn text_leg(field: &str) -> Vec<Prefetch> {
 async fn run(store: &MemoryStore, seg: &Key, cen: &Key, field: &str) -> Result<usize, QueryError> {
     let targets = [Target {
         segment: seg.clone(),
-        centroids: cen.clone(),
+        centroids: Some(cen.clone()),
         deleted: None,
         shadowed: false,
     }];

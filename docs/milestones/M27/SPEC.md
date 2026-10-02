@@ -53,6 +53,8 @@ it gets today. `exact_scan_threshold` is a constant in production, so neither ha
 - `pstore-server` `read_cache.rs` pins a warm vector query at `1 + segments` reads, citing row
   46. It becomes `1`, in the strengthening direction, and is criterion 5's server-side red test.
 - `pstore-query`'s tests that build a `Target` pass `Some(centroid_key(..))`.
+- ⚠️ Amended at implementation: `served_epoch.rs` pins each query's reads too. Its two vector
+  queries fall by one each, the small segment's 404, and its bytes are unchanged.
 - `warm.rs`'s loop over `.cen` reads asserts over none once warm reads no 404. It keeps its
   meaning, and M21 test 3's mutation is checked again.
 

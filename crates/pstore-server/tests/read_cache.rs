@@ -104,17 +104,16 @@ fn queries() -> Vec<Value> {
         .collect()
 }
 
-/// Each query, and what it costs when every cacheable read hits: HEAD, plus -- for a vector
-/// query -- one read per segment below `EXACT_SCAN_THRESHOLD`, whose centroid table is
-/// absent. A 404 is not an object, so no cache keeps it (BACKLOG row 46).
+/// Each query, and what it costs when every cacheable read hits: HEAD, and nothing else. Each
+/// segment is below `EXACT_SCAN_THRESHOLD`, so HEAD's row count says it has no centroid table,
+/// and the 404 no cache could keep is not asked for (M27, BACKLOG row 46).
 fn queries_and_warm_cost() -> Vec<(Value, u64)> {
-    let segments = 2;
     vec![
-        (json!({"vector": [1.0, 0.0], "top_k": 10}), 1 + segments),
+        (json!({"vector": [1.0, 0.0], "top_k": 10}), 1),
         (json!({"rank_by": ["id", "asc"], "top_k": 100}), 1),
         (
             json!({"vector": [0.0, 1.0], "top_k": 5, "filters": ["n", "Gt", 10]}),
-            1 + segments,
+            1,
         ),
     ]
 }

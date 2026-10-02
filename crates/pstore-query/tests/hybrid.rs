@@ -38,7 +38,7 @@ const GAP: u64 = 256;
 fn one(segment: &Key, centroids: &Key) -> [Target; 1] {
     [Target {
         segment: segment.clone(),
-        centroids: centroids.clone(),
+        centroids: Some(centroids.clone()),
         deleted: None,
         shadowed: false,
     }]

@@ -83,9 +83,10 @@ pub enum QueryError {
 pub struct Target {
     /// The segment object.
     pub segment: Key,
-    /// Its centroid table. Absent in the store is not an error: D-10 reads that as "scan me
-    /// exactly".
-    pub centroids: Key,
+    /// Its centroid table, or `None` when the caller knows it has none (M27), and the open
+    /// round asks for nothing. Absent in the store is not an error either: D-10 reads both as
+    /// "scan me exactly".
+    pub centroids: Option<Key>,
     /// Its delete vector, when it has one (M9c). Fetched in the open round.
     pub deleted: Option<Key>,
     /// Whether the query's shadowed ids hide rows here. `false` for the fresh segment, whose
@@ -732,7 +733,7 @@ async fn open<S: BlobStore>(
     };
     let (segment, cen, dict, terms, deleted) = futures_util::future::join5(
         Segment::open(store, key),
-        maybe(store, wants_dense.then(|| centroids.clone())),
+        maybe(store, centroids.clone().filter(|_| wants_dense)),
         maybe(
             store,
             wants_sparse.then(|| pstore_format::sparse::dict_key(key)),

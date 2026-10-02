@@ -102,10 +102,11 @@ async fn a_read_only_process_reports_the_epoch_it_served() {
         costs.push(got["meta"]["cost"].clone());
     }
     // Criterion 5, pinned as measured BEFORE M10: the epoch comes from a HEAD the query
-    // already read, so reporting it costs nothing.
+    // already read, so reporting it costs nothing. M27 removed one read from each vector
+    // query: the 404 for the small segment's centroid table, which HEAD's count says is absent.
     let reads: Vec<_> = costs.iter().map(|c| c["blob_reads"].clone()).collect();
     let bytes: Vec<_> = costs.iter().map(|c| c["bytes_read"].clone()).collect();
-    assert_eq!(json!(reads), json!([5, 3, 7]));
+    assert_eq!(json!(reads), json!([4, 3, 6]));
     assert_eq!(json!(bytes), json!([545, 537, 553]));
     assert!(costs.iter().all(|c| c["blob_lists"] == 0));
     for q in [relevance(), ordered(), strong] {
