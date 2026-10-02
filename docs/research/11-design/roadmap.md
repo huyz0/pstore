@@ -521,6 +521,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M25 | **A rejected row is set aside, never dropped** ([VERIFIED](../../milestones/M25/VERIFIED.md)): a fold's schema rejects go to a quarantine HEAD names, exportable and discarded only by an operator | [BACKLOG](../../milestones/BACKLOG.md) row 28: a race between two processes that never read HEAD could lose rows acknowledged `durable` |
 | M26 | **The engine registry is bounded** ([VERIFIED](../../milestones/M26/VERIFIED.md)): `PSTORE_ENGINES` caps it, and only idle engines no request holds are dropped | [BACKLOG](../../milestones/BACKLOG.md) row 25: one engine per tenant for the life of the process, 1M of them at the README's scale |
 | M27 | **A query asks for no centroid table it knows is not there** ([VERIFIED](../../milestones/M27/VERIFIED.md)): HEAD's row count says a small segment has none, so its 404 is not asked for | [BACKLOG](../../milestones/BACKLOG.md) row 46: a read per small segment on every vector query, warm or cold |
+| M28 | **The read cache's three loose ends** ([VERIFIED](../../milestones/M28/VERIFIED.md)): a scan claims no gate and only a claimant removes one, recency is O(log entries), and the disk hash is defined by the entry format | [BACKLOG](../../milestones/BACKLOG.md) rows 45, 47 and 48, from M20's reviews |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
