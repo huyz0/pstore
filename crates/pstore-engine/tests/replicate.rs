@@ -1489,10 +1489,7 @@ async fn a_sync_copying_one_delete_vector_a_round_never_gives_up() {
     s.sync(&mut st).await;
     // A delete in every segment: 26 vectors, the j-th answering 404 to its first j reads.
     s.src
-        .delete(
-            "src",
-            (0..26).map(|k| format!("d{:04}", k * 2).into()).collect(),
-        )
+        .delete("src", (0..26).map(|k| format!("d{:04}", k * 2)).collect())
         .await
         .unwrap();
     fold(&s.src).await;
