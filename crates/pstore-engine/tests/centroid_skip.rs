@@ -379,3 +379,74 @@ async fn the_saving_is_exactly_the_404s() {
     assert_eq!(cen, 8);
     assert_eq!(before - mine, 8, "{before} reads before, {mine} now");
 }
+
+#[tokio::test]
+async fn a_query_with_no_dense_leg_reads_no_table() {
+    // The table exists, and a text leg alone has no use for it.
+    let s = Arc::new(Counting::default());
+    let w = engine(&s, 1, THRESHOLD);
+    segment(&w, "idx", 0, THRESHOLD as u32).await;
+    let r = engine(&s, 2, THRESHOLD);
+    let text = vec![Prefetch::Text {
+        field: "text".to_owned(),
+        query: "word2".to_owned(),
+        limit: 10,
+    }];
+    let (a, _, cen) = cost(&s, r.query("idx", &text, Fusion::default(), 10)).await;
+    assert_eq!(a.unwrap().hits.len(), 10);
+    assert_eq!(cen, 0, "a text-only query read a centroid table");
+}
+
+#[tokio::test]
+async fn a_large_fresh_segment_still_uses_its_table() {
+    // Unfolded rows above the threshold: the fresh segment's own build makes a table, and a
+    // one-probe query answers from it -- not by exact scan, which would rank differently.
+    let s = Arc::new(Counting::default());
+    // Lists of 20 rows, so the 400 rows make many and one probe is a real restriction.
+    let w = Engine::new(Arc::clone(&s), T, LaneId(1)).with_index_params(
+        pstore_index::cluster::Params {
+            target_list_size: 20,
+            ..params(THRESHOLD)
+        },
+    );
+    // Scattered, so the true neighbours fall in several clusters and one probe misses some.
+    let mut x: u64 = 27;
+    let mut next = || {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let rows: Vec<Document> = (0..400)
+        .map(|i| Document::new(format!("f{i:05}"), vec![next(), next(), next(), next()]))
+        .collect();
+    w.write("idx", rows).await.unwrap();
+    w.flush().await.unwrap();
+    let one_probe = |exact| {
+        vec![Prefetch::Dense {
+            field: pstore_format::DEFAULT_FIELD.to_owned(),
+            query: Q.to_vec(),
+            limit: 10,
+            tune: Query {
+                k: 10,
+                p: 1,
+                exact,
+                ..Query::default()
+            },
+        }]
+    };
+    let ann = w
+        .query("idx", &one_probe(false), Fusion::default(), 10)
+        .await
+        .unwrap();
+    let exact = w
+        .query("idx", &one_probe(true), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(ann.unfolded.len(), 400, "the rows were folded, not fresh");
+    assert_ne!(
+        ranked(&ann),
+        ranked(&exact),
+        "a one-probe query over a clustered fresh segment answered by exact scan"
+    );
+}
