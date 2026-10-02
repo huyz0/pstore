@@ -42,6 +42,9 @@ struct Hooked {
     hook: Arc<Mutex<Option<(String, Hook)>>>,
     /// The next read of a key containing this fails as an outage would, once.
     fail_once: Arc<Mutex<Option<String>>>,
+    /// Reads of exactly this key answer 404 this many more times, though it exists: what a
+    /// source that moved between its HEAD and the read looks like.
+    missing: Arc<Mutex<BTreeMap<String, u32>>>,
     /// The next this-many conditional writes are contended (a 409).
     contend_next: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many conditional writes lose, as to a writer that landed first.
@@ -91,6 +94,12 @@ impl Hooked {
             .any(|p| key.as_str().contains(p.as_str()))
         {
             return Err(BlobError::Other("injected outage".to_owned()));
+        }
+        if let Some(n) = self.missing.lock().unwrap().get_mut(key.as_str())
+            && *n > 0
+        {
+            *n -= 1;
+            return Err(BlobError::NotFound(key.to_string()));
         }
         Ok(())
     }
@@ -1392,4 +1401,209 @@ async fn a_sync_after_the_plan_is_re_read_with_nothing_changed_is_idle() {
     // already knows is still current, so the sync stops at the source read.
     st.invalidate();
     assert!(s.sync(&mut st).await.idle);
+}
+
+fn src_keys_ending(keys: &BTreeSet<String>, suffix: &str) -> Vec<String> {
+    keys.iter()
+        .filter(|k| k.ends_with(suffix))
+        .cloned()
+        .collect()
+}
+
+fn src_prefix() -> String {
+    format!("{:04x}/tnt/{}/idx/src/", SRC.0 as u16, SRC.0)
+}
+
+/// 26 segments in the source, the j-th answering 404 to its first j reads: each round of a
+/// sync copies exactly one and remaps for the rest -- 26 rounds, every one making progress.
+async fn one_segment_a_round(s: &Setup) {
+    for k in 0..26 {
+        write(&s.src, "src", k * 2..k * 2 + 2).await;
+    }
+    let segs = src_keys_ending(&s.here.keys(&src_prefix()).await, ".seg");
+    assert_eq!(segs.len(), 26, "one segment a fold");
+    let mut m = s.here.hooked.missing.lock().unwrap();
+    for (j, k) in segs.into_iter().enumerate() {
+        m.insert(k, u32::try_from(j).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn a_sync_making_progress_every_round_never_gives_up_or_copies_twice() {
+    // More rounds than MAX_STALLS, each copying one segment: a stall is a round that copies
+    // nothing, and these never are.
+    let plain = setup(Kind::CrossTenant);
+    for k in 0..26 {
+        write(&plain.src, "src", k * 2..k * 2 + 2).await;
+    }
+    plain.create().await;
+    let w0 = plain.here.writes(DST);
+    plain.sync(&mut SyncState::default()).await;
+    let once = plain.here.writes(DST) - w0;
+
+    let s = setup(Kind::CrossTenant);
+    one_segment_a_round(&s).await;
+    s.create().await;
+    let w0 = s.here.writes(DST);
+    let out = s.sync(&mut SyncState::default()).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    s.same("after 26 rounds").await;
+    // No copy made twice: a copy whose sidecar was absent all along is kept across a remap.
+    assert_eq!(s.here.writes(DST) - w0, once);
+    assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+}
+
+#[tokio::test]
+async fn a_sync_copying_nothing_round_after_round_gives_up() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..10).await;
+    s.create().await;
+    let seg = src_keys_ending(&s.here.keys(&src_prefix()).await, ".seg");
+    // Named by every source HEAD, and never there: more rounds than MAX_STALLS, then it is.
+    s.here
+        .hooked
+        .missing
+        .lock()
+        .unwrap()
+        .insert(seg[0].clone(), 30);
+    let out = s.sync(&mut SyncState::default()).await;
+    assert!(out.committed.is_empty(), "{out:?}");
+    assert!(
+        out.failed
+            .get("dst")
+            .is_some_and(|why| why.contains("kept changing")),
+        "{out:?}"
+    );
+    // It stopped at the stall limit, not when the source settled.
+    assert!(s.here.hooked.missing.lock().unwrap()[&seg[0]] > 0);
+}
+
+#[tokio::test]
+async fn a_sync_copying_one_delete_vector_a_round_never_gives_up() {
+    let s = setup(Kind::CrossTenant);
+    for k in 0..26 {
+        write(&s.src, "src", k * 2..k * 2 + 2).await;
+    }
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    // A delete in every segment: 26 vectors, the j-th answering 404 to its first j reads.
+    s.src
+        .delete(
+            "src",
+            (0..26).map(|k| format!("d{:04}", k * 2).into()).collect(),
+        )
+        .await
+        .unwrap();
+    fold(&s.src).await;
+    let dvs = src_keys_ending(&s.here.keys(&src_prefix()).await, ".dv");
+    assert_eq!(dvs.len(), 26, "one vector a segment");
+    {
+        let mut m = s.here.hooked.missing.lock().unwrap();
+        for (j, k) in dvs.into_iter().enumerate() {
+            m.insert(k, u32::try_from(j).unwrap());
+        }
+    }
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    s.same("after 26 rounds of vectors").await;
+}
+
+#[tokio::test]
+async fn a_sync_retries_a_lost_commit_up_to_its_limit() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..10).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    let lose = |n| {
+        s.here
+            .hooked
+            .lose_next
+            .store(n, std::sync::atomic::Ordering::SeqCst)
+    };
+    lose(23);
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    write(&s.src, "src", 10..20).await;
+    lose(24);
+    let r = s.dst.replicate(&s.remotes, &mut st).await;
+    assert!(matches!(r, Err(EngineError::Lost)), "{r:?}");
+    s.here
+        .hooked
+        .contend_next
+        .store(24, std::sync::atomic::Ordering::SeqCst);
+    let r = s.dst.replicate(&s.remotes, &mut st).await;
+    assert!(matches!(r, Err(EngineError::Contended)), "{r:?}");
+    // And what the failed syncs wrote is buried; the next sync lands.
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    s.same("after two abandoned syncs").await;
+    s.dst.gc(0).await.unwrap();
+    s.same("after a reap").await;
+    assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+}
+
+#[tokio::test]
+async fn a_sync_after_abandoned_ones_never_reuses_a_buried_key() {
+    // Two abandoned syncs, each burying its copies in a commit of its own. The next sync must
+    // name its copies past every buried one: a reap between its PUTs and its commit takes a
+    // buried key it rewrote, and it commits a segment that is gone.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    for _ in 0..2 {
+        s.here
+            .hooked
+            .fail_cas
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.dst.replicate(&s.remotes, &mut st).await.is_err());
+    }
+    let reaper = s.here.engine(DST, 2);
+    let out = s
+        .dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+            reaper.gc(0).await.unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    s.same("after a reap that raced the commit").await;
+}
+
+#[tokio::test]
+async fn a_commit_reports_only_what_did_not_change_as_current() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..10).await;
+    write(&s.src, "other", 0..10).await;
+    s.create().await;
+    let from = s.here.acct.as_tenant(DST);
+    s.dst
+        .create_replication("dst2", ReplicaSource::local(SRC, "other"), &from)
+        .await
+        .unwrap();
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    write(&s.src, "src", 10..20).await;
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    assert_eq!(out.current, vec!["dst2".to_owned()], "{out:?}");
+}
+
+#[tokio::test]
+async fn a_resume_racing_a_sync_fences_it_though_the_source_is_the_same() {
+    // Paused and resumed under the sync: the same source, a new run. The plan's run is gone.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let controller = s.here.engine(DST, 2);
+    let mut st = SyncState::default();
+    let out = s
+        .dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+            controller.pause_replication("dst").await.unwrap();
+            controller.resume_replication("dst").await.unwrap();
+        })
+        .await
+        .unwrap();
+    assert!(out.committed.is_empty(), "{out:?}");
+    assert!(s.dst.replications().await.unwrap()["dst"].applied.is_none());
 }
