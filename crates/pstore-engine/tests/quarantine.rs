@@ -309,3 +309,165 @@ async fn a_rejecting_fold_costs_one_write_per_index() {
     // -- the quarantine for `docs`, beside `other`'s segment and the HEAD CAS -- and no read.
     assert_eq!((r1 - r0, w1 - w0), (19, 3));
 }
+
+#[tokio::test]
+async fn an_index_without_rejects_has_an_empty_quarantine() {
+    // It exists by its segments alone, so its export is empty, not absent.
+    let w = World::new().await;
+    let q = w
+        .first
+        .quarantine("docs")
+        .await
+        .unwrap()
+        .expect("an existing index");
+    assert!(q.rows.is_empty());
+}
+
+#[tokio::test]
+async fn a_fully_discarded_rejects_only_index_still_exists_and_drops() {
+    // Known only by its rejects, then every object discarded: its reject count remains, and
+    // with it the index -- the export answers, empty, and a drop drops it.
+    let w = World::new().await;
+    w.first
+        .commit_head_for_test(|h| {
+            h.indexes.remove("docs");
+        })
+        .await
+        .unwrap();
+    w.reject().await;
+    let q = w.first.quarantine("docs").await.unwrap().unwrap();
+    assert_eq!(
+        w.first.discard_quarantine("docs", q.epoch).await.unwrap(),
+        Some(1)
+    );
+    let head = w.head().await;
+    assert!(!head.quarantine.contains_key("docs") && head.schema_rejects.contains_key("docs"));
+    let q = w
+        .first
+        .quarantine("docs")
+        .await
+        .unwrap()
+        .expect("it still exists");
+    assert!(q.rows.is_empty());
+    assert!(
+        w.first.delete_index("docs").await.unwrap().is_some(),
+        "the drop found nothing to drop"
+    );
+    assert!(!w.head().await.schema_rejects.contains_key("docs"));
+}
+
+/// The shared store, with HEAD's conditional writes refused `Contended` while `left` > 0.
+#[derive(Debug)]
+struct Contend {
+    inner: Arc<Store>,
+    left: std::sync::atomic::AtomicU32,
+    refused: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for Contend {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_range(key, range).await
+    }
+    async fn get_suffix(&self, key: &Key, n: u64) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_suffix(key, n).await
+    }
+    async fn get_with_tag(
+        &self,
+        key: &Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        self.inner.get_tag(key).await
+    }
+    async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if key.as_str().ends_with("/HEAD")
+            && self
+                .left
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.refused.fetch_add(1, SeqCst);
+            return Err(pstore_blob::CasError::Contended);
+        }
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+}
+
+fn contended(w: &World, times: u32) -> (Arc<Contend>, Engine<Contend>) {
+    let s = Arc::new(Contend {
+        inner: Arc::clone(&w.store),
+        left: times.into(),
+        refused: 0.into(),
+    });
+    (Arc::clone(&s), Engine::new(s, T, LaneId(3)))
+}
+
+#[tokio::test]
+async fn a_contended_discard_retries_and_lands() {
+    let w = World::new().await;
+    w.reject().await;
+    let q = w.first.quarantine("docs").await.unwrap().unwrap();
+    let (s, e) = contended(&w, 1);
+    assert_eq!(
+        e.discard_quarantine("docs", q.epoch).await.unwrap(),
+        Some(1)
+    );
+    assert_eq!(s.refused.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!w.head().await.quarantine.contains_key("docs"));
+}
+
+#[tokio::test]
+async fn a_discard_that_keeps_contending_reports_contention_after_every_attempt() {
+    let w = World::new().await;
+    w.reject().await;
+    let q = w.first.quarantine("docs").await.unwrap().unwrap();
+    let (s, e) = contended(&w, u32::MAX);
+    let err = e
+        .discard_quarantine("docs", q.epoch)
+        .await
+        .expect_err("a discard committed against a store refusing every CAS");
+    assert!(
+        matches!(err, pstore_engine::EngineError::Contended),
+        "{err:?}"
+    );
+    // Every attempt, exactly: one that never retried reports the same error.
+    assert_eq!(s.refused.load(std::sync::atomic::Ordering::SeqCst), 24);
+    assert!(w.head().await.quarantine.contains_key("docs"));
+}
