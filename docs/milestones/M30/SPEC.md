@@ -23,6 +23,14 @@ good.
      schema stays `""`.
   4. Every compaction of the index then fails with that `Format` error, so its segment count
      only grows.
+- ⚠️ **Found at implementation (amendment):** a text leg over a segment with **no text index
+  at all** is refused with `UnknownField` (`pstore-query` run.rs:788), as if the segment
+  named another field. A segment with no postings records no text fields (reader.rs:208).
+  - So with the server's default settings, an index whose first fold had no text refuses
+    every text query (`Query("no such vector field")`) until a compaction merges that
+    segment away. This was measured in a probe.
+  - The refusal exists for a segment indexed over a *different* field (M6c.2). A segment with
+    none has no wrong field to answer from.
 - **Who can reach it:** `pstore-server` always uses the default text field, so a server fleet
   cannot. An embedder calling `Engine::with_text_field` can, and the engine's contract (M7d)
   says the schema prevents exactly this.
@@ -45,7 +53,12 @@ good.
    does not change at the fold.
 4. **A compaction seals over the schema's field** when one is recorded. It refuses, with the
    same `Format` error, any input whose text index names another. With none recorded, it
-   derives the field from its inputs, as today.
+   derives the field from its inputs, as today; with none named it indexes no text (code
+   review), since a default would index a field no schema records.
+
+5. **A segment with no text index answers a text leg with nothing** (amendment). A segment
+   naming another field is still refused. Under M30, a segment whose rows carry text in the
+   schema's field always has postings, so "no index" means "no matching rows".
 
 **Not changed:** the door and flush checks; the reject pass (M25); the format; request
 counts; an index whose schema already records a field; branches and replicas, which copy the
@@ -55,24 +68,23 @@ over that field and fills nothing: only a fold fills (spec review round 2).
 
 ## Acceptance criteria
 
-1. **The probe's sequence ends compactable.** After step 2 the schema records `body`. The
-   `title` process reads HEAD, then step 3's write is refused at the door with
-   `SchemaConflict`, and a compaction commits. Parent: schema `""`, accepted, compaction fails.
-2. **A patch that adds text fills.** A vector-only index (schema `""`) has a row patched with
-   `body` text and folded by a `body` process: the schema records `body`. Parent: `""`.
-3. **A fold over another field indexes the schema's.** In an index recording `body`, a `title`
-   process folds a row with `body` text, and a `body` query finds it. Parent: it does not.
-4. **The fresh segment agrees.** In 3's index, before the fold, the `title` process's query
-   for that unfolded row finds it, as after. Parent: it does not.
-5. **A compaction rebuilds over the schema's field.** The inputs name no text field, the schema
-   records `body` (set with `commit_head_for_test`), and the rows carry `body` text. After the
-   compaction, a `body` query finds them. Parent: the merge is over the default, so it does not.
-6. **A compaction refuses an input of another field.** Inputs naming only `title`, in an index
-   recording `body`: refused with the `Format` error, HEAD unchanged. Parent: it commits.
-7. **Vector-only folds fill nothing.** A `title` process folds vector-only rows into a `""`
+1. **The probe's sequence ends compactable.** After step 2 the schema records `body`; the `title`
+   process reads HEAD, its step 3 write is refused (`SchemaConflict`), a compaction commits.
+2. **A patch that adds text fills.** A vector-only row patched with `body` text and folded by a
+   `body` process: the schema records `body` (parent: `""`).
+3. **A fold over another field indexes the schema's.** In a `body` index a `title` process
+   folds a row with `body` text, and a `body` query finds it (parent: it does not).
+4. **The fresh segment agrees.** In 3, before the fold, the `title` process's query finds it.
+5. **A compaction uses the schema's field**, in HEADs built with `commit_head_for_test`. Inputs
+   naming none under a `body` schema are merged over `body`, and a query finds their rows
+   (parent: over the default). Inputs naming only `title` are refused with `Format`, and
+   HEAD is unchanged (parent: committed).
+6. **Vector-only folds fill nothing.** A `title` process folds vector-only rows into a `""`
    index: the schema stays `""`.
-8. **Gates.** `./scripts/gates.sh` is green. The sweep over M30's source diff misses 0, or
-   names each miss as equivalent. Test 7's red is shown by "fill on any fold", recorded.
+7. **A vector-only segment does not refuse a text query.** A default engine folds a vector-only
+   row, then a `text` one, and a `text` query finds it (parent: `no such vector field`).
+8. **Gates.** `./scripts/gates.sh` is green; the sweep over M30's source diff misses 0 or
+   names each miss equivalent. Test 6's red is shown by "fill on any fold", recorded.
 
 ## Test plan
 
@@ -84,11 +96,17 @@ New tests in `crates/pstore-engine/tests/schema.rs`.
 | 2 | `a_patch_that_adds_text_fills_the_text_field` | `""`; fill decided before resolution |
 | 3 | `a_fold_indexes_the_schemas_text_field_not_its_own` | `title` postings; seal over `self.text_field` |
 | 4 | `the_fresh_segment_indexes_the_schemas_text_field` | fresh build over `self.text_field` |
-| 5 | `a_compaction_rebuilds_over_the_schemas_text_field` | merged over the default field |
-| 6 | `a_compaction_refuses_an_input_of_another_field` | the merge commits; the refusal dropped |
-| 7 | `a_vector_only_fold_fills_no_text_field` | a guard: fill on any fold |
+| 5 | `a_compaction_rebuilds_over_the_schemas_text_field`, `a_compaction_refuses_an_input_of_another_field` | merged over the default field; the merge commits |
+| 6 | `a_vector_only_fold_fills_no_text_field` | a guard: fill on any fold |
+| 7 | `a_vector_only_segment_does_not_refuse_a_text_query` (`schema.rs`), `a_segment_with_no_text_index_answers_nothing` (`pstore-query/tests/text_field.rs`) | the refusal; the exemption placed after the sidecar check |
 
-Tests 5 and 6 build their HEAD with `commit_head_for_test`, since M30 makes it unreachable.
+⚠️ **One existing test changes with the contract** (amendment):
+`pstore-query/tests/hybrid.rs`'s `a_text_leg_is_no_longer_refused_and_still_names_what_is_missing`
+asserted that a segment with no text index refuses a text leg. It now asserts that such a segment
+answers nothing. Its own comment's case, a segment *with* a text index whose term dictionary is
+missing, still errors naming the sidecar, and is asserted directly.
+
+Test 5's two build their HEADs with `commit_head_for_test`, since M30 makes it unreachable.
 
 ## RA budget
 
@@ -108,11 +126,15 @@ The fill is a field in a HEAD the fold already commits.
   field's text are then rejected at its reject pass and quarantined (M25), which is what a
   non-empty schema already does.
 
+- **A pre-M30 segment whose rows carry text in a field nothing indexed** now answers a text
+  leg with nothing instead of a refusal. That segment was written by a misconfigured process
+  before the seal used the schema's field. Its rows were already unsearchable; now they are
+  silently so. Named in the ledger.
 - **The fill is observable.** `GET /v1/indexes/{id}/schema` reports a text field where it
   reported none (spec review m6). M7d's "immutable afterwards" holds for every recorded field.
   `""` was never a recording, and `head.rs`'s doc comment on `text_field` says so after M30.
 
 ## Tasks
 
-- **M30.1** — Fill, the fold's seal and the compaction's seal and refusal, and the fresh segment, with tests 1–7.
+- **M30.1** — Fill, the fold's seal and the compaction's seal and refusal, the fresh segment, and the text leg over a segment with no index, with tests 1–7.
 - **M30.2** — The ledger, `BACKLOG.md` row 29 closed, and the roadmap row.

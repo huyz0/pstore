@@ -785,6 +785,13 @@ async fn leg<S: BlobStore>(
             // ⚠️ Refused, never answered from the wrong field. An empty result would be the
             // kinder-looking failure and the worse one: a caller cannot tell it from a term
             // that simply does not occur.
+            // ⚠️ A segment with no text index at all has no matching rows, and answers nothing
+            // (M30): refusing it refused every text query over an index whose first fold had
+            // no text, until a compaction happened to merge that segment away. Before the
+            // sidecar check, which such a segment has nothing for.
+            if opened.segment.text_fields().is_empty() {
+                return Ok(Vec::new());
+            }
             if !opened.segment.text_fields().iter().any(|f| f == field) {
                 return Err(QueryError::Format(FormatError::UnknownField));
             }

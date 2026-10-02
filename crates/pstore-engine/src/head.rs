@@ -30,8 +30,9 @@ pub struct SegmentRef {
 pub struct IndexSchema {
     /// Components in every vector of the index's dense field.
     pub dims: u32,
-    /// The attribute the text index is built over. **Empty means the fold that recorded this
-    /// schema saw no text at all**, which is not the same as a field named "".
+    /// The attribute the text index is built over. **Empty means no fold has sealed text
+    /// yet**, which is not the same as a field named "": the first that does fills it (M30),
+    /// and from then on it never changes. Every seal of the index uses it.
     pub text_field: String,
     /// How its vectors are compared (M9d). `dims` is the **stored** width, which this adds to.
     pub metric: Metric,

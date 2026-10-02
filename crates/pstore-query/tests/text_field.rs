@@ -164,3 +164,41 @@ async fn a_pre_m6c_segment_still_answers_the_default() {
         "a pre-M6c segment stopped answering its own text field"
     );
 }
+
+#[tokio::test]
+async fn a_segment_with_no_text_index_answers_nothing() {
+    // M30: no text index at all is not "another field". Its rows carry no text the index
+    // could find, so a text leg over it contributes nothing, for any field it names.
+    let s = MemoryStore::new();
+    let docs: Vec<Document> = (0..120)
+        .map(|i| {
+            let mut d = doc(i, "unused");
+            d.attrs.clear();
+            d
+        })
+        .collect();
+    let built = vec_index::build_all(
+        &docs,
+        Params {
+            target_list_size: 40,
+            exact_scan_threshold: 200,
+            ..Params::default()
+        },
+        pstore_format::DEFAULT_FIELD,
+        None,
+        None,
+    );
+    assert!(
+        built.text_dictionary.is_none(),
+        "the fixture has a text index"
+    );
+    let (seg, cen) = (Key::new(SEG), Key::new(CEN));
+    s.put(&seg, built.segment).await.unwrap();
+    for field in [text::DEFAULT_TEXT_FIELD, "body"] {
+        assert_eq!(
+            run(&s, &seg, &cen, field).await.unwrap(),
+            0,
+            "a text leg for `{field}` over a segment with no text index"
+        );
+    }
+}

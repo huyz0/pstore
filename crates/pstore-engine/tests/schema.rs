@@ -420,3 +420,288 @@ async fn a_conforming_fold_records_no_rejects() {
         head.schema_rejects
     );
 }
+
+// ---- M30: the schema's text field decides where a segment's text is indexed ----
+
+/// A vector-only fold, then engines configured `body` and `title`, on one store.
+async fn three() -> (
+    Arc<MemoryStore>,
+    Engine<MemoryStore>,
+    Engine<MemoryStore>,
+    Engine<MemoryStore>,
+) {
+    let store = Arc::new(MemoryStore::new());
+    let v = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let a = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    let b = Engine::new(Arc::clone(&store), T, LaneId(3)).with_text_field("title");
+    folded(&v, vec![doc("v", 4)]).await;
+    assert_eq!(text_field(&store).await, "");
+    (store, v, a, b)
+}
+
+async fn folded(e: &Engine<MemoryStore>, docs: Vec<Document>) {
+    e.write("idx", docs).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+}
+
+async fn text_field(store: &MemoryStore) -> String {
+    committed(store).await.schemas["idx"].text_field.clone()
+}
+
+/// The ids a `body` text query names, as `e` sees them.
+async fn body(e: &Engine<MemoryStore>, q: &str) -> Vec<String> {
+    let legs = vec![pstore_query::Prefetch::Text {
+        field: "body".to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }];
+    let answer = e
+        .query("idx", &legs, pstore_query::Fusion::default(), 10)
+        .await
+        .unwrap();
+    e.resolve(&answer).into_iter().map(|(id, _)| id).collect()
+}
+
+/// `e` reads HEAD, as any query does, so its door knows the recorded schema.
+async fn refresh(e: &Engine<MemoryStore>) {
+    let _ = body(e, "anything").await;
+}
+
+#[tokio::test]
+async fn an_empty_text_field_is_filled_by_the_first_fold_with_text() {
+    let (store, v, a, b) = three().await;
+    folded(&a, vec![texted("a", "body", "alpha")]).await;
+    assert_eq!(
+        text_field(&store).await,
+        "body",
+        "the first fold with text filled nothing"
+    );
+    refresh(&b).await;
+    let err = b
+        .write("idx", vec![texted("b", "title", "beta")])
+        .await
+        .expect_err("a second text field was accepted");
+    assert!(
+        matches!(
+            err,
+            EngineError::SchemaConflict {
+                what: "the text field",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        v.compact("idx").await.unwrap().is_some(),
+        "nothing compacted"
+    );
+    assert_eq!(body(&a, "alpha").await, ["a"]);
+}
+
+#[tokio::test]
+async fn a_patch_that_adds_text_fills_the_text_field() {
+    let (store, _v, a, _b) = three().await;
+    let mut set = std::collections::BTreeMap::new();
+    set.insert("body".to_owned(), Value::Str("gamma".to_owned()));
+    a.patch(
+        "idx",
+        vec![pstore_engine::Patch {
+            id: "v".to_owned(),
+            set,
+            unset: Vec::new(),
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    a.flush().await.unwrap();
+    a.fold().await.unwrap();
+    assert_eq!(
+        text_field(&store).await,
+        "body",
+        "a patch's text filled nothing"
+    );
+    assert_eq!(body(&a, "gamma").await, ["v"]);
+}
+
+#[tokio::test]
+async fn a_fold_indexes_the_schemas_text_field_not_its_own() {
+    let (store, _v, a, b) = three().await;
+    folded(&a, vec![texted("a", "body", "alpha")]).await;
+    assert_eq!(text_field(&store).await, "body");
+    refresh(&b).await;
+    folded(&b, vec![texted("x", "body", "gamma")]).await;
+    assert_eq!(
+        body(&a, "gamma").await,
+        ["x"],
+        "a fold by a process configured otherwise wrote no postings for the index's field"
+    );
+}
+
+#[tokio::test]
+async fn the_fresh_segment_indexes_the_schemas_text_field() {
+    let (_store, _v, a, b) = three().await;
+    folded(&a, vec![texted("a", "body", "alpha")]).await;
+    refresh(&b).await;
+    b.write("idx", vec![texted("x", "body", "gamma")])
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&b, "gamma").await,
+        ["x"],
+        "the unfolded row was indexed over the process's field"
+    );
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert_eq!(body(&b, "gamma").await, ["x"]);
+}
+
+#[tokio::test]
+async fn a_compaction_rebuilds_over_the_schemas_text_field() {
+    // Segments that name no text field -- sealed by a `title` process over `body` rows, which
+    // fills nothing -- under a schema recording `body`, set by hand: an index from before M30.
+    let (store, v, _a, b) = three().await;
+    folded(&b, vec![texted("x", "body", "gamma")]).await;
+    folded(&b, vec![texted("y", "body", "gamma delta")]).await;
+    assert_eq!(text_field(&store).await, "");
+    v.commit_head_for_test(|h| {
+        h.schemas.get_mut("idx").unwrap().text_field = "body".to_owned();
+    })
+    .await
+    .unwrap();
+    assert!(
+        v.compact("idx").await.unwrap().is_some(),
+        "nothing compacted"
+    );
+    let mut got = body(&v, "gamma").await;
+    got.sort();
+    assert_eq!(
+        got,
+        ["x", "y"],
+        "the merge was not built over the schema's field"
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_refuses_an_input_of_another_field() {
+    // Inputs naming only `title`, under a schema recording `body` (set by hand).
+    let (store, v, _a, b) = three().await;
+    folded(&b, vec![texted("x", "title", "gamma")]).await;
+    folded(&b, vec![texted("y", "title", "delta")]).await;
+    v.commit_head_for_test(|h| {
+        h.schemas.get_mut("idx").unwrap().text_field = "body".to_owned();
+    })
+    .await
+    .unwrap();
+    let before = committed(&*store).await;
+    let err = v
+        .compact("idx")
+        .await
+        .expect_err("a merge was built over a field the schema does not record");
+    assert!(matches!(err, EngineError::Format(_)), "{err:?}");
+    let after = committed(&*store).await;
+    assert_eq!(after.epoch, before.epoch, "HEAD moved");
+    assert_eq!(after.indexes["idx"].len(), before.indexes["idx"].len());
+}
+
+#[tokio::test]
+async fn a_vector_only_fold_fills_no_text_field() {
+    let (store, _v, _a, b) = three().await;
+    folded(&b, vec![doc("w", 4)]).await;
+    assert_eq!(
+        text_field(&store).await,
+        "",
+        "a fold without text filled the field"
+    );
+}
+
+#[tokio::test]
+async fn a_vector_only_segment_does_not_refuse_a_text_query() {
+    // M30: the server's own sequence, with its default text field. The index's first fold
+    // has no text, and its second does: a text query must answer, not refuse.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    folded(&e, vec![doc("v", 4)]).await;
+    folded(&e, vec![texted("t", "text", "alpha")]).await;
+    let legs = vec![pstore_query::Prefetch::Text {
+        field: "text".to_owned(),
+        query: "alpha".to_owned(),
+        limit: 10,
+    }];
+    let answer = e
+        .query("idx", &legs, pstore_query::Fusion::default(), 10)
+        .await
+        .expect("a text query over an index with a vector-only segment was refused");
+    let ids: Vec<String> = e.resolve(&answer).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, ["t"]);
+}
+
+#[tokio::test]
+async fn a_cached_fresh_segment_is_rebuilt_when_the_text_field_is_filled() {
+    // `b` holds an unfolded `body` row, indexed while the schema was `""` -- over its own field,
+    // so with no postings. Another process's fold then fills `body`. `b`'s rows are unchanged,
+    // but its cached fresh segment is over the wrong field now, and must be rebuilt.
+    let (store, _v, a, b) = three().await;
+    b.write("idx", vec![texted("x", "body", "gamma")])
+        .await
+        .unwrap();
+    assert!(body(&b, "gamma").await.is_empty());
+    folded(&a, vec![texted("a", "body", "alpha")]).await;
+    assert_eq!(text_field(&store).await, "body");
+    assert_eq!(
+        body(&b, "gamma").await,
+        ["x"],
+        "a fresh segment cached under the old text field was served"
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_with_no_field_to_keep_builds_no_text_index() {
+    // Code review, M30: one process configured `body` folds rows carrying a `text` attribute,
+    // which it does not index, so nothing fills. A merge that fell back to the default field
+    // would index `text` without recording it -- and the first `body` fold would then make
+    // the index uncompactable. With no field recorded and none named, it indexes nothing.
+    let store = Arc::new(MemoryStore::new());
+    let a = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    folded(&a, vec![doc("v", 4)]).await;
+    folded(&a, vec![texted("x", "text", "gamma")]).await;
+    folded(&a, vec![texted("y", "text", "delta")]).await;
+    assert!(
+        a.compact("idx").await.unwrap().is_some(),
+        "nothing compacted"
+    );
+    assert_eq!(text_field(&store).await, "");
+    folded(&a, vec![texted("z", "body", "alpha")]).await;
+    assert_eq!(text_field(&store).await, "body");
+    assert!(
+        a.compact("idx").await.unwrap().is_some(),
+        "the index became uncompactable"
+    );
+    assert_eq!(body(&a, "alpha").await, ["z"]);
+}
+
+#[tokio::test]
+async fn before_any_text_the_fresh_segment_indexes_the_process_field() {
+    // Code review, M30: a schema recording `""` names no field, so the unfolded rows are
+    // indexed over this process's, as the fold that seals them -- and fills it -- will be.
+    let (_store, _v, _a, b) = three().await;
+    b.write("idx", vec![texted("x", "title", "gamma")])
+        .await
+        .unwrap();
+    let legs = vec![pstore_query::Prefetch::Text {
+        field: "title".to_owned(),
+        query: "gamma".to_owned(),
+        limit: 10,
+    }];
+    let answer = b
+        .query("idx", &legs, pstore_query::Fusion::default(), 10)
+        .await
+        .unwrap();
+    let ids: Vec<String> = b.resolve(&answer).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        ids,
+        ["x"],
+        "an empty recorded field was used as a field name"
+    );
+}

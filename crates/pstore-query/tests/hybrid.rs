@@ -452,23 +452,37 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
     .expect("a text leg was refused");
     assert!(!hits.is_empty(), "the analyzer did not lowercase the query");
 
-    // A segment with no term dictionary is an error naming the sidecar, not an empty answer.
-    let (bare, bare_cen) = put(&store, &docs).await;
-    assert!(
-        query(
-            &store,
-            &one(&bare, &bare_cen),
-            &[Prefetch::Text {
-                field: text::DEFAULT_TEXT_FIELD.to_owned(),
-                query: "revenue".to_owned(),
-                limit: 10,
-            }],
-            Fusion::default(),
-            10,
-        )
+    let leg = || {
+        [Prefetch::Text {
+            field: text::DEFAULT_TEXT_FIELD.to_owned(),
+            query: "revenue".to_owned(),
+            limit: 10,
+        }]
+    };
+    // A segment WITH a text index whose term dictionary is missing is an error naming the
+    // sidecar, not an empty answer.
+    store.delete_batch(&[text::dict_key(&seg)]).await.unwrap();
+    let err = query(&store, &one(&seg, &cen), &leg(), Fusion::default(), 10)
         .await
-        .is_err(),
-        "a text leg over a segment with no text answered instead of failing"
+        .expect_err("a text leg over a segment missing its term dictionary answered");
+    assert!(err.to_string().contains("sidecar"), "{err}");
+
+    // ⚠️ Amended by M30: a segment with NO text index has no matching rows, and answers
+    // nothing. Refusing it refused every text query over an index whose first fold had no
+    // text, until a compaction merged that segment away.
+    let (bare, bare_cen) = put(&store, &docs).await;
+    let hits = query(
+        &store,
+        &one(&bare, &bare_cen),
+        &leg(),
+        Fusion::default(),
+        10,
+    )
+    .await
+    .expect("a text leg over a segment with no text index was refused");
+    assert!(
+        hits.is_empty(),
+        "a segment with no text index answered rows"
     );
 }
 

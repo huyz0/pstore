@@ -553,6 +553,8 @@ struct Fresh {
     fts: FullText,
     /// The attributes it sketched (M15.2), by the same rule.
     trigram: Vec<String>,
+    /// The attribute its text index was built over (M30): the index's, else this process's.
+    text_field: String,
 }
 
 /// The attribute name marking a tombstone (M9c.2): **empty**, which the write door refuses and
@@ -1660,6 +1662,16 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// Whether this row has text in the attribute this process indexes.
+    /// The attribute an index's text is indexed over (M30): the one its schema records, else
+    /// this process's. ⚠️ Never this process's when the schema records one: a process
+    /// configured otherwise would seal the index's rows with no postings for their text.
+    fn text_field_of<'a>(&'a self, schema: Option<&'a head::IndexSchema>) -> &'a str {
+        schema
+            .map(|s| s.text_field.as_str())
+            .filter(|f| !f.is_empty())
+            .unwrap_or(self.text_field.as_str())
+    }
+
     fn carries_text(&self, doc: &Document) -> bool {
         matches!(
             doc.attrs.get(self.text_field.as_str()),
@@ -1812,16 +1824,19 @@ impl<S: BlobStore> Engine<S> {
         names: &mut Names,
         base: &Key,
         docs: &[Document],
-        text_field: &str,
+        text_field: Option<&str>,
         fts: &FullText,
         trigram: &[String],
     ) -> Result<Key, EngineError> {
         let sparse = sparse_field_of(docs);
-        let wants_text = docs.iter().any(|d| {
-            matches!(
-                d.attrs.get(text_field),
-                Some(pstore_format::Value::Str(s)) if !s.is_empty()
-            )
+        // `None` indexes no text (M30): a merge with no field to keep must not choose one.
+        let text_field = text_field.filter(|f| {
+            docs.iter().any(|d| {
+                matches!(
+                    d.attrs.get(*f),
+                    Some(pstore_format::Value::Str(s)) if !s.is_empty()
+                )
+            })
         });
         // ⚠️ **The `replicas: 0` clamp is gone (M3c).** It was a correctness clamp, not a
         // tuning choice: rows were written in list order, so a replicated vector was written
@@ -1839,7 +1854,7 @@ impl<S: BlobStore> Engine<S> {
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
-            wants_text.then_some(text_field),
+            text_field,
             &fts.analyzer,
             trigram,
         )
@@ -3524,6 +3539,17 @@ impl<S: BlobStore> Engine<S> {
                 }
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.
                 let sealed: Vec<Document> = docs.iter().cloned().map(stripped).collect();
+                // ⚠️ **An empty text field is filled by the first fold whose sealed rows carry
+                // text** (M30). Empty means "no text yet", not a choice: left empty, two
+                // processes configured with different fields could each fold text in, and every
+                // compaction of the index would then be refused. Judged on the rows sealed --
+                // `seal`'s own predicate -- so a patch that adds text fills it too.
+                if let Some(s) = next.schemas.get_mut(idx)
+                    && s.text_field.is_empty()
+                    && sealed.iter().any(|d| self.carries_text(d))
+                {
+                    s.text_field.clone_from(&self.text_field);
+                }
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();
                 let seg_key = self
@@ -3531,7 +3557,7 @@ impl<S: BlobStore> Engine<S> {
                         names,
                         &self.segment_key(next.epoch, idx),
                         &sealed,
-                        &self.text_field,
+                        Some(self.text_field_of(Some(&schema))),
                         &schema.fts,
                         &schema.trigram,
                     )
@@ -4270,9 +4296,25 @@ impl<S: BlobStore> Engine<S> {
             .collect();
         named.sort_unstable();
         named.dedup();
+        // M30: the schema's field, when it records one, and an input naming another is refused
+        // as two disagreeing inputs are. Before the schema existed to ask, the inputs decided.
+        let recorded = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.text_field.clone())
+            .filter(|f| !f.is_empty());
+        if let Some(r) = &recorded {
+            named.push(r);
+            named.sort_unstable();
+            named.dedup();
+        }
+        // ⚠️ **None named, none recorded: no text index** (M30, code review). The default here
+        // indexed an attribute no schema records, and the first fold to fill the field with
+        // another then made every later compaction of the index refuse.
         let text_field = match named.as_slice() {
-            [] => pstore_format::text::DEFAULT_TEXT_FIELD,
-            [one] => one,
+            [] => None,
+            [one] => Some(*one),
             many => {
                 return Err(EngineError::Format(format!(
                     "cannot merge segments whose text indexes name different attributes: \
@@ -4499,6 +4541,8 @@ impl<S: BlobStore> Engine<S> {
             .map(|s| s.trigram.clone())
             .or_else(|| ops.iter().find_map(trgm_of))
             .unwrap_or_default();
+        // M30: indexed over the index's text field, as the fold that seals these rows will be.
+        let text_field = self.text_field_of(schema).to_owned();
         let mut slot = self.fresh.lock().await;
         // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
         // rows and store afterwards let a concurrent query on another index replace the cached
@@ -4508,6 +4552,7 @@ impl<S: BlobStore> Engine<S> {
             && f.index == index
             && f.fts == fts
             && f.trigram == trigram
+            && f.text_field == text_field
         {
             return Ok(Some(Some(f.view())));
         }
@@ -4537,6 +4582,7 @@ impl<S: BlobStore> Engine<S> {
                 metric,
                 fts,
                 trigram,
+                text_field,
             };
             let view = fresh.view();
             *slot = Some(fresh);
@@ -4550,7 +4596,7 @@ impl<S: BlobStore> Engine<S> {
         let sparse = sparse_field_of(&rows);
         let wants_text = rows.iter().any(|d| {
             matches!(
-                d.attrs.get(self.text_field.as_str()),
+                d.attrs.get(text_field.as_str()),
                 Some(pstore_format::Value::Str(s)) if !s.is_empty()
             )
         });
@@ -4559,7 +4605,7 @@ impl<S: BlobStore> Engine<S> {
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
-            wants_text.then_some(self.text_field.as_str()),
+            wants_text.then_some(text_field.as_str()),
             &fts.analyzer,
             &trigram,
         )
@@ -4614,6 +4660,7 @@ impl<S: BlobStore> Engine<S> {
             metric,
             fts,
             trigram,
+            text_field,
         };
         let view = fresh.view();
         *slot = Some(fresh);
