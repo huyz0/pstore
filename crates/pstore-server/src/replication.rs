@@ -132,6 +132,27 @@ fn tenant_of_id(id: &str) -> Option<TenantId> {
     u128::from_str_radix(id, 16).ok().map(TenantId)
 }
 
+/// One slot of the worker's count, reserved by a control call: given back when dropped,
+/// unless handed to the worker first.
+struct Reservation<'a>(Option<&'a AtomicUsize>);
+
+impl Reservation<'_> {
+    /// The slot is the worker's now: dropping this gives nothing back.
+    fn hand_over(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if let Some(held) = self.0 {
+            let _ = held.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
+                Some(h.saturating_sub(1))
+            });
+        }
+    }
+}
+
 /// The note a tenant-wide sync failure is recorded under, which a status falls back to.
 const TENANT_NOTE: &str = "*";
 
@@ -277,15 +298,19 @@ impl<S: BlobStore + 'static> Api<S> {
         let policy = self.policy();
         // ⚠️ A slot is reserved before the claim is offered, so two control calls racing a
         // tick cannot both claim past `max` on a stale count (code review M1).
-        let reserved = self.replicating.worker.load(Ordering::SeqCst)
+        // ⚠️ **Held by a guard** (code review round 4): a client that goes away drops this
+        // call wherever it waits, and a slot given back only by the code after the await
+        // would be held by nobody, for good -- enough of them and the worker takes no work.
+        let reserved = (self.replicating.worker.load(Ordering::SeqCst)
             && self
                 .replicating
                 .held
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
                     (h < policy.max).then_some(h + 1)
                 })
-                .is_ok();
-        let claim = reserved.then(|| Claim {
+                .is_ok())
+        .then(|| Reservation(Some(&self.replicating.held)));
+        let claim = reserved.is_some().then(|| Claim {
             owner: self.lane.0,
             expires_ms: self
                 .now_ms()
@@ -309,13 +334,8 @@ impl<S: BlobStore + 'static> Api<S> {
             .await
         {
             Ok(e) => e,
-            Err(e) => {
-                // The reserved slot goes back with the failure (code review round 2, m8).
-                if reserved {
-                    self.replicating.held.fetch_sub(1, Ordering::SeqCst);
-                }
-                return Err(e.into());
-            }
+            // The reserved slot goes back with the failure, as the guard drops.
+            Err(e) => return Err(e.into()),
         };
         // Handed to the worker only when THIS call's claim is the one written; otherwise the
         // reserved slot is given back.
@@ -329,8 +349,10 @@ impl<S: BlobStore + 'static> Api<S> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((tenant, reg.shard_of(&id_of(tenant)), e.generation));
-        } else if reserved {
-            self.replicating.held.fetch_sub(1, Ordering::SeqCst);
+            // Handed over: the slot is the worker's now.
+            if let Some(mut r) = reserved {
+                r.hand_over();
+            }
         }
         Ok(entry)
     }
@@ -432,11 +454,13 @@ impl<S: BlobStore + 'static> Api<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         for (tenant, shard, generation) in adopted {
-            // Its slot was reserved when the claim was made.
+            // Its slot was reserved when the claim was made: it takes it, or gives it back.
             if let std::collections::btree_map::Entry::Vacant(v) = w.held.entry(tenant) {
                 v.insert(held(shard, generation, now, policy.period));
                 w.renew_at.entry(shard).or_insert(now + renew_every);
                 tick.claimed += 1;
+            } else {
+                self.release(1);
             }
         }
 
@@ -460,7 +484,10 @@ impl<S: BlobStore + 'static> Api<S> {
         let mut claimed = Vec::with_capacity(scan.len());
         let mut taken = 0;
         for s in &scan {
-            let room = policy.max.saturating_sub(w.held.len() + taken);
+            // Against the count of what is held AND reserved by control calls in flight.
+            let room = policy
+                .max
+                .saturating_sub(self.replicating.held.load(Ordering::SeqCst) + taken);
             let got = reg
                 .claim(*s, self.lane.0, self.now_ms(), ttl_ms, room)
                 .await;
@@ -478,7 +505,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 let Some(tenant) = tenant_of_id(&id) else {
                     continue;
                 };
-                let full = w.held.len() >= policy.max;
+                let full = self.replicating.held.load(Ordering::SeqCst) >= policy.max;
                 match w.held.get_mut(&tenant) {
                     Some(h) if h.generation != e.generation => {
                         h.generation = e.generation;
@@ -491,6 +518,7 @@ impl<S: BlobStore + 'static> Api<S> {
                     None => {
                         w.held
                             .insert(tenant, held(*shard, e.generation, now, policy.period));
+                        self.replicating.held.fetch_add(1, Ordering::SeqCst);
                         tick.claimed += 1;
                     }
                 }
@@ -589,20 +617,26 @@ impl<S: BlobStore + 'static> Api<S> {
             }
         }
         for tenant in gone {
-            w.held.remove(&tenant);
+            if w.held.remove(&tenant).is_some() {
+                self.release(1);
+            }
             let _ = self.reconcile(tenant, false).await;
         }
+        // ⚠️ Never stored over (code review round 2, m8; a race test found it): a control call
+        // reserves its slot mid-tick, and a count rewritten from what the worker holds would
+        // drop that reservation and let the next claim past `max`. Kept exact at each change.
         tick.held = w.held.len();
-        let pending = self
-            .replicating
-            .adopted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        self.replicating
-            .held
-            .store(tick.held + pending, Ordering::SeqCst);
         tick
+    }
+
+    /// Gives back `n` slots of the worker's count of what it holds and has reserved.
+    fn release(&self, n: usize) {
+        let _ = self
+            .replicating
+            .held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
+                Some(h.saturating_sub(n))
+            });
     }
 
     /// Renews each held shard whose time has come: one CAS per shard per `ttl / 3`, keeping
@@ -647,6 +681,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 continue;
             };
             w.renew_at.insert(shard, now + renew_every);
+            let before = w.held.len();
             w.held.retain(|t, h| {
                 if h.shard != shard {
                     return true;
@@ -663,6 +698,7 @@ impl<S: BlobStore + 'static> Api<S> {
                     }
                 }
             });
+            self.release(before - w.held.len());
         }
         let shards: std::collections::BTreeSet<u16> = w.held.values().map(|h| h.shard).collect();
         w.renew_at.retain(|s, _| shards.contains(s));
