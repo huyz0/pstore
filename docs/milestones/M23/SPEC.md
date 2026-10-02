@@ -37,11 +37,17 @@ Precondition::NotExists)`, through one engine helper that picks the object's **n
 - **Created:** the name is this attempt's.
 - **`Lost` or `Contended`:** the name is taken, or may be. The next name is tried at once, with no
   read. A refusal is never an error and never a reason to re-read HEAD.
-  - The process's own earlier object at that name refuses it too, and that is the point: a
-    retry never replaces its own late PUT either. No memory of attempted names is kept.
+- **The next name is carried across an operation's attempts** (spec review B1). Each fold,
+  compaction or branch call keeps, per base key, the next `n` to try. A retry at an unchanged
+  epoch starts past every name it has already created or been refused. It is never refused by
+  its own object, and never replaces its own late PUT. A new call starts at 0, and a refusal by
+  an earlier call's object costs one write.
 - **`Io`:** the attempt fails, as a failed `put` does today.
-- **After 16 refused names** the operation fails with `EngineError::Lost`, having replaced
-  nothing.
+- **After 16 refused names in one call** the operation fails with `EngineError::Contended`,
+  having replaced nothing. Not `Lost`: `Lost` tells the caller to rebase, and no HEAD moved
+  (BACKLOG row 11; `retry_ceiling.rs`).
+- **Compaction re-seals only when the epoch moved.** Its retry compares the epoch it sealed at
+  with the next one, not keys, which differ once a name carries a suffix.
 
 **A segment claims its name before its sidecars.** `seal` creates the segment first, then each
 sidecar with create-if-absent, under the segment's chosen name. HEAD still names nothing until
@@ -52,12 +58,35 @@ the commit, after all of them, so a reader still never opens a segment whose sid
   it. Another process's segment would then be read with that table.
 
 **Burial.** Branch and compaction record a key before writing it, so a write that fails
-partway is buried (M19). A name **refused** is another process's object, or this one's earlier
-attempt. It is removed from that record and never buried. An `Io` name stays recorded, as M19
-decided. The fold buries nothing today; what its discarded attempts leave stays the orphan
-sweeper's (M6e).
+partway is buried (M19). A name **refused** is another process's object, or an earlier call's.
+It is removed from that record and never buried. An `Io` name stays recorded, as M19 decided:
+it may be another process's, and `bury_abandoned`'s live filter is what keeps it once committed.
+**A fold now buries too** (spec review m2). Today a retry at its own epoch overwrites its earlier
+segment, and nothing sweeps engine keys (M6e's `sweep` is the catalog's). Under M23 that earlier
+segment would leak. So a fold records each name it creates, and when it returns, it buries those
+its committed HEAD does not name, through `bury_abandoned`: one read and one commit, only after a
+discarded attempt. This also buries what a lost-CAS retry leaves, which leaks today.
 
 **Comments.** The two that cite "not honoured everywhere" are corrected to cite `require_fencing`.
+
+**Existing tests** (spec review M1). None is weakened; each keeps the mutation it was written for.
+- `abandon.rs` `sealing_one_key_twice_writes_the_same_bytes`: its premise, the loser's PUT landing
+  on the winner's committed key, is what M23 removes. Rewritten to the stronger property: the
+  twin commits another name, and no key's bytes ever change.
+- `abandon.rs` `an_error_after_sealing_buries_the_seal`: its fault moves with the write, from
+  `put` to `put_conditional` on `.seg`.
+- `abandon.rs` `a_same_lane_winners_key_is_not_buried` and `a_key_already_buried_is_not_buried_twice`:
+  "both derive the same key" stops being true. The case left where a recorded name can be live is
+  an `Io` create that did not land, whose name the twin then won. Both move to that setup: the
+  `Io` fails the call at once, so the twin's compaction runs inside the store's hook, before it
+  answers `Io`.
+- `retry_ceiling.rs` (both) and `pstore-testkit` `Gated` (`compaction.rs`'s races): they race or
+  refuse **HEAD's** CAS, and every conditional write now includes segment creates first. They are
+  narrowed to the HEAD key, which keeps the commit loop the thing under test.
+  - ⚠️ **`retry_ceiling` asserts an exact count** (spec review round 2): the commit's attempts
+    plus the burial's, 2 × `MAX_COMMIT_ATTEMPTS`, for the fold and the compaction alike. Its
+    `refused() > 1` would pass a commit loop that never retried, since the burial's own attempts
+    are refused too. This strengthens the compaction test as well, which has the same hole today.
 
 **Not changed:**
 - **Bundles:** M17's.
@@ -74,25 +103,34 @@ sweeper's (M6e).
 1. **A paused fold never replaces a live segment.** Fold A reads HEAD and is held at its
    segment write. Fold B, on the same lane, commits at that key. A is released and commits.
    B's segment bytes are unchanged, and every row both folds folded is served.
-2. **A paused compaction never replaces a live segment.** The same, with two compactions.
+2. **A paused compaction never replaces a live segment.** Compaction A fixes its inputs, loses its
+   CAS, and is held at its re-seal at the next epoch. Compaction B, on the same lane, merges the
+   newer HEAD and commits that key. B's segment bytes are unchanged.
 3. **A paused fold never replaces a live delete vector.** The same, with two folds deleting
    from one segment.
-4. **A branch's delete-vector copy never replaces a live one.** The same, with two branches.
+4. **A branch's delete-vector copy never replaces a live one.** `src2` is branched from `src1` and
+   deletes more rows. Both are branched to `dest` by two same-lane branches, so both copy a vector
+   to one key with different rows. The first committed vector's bytes are unchanged.
 5. **A retry at its own epoch takes the next name.** A fold whose first HEAD CAS answers
-   `Contended` commits on its retry, at the `_1` name, and its earlier object is not replaced.
+   `Contended` commits on its retry, at the `_1` name, and its earlier object is not replaced. A
+   compaction retried at its own epoch, its seal already at a suffixed name, does not re-seal.
 6. **An uncontended operation is unchanged on the wire.** A fold, a compaction and a branch
    each issue the same requests as before, with conditional PUTs in place of PUTs, and commit
    today's key names. Each refused name costs exactly one more write request.
 7. **The segment claims its name first.** When A's fold, with a centroid table, is refused the
    name B's centroid-less segment holds, no centroid table exists at B's name, and B's queries
    scan exactly.
-8. **A refused name is never buried.** A compaction refused at a name, then abandoned, leaves
-   that name out of the graveyard. With the refused name recorded, the test fails.
-9. **Bounded.** With every create refused, an operation fails with `EngineError::Lost` after
-   16 names, and replaces nothing.
+8. **A refused name is never buried.** A compaction is refused at a name holding a planted object
+   HEAD does not name, then abandoned. That name is not in the graveyard. With the refused name
+   recorded, the test fails; `bury_abandoned`'s live filter cannot save it.
+9. **Bounded.** With every create refused, a fold and a compaction each fail with
+   `EngineError::Contended` after 16 names, and replace nothing.
 10. **Suffixed names are read like any other.** A `_1` segment and delete vector are resolved by
     `as_of`, reaped by GC once buried past retention, and not mistaken for a replica copy.
-11. **Gates.** `./scripts/gates.sh` is green, and the mutation sweep over M23's source diff
+11. **A fold buries what its discarded attempts created.** A fold retried at its own epoch, and one
+   retried after a lost CAS, each leave every created name either in its committed HEAD or in the
+   graveyard, and GC reaps the rest.
+12. **Gates.** `./scripts/gates.sh` is green, and the mutation sweep over M23's source diff
     misses 0, every miss closed by a test or named as equivalent.
 
 ## Test plan
@@ -112,28 +150,35 @@ fold are written by a third engine on another lane, so M17's `LaneTaken` never e
 | 6 | `an_uncontended_fold_compaction_and_branch_are_unchanged` | a suffix at `n = 0`; an extra request per create |
 | 7 | `a_segment_claims_its_name_before_its_sidecars` | sidecars first: B's segment gains A's centroids |
 | 8 | `a_refused_name_is_never_buried` | the name left in the burial record |
-| 9 | `sixteen_refusals_fail_the_operation` | an unbounded loop (times out); a refusal past 16 retried |
+| 9 | `sixteen_refusals_fail_the_operation` | an unbounded loop (times out); `Lost` reported |
 | 10 | `a_suffixed_name_is_resolved_reaped_and_not_a_copy` | `-` in place of `_`; a parser reading `n` as an epoch |
+| 11 | `a_fold_buries_what_its_discarded_attempts_created` | no fold burial; the committed name buried |
+| 5′ | `a_compaction_retried_at_its_own_epoch_does_not_reseal` | keys compared in place of epochs (its seal refused once first, so the key carries `_1`) |
 
 Each is observed red on today's code, or for 6, 9 and 10, which today's code passes, against
-the mutation named.
+the mutation named. Setups: 2 needs A's re-seal after a lost CAS, since two compactions of one HEAD
+seal identical bytes. 4 needs two sources sharing a segment with different vectors.
 
 ## RA budget
 
 | Op | W | Rseq | Rpar | List | Depth |
 |---|---|---|---|---|---|
 | Fold, compaction, branch, uncontended | unchanged: each PUT becomes a conditional PUT | unchanged | unchanged | 0 | unchanged |
-| Each refused name | **+1** | 0 | 0 | 0 | +1 write round |
+| Each refused name | **+1**, plus any sidecar already created under it | 0 | 0 | 0 | +1 write round |
+| A fold with a discarded attempt | +1 commit (the burial) | +1 (HEAD) | 0 | 0 | after the fold returns |
 
 Queries are untouched. HEAD's bytes grow only by the 2+ characters of a suffix, and only after a
 refusal.
 
 ## Risks
 
-- **A stale sidecar under a name this process wins.** Suppose the orphan sweeper reaps a
-  segment but not its sidecar. A later segment created at that name, with no sidecar of its own,
-  would then be read with the stale one. Claiming the name first makes this need a sweep that
-  splits a segment from its sidecars. Test 7's setup is the place it would show.
+- **A stale sidecar under a name this process wins.** GC reaps a buried segment with its
+  sidecars. If anything ever reaped a segment and left a sidecar, a later segment at that name
+  with no sidecar of its own would be read with the stale one. Test 7's setup is where it shows.
+- **Segment writes change fault class** (m3). `Faulty`'s `write_error` covers `put` only, and
+  `Congested` retries `put` on a 503 but never `put_conditional`. Segment writes now get CAS faults
+  and no 503 retry, as bundles have since M17. `pstore-testkit`'s sweep axes run engine ops under
+  CAS faults, and will say if 16 names is too few. The bound is not raised to pass a test.
 - **`Faulty`'s `cas_lost` and `cas_contended` now refuse segment and delete-vector creates.**
   A test injecting them at a high rate around folds could exhaust 16 names. The suite says so;
   the bound is not raised to pass it.
@@ -142,6 +187,7 @@ refusal.
 
 ## Tasks
 
-- **M23.1** — The naming helper. Segment-first `seal`. Every site: fold, `supersede`, compaction,
-  branch. The burial rule, the two comments, and tests 1–10.
+- **M23.1** — The naming helper, carried per call. Segment-first `seal`. Every site: fold,
+  `supersede`, compaction, branch. Exhaustion as `Contended`, compaction's epoch compare, the
+  burial rule, the fold's burial, the two comments, the existing tests above, and tests 1–11.
 - **M23.2** — The ledger, `BACKLOG.md` row 44 closed, and the roadmap row.
