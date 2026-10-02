@@ -102,6 +102,21 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
 A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
 HMAC keys. It is only ever read.
 
+## Quarantined rows
+
+A fold refuses a row that contradicts its index's schema, and keeps going: a race between two
+processes that have both never read HEAD can produce one. Since M25 the row is **set aside, not
+dropped**: `GET /v1/indexes/{index}` reports it in `quarantined_rows`, and it stays until you
+act on it, through GC and across restarts.
+
+- `GET /v1/indexes/{index}/quarantine` exports every such row: the document as a client writes
+  one, the reserved attributes that say how it was written, and why the schema refuses it.
+  Cosine vectors come back as the stored unit vector; their magnitude is gone.
+- Fix and rewrite what you want to keep, then `DELETE /v1/indexes/{index}/quarantine?through=E`,
+  with `E` the `epoch` the export reported. It removes only what that export showed.
+- ⚠️ **Upgrade every process before relying on it.** A process older than M25 commits HEAD
+  without the quarantine, and the rows it named become unreachable.
+
 ## Unscheduled duties
 
 ⚠️ **The ids below are checked against `pstore_server::UNSCHEDULED`**, served at

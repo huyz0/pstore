@@ -139,15 +139,25 @@ async fn a_contradicting_index_seals_nothing() {
     cold.write_without_schema_check_for_test("docs", vec![doc("wrong", 2)])
         .await;
     cold.flush_without_schema_check_for_test().await.unwrap();
+    let segs = |keys: Vec<pstore_blob::Key>| -> Vec<String> {
+        keys.into_iter()
+            .map(|k| k.as_str().to_owned())
+            .filter(|k| k.ends_with(".seg"))
+            .collect()
+    };
+    let all = pstore_blob::Key::new(String::new());
+    let before = segs(store.list_unrestricted(&all).await.unwrap());
     let writes = acct.count(T, OpClass::Write);
     cold.fold().await.unwrap();
-    // The fold still commits HEAD and may write a graveyard entry, but it must not have
-    // sealed a segment for the contradicting index: a segment is a PUT plus its sidecars.
-    assert!(
-        acct.count(T, OpClass::Write) - writes <= 1,
-        "a contradicting fold wrote {} objects; one is the HEAD commit",
-        acct.count(T, OpClass::Write) - writes
+    // It must not have sealed a segment for the contradicting index. ⚠️ M25: it does write
+    // one object -- the quarantine the rejected row is set aside in -- beside the HEAD commit,
+    // so the count is exact and the segments are checked directly.
+    assert_eq!(
+        acct.count(T, OpClass::Write) - writes,
+        2,
+        "a contradicting fold writes the HEAD commit and its quarantine, and nothing else"
     );
+    assert_eq!(segs(store.list_unrestricted(&all).await.unwrap()), before);
 }
 
 #[tokio::test]

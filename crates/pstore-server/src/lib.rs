@@ -499,6 +499,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
             .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
+            .route(
+                "/v1/indexes/{index}/quarantine",
+                get(export_quarantine::<S>).delete(discard_quarantine::<S>),
+            )
             .route("/v1/replications", get(replication::list::<S>))
             .route(
                 "/v1/indexes/{index}/replication",
@@ -1973,6 +1977,7 @@ async fn index_summary<S: BlobStore + 'static>(
         epoch: served,
         schema: None,
         rejected_rows: 0,
+        quarantined_rows: 0,
         updated_epoch: None,
     });
     Ok(axum::Json(IndexSummary {
@@ -1989,10 +1994,105 @@ async fn index_summary<S: BlobStore + 'static>(
             regex: sc.trigram,
         }),
         rejected_rows: s.rejected_rows,
+        quarantined_rows: s.quarantined_rows,
         updated_epoch: s.updated_epoch.map(|e| e.0),
         approx_row_count: s.documents,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+fn no_index(index: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "index_not_found",
+        format!("this tenant has no index {index}"),
+    )
+}
+
+/// `GET /v1/indexes/{index}/quarantine` (M25): every row a fold set aside, as a client would
+/// write it again, with the `$` attributes that may say why, and the epoch a discard names.
+async fn export_quarantine<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let q = match engine.quarantine(&index).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return Err(no_index(&index)),
+        // ⚠️ An object HEAD names and the store lacks: never a shorter export, which a
+        // client would take for the whole quarantine and discard.
+        Err(pstore_engine::EngineError::Blob(e)) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "quarantine_unavailable",
+                e,
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let rows: Vec<serde_json::Value> = q
+        .rows
+        .iter()
+        .map(|r| {
+            let attrs: std::collections::BTreeMap<String, serde_json::Value> = r
+                .document
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.clone(), to_json(v)))
+                .collect();
+            let reserved: std::collections::BTreeMap<String, serde_json::Value> = r
+                .reserved
+                .iter()
+                .map(|(k, v)| (k.clone(), to_json(v)))
+                .collect();
+            serde_json::json!({
+                "document": {
+                    "id": r.document.id,
+                    "vector": r.document.vector(),
+                    "attributes": attrs,
+                },
+                "reserved": reserved,
+                "reason": r.reason,
+            })
+        })
+        .collect();
+    Ok(axum::Json(serde_json::json!({
+        "epoch": q.epoch.0,
+        "rows": rows,
+        "cost": api.spend(tenant).since(before),
+    })))
+}
+
+/// `DELETE /v1/indexes/{index}/quarantine?through={epoch}` (M25): buries what an export at
+/// `through` showed, and nothing a later fold set aside.
+async fn discard_quarantine<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let through = params
+        .get("through")
+        .and_then(|t| t.parse::<u64>().ok())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "through is required: the epoch the quarantine's export reported".to_owned(),
+            )
+        })?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let n = engine
+        .discard_quarantine(&index, pstore_types::Epoch(through))
+        .await?
+        .ok_or_else(|| no_index(&index))?;
+    Ok(axum::Json(serde_json::json!({
+        "discarded": n,
+        "cost": api.spend(tenant).since(before),
+    })))
 }
 
 /// `GET /v1/indexes`.

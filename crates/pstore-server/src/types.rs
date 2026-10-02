@@ -400,6 +400,9 @@ pub struct IndexSummary {
     /// contradicted the schema. Reported because a discard nobody can see is indistinguishable
     /// from a bug — and because the alternative to discarding was stopping the tenant.
     pub rejected_rows: u64,
+    /// Of those, the rows still set aside (M25): `GET …/quarantine` exports them, and
+    /// `DELETE …/quarantine` discards them.
+    pub quarantined_rows: u64,
     /// The epoch of the last commit that rewrote its segments or their delete vectors, or
     /// `null` before its first fold (M9f).
     pub updated_epoch: Option<u64>,

@@ -68,6 +68,7 @@ fn bury_into<'k>(next: &mut Head, keys: impl IntoIterator<Item = &'k String>) ->
         .flatten()
         .map(|r| r.key.clone())
         .chain(next.deletes.values().map(|(k, _)| k.clone()))
+        .chain(next.quarantine.values().flatten().map(|(k, _)| k.clone()))
         .chain(next.graveyard.values().flatten().cloned())
         .collect();
     // A set: a branch's retry can derive, and record, the same copy key twice.
@@ -82,6 +83,64 @@ fn bury_into<'k>(next: &mut Head, keys: impl IntoIterator<Item = &'k String>) ->
         next.graveyard.entry(born).or_default().push((*k).clone());
     }
     due.len()
+}
+
+/// Whether `index` exists for its quarantine (M25): HEAD names its segments, counts its
+/// rejects, or names its quarantine -- the drop's rule, plus the quarantine.
+fn quarantine_exists(head: &Head, index: &str) -> bool {
+    head.indexes.contains_key(index)
+        || head.schema_rejects.contains_key(index)
+        || head.quarantine.contains_key(index)
+}
+
+/// A rejected row as a client could write it again (M25): every `$` attribute moved to
+/// `reserved`, and each dense vector back in client space -- euclidean's appended
+/// `-|v|^2/2` dropped, exactly; cosine's unit vector as stored.
+fn client_form(mut d: Document, reason: Option<String>) -> Quarantined {
+    let metric = metric_of(&d);
+    let reserved: BTreeMap<String, pstore_format::Value> = d
+        .attrs
+        .iter()
+        .filter(|(k, _)| k.starts_with('$'))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    d.attrs.retain(|k, _| !k.starts_with('$'));
+    if metric == Metric::EuclideanSquared {
+        for field in d.vectors.values_mut() {
+            if let pstore_format::VectorField::Dense(vs) = field {
+                for v in vs.iter_mut() {
+                    v.pop();
+                }
+            }
+        }
+    }
+    Quarantined {
+        document: d,
+        reserved,
+        reason,
+    }
+}
+
+/// What an index's quarantine holds (M25), as of the HEAD at `epoch`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quarantine {
+    /// The HEAD it was read from: what a discard `through` it removes, and nothing later.
+    pub epoch: Epoch,
+    /// Every row, from every object the quarantine names.
+    pub rows: Vec<Quarantined>,
+}
+
+/// One rejected row, as a client could write it again (M25).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quarantined {
+    /// The row in client space: euclidean's stored norm component dropped; cosine's unit
+    /// vector as stored, since the magnitude is gone; no `$` attribute.
+    pub document: Document,
+    /// Every `$` attribute, verbatim: why a row can be rejected, and what the door refuses.
+    pub reserved: BTreeMap<String, pstore_format::Value>,
+    /// Why the schema HEAD records now refuses it, or `None` when none is recorded or it no
+    /// longer conflicts. Depends on this process's text field.
+    pub reason: Option<String>,
 }
 
 /// The names one fold, compaction or branch call has used (M23): segments and delete vectors
@@ -563,9 +622,16 @@ pub(crate) fn valid_name(n: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-/// `index`'s stats in `head`, or `None` when HEAD names no segment of it.
+/// `index`'s stats in `head`, or `None` when HEAD names no segment of it, counts no reject of
+/// it and names no quarantine of it (M25: an index known only by its rejects has zero
+/// segments, and its quarantine to report).
 pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
-    h.indexes.get(index).map(|refs| IndexStats {
+    let refs = match h.indexes.get(index) {
+        Some(refs) => refs,
+        None if quarantine_exists(h, index) => &Vec::new(),
+        None => return None,
+    };
+    Some(IndexStats {
         // The newest commit that rewrote its segments or their delete vectors (M9f): both
         // keys carry the epoch they were written at, and a retry re-derives them.
         updated_epoch: refs
@@ -593,6 +659,10 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
         epoch: h.epoch,
         schema: h.schemas.get(index).cloned(),
         rejected_rows: h.schema_rejects.get(index).copied().unwrap_or(0),
+        quarantined_rows: h
+            .quarantine
+            .get(index)
+            .map_or(0, |q| q.iter().map(|(_, n)| u64::from(*n)).sum()),
     })
 }
 
@@ -1256,6 +1326,8 @@ pub struct IndexStats {
     /// writes, dropped rather than allowed to stop the tenant, and reported so the discard
     /// is visible rather than silent.
     pub rejected_rows: u64,
+    /// Of those, the rows still set aside (M25): exportable, until discarded.
+    pub quarantined_rows: u64,
 }
 
 /// One writer's view of one tenant.
@@ -1825,8 +1897,9 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
-    /// Creates a delete vector at the first name `base` has free in this call (M23).
-    async fn create_dv(
+    /// Creates an object -- a delete vector, a quarantine -- at the first name `base` has free
+    /// in this call (M23).
+    async fn create_object(
         &self,
         names: &mut Names,
         base: &str,
@@ -2374,7 +2447,13 @@ impl<S: BlobStore> Engine<S> {
         // request only for a process that has never read one.
         self.remember_schemas(&at.head);
         self.prune_to(&at.head);
-        Ok(at.head.indexes.into_keys().collect())
+        // M25: an index known only by its rejects exists too, as the metadata route says.
+        let mut names: Vec<String> = at.head.indexes.into_keys().collect();
+        names.extend(at.head.schema_rejects.into_keys());
+        names.extend(at.head.quarantine.into_keys());
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
     }
 
     /// Segment count, document count and epoch for one index, or `None` if HEAD does not
@@ -2839,6 +2918,107 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
+    /// The rows `index`'s quarantine holds (M25), or `None` when no such index exists.
+    ///
+    /// # Errors
+    /// As a HEAD read, and a quarantine object HEAD names but the store lacks.
+    pub async fn quarantine(&self, index: &str) -> Result<Option<Quarantine>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        if !quarantine_exists(&at.head, index) {
+            return Ok(None);
+        }
+        let objects = at.head.quarantine.get(index).cloned().unwrap_or_default();
+        // One parallel round: an object HEAD names but the store lacks is an error, never a
+        // shorter export.
+        let bodies = futures_util::future::try_join_all(
+            objects
+                .iter()
+                .map(|(k, _)| async move { self.store.get(&Key::new(k.clone())).await }),
+        )
+        .await
+        .map_err(|e| EngineError::Blob(e.to_string()))?;
+        let schema = at.head.schemas.get(index);
+        let mut rows = Vec::new();
+        for body in &bodies {
+            for (name, entry) in bundle::read_index(body)? {
+                if name != index {
+                    continue;
+                }
+                for d in bundle::read_entry(body, &entry)? {
+                    let reason = schema
+                        .and_then(|s| self.row_conflict(index, s, &d))
+                        .map(|e| e.to_string());
+                    rows.push(client_form(d, reason));
+                }
+            }
+        }
+        Ok(Some(Quarantine {
+            epoch: at.head.epoch,
+            rows,
+        }))
+    }
+
+    /// Buries `index`'s quarantine objects whose key epoch is at or below `through` (M25),
+    /// answering how many, or `None` when no such index exists.
+    ///
+    /// # Errors
+    /// As a commit.
+    pub async fn discard_quarantine(
+        &self,
+        index: &str,
+        through: Epoch,
+    ) -> Result<Option<usize>, EngineError> {
+        let mut at = head::read(&*self.store, self.tenant).await?;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            if !quarantine_exists(&at.head, index) {
+                return Ok(None);
+            }
+            // ⚠️ Only what an export at `through` showed (spec review M3): an object a later
+            // fold set aside carries a later key epoch, and is kept, rebase or not.
+            let (due, kept): (Vec<_>, Vec<_>) = at
+                .head
+                .quarantine
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .partition(|(k, _)| head::key_epoch(k).is_some_and(|e| e <= through.0));
+            if due.is_empty() {
+                return Ok(Some(0));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            if kept.is_empty() {
+                next.quarantine.remove(index);
+            } else {
+                next.quarantine.insert(index.to_owned(), kept);
+            }
+            // Live until now, so buried at this epoch (spec review M4): GC's window applies.
+            next.graveyard
+                .entry(next.epoch.0)
+                .or_default()
+                .extend(due.iter().map(|(k, _)| k.clone()));
+            match head::commit(&*self.store, self.tenant, &at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    self.record_reapable(epoch);
+                    return Ok(Some(due.len()));
+                }
+                Err(e @ (EngineError::Lost | EngineError::Contended))
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    if matches!(e, EngineError::Lost) {
+                        at = head::read(&*self.store, self.tenant).await?;
+                    }
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
     /// Deletes `index` (M9f.2): **a fold that drops it**, so every bundle holding its rows up
     /// to each lane's tail is read, and the watermarks advance past them -- no later fold can
     /// bring those rows back. Every other index folds as usual. Returns the epoch that dropped
@@ -2982,10 +3162,10 @@ impl<S: BlobStore> Engine<S> {
                 };
                 let bytes = self.store.get(&Key::new(from.clone())).await?;
                 let to = head::dv_ref(dest, &r.key);
-                // Created, never replaced (M23). `create_dv` records what it created or may
+                // Created, never replaced (M23). `create_object` records what it created or may
                 // have, so one that fails partway is buried too (M19), and never a refused name.
                 let key = self
-                    .create_dv(names, &head::dv_key(&to, next.epoch.0, self.lane.0), bytes)
+                    .create_object(names, &head::dv_key(&to, next.epoch.0, self.lane.0), bytes)
                     .await?;
                 copies.push(key.clone());
                 next.deletes.insert(to, (key, *rows));
@@ -3133,6 +3313,7 @@ impl<S: BlobStore> Engine<S> {
                 // index whose accepted rows were all deleted, and seal nothing (code review).
                 let exists = at.head.indexes.contains_key(x)
                     || at.head.schema_rejects.contains_key(x)
+                    || at.head.quarantine.contains_key(x)
                     || rows(by_index.get(x))
                     || rows(self.mem().pending.get(x));
                 if !exists {
@@ -3171,6 +3352,8 @@ impl<S: BlobStore> Engine<S> {
             // ⚠️ Before `seal`, so a contradiction costs **zero write-class requests** and
             // cannot orphan an object no HEAD will ever name.
             let mut rejects: BTreeMap<String, u64> = BTreeMap::new();
+            // M25: the rows themselves, quarantined below rather than dropped.
+            let mut rejected: BTreeMap<String, Vec<Document>> = BTreeMap::new();
             // ⚠️ **A new index's schema is implied BEFORE the pass, and the pass runs against it**
             // (M9d, spec review): skipping the pass for a new index sealed two writers' first
             // rows together whatever they disagreed on -- same width, different metrics, and
@@ -3190,11 +3373,13 @@ impl<S: BlobStore> Engine<S> {
                 // watermark advances past their bundles, so a later fold never sees them and
                 // GC reaps them. Code review measured that: one wrong row cost two innocent
                 // ones. The blast radius of a contradiction is the contradicting row.
-                let before = docs.len();
-                docs.retain(|d| self.row_conflict(idx, schema, d).is_none());
-                let dropped = (before - docs.len()) as u64;
-                if dropped > 0 {
-                    rejects.insert(idx.clone(), dropped);
+                let (keep, out): (Vec<Document>, Vec<Document>) = std::mem::take(docs)
+                    .into_iter()
+                    .partition(|d| self.row_conflict(idx, schema, d).is_none());
+                *docs = keep;
+                if !out.is_empty() {
+                    rejects.insert(idx.clone(), out.len() as u64);
+                    rejected.insert(idx.clone(), out);
                 }
             }
             // An index whose every row was dropped seals nothing, and must not seal an empty
@@ -3340,6 +3525,26 @@ impl<S: BlobStore> Engine<S> {
             for (idx, n) in &rejects {
                 *next.schema_rejects.entry(idx.clone()).or_default() += *n;
             }
+            // ⚠️ **Set aside, never dropped** (M25): each index's rejected rows go to one object,
+            // created never replaced, named by HEAD and live to every burial and to GC until an
+            // operator discards it or the index is dropped. A dropped index's go with it.
+            for (idx, docs) in &rejected {
+                if drop == Some(idx.as_str()) {
+                    continue;
+                }
+                let one = BTreeMap::from([(idx.clone(), docs.clone())]);
+                let key = self
+                    .create_object(
+                        names,
+                        self.quarantine_key(next.epoch, idx).as_str(),
+                        bytes::Bytes::from(bundle::encode(&one)),
+                    )
+                    .await?;
+                next.quarantine
+                    .entry(idx.clone())
+                    .or_default()
+                    .push((key, docs.len() as u32));
+            }
             for (idx, n) in &replica_rows {
                 if let Some(r) = next.replications.get_mut(idx) {
                     r.rejected += *n;
@@ -3372,6 +3577,10 @@ impl<S: BlobStore> Engine<S> {
                     grave.push(head::burial(x, &r.key));
                 }
                 next.schema_rejects.remove(x);
+                // M25: its quarantine, which was live, buried at this epoch like its segments.
+                for (key, _) in next.quarantine.remove(x).unwrap_or_default() {
+                    grave.push(key);
+                }
                 if let Some(schema) = next.schemas.remove(x) {
                     next.dropped.push((x.to_owned(), next.epoch.0, schema));
                 }
@@ -3451,7 +3660,7 @@ impl<S: BlobStore> Engine<S> {
             let mut rows = p.deleted;
             rows.extend(hit);
             let key = self
-                .create_dv(
+                .create_object(
                     names,
                     &head::dv_key(&p.key, next.epoch.0, self.lane.0),
                     bytes::Bytes::from(pstore_query::deletes::encode(&rows)),
@@ -3681,6 +3890,14 @@ impl<S: BlobStore> Engine<S> {
                 .map(|r| r.key.as_str())
                 // And every delete vector HEAD names (M9c.2).
                 .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
+                // And every quarantine (M25): acknowledged rows, kept until discarded.
+                .chain(
+                    at.head
+                        .quarantine
+                        .values()
+                        .flatten()
+                        .map(|(k, _)| k.as_str()),
+                )
                 .collect();
             // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
             // it is a burial of the segment.
@@ -3799,6 +4016,15 @@ impl<S: BlobStore> Engine<S> {
             .await
             .map(|at| at.head)
             .unwrap_or_default()
+    }
+
+    /// Where a fold attempt at `epoch` sets aside an index's rejected rows (M25): the first
+    /// name `create_object` tries.
+    fn quarantine_key(&self, epoch: Epoch, index: &str) -> Key {
+        Key::new(format!(
+            "{:04x}/tnt/{}/idx/{index}/quarantine/{:020}-{:016x}.q",
+            self.tenant.0 as u16, self.tenant.0, epoch.0, self.lane.0
+        ))
     }
 
     /// The key a compactor writes its merged output to.

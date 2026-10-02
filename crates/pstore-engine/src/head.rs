@@ -198,6 +198,10 @@ pub struct Head {
     /// Each replica index (M22), by name: what it follows and how far. ⚠️ A trailing section
     /// after `branched`: absent means none.
     pub replications: BTreeMap<String, Replication>,
+    /// Rows a fold rejected (M25), set aside rather than dropped: per index, each quarantine
+    /// object's key and its row count. Live to every burial and to GC until an operator
+    /// discards it or its index is dropped. ⚠️ A trailing section after `replications`.
+    pub quarantine: BTreeMap<String, Vec<(String, u32)>>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -255,7 +259,7 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 /// reach the same key -- and "create-if-absent is not honoured everywhere", the reason this
 /// once gave for not using it, stopped being true when `require_fencing` began refusing any
 /// backend that does not honour it. A vector is now created, never replaced, and a refused name
-/// takes the next (`Engine::create_dv`).
+/// takes the next (`Engine::create_object`).
 ///
 /// ⚠️ It keeps the segment's `/seg/` path, and that is safe only because [`key_index`] reads a
 /// key as a segment **only when it ends in `.seg`** — without that, `as_of` would resurrect a
@@ -432,7 +436,7 @@ impl Head {
             .collect();
         // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
         // one is -- otherwise the later count would be read as the earlier one's.
-        let more = !self.replications.is_empty();
+        let more = !self.replications.is_empty() || !self.quarantine.is_empty();
         if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() || more {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in fts {
@@ -458,7 +462,7 @@ impl Head {
                 out.extend_from_slice(&epoch.to_le_bytes());
             }
         }
-        // M22: the replications, last.
+        // M22: the replications; M25's quarantine after them, by the same rule.
         if more {
             out.extend_from_slice(&(self.replications.len() as u32).to_le_bytes());
             for (name, r) in &self.replications {
@@ -473,6 +477,17 @@ impl Head {
                     out.extend_from_slice(&fp.to_le_bytes());
                 }
                 out.extend_from_slice(&r.rejected.to_le_bytes());
+            }
+        }
+        if !self.quarantine.is_empty() {
+            out.extend_from_slice(&(self.quarantine.len() as u32).to_le_bytes());
+            for (name, objects) in &self.quarantine {
+                put_str(&mut out, name);
+                out.extend_from_slice(&(objects.len() as u32).to_le_bytes());
+                for (key, rows) in objects {
+                    put_str(&mut out, key);
+                    out.extend_from_slice(&rows.to_le_bytes());
+                }
             }
         }
         out
@@ -687,6 +702,18 @@ impl Head {
                     rejected,
                 },
             );
+        }
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let mut objects = Vec::new();
+            for _ in 0..c.u32()? {
+                let key = c.string()?;
+                objects.push((key, c.u32()?));
+            }
+            h.quarantine.insert(name, objects);
         }
         Ok(h)
     }
@@ -969,6 +996,82 @@ mod tests {
         assert_eq!(unscoped(&format!("{seg}.br-616")), None);
         assert_eq!(unscoped(&format!("{seg}.br-zz")), None);
         assert_eq!(unscoped(&dv_key(&key, 3, 1)), None);
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A HEAD with a branch and a running replication, and no quarantine.
+    fn sample() -> Head {
+        let mut h = Head {
+            epoch: pstore_types::Epoch(7),
+            ..Head::default()
+        };
+        h.branched.insert("b".to_owned(), 3);
+        h.replications.insert(
+            "r".to_owned(),
+            Replication {
+                source: ReplicaSource {
+                    store: String::new(),
+                    tenant: pstore_types::TenantId(5),
+                    index: "s".to_owned(),
+                },
+                running: true,
+                run: 2,
+                applied: None,
+                rejected: 0,
+            },
+        );
+        h
+    }
+
+    #[test]
+    fn an_empty_quarantine_changes_no_byte() {
+        // M25: the parent commit's encoder wrote exactly these bytes for the same HEADs.
+        let bare = Head {
+            epoch: pstore_types::Epoch(7),
+            ..Head::default()
+        };
+        assert_eq!(
+            hex(&bare.encode()),
+            "0700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex(&sample().encode()),
+            "070000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000001000000620300000000000000010000000100000072000000000500000000000000000000000000000001000000730102000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn a_head_without_a_quarantine_decodes() -> Result<(), EngineError> {
+        let h = Head::decode(&sample().encode())?;
+        assert!(h.quarantine.is_empty());
+        assert_eq!(h.replications, sample().replications);
+        Ok(())
+    }
+
+    #[test]
+    fn a_quarantine_alone_round_trips() -> Result<(), EngineError> {
+        // The only optional section: every earlier count must be written as 0 before it.
+        let mut h = Head {
+            epoch: pstore_types::Epoch(9),
+            ..Head::default()
+        };
+        h.quarantine.insert(
+            "docs".to_owned(),
+            vec![("k/1.q".to_owned(), 2), ("k/2_1.q".to_owned(), 5)],
+        );
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back.quarantine, h.quarantine);
+        assert!(back.replications.is_empty() && back.branched.is_empty());
+        // And beside a replication.
+        let mut both = sample();
+        both.quarantine = h.quarantine.clone();
+        let back = Head::decode(&both.encode())?;
+        assert_eq!(back.quarantine, h.quarantine);
+        assert_eq!(back.replications, both.replications);
+        Ok(())
     }
 
     #[test]
