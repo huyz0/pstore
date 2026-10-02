@@ -23,6 +23,8 @@ pub struct Gated {
     n: usize,
     armed: std::sync::atomic::AtomicBool,
     broke: std::sync::atomic::AtomicBool,
+    /// Gate only keys ending with this; every conditional write when `None`.
+    only: Option<&'static str>,
 }
 
 /// How long a writer waits at the barrier before giving up on its peers.
@@ -42,6 +44,20 @@ impl Gated {
             n,
             armed: std::sync::atomic::AtomicBool::new(false),
             broke: std::sync::atomic::AtomicBool::new(false),
+            only: None,
+        }
+    }
+
+    /// As [`Self::new`], gating only conditional writes to keys ending with `suffix`.
+    ///
+    /// ⚠️ For a race on the engine's commit, gate `"/HEAD"`: since M23 a segment is created with
+    /// a conditional write too, so the first `n` conditional writes are segment creates, and
+    /// the barrier would release before any commit is reached.
+    #[must_use]
+    pub fn only(n: usize, suffix: &'static str) -> Self {
+        Self {
+            only: Some(suffix),
+            ..Self::new(n)
         }
     }
 
@@ -97,7 +113,9 @@ impl BlobStore for Gated {
         // ⚠️ Only the first `n`. A loser that rebases and retries must not re-enter the
         // barrier: it would wait for `n` peers that have already finished and deadlock the
         // test rather than fail it, which is the harder failure to read.
-        if self.armed.load(Ordering::SeqCst) && self.arrived.fetch_add(1, Ordering::SeqCst) < self.n
+        if self.armed.load(Ordering::SeqCst)
+            && self.only.is_none_or(|s| key.as_str().ends_with(s))
+            && self.arrived.fetch_add(1, Ordering::SeqCst) < self.n
         {
             // ⚠️ Bounded. A plain `wait()` turns "the expected racers never arrived" into a
             // hang, and a hang is the worst way for a test to fail: no message, no line

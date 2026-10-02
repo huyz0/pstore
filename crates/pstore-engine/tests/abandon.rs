@@ -29,17 +29,27 @@ fn doc(id: &str) -> Document {
     Document::new(id, vec![1.0, 0.5])
 }
 
-/// A memory store, shared by its clones, that can refuse the next segment PUT.
+/// A memory store, shared by its clones, that can refuse the next segment write.
 #[derive(Debug, Default, Clone)]
 struct Store {
     inner: MemoryStore,
     refuse_seal: Arc<AtomicBool>,
+    /// The next segment create waits for `go`, then answers `Io` having written nothing (M23).
+    io_seal: Arc<IoSeal>,
     head_reads: Arc<std::sync::atomic::AtomicU64>,
     head_cas: Arc<std::sync::atomic::AtomicU64>,
     /// HEAD commits to let through before answering one `Contended`; `u64::MAX` for never.
     contend_after: Arc<std::sync::atomic::AtomicU64>,
     /// Whether every HEAD commit from now on answers `Lost`.
     lose_all: Arc<AtomicBool>,
+}
+
+/// An `Io` create that did not land, with a pause before it is answered.
+#[derive(Debug, Default)]
+struct IoSeal {
+    armed: AtomicBool,
+    reached: tokio::sync::Notify,
+    go: tokio::sync::Notify,
 }
 
 impl Store {
@@ -84,9 +94,6 @@ impl BlobStore for Store {
         self.inner.head(key).await
     }
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
-        if key.as_str().ends_with(".seg") && self.refuse_seal.swap(false, Ordering::SeqCst) {
-            return Err(BlobError::Other("the store is down".to_owned()));
-        }
         self.inner.put(key, body).await
     }
     async fn put_conditional(
@@ -95,6 +102,15 @@ impl BlobStore for Store {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
+        // M23: a segment is created, never replaced, so its faults are a create's.
+        if key.as_str().ends_with(".seg") && self.refuse_seal.swap(false, Ordering::SeqCst) {
+            return Err(CasError::Io("the store is down".to_owned()));
+        }
+        if key.as_str().ends_with(".seg") && self.io_seal.armed.swap(false, Ordering::SeqCst) {
+            self.io_seal.reached.notify_one();
+            self.io_seal.go.notified().await;
+            return Err(CasError::Io("timed out".to_owned()));
+        }
         if key.as_str().ends_with("/HEAD") {
             self.head_cas.fetch_add(1, Ordering::SeqCst);
             if self.lose_all.load(Ordering::SeqCst) {
@@ -334,19 +350,26 @@ async fn a_refused_branch_retry_is_buried() {
 
 #[tokio::test]
 async fn a_same_lane_winners_key_is_not_buried() {
-    // Both compactions derive the same key from the same HEAD; the winner commits it.
+    // M23: a refused name is never recorded, so the one way a recorded name is live is an
+    // `Io` create that did not land, whose name the same-lane twin then won and committed.
+    // The twin runs inside the store's pause, before ours is answered `Io`.
     let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "idx", &["a", "b"]).await;
-    let got = e
-        .compact_with_interference_for_test("idx", async {
-            twin.compact("idx").await.unwrap().unwrap();
-        })
-        .await
-        .unwrap();
-    assert_eq!(got, None);
+    store.io_seal.armed.store(true, Ordering::SeqCst);
+    let (got, ()) = tokio::join!(e.compact("idx"), async {
+        store.io_seal.reached.notified().await;
+        twin.compact("idx").await.unwrap().unwrap();
+        store.io_seal.go.notify_one();
+    });
+    assert!(matches!(got, Err(EngineError::Blob(_))), "{got:?}");
     let head = e.head_for_test().await;
-    for k in named(&head) {
+    let live = named(&head);
+    assert!(
+        live.iter().any(|k| k.contains("/seg/L1/")),
+        "the twin did not commit"
+    );
+    for k in live {
         assert_eq!(buried_at(&head, &k), None, "the live {k} was buried");
     }
     e.gc(0).await.unwrap();
@@ -443,23 +466,23 @@ async fn nothing_written_and_success_commit_no_burial() {
 
 #[tokio::test]
 async fn a_key_already_buried_is_not_buried_twice() {
-    // The same-lane winner commits the key both compactions sealed, and then compacts it away
-    // itself, burying it. The loser's burial finds it buried already.
+    // The same-lane twin wins the name ours' `Io` create did not take (M23), commits it, and
+    // then compacts it away itself, burying it. Ours' burial finds it buried already.
     let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "idx", &["a", "b"]).await;
     let won: Arc<Mutex<Option<String>>> = Arc::default();
-    let got = e
-        .compact_with_interference_for_test("idx", async {
-            twin.compact("idx").await.unwrap().unwrap();
-            let k = twin.head_for_test().await.indexes["idx"][0].key.clone();
-            *won.lock().unwrap() = Some(k);
-            seeded(&twin, "idx", &["c"]).await;
-            twin.compact("idx").await.unwrap().unwrap();
-        })
-        .await
-        .unwrap();
-    assert_eq!(got, None);
+    store.io_seal.armed.store(true, Ordering::SeqCst);
+    let (got, ()) = tokio::join!(e.compact("idx"), async {
+        store.io_seal.reached.notified().await;
+        twin.compact("idx").await.unwrap().unwrap();
+        let k = twin.head_for_test().await.indexes["idx"][0].key.clone();
+        *won.lock().unwrap() = Some(k);
+        seeded(&twin, "idx", &["c"]).await;
+        twin.compact("idx").await.unwrap().unwrap();
+        store.io_seal.go.notify_one();
+    });
+    assert!(matches!(got, Err(EngineError::Blob(_))), "{got:?}");
     let k = won.lock().unwrap().clone().unwrap();
     let head = e.head_for_test().await;
     let entries = head
@@ -536,9 +559,10 @@ async fn bytes_of(store: &Store) -> std::collections::BTreeMap<String, Bytes> {
 
 #[tokio::test]
 async fn sealing_one_key_twice_writes_the_same_bytes() {
-    // M20's read cache keeps a key's bytes for as long as its disk does, so a key two same-lane
-    // compactions both seal must be sealed identically: the loser's PUT lands on the winner's
-    // committed segment and sidecars.
+    // M20's read cache keeps a key's bytes for as long as its disk does, so no key may ever
+    // change its bytes. Until M23 that held because two same-lane compactions sealed one key
+    // identically and the loser's PUT landed on the winner's; now it holds because a key is
+    // created once: the twin is refused ours' name and commits another.
     let store = Store::new();
     let (e, twin) = (engine(&store, 1), engine(&store, 1));
     seeded(&e, "idx", &["a", "b", "c"]).await;
@@ -546,7 +570,7 @@ async fn sealing_one_key_twice_writes_the_same_bytes() {
     let sealed = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let got = e
         .compact_with_interference_for_test("idx", async {
-            // Ours has sealed; the twin seals the same keys and commits them.
+            // Ours has sealed; the twin is refused that name, seals another, and commits it.
             *sealed.lock().unwrap() = bytes_of(&store).await;
             twin.compact("idx").await.unwrap().unwrap();
         })
@@ -560,13 +584,17 @@ async fn sealing_one_key_twice_writes_the_same_bytes() {
         new.iter().any(|k| k.ends_with(".seg")),
         "nothing sealed: {new:?}"
     );
-    // The twin committed the very segment ours sealed, so its PUT landed on ours.
     let live = named(&e.head_for_test().await);
     assert!(
-        new.iter().any(|k| k.ends_with(".seg") && live.contains(*k)),
-        "the twin committed another key"
+        live.iter().any(|k| k.ends_with("_1.seg")),
+        "the twin did not commit the next name: {live:?}"
     );
+    // Every key keeps the bytes it was first written with: ours' until GC reaps them, and
+    // nothing of ours is live.
     for k in new {
-        assert_eq!(after.get(k), ours.get(k), "{k} was sealed with other bytes");
+        assert!(!live.contains(k), "{k} is ours and live");
+        if let Some(b) = after.get(k) {
+            assert_eq!(Some(b), ours.get(k), "{k} changed its bytes");
+        }
     }
 }

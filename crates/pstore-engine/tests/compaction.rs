@@ -117,7 +117,7 @@ async fn concurrent_compactors_produce_one_winner() {
     // the winner published sees one segment and returns without racing at all, and the
     // test then passes for the wrong reason -- or fails for one, which is how this was
     // found.
-    let store = Arc::new(Gated::new(12));
+    let store = Arc::new(Gated::only(12, "/HEAD"));
     let t = TenantId(4);
     let seeded = with_segments(&store, t, 8).await;
     let before: Vec<String> = seeded
@@ -175,7 +175,7 @@ async fn a_losing_compactors_output_is_unreferenced() {
     // The losers wrote real objects. GC's whole contract is that an object HEAD does not
     // name is reapable, so if a loser's output were still referenced -- or if the winner's
     // were not -- the manifest and the bucket would disagree about what is live.
-    let store = Arc::new(Gated::new(6));
+    let store = Arc::new(Gated::only(6, "/HEAD"));
     let t = TenantId(5);
     drop(with_segments(&store, t, 8).await);
     store.arm();
@@ -243,7 +243,7 @@ async fn a_fold_landing_mid_compaction_is_not_swallowed_by_it() {
     // a fold publishes a new segment. Whichever wins the CAS, the loser rebases -- and if
     // the compactor rebuilds the index from the segments it *read* rather than from the
     // ones HEAD now names, the fold's rows vanish with no error anywhere.
-    let store = Arc::new(Gated::new(2));
+    let store = Arc::new(Gated::only(2, "/HEAD"));
     let t = TenantId(6);
     drop(with_segments(&store, t, 6).await);
 

@@ -967,3 +967,33 @@ impl<S: BlobStore> Engine<S> {
         Ok(absent)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_suffixed_name_is_not_a_copy() {
+        // M23: `_`, not `-`, so a segment or vector whose name was refused once never reads as
+        // a replica's copy of a source hashing to its suffix.
+        let base = "0046/tnt/70/idx/d/seg/L1/00000000000000000007-0000000000000001";
+        let seg = format!("{base}.seg");
+        let dv = format!("{seg}.{:020}-{:016x}.dv", 9, 1);
+        for n in [1, 2, 0xa] {
+            assert_eq!(carried(&crate::suffixed(&seg, n), ".seg"), None);
+            assert_eq!(carried(&crate::suffixed(&dv, n), ".dv"), None);
+        }
+        // A copy is still one.
+        assert_eq!(
+            carried(&format!("{base}-{:016x}.seg", 0xab), ".seg"),
+            Some(0xab)
+        );
+        assert_eq!(
+            carried(
+                &format!("{base}.seg.{:020}-{:016x}-{:016x}.dv", 9, 1, 0xcd),
+                ".dv"
+            ),
+            Some(0xcd)
+        );
+    }
+}

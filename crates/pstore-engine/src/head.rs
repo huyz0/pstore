@@ -250,9 +250,12 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 /// own key, then the epoch and the writer's lane.
 ///
 /// ⚠️ **With the lane** (spec review of M9c): two folders against the same HEAD both write a
-/// vector for the same segment at the same epoch, with different contents; one CAS wins, and
-/// the loser's unconditional PUT landing afterwards would overwrite the vector HEAD names --
-/// create-if-absent is not honoured everywhere, which is why segment keys carry the lane too.
+/// vector for the same segment at the same epoch, with different contents, so their keys
+/// differ by lane. ⚠️ **Corrected by M23:** the lane is not enough -- two processes on one lane
+/// reach the same key -- and "create-if-absent is not honoured everywhere", the reason this
+/// once gave for not using it, stopped being true when `require_fencing` began refusing any
+/// backend that does not honour it. A vector is now created, never replaced, and a refused name
+/// takes the next (`Engine::create_dv`).
 ///
 /// ⚠️ It keeps the segment's `/seg/` path, and that is safe only because [`key_index`] reads a
 /// key as a segment **only when it ends in `.seg`** — without that, `as_of` would resurrect a
@@ -966,5 +969,22 @@ mod tests {
         assert_eq!(unscoped(&format!("{seg}.br-616")), None);
         assert_eq!(unscoped(&format!("{seg}.br-zz")), None);
         assert_eq!(unscoped(&dv_key(&key, 3, 1)), None);
+    }
+
+    #[test]
+    fn a_suffixed_name_parses_as_its_base() {
+        // M23: a refused name takes `_{n:x}` before its extension, and every parser reads the
+        // epoch, the index and the segment exactly as from the name without it.
+        let base = "0046/tnt/70/idx/a/seg/L0/00000000000000000007-0000000000000001";
+        let (seg, seg1) = (format!("{base}.seg"), format!("{base}_1.seg"));
+        assert_eq!(key_epoch(&seg1), Some(7));
+        assert_eq!(key_index(&seg1), key_index(&seg));
+        assert_eq!(key_index(&seg1).as_deref(), Some("a"));
+        let dv = dv_key(&seg, 9, 1);
+        let dv1 = format!("{}_a.dv", dv.trim_end_matches(".dv"));
+        assert_eq!(dv_of(&dv1), Some((seg.as_str(), 9)));
+        assert_eq!(dv_of(&dv1), dv_of(&dv));
+        assert_eq!(key_index(&dv1), None);
+        assert_eq!(unscoped(&seg1), None);
     }
 }

@@ -48,6 +48,73 @@ struct Reapable {
 /// contention the caller should know about, not something to keep paying for silently.
 const MAX_COMMIT_ATTEMPTS: u32 = 24;
 
+/// How many taken names one create walks past before giving up (M23). A refusal means another
+/// process, or an earlier call, holds the name, and 16 such objects at one epoch and lane is
+/// not contention any retry fixes.
+const MAX_REFUSED_NAMES: u32 = 16;
+
+/// A segment's sidecar: how its name derives from the segment's, and its bytes (M23).
+type Sidecar = (fn(&Key) -> Key, bytes::Bytes);
+
+/// Buries each of `keys` that `next` neither names nor has buried, under its own key epoch, as
+/// M7e buries a retry's stale keys, so `as_of` never resurrects it (M19). Answers how many.
+///
+/// ⚠️ **Never a key `next` names**: a HEAD CAS answered `Contended` or `Io` may have landed,
+/// and then a name a call thinks it abandoned is live.
+fn bury_into<'k>(next: &mut Head, keys: impl IntoIterator<Item = &'k String>) -> usize {
+    let live: std::collections::HashSet<String> = next
+        .indexes
+        .values()
+        .flatten()
+        .map(|r| r.key.clone())
+        .chain(next.deletes.values().map(|(k, _)| k.clone()))
+        .chain(next.graveyard.values().flatten().cloned())
+        .collect();
+    // A set: a branch's retry can derive, and record, the same copy key twice.
+    let due: std::collections::BTreeSet<&String> =
+        keys.into_iter().filter(|k| !live.contains(*k)).collect();
+    let fallback = next.epoch.0;
+    for k in &due {
+        let born = head::dv_of(k)
+            .map(|(_, e)| e)
+            .or_else(|| head::key_epoch(k))
+            .unwrap_or(fallback);
+        next.graveyard.entry(born).or_default().push((*k).clone());
+    }
+    due.len()
+}
+
+/// The names one fold, compaction or branch call has used (M23): segments and delete vectors
+/// are created, never replaced, so a retry at an unchanged epoch takes a name past every one
+/// it has already tried, and is never refused by its own object.
+#[derive(Debug, Default)]
+struct Names {
+    /// Per base key, the next suffix to try.
+    next: std::collections::HashMap<String, u32>,
+    /// What this call created, or may have: never what it was refused.
+    written: Vec<String>,
+}
+
+impl Names {
+    /// The next name for `base`: `base` itself first, then `_{n:x}` before its extension.
+    fn take(&mut self, base: &Key) -> Key {
+        let n = self.next.entry(base.as_str().to_owned()).or_insert(0);
+        let key = suffixed(base.as_str(), *n);
+        *n += 1;
+        Key::new(key)
+    }
+}
+
+/// `key` with suffix `n` (M23): unchanged at 0, else `_{n:x}` before `.seg` or `.dv`. `_`,
+/// because `replica::carried` reads a third `-` field as a source hash.
+fn suffixed(key: &str, n: u32) -> String {
+    if n == 0 {
+        return key.to_owned();
+    }
+    let (stem, ext) = key.rsplit_once('.').unwrap_or((key, ""));
+    format!("{stem}_{n:x}.{ext}")
+}
+
 /// Why an engine operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EngineError {
@@ -1232,6 +1299,10 @@ pub struct Engine<S> {
     lane_seen: std::sync::atomic::AtomicU64,
     /// A bundle write whose outcome is unknown (M17), resolved before anything else is written.
     uncertain: Mutex<Option<Uncertain>>,
+    /// Names a fold created and its own commit did not bury (M23): its attempts were discarded
+    /// and it ended with nothing to commit, or failed. This process's next fold commit buries
+    /// them, so a fold never makes a commit of its own to bury.
+    abandoned: Mutex<Vec<String>>,
     /// Each commit this engine made, and when (M18): what a scheduled reap may take once it is
     /// old enough. Never a reap's own commit.
     reapable: Mutex<std::collections::VecDeque<Reapable>>,
@@ -1367,6 +1438,7 @@ impl<S: BlobStore> Engine<S> {
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             uncertain: Mutex::new(None),
+            abandoned: Mutex::new(Vec::new()),
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fresh: tokio::sync::Mutex::new(None),
@@ -1665,12 +1737,13 @@ impl<S: BlobStore> Engine<S> {
     /// knows nothing about.
     async fn seal(
         &self,
-        key: &Key,
+        names: &mut Names,
+        base: &Key,
         docs: &[Document],
         text_field: &str,
         fts: &FullText,
         trigram: &[String],
-    ) -> Result<(), EngineError> {
+    ) -> Result<Key, EngineError> {
         let sparse = sparse_field_of(docs);
         let wants_text = docs.iter().any(|d| {
             matches!(
@@ -1700,35 +1773,104 @@ impl<S: BlobStore> Engine<S> {
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
-        // ⚠️ Every sidecar FIRST, and before the segment is named by HEAD. A segment whose
-        // sidecar is not there yet reads as a segment whose field cannot be reconstructed —
-        // postings intact, and unreachable.
-        //
         // ⚠️ Written only when there is something in it. `Built` carries a dictionary whenever
         // the field was named, and an object per fold for an index that has no postings is a
         // request and an object that never reads back.
-        if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
-            self.store
-                .put(&pstore_format::sparse::dict_key(key), bytes::Bytes::from(d))
-                .await?;
-        }
-        if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
-            self.store
-                .put(&pstore_format::text::dict_key(key), bytes::Bytes::from(d))
-                .await?;
-        }
+        //
         // ⚠️ Absent is not an error: D-10 reads a missing centroid table as "this index is
         // below the exact-scan threshold, scan me exactly".
-        if let Some(c) = &built.centroids {
-            self.store
-                .put(
-                    &pstore_index::vec_index::centroid_key(key),
-                    bytes::Bytes::from(c.encode()),
-                )
-                .await?;
+        let mut sidecars: Vec<Sidecar> = Vec::new();
+        if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
+            sidecars.push((pstore_format::sparse::dict_key, bytes::Bytes::from(d)));
         }
-        self.store.put(key, built.segment).await?;
-        Ok(())
+        if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
+            sidecars.push((pstore_format::text::dict_key, bytes::Bytes::from(d)));
+        }
+        if let Some(c) = &built.centroids {
+            sidecars.push((
+                pstore_index::vec_index::centroid_key,
+                bytes::Bytes::from(c.encode()),
+            ));
+        }
+        // ⚠️ **The segment claims its name FIRST** (M23), and every sidecar is created under it
+        // before HEAD names the segment, so a reader still never opens one whose sidecar is
+        // missing. Sidecars first would let a process create a centroid table at a name whose
+        // segment another process then wins -- and that segment would be read with it.
+        let mut refused = 0;
+        loop {
+            let key = names.take(base);
+            if self
+                .create(names, &key, built.segment.clone(), true)
+                .await?
+            {
+                let mut all = true;
+                for (named, body) in &sidecars {
+                    // A refusal here can only be a stale orphan's: the segment is ours.
+                    if !self
+                        .create(names, &named(&key), body.clone(), false)
+                        .await?
+                    {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return Ok(key);
+                }
+            }
+            refused += 1;
+            if refused >= MAX_REFUSED_NAMES {
+                return Err(EngineError::Contended);
+            }
+        }
+    }
+
+    /// Creates a delete vector at the first name `base` has free in this call (M23).
+    async fn create_dv(
+        &self,
+        names: &mut Names,
+        base: &str,
+        body: bytes::Bytes,
+    ) -> Result<String, EngineError> {
+        let base = Key::new(base.to_owned());
+        for _ in 0..MAX_REFUSED_NAMES {
+            let key = names.take(&base);
+            if self.create(names, &key, body.clone(), true).await? {
+                return Ok(key.as_str().to_owned());
+            }
+        }
+        Err(EngineError::Contended)
+    }
+
+    /// One create-if-absent (M23): `true` when it created `key`, `false` when the name is taken
+    /// or may be. With `record`, a name this call created, or may have (an `Io`), is kept for
+    /// burial; a refused one never is, since it is another call's object.
+    async fn create(
+        &self,
+        names: &mut Names,
+        key: &Key,
+        body: bytes::Bytes,
+        record: bool,
+    ) -> Result<bool, EngineError> {
+        match self
+            .store
+            .put_conditional(key, body, pstore_blob::Precondition::NotExists)
+            .await
+        {
+            Ok(_) => {
+                if record {
+                    names.written.push(key.as_str().to_owned());
+                }
+                Ok(true)
+            }
+            Err(pstore_blob::CasError::Lost | pstore_blob::CasError::Contended) => Ok(false),
+            Err(pstore_blob::CasError::Io(e)) => {
+                if record {
+                    names.written.push(key.as_str().to_owned());
+                }
+                Err(EngineError::Blob(e))
+            }
+        }
     }
 
     /// Buffers documents. **Visible immediately**; durable at the next [`Self::flush`].
@@ -2573,6 +2715,14 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// What earlier folds left to bury (M23). A poisoned lock is recovered: a lost entry is an
+    /// object nothing names, never a wrong answer.
+    fn abandoned_mut(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Which attempt at an uncertain write landed (M17): the one whose bytes the bundle is --
     /// or, when it is absent, `None` if HEAD's watermark for this lane is not past it. Anything
     /// else is another process's: other bytes there, or one folded and reaped, whose it was
@@ -2753,12 +2903,10 @@ impl<S: BlobStore> Engine<S> {
         dest: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
     ) -> Result<Epoch, EngineError> {
-        let mut written = Vec::new();
-        let out = self
-            .branch_attempts(src, dest, interfere, &mut written)
-            .await;
+        let mut names = Names::default();
+        let out = self.branch_attempts(src, dest, interfere, &mut names).await;
         if out.is_err() {
-            self.bury_abandoned(&written).await;
+            self.bury_abandoned(&names.written).await;
         }
         out
     }
@@ -2768,7 +2916,7 @@ impl<S: BlobStore> Engine<S> {
         src: &str,
         dest: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
-        written: &mut Vec<String>,
+        names: &mut Names,
     ) -> Result<Epoch, EngineError> {
         require_fencing(&*self.store)?;
         for n in [src, dest] {
@@ -2834,10 +2982,11 @@ impl<S: BlobStore> Engine<S> {
                 };
                 let bytes = self.store.get(&Key::new(from.clone())).await?;
                 let to = head::dv_ref(dest, &r.key);
-                let key = head::dv_key(&to, next.epoch.0, self.lane.0);
-                // Recorded before the PUT, so one that fails partway is buried too (M19).
-                written.push(key.clone());
-                self.store.put(&Key::new(key.clone()), bytes).await?;
+                // Created, never replaced (M23). `create_dv` records what it created or may
+                // have, so one that fails partway is buried too (M19), and never a refused name.
+                let key = self
+                    .create_dv(names, &head::dv_key(&to, next.epoch.0, self.lane.0), bytes)
+                    .await?;
                 copies.push(key.clone());
                 next.deletes.insert(to, (key, *rows));
             }
@@ -2901,6 +3050,25 @@ impl<S: BlobStore> Engine<S> {
         &self,
         drop: Option<&str>,
         interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Folded, EngineError> {
+        let mut names = Names::default();
+        let out = self.fold_attempts(drop, interfere, &mut names).await;
+        // ⚠️ **A fold buries what its discarded attempts created** (M23). A retry at its own
+        // epoch used to overwrite its earlier segment; now that is a second object, and nothing
+        // sweeps engine keys. A commit buries them itself, at no cost; what is left -- a fold
+        // that ended with nothing to commit, or failed -- waits for this process's next one.
+        // Never a commit of its own: a fold's epochs are the ones it reports.
+        if !names.written.is_empty() {
+            self.abandoned_mut().append(&mut names.written);
+        }
+        out
+    }
+
+    async fn fold_attempts(
+        &self,
+        drop: Option<&str>,
+        interfere: Option<impl Future<Output = ()> + Send>,
+        names: &mut Names,
     ) -> Result<Folded, EngineError> {
         require_fencing(&*self.store)?;
         let mut interfere = interfere;
@@ -3108,7 +3276,7 @@ impl<S: BlobStore> Engine<S> {
                     Some(p) => p,
                     None => self.prepare(&at.head, idx, None).await?,
                 };
-                self.supersede(&mut next, prepared, ids).await?;
+                self.supersede(names, &mut next, prepared, ids).await?;
             }
             by_index.retain(|_, docs| !docs.is_empty());
 
@@ -3133,19 +3301,20 @@ impl<S: BlobStore> Engine<S> {
                     }
                     next.schemas.insert(idx.clone(), schema);
                 }
-                let seg_key = self.segment_key(next.epoch, idx);
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.
                 let sealed: Vec<Document> = docs.iter().cloned().map(stripped).collect();
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();
-                self.seal(
-                    &seg_key,
-                    &sealed,
-                    &self.text_field,
-                    &schema.fts,
-                    &schema.trigram,
-                )
-                .await?;
+                let seg_key = self
+                    .seal(
+                        names,
+                        &self.segment_key(next.epoch, idx),
+                        &sealed,
+                        &self.text_field,
+                        &schema.fts,
+                        &schema.trigram,
+                    )
+                    .await?;
                 next.indexes
                     .entry(idx.clone())
                     .or_default()
@@ -3211,8 +3380,13 @@ impl<S: BlobStore> Engine<S> {
                 f.await;
             }
 
+            // M23: what earlier attempts and earlier folds left, buried in this commit.
+            let carried: Vec<String> = self.abandoned_mut().clone();
+            bury_into(&mut next, carried.iter().chain(&names.written));
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
+                    names.written.clear();
+                    self.abandoned_mut().retain(|k| !carried.contains(k));
                     // A drop's pending rows go with it, and no cached fresh view may keep
                     // serving them. Its durable batches are all below the new watermark (the
                     // flush lock is held), so the prune below removes them.
@@ -3259,6 +3433,7 @@ impl<S: BlobStore> Engine<S> {
     /// count, not the bytes, and the fold's cost reports it.
     async fn supersede(
         &self,
+        names: &mut Names,
         next: &mut Head,
         prepared: Vec<Prepared>,
         ids: &std::collections::HashSet<String>,
@@ -3275,10 +3450,10 @@ impl<S: BlobStore> Engine<S> {
             }
             let mut rows = p.deleted;
             rows.extend(hit);
-            let key = head::dv_key(&p.key, next.epoch.0, self.lane.0);
-            self.store
-                .put(
-                    &Key::new(key.clone()),
+            let key = self
+                .create_dv(
+                    names,
+                    &head::dv_key(&p.key, next.epoch.0, self.lane.0),
                     bytes::Bytes::from(pstore_query::deletes::encode(&rows)),
                 )
                 .await?;
@@ -3631,10 +3806,12 @@ impl<S: BlobStore> Engine<S> {
     /// ⚠️ **Carries the compactor's lane**, so two nodes compacting the same inputs write
     /// to two different objects. Deriving the key from the inputs instead would be
     /// tempting — the losers would cost nothing — but it makes the second compactor
-    /// overwrite a live object unconditionally, which is Invariant I1 gone. The
-    /// create-if-absent that would fix it is exactly the precondition MinIO was *measured*
-    /// ignoring, so the fix would be silently absent on a backend we support. A wasted
-    /// object that GC reaps is the cheaper mistake.
+    /// overwrite a live object unconditionally, which is Invariant I1 gone.
+    ///
+    /// ⚠️ **Corrected by M23.** This said create-if-absent could not fix that, because MinIO was
+    /// measured ignoring it. Since `require_fencing` the engine refuses any backend whose
+    /// create-if-absent is not `Supported`, and two processes on one lane reached this key
+    /// anyway. The key is now only the first name `seal` tries: it creates, never replaces.
     fn compacted_key(&self, epoch: Epoch, index: &str) -> Key {
         Key::new(format!(
             "{:04x}/tnt/{}/idx/{index}/seg/L1/{:020}-{:016x}.seg",
@@ -3728,38 +3905,11 @@ impl<S: BlobStore> Engine<S> {
             return;
         };
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
-            let live: std::collections::HashSet<&str> = at
-                .head
-                .indexes
-                .values()
-                .flatten()
-                .map(|r| r.key.as_str())
-                .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
-                .collect();
-            let buried: std::collections::HashSet<&str> = at
-                .head
-                .graveyard
-                .values()
-                .flatten()
-                .map(String::as_str)
-                .collect();
-            // A set: a branch's retry can derive, and record, the same copy key twice.
-            let due: std::collections::BTreeSet<&String> = keys
-                .iter()
-                .filter(|k| !live.contains(k.as_str()) && !buried.contains(k.as_str()))
-                .collect();
-            if due.is_empty() {
-                return;
-            }
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
-            for k in due {
-                let born = head::dv_of(k)
-                    .map(|(_, e)| e)
-                    .or_else(|| head::key_epoch(k))
-                    .unwrap_or(next.epoch.0);
-                next.graveyard.entry(born).or_default().push(k.clone());
+            if bury_into(&mut next, keys) == 0 {
+                return;
             }
             match head::commit(&*self.store, self.tenant, &at, &next).await {
                 Ok(epoch) => {
@@ -3791,10 +3941,10 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
     ) -> Result<Option<Epoch>, EngineError> {
-        let mut written = Vec::new();
-        let out = self.compact_attempts(index, interfere, &mut written).await;
+        let mut names = Names::default();
+        let out = self.compact_attempts(index, interfere, &mut names).await;
         if !matches!(out, Ok(Some(_))) {
-            self.bury_abandoned(&written).await;
+            self.bury_abandoned(&names.written).await;
         }
         out
     }
@@ -3803,7 +3953,7 @@ impl<S: BlobStore> Engine<S> {
         &self,
         index: &str,
         interfere: Option<impl Future<Output = ()> + Send>,
-        written: &mut Vec<String>,
+        names: &mut Names,
     ) -> Result<Option<Epoch>, EngineError> {
         require_fencing(&*self.store)?;
         let at = head::read(&*self.store, self.tenant).await?;
@@ -3874,14 +4024,16 @@ impl<S: BlobStore> Engine<S> {
         // M14: a merge re-analyzes, so under the index's analyzer -- never the default.
         let schema = at.head.schemas.get(index).cloned().unwrap_or_default();
         let (fts, trigram) = (schema.fts, schema.trigram);
-        let mut out_key = self.compacted_key(at.head.epoch.next(), index);
+        let mut sealed_at = at.head.epoch.next();
+        let mut out_key = self.compacted_key(sealed_at, index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
         // ⚠️ None when every input row is deleted (M9c.2): the merge then only removes.
+        // ⚠️ `seal` records what it creates, and what it may have (an `Io`), so one that fails
+        // partway is buried too (M19) -- and never a name it was refused (M23).
         let empty = rows.is_empty();
         if !empty {
-            // Recorded before the seal, so one that fails partway is buried too (M19).
-            written.push(out_key.as_str().to_owned());
-            self.seal(&out_key, &rows, text_field, &fts, &trigram)
+            out_key = self
+                .seal(names, &out_key, &rows, text_field, &fts, &trigram)
                 .await?;
         }
         // ⚠️ **Every key this attempt and its retries have written**, so a stale one can be
@@ -3899,12 +4051,23 @@ impl<S: BlobStore> Engine<S> {
             // reconstructed as the merged segment AND both its inputs, because a segment's key
             // epoch is what says when it became live. One extra PUT on a contended compaction,
             // no rebuild, and the invariant every past epoch depends on holds by construction.
-            let want = self.compacted_key(at.head.epoch.next(), index);
-            if want != out_key && !empty {
-                written.push(want.as_str().to_owned());
-                self.seal(&want, &rows, text_field, &fts, &trigram).await?;
+            // ⚠️ **Epochs compared, not keys** (M23): a name carries a suffix once one was
+            // refused, and comparing keys would re-seal on every retry at an unchanged epoch.
+            let want = at.head.epoch.next();
+            if want != sealed_at && !empty {
+                let key = self
+                    .seal(
+                        names,
+                        &self.compacted_key(want, index),
+                        &rows,
+                        text_field,
+                        &fts,
+                        &trigram,
+                    )
+                    .await?;
                 stale.push(out_key.clone());
-                out_key = want;
+                out_key = key;
+                sealed_at = want;
             }
             let out = SegmentRef {
                 key: out_key.as_str().to_owned(),

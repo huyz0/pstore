@@ -6,22 +6,16 @@ overwritten segment breaks.
 
 ## What is true today
 
-- Four kinds of object are keyed by the writer's `(epoch, lane)` and written with an
-  unconditional `put`:
-  - a fold's L0 segment (`segment_key`);
-  - a compaction's L1 segment (`compacted_key`);
-  - a delete vector (`head::dv_key`), written by a fold's `supersede` and by a branch's copies.
+- A fold's L0 segment (`segment_key`), a compaction's L1 segment (`compacted_key`) and a delete
+  vector (`head::dv_key`, written by `supersede` and by a branch's copies) are keyed by the
+  writer's `(epoch, lane)`, at `HEAD.epoch + 1`, and written with an unconditional `put`.
 - A segment's sidecars are named after it, and `seal` writes them **before** the segment: the
   sparse and text dictionaries, and the centroid table.
-- The epoch is `HEAD.epoch + 1` at the HEAD the attempt read.
-- Two processes on one lane can reach the same key:
-  - a process pauses after its HEAD read;
-  - its restarted successor commits at that key;
-  - when the first one wakes, its `put` replaces a segment HEAD names, with other rows;
-  - those rows are acknowledged and folded, and are gone with no error.
-- The same happens within one process. A retry against an unchanged HEAD (after `Contended`,
-  or a later fold after an `Io`) re-seals the same key, and an earlier attempt's PUT that lands
-  late replaces the retry's.
+- Two processes on one lane can reach the same key. One pauses after its HEAD read; its restarted
+  successor commits at that key; when the first wakes, its `put` replaces a segment HEAD names,
+  with other rows. Those rows were acknowledged and folded, and are gone with no error.
+- Within one process, a retry against an unchanged HEAD re-seals the same key, and an earlier
+  attempt's PUT landing late replaces the retry's.
 - Two comments justify the unconditional `put` by "create-if-absent is not honoured everywhere"
   (`head.rs` above `dv_key`; `compacted_key`). That stopped being true with `require_fencing`,
   which refuses any backend whose `create_if_absent` is not `Supported`. M17's bundles rely on it.
@@ -34,7 +28,6 @@ Precondition::NotExists)`, through one engine helper that picks the object's **n
 - **Name `n`:** `n = 0` is today's key, unchanged. Each `n ≥ 1` appends `_{n:x}` to the
   stem: `…/seg/L0/{epoch:020}-{lane:016x}_{n:x}.seg` and `{segment}.{epoch:020}-{lane:016x}_{n:x}.dv`.
   `_` because `carried` (replica.rs) reads a third `-` field as a source hash.
-- **Created:** the name is this attempt's.
 - **`Lost` or `Contended`:** the name is taken, or may be. The next name is tried at once, with no
   read. A refusal is never an error and never a reason to re-read HEAD.
 - **The next name is carried across an operation's attempts** (spec review B1). Each fold,
@@ -63,9 +56,19 @@ It is removed from that record and never buried. An `Io` name stays recorded, as
 it may be another process's, and `bury_abandoned`'s live filter is what keeps it once committed.
 **A fold now buries too** (spec review m2). Today a retry at its own epoch overwrites its earlier
 segment, and nothing sweeps engine keys (M6e's `sweep` is the catalog's). Under M23 that earlier
-segment would leak. So a fold records each name it creates, and when it returns, it buries those
-its committed HEAD does not name, through `bury_abandoned`: one read and one commit, only after a
-discarded attempt. This also buries what a lost-CAS retry leaves, which leaks today.
+segment would leak. So a fold records each name it creates, and buries what it no longer needs.
+This also buries what a lost-CAS retry leaves, which leaks today.
+- ⚠️ **Amended at implementation: in its own commit, never a commit of its own.** As specified, a
+  burial commit after the fold, through `bury_abandoned`, broke two tests. They pin that the epochs
+  folds report have no gaps (`engine.rs` `concurrent_committers_lose_and_duplicate_nothing`,
+  `linearizability.rs` `one_hundred_writers_produce_a_dense_epoch_sequence`), and a burial commit
+  is an epoch no fold reports.
+- The names go into the graveyard of the commit the fold makes anyway, each under its own key
+  epoch, as compaction buries its stale keys. Before that, any name that commit names, or has
+  already buried, is dropped.
+- A fold that ends with nothing to commit, or fails, keeps its names in the engine. This
+  process's next fold commit buries them. A process that never commits again leaks them, which
+  every such name does today.
 
 **Comments.** The two that cite "not honoured everywhere" are corrected to cite `require_fencing`.
 
@@ -83,10 +86,13 @@ discarded attempt. This also buries what a lost-CAS retry leaves, which leaks to
 - `retry_ceiling.rs` (both) and `pstore-testkit` `Gated` (`compaction.rs`'s races): they race or
   refuse **HEAD's** CAS, and every conditional write now includes segment creates first. They are
   narrowed to the HEAD key, which keeps the commit loop the thing under test.
-  - ⚠️ **`retry_ceiling` asserts an exact count** (spec review round 2): the commit's attempts
-    plus the burial's, 2 × `MAX_COMMIT_ATTEMPTS`, for the fold and the compaction alike. Its
-    `refused() > 1` would pass a commit loop that never retried, since the burial's own attempts
-    are refused too. This strengthens the compaction test as well, which has the same hole today.
+  - ⚠️ **`retry_ceiling` asserts an exact count** (spec review round 2). For the compaction it is
+    its commit's attempts plus its burial's, 2 × `MAX_COMMIT_ATTEMPTS`. For the fold it is
+    `MAX_COMMIT_ATTEMPTS`, since a fold makes no burial commit (amended above). `refused() > 1`
+    passes a commit loop that never retried once the burial's attempts are refused too. The
+    compaction test had the same hole before M23, and this closes it.
+  - `Gated` gains `Gated::only(n, suffix)`, and `compaction.rs` uses it with `"/HEAD"`. Its other
+    users gate catalog keys, so narrowing `Gated::new` itself would break them.
 
 **Not changed:**
 - **Bundles:** M17's.
@@ -129,7 +135,8 @@ discarded attempt. This also buries what a lost-CAS retry leaves, which leaks to
     `as_of`, reaped by GC once buried past retention, and not mistaken for a replica copy.
 11. **A fold buries what its discarded attempts created.** A fold retried at its own epoch, and one
    retried after a lost CAS, each leave every created name either in its committed HEAD or in the
-   graveyard, and GC reaps the rest.
+   graveyard, with no commit of their own, and GC reaps the rest. A fold left with nothing to
+   commit buries its names at this process's next fold commit.
 12. **Gates.** `./scripts/gates.sh` is green, and the mutation sweep over M23's source diff
     misses 0, every miss closed by a test or named as equivalent.
 
@@ -165,7 +172,7 @@ seal identical bytes. 4 needs two sources sharing a segment with different vecto
 |---|---|---|---|---|---|
 | Fold, compaction, branch, uncontended | unchanged: each PUT becomes a conditional PUT | unchanged | unchanged | 0 | unchanged |
 | Each refused name | **+1**, plus any sidecar already created under it | 0 | 0 | 0 | +1 write round |
-| A fold with a discarded attempt | +1 commit (the burial) | +1 (HEAD) | 0 | 0 | after the fold returns |
+| A fold with a discarded attempt | unchanged: buried in its own, or the next, commit | 0 | 0 | 0 | unchanged |
 
 Queries are untouched. HEAD's bytes grow only by the 2+ characters of a suffix, and only after a
 refusal.

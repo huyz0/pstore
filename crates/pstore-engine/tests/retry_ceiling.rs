@@ -29,7 +29,11 @@ use pstore_types::{CasTag, LaneId, TenantId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A correct store whose conditional writes start contending once armed.
+/// A correct store whose HEAD commits start contending once armed.
+///
+/// ⚠️ **HEAD only** (M23). Segments are created with a conditional write too, so contending
+/// every conditional write would stop a fold or a compaction at its seal, and the commit loop
+/// this file exists to pin would never run.
 ///
 /// ⚠️ `Flaky::always_contended` cannot do this: the setup a compaction needs — two folds, each
 /// a CAS — has to succeed before the contention starts.
@@ -88,7 +92,7 @@ impl BlobStore for ArmedContention {
         body: Bytes,
         pre: Precondition,
     ) -> Result<PutOutcome, CasError> {
-        if self.armed.load(Ordering::Relaxed) {
+        if self.armed.load(Ordering::Relaxed) && key.as_str().ends_with("/HEAD") {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return Err(CasError::Contended);
         }
@@ -143,10 +147,13 @@ async fn a_compaction_that_keeps_contending_reports_contention_not_a_lost_race()
         "the loop ran out of attempts and reported {err:?} rather than what it actually saw. \
          `Lost` tells the caller to rebase against a HEAD that never moved"
     );
-    assert!(
-        store.refused() > 1,
-        "the compaction gave up after {} refusal(s): it reported the right error from a loop \
-         that never retried, which is what a guard mutated to `false` also does",
+    // ⚠️ **Exactly**, not `> 1` (M23 spec review): the compaction's 24 commit attempts, then
+    // its burial's 24. A commit loop that never retried scores 1 + 24, which `> 1` passed.
+    assert_eq!(
+        store.refused(),
+        2 * 24,
+        "the compaction gave up after {} refusal(s): a loop that never retried reports the \
+         right error too, which is what a guard mutated to `false` does",
         store.refused()
     );
 }
@@ -172,10 +179,13 @@ async fn a_fold_that_keeps_contending_reports_contention_not_a_lost_race() {
         matches!(err, EngineError::Contended),
         "the fold loop reported {err:?} rather than what it saw"
     );
-    assert!(
-        store.refused() > 1,
-        "the fold gave up after {} refusal(s): it reported the right error from a loop \
-         that never retried, which is what a guard mutated to `false` also does",
+    // ⚠️ **Exactly** (M23): a fold's 24 commit attempts and nothing more, since a fold never
+    // commits a burial of its own.
+    assert_eq!(
+        store.refused(),
+        24,
+        "the fold gave up after {} refusal(s): a loop that never retried reports the right \
+         error too, which is what a guard mutated to `false` does",
         store.refused()
     );
 }
