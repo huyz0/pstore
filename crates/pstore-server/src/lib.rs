@@ -96,18 +96,22 @@ type Tenant<S> = Engine<Caching<TenantView<S>>>;
 
 /// One process's serving state: the store, the lane it writes on, and one engine per tenant.
 ///
-/// ⚠️ **One `Engine` per tenant, held forever.** The engine owns the memtable that makes a
-/// write visible before it is folded, so it cannot be rebuilt per request — and evicting one
-/// with unflushed rows would discard acknowledged writes. The eviction policy is therefore a
-/// decision about the durability contract, and M7c deliberately does not make it: the
-/// registry is unbounded and the spec says so.
+/// ⚠️ **One `Engine` per tenant, held while it holds anything a restart would lose.** The
+/// engine owns the memtable that makes a write visible before it is folded, so it cannot be
+/// rebuilt per request -- and evicting one with unflushed rows would discard acknowledged
+/// writes. M7c left the registry unbounded rather than decide that; M26 bounds it at
+/// `PSTORE_ENGINES`, dropping only engines that are idle (`Engine::is_idle`), held by no
+/// request, and owed no fold or reap.
 #[derive(Debug)]
 pub struct Api<S> {
     store: Accounted<S>,
     lane: LaneId,
     /// The read cache every tenant's view shares, or `None` for an uncached server (M20).
     cache: Option<Arc<CacheCore>>,
-    engines: tokio::sync::Mutex<HashMap<TenantId, Arc<Tenant<S>>>>,
+    /// Each tenant's engine and when a request last asked for it (M26).
+    engines: tokio::sync::Mutex<HashMap<TenantId, Slot<S>>>,
+    /// The registry's cap, `0` for none, and the state of its eviction loop (M26).
+    registry: Mutex<Registry>,
     /// What `GET /metrics` reports about this process's own traffic.
     ///
     /// ⚠️ **On the `Api`, not in a static.** A process-global counter would make the refusal
@@ -125,6 +129,36 @@ pub struct Api<S> {
     /// Replication (M22): its policy and named sources, the register of tenants with running
     /// replications, and what this process's worker holds.
     replicating: replication::Replicating<S>,
+}
+
+/// One tenant's engine in the registry (M26).
+#[derive(Debug)]
+struct Slot<S> {
+    engine: Arc<Tenant<S>>,
+    used: tokio::time::Instant,
+}
+
+/// The registry's cap and its eviction loop's state (M26).
+#[derive(Debug, Default)]
+struct Registry {
+    /// `PSTORE_ENGINES`: past it, idle engines are dropped. `0` for unbounded.
+    cap: usize,
+    /// Whether a reap loop runs: only then does a reapable commit keep an engine.
+    reaping: bool,
+    /// No scan before this, after one that freed nothing; and how long it waited.
+    next_scan: Option<tokio::time::Instant>,
+    backoff: std::time::Duration,
+    evicted: u64,
+    scans: u64,
+}
+
+/// What one eviction pass did (M26).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvictTick {
+    /// Whether it scanned the registry.
+    pub scanned: bool,
+    /// Engines it dropped.
+    pub evicted: usize,
 }
 
 /// When a scheduled fold runs (M9i.1): D-39's triggers, size or age, never a fixed timer.
@@ -259,6 +293,7 @@ impl<S: BlobStore + 'static> Api<S> {
             lane,
             cache,
             engines: tokio::sync::Mutex::new(HashMap::new()),
+            registry: Mutex::new(Registry::default()),
             http: Mutex::new(Http::default()),
             backoff: Mutex::new(HashMap::new()),
             requested: Mutex::new(std::collections::HashSet::new()),
@@ -317,7 +352,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .lock()
             .await
             .iter()
-            .map(|(t, e)| (*t, Arc::clone(e)))
+            .map(|(t, s)| (*t, Arc::clone(&s.engine)))
             .collect();
         let now = tokio::time::Instant::now();
         let mut tick = ReapTick::default();
@@ -390,7 +425,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .lock()
             .await
             .iter()
-            .map(|(t, e)| (*t, Arc::clone(e)))
+            .map(|(t, s)| (*t, Arc::clone(&s.engine)))
             .collect();
         let now = tokio::time::Instant::now();
         let mut tick = FoldTick::default();
@@ -431,7 +466,10 @@ impl<S: BlobStore + 'static> Api<S> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&tenant);
-                Some((tenant, requested, engine.fold_committed().await))
+                // M26: the engine travels with its result, held until the mark is put back --
+                // an engine no request holds and no mark owes is one eviction may drop.
+                let outcome = engine.fold_committed().await;
+                Some((tenant, requested, outcome, engine))
             })
             .buffer_unordered(FOLD_CONCURRENCY)
             .filter_map(std::future::ready)
@@ -441,7 +479,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .backoff
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (tenant, requested, outcome) in results {
+        for (tenant, requested, outcome, _held) in results {
             if requested && outcome.is_err() {
                 self.requested
                     .lock()
@@ -536,16 +574,130 @@ impl<S: BlobStore + 'static> Api<S> {
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
         let mut engines = self.engines.lock().await;
-        Arc::clone(engines.entry(tenant).or_insert_with(|| {
-            Arc::new(Engine::new(
+        let slot = engines.entry(tenant).or_insert_with(|| Slot {
+            engine: Arc::new(Engine::new(
                 Arc::new(Caching::over(
                     Arc::new(self.store.as_tenant(tenant)),
                     self.cache.clone(),
                 )),
                 tenant,
                 self.lane,
-            ))
-        }))
+            )),
+            used: tokio::time::Instant::now(),
+        });
+        // M26: the only thing the registry's cap adds to a request.
+        slot.used = tokio::time::Instant::now();
+        Arc::clone(&slot.engine)
+    }
+
+    /// The engine for `tenant`, held as a request would hold it (M26's tests).
+    #[doc(hidden)]
+    pub async fn hold_engine_for_test(&self, tenant: TenantId) -> Arc<Tenant<S>> {
+        self.engine(tenant).await
+    }
+
+    /// Caps the registry at `cap` engines, `0` for unbounded (M26, `PSTORE_ENGINES`): past it,
+    /// the eviction loop drops the least recently used idle engines.
+    pub fn limit_engines(&self, cap: usize) {
+        self.registry_mut().cap = cap;
+    }
+
+    /// Whether a reap loop runs (M26): only then does a reapable commit keep an engine, since
+    /// nothing else would ever collect it. [`serve_folding`] sets it.
+    pub fn set_reaping(&self, on: bool) {
+        self.registry_mut().reaping = on;
+    }
+
+    /// Engines the registry holds.
+    pub async fn engines(&self) -> usize {
+        self.engines.lock().await.len()
+    }
+
+    /// Engines evicted, and eviction scans made, since the process started.
+    #[must_use]
+    pub fn eviction_counts(&self) -> (u64, u64) {
+        let r = self.registry_mut();
+        (r.evicted, r.scans)
+    }
+
+    fn registry_mut(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this server owes `tenant` a fold a refused `strong` read asked for (M9i.2): the
+    /// one thing it owes that its engine does not hold.
+    ///
+    /// ⚠️ **A backoff needs no check of its own** (mutation sweep): a fold that failed keeps
+    /// its own rows unfolded, or its request marked again, and a reap that failed keeps its
+    /// reapable records -- each of which keeps the tenant already.
+    fn owed(&self, tenant: TenantId) -> bool {
+        self.requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&tenant)
+    }
+
+    /// One eviction pass (M26): past the cap, drops idle engines no request holds, least
+    /// recently used first, down to `cap - cap / 10`. Memory only: no blob request.
+    ///
+    /// ⚠️ **Idle** is what a restart of this tenant alone would lose nothing to, and **held** --
+    /// an `Arc` beyond the registry's own -- is a request in flight: dropping that one would let
+    /// the next request build a second engine on the same lane in one process. Both are read
+    /// under the registry's lock, which every way of reaching an engine takes.
+    #[doc(hidden)]
+    pub async fn evict_tick(&self) -> EvictTick {
+        let now = tokio::time::Instant::now();
+        let (cap, reaping) = {
+            let r = self.registry_mut();
+            if r.cap == 0 || r.next_scan.is_some_and(|at| now < at) {
+                return EvictTick::default();
+            }
+            (r.cap, r.reaping)
+        };
+        let mut engines = self.engines.lock().await;
+        if engines.len() <= cap {
+            return EvictTick::default();
+        }
+        let target = cap - cap / 10;
+        let mut idle: Vec<(tokio::time::Instant, TenantId)> = Vec::new();
+        let mut held_idle = false;
+        for (t, s) in engines.iter() {
+            if !s.engine.is_idle(reaping) || self.owed(*t) {
+                continue;
+            }
+            if Arc::strong_count(&s.engine) > 1 {
+                held_idle = true;
+            } else {
+                idle.push((s.used, *t));
+            }
+        }
+        idle.sort_unstable();
+        let n = (engines.len() - target).min(idle.len());
+        for (_, t) in idle.iter().take(n) {
+            engines.remove(t);
+        }
+        drop(engines);
+        let mut r = self.registry_mut();
+        r.scans += 1;
+        r.evicted += n as u64;
+        // ⚠️ A pass that freed nothing backs off -- unless it found an idle engine held, which
+        // another tick's snapshot may have been holding a moment.
+        if n == 0 && !held_idle {
+            r.backoff = (r.backoff * 2).clamp(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(60),
+            );
+            r.next_scan = Some(now + r.backoff);
+        } else {
+            r.backoff = std::time::Duration::ZERO;
+            r.next_scan = None;
+        }
+        EvictTick {
+            scanned: true,
+            evicted: n,
+        }
     }
 
     /// What `tenant` has spent so far, as the pair every handler diffs.
@@ -776,6 +928,15 @@ async fn duties() -> Response {
 /// endpoint that reads the store is a load generator pointed at the thing it measures.
 async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Response {
     let mut out = String::new();
+    // M26: the engine registry.
+    let (evicted, _) = api.eviction_counts();
+    out.push_str(&format!(
+        "# HELP pstore_engines Engines the registry holds.\n# TYPE pstore_engines gauge\n\
+         pstore_engines {}\n\
+         # HELP pstore_engines_evicted_total Idle engines dropped past PSTORE_ENGINES.\n\
+         # TYPE pstore_engines_evicted_total counter\npstore_engines_evicted_total {evicted}\n",
+        api.engines().await
+    ));
     out.push_str(
         "# HELP pstore_blob_requests_total Blob requests by class.
 ",
@@ -2950,6 +3111,8 @@ pub struct Config {
     pub replication: Option<ReplicationPolicy>,
     /// The named remote stores a replication may read, from `PSTORE_SOURCES` (M22).
     pub sources: Vec<SourceConfig>,
+    /// The engine registry's cap, from `PSTORE_ENGINES` (M26): 10 000 by default, `0` for none.
+    pub engines: usize,
 }
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
@@ -3078,6 +3241,9 @@ pub enum ConfigError {
     /// A replication source that is not fully configured (M22).
     #[error("replication source {0:?}: {1}")]
     Source(String, &'static str),
+    /// `PSTORE_ENGINES` that is not a count (M26).
+    #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
+    Engines(String),
 }
 
 impl Config {
@@ -3120,6 +3286,10 @@ impl Config {
             cache: cache_config(&get, backend)?,
             replication: replication_policy(&get)?,
             sources: source_configs(&get)?,
+            engines: match get("PSTORE_ENGINES") {
+                None => 10_000,
+                Some(v) => v.parse().map_err(|_| ConfigError::Engines(v))?,
+            },
         })
     }
 }
@@ -3405,6 +3575,22 @@ pub async fn run_reaps<S: BlobStore + 'static>(
     }
 }
 
+/// Runs an eviction pass once a second until `stop` resolves (M26): whenever the registry has
+/// a cap, whatever the fold, reap and replication loops are doing.
+pub async fn run_evictions<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    stop: impl std::future::Future<Output = ()> + Send,
+) {
+    tokio::pin!(stop);
+    loop {
+        api.evict_tick().await;
+        tokio::select! {
+            () = &mut stop => return,
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 /// [`serve`], with the scheduled fold running beside it when `fold` is set (M9i.1), and the
 /// scheduled reap when `gc` is (M18). One signal stops all three, and both loops have returned
 /// before this does.
@@ -3421,6 +3607,14 @@ pub async fn serve_folding<S: BlobStore + 'static>(
 ) -> std::io::Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let tx = Arc::new(tx);
+    // M26: its own loop, never riding the fold or reap loops, either of which may be off.
+    api.set_reaping(gc.is_some());
+    let evictions = {
+        let mut rx = rx.clone();
+        tokio::spawn(run_evictions(Arc::clone(&api), async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+        }))
+    };
     let folds = fold.map(|policy| {
         let mut rx = rx.clone();
         tokio::spawn(run_folds(Arc::clone(&api), policy, async move {
@@ -3457,6 +3651,7 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     if let Some(r) = replication {
         let _ = r.await;
     }
+    let _ = evictions.await;
     served
 }
 

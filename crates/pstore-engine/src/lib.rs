@@ -2918,6 +2918,35 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
+    /// Whether a restart of this tenant alone would lose nothing (M26): no unflushed or unfolded
+    /// rows, no uncertain write, no name to bury, no taken lane, and -- when `count_reapable`,
+    /// because a reap loop runs that would collect it -- no reapable commit. From memory only.
+    #[must_use]
+    pub fn is_idle(&self, count_reapable: bool) -> bool {
+        {
+            let m = self.mem();
+            if !m.pending.is_empty() || !m.durable.is_empty() {
+                return false;
+            }
+        }
+        // M17: a lane known to be taken refuses every flush; a rebuilt engine would forget it.
+        let taken = self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|r| self.lane_seen.load(std::sync::atomic::Ordering::SeqCst) > r.next.0);
+        if taken || self.uncertain().is_some() || !self.abandoned_mut().is_empty() {
+            return false;
+        }
+        !count_reapable
+            || self
+                .reapable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
     /// The rows `index`'s quarantine holds (M25), or `None` when no such index exists.
     ///
     /// # Errors

@@ -102,6 +102,24 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
 A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
 HMAC keys. It is only ever read.
 
+## The engine registry
+
+A server keeps one engine per tenant it has served. Since M26, `PSTORE_ENGINES` caps them: 10 000
+by default, `0` for no cap. Once a second, while the registry is over the cap, the server drops
+the least recently used engines that hold nothing a restart would lose, down to 90% of the cap.
+
+What it never drops:
+- an engine holding unflushed or unfolded rows, an unresolved bundle write, objects to bury, or a
+  lane another process has taken;
+- an engine with commits the scheduled reap has yet to collect, while `PSTORE_GC` is on: a tenant
+  that commits stays for about the reap age after;
+- an engine a `strong` read has asked a fold of, or one a request is using.
+
+The cap is soft. A server whose busy tenants alone exceed it stays over, and scans at most once
+a minute. `pstore_engines` and `pstore_engines_evicted_total` in `/metrics` show the size and the
+churn. A dropped tenant's next request costs what a restart costs it: a HEAD read, and on its
+first flush the lane probes.
+
 ## Quarantined rows
 
 A fold refuses a row that contradicts its index's schema, and keeps going: a race between two

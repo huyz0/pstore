@@ -121,6 +121,7 @@ async fn run<S: BlobStore + 'static>(
             return std::process::ExitCode::FAILURE;
         }
     };
+    api.limit_engines(config.engines);
     let mut sources = std::collections::BTreeMap::new();
     for s in &config.sources {
         match source(s) {

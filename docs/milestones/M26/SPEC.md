@@ -37,6 +37,9 @@ eviction a restart of that tenant alone would make, losing nothing.**
   - the lane is not known to be taken (M17's sticky refusal).
 - **And the server's own marks** (spec review minor 1): a tenant a refused `strong` read asked a
   fold of (M9i.2), or whose fold or reap is backing off, is busy too.
+  - ⚠️ Amended at implementation: only the request is a mark of its own. A fold backing off
+    keeps its own rows unfolded or its request marked again, and a reap backing off keeps its
+    reapable records, so each is already busy. A separate backoff check survived every mutation.
 - **In use** is never evicted. The registry holds each engine in an `Arc`, and one whose
   `strong_count` is above 1 has a request in flight. Dropping it would let the next request build
   a second engine on the same lane in one process.
