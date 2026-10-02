@@ -1198,3 +1198,78 @@ async fn a_renewal_keeps_a_claim_made_for_the_worker_before_it_adopts_it() {
         "the renewal released a claim the worker had not adopted yet"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_scan_notices_a_new_replication_on_a_tenant_it_holds() {
+    // One shard, so a scan reaches it every `scan`, well before the next renewal at `ttl / 3`.
+    let world = World::new();
+    let one = ReplicationPolicy {
+        shards: 1,
+        ..policy()
+    };
+    let api = world.api_with(1, one);
+    let control = world.api_with(9, one);
+    write(&api, SRC, "src", 0..6).await;
+    let src = json!({"index": "src", "tenant": SRC.to_string()});
+    create(&control, DST, "dst", src.clone()).await;
+    let mut w = Worker::default();
+    // Claimed by the start scan, synced and committed in one tick.
+    let r0 = world.acct.count(TenantId(0), OpClass::Read);
+    let tick = api.replication_tick(&mut w).await;
+    // The register's CONFIG and its one shard, read once: no renewal of the claim just taken.
+    assert_eq!(world.acct.count(TenantId(0), OpClass::Read) - r0, 2);
+    assert_eq!(
+        (tick.claimed, tick.synced, tick.committed),
+        (1, 1, 1),
+        "{tick:?}"
+    );
+    // A claim taken by a scan is next renewed `ttl / 3` on: nothing written a second later.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let w0 = world.acct.count(TenantId(0), OpClass::Write);
+    api.replication_tick(&mut w).await;
+    assert_eq!(world.acct.count(TenantId(0), OpClass::Write), w0);
+    // A second replication, created where no worker runs: the entry's `gen` moves, its claim
+    // stays this worker's, and the next scan -- not the renewal -- sends it to HEAD again.
+    create(&control, DST, "dst2", src).await;
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        api.replication_tick(&mut w).await;
+    }
+    assert_eq!(rows(&api, DST, "dst2").await.unwrap().len(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_notes_are_written_at_most_once_a_renewal_period() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..4).await;
+    create(
+        &api,
+        DST,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let mut w = Worker::default();
+    api.replication_tick(&mut w).await;
+    let (_, b) = status(&api, DST, "dst").await;
+    let first = b["last_commit_ms"]
+        .as_u64()
+        .expect("the first commit is noted at once");
+    // A second commit seconds later: noted in memory, not yet written.
+    write(&api, SRC, "src", 4..8).await;
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        api.replication_tick(&mut w).await;
+    }
+    assert_eq!(rows(&api, DST, "dst").await.unwrap().len(), 8);
+    let (_, b) = status(&api, DST, "dst").await;
+    assert_eq!(b["last_commit_ms"].as_u64(), Some(first), "{b}");
+    // A renewal period on, the next sync writes it.
+    for _ in 0..70 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        api.replication_tick(&mut w).await;
+    }
+    let (_, b) = status(&api, DST, "dst").await;
+    assert!(b["last_commit_ms"].as_u64().unwrap() > first, "{b}");
+}
