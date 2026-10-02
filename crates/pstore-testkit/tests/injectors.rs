@@ -309,3 +309,28 @@ async fn an_injected_error_says_it_was_injected() {
         "an injected failure surfaced as {e}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn only_gates_the_named_keys() {
+    // M23: the engine's commit races gate HEAD only, since a segment is a conditional write
+    // too. A key that does not match passes straight through, alone, and a lone matching
+    // write is held for a peer that never comes, and gives up.
+    let s = Gated::only(2, "/HEAD");
+    s.arm();
+    s.put_conditional(
+        &k("t/idx/seg/L0/1-1.seg"),
+        Bytes::from_static(b"x"),
+        Precondition::NotExists,
+    )
+    .await
+    .unwrap();
+    assert!(s.raced(), "a segment create was held");
+    s.put_conditional(
+        &k("t/HEAD"),
+        Bytes::from_static(b"h"),
+        Precondition::NotExists,
+    )
+    .await
+    .unwrap();
+    assert!(!s.raced(), "a lone HEAD write was not held");
+}

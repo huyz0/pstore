@@ -117,11 +117,17 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 44 | ⚠️ **A process paused between its HEAD read and its segment PUT can overwrite a live segment.** Segment keys derive from the epoch and the lane, and a segment PUT is unconditional. A process that pauses there, on a lane whose restarted successor has since committed that key, overwrites it with other rows when it wakes. Found by M20's spec review. The read cache makes the damage last longer; it does not create it. The fix is the one bundles got in M17: create segments if absent, and treat a refusal as another writer. | [M20](M20/SPEC.md) | M |
+| ~~44~~ | **CLOSED by [M23](M23/VERIFIED.md)**: segments, their sidecars and delete vectors are created, never replaced; a refused name takes the next (`_{n}`), and the segment claims its name before its sidecars. ~~⚠️ **A process paused between its HEAD read and its segment PUT can overwrite a live segment.** Segment keys derive from the epoch and the lane, and a segment PUT is unconditional. A process that pauses there, on a lane whose restarted successor has since committed that key, overwrites it with other rows when it wakes. Found by M20's spec review. The read cache makes the damage last longer; it does not create it. The fix is the one bundles got in M17: create segments if absent, and treat a refusal as another writer.~~ | [M20](M20/SPEC.md) | M |
 | 45 | **The memory tier's LRU is a `Vec`**, whose touch is O(entries). Since M20 one core is shared by every tenant, so this is a cost that grows with the whole node's working set, not a correctness issue. | [M20](M20/SPEC.md) | S |
 | 46 | ⚠️ **A vector query pays a read per small segment for a centroid table that does not exist.** Below `EXACT_SCAN_THRESHOLD` (25,000 rows) a segment has no `.cen`, and the query learns that from a 404, every time. A read cache cannot keep a 404, since only an object can be validated, so this survives M20 and is most of a warm query's cost for most tenants. The fix is a **format** change: a segment's footer says whether its centroid table exists. | [M20](M20/SPEC.md) | S |
 | 47 | **A scan's miss claims the bulk singleflight gate and admits nothing**, so bulk readers waiting on it wake to a miss and each fetch again: N concurrent misses cost 1 + N requests instead of 1. A claim-free fetcher also removes whichever gate is there, possibly a later claimant's. Found by M20's code review as a minor; rare today, since a query and a scan share no range (M20 criterion 9's amendment). The fix: a scan fetches without claiming, and only the claimant removes its gate. | [M20](M20/SPEC.md) | S |
 | 48 | **The disk tier's lookup hash is std's `Hash` over `Id`**, which Rust does not promise is stable across releases. A toolchain upgrade that changes it makes every recovered entry miss: never wrong bytes, since foyer checks the key on load, but a silent full flush. Hash `Id` by hand over its structural encoding. Found by M20's code review. | [M20](M20/SPEC.md) | S |
+
+## Opened by M23
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 49 | **A compaction that commits can leak a segment whose sidecar create was refused.** `seal` abandons a name when a sidecar is refused, and moves on; the segment it created there stays in the call's record, which a compaction buries only when it does not commit. A refused sidecar needs a stale orphan under a name the segment won, so this is rare. The fix is the fold's: bury the call's record in the commit, through `bury_into`. Found by M23's code review as a minor. | [M23](M23/VERIFIED.md) | S |
 
 ## Opened by M19
 

@@ -657,6 +657,16 @@ async fn a_fold_left_with_nothing_buries_at_its_next_commit() {
         "the next commit did not bury {}",
         left[0]
     );
+    // Buried once and forgotten: reaped, it is never buried again by a later commit.
+    w.w.gc(0).await.unwrap();
+    assert!(!graveyard(&w.head().await).contains(&left[0]));
+    w.put("idx", &["c"]).await;
+    w.a.fold().await.unwrap();
+    assert!(
+        !graveyard(&w.head().await).contains(&left[0]),
+        "{} was buried again after it was reaped",
+        left[0]
+    );
 }
 
 #[tokio::test]

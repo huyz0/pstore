@@ -516,6 +516,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M20 | **A read cache that survives a restart** ([SPEC](../../milestones/M20/SPEC.md)): the disk tier D-23 calls mandatory, behind the memory tier, wired into the server | The server wires in no read cache at all (`pstore-cache` is unused), and a restart flushes whatever a node holds. Tested on a local directory: correctness needs a disk, not NVMe, and any number measured there is `provisional` |
 | M21 | **`hint_cache_warm`** ([VERIFIED](../../milestones/M21/VERIFIED.md)): `POST /v1/indexes/{index}/warm`, metadata only (D-44) | Needs M20's tier to warm. ⚠️ Was M17, then M20: backlog rows that lose or leak data went first, then the tier it warms |
 | M22 | **Replication jobs** ([VERIFIED](../../milestones/M22/VERIFIED.md)): an index follows another, across tenants or buckets, pulled by workers that find work in a register in the bucket | Asked for. ⚠️ Not the "read-only replicas" declined below: those give a node ownership of data; these are indexes in a HEAD, and no node owns anything |
+| M23 | **A segment is created, never replaced** ([VERIFIED](../../milestones/M23/VERIFIED.md)): segments, sidecars and delete vectors are written create-if-absent, and a refused name takes the next | [BACKLOG](../../milestones/BACKLOG.md) row 44: a paused process could replace a live segment with other rows, losing acknowledged writes. Data loss first, as M17 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
