@@ -291,6 +291,14 @@ async fn claim_honours_room_and_never_counts_its_own() {
         .filter(|e| e.claim.is_none())
         .count();
     assert_eq!(free, 3);
+    // Lapsed, it is still its own: re-taken whatever the room, and not counted against it.
+    let held = reg.claim(0, 1, 2 * TTL, TTL, 0).await.unwrap();
+    assert!(held.contains_key("own"), "{held:?}");
+    assert_eq!(
+        held["own"].claim.unwrap().expires_ms,
+        3 * TTL,
+        "re-taken, not left lapsed"
+    );
 }
 
 #[tokio::test]
@@ -586,6 +594,7 @@ async fn every_write_gives_up_after_its_attempts_and_waits_between_them() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     for op in 0..3 {
         let base = store.cas();
+        let reads = store.reads();
         let r = match op {
             0 => reg
                 .reconcile("t1", || async { Ok(Some(2)) }, None, false)
@@ -599,6 +608,8 @@ async fn every_write_gives_up_after_its_attempts_and_waits_between_them() {
         };
         assert!(matches!(r, Err(JobsError::Contended)), "op {op}: {r:?}");
         assert_eq!(store.cas() - base, u64::from(MAX_ATTEMPTS), "op {op}");
+        // One read per attempt, and none after the last.
+        assert_eq!(store.reads() - reads, u64::from(MAX_ATTEMPTS), "op {op}");
     }
 }
 

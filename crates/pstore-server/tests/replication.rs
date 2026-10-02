@@ -406,9 +406,20 @@ async fn a_status_call_repairs_a_lost_entry() {
     // A crash between a control call's HEAD CAS and its reconcile: the entry is gone.
     api.forget_replication_entry_for_test(TenantId(u128::from(DST)))
         .await;
+    assert!(
+        api.replication_entry_for_test(TenantId(u128::from(DST)))
+            .await
+            .is_none(),
+        "the entry was not lost"
+    );
     let (_, b) = status(&api, DST, "dst").await;
     // The status saw the disagreement, repaired it, and says so.
     assert_eq!(b["queued"], true, "{b}");
+    assert!(
+        api.replication_entry_for_test(TenantId(u128::from(DST)))
+            .await
+            .is_some()
+    );
     let mut workers = vec![(Arc::clone(&api), Worker::default())];
     run(&mut workers, 2, Duration::from_secs(1)).await;
     assert_eq!(rows(&api, DST, "dst").await.unwrap().len(), 5);
@@ -571,9 +582,46 @@ async fn a_creator_with_a_worker_claims_its_job_at_once() {
         json!({"index": "src", "tenant": SRC.to_string()}),
     )
     .await;
-    // One tick: no scan has reached the shard, yet the job is held and synced.
-    run(&mut workers, 1, Duration::from_secs(1)).await;
+    // One tick: no scan has reached the shard, yet the job is held and synced -- adopted,
+    // with no register write: its claim was made by the create, and is not due for renewal.
+    // A second on, so a renewal would have a new expiry to write.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let w0 = world.acct.count(TenantId(0), OpClass::Write);
+    let tick = api.replication_tick(&mut workers[0].1).await;
+    assert_eq!((tick.claimed, tick.held), (1, 1), "{tick:?}");
+    assert_eq!(world.acct.count(TenantId(0), OpClass::Write), w0);
     assert_eq!(rows(&api, DST, "dst").await.unwrap().len(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn creates_racing_a_tick_claim_no_more_than_max() {
+    // No tick between them: the slot each claim takes is reserved before it is offered.
+    let world = World::new();
+    let one = ReplicationPolicy { max: 1, ..policy() };
+    let api = world.api_with(1, one);
+    write(&api, SRC, "src", 0..4).await;
+    api.replication_tick(&mut Worker::default()).await;
+    let src = json!({"index": "src", "tenant": SRC.to_string()});
+    create(&api, 100, "dst", src.clone()).await;
+    create(&api, 101, "dst", src).await;
+    let owners = (
+        api.replication_entry_for_test(TenantId(100))
+            .await
+            .unwrap()
+            .1,
+        api.replication_entry_for_test(TenantId(101))
+            .await
+            .unwrap()
+            .1,
+    );
+    assert_eq!(owners, (Some(1), None));
+}
+
+#[test]
+fn the_worker_state_shows_in_debug_output() {
+    let api = Api::new(World::new().acct.clone(), LaneId(1)).unwrap();
+    let out = format!("{:?}", api.replicating_for_test());
+    assert!(out.contains("worker") && out.contains("held"), "{out}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -684,6 +732,22 @@ fn the_worker_and_its_sources_are_configured_from_the_environment() {
             "{k}={v} was accepted"
         );
     }
+    // The least TTL accepted, and an underscore in a source name.
+    assert_eq!(
+        Config::from_vars(vars(&[("PSTORE_REPLICATION_TTL_S", "3")]))
+            .unwrap()
+            .replication
+            .unwrap()
+            .ttl,
+        Duration::from_secs(3)
+    );
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_SOURCES", "eu_west"),
+        ("PSTORE_SOURCE_EU_WEST_ENDPOINT", "https://x"),
+        ("PSTORE_SOURCE_EU_WEST_BUCKET", "b"),
+    ]))
+    .unwrap();
+    assert_eq!(c.sources[0].name, "eu_west");
     // Sources: named, each with an endpoint and a bucket, credentials both or neither.
     let c = Config::from_vars(vars(&[
         ("PSTORE_SOURCES", "eu, far"),
@@ -727,7 +791,12 @@ fn the_worker_and_its_sources_are_configured_from_the_environment() {
             ("PSTORE_SOURCE_EU_BUCKET", "b"),
             ("PSTORE_SOURCE_EU_ACCESS_KEY", "k"),
         ],
-        vec![("PSTORE_SOURCES", "e u")],
+        // Refused by its name, with everything else it needs given.
+        vec![
+            ("PSTORE_SOURCES", "e u"),
+            ("PSTORE_SOURCE_E U_ENDPOINT", "https://x"),
+            ("PSTORE_SOURCE_E U_BUCKET", "b"),
+        ],
         vec![
             ("PSTORE_SOURCES", "eu,EU"),
             ("PSTORE_SOURCE_EU_ENDPOINT", "https://x"),
@@ -1050,6 +1119,14 @@ async fn a_restart_with_a_lower_max_holds_no_more_than_it() {
     let (after, mut aw) = (world.api_with(1, two), Worker::default());
     let tick = after.replication_tick(&mut aw).await;
     assert!(tick.held <= 2, "{tick:?}");
+    // A control call on a tenant it still has the claim on but does not hold, while full:
+    // not this call's claim, so not handed to the worker past its max.
+    let src = json!({"index": "src", "tenant": SRC.to_string()});
+    for t in tenants() {
+        create(&after, t, "dst2", src.clone()).await;
+    }
+    let tick = after.replication_tick(&mut aw).await;
+    assert!(tick.held <= 2, "{tick:?}");
     // The rest go to others: released at the next renewal of a shard it still holds in, or
     // lapsed after `ttl` in one it holds nothing in -- within `ttl + S·scan` either way.
     let (other, mut ow) = (world.api(2), Worker::default());
@@ -1101,7 +1178,17 @@ async fn a_renewal_keeps_a_claim_made_for_the_worker_before_it_adopts_it() {
         Some(1)
     );
     tokio::time::advance(policy().ttl / 3 + Duration::from_secs(1)).await;
+    let a_before = api
+        .replication_claim_for_test(TenantId(u128::from(a)))
+        .await;
     api.renew_for_test(&mut w).await;
+    let a_after = api
+        .replication_claim_for_test(TenantId(u128::from(a)))
+        .await;
+    assert!(
+        a_after.unwrap().1 > a_before.unwrap().1,
+        "no renewal ran: {a_before:?} {a_after:?}"
+    );
     assert_eq!(
         api.replication_entry_for_test(TenantId(u128::from(b)))
             .await

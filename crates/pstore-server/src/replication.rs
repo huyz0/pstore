@@ -346,6 +346,27 @@ impl<S: BlobStore + 'static> Api<S> {
         }
     }
 
+    /// `tenant`'s claim as `(owner, expires_ms)`, read straight from its shard. Not part of the
+    /// API.
+    #[doc(hidden)]
+    pub async fn replication_claim_for_test(&self, tenant: TenantId) -> Option<(u64, u64)> {
+        let reg = self.register_for(tenant).await.ok()?;
+        let id = id_of(tenant);
+        reg.read(reg.shard_of(&id))
+            .await
+            .ok()?
+            .entries
+            .get(&id)?
+            .claim
+            .map(|c| (c.owner, c.expires_ms))
+    }
+
+    /// The worker's shared state, for its debug output. Not part of the API.
+    #[doc(hidden)]
+    pub fn replicating_for_test(&self) -> &impl std::fmt::Debug {
+        &self.replicating
+    }
+
     /// Runs only the worker's renewal of its due shards. Not part of the API.
     #[doc(hidden)]
     pub async fn renew_for_test(&self, w: &mut Worker) {
@@ -892,4 +913,17 @@ pub async fn run_replication<S: BlobStore + 'static>(
         }
     }
     api.replicating.worker.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NOTE_BYTES, clipped};
+
+    #[test]
+    fn a_note_is_clipped_at_a_char_boundary_below_the_limit() {
+        // A two-byte char straddling the limit: cut before it, never through or past it.
+        let s = format!("{}é tail", "a".repeat(NOTE_BYTES - 1));
+        assert_eq!(clipped(&s), "a".repeat(NOTE_BYTES - 1));
+        assert_eq!(clipped("short"), "short");
+    }
 }
