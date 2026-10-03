@@ -402,3 +402,42 @@ async fn the_reap_backoff_doubles_to_its_cap() {
     }
     assert!((3..=5).contains(&late), "{late} attempts in four ages");
 }
+
+#[test]
+fn the_lane_recheck_is_half_the_reap_age_on_or_off() {
+    // M39: another server reaping the tenant reaps this lane's bundles too, so the bound is
+    // the fleet's reap age whether or not this process reaps.
+    let unset = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
+    assert_eq!(unset.lane_recheck, HOUR / 2);
+    for gc in ["off", ""] {
+        let mut pairs = vec![("PSTORE_LANE", "1"), ("PSTORE_GC_AGE_S", "60")];
+        if !gc.is_empty() {
+            pairs.push(("PSTORE_GC", gc));
+        }
+        let c = Config::from_vars(vars(&pairs)).unwrap();
+        assert_eq!(c.lane_recheck, Duration::from_secs(30), "PSTORE_GC={gc:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_server_rechecks_within_half_the_reap_age() {
+    let store = Accounted::new(MemoryStore::new());
+    let api = Api::new(store.clone(), LaneId(1)).unwrap();
+    api.recheck_lanes_within(Duration::from_secs(30));
+    let t = TenantId(39);
+    let engine = api.hold_engine_for_test(t).await;
+    let doc = |id: &str| pstore_format::Document::new(id, vec![1.0, 0.5]);
+    engine.write("idx", vec![doc("a")]).await.unwrap();
+    engine.flush().await.unwrap();
+    let mut reads = Vec::new();
+    for (wait, id) in [(29, "b"), (2, "c")] {
+        tokio::time::advance(Duration::from_secs(wait)).await;
+        engine.write("idx", vec![doc(id)]).await.unwrap();
+        let before = store.count(t, OpClass::Read);
+        engine.flush().await.unwrap();
+        reads.push(store.count(t, OpClass::Read) - before);
+    }
+    // 29 s after the resume's read: none; 31 s after it: one. (That the bound is half the age,
+    // not the whole, is the configuration's test above.)
+    assert_eq!(reads, [0, 1]);
+}

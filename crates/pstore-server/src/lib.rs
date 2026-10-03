@@ -145,6 +145,8 @@ struct Registry {
     cap: usize,
     /// Whether a reap loop runs: only then does a reapable commit keep an engine.
     reaping: bool,
+    /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
+    lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
     next_scan: Option<tokio::time::Instant>,
     backoff: std::time::Duration,
@@ -573,17 +575,24 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
+        let recheck = self.registry_mut().lane_recheck;
         let mut engines = self.engines.lock().await;
-        let slot = engines.entry(tenant).or_insert_with(|| Slot {
-            engine: Arc::new(Engine::new(
+        let slot = engines.entry(tenant).or_insert_with(|| {
+            let engine = Engine::new(
                 Arc::new(Caching::over(
                     Arc::new(self.store.as_tenant(tenant)),
                     self.cache.clone(),
                 )),
                 tenant,
                 self.lane,
-            )),
-            used: tokio::time::Instant::now(),
+            );
+            Slot {
+                engine: Arc::new(match recheck {
+                    Some(within) => engine.with_lane_recheck(within),
+                    None => engine,
+                }),
+                used: tokio::time::Instant::now(),
+            }
         });
         // M26: the only thing the registry's cap adds to a request.
         slot.used = tokio::time::Instant::now();
@@ -600,6 +609,14 @@ impl<S: BlobStore + 'static> Api<S> {
     /// the eviction loop drops the least recently used idle engines.
     pub fn limit_engines(&self, cap: usize) {
         self.registry_mut().cap = cap;
+    }
+
+    /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
+    /// older than `within` (M39): half of `PSTORE_GC_AGE_S`, which `Config::lane_recheck`
+    /// gives, whether or not this process reaps -- another server reaping the tenant reaps
+    /// this lane's bundles too.
+    pub fn recheck_lanes_within(&self, within: std::time::Duration) {
+        self.registry_mut().lane_recheck = Some(within);
     }
 
     /// Whether a reap loop runs (M26): only then does a reapable commit keep an engine, since
@@ -3105,6 +3122,9 @@ pub struct Config {
     pub fold: Option<FoldPolicy>,
     /// The scheduled reap's policy, or `None` when `PSTORE_GC=off` (M18).
     pub gc: Option<GcPolicy>,
+    /// Half of `PSTORE_GC_AGE_S` (M39), with `PSTORE_GC` on or off: how stale an engine's read
+    /// of its lane may grow before a flush reads HEAD again.
+    pub lane_recheck: std::time::Duration,
     /// The read cache, or `None` when `PSTORE_CACHE_DIR` is unset (M20).
     pub cache: Option<CacheConfig>,
     /// The replication worker's policy, or `None` with `PSTORE_REPLICATION=off` (M22).
@@ -3283,6 +3303,7 @@ impl Config {
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
             fold: fold_policy(&get)?,
             gc: gc_policy(&get)?,
+            lane_recheck: reap_age(&get)? / 2,
             cache: cache_config(&get, backend)?,
             replication: replication_policy(&get)?,
             sources: source_configs(&get)?,
@@ -3512,9 +3533,27 @@ fn gc_policy(get: &impl Fn(&str) -> Option<String>) -> Result<Option<GcPolicy>, 
     let d = GcPolicy::default();
     let policy = GcPolicy {
         period: positive("PSTORE_GC_PERIOD_MS")?.map_or(d.period, std::time::Duration::from_millis),
-        age: positive("PSTORE_GC_AGE_S")?.map_or(d.age, std::time::Duration::from_secs),
+        age: reap_age(get)?,
     };
     Ok(on.then_some(policy))
+}
+
+/// `PSTORE_GC_AGE_S`, or the default an hour, read **whether or not the reap is on** (M39).
+fn reap_age(get: &impl Fn(&str) -> Option<String>) -> Result<std::time::Duration, ConfigError> {
+    get("PSTORE_GC_AGE_S")
+        .map(|v| {
+            v.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(std::time::Duration::from_secs)
+                .ok_or(ConfigError::Fold(
+                    "PSTORE_GC_AGE_S",
+                    v,
+                    "a positive integer",
+                ))
+        })
+        .transpose()
+        .map(|age| age.unwrap_or(GcPolicy::default().age))
 }
 
 /// Runs [`Api::fold_due`] every `policy.period` until `stop` resolves (M9i.1).

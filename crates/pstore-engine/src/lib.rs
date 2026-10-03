@@ -1421,6 +1421,10 @@ pub struct Engine<S> {
     /// The highest watermark any HEAD this engine read gave its own lane (M17). Recorded where
     /// HEAD is read; compared only by the flush, under `flushing`.
     lane_seen: std::sync::atomic::AtomicU64,
+    /// How stale this engine's last fresh read of its lane may grow before a flush reads HEAD
+    /// again (M39), and when that read was made -- the instant before its GET.
+    lane_recheck: Option<std::time::Duration>,
+    lane_read: Mutex<Option<tokio::time::Instant>>,
     /// Whether a flush refused a schema conflict and no bundle has landed since (M35). The
     /// next flush waives every conflict the fold quarantines, so rows accepted before the
     /// schema was known become durable and are set aside, rather than blocking the lane
@@ -1571,6 +1575,8 @@ impl<S: BlobStore> Engine<S> {
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
+            lane_recheck: None,
+            lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
             uncertain: Mutex::new(None),
             abandoned: Mutex::new(Vec::new()),
@@ -1614,6 +1620,26 @@ impl<S: BlobStore> Engine<S> {
     pub fn with_text_field(mut self, name: &str) -> Self {
         self.text_field = name.to_owned();
         self
+    }
+
+    /// Re-reads HEAD on a flush whose last fresh read of this lane is older than `within`
+    /// (M39), so a second writer on the lane whose bundle at our next sequence was folded and
+    /// reaped meanwhile is found before we create that key again below the watermark.
+    ///
+    /// ⚠️ **Half the reap age, whatever this process does.** The scheduled reap takes only
+    /// commits at least its age old (M18), so a bundle is reaped no sooner than that after the
+    /// fold that buried it: within half of it, the fold either preceded our last read, which
+    /// then showed the watermark, or the bundle still exists and our create is refused.
+    #[must_use]
+    pub fn with_lane_recheck(mut self, within: std::time::Duration) -> Self {
+        self.lane_recheck = Some(within);
+        self
+    }
+
+    fn lane_read(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
+        self.lane_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Records what a HEAD read said, so the door can refuse without asking again.
@@ -2792,6 +2818,28 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<Option<Seq>, EngineError> {
         require_fencing(&*self.store)?;
         let _lane = self.flushing.lock().await;
+        // ⚠️ **M39: first, under the lock, before M17's resolution loads the watermark** (spec
+        // review): placed later, a write of our own that landed late and was folded read as
+        // another writer's, a sticky `LaneTaken`. Only when there is something to write or
+        // resolve, so an idle engine issues nothing; and only once resumed, since the resume
+        // reads afresh anyway.
+        let due = self.lane_recheck.is_some_and(|within| {
+            let busy = !self.mem().pending.is_empty() || self.uncertain().is_some();
+            let resumed = self
+                .seq
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            let stale = self.lane_read().is_none_or(|at| at.elapsed() >= within);
+            busy && resumed && stale
+        });
+        if due {
+            let at = tokio::time::Instant::now();
+            let head = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&head.head);
+            self.watermark(&head.head);
+            *self.lane_read() = Some(at);
+        }
         // M17: a write whose outcome is unknown is resolved before anything else is written.
         // One found absent is resolved again once a HEAD shows the lane past it (code review,
         // M17): it may have landed late and been folded, and one GET says whose it was.
@@ -2839,8 +2887,10 @@ impl<S: BlobStore> Engine<S> {
         // text field, so whichever engine folds it sees the conflict. M35 had to refuse that
         // one at every flush, because a foreign fold sealed it with its text unindexed.
         let watermark = if lane.is_none() || (check && self.schemas_unseen()) {
+            let read = tokio::time::Instant::now();
             let at = head::read(&*self.store, self.tenant).await?;
             self.remember_schemas(&at.head);
+            *self.lane_read() = Some(read);
             self.watermark(&at.head)
         } else {
             0

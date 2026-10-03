@@ -600,3 +600,106 @@ async fn an_absent_write_at_the_watermark_costs_one_put() {
         (1, 0)
     );
 }
+
+// ---- M39: a flush re-reads its lane's watermark within half the reap age ----
+
+const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_writer_is_refused_not_lost() {
+    // BACKLOG row 24's residue. A idles; B, misconfigured onto A's lane, writes A's next
+    // sequence, folds it and reaps it. Before M39, A's next flush created that key again --
+    // acknowledged durable, below the watermark, never folded.
+    let acct = Accounted::new(MemoryStore::new());
+    let a = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE).with_lane_recheck(WITHIN);
+    let b = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE);
+    a.write("idx", vec![doc("a0")]).await.unwrap();
+    assert_eq!(a.flush().await.unwrap(), Some(Seq(0)));
+    tokio::time::advance(WITHIN + std::time::Duration::from_secs(1)).await;
+    b.write("idx", vec![doc("b1")]).await.unwrap();
+    assert_eq!(b.flush().await.unwrap(), Some(Seq(1)));
+    b.fold().await.unwrap();
+    b.gc(0).await.unwrap();
+    let view = acct.as_tenant(T);
+    assert!(
+        view.get(&bundle_key(T, LANE, Seq(1))).await.is_err(),
+        "not reaped"
+    );
+    a.write("idx", vec![doc("a1")]).await.unwrap();
+    let err = a.flush().await.expect_err("A wrote below the watermark");
+    assert!(
+        matches!(err, EngineError::LaneTaken { lane: 1, seq: 1 }),
+        "{err:?}"
+    );
+    assert!(view.get(&bundle_key(T, LANE, Seq(1))).await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_landed_write_is_not_taken_by_the_recheck() {
+    // ⚠️ Spec review, M39: the recheck runs before M17's resolution loads the watermark. A
+    // write of our own that timed out, landed late and was folded is ours, never `LaneTaken`.
+    let store = Arc::new(Unreliable::default());
+    let e = Engine::new(Arc::clone(&store), T, LANE).with_lane_recheck(WITHIN);
+    e.write("idx", vec![doc("r0")]).await.unwrap();
+    assert_eq!(e.flush().await.unwrap(), Some(Seq(0)));
+    e.write("idx", vec![doc("r1")]).await.unwrap();
+    store.delay.store(true, Ordering::SeqCst);
+    e.flush()
+        .await
+        .expect_err("a timed-out write was reported as landed");
+    let (key, body) = store.delayed.lock().unwrap().take().unwrap();
+    store.inner.put(&key, body).await.unwrap();
+    let folder = Engine::new(Arc::clone(&store), T, LaneId(9));
+    folder.fold().await.unwrap();
+    tokio::time::advance(WITHIN + std::time::Duration::from_secs(1)).await;
+    e.write("idx", vec![doc("r2")]).await.unwrap();
+    e.flush()
+        .await
+        .expect("a write of our own, landed late and folded, was taken");
+    e.flush().await.unwrap();
+    folder.fold().await.unwrap();
+    assert_eq!(ids(&folder).await, ["r0", "r1", "r2"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_lane_recheck_is_once_per_window() {
+    let acct = Accounted::new(MemoryStore::new());
+    let e = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE).with_lane_recheck(WITHIN);
+    let mut at = 0u64;
+    let mut reads = Vec::new();
+    for t in [0u64, 5, 10, 11, 21] {
+        tokio::time::advance(std::time::Duration::from_secs(t - at)).await;
+        at = t;
+        e.write("idx", vec![doc(&format!("r{t}"))]).await.unwrap();
+        let before = acct.count(T, OpClass::Read);
+        e.flush().await.unwrap();
+        reads.push(acct.count(T, OpClass::Read) - before);
+    }
+    assert_eq!(&reads[1..], [0, 1, 0, 1], "{reads:?}");
+    // An idle engine issues nothing: an empty flush past the window reads no HEAD.
+    tokio::time::advance(WITHIN * 2).await;
+    let before = acct.count(T, OpClass::Read);
+    assert_eq!(e.flush().await.unwrap(), None);
+    assert_eq!(
+        acct.count(T, OpClass::Read) - before,
+        0,
+        "an empty flush read"
+    );
+    // And without a bound, nothing after the resume, as before M39 -- whose own reads the
+    // bounded engine's first flush matches exactly: no recheck before the lane is resumed.
+    let acct = Accounted::new(MemoryStore::new());
+    let e = Engine::new(Arc::new(acct.as_tenant(T)), T, LANE);
+    e.write("idx", vec![doc("x0")]).await.unwrap();
+    let before = acct.count(T, OpClass::Read);
+    e.flush().await.unwrap();
+    assert_eq!(
+        acct.count(T, OpClass::Read) - before,
+        reads[0],
+        "the first flush"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+    e.write("idx", vec![doc("x1")]).await.unwrap();
+    let before = acct.count(T, OpClass::Read);
+    e.flush().await.unwrap();
+    assert_eq!(acct.count(T, OpClass::Read) - before, 0);
+}

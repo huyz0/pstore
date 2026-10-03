@@ -138,6 +138,7 @@ async fn run<S: BlobStore + 'static>(
         }
     }
     api.configure_replication(config.replication.unwrap_or_default(), sources);
+    api.recheck_lanes_within(config.lane_recheck);
     let listener = match tokio::net::TcpListener::bind(&config.bind).await {
         Ok(l) => l,
         Err(e) => {
