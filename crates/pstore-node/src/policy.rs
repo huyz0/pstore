@@ -89,6 +89,31 @@ pub fn to_dial<'a>(known: &'a Roster, view: &[String]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The roster's nodes but this one: who to gossip with at startup.
+#[must_use]
+pub fn seeds(roster: &Roster, advertise: &str) -> Vec<String> {
+    roster
+        .nodes()
+        .iter()
+        .filter(|n| *n != advertise)
+        .cloned()
+        .collect()
+}
+
+/// The members of `zone`, in order, from a view labelled by zone.
+///
+/// ⚠️ **This cell's, never the gossip view.** Publishing the whole view into a per-cell key is
+/// a per-AZ roster in name only: the address is per-cell and the contents are the fleet, so
+/// placement crosses AZs anyway and every byte of it is billed.
+#[must_use]
+pub fn in_cell(zoned: &[(String, String)], zone: &str) -> Vec<String> {
+    zoned
+        .iter()
+        .filter(|(_, z)| z == zone)
+        .map(|(a, _)| a.clone())
+        .collect()
+}
+
 /// What this node should write to the roster, or `None` if it would add nothing.
 ///
 /// ⚠️ The **union**, never this node's view alone. `refold` replaces the object, so a node

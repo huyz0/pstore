@@ -321,3 +321,20 @@ fn zone_from_env_reads_pstore_az() {
         );
     }
 }
+
+#[test]
+fn seeds_and_in_cell_filter_exactly() {
+    let roster = Roster::from_nodes(nodes(4));
+    let me = "10.0.0.2:7946";
+    let got = pstore_node::policy::seeds(&roster, me);
+    let want: Vec<String> = nodes(4).into_iter().filter(|n| n != me).collect();
+    assert_eq!(got, want);
+    assert_eq!(pstore_node::policy::seeds(&roster, "elsewhere:1").len(), 4);
+
+    let zoned: Vec<(String, String)> = [("a", "z1"), ("b", "z2"), ("c", "z1"), ("d", "z10")]
+        .iter()
+        .map(|(a, z)| ((*a).to_owned(), (*z).to_owned()))
+        .collect();
+    assert_eq!(pstore_node::policy::in_cell(&zoned, "z1"), ["a", "c"]);
+    assert!(pstore_node::policy::in_cell(&zoned, "z9").is_empty());
+}

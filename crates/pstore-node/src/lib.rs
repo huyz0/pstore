@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub mod gossip;
 pub mod policy;
+pub mod schedule;
 pub mod swim;
 pub mod transport;
 

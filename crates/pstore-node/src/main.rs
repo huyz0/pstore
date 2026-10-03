@@ -12,10 +12,10 @@
 
 use pstore_blob::{BlobStore, Capabilities, ObjectStoreBackend};
 use pstore_cluster::Roster;
-use pstore_node::policy::{self, fresh_node_id, jitter, read_roster_patiently};
-use pstore_node::{ATTEMPT_TIMEOUT, DEFAULT_GOSSIP_PERIOD, HEAL_PERIOD, gossip, swim};
+use pstore_node::policy::{self, fresh_node_id, read_roster_patiently};
+use pstore_node::schedule::{self, Cadence, Clock};
+use pstore_node::{ATTEMPT_TIMEOUT, gossip, swim};
 use std::sync::Arc;
-use std::time::Duration;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -120,12 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // bucket we already depend on is how a node finds the fleet, which is what keeps "one
     // stateful dependency" true.
     let (roster, tag) = read_roster_patiently(&store, &cell, &node_id).await?;
-    let seeds: Vec<String> = roster
-        .nodes()
-        .iter()
-        .filter(|n| **n != advertise)
-        .cloned()
-        .collect();
+    let seeds = policy::seeds(&roster, &advertise);
     println!(
         "JOIN node={node_id} advertise={advertise} seeds={}",
         seeds.len()
@@ -133,32 +128,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Injected probe loss (M4b criterion 3). Zero unless asked: a fleet that always drops
     // datagrams cannot tell a loss result from a baseline one.
-    let loss: f64 = std::env::var("PSTORE_PROBE_LOSS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
+    let loss = schedule::probe_loss(std::env::var("PSTORE_PROBE_LOSS").ok().as_deref());
     // ⚠️ One value, used twice: chitchat's gossip interval and this loop's sampling
     // interval are the same number, so a timing reported in periods means the same thing to
     // the node and to the harness that reads its log.
-    let period = std::env::var("PSTORE_GOSSIP_PERIOD_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|ms| *ms > 0)
-        .map_or(DEFAULT_GOSSIP_PERIOD, Duration::from_millis);
-    // ⚠️ Separable from the gossip period ON PURPOSE. This loop asks chitchat for its member
-    // list every tick, which locks its state and clones a `String` per member — 500
-    // allocations a second per node at 100 members and a 200ms period, all of it ours rather
-    // than the protocol's. Whether that matters is a measurement, and it cannot be taken
-    // while the two intervals are the same number.
-    let poll = std::env::var("PSTORE_POLL_PERIOD_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|ms| *ms > 0)
-        .map_or(period, Duration::from_millis);
+    // ⚠️ The poll is separable from the gossip period ON PURPOSE. This loop asks the
+    // membership for its member list every tick, which locks its state and clones a `String`
+    // per member — 500 allocations a second per node at 100 members and a 200ms period, all of
+    // it ours rather than the protocol's. Whether that matters is a measurement, and it cannot
+    // be taken while the two intervals are the same number.
+    let (period, poll) = schedule::periods(
+        std::env::var("PSTORE_GOSSIP_PERIOD_MS").ok().as_deref(),
+        std::env::var("PSTORE_POLL_PERIOD_MS").ok().as_deref(),
+    );
     // ⚠️ Both protocols stay runnable, on one harness, deliberately. Replacing a membership
     // layer and measuring only the replacement compares two runs rather than two protocols —
     // and every difference in the host, the harness or the day lands in the result.
-    let handle = if env("PSTORE_GOSSIP", "swim") == "chitchat" {
+    let handle = if schedule::chitchat(std::env::var("PSTORE_GOSSIP").ok().as_deref()) {
         Membership::Chitchat(
             gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?,
         )
@@ -194,20 +180,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report the view, and refold the roster from it. The roster is a *cache of gossip*, so
     // a lost refold is never a lost membership — it is one fewer cache update.
-    // ⚠️ Everything below is counted in PERIODS, not seconds, because the period is no
-    // longer fixed — it scales with the fleet. `ticks % HEAL_PERIOD.as_secs()` was correct
-    // only while a period happened to be 200ms and five of them made a second; at a 2s
-    // period the same expression heals every 100 seconds.
-    let view_every = (Duration::from_secs(1).as_millis() / poll.as_millis().max(1)).max(1) as u64;
-    let heal_every = (HEAL_PERIOD.as_millis() / poll.as_millis().max(1)).max(1) as u64;
-    // How often to report what this node would own, in seconds; 0 disables it.
-    let owns_every: u64 = std::env::var("PSTORE_OWNS_PERIOD_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    let mut ticks = 0u64;
-    let mut sub = 0u64;
-    let mut last_size = usize::MAX;
+    // ⚠️ When to report and when to act is `schedule::Clock`'s to decide (M31), counted in
+    // views rather than polls -- the heal cadence counted polls against a count of views, so
+    // at a 200 ms poll a node healed every 50 s instead of every `HEAL_PERIOD`.
+    let cadence = Cadence::new(
+        poll,
+        schedule::owns_period(std::env::var("PSTORE_OWNS_PERIOD_S").ok().as_deref()),
+        &node_id,
+    );
+    let mut clock = Clock::new(cadence);
     loop {
         // ⚠️ Sampled at the GOSSIP period, not once a second. Criterion 2 is stated in
         // periods of 200ms and its bound is eight of them — an instrument that samples once
@@ -215,28 +196,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // any pass or fail it reports is unfalsifiable. Measured before this change: "9
         // periods" against a bound of 8, from a sampler that could not have said otherwise.
         tokio::time::sleep(poll).await;
-        sub += 1;
         let size = handle.member_count().await;
+        let tick = clock.tick(size);
 
         // The view size changes rarely, so printing on CHANGE costs almost nothing and is
         // what actually carries the timing: `docker logs -t` timestamps it to the
         // millisecond, and convergence is the last of these across the fleet.
-        if size != last_size {
-            last_size = size;
-            println!("VIEWCHANGE members={last_size} self={me}");
+        if let Some(members) = tick.changed {
+            println!("VIEWCHANGE members={members} self={me}");
         }
 
-        if !sub.is_multiple_of(view_every) {
+        let Some(view) = tick.view else {
             continue;
-        }
+        };
         // Only now, once a second at most, is the list itself worth building.
         let members = handle.members().await;
-        ticks += 1;
         // Scraped by `scripts/cluster.sh`; a line per second per node is cheap and needs no
         // endpoint, which would be a server by another name.
-        println!("VIEW t={ticks} members={size} self={me}");
+        println!("VIEW t={view} members={size} self={me}");
 
-        if ticks % heal_every == jitter(&node_id, heal_every) {
+        if tick.heal {
             // Read first. The roster is two things at once here: the directory this node
             // publishes into, and the seed list it heals a partition from.
             // Bounded for the same reason the join read is: an unbounded blob request on
@@ -256,12 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // per-cell key is a per-AZ roster in name only: the address is per-cell and
                 // the contents are the fleet, so placement crosses AZs anyway and every byte
                 // of it is billed.
-                let zoned = handle.members_zoned(&zone).await;
-                let mine: Vec<String> = zoned
-                    .iter()
-                    .filter(|(_, z)| *z == zone)
-                    .map(|(a, _)| a.clone())
-                    .collect();
+                let mine = policy::in_cell(&handle.members_zoned(&zone).await, &zone);
                 match policy::union_to_publish(&cur, &mine) {
                     None => {
                         if healed > 0 {
@@ -296,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // exists only so a fleet run can report what a node WOULD own. It was inside the
         // number M4b attributed to gossip. `PSTORE_OWNS_PERIOD_S=0` turns it off, which is
         // what makes the attribution measurable instead of assumed.
-        if owns_every > 0 && ticks.is_multiple_of(owns_every) {
+        if tick.owns {
             // Reuse the view already fetched this tick. Fetching again locks chitchat's
             // state and clones a String per member, for a list that cannot have changed.
             // ⚠️ This cell's members, not the gossip view. Building a ring from the
