@@ -40,14 +40,6 @@ pub struct Member {
     me: String,
 }
 
-/// The largest datagram we will read.
-///
-/// ⚠️ A reconciliation carries the whole member set, so this bounds the fleet a single `Sync`
-/// can describe: ~64 bytes a member puts 10,000 members past it. Reconciliation is the rare
-/// path and a truncated one is refused rather than half-applied, so the failure is a retry
-/// rather than a wrong member set — but it is a ceiling, and it is written down.
-const MAX_DATAGRAM: usize = 65_507;
-
 impl Member {
     /// The address peers reach this node on.
     #[must_use]
@@ -174,7 +166,10 @@ fn spawn_receiver(
 ) {
     let (socket, proto, stats) = (Arc::clone(socket), Arc::clone(proto), Arc::clone(stats));
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        // The largest message the protocol sends, never a size of our own (M44): an answer
+        // that would exceed it goes as several `Part`s, so sender and reader cannot disagree.
+        // Only a member whose address alone is over ~65 KB can still fail to send.
+        let mut buf = vec![0u8; pstore_gossip::MAX_DATAGRAM];
         let mut rng = Bernoulli::new(seed);
         loop {
             let Ok((n, from)) = socket.recv_from(&mut buf).await else {

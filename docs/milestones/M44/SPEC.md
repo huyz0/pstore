@@ -73,7 +73,8 @@ address from the UDP source), so this is residue for row 53, not a change of tru
      the split cannot pass by sending one member per datagram.
    - Test: `protocol::tests::a_large_answer_is_split_under_the_datagram`.
 3. **A `TaggedDigest` answer is split the same way.** The same 3,000-member view answering a
-   `TaggedDigest` of all-zero sums and tags gets `Part`s that each fit and that concatenate to
+   `TaggedDigest` of all-zero sums, and tags that are each the complement of its own so
+   every leaf differs (code review: an all-zero tag would leave about one leaf unsent), gets `Part`s that each fit and that concatenate to
    all 3,000 in order. Test: `protocol::tests::a_large_tagged_answer_is_split_under_the_datagram`.
 4. **A large `Sync` answer is split, and a small one is not.**
    - The 3,000-member view answering a one-member `Sync` sends `Part`s, each fitting, that

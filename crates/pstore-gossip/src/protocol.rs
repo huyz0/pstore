@@ -304,13 +304,7 @@ impl Protocol {
                         .filter(|m| differ.contains(&crate::cluster::bucket_of(&m.id)))
                         .cloned()
                         .collect();
-                    out.push((
-                        addr,
-                        Message::Part {
-                            from: *self.cluster.me(),
-                            members,
-                        },
-                    ));
+                    out.extend(self.parts(&addr, split(members)));
                 }
                 out
             }
@@ -338,13 +332,7 @@ impl Protocol {
                         })
                         .cloned()
                         .collect();
-                    out.push((
-                        addr,
-                        Message::Part {
-                            from: *self.cluster.me(),
-                            members,
-                        },
-                    ));
+                    out.extend(self.parts(&addr, split(members)));
                 }
                 out
             }
@@ -361,11 +349,41 @@ impl Protocol {
                 if let Some(addr) = self.addr_of(from)
                     && members.len() != self.cluster.len()
                 {
-                    out.push((addr, self.sync()));
+                    // M44: the whole view, as one `Sync` when it fits a datagram and as
+                    // `Part`s when it does not. A `Part` draws no reply, so this cannot loop,
+                    // and the peer learns everything a `Sync` would have told it.
+                    let mut chunks = split(self.cluster.members().cloned().collect());
+                    if chunks.len() == 1 {
+                        out.push((
+                            addr,
+                            Message::Sync {
+                                from: *self.cluster.me(),
+                                members: chunks.remove(0),
+                            },
+                        ));
+                    } else {
+                        out.extend(self.parts(&addr, chunks));
+                    }
                 }
                 out
             }
         }
+    }
+
+    /// `chunks` to `addr`, one `Part` each (M44).
+    fn parts(&self, addr: &str, chunks: Vec<Vec<Member>>) -> Vec<(String, Message)> {
+        chunks
+            .into_iter()
+            .map(|members| {
+                (
+                    addr.to_owned(),
+                    Message::Part {
+                        from: *self.cluster.me(),
+                        members,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// What a checksum mismatch sends (M34): a `Digest` past [`RECONCILE_WHOLE_UP_TO`]
@@ -709,6 +727,32 @@ impl Protocol {
             .map(|m| m.addr.clone())
             .collect()
     }
+}
+
+/// `members`, in order, cut into chunks whose `Part` or `Sync` encodes to at most
+/// [`MAX_DATAGRAM`](crate::wire::MAX_DATAGRAM) bytes (M44).
+///
+/// - The length is summed exactly, never estimated: a datagram one byte over is dropped at
+///   the socket, silently.
+/// - A member that cannot fit even alone gets a chunk of its own. The socket drops it, as it
+///   always did; leaving it out here would hide that it exists.
+/// - Always at least one chunk, so an empty answer is still the one empty `Part` it was.
+fn split(members: Vec<Member>) -> Vec<Vec<Member>> {
+    use crate::wire::{MAX_DATAGRAM, MEMBERS_HEADER, member_len};
+    let mut out = Vec::new();
+    let mut chunk = Vec::new();
+    let mut len = MEMBERS_HEADER;
+    for m in members {
+        let n = member_len(&m);
+        if !chunk.is_empty() && len + n > MAX_DATAGRAM {
+            out.push(std::mem::take(&mut chunk));
+            len = MEMBERS_HEADER;
+        }
+        len += n;
+        chunk.push(m);
+    }
+    out.push(chunk);
+    out
 }
 
 #[cfg(test)]
@@ -1192,5 +1236,192 @@ mod tests {
         assert_eq!(mix(1, 1), 0x93f0_1a4e_d8b4_cd0f);
         assert_eq!(mix(42, 5), 0x7742_60bc_98c9_f5c2);
         assert_eq!(mix(0xDEAD_BEEF, 3), 0xbbd4_8e3b_6581_0b13);
+    }
+
+    /// M44: a node id from a number up to 65,535, big-endian in the first two bytes, so the
+    /// view yields them in number order and 256 is `nid(1)`.
+    fn wide(i: u16) -> NodeId {
+        let mut b = [0u8; 16];
+        b[..2].copy_from_slice(&i.to_be_bytes());
+        b
+    }
+
+    /// M44: node 0 and members `1..=n`, each with a 40-byte address and an 8-byte zone.
+    fn crowd(n: u16) -> Protocol {
+        let mut c = Cluster::new(wide(0), format!("{:040}", 0), "zone-abc".to_owned());
+        for i in 1..=n {
+            c.join(wide(i), format!("{i:040}"), "zone-abc".to_owned());
+        }
+        Protocol::new(c)
+    }
+
+    /// M44: the members of every message in `out`, which must all be `Part`s that fit.
+    fn parts_of(out: &[(String, Message)]) -> Vec<Vec<Member>> {
+        out.iter()
+            .map(|(_, m)| {
+                assert!(
+                    m.encode().len() <= crate::wire::MAX_DATAGRAM,
+                    "a message of {} bytes",
+                    m.encode().len()
+                );
+                match m {
+                    Message::Part { members, .. } => members.clone(),
+                    other => panic!("expected a Part, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// M44: a member's encoded length, by encoding it alone and taking off the header.
+    fn size_of(m: &Member) -> usize {
+        let part = Message::Part {
+            from: nid(0),
+            members: vec![m.clone()],
+        };
+        part.encode().len() - 21
+    }
+
+    fn view_of(p: &Protocol) -> Vec<Member> {
+        p.cluster.members().cloned().collect()
+    }
+
+    /// M44: the answer, split tightly: every `Part` but the last would not fit one more.
+    fn assert_split(p: &Protocol, out: &[(String, Message)]) {
+        let parts = parts_of(out);
+        assert!(parts.len() > 1, "{} members in one Part", view_of(p).len());
+        assert_eq!(
+            parts.concat(),
+            view_of(p),
+            "not every member once, in order"
+        );
+        for pair in parts.windows(2) {
+            let full: usize = 21 + pair[0].iter().map(size_of).sum::<usize>();
+            assert!(full + size_of(&pair[1][0]) > crate::wire::MAX_DATAGRAM);
+        }
+    }
+
+    fn zero_digest(from: NodeId) -> Message {
+        Message::Digest {
+            from,
+            buckets: vec![0; crate::cluster::BUCKETS],
+        }
+    }
+
+    #[test]
+    fn a_part_of_exactly_the_datagram_is_one_part() {
+        // M44: two members whose `Part` is exactly 65,507 bytes travel together; one byte
+        // more and they travel apart. Node 1 is 36 bytes; node 0 the rest.
+        for (extra, parts) in [(0, 1), (1, 2)] {
+            let addr = "a".repeat(65_507 - 21 - 36 - 34 + extra);
+            let mut c = Cluster::new(nid(0), addr, "z".to_owned());
+            c.join(nid(1), "n1".to_owned(), "z".to_owned());
+            let mut p = Protocol::new(c);
+            let out = p.receive("n1", &zero_digest(nid(1)));
+            let got = parts_of(&out);
+            assert_eq!(got.len(), parts, "{extra} byte(s) over");
+            assert_eq!(got.concat(), view_of(&p));
+        }
+    }
+
+    #[test]
+    fn a_large_answer_is_split_under_the_datagram() {
+        let mut p = crowd(3_000);
+        let out = p.receive("x", &zero_digest(wide(256)));
+        assert_split(&p, &out);
+    }
+
+    #[test]
+    fn a_large_tagged_answer_is_split_under_the_datagram() {
+        // Every tag differs from this view's, so every leaf is sent.
+        let mut p = crowd(3_000);
+        let tags = p.cluster.leaf_tags().iter().map(|t| !t).collect();
+        let msg = Message::TaggedDigest {
+            from: wide(256),
+            buckets: vec![0; crate::cluster::BUCKETS],
+            tags,
+        };
+        let out = p.receive("x", &msg);
+        assert_split(&p, &out);
+    }
+
+    #[test]
+    fn a_sync_answer_that_cannot_fit_is_sent_as_parts() {
+        let mut p = crowd(3_000);
+        let sender = p.cluster.member(&wide(256)).cloned().expect("a member");
+        let msg = Message::Sync {
+            from: wide(256),
+            members: vec![sender],
+        };
+        let out = p.receive("x", &msg);
+        assert_split(&p, &out);
+
+        // A small node absorbs them without a reply, and agrees with the big view.
+        let mut c = Cluster::new(wide(1), format!("{:040}", 1), "zone-abc".to_owned());
+        c.join(wide(256), format!("{:040}", 256), "zone-abc".to_owned());
+        let mut s = Protocol::new(c);
+        for (_, m) in &out {
+            assert!(s.receive("x", m).is_empty());
+        }
+        assert_eq!(s.cluster.checksum(), p.cluster.checksum());
+
+        // A view that fits answers with one `Sync`, as before.
+        let mut small = protocol(&[1, 2], &[]);
+        let msg = Message::Sync {
+            from: nid(1),
+            members: vec![record(1, "az-a", 0, State::Alive)],
+        };
+        let out = small.receive("n1", &msg);
+        assert!(
+            matches!(&out[..], [(_, Message::Sync { members, .. })] if members.len() == 3),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_differing_bucket_this_view_holds_nothing_of_is_one_empty_part() {
+        // M44: a split always yields a chunk, so an answer with no members is still the one
+        // empty `Part` it was -- which tells the asker this node is alive.
+        let mut p = protocol(&[1], &[]);
+        let mut buckets = p.cluster.buckets().to_vec();
+        let empty = buckets
+            .iter()
+            .position(|b| *b == 0)
+            .expect("an empty bucket");
+        buckets[empty] = 1;
+        let out = p.receive(
+            "n1",
+            &Message::Digest {
+                from: nid(1),
+                buckets,
+            },
+        );
+        assert_eq!(parts_of(&out), vec![Vec::<Member>::new()]);
+    }
+
+    #[test]
+    fn an_oversize_member_is_sent_alone() {
+        let mut c = Cluster::new(nid(0), "n0".to_owned(), "z".to_owned());
+        for n in 1..=5u8 {
+            let addr = if n == 3 {
+                "a".repeat(70_000)
+            } else {
+                format!("n{n}")
+            };
+            c.join(nid(n), addr, "z".to_owned());
+        }
+        let mut p = Protocol::new(c);
+        let out = p.receive("n1", &zero_digest(nid(1)));
+        let ids = |ms: &[Member]| ms.iter().map(|m| m.id[0]).collect::<Vec<_>>();
+        let mut got = Vec::new();
+        for (_, m) in &out {
+            let Message::Part { members, .. } = m else {
+                panic!("expected a Part, got {m:?}");
+            };
+            if !members.iter().any(|m| m.id == nid(3)) {
+                assert!(m.encode().len() <= crate::wire::MAX_DATAGRAM);
+            }
+            got.push(ids(members));
+        }
+        assert_eq!(got, vec![vec![0, 1, 2], vec![3], vec![4, 5]]);
     }
 }

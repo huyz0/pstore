@@ -80,6 +80,10 @@ pub enum Message {
     },
 }
 
+/// The largest message this crate puts on the wire (M44): a UDP payload over IPv4. A
+/// reader's buffer is this size, and an answer that would exceed it is split into `Part`s.
+pub const MAX_DATAGRAM: usize = 65_507;
+
 const PING: u8 = 1;
 const ACK: u8 = 2;
 const PING_REQ: u8 = 3;
@@ -117,6 +121,18 @@ fn put_member(out: &mut Vec<u8>, m: &Member) {
         out.extend_from_slice(bytes);
     }
 }
+
+/// A member's length as [`put_member`] writes it (M44): id, incarnation, state, and each of
+/// address and zone behind a 4-byte length.
+///
+/// ⚠️ A field over 4 GiB is written as empty (M8f) and counted here at full length: an
+/// overestimate, so at worst such a member travels alone. No test can build one.
+pub(crate) fn member_len(m: &Member) -> usize {
+    33 + m.addr.len() + m.zone.len()
+}
+
+/// A `Part`'s or `Sync`'s length before its members: tag, sender, and count.
+pub(crate) const MEMBERS_HEADER: usize = 21;
 
 /// A cursor that refuses to read past the end, so a truncated frame is `None` rather than a
 /// shorter message.
