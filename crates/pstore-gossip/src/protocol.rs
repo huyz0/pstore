@@ -410,9 +410,12 @@ impl Protocol {
             if buckets.get(b) == mine.get(b) {
                 continue;
             }
-            let differing = (0..per)
+            // A sum of distinct bits, not an `|` fold (M43 sweep): over distinct bits `|` and
+            // `^` agree, so a fold is a mutant no test can kill.
+            let differing: u16 = (0..per)
                 .filter(|j| tags.get(b * per + j) != my_tags.get(b * per + j))
-                .fold(0u16, |acc, j| acc | (1 << j));
+                .map(|j| 1u16 << j)
+                .sum();
             *mask = if count.get(b).copied().unwrap_or(0) <= LEAF_ABOVE || differing == 0 {
                 u16::MAX
             } else {
