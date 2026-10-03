@@ -58,6 +58,8 @@ async fn put<S: BlobStore>(store: &S, name: &str, docs: &[Document]) -> Target {
     Target {
         centroids: Some(Key::new(format!("t/idx/{name}.centroids"))),
         deleted: None,
+        sparse_dict: true,
+        text_dict: true,
         shadowed: false,
         segment: key,
     }

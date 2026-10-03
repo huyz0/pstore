@@ -17,6 +17,36 @@ pub struct SegmentRef {
     pub key: String,
     /// Rows it holds.
     pub rows: u32,
+    /// Which dictionaries it has (M32), or `None` when HEAD does not say: a HEAD from before
+    /// M32, or a ref resurrected for `as_of`. Unknown asks, as every query did before.
+    pub dicts: Option<Dicts>,
+}
+
+/// Which dictionary sidecars a segment has (M32). Fixed when it is sealed, never changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dicts {
+    /// A sparse dictionary (`.sdict`).
+    pub sparse: bool,
+    /// A term dictionary (`.tdict`).
+    pub text: bool,
+}
+
+impl Dicts {
+    /// HEAD's byte for a ref: bit 0 sparse, bit 1 text, `0xFF` unknown.
+    fn byte(d: Option<Self>) -> u8 {
+        d.map_or(0xFF, |d| u8::from(d.sparse) | (u8::from(d.text) << 1))
+    }
+
+    fn of(b: u8) -> Result<Option<Self>, EngineError> {
+        match b {
+            0xFF => Ok(None),
+            0..=3 => Ok(Some(Self {
+                sparse: b & 1 != 0,
+                text: b & 2 != 0,
+            })),
+            _ => Err(EngineError::CorruptHead),
+        }
+    }
 }
 
 /// What an index's rows must look like: the two facts the engine already depends on and
@@ -437,7 +467,9 @@ impl Head {
             .collect();
         // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
         // one is -- otherwise the later count would be read as the earlier one's.
-        let more = !self.replications.is_empty() || !self.quarantine.is_empty();
+        // M32: the dictionaries are the last section, written whenever any ref's are known.
+        let dicts = self.indexes.values().flatten().any(|r| r.dicts.is_some());
+        let more = !self.replications.is_empty() || !self.quarantine.is_empty() || dicts;
         if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() || more {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in fts {
@@ -480,7 +512,7 @@ impl Head {
                 out.extend_from_slice(&r.rejected.to_le_bytes());
             }
         }
-        if !self.quarantine.is_empty() {
+        if !self.quarantine.is_empty() || dicts {
             out.extend_from_slice(&(self.quarantine.len() as u32).to_le_bytes());
             for (name, objects) in &self.quarantine {
                 put_str(&mut out, name);
@@ -489,6 +521,16 @@ impl Head {
                     put_str(&mut out, key);
                     out.extend_from_slice(&rows.to_le_bytes());
                 }
+            }
+        }
+        // ⚠️ M32: one byte per segment, in the index's order -- not a key per segment, which
+        // would grow every HEAD every query reads by ~80 bytes a segment.
+        if dicts {
+            out.extend_from_slice(&(self.indexes.len() as u32).to_le_bytes());
+            for (name, refs) in &self.indexes {
+                put_str(&mut out, name);
+                out.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+                out.extend(refs.iter().map(|r| Dicts::byte(r.dicts)));
             }
         }
         out
@@ -523,6 +565,7 @@ impl Head {
                 segs.push(SegmentRef {
                     key: c.string()?,
                     rows: c.u32()?,
+                    dicts: None,
                 });
             }
             h.indexes.insert(name, segs);
@@ -716,6 +759,25 @@ impl Head {
             }
             h.quarantine.insert(name, objects);
         }
+        // ⚠️ End of buffer here is "no dictionaries known" (M32): every HEAD before it ends at
+        // the quarantine, and a decoder from before it stops there too and re-encodes without
+        // this section -- every ref then asks, as it did.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let n = c.u32()? as usize;
+            // A section that names an index HEAD does not, or disagrees with its segment
+            // count, is not one this HEAD wrote: refused rather than misapplied.
+            let refs = h.indexes.get_mut(&name).ok_or(EngineError::CorruptHead)?;
+            if refs.len() != n {
+                return Err(EngineError::CorruptHead);
+            }
+            for r in refs.iter_mut() {
+                r.dicts = Dicts::of(c.u8()?)?;
+            }
+        }
         Ok(h)
     }
 
@@ -785,6 +847,7 @@ impl Head {
                         out.indexes.entry(index).or_default().push(SegmentRef {
                             key: segment.to_owned(),
                             rows: 0,
+                            dicts: None,
                         });
                     }
                     continue;
@@ -800,6 +863,7 @@ impl Head {
                     out.indexes.entry(index).or_default().push(SegmentRef {
                         key: key.clone(),
                         rows: 0,
+                        dicts: None,
                     });
                 }
             }
@@ -1025,6 +1089,90 @@ mod tests {
             },
         );
         h
+    }
+
+    /// One index, `a`, of two segments: the first's dictionaries known, the second's not.
+    fn with_dicts() -> Head {
+        let mut h = Head {
+            epoch: pstore_types::Epoch(11),
+            ..Head::default()
+        };
+        h.indexes.insert(
+            "a".to_owned(),
+            vec![
+                SegmentRef {
+                    key: "k/1.seg".to_owned(),
+                    rows: 4,
+                    dicts: Some(Dicts {
+                        sparse: false,
+                        text: true,
+                    }),
+                },
+                SegmentRef {
+                    key: "k/2.seg".to_owned(),
+                    rows: 5,
+                    dicts: None,
+                },
+            ],
+        );
+        h
+    }
+
+    #[test]
+    fn the_dicts_section_round_trips_and_refuses_malformed_input() -> Result<(), EngineError> {
+        // M32: round-trips, beside every other optional section too.
+        let h = with_dicts();
+        assert_eq!(Head::decode(&h.encode())?, h);
+        let mut all = sample();
+        all.indexes = h.indexes.clone();
+        all.quarantine
+            .insert("q".to_owned(), vec![("k/1.q".to_owned(), 1)]);
+        assert_eq!(Head::decode(&all.encode())?, all);
+
+        // Nothing known: byte-identical to the parent's encoding (`an_empty_quarantine...`
+        // pins the empty case; this one has a segment).
+        let mut none = with_dicts();
+        for r in none.indexes.values_mut().flatten() {
+            r.dicts = None;
+        }
+        assert_eq!(
+            hex(&none.encode()),
+            "0b00000000000000000000000000000001000000010000006102000000070000006b2f312e73656704000000070000006b2f322e73656705000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        // The section is the last 15 bytes: a count of 1, the name `a`, a count of 2, two flags.
+        let good = h.encode();
+        let body = good
+            .get(..good.len() - 15)
+            .ok_or(EngineError::CorruptHead)?;
+        let section = |name: &str, flags: &[u8]| {
+            let mut b = body.to_vec();
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&(flags.len() as u32).to_le_bytes());
+            b.extend_from_slice(flags);
+            b
+        };
+        assert_eq!(Head::decode(&section("a", &[2, 0xFF]))?, h);
+        for (why, bad) in [
+            ("a count that disagrees", section("a", &[2])),
+            // More flags than segments: without the count check, the extra byte is left over
+            // and the section reads as valid.
+            ("a count above the segments'", section("a", &[2, 0xFF, 0])),
+            ("an index HEAD does not name", section("b", &[2, 0xFF])),
+            ("a flag byte out of range", section("a", &[7, 0xFF])),
+        ] {
+            assert!(
+                matches!(Head::decode(&bad), Err(EngineError::CorruptHead)),
+                "{why} was accepted"
+            );
+        }
+
+        // Truncated at the section, as a decoder from before M32 re-encodes it: unknown.
+        let old = Head::decode(body)?;
+        assert!(old.indexes.values().flatten().all(|r| r.dicts.is_none()));
+        Ok(())
     }
 
     #[test]

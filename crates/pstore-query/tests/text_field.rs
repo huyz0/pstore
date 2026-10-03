@@ -81,6 +81,8 @@ async fn run(store: &MemoryStore, seg: &Key, cen: &Key, field: &str) -> Result<u
         segment: seg.clone(),
         centroids: Some(cen.clone()),
         deleted: None,
+        sparse_dict: true,
+        text_dict: true,
         shadowed: false,
     }];
     query(

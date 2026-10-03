@@ -1604,3 +1604,27 @@ async fn a_resume_racing_a_sync_fences_it_though_the_source_is_the_same() {
     assert!(out.committed.is_empty(), "{out:?}");
     assert!(s.dst.replications().await.unwrap()["dst"].applied.is_none());
 }
+
+#[tokio::test]
+async fn a_replica_records_its_sources_dictionaries() {
+    // M32: a replica's segments are its source's, so their dictionaries are the source's too.
+    let s = setup(Kind::SameTenant);
+    write(&s.src, "src", 0..40).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let keys = s.here.keys("").await;
+    let head = s.dst.head_for_test().await;
+    let refs = head
+        .indexes
+        .get("dst")
+        .expect("the replica has no segments");
+    assert!(!refs.is_empty());
+    for r in refs {
+        let want = pstore_engine::Dicts {
+            sparse: keys.contains(&format!("{}.sdict", r.key)),
+            text: keys.contains(&format!("{}.tdict", r.key)),
+        };
+        assert_eq!(r.dicts, Some(want), "{}", r.key);
+    }
+}

@@ -89,6 +89,11 @@ pub struct Target {
     pub centroids: Option<Key>,
     /// Its delete vector, when it has one (M9c). Fetched in the open round.
     pub deleted: Option<Key>,
+    /// Whether it may have a sparse dictionary, and a term dictionary (M32): `false` when the
+    /// caller knows it has none, and the open round asks for nothing.
+    pub sparse_dict: bool,
+    /// See `sparse_dict`.
+    pub text_dict: bool,
     /// Whether the query's shadowed ids hide rows here. `false` for the fresh segment, whose
     /// rows ARE the newest versions.
     pub shadowed: bool,
@@ -736,11 +741,11 @@ async fn open<S: BlobStore>(
         maybe(store, centroids.clone().filter(|_| wants_dense)),
         maybe(
             store,
-            wants_sparse.then(|| pstore_format::sparse::dict_key(key)),
+            (wants_sparse && target.sparse_dict).then(|| pstore_format::sparse::dict_key(key)),
         ),
         maybe(
             store,
-            wants_text.then(|| pstore_format::text::dict_key(key)),
+            (wants_text && target.text_dict).then(|| pstore_format::text::dict_key(key)),
         ),
         dv,
     )
@@ -870,6 +875,12 @@ async fn leg<S: BlobStore>(
             query,
             limit,
         } => {
+            // ⚠️ A segment with no sparse field has no matching rows, and answers nothing (M32),
+            // judged by its footer and before the sidecar check, as M30 judged text: refusing
+            // it refused every sparse query over an index with any such segment.
+            if opened.segment.sparse_field().is_none() {
+                return Ok(Vec::new());
+            }
             let raw = opened.dictionary.as_ref().ok_or(FormatError::Corrupt(
                 "a sparse leg over a segment with no dictionary sidecar",
             ))?;

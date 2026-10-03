@@ -8,7 +8,7 @@ mod replica;
 
 pub use bundle::Entry;
 pub use head::{
-    Head, HeadAt, IndexSchema, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
+    Dicts, Head, HeadAt, IndexSchema, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
 };
 pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
 
@@ -1827,7 +1827,7 @@ impl<S: BlobStore> Engine<S> {
         text_field: Option<&str>,
         fts: &FullText,
         trigram: &[String],
-    ) -> Result<Key, EngineError> {
+    ) -> Result<(Key, Dicts), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
         let text_field = text_field.filter(|f| {
@@ -1867,11 +1867,15 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ Absent is not an error: D-10 reads a missing centroid table as "this index is
         // below the exact-scan threshold, scan me exactly".
         let mut sidecars: Vec<Sidecar> = Vec::new();
+        // M32: what HEAD records, from the sidecars this seal writes and nothing else.
+        let mut dicts = Dicts::default();
         if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
             sidecars.push((pstore_format::sparse::dict_key, bytes::Bytes::from(d)));
+            dicts.sparse = true;
         }
         if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
             sidecars.push((pstore_format::text::dict_key, bytes::Bytes::from(d)));
+            dicts.text = true;
         }
         if let Some(c) = &built.centroids {
             sidecars.push((
@@ -1902,7 +1906,7 @@ impl<S: BlobStore> Engine<S> {
                     }
                 }
                 if all {
-                    return Ok(key);
+                    return Ok((key, dicts));
                 }
             }
             refused += 1;
@@ -3552,7 +3556,7 @@ impl<S: BlobStore> Engine<S> {
                 }
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();
-                let seg_key = self
+                let (seg_key, dicts) = self
                     .seal(
                         names,
                         &self.segment_key(next.epoch, idx),
@@ -3568,6 +3572,7 @@ impl<S: BlobStore> Engine<S> {
                     .push(SegmentRef {
                         key: seg_key.as_str().to_owned(),
                         rows: docs.len() as u32,
+                        dicts: Some(dicts),
                     });
             }
             // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
@@ -4335,8 +4340,9 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ `seal` records what it creates, and what it may have (an `Io`), so one that fails
         // partway is buried too (M19) -- and never a name it was refused (M23).
         let empty = rows.is_empty();
+        let mut out_dicts = Dicts::default();
         if !empty {
-            out_key = self
+            (out_key, out_dicts) = self
                 .seal(names, &out_key, &rows, text_field, &fts, &trigram)
                 .await?;
         }
@@ -4356,7 +4362,7 @@ impl<S: BlobStore> Engine<S> {
             // refused, and comparing keys would re-seal on every retry at an unchanged epoch.
             let want = at.head.epoch.next();
             if want != sealed_at && !empty {
-                let key = self
+                let (key, dicts) = self
                     .seal(
                         names,
                         &self.compacted_key(want, index),
@@ -4367,11 +4373,13 @@ impl<S: BlobStore> Engine<S> {
                     )
                     .await?;
                 out_key = key;
+                out_dicts = dicts;
                 sealed_at = want;
             }
             let out = SegmentRef {
                 key: out_key.as_str().to_owned(),
                 rows: rows.len() as u32,
+                dicts: Some(out_dicts),
             };
             let current: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
             // ⚠️ The discard condition. If any input is no longer named by HEAD, another
@@ -4611,6 +4619,7 @@ impl<S: BlobStore> Engine<S> {
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
 
+        let mut has_sparse_dict = false;
         if let Some(d) = built.dictionary.filter(|d| !d.is_empty()) {
             store
                 .put(
@@ -4618,11 +4627,14 @@ impl<S: BlobStore> Engine<S> {
                     bytes::Bytes::from(d),
                 )
                 .await?;
+            has_sparse_dict = true;
         }
+        let mut has_text_dict = false;
         if let Some(d) = built.text_dictionary.filter(|d| !d.is_empty()) {
             store
                 .put(&pstore_format::text::dict_key(&key), bytes::Bytes::from(d))
                 .await?;
+            has_text_dict = true;
         }
         if let Some(c) = &built.centroids {
             store
@@ -4640,6 +4652,9 @@ impl<S: BlobStore> Engine<S> {
                 .centroids
                 .is_some()
                 .then(|| pstore_index::vec_index::centroid_key(&key)),
+            // M32: from what its own build wrote.
+            sparse_dict: has_sparse_dict,
+            text_dict: has_text_dict,
             segment: key,
             deleted: None,
             shadowed: false,
@@ -5725,6 +5740,9 @@ fn segment_targets(
             pstore_query::Target {
                 centroids: may_have_centroids(r.rows, threshold)
                     .then(|| pstore_index::vec_index::centroid_key(&segment)),
+                // M32: asked for unless HEAD says the segment has none.
+                sparse_dict: r.dicts.is_none_or(|d| d.sparse),
+                text_dict: r.dicts.is_none_or(|d| d.text),
                 deleted: deletes
                     .get(&head::dv_ref(index, &r.key))
                     .map(|(key, _)| Key::new(key.clone())),

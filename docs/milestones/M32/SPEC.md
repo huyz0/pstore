@@ -99,6 +99,11 @@ except that their API does not exist, so their red is the named mutation (spec r
 | A text or sparse query | 0 | 0 | −1 per segment without that dictionary | 0 | unchanged |
 | HEAD | 0 | 0 | 0 | 0 | unchanged; +1 byte per segment, + a name and a count per index |
 
+⚠️ Amended at implementation: two server tests pin the bytes a HEAD read costs. Each reads 37
+more, the earlier optional sections' 20 bytes of zero counts and a 17-byte section for one
+index of one segment: `patch.rs` 859 → 896, `served_epoch.rs` [545, 537, 553] → [582, 574,
+590]. No read count moves.
+
 ## Risks
 
 - **A flag that says absent when the sidecar exists** fails that query loudly: the footer names

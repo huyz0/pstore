@@ -826,6 +826,8 @@ impl<S: BlobStore> Engine<S> {
                 mapped.push(SegmentRef {
                     key: seg.clone(),
                     rows: r.rows,
+                    // M32: the copy's sidecars are the source's.
+                    dicts: r.dicts,
                 });
                 let want = src_head.deletes.get(&head::dv_ref(index, &r.key)).cloned();
                 let Some((k, n)) = want else {

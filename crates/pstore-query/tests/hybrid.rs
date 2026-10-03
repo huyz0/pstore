@@ -40,6 +40,8 @@ fn one(segment: &Key, centroids: &Key) -> [Target; 1] {
         segment: segment.clone(),
         centroids: Some(centroids.clone()),
         deleted: None,
+        sparse_dict: true,
+        text_dict: true,
         shadowed: false,
     }]
 }

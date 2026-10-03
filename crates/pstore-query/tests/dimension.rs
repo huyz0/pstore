@@ -37,6 +37,8 @@ async fn a_query_vector_of_the_wrong_dimension_is_refused_by_the_dense_leg() {
     let target = Target {
         centroids: Some(pstore_index::vec_index::centroid_key(&key)),
         deleted: None,
+        sparse_dict: true,
+        text_dict: true,
         shadowed: false,
         segment: key.clone(),
     };

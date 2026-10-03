@@ -137,6 +137,8 @@ async fn main() {
         targets.push(Target {
             centroids: Some(Key::new(format!("{}.cen", key.as_str()))),
             deleted: None,
+            sparse_dict: true,
+            text_dict: true,
             shadowed: false,
             segment: key,
         });
