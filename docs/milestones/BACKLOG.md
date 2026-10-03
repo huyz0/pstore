@@ -140,7 +140,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 53 | **Under heavy loss, gossip still pays for suspicion churn, and a `Part` grows at N/16.** At 100 members and 10% loss, [M34](M34/VERIFIED.md) still measures 9,662 B per node per round, because a probe ends in a suspicion about 0.75% of the time, and every one changes checksums fleet-wide. At 10,000 members, one differing bucket is about 625 members, roughly 37 KB in one datagram. The churn is Lifeguard's territory: local health awareness and suspicion confirmation (D-4, OQ-12). The slope wants buckets scaled to the fleet, or a digest in two levels. Measure first, on M33's real-hop model. | [M34](M34/SPEC.md) | M |
+| 53 | ⚠️ **NARROWED by [M38](M38/VERIFIED.md), not closed.** The churn was two bugs, not Lifeguard's territory: a `PingReq` helper suspected its target whenever its one relayed path timed out (2,953 of 3,063 suspicions at 100 members and 10% loss), and a node raised its incarnation on claims below it. Fixed, 100 members at 10% loss cost 734 B per node per round, down from 9,662, with suspicion at what loss predicts. The residue: **a `Part` still grows at N/16** per differing bucket, about 625 members (roughly 37 KB in one datagram) at 10,000 members. The slope wants buckets scaled to the fleet, or a digest in two levels. Measure first, on M33's real-hop model, at a fleet size where it binds. | [M34](M34/SPEC.md) | M |
 
 ## Opened by M33
 
