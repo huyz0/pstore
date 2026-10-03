@@ -76,6 +76,13 @@
    engine folds a `body` row into it, and a compaction of the index succeeds: no segment
    indexed a field the schema does not name.
    - **Parent:** the schema records `text`.
+3b. **A sealed row keeps its field across a patch** (code review, round 1). The seal strips
+   `$text`, so a row read back from a segment for resolution is stamped with the field its
+   segment indexed: the recorded one, or `""` when none is, under which no row carries text.
+   In `a_sealed_custom_row_keeps_its_field_across_a_patch`, criterion 3's row, folded by its
+   `body` writer, is patched for `color` by id and by filter, and folded each time. The schema
+   still records no field, and a later `body` row then fills `body`.
+   - **Without the stamp:** `text` was recorded at the first patch's fold.
 4. **Every non-default row is stamped.** A `prose` engine's vector-only row, quarantined for
    its width, exports `$text` = `prose`.
    - **Parent:** no stamp.
@@ -85,6 +92,7 @@
 5. **A patch's text fills the field under its writer's field.**
    `a_patch_that_adds_text_fills_the_text_field` passes unchanged. It was red under this
    spec's first draft (spec review, B1).
+5c. **A by-filter patch is stamped as a patch by id is.** `a_patch_by_filter_that_adds_text_fills_the_text_field`: a `body` engine's by-filter patch adds `body` text to a vector-only index, and the fold records `body`.
 5b. **A default writer's patch keeps a custom row's stamp.** A `body` engine writes criterion 3's
    row, a default engine patches its `color`, and a default engine folds the index. The schema
    records no text field.
@@ -108,7 +116,8 @@ In `crates/pstore-engine/tests/schema.rs`.
 | 4 | `the_text_stamp_is_never_served`, amended | a non-default writer stamping only rows with text. ⚠️ Its header comment changes too (spec review, m2): it is no longer green on the parent |
 | — | 1 and 4 together | the stamp condition inverted (spec review, m3) |
 | 5 | `a_patch_that_adds_text_fills_the_text_field` (existing) | a patch not stamped; `merged` keeping the base's stamp when the patch sets text |
-| 5b | `a_default_patch_keeps_a_custom_rows_stamp` (⚠️ green on the parent, whose `merged` ignores every `$` name: a mutation guard, seen red against the named mutant) | `merged` taking a patch's stamp state when the patch sets no text under its field |
+| 5c | `a_patch_by_filter_that_adds_text_fills_the_text_field` (added in implementation: a by-filter patch left unstamped survived every other test) | a by-filter patch not stamped |
+| 5b | `a_default_patch_keeps_a_custom_rows_stamp` (⚠️ predicted green on the parent; **measured red** there, since the parent's default folder records `text` from the row's ordinary attribute) | `merged` taking a patch's stamp state when the patch sets no text under its field |
 | 6 | `a_custom_writers_no_op_patch_touches_nothing` (⚠️ green on the parent, as 5b) | the stamp compared in the no-op check |
 
 ## RA budget

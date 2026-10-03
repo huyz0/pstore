@@ -16,7 +16,7 @@
 //! the door, refuse at the flush, and at the fold **drop and count** — never stop.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
-use pstore_engine::{Engine, EngineError, Head, Metric};
+use pstore_engine::{Engine, EngineError, Head, Metric, Patch};
 use pstore_format::{Document, Value};
 use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
@@ -1225,8 +1225,10 @@ async fn a_foreign_fold_indexes_the_writers_field() {
 
 #[tokio::test]
 async fn the_text_stamp_is_never_served() {
-    // ⚠️ Green on the parent by design: nothing stamps there. It guards `$text` left out of
-    // `stripped`, and a stamp on a row that carries no text.
+    // ⚠️ It guards `$text` left out of `stripped`. M37: a writer over another field than the
+    // default stamps every row it writes, a vector-only one included, so a `prose` engine's
+    // ordinary `text` attribute is never read as default text (and the default writer's rows
+    // carry no stamp: `the_default_field_is_never_stamped`).
     let store = Arc::new(MemoryStore::new());
     let p = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("prose");
     let served = |rows: Vec<Document>| {
@@ -1244,7 +1246,7 @@ async fn the_text_stamp_is_never_served() {
     p.fold().await.unwrap();
     served(p.scan("docs", None).await.unwrap());
 
-    // A row with no text is never stamped: one quarantined for its width exports no stamp.
+    // A `prose` engine's vector-only row is stamped too (M37).
     let cold = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
     cold.write("vecs", vec![doc("w", 2)]).await.unwrap();
     into(&p, "vecs", vec![doc("v", 4)]).await;
@@ -1253,7 +1255,10 @@ async fn the_text_stamp_is_never_served() {
         .expect_err("the width conflict was not refused once");
     cold.flush().await.unwrap();
     cold.fold().await.unwrap();
-    assert_eq!(stamps(&cold, "vecs").await, [("w".to_owned(), None)]);
+    assert_eq!(
+        stamps(&cold, "vecs").await,
+        [("w".to_owned(), prose("prose"))]
+    );
 }
 
 #[tokio::test]
@@ -1287,4 +1292,186 @@ async fn the_field_a_fold_judged_by_is_the_field_it_records() {
             "{index}"
         );
     }
+}
+
+// ---- M37: an unstamped row was written under the default text field ----
+
+/// A row of width `dims` carrying `text` under `field`.
+fn wide_text(id: &str, dims: usize, field: &str, text: &str) -> Document {
+    let mut d = doc(id, dims);
+    d.attrs
+        .insert(field.to_owned(), Value::Str(text.to_owned()));
+    d
+}
+
+#[tokio::test]
+async fn the_default_field_is_never_stamped() {
+    // ⚠️ Every server engine uses the default field, so M36's stamp there said nothing and
+    // was exactly what a rolling upgrade leaked into segments (BACKLOG row 55).
+    let store = Arc::new(MemoryStore::new());
+    let cold = Engine::new(Arc::clone(&store), T, LaneId(2));
+    cold.write(
+        "docs",
+        vec![wide_text("t", 2, "text", "revenue"), doc("w", 2)],
+    )
+    .await
+    .unwrap();
+    let first = Engine::new(Arc::clone(&store), T, LaneId(1));
+    into(&first, "docs", vec![doc("a", 4)]).await;
+    cold.flush()
+        .await
+        .expect_err("the width conflict was not refused once");
+    cold.flush().await.unwrap();
+    cold.fold().await.unwrap();
+    assert_eq!(
+        stamps(&cold, "docs").await,
+        [("t".to_owned(), None), ("w".to_owned(), None)]
+    );
+}
+
+#[tokio::test]
+async fn an_unstamped_row_is_the_default_fields() {
+    // An older build's row, or one buffered past the door: no stamp. Read as the default
+    // field's whichever engine folds it, as an absent `$metric` is `dot_product`.
+    let store = Arc::new(MemoryStore::new());
+    let old = Engine::new(Arc::clone(&store), T, LaneId(1));
+    old.write_without_schema_check_for_test("fresh", vec![wide_text("u", 4, "text", "revenue")])
+        .await;
+    old.flush_without_schema_check_for_test().await.unwrap();
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    b.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "text");
+    assert_eq!(text_hits(&b, "fresh", "text", "revenue").await, ["u"]);
+}
+
+#[tokio::test]
+async fn a_custom_writers_row_is_never_the_defaults() {
+    // A `body` engine's row with an ordinary attribute named `text`: not text, whichever
+    // engine folds it -- and no segment may index it as text behind the schema's back, or a
+    // later `body` fold leaves the index uncompactable (M30).
+    let store = Arc::new(MemoryStore::new());
+    let b = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    b.write("fresh", vec![wide_text("r", 4, "text", "revenue")])
+        .await
+        .unwrap();
+    b.flush().await.unwrap();
+    let d = Engine::new(Arc::clone(&store), T, LaneId(2));
+    d.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "");
+    assert_eq!(ids_in(&d, "fresh").await, ["r"]);
+
+    into(&b, "fresh", vec![texted("s", "body", "revenue")]).await;
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "body");
+    b.compact("fresh")
+        .await
+        .expect("a segment indexed a field the schema does not name");
+    assert_eq!(text_hits(&b, "fresh", "body", "revenue").await, ["s"]);
+}
+
+#[tokio::test]
+async fn a_default_patch_keeps_a_custom_rows_stamp() {
+    // ⚠️ Green on the parent, whose `merged` ignores every `$` name: a guard against a patch
+    // taking over a row's stamp when it sets no text under its own field.
+    let store = Arc::new(MemoryStore::new());
+    let b = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    b.write("fresh", vec![wide_text("r", 4, "text", "revenue")])
+        .await
+        .unwrap();
+    b.flush().await.unwrap();
+    let d = Engine::new(Arc::clone(&store), T, LaneId(2));
+    let colour = Patch {
+        id: "r".to_owned(),
+        set: std::collections::BTreeMap::from([("color".to_owned(), Value::Str("red".to_owned()))]),
+        unset: vec![],
+    };
+    d.patch("fresh", vec![colour], None).await.unwrap();
+    d.flush().await.unwrap();
+    d.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "");
+}
+
+#[tokio::test]
+async fn a_custom_writers_no_op_patch_touches_nothing() {
+    // ⚠️ Green on the parent, as above. M13.1: a patch that changes nothing touches nothing --
+    // and a stamp is not a change, since a segment row never carries one.
+    let store = Arc::new(MemoryStore::new());
+    let b = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    into(&b, "idx", vec![texted("x", "body", "revenue")]).await;
+    let before = committed(&*store).await.indexes["idx"].clone();
+    let same = Patch {
+        id: "x".to_owned(),
+        set: std::collections::BTreeMap::from([(
+            "body".to_owned(),
+            Value::Str("revenue".to_owned()),
+        )]),
+        unset: vec![],
+    };
+    b.patch("idx", vec![same], None).await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert_eq!(
+        committed(&*store).await.indexes["idx"],
+        before,
+        "a patch that changed nothing wrote a segment or a delete vector"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_by_filter_that_adds_text_fills_the_text_field() {
+    // M37: a by-filter patch is stamped as a patch by id is, so the text it adds is read
+    // under its writer's field, never the default's.
+    let (store, _v, a, _b) = three().await;
+    let mut set = std::collections::BTreeMap::new();
+    set.insert("body".to_owned(), Value::Str("gamma".to_owned()));
+    a.patch_by_filter(
+        "idx",
+        &pstore_query::Predicate::Absent("nothing".to_owned()),
+        Patch {
+            id: String::new(),
+            set,
+            unset: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    a.flush().await.unwrap();
+    a.fold().await.unwrap();
+    assert_eq!(text_field(&store).await, "body");
+    assert_eq!(body(&a, "gamma").await, ["v"]);
+}
+
+#[tokio::test]
+async fn a_sealed_custom_row_keeps_its_field_across_a_patch() {
+    // ⚠️ M37 code review, reproduced: the seal strips the stamp, so a `body` row read back from
+    // its segment looked unstamped -- the default's -- and a later patch of `color` made its
+    // ordinary `text` attribute fill the field, after which every `body` row was a conflict.
+    let store = Arc::new(MemoryStore::new());
+    let b = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    into(&b, "fresh", vec![wide_text("r", 4, "text", "revenue")]).await;
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "");
+    let colour = |id: &str| Patch {
+        id: id.to_owned(),
+        set: std::collections::BTreeMap::from([("color".to_owned(), Value::Str("red".to_owned()))]),
+        unset: vec![],
+    };
+    b.patch("fresh", vec![colour("r")], None).await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "");
+    // And by filter, which reaches `merged` through another path.
+    b.patch_by_filter(
+        "fresh",
+        &pstore_query::Predicate::Absent("nothing".to_owned()),
+        Patch {
+            id: String::new(),
+            ..colour("")
+        },
+    )
+    .await
+    .unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "");
+    into(&b, "fresh", vec![texted("s", "body", "revenue")]).await;
+    assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "body");
 }

@@ -742,6 +742,24 @@ fn merged(mut base: Document, patch: &Document) -> Document {
             }
         }
     }
+    // M37: the row's writer is the patch's when the patch sets text under its own field --
+    // its stamp, or its absence, which means the default. Otherwise the base's stands, so a
+    // default writer's patch of `color` never makes a `body` row's ordinary `text` read as
+    // text.
+    let writer = match patch.attrs.get(TEXT_ATTR) {
+        Some(pstore_format::Value::Str(f)) => f.as_str(),
+        _ => DEFAULT_TEXT,
+    };
+    if has_text(patch, writer) {
+        match patch.attrs.get(TEXT_ATTR) {
+            Some(v) => {
+                base.attrs.insert(TEXT_ATTR.to_owned(), v.clone());
+            }
+            None => {
+                base.attrs.remove(TEXT_ATTR);
+            }
+        }
+    }
     base
 }
 
@@ -784,7 +802,7 @@ fn resolve(
             // vector, and no segment row, for a version that is already what it would write.
             Some(OP_PATCH) => current
                 .filter(&admits)
-                .and_then(|c| Some(merged(c.clone(), &op)).filter(|m| *m != c))
+                .and_then(|c| Some(merged(c.clone(), &op)).filter(|m| !same_row(m, &c)))
                 .map(Some),
             Some(OP_COND_UPSERT) => current
                 .as_ref()
@@ -889,7 +907,7 @@ fn by_filter(
             None
         } else {
             let m = merged(c.clone(), op);
-            if m == c {
+            if same_row(&m, &c) {
                 continue;
             }
             Some(m)
@@ -1022,6 +1040,23 @@ fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError
         ),
         got: describe(got),
     }
+}
+
+/// The default text field, which an absent `$text` means (M37).
+const DEFAULT_TEXT: &str = pstore_format::text::DEFAULT_TEXT_FIELD;
+
+/// Whether two versions of a row are the same row, **whatever their stamps** (M37): a segment
+/// row never carries one, so a patch that changes nothing but a stamp must touch nothing
+/// (M13.1).
+fn same_row(a: &Document, b: &Document) -> bool {
+    let attrs = |d: &Document| {
+        d.attrs
+            .iter()
+            .filter(|(k, _)| k.as_str() != TEXT_ATTR)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>()
+    };
+    a.id == b.id && a.vectors == b.vectors && attrs(a) == attrs(b)
 }
 
 /// Whether `doc` carries a non-empty string under `field`.
@@ -1720,7 +1755,6 @@ impl<S: BlobStore> Engine<S> {
         schema
     }
 
-    /// Whether this row has text in the attribute this process indexes.
     /// The attribute an index's text is indexed over (M30): the one its schema records, else
     /// this process's. ⚠️ Never this process's when the schema records one: a process
     /// configured otherwise would seal the index's rows with no postings for their text.
@@ -1731,21 +1765,32 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or(self.text_field.as_str())
     }
 
-    fn carries_text(&self, doc: &Document) -> bool {
-        has_text(doc, &self.text_field)
+    /// The field a row's text is under (M36): its writer's -- the stamp, else the default
+    /// (M37), as an absent `$metric` is `dot_product` -- when it carries text there, else
+    /// `None`. Never this engine's own: whichever engine folds a row judges it the same.
+    ///
+    /// ⚠️ **Text under the writer's field, not a stamp alone**: a writer over another field
+    /// stamps every row it writes (M37), with text or without, and `merged` keeps a stamp
+    /// after a patch unsets the text.
+    /// The fresh view alone still indexes this engine's own field when no schema records
+    /// one, because it holds only this engine's rows (M37 spec review).
+    fn text_of<'a>(&self, doc: &'a Document) -> Option<&'a str> {
+        let writer = match doc.attrs.get(TEXT_ATTR) {
+            Some(pstore_format::Value::Str(f)) => f.as_str(),
+            _ => DEFAULT_TEXT,
+        };
+        has_text(doc, writer).then_some(writer)
     }
 
-    /// The field a row's text is under (M36): its writer's stamp, else this engine's field
-    /// when it carries text under that -- a row from an older build, or one buffered past the
-    /// door by a test. `None` when it carries none.
-    ///
-    /// ⚠️ The door stamps only a row with text. A stamped row whose text a patch unset (spec
-    /// review, M36) reaches no reader: the reject pass judges every row before resolution,
-    /// so the one reader of resolved rows, the fill, runs only when no stamped row conformed.
-    fn text_of<'a>(&'a self, doc: &'a Document) -> Option<&'a str> {
-        match doc.attrs.get(TEXT_ATTR) {
-            Some(pstore_format::Value::Str(f)) => Some(f),
-            _ => self.carries_text(doc).then_some(self.text_field.as_str()),
+    /// Stamps this writer's text field on a row's or a patch's attributes (M36), unless it is
+    /// the default (M37): every server engine's is, so nothing a server writes is stamped, and
+    /// a build that does not know the stamp has nothing to leak.
+    fn stamp(&self, attrs: &mut BTreeMap<String, pstore_format::Value>) {
+        if self.text_field != DEFAULT_TEXT {
+            attrs.insert(
+                TEXT_ATTR.to_owned(),
+                pstore_format::Value::Str(self.text_field.clone()),
+            );
         }
     }
 
@@ -2136,6 +2181,7 @@ impl<S: BlobStore> Engine<S> {
         for p in patches {
             let id = p.id.clone();
             let mut attrs = patch_attrs(p)?;
+            self.stamp(&mut attrs);
             if let Some(c) = &cond {
                 attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
             }
@@ -2213,6 +2259,7 @@ impl<S: BlobStore> Engine<S> {
         let mark = encoded(filter)?;
         let mut attrs = patch_attrs(patch)?;
         attrs.remove(OP_ATTR);
+        self.stamp(&mut attrs);
         self.mem()
             .buffer(index, vec![by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)]);
         Ok(())
@@ -2261,13 +2308,9 @@ impl<S: BlobStore> Engine<S> {
                     pstore_format::Value::Int(metric.code()),
                 );
             }
-            // M36: the writer's text field, on a row whose text is under it.
-            if self.carries_text(d) {
-                d.attrs.insert(
-                    TEXT_ATTR.to_owned(),
-                    pstore_format::Value::Str(self.text_field.clone()),
-                );
-            }
+            // M36: the writer's text field. M37: on every row, and only when it is not the
+            // default, which an absent stamp means.
+            self.stamp(&mut d.attrs);
             if let Some(f) = &declared.fts {
                 d.attrs
                     .insert(FTS_ATTR.to_owned(), pstore_format::Value::Str(f.encode()));
@@ -3588,11 +3631,28 @@ impl<S: BlobStore> Engine<S> {
                 };
                 let prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
                 let mut prepared = prepared;
+                // ⚠️ **A sealed row is stamped with the field its segment indexed** (M37 code
+                // review): the seal strips `$text`, and an absent stamp means the default, so a
+                // `body` row patched after its fold would read its ordinary `text` attribute as
+                // text. A segment indexes the recorded field only, so that is the row's field;
+                // an empty one stamps `""`, under which no row carries text.
+                let field = at
+                    .head
+                    .schemas
+                    .get(&idx)
+                    .map(|s| s.text_field.clone())
+                    .unwrap_or_default();
                 // Moved out, not cloned: `supersede` needs ids and positions only.
                 let base: std::collections::HashMap<String, Document> = prepared
                     .iter_mut()
                     .flat_map(|p| std::mem::take(&mut p.kept))
-                    .map(|(_, d)| (d.id.clone(), d))
+                    .map(|(_, mut d)| {
+                        d.attrs.insert(
+                            TEXT_ATTR.to_owned(),
+                            pstore_format::Value::Str(field.clone()),
+                        );
+                        (d.id.clone(), d)
+                    })
                     .collect();
                 let (changed, sealed) = resolve(docs, &base, &mut cx);
                 touched.insert(idx.clone(), changed.into_iter().collect());
@@ -3674,7 +3734,9 @@ impl<S: BlobStore> Engine<S> {
                         names,
                         &self.segment_key(next.epoch, idx),
                         &sealed,
-                        Some(self.text_field_of(Some(&schema))),
+                        // M37: the recorded field only, never this engine's: a row read as no
+                        // text must not be indexed as text behind the schema's back.
+                        Some(schema.text_field.as_str()).filter(|f| !f.is_empty()),
                         &schema.fts,
                         &schema.trigram,
                     )
