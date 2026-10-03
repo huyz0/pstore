@@ -45,6 +45,8 @@ coalesce gap 0. The corpus is a 128-dimension Gaussian mixture with 36-byte ids.
   whatever the scale, and it grows with id length and probe width.
 - Round 4 reads whole row blocks, which grow with the segment, so the break-even id length
   rises with scale. Ids of about 8 bytes would save bytes at 400,000 rows and p = 2.
+  ⚠️ **Amended by the run** (M42 code review): the break-even there is about 17 bytes, and
+  about 15.5 at the 1 MiB gap. "About 8" was a length that saves, not the break-even.
 
 **The repo's own rule decides which way this leans** (spec review, blocker). The corpus prices
 the round trip, not the byte: "the round trip is the unit of cost, not the byte"
@@ -55,7 +57,9 @@ the round trip, not the byte: "the round trip is the unit of cost, not the byte"
 - ⚠️ **But bytes are not free here either** (spec review, round 2). The index's own comments
   say "storage is the cheap resource and query bytes are the scarce one" (`cluster.rs`), and
   that "bytes per query is the cost model's dominant input" (`Query::default`). The change
-  raises that input by about a fifth.
+  raises that input by about a fifth at gap 0. ⚠️ **Amended by the run:** at the production
+  backend's 1 MiB gap it is +35.4% at 100,000 rows and +41.9% at 400,000 (p = 8, net of
+  round 4).
 - So **building ids beside codes is a cost judgement the corpus already supports, not a line
   crossed**.
 - What *would* cross one is keeping four rounds by restating D-34 (three for the ranking, one

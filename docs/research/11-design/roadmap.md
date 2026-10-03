@@ -535,6 +535,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M39 | **A flush re-reads its lane's watermark within half the reap age** ([VERIFIED](../../milestones/M39/VERIFIED.md)): a second writer's folded and reaped bundle is refused as `LaneTaken`, never written again below the watermark | [BACKLOG](../../milestones/BACKLOG.md) row 24 |
 | M40 | **A filter never names a reserved attribute** ([VERIFIED](../../milestones/M40/VERIFIED.md)): the API refuses `$` names in filters and conditions; a scan filters what it serves | [BACKLOG](../../milestones/BACKLOG.md) row 56 |
 | M41 | **A fresh view never matches another writer's row** ([VERIFIED](../../milestones/M41/VERIFIED.md)): row 56's last item measured unreachable, and pinned | [BACKLOG](../../milestones/BACKLOG.md) row 56 |
+| M42 | **Ids beside codes, priced** ([VERIFIED](../../milestones/M42/VERIFIED.md)): the fourth round's alternative costs +21% bytes at gap 0 and +35–42% at the production gap, for dense id-only queries only; left to a human | [BACKLOG](../../milestones/BACKLOG.md) row 26 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
