@@ -34,8 +34,9 @@ accounting, M9c.1's fresh-view generation, and M7d's "drop and count". Instead:
    read one. So the door knows every recorded schema, and the replica check sees what the
    read learned.
 2. **A cached schema is authoritative at the door.** When this process holds one for the index,
-   the door checks a batch against it alone, and no longer falls back to the width of rows it
-   holds unfolded. A stale wrong row then refuses no correct write.
+   the door checks a batch against it alone, and no longer falls back to the rows it holds
+   unfolded, for any property (width, metric, analyzer, trigrams: code review, M35). A stale
+   wrong row then refuses no correct write.
 3. **A flush refuses a schema conflict once, then waives.** The refusal is returned as today. The
    next flush skips the schema check, so the rows accepted before the schema was known become
    durable, and the fold's reject pass sets them aside in the index's quarantine (M25). There
@@ -46,6 +47,10 @@ accounting, M9c.1's fresh-view generation, and M7d's "drop and count". Instead:
      that writes its bundle clears it. A flush that fails (`Io`, `Contended`) keeps it for the
      retry. It skips the schema check for **every** index in that flush, not only the one the
      refusal named: `find_map` reports the first conflict and stops.
+   - ⚠️ **Never a text-field conflict** (code review, M35). A row does not record its writer's
+     text field, so a fold run by another engine sees no conflict, and a waived row went into
+     the index with its text unindexed. That one conflict is refused at every flush, as before
+     M35, and is the residue this milestone leaves.
    - Two comments become false and are corrected: `flush_inner`'s "Nothing wrong may become
      durable", and the schema test's "A row that never becomes durable can never reach a
      fold".
@@ -82,6 +87,21 @@ In `crates/pstore-engine/tests/schema.rs`.
 | 3 | `one_waiver_covers_every_refused_index` | a waiver for the named index only; a waiver cleared by a failed flush |
 | — | `a_text_field_that_contradicts_the_schema_is_refused` (existing) | ⚠️ **amended, not weakened**: its write is now refused at the door (the first read knows the schema), where it was accepted and refused at the flush |
 | 4 | `the_first_write_reads_head_once` | a read per write; the `schemas_unseen` guard dropped |
+| 5 | `a_failed_first_read_refuses_no_write` (added in implementation) | a read fault refusing the write |
+| 6 | `a_waiver_never_covers_a_text_field` (code review) | the waiver covering a text-field conflict |
+| 7 | `a_stale_row_of_another_metric_refuses_no_write` (code review) | the door's metric fallback kept |
+
+⚠️ **Found in implementation: four tests pinned the gap this milestone closes**, and each is
+amended toward the stronger outcome, never loosened:
+- `the_width_survives_a_flush_and_a_fold` (`tests/dimensions.rs`) asserted that a new process
+  *accepts* a wrong width, "and must not pay" a read. It now asserts the refusal.
+- `a_divergent_backend_is_refused_before_anything_is_written` counted the write's requests as
+  the refused operations'. It now pins the write at exactly 1 read and the refusals at 0.
+- `a_euclidean_row_is_exported_in_client_space` (`tests/quarantine.rs`) built its rejected row
+  through a cold door. It now builds it in the race: written before the index has a schema.
+- `a_batched_write_costs_nothing` and the durable-cost test (`pstore-server/tests/cost.rs`):
+  the first write reads HEAD once (batched 0 → 1, durable first write 10 → 11), and a second
+  batched write is now asserted at 0 in every class.
 
 ## RA budget
 
@@ -101,8 +121,13 @@ rebuilt.
   a `batched` one's background flush. The quarantine is how the row stays visible rather than
   lost, against M7d's "nothing wrong may become durable": that rule holds at the door, which
   now sees HEAD, and the flush only waives what the door could not have seen.
-- **A first write can fail on a store error**, or wait a round trip, where it buffered for free.
-  Two first writes in parallel both read HEAD, which is harmless.
+- **A first write waits a round trip**, where it buffered for free. Two first writes in parallel
+  both read HEAD, which is harmless.
+- ⚠️ **Corrected in implementation: a first write never fails on a store error.** The draft
+  said it could. The server's chaos suite showed what that means: ingest that depends on read
+  availability. The read is best effort when only the schema is wanted. On a fault the door
+  knows what it knew before M35, the flush still checks, and the next write tries the read
+  again. A known replica's read still stands, as M22 made it.
 - **A drop and re-create** still recovers through M9f.2's re-read at the door. The first read
   remembers schemas only and prunes nothing; the flush prunes as it does today.
 

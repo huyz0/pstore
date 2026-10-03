@@ -16,7 +16,7 @@
 //! the door, refuse at the flush, and at the fold **drop and count** — never stop.
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
-use pstore_engine::{Engine, EngineError, Head};
+use pstore_engine::{Engine, EngineError, Head, Metric};
 use pstore_format::{Document, Value};
 use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
@@ -162,9 +162,10 @@ async fn a_contradicting_index_seals_nothing() {
 
 #[tokio::test]
 async fn a_flush_refuses_before_the_bundle_is_written() {
-    // ⚠️ The rung that makes the rest safe: a row that never becomes durable can never reach
-    // a fold, so the drop-and-count path is a race between two cold processes rather than the
-    // normal way to write.
+    // ⚠️ The rung that makes the rest rare: the refused rows are not in a bundle, so the
+    // drop-and-count path is a race between two cold processes rather than the normal way to
+    // write. ⚠️ Since M35 the refusal is once: the next flush waives it, and the fold
+    // quarantines the rows (`a_refused_flush_blocks_no_later_write`).
     let acct = Arc::new(Accounted::new(MemoryStore::new()));
     let store = Arc::new(acct.as_tenant(T));
     let e = Engine::new(Arc::clone(&store), T, LaneId(1));
@@ -259,16 +260,19 @@ async fn a_text_field_that_contradicts_the_schema_is_refused() {
 
     // ⚠️ A second process configured over a different attribute, with rows that carry it: its
     // segment would hold postings nobody queries, which is M6c's failure at index scope.
+    // ⚠️ M35: refused at the door, where it was accepted and refused at the flush, because a
+    // process's first write now reads the recorded schema.
     let other = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
-    other
+    let err = other
         .write("docs", vec![texted("b", "prose", "revenue")])
         .await
-        .unwrap();
-    let err = other
-        .flush()
-        .await
-        .expect_err("a contradicting text field was written");
+        .expect_err("a contradicting text field was accepted");
     assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    assert_eq!(
+        other.flush().await.unwrap(),
+        None,
+        "a contradicting text field was written"
+    );
 }
 
 #[tokio::test]
@@ -704,4 +708,364 @@ async fn before_any_text_the_fresh_segment_indexes_the_process_field() {
         ["x"],
         "an empty recorded field was used as a field name"
     );
+}
+
+// ---- M35: a wrong row is refused at the door, and never blocks a lane ----
+
+async fn into(e: &Engine<impl BlobStore + 'static>, index: &str, docs: Vec<Document>) {
+    e.write(index, docs).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+}
+
+async fn ids_in(e: &Engine<impl BlobStore + 'static>, index: &str) -> Vec<String> {
+    let mut ids: Vec<String> = e
+        .scan(index, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+async fn quarantined(e: &Engine<impl BlobStore + 'static>, index: &str) -> Vec<String> {
+    let mut ids: Vec<String> = e
+        .quarantine(index)
+        .await
+        .unwrap()
+        .map(|q| q.rows.into_iter().map(|r| r.document.id).collect())
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn a_first_write_learns_the_recorded_schema() {
+    // ⚠️ The sequence measured while planning M35: a process that had never read HEAD accepted
+    // a wrong width, and then refused every correct one, because the door compared against
+    // the wrong row it held.
+    let store = Arc::new(MemoryStore::new());
+    let first = Engine::new(Arc::clone(&store), T, LaneId(1));
+    into(&first, "docs", vec![doc("a", 4)]).await;
+
+    let cold = Engine::new(Arc::clone(&store), T, LaneId(2));
+    let err = cold
+        .write("docs", vec![doc("wrong", 3)])
+        .await
+        .expect_err("a first write accepted a width HEAD contradicts");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    cold.write("docs", vec![doc("right", 4)]).await.unwrap();
+    cold.flush().await.unwrap();
+    cold.fold().await.unwrap();
+    assert_eq!(ids_in(&cold, "docs").await, ["a", "right"]);
+    assert!(committed(&*store).await.schema_rejects.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_flush_blocks_no_later_write() {
+    // The race the door cannot see: this engine read HEAD before any schema was recorded,
+    // and another process records one before this engine flushes.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(2));
+    e.write("docs", vec![doc("w1", 3)]).await.unwrap();
+    e.write("docs", vec![doc("w2", 3)]).await.unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(1));
+    into(&other, "docs", vec![doc("a", 4)]).await;
+
+    let err = e
+        .flush()
+        .await
+        .expect_err("the flush wrote a known conflict");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    // ⚠️ Before M35 this engine refused every later write and flush to `docs` until it
+    // restarted: the door compared against the stale rows, and the flush refused them again.
+    e.write("docs", vec![doc("right", 4)])
+        .await
+        .expect("a correct write was refused after a flush's refusal");
+    e.flush()
+        .await
+        .expect("a second flush refused the same rows again");
+    e.fold().await.unwrap();
+    assert_eq!(ids_in(&e, "docs").await, ["a", "right"]);
+    assert_eq!(quarantined(&e, "docs").await, ["w1", "w2"]);
+
+    // ⚠️ And the waiver is spent once a bundle lands. The race again, on an index this engine
+    // has no schema for: a refused write's re-read (M9f.2) teaches it the schema, and the
+    // stale row it holds is refused at the next flush rather than waived.
+    e.write("late", vec![doc("w3", 3)]).await.unwrap();
+    into(&other, "late", vec![doc("b", 4)]).await;
+    let err = e
+        .write("late", vec![doc("w4", 2)])
+        .await
+        .expect_err("a wrong width was accepted with the schema in hand");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    let err = e
+        .flush()
+        .await
+        .expect_err("a waiver outlived the bundle that spent it");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+}
+
+/// A memory store whose next bundle write answers `Io` without landing, once, and whose next
+/// HEAD read fails, once.
+#[derive(Debug, Default, Clone)]
+struct FailOnce {
+    inner: MemoryStore,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+    fail_head: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for FailOnce {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &pstore_blob::Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &pstore_blob::Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_range(key, range).await
+    }
+    async fn get_suffix(
+        &self,
+        key: &pstore_blob::Key,
+        n: u64,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_suffix(key, n).await
+    }
+    async fn get_with_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        if key.as_str().ends_with("/HEAD")
+            && self
+                .fail_head
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(pstore_blob::BlobError::Other(
+                "the connection dropped".to_owned(),
+            ));
+        }
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        self.inner.get_tag(key).await
+    }
+    async fn head(&self, key: &pstore_blob::Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        if key.as_str().ends_with(".bundle")
+            && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(pstore_blob::CasError::Io(
+                "refused before writing".to_owned(),
+            ));
+        }
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[pstore_blob::Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(
+        &self,
+        prefix: &pstore_blob::Key,
+    ) -> Result<Vec<pstore_blob::Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+    async fn get_range_as(
+        &self,
+        key: &pstore_blob::Key,
+        range: std::ops::Range<u64>,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_range_as(key, range, class).await
+    }
+    async fn get_suffix_as(
+        &self,
+        key: &pstore_blob::Key,
+        n: u64,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_suffix_as(key, n, class).await
+    }
+    async fn get_immutable(
+        &self,
+        key: &pstore_blob::Key,
+        class: pstore_blob::Class,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.inner.get_immutable(key, class).await
+    }
+}
+
+#[tokio::test]
+async fn one_waiver_covers_every_refused_index() {
+    let store = FailOnce::default();
+    let e = Engine::new(Arc::new(store.clone()), T, LaneId(2));
+    e.write("a", vec![doc("a1", 3)]).await.unwrap();
+    e.write("b", vec![doc("b1", 3)]).await.unwrap();
+    let other = Engine::new(Arc::new(store.clone()), T, LaneId(1));
+    other.write("a", vec![doc("a0", 4)]).await.unwrap();
+    other.write("b", vec![doc("b0", 4)]).await.unwrap();
+    other.flush().await.unwrap();
+    other.fold().await.unwrap();
+
+    // One refusal, naming one index: the check stops at the first conflict.
+    let err = e
+        .flush()
+        .await
+        .expect_err("the flush wrote a known conflict");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    // A flush that fails to write its bundle keeps the waiver for its retry.
+    store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = e
+        .flush()
+        .await
+        .expect_err("the injected failure was not hit");
+    assert!(matches!(err, EngineError::Blob(_)), "{err:?}");
+    e.flush()
+        .await
+        .expect("the retry refused rows the waiver covers");
+    e.fold().await.unwrap();
+    assert_eq!(quarantined(&e, "a").await, ["a1"]);
+    assert_eq!(quarantined(&e, "b").await, ["b1"]);
+    assert_eq!(ids_in(&e, "a").await, ["a0"]);
+    assert_eq!(ids_in(&e, "b").await, ["b0"]);
+}
+
+#[tokio::test]
+async fn the_first_write_reads_head_once() {
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let seed = Engine::new(Arc::clone(&store), T, LaneId(1));
+    seed.write("docs", vec![doc("a", 4)]).await.unwrap();
+    seed.flush().await.unwrap();
+    seed.fold().await.unwrap();
+
+    let e = Engine::new(Arc::clone(&store), T, LaneId(3));
+    let before = acct.count(T, OpClass::Read);
+    e.write("docs", vec![doc("b", 4)]).await.unwrap();
+    assert_eq!(acct.count(T, OpClass::Read) - before, 1, "the first write");
+    let before = acct.count(T, OpClass::Read);
+    for i in 0..10 {
+        e.write("docs", vec![doc(&format!("c{i}"), 4)])
+            .await
+            .unwrap();
+    }
+    assert_eq!(acct.count(T, OpClass::Read) - before, 0, "ten later writes");
+    // The resume's fresh read (M9j) is a different question, and stays.
+    let before = acct.count(T, OpClass::Read);
+    e.flush().await.unwrap();
+    assert!(
+        acct.count(T, OpClass::Read) > before,
+        "the first flush read nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_first_read_refuses_no_write() {
+    // ⚠️ Found by the server's chaos suite: a buffered write that fails on a read fault
+    // makes ingest depend on read availability, which it never did. The read is retried by
+    // the next write instead.
+    let store = FailOnce::default();
+    let first = Engine::new(Arc::new(store.clone()), T, LaneId(1));
+    into(&first, "docs", vec![doc("a", 4)]).await;
+
+    let cold = Engine::new(Arc::new(store.clone()), T, LaneId(2));
+    store
+        .fail_head
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    cold.write("docs", vec![doc("b", 4)])
+        .await
+        .expect("a read fault refused a buffered write");
+    assert!(
+        !store.fail_head.load(std::sync::atomic::Ordering::SeqCst),
+        "the first write did not read HEAD"
+    );
+    let err = cold
+        .write("docs", vec![doc("wrong", 3)])
+        .await
+        .expect_err("the next write did not retry the read");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_waiver_never_covers_a_text_field() {
+    // ⚠️ Code review, M35: a row does not record its writer's text field, so a fold run by
+    // another engine cannot quarantine it, and a waived row went into the index with its text
+    // unindexed. That one conflict is refused at every flush, as it was before M35.
+    let store = Arc::new(MemoryStore::new());
+    let wrong = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
+    wrong
+        .write("docs", vec![texted("p", "prose", "revenue")])
+        .await
+        .unwrap();
+    let right = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    into(&right, "docs", vec![texted("a", "body", "revenue")]).await;
+
+    for attempt in ["first", "second"] {
+        let err = wrong
+            .flush()
+            .await
+            .expect_err("a contradicting text field was written");
+        assert!(
+            matches!(
+                err,
+                EngineError::SchemaConflict {
+                    what: "the text field",
+                    ..
+                }
+            ),
+            "{attempt}: {err:?}"
+        );
+    }
+    right.fold().await.unwrap();
+    assert_eq!(ids_in(&right, "docs").await, ["a"]);
+}
+
+#[tokio::test]
+async fn a_stale_row_of_another_metric_refuses_no_write() {
+    // Code review, M35: the schema is authoritative at the door for every property, not the
+    // width alone.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(2));
+    e.write_as("docs", vec![doc("e", 4)], Metric::EuclideanSquared)
+        .await
+        .unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(1));
+    into(&other, "docs", vec![doc("a", 4)]).await;
+
+    let err = e
+        .flush()
+        .await
+        .expect_err("the flush wrote a known conflict");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
+    e.write("docs", vec![doc("right", 4)])
+        .await
+        .expect("a stale row of another metric refused a correct write");
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    assert_eq!(ids_in(&e, "docs").await, ["a", "right"]);
+    assert_eq!(quarantined(&e, "docs").await, ["e"]);
 }

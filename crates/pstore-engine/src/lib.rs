@@ -1010,6 +1010,22 @@ fn describe(f: &FullText) -> String {
     )
 }
 
+/// Whether a fold sets a row with this conflict aside in its quarantine (M25), whichever
+/// engine runs it, so a flush may waive it (M35).
+///
+/// ⚠️ **Not a text-field conflict**: it is decided against the folding engine's own text
+/// field, which a row does not carry, so a fold run by a correctly configured engine sees
+/// none and indexes the row with its text unindexed.
+fn quarantinable(e: &EngineError) -> bool {
+    !matches!(
+        e,
+        EngineError::SchemaConflict {
+            what: "the text field",
+            ..
+        }
+    )
+}
+
 /// An analyzer conflict, from what the index has and what a row declares.
 fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError {
     EngineError::SchemaConflict {
@@ -1371,6 +1387,16 @@ pub struct Engine<S> {
     /// The highest watermark any HEAD this engine read gave its own lane (M17). Recorded where
     /// HEAD is read; compared only by the flush, under `flushing`.
     lane_seen: std::sync::atomic::AtomicU64,
+    /// Whether a flush refused a schema conflict and no bundle has landed since (M35). The
+    /// next flush waives every conflict the fold quarantines, so rows accepted before the
+    /// schema was known become durable and are set aside, rather than blocking the lane
+    /// until a restart.
+    ///
+    /// ⚠️ **Every index, not the one the refusal named**: the check reports the first
+    /// conflict and stops. And kept across a flush that fails, for its retry. ⚠️ Any bundle
+    /// landing clears it, an earlier uncertain one included (M17): that costs at most one
+    /// more refusal, never a waived row.
+    waived: std::sync::atomic::AtomicBool,
     /// A bundle write whose outcome is unknown (M17), resolved before anything else is written.
     uncertain: Mutex<Option<Uncertain>>,
     /// Names a fold created and its own commit did not bury (M23): its attempts were discarded
@@ -1511,6 +1537,7 @@ impl<S: BlobStore> Engine<S> {
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
+            waived: std::sync::atomic::AtomicBool::new(false),
             uncertain: Mutex::new(None),
             abandoned: Mutex::new(Vec::new()),
             reapable: Mutex::new(std::collections::VecDeque::new()),
@@ -1573,8 +1600,11 @@ impl<S: BlobStore> Engine<S> {
 
     /// Refuses a write into a replica index (M22): by what this process last read, at zero
     /// requests; a refusal re-reads HEAD once before it stands, so another process's cancel
-    /// is seen. A process that has read nothing cannot know, and the fold drops what it lets
-    /// through.
+    /// is seen.
+    ///
+    /// ⚠️ **And a process's first write reads HEAD here, once** (M35), so the door knows every
+    /// recorded schema. Before, a process that had never read accepted a wrong width, and then
+    /// refused every correct write to that index against the wrong row it held.
     async fn refuse_replica(&self, index: &str) -> Result<(), EngineError> {
         let named = |e: &Self| {
             e.replica_names
@@ -1582,10 +1612,19 @@ impl<S: BlobStore> Engine<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(index)
         };
-        if !named(self) {
+        let at = if named(self) {
+            head::read(&*self.store, self.tenant).await?
+        } else if self.schemas_unseen() {
+            // ⚠️ **Best effort** (M35): only the schema was wanted, and a write is buffered,
+            // so a read fault must not refuse it. The door then knows what it knew before
+            // M35, the flush still checks, and the next write tries the read again.
+            match head::read(&*self.store, self.tenant).await {
+                Ok(at) => at,
+                Err(_) => return Ok(()),
+            }
+        } else {
             return Ok(());
-        }
-        let at = head::read(&*self.store, self.tenant).await?;
+        };
         self.remember_schemas(&at.head);
         if at.head.replications.contains_key(index) {
             return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
@@ -2274,11 +2313,14 @@ impl<S: BlobStore> Engine<S> {
         // that does not match. Silent wrongness is what had to go; a refusal one step later
         // is a cost.
         // ⚠️ **Rung one of the ladder: the schema this process has already read**, at zero
-        // requests. Cold, it has nothing to compare against and the flush is what refuses.
-        if let Some(schema) = self.cached_schema(index)
-            && let Some(e) = self.batch_conflict(index, &schema, docs)
-        {
-            return Some(e);
+        // requests. Since M35 every write path has read HEAD once before it gets here.
+        //
+        // ⚠️ **And it is authoritative** (M35): rows this process holds may be ones accepted
+        // before the schema was known, which the fold will quarantine. Comparing against them
+        // refused every correct write after one wrong one. The schema records every property
+        // the rungs below infer from rows, so they are for an index with no schema yet.
+        if let Some(schema) = self.cached_schema(index) {
+            return self.batch_conflict(index, &schema, docs);
         }
         // ⚠️ **Falls back to the batch's own first row**, which closes the case a reviewer
         // spotted next to the one this ladder was built for: a brand-new index created by a
@@ -2703,10 +2745,18 @@ impl<S: BlobStore> Engine<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // ⚠️ **Rung two, and the rung that makes the fold's drop path a race rather than a
-        // routine.** Nothing wrong may become durable, so the schema is read here — **once
-        // per process**, on the first flush, in the read the lane's resume makes anyway. A
-        // read per flush would be a request per write, which is the cost model this design
-        // exists to protect.
+        // routine.** The schema is read here — **once per process**, on the first flush, in
+        // the read the lane's resume makes anyway. A read per flush would be a request per
+        // write, which is the cost model this design exists to protect.
+        //
+        // ⚠️ **It refuses once, then waives** (M35). What it refuses was accepted at a door
+        // that could not have known: retained, those rows refused every later flush until a
+        // restart. Waived, they become durable and the fold quarantines them, counted and
+        // exportable. Anything written after the refusal meets the schema at the door.
+        //
+        // ⚠️ **Never a text-field conflict** (code review, M35): a row does not record its
+        // writer's text field, so a fold run by another engine cannot see it, and a waived row
+        // went into the index with its text unindexed. That one stays refused at every flush.
         let watermark = if lane.is_none() || (check && self.schemas_unseen()) {
             let at = head::read(&*self.store, self.tenant).await?;
             self.remember_schemas(&at.head);
@@ -2715,11 +2765,15 @@ impl<S: BlobStore> Engine<S> {
             0
         };
         if check {
+            let waived = self.waived.load(std::sync::atomic::Ordering::SeqCst);
             let refusal = pending.iter().find_map(|(index, docs)| {
                 let schema = self.cached_schema(index)?;
-                self.batch_conflict(index, &schema, docs)
+                docs.iter()
+                    .filter_map(|d| self.row_conflict(index, &schema, d))
+                    .find(|e| !waived || !quarantinable(e))
             });
             if let Some(e) = refusal {
+                self.waived.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Err(e);
             }
         }
@@ -2869,6 +2923,9 @@ impl<S: BlobStore> Engine<S> {
     /// A bundle at `seq` holding the first `counts` rows of each index's `pending` has landed:
     /// the sequence is taken, and the rows move to `durable`.
     fn landed(&self, seq: Seq, counts: &BTreeMap<String, usize>, size: u64) {
+        // A bundle landed, so whatever the waiver covered is durable (M35).
+        self.waived
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         {
             let mut s = self
                 .seq

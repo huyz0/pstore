@@ -39,7 +39,16 @@ async fn a_divergent_backend_is_refused_before_anything_is_written() {
     let e = Engine::new(Arc::new(acc.as_tenant(T)), T, LaneId(0));
 
     // `write` is buffered and visible, never durable, so it is deliberately NOT refused.
+    // ⚠️ Since M35 a process's first write reads HEAD once, for the schema; it writes nothing.
     e.write("i", vec![doc(1)]).await.unwrap();
+    let classes = [
+        OpClass::Write,
+        OpClass::Read,
+        OpClass::Delete,
+        OpClass::List,
+    ];
+    let written: Vec<u64> = classes.iter().map(|c| acc.total(*c)).collect();
+    assert_eq!(written, [0, 1, 0, 0], "the first write's requests");
 
     // ⚠️ Every door that acknowledges durability, not just the obvious one. `fold` and
     // `compact` reach `head::commit` without ever flushing, and `gc` DELETES before it
@@ -49,14 +58,9 @@ async fn a_divergent_backend_is_refused_before_anything_is_written() {
     refusal(e.compact("i").await.expect_err("compact must refuse"));
     refusal(e.gc(0).await.expect_err("gc must refuse"));
 
-    for class in [
-        OpClass::Write,
-        OpClass::Read,
-        OpClass::Delete,
-        OpClass::List,
-    ] {
+    for (class, before) in classes.into_iter().zip(written) {
         assert_eq!(
-            acc.total(class),
+            acc.total(class) - before,
             0,
             "{class:?} requests were issued by a refused operation"
         );

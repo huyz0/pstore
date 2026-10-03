@@ -110,15 +110,26 @@ async fn a_rejected_row_is_quarantined_intact() {
 #[tokio::test]
 async fn a_euclidean_row_is_exported_in_client_space() {
     // A row rejected for its metric: the index is dot product, this writer euclidean.
-    let w = World::new().await;
-    w.cold
-        .write_as("docs", vec![doc("e", 4)], Metric::EuclideanSquared)
+    // ⚠️ Since M35 a first write reads the recorded schema, so the euclidean row is written
+    // in the race the door cannot see: before the index has a schema at all.
+    let store = Arc::new(Accounted::new(MemoryStore::new()).as_tenant(T));
+    let cold = Engine::new(Arc::clone(&store), T, LaneId(2));
+    cold.write_as("docs", vec![doc("e", 4)], Metric::EuclideanSquared)
         .await
         .unwrap();
-    w.cold.flush_without_schema_check_for_test().await.unwrap();
-    w.cold.fold().await.unwrap();
-    let q = w.first.quarantine("docs").await.unwrap().unwrap();
-    assert_eq!(q.rows.len(), 1, "{:?}", w.head().await.schema_rejects);
+    let first = Engine::new(Arc::clone(&store), T, LaneId(1));
+    first.write("docs", vec![doc("a", 4)]).await.unwrap();
+    first.flush().await.unwrap();
+    first.fold().await.unwrap();
+    cold.flush_without_schema_check_for_test().await.unwrap();
+    cold.fold().await.unwrap();
+    let q = first.quarantine("docs").await.unwrap().unwrap();
+    assert_eq!(
+        q.rows.len(),
+        1,
+        "{:?}",
+        first.head_for_test().await.schema_rejects
+    );
     let r = &q.rows[0];
     assert_eq!(
         r.document.vector(),

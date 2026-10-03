@@ -81,13 +81,13 @@ async fn the_width_survives_a_flush_and_a_fold() {
     );
 
     e.fold().await.unwrap();
-    // ⚠️ After the fold the memtable is empty and the width lives in the segment. A process
-    // that has just started knows nothing either -- so this is the case that must be **loud
-    // at query time** rather than silently wrong, and `a_query_vector_of_the_wrong_dimension`
-    // in `pstore-query` is what makes it so.
+    // ⚠️ After the fold the memtable is empty and the width lives in the segment and in the
+    // schema HEAD records. A process that has just started knew nothing until M35, and
+    // accepted this; its first write now reads HEAD once, so it is refused at the door.
     let fresh = Engine::new(Arc::clone(&store), T, LaneId(2));
-    fresh
+    let err = fresh
         .write("docs", vec![Document::new("b", vec![9.0, 9.0])])
         .await
-        .expect("a new process cannot know the width without a read, and must not pay one");
+        .expect_err("a new process accepted a width HEAD records against it");
+    assert!(matches!(err, EngineError::SchemaConflict { .. }), "{err:?}");
 }

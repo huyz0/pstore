@@ -73,8 +73,19 @@ async fn a_batched_write_costs_nothing() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["documents_written"], 10);
     assert_eq!(body["durable"], false);
-    // ⚠️ Every class, not just writes: a batched write that reads HEAD "just to be sure"
-    // would put a blob request on the hot path of every ingest call.
+    // ⚠️ M35: a process's FIRST write reads HEAD once, for the recorded schema, so a wrong
+    // width is refused at the door rather than blocking its index until a restart.
+    assert_eq!(
+        body["cost"]["blob_reads"], 1,
+        "a first write reads HEAD once"
+    );
+    for class in ["blob_writes", "blob_lists"] {
+        assert_eq!(body["cost"][class], 0, "a batched write issued a {class}");
+    }
+    // ⚠️ Every class, not just writes, on every write after it: a batched write that reads
+    // HEAD "just to be sure" would put a blob request on the hot path of every ingest call.
+    let (status, body) = send(&api, write("7", "docs", "batched", 10)).await;
+    assert_eq!(status, StatusCode::OK);
     for class in ["blob_reads", "blob_writes", "blob_lists"] {
         assert_eq!(body["cost"][class], 0, "a batched write issued a {class}");
     }
@@ -101,9 +112,13 @@ async fn a_durable_write_costs_its_lane_registration_once_then_one_put() {
     // ⚠️ **10 since M9j**: the first flush also resumes the lane, with one window of 8
     // parallel probes for its tail, so a server restarted on its lane cannot overwrite what
     // it wrote before (BACKLOG row 39). Still once per process; HEAD serves both.
+    //
+    // ⚠️ **11 since M35**: the write reads HEAD once before it buffers, for the door's schema
+    // check, and the flush's resume reads it again afresh (M9j), because a batched write's
+    // read may be arbitrarily old by the time it flushes.
     assert_eq!(
-        body["cost"]["blob_reads"], 10,
-        "first flush reads the lane set, HEAD, and one window of probes"
+        body["cost"]["blob_reads"], 11,
+        "the write's HEAD, then the flush's lane set, HEAD, and one window of probes"
     );
     assert_eq!(body["cost"]["blob_lists"], 0);
 
