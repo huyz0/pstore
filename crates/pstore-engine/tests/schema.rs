@@ -1475,3 +1475,77 @@ async fn a_sealed_custom_row_keeps_its_field_across_a_patch() {
     into(&b, "fresh", vec![texted("s", "body", "revenue")]).await;
     assert_eq!(committed(&*store).await.schemas["fresh"].text_field, "body");
 }
+
+// ---- M41: a fresh view never matches another writer's row ----
+
+/// Every engine's text-query answer for `revenue` over `text` and over `body`, as a `Result`
+/// so an answer turning into an error is a difference, never a panic.
+async fn answers(engines: &[&Engine<MemoryStore>]) -> Vec<Result<Vec<String>, String>> {
+    let mut out = Vec::new();
+    for e in engines {
+        for field in ["text", "body"] {
+            out.push(text_query(e, "idx", field, "revenue").await);
+        }
+    }
+    out
+}
+
+async fn text_query(
+    e: &Engine<MemoryStore>,
+    index: &str,
+    field: &str,
+    q: &str,
+) -> Result<Vec<String>, String> {
+    let legs = vec![pstore_query::Prefetch::Text {
+        field: field.to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }];
+    e.query(index, &legs, pstore_query::Fusion::default(), 10)
+        .await
+        .map(|a| e.resolve(&a).into_iter().map(|(id, _)| id).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn a_fresh_view_never_matches_another_writers_row() {
+    // BACKLOG row 56's last item said a default engine's fresh view could match a `body`
+    // writer's ordinary `text` attribute until a fold. A fresh view holds only its own
+    // engine's rows, so it cannot: measured while planning M41, and pinned here.
+    let (store, _v, b, _t) = three().await;
+    let d = Engine::new(Arc::clone(&store), T, LaneId(4));
+    let mut row = doc("r", 4);
+    row.attrs
+        .insert("text".to_owned(), Value::Str("revenue".to_owned()));
+    b.write("idx", vec![row]).await.unwrap();
+    b.flush().await.unwrap();
+    let before = answers(&[&d, &b]).await;
+    assert!(
+        before.iter().all(|a| a == &Ok(Vec::new())),
+        "before the fold: {before:?}"
+    );
+    d.fold().await.unwrap();
+    assert_eq!(
+        answers(&[&d, &b]).await,
+        before,
+        "an answer changed across the fold"
+    );
+    assert_eq!(text_field(&store).await, "");
+
+    // And for text that is indexed: the writer's fresh view finds it under its own field,
+    // and so does the fold, run by an engine configured otherwise.
+    b.write("idx", vec![texted("s", "body", "revenue")])
+        .await
+        .unwrap();
+    b.flush().await.unwrap();
+    assert_eq!(
+        text_query(&b, "idx", "body", "revenue").await,
+        Ok(vec!["s".to_owned()])
+    );
+    d.fold().await.unwrap();
+    assert_eq!(text_field(&store).await, "body");
+    assert_eq!(
+        text_query(&d, "idx", "body", "revenue").await,
+        Ok(vec!["s".to_owned()])
+    );
+}
