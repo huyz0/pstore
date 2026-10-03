@@ -332,3 +332,39 @@ async fn a_head_without_lengths_reads_by_suffix() {
     let lens: Vec<bool> = h.indexes["idx"].iter().map(|r| r.len.is_some()).collect();
     assert_eq!(lens.iter().filter(|k| **k).count(), 1, "{lens:?}");
 }
+
+/// M46: three folds, then a compaction, and every leg asked `as_of` the epoch before it --
+/// whose segments only the graveyard names, with no length.
+async fn as_of_after_compaction<S: BlobStore + 'static>(s: Arc<S>) -> String {
+    let w = Engine::new(Arc::clone(&s), SRC, LaneId(1));
+    let mut at = pstore_types::Epoch(0);
+    for k in 0..3u32 {
+        w.write("idx", (k * 8..k * 8 + 8).map(doc).collect())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        at = w.fold().await.unwrap();
+    }
+    w.compact("idx").await.unwrap().expect("a merge");
+    let r = Engine::new(s, SRC, LaneId(2));
+    let mut out = String::new();
+    for p in legs() {
+        let a = r
+            .query_as_of("idx", at, &p, Fusion::default(), 5)
+            .await
+            .unwrap();
+        out.push_str(&format!("{:?}\n", r.resolve(&a)));
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_store_without_suffix_reads_answers_as_of() {
+    let azure_like = Arc::new(pstore_testkit::no_suffix::NoSuffix::new(MemoryStore::new()));
+    let got = as_of_after_compaction(azure_like).await;
+    assert_eq!(
+        got,
+        as_of_after_compaction(Arc::new(MemoryStore::new())).await
+    );
+    assert!(got.contains("d00"), "{got}");
+}

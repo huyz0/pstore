@@ -128,7 +128,11 @@ format decision: the Azure adapter, and what it does where HEAD knows no segment
    - The test reads `PSTORE_AZURE_KEY`, which the script sets to Azurite's published
      `devstoreaccount1` key. Unset, the key path is managed identity, which cannot reach
      Azurite.
-   - It uses `node_modules/.bin/azurite` when present and installs it with npm when not.
+   - Added in code review, which found the test above drives `Engine` and only constructs
+     `Api`: `the_server_writes_folds_and_answers_as_of_against_azurite` writes and folds
+     through the server's router, compacts with an engine over the same container (no route
+     compacts), and asks `as_of` through the router.
+   - It uses `node_modules/.bin/azurite-blob` when present and installs it with npm when not.
      `conformance.sh` uses Docker, and this second route exists because the environments
      that develop this repo do not all have a Docker daemon (this one does not). It declares
      `# portable: no`, and runs outside `gates.sh` as `conformance.sh` does.

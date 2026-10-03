@@ -115,6 +115,10 @@ pub struct Capabilities {
     /// Backend-tuned, because it is where `bandwidth x latency_saved` equals the cost of
     /// one more request. Zero disables merging.
     pub coalesce_gap: u64,
+    /// Whether `Range: bytes=-N` is served (M46). False on Azure, whose client refuses it
+    /// and whose REST API has no such form (C-14). A segment open that knows no length then
+    /// asks `head` first: two billed requests, never one hidden inside the adapter.
+    pub suffix_read: bool,
 }
 
 impl Capabilities {

@@ -23,10 +23,11 @@ pstore-jobs   = { path = "../pstore-jobs" }
 # to `pstore-blob`: a transport in a library crate is a transport every crate above it
 # inherits, and the engine must stay callable without one.
 axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
-# ⚠️ `aws` only. `pstore-blob`'s `compat` feature would pull `azure` and `gcp` too: the
-# emulator-integration feature for a probe example, not a shipping image's dependency set —
-# and the GCS client is one the capability matrix says must never be a CAS target.
-object_store  = { version = "0.14.1", features = ["aws"] }
+# ⚠️ `aws` and `azure` (M46), never `gcp`: the GCS client is one the capability matrix says
+# must never be a CAS target. Not `pstore-blob`'s `compat` feature, which pulls all three for
+# a probe example. Azure is here because M45 took the segment open off the suffix read C-14
+# found absent there.
+object_store  = { version = "0.14.1", features = ["aws", "azure"] }
 # D-36: a vector may arrive as base64 of little-endian `f32`s (M9d). Already in the lockfile.
 base64        = "0.22"
 # M9g: a multi-query's sub-queries run concurrently.

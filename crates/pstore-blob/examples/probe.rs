@@ -158,8 +158,8 @@ async fn main() {
     );
     println!();
     println!(
-        "⚠️ **Two of six fields are measured.** `cas` and `create_if_absent` come from the \
-         probes. `backend` is a label; `delete_is_free` is a billing fact no probe can see; \
+        "⚠️ **Three of seven fields are measured.** `cas`, `create_if_absent` and \
+         `suffix_read` come from the probes. `backend` is a label; `delete_is_free` is a billing fact no probe can see; \
          `max_batch_delete` would need a search that is its own probe; `coalesce_gap` is `G*`, \
          which is OQ-2 and blocked on real clouds. Those four are **declared**."
     );
@@ -218,6 +218,7 @@ async fn main() {
                     "| `create_if_absent` | measured | {} |",
                     support(&r.observed.create_if_absent)
                 );
+                println!("| `suffix_read` | measured | {} |", r.observed.suffix_read);
                 println!("| `backend` | declared | `{}` |", r.observed.backend);
                 println!(
                     "| `delete_is_free` | declared | {} |",

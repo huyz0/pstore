@@ -3119,6 +3119,8 @@ pub struct Config {
     pub endpoint: String,
     /// The bucket, ignored by [`Backend::Memory`].
     pub bucket: String,
+    /// The Azure account and container, present exactly when the backend is [`Backend::Azure`].
+    pub azure: Option<AzureConfig>,
     /// Static credentials, or `None` to use the provider's own chain.
     ///
     /// ⚠️ **`None` is the deployed case, not the odd one.** A BYOC deployment on EC2 or EKS
@@ -3173,15 +3175,14 @@ pub struct CacheConfig {
 
 /// Where a server keeps its data.
 ///
-/// ⚠️ **There is no `azure` and no `gcs`, and their absence is a decision.** A segment open
-/// whose length HEAD does not record is a suffix read (`Segment::open_at` with `None`), and
-/// C-14 records suffix ranges as absent on Azure three ways — the client refuses them before
-/// building a request, Azurite answers `bytes=-1` with a 500, and the REST API has no suffix
-/// form. Since M45 HEAD records every length it seals, but a HEAD from before M45, one an
-/// older node rewrote, and every `as_of` read still open by suffix: a server pointed at Azure
-/// would start and then fail those. `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which
-/// is the worst shape a precondition can have. Neither is offered, so neither can be reached
-/// by an operator who has not read this comment.
+/// ⚠️ **There is no `gcs`, and its absence is a decision**: `fake-gcs-server` accepts
+/// `ifGenerationMatch` and ignores it, which is the worst shape a precondition can have, so it
+/// is not offered and cannot be reached by an operator who has not read this comment.
+///
+/// **`azure` exists since M46.** C-14 records suffix ranges as absent on Azure, so a segment
+/// open must not need one: since M45 HEAD records each segment's length and the open reads an
+/// absolute range, and where it knows none -- an `as_of` read of a buried segment -- the
+/// store's `suffix_read: false` makes it ask `head` first, two billed requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     /// In-process, durable for exactly as long as the process. The default M7c shipped.
@@ -3189,6 +3190,27 @@ pub enum Backend {
     Memory,
     /// S3 or an S3-compatible endpoint.
     S3,
+    /// Azure Blob Storage (M46), configured by [`AzureConfig`].
+    Azure,
+}
+
+/// Where an Azure backend lives (M46): `PSTORE_AZURE_*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AzureConfig {
+    /// `PSTORE_AZURE_ACCOUNT`. Required: the client builds no store without one.
+    pub account: String,
+    /// `PSTORE_AZURE_KEY`, or `None` for the client's own chain (managed identity) -- the
+    /// deployed case, as S3's provider chain is.
+    pub key: Option<String>,
+    /// `PSTORE_AZURE_CONTAINER`, `pstore` unset.
+    pub container: String,
+    /// `PSTORE_AZURE_ENDPOINT`: the full URL up to the container, used as given with HTTP
+    /// allowed -- how Azurite (`http://127.0.0.1:10000/devstoreaccount1`) and a private
+    /// endpoint are reached. `None` for the account's public endpoint.
+    ///
+    /// ⚠️ **Never the client's emulator mode**, which ignores the endpoint and reads
+    /// `AZURITE_BLOB_STORAGE_URL` instead (spec review).
+    pub endpoint: Option<String>,
 }
 
 /// What the operator says the conformance suite measured about this bucket.
@@ -3231,6 +3253,42 @@ pub fn s3_capabilities(endpoint: &str, profile: Profile) -> pstore_blob::Capabil
     }
 }
 
+/// The capabilities an Azure account's profile claims (M46): S3's rule, under an
+/// `azure(account)` name. What the Azure client itself does -- no suffix reads, batches of
+/// 256 -- is [`pstore_blob::ObjectStoreBackend::azure`]'s, whatever the profile.
+#[must_use]
+pub fn azure_capabilities(account: &str, profile: Profile) -> pstore_blob::Capabilities {
+    pstore_blob::Capabilities {
+        backend: format!("azure({account})"),
+        ..s3_capabilities("", profile)
+    }
+}
+
+/// The Azure store `config` names (M46), with `profile`'s capabilities.
+///
+/// # Errors
+/// The client's refusal to build, which with an account present is a malformed endpoint.
+pub fn azure_store(
+    config: &AzureConfig,
+    profile: Profile,
+) -> Result<pstore_blob::ObjectStoreBackend, object_store::Error> {
+    let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
+        .with_account(&config.account)
+        .with_container_name(&config.container);
+    if let Some(key) = &config.key {
+        builder = builder.with_access_key(key);
+    }
+    if let Some(endpoint) = &config.endpoint {
+        builder = builder
+            .with_endpoint(endpoint.clone())
+            .with_allow_http(true);
+    }
+    Ok(pstore_blob::ObjectStoreBackend::azure(
+        std::sync::Arc::new(builder.build()?),
+        azure_capabilities(&config.account, profile),
+    ))
+}
+
 /// Why a process could not read its configuration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -3245,7 +3303,7 @@ pub enum ConfigError {
     /// ⚠️ Named rather than defaulted: falling back to `memory` on a typo is a deployment
     /// that reports success and stores nothing past the process.
     #[error(
-        "PSTORE_BACKEND={0} is not a backend this build has: memory, s3. Azure and GCS are \
+        "PSTORE_BACKEND={0} is not a backend this build has: memory, s3, azure. GCS is \
          deliberately absent -- see docs/deploy.md"
     )]
     Backend(String),
@@ -3260,6 +3318,11 @@ pub enum ConfigError {
     /// and into request time — the failure mode this whole milestone exists to remove.
     #[error("PSTORE_S3_ENDPOINT must be set when PSTORE_BACKEND=s3")]
     Endpoint,
+    /// `PSTORE_BACKEND=azure` with no account (M46), refused here for the reason
+    /// [`Self::Endpoint`] is: the client would refuse it at startup anyway, further from the
+    /// variable that caused it.
+    #[error("PSTORE_AZURE_ACCOUNT must be set when PSTORE_BACKEND=azure")]
+    AzureAccount,
     /// A scheduled-fold variable that is not what it must be (M9i.1).
     #[error("{0}={1} is refused: {2}")]
     Fold(&'static str, String, &'static str),
@@ -3293,6 +3356,7 @@ impl Config {
         let backend = match get("PSTORE_BACKEND").as_deref() {
             None | Some("memory") => Backend::Memory,
             Some("s3") => Backend::S3,
+            Some("azure") => Backend::Azure,
             Some(other) => return Err(ConfigError::Backend(other.to_owned())),
         };
         let profile = match get("PSTORE_PROFILE").as_deref() {
@@ -3304,6 +3368,21 @@ impl Config {
         if backend == Backend::S3 && endpoint.is_empty() {
             return Err(ConfigError::Endpoint);
         }
+        let azure = match backend {
+            Backend::Azure => Some(AzureConfig {
+                account: get("PSTORE_AZURE_ACCOUNT")
+                    .filter(|a| !a.is_empty())
+                    .ok_or(ConfigError::AzureAccount)?,
+                // Empty is unset, for the key and the container alike (code review): an empty key
+                // is no credential, and an empty container is no container.
+                key: get("PSTORE_AZURE_KEY").filter(|k| !k.is_empty()),
+                container: get("PSTORE_AZURE_CONTAINER")
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| "pstore".to_owned()),
+                endpoint: get("PSTORE_AZURE_ENDPOINT"),
+            }),
+            Backend::Memory | Backend::S3 => None,
+        };
         Ok(Self {
             bind: get("PSTORE_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_owned()),
             lane: LaneId(lane),
@@ -3311,6 +3390,7 @@ impl Config {
             profile,
             endpoint,
             bucket: get("PSTORE_BUCKET").unwrap_or_else(|| "pstore".to_owned()),
+            azure,
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
             fold: fold_policy(&get)?,
             gc: gc_policy(&get)?,

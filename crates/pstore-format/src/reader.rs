@@ -41,6 +41,12 @@ impl Segment {
         key: &Key,
         len: Option<u64>,
     ) -> Result<Self, FormatError> {
+        // M46: a store with no suffix reads (Azure) learns the length first. Two billed,
+        // sequential requests -- C-14's exit 3 -- and only where HEAD knows no length.
+        let len = match len {
+            None if !store.capabilities().suffix_read => Some(store.head(key).await?),
+            known => known,
+        };
         // One suffix read. No `head` first: it is billed as a read, so requiring one
         // would double every cold open -- found by the request counter, not by inspection.
         // ⚠️ `Meta`, not the default `Bulk`. This suffix IS the index section for most
@@ -1192,5 +1198,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seg.row_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_suffix_reads_an_unknown_length_is_asked_first() {
+        // M46: a store with no suffix reads (Azure) opens a segment HEAD knows no length of by
+        // `head`, then the range a known length reads -- two billed reads, the same bytes.
+        use pstore_blob::{Accounted, BlobStore, MemoryStore, OpClass};
+        use pstore_testkit::no_suffix::NoSuffix;
+        use pstore_types::TenantId;
+        let t = TenantId(46);
+        for (n, rows) in [(100, 100), (2, 2)] {
+            let acc = Accounted::new(NoSuffix::new(MemoryStore::new()));
+            let store = acc.as_tenant(t);
+            let key = Key::new("x");
+            let body = segment(n);
+            let len = body.len() as u64;
+            store.put(&key, body).await.unwrap();
+            let reads = || (acc.count(t, OpClass::Read), acc.bytes(t, OpClass::Read));
+
+            let before = reads();
+            let known = Segment::open_at(&store, &key, Some(len)).await.unwrap();
+            let after_known = reads();
+            let unknown = Segment::open_at(&store, &key, None).await.unwrap();
+            let after_unknown = reads();
+
+            assert_eq!(known.row_count(), rows);
+            assert_eq!(unknown.row_count(), rows);
+            assert_eq!(after_known.0 - before.0, 1, "{n} rows: a known length");
+            assert_eq!(
+                after_unknown.0 - after_known.0,
+                2,
+                "{n} rows: head, then range"
+            );
+            assert_eq!(
+                after_unknown.1 - after_known.1,
+                after_known.1 - before.1,
+                "{n} rows: the bytes a known length reads"
+            );
+        }
     }
 }

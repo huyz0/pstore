@@ -87,6 +87,8 @@ impl Claims {
             delete_is_free: true,
             max_batch_delete: 1000,
             coalesce_gap: 0,
+            // It wraps a `MemoryStore`, which serves suffix reads.
+            suffix_read: true,
         }
     }
 }

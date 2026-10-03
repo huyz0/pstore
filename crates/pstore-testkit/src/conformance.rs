@@ -352,6 +352,10 @@ pub async fn run<S: BlobStore>(s: &S, run_id: u64) -> Report {
             delete_is_free: declared.delete_is_free,
             max_batch_delete: declared.max_batch_delete,
             coalesce_gap: declared.coalesce_gap,
+            // M46: measured, as `cas` is. A backend that claims suffix reads and fails the
+            // probe is recorded as having none, which is the one answer a segment open can
+            // act on safely.
+            suffix_read: find("suffix_read") == Support::Supported,
         },
         probes,
     }

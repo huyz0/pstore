@@ -9,5 +9,6 @@ pub mod conformance;
 pub mod depth;
 pub mod flaky;
 pub mod gated;
+pub mod no_suffix;
 pub mod sim;
 pub mod sweep;

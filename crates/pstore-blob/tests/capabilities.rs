@@ -16,6 +16,7 @@ fn caps(cas: Support, create: Support) -> Capabilities {
         delete_is_free: true,
         max_batch_delete: 1000,
         coalesce_gap: 0,
+        suffix_read: true,
     }
 }
 

@@ -20,10 +20,13 @@ Run `scripts/conformance.sh` against your endpoint, read
 `PSTORE_PROFILE=conforming` only if `cas` and `create_if_absent` both measured `Supported`.
 ⚠️ Nothing re-probes at runtime. `conforming` is your word.
 
-⚠️ **`PSTORE_BACKEND` has two values, `memory` and `s3`.** Azure and GCS are deliberately
-absent. Every segment open is a suffix read, and C-14 records suffix ranges as absent on Azure
-three ways; `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which is the worst
-shape a precondition can have. An Azure backend is a design decision with its own spec.
+⚠️ **`PSTORE_BACKEND` has three values, `memory`, `s3` and `azure`.** GCS is deliberately
+absent: `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which is the worst shape
+a precondition can have. Azure arrived in [M46](milestones/M46/SPEC.md), once
+[M45](milestones/M45/SPEC.md) took the segment open off the suffix read C-14 found absent
+there. An `as_of` read on Azure asks `head` before each buried segment it opens: two billed
+requests where S3 makes one. ⚠️ Azure has been run against Azurite only
+(`scripts/azurite.sh`), which says nothing about its latency, cost or CAS under contention.
 
 ## One lane per process
 
@@ -184,12 +187,16 @@ expose this port to anyone you would not give the whole bucket to.**
 |---|---|---|
 | `PSTORE_LANE` | — | **Required.** See above. |
 | `PSTORE_BIND` | `127.0.0.1:8080` | ⚠️ The image sets `0.0.0.0:8080`; the library default is loopback, which inside a container is reachable by nothing. |
-| `PSTORE_BACKEND` | `memory` | `memory` or `s3`. `memory` is durable for exactly as long as the process. |
+| `PSTORE_BACKEND` | `memory` | `memory`, `s3` or `azure`. `memory` is durable for exactly as long as the process. |
 | `PSTORE_PROFILE` | `unprobed` | `unprobed` refuses to serve. |
 | `PSTORE_S3_ENDPOINT` | — | e.g. `http://rustfs:9000`. |
 | `PSTORE_BUCKET` | `pstore` | Must exist; the server does not create it. |
 | `PSTORE_ACCESS_KEY` / `PSTORE_SECRET_KEY` | the provider's credential chain | ⚠️ **Unset is the deployed case**: an instance profile or a service-account role. Both halves or neither — half a pair is ignored. |
 | `PSTORE_REGION` | `us-east-1` | |
+| `PSTORE_AZURE_ACCOUNT` | — | **Required** with `PSTORE_BACKEND=azure`. |
+| `PSTORE_AZURE_KEY` | the client's credential chain | Unset is managed identity, as S3's unset keys are the provider chain. |
+| `PSTORE_AZURE_CONTAINER` | `pstore` | Must exist; the server does not create it. |
+| `PSTORE_AZURE_ENDPOINT` | the account's public endpoint | The full URL up to the container, used as given with HTTP allowed: Azurite is `http://127.0.0.1:10000/devstoreaccount1`. |
 | `PSTORE_FOLD` | on | Exactly `off` disables the scheduled fold; anything else is refused. |
 | `PSTORE_FOLD_PERIOD_MS` | `1000` | How often the fold loop looks. Looking costs no request. |
 | `PSTORE_FOLD_AGE_S` | `3600` | A tenant is folded once its oldest unfolded write is this old. Shorter means faster visibility to other processes, and more folds: D-39 prices it. |

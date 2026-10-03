@@ -92,6 +92,7 @@ impl MemoryStore {
                 delete_is_free: true,
                 max_batch_delete: 1000,
                 coalesce_gap: 64 * 1024,
+                suffix_read: true,
             },
             tag_style,
         }

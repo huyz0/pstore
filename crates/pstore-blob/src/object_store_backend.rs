@@ -48,7 +48,29 @@ impl ObjectStoreBackend {
             delete_is_free: false,
             max_batch_delete: 1000,
             coalesce_gap: 1024 * 1024,
+            // Every backend but Azure serves it; `azure` says otherwise.
+            suffix_read: true,
         }
+    }
+
+    /// Wraps an Azure store (M46): `caps` with what the Azure client does, whatever profile
+    /// it came from.
+    /// - No suffix reads: the client refuses `GetRange::Suffix` (C-14), so a segment open
+    ///   that knows no length asks `head` first, billed, above this adapter.
+    /// - Batches of 256: the client splits a delete into requests of 256 keys, and one
+    ///   `delete_batch` must be one request, or `Accounted` bills one for several.
+    /// - Deletes are billed.
+    #[must_use]
+    pub fn azure(inner: Arc<dyn ObjectStore>, caps: Capabilities) -> Self {
+        Self::new(
+            inner,
+            Capabilities {
+                suffix_read: false,
+                max_batch_delete: 256,
+                delete_is_free: false,
+                ..caps
+            },
+        )
     }
 
     fn path(key: &Key) -> Path {
@@ -293,6 +315,30 @@ mod tests {
             store: "test",
             source: msg.to_owned().into(),
         }
+    }
+
+    #[test]
+    fn azure_declares_no_suffix_and_batches_of_256() {
+        // M46: what the Azure client does, whatever profile the caps came from.
+        let profile = Capabilities {
+            cas: Support::Supported,
+            create_if_absent: Support::Supported,
+            ..ObjectStoreBackend::unprobed("azure")
+        };
+        let az = ObjectStoreBackend::azure(
+            Arc::new(object_store::memory::InMemory::new()),
+            profile.clone(),
+        );
+        let caps = crate::BlobStore::capabilities(&az);
+        assert!(!caps.suffix_read);
+        assert_eq!(caps.max_batch_delete, 256);
+        assert!(!caps.delete_is_free);
+        // The profile's own claims survive.
+        assert_eq!(caps.cas, Support::Supported);
+        assert_eq!(caps.create_if_absent, Support::Supported);
+        // Every other backend serves suffix reads.
+        assert!(profile.suffix_read);
+        assert!(crate::BlobStore::capabilities(&crate::MemoryStore::new()).suffix_read);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
 use pstore_server::{
-    Api, Backend, Config, Profile, SourceConfig, open_cache, s3_capabilities, serve_folding,
+    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, s3_capabilities,
+    serve_folding,
 };
 use std::sync::Arc;
 
@@ -26,6 +27,21 @@ async fn main() -> std::process::ExitCode {
             Ok(store) => run(Accounted::new(store), &config).await,
             Err(e) => {
                 eprintln!("pstore-server: cannot open {}: {e}", config.endpoint);
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Backend::Azure => match config
+            .azure
+            .as_ref()
+            .map(|a| azure_store(a, config.profile))
+        {
+            Some(Ok(store)) => run(Accounted::new(store), &config).await,
+            Some(Err(e)) => {
+                eprintln!("pstore-server: cannot open the Azure container: {e}");
+                std::process::ExitCode::FAILURE
+            }
+            None => {
+                eprintln!("pstore-server: PSTORE_BACKEND=azure without its configuration");
                 std::process::ExitCode::FAILURE
             }
         },

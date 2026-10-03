@@ -30,6 +30,46 @@ async fn the_memory_store_conforms() {
 }
 
 #[tokio::test]
+async fn suffix_read_is_measured_not_declared() {
+    // M46: a store that claims suffix reads and fails them is recorded as having none.
+    let liar = pstore_testkit::no_suffix::NoSuffix::claiming(MemoryStore::new());
+    assert!(
+        liar.capabilities().suffix_read,
+        "the fixture must claim them"
+    );
+    let r = conformance::run(&liar, 46).await;
+    assert!(!r.observed.suffix_read);
+    // And one that serves them is recorded as serving them.
+    assert!(
+        conformance::run(&MemoryStore::new(), 47)
+            .await
+            .observed
+            .suffix_read
+    );
+}
+
+#[tokio::test]
+async fn a_store_without_suffix_reads_conforms_on_everything_else() {
+    // M46: `NoSuffix` forwards every other method, and the suite is what shows it does. Its
+    // one divergence is the one it is for.
+    let r = conformance::run(
+        &pstore_testkit::no_suffix::NoSuffix::new(MemoryStore::new()),
+        48,
+    )
+    .await;
+    let diverged: Vec<&str> = r
+        .probes
+        .iter()
+        .filter(|p| p.outcome != Support::Supported)
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(diverged, ["suffix_read"]);
+    assert_eq!(r.observed.cas, Support::Supported);
+    assert_eq!(r.observed.create_if_absent, Support::Supported);
+    assert!(!r.observed.suffix_read);
+}
+
+#[tokio::test]
 async fn every_decorator_conforms() {
     // A decorator that drops or mangles a method is invisible until something above it
     // depends on the method. This is that something.

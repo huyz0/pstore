@@ -13,7 +13,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pstore_blob::{Accounted, MemoryStore, Support};
-use pstore_server::{Api, Backend, Config, ConfigError, Profile, UNSCHEDULED, s3_capabilities};
+use pstore_server::{
+    Api, AzureConfig, Backend, Config, ConfigError, Profile, UNSCHEDULED, azure_capabilities,
+    s3_capabilities,
+};
 use pstore_types::LaneId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,13 +47,99 @@ fn a_backend_or_profile_it_does_not_know_is_refused_by_name() {
     // ⚠️ Never "fall back to the default": a typo in `PSTORE_PROFILE` would then be a
     // deployment that silently refuses every write, and a typo in `PSTORE_BACKEND` a
     // deployment that silently stores nothing durably.
-    let e = Config::from_vars(vars(&[("PSTORE_LANE", "1"), ("PSTORE_BACKEND", "azure")]));
-    assert_eq!(e, Err(ConfigError::Backend("azure".to_owned())));
+    // `gcs`, not `azure`: M46 made `azure` a backend.
+    let e = Config::from_vars(vars(&[("PSTORE_LANE", "1"), ("PSTORE_BACKEND", "gcs")]));
+    assert_eq!(e, Err(ConfigError::Backend("gcs".to_owned())));
     let e = Config::from_vars(vars(&[
         ("PSTORE_LANE", "1"),
         ("PSTORE_PROFILE", "probably"),
     ]));
     assert_eq!(e, Err(ConfigError::Profile("probably".to_owned())));
+}
+
+/// M46: Azure needs an account, as `MicrosoftAzureBuilder` refuses to build without one; the
+/// key is optional, as unset it is the builder's own chain (managed identity).
+#[test]
+fn azure_is_configured_with_an_account() {
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_BACKEND", "azure"),
+        ("PSTORE_AZURE_ACCOUNT", "devstoreaccount1"),
+        ("PSTORE_AZURE_KEY", "k"),
+        (
+            "PSTORE_AZURE_ENDPOINT",
+            "http://127.0.0.1:10000/devstoreaccount1",
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(c.backend, Backend::Azure);
+    assert_eq!(
+        c.azure,
+        Some(AzureConfig {
+            account: "devstoreaccount1".to_owned(),
+            key: Some("k".to_owned()),
+            container: "pstore".to_owned(),
+            endpoint: Some("http://127.0.0.1:10000/devstoreaccount1".to_owned()),
+        })
+    );
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_BACKEND", "azure"),
+        ("PSTORE_AZURE_ACCOUNT", "acct"),
+        ("PSTORE_AZURE_CONTAINER", "box"),
+    ]))
+    .unwrap();
+    assert_eq!(
+        c.azure,
+        Some(AzureConfig {
+            account: "acct".to_owned(),
+            key: None,
+            container: "box".to_owned(),
+            endpoint: None,
+        })
+    );
+    // An empty key or container is unset.
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_BACKEND", "azure"),
+        ("PSTORE_AZURE_ACCOUNT", "acct"),
+        ("PSTORE_AZURE_KEY", ""),
+        ("PSTORE_AZURE_CONTAINER", ""),
+    ]))
+    .unwrap();
+    let a = c.azure.unwrap();
+    assert_eq!((a.key, a.container.as_str()), (None, "pstore"));
+    // No account, and a key is not one.
+    for missing in [
+        vec![("PSTORE_LANE", "1"), ("PSTORE_BACKEND", "azure")],
+        vec![
+            ("PSTORE_LANE", "1"),
+            ("PSTORE_BACKEND", "azure"),
+            ("PSTORE_AZURE_KEY", "k"),
+        ],
+        vec![
+            ("PSTORE_LANE", "1"),
+            ("PSTORE_BACKEND", "azure"),
+            ("PSTORE_AZURE_ACCOUNT", ""),
+        ],
+    ] {
+        assert_eq!(
+            Config::from_vars(vars(&missing)),
+            Err(ConfigError::AzureAccount)
+        );
+    }
+    // And another backend carries none.
+    let s3 = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_AZURE_ACCOUNT", "acct"),
+    ]))
+    .unwrap();
+    assert_eq!(s3.azure, None);
+    // The profile is S3's rule under an `azure(...)` name, with Azure's own facts.
+    let caps = azure_capabilities("acct", Profile::Conforming);
+    assert_eq!(caps.backend, "azure(acct)");
+    assert_eq!(caps.cas, Support::Supported);
+    assert!(!azure_capabilities("acct", Profile::Unprobed).admits_durable_writes());
 }
 
 /// ⚠️ **The one required field the first draft defaulted.** An absent endpoint under
