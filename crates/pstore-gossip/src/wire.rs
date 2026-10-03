@@ -51,12 +51,30 @@ pub enum Message {
         /// The sender's members.
         members: Vec<Member>,
     },
+    /// Where two checksums disagree (M34): the sender's 16 bucket sums. Sent on a mismatch in
+    /// a fleet of more than 32, in place of a `Sync`.
+    Digest {
+        /// Who is reconciling.
+        from: NodeId,
+        /// One sum per bucket, exactly `BUCKETS` of them.
+        buckets: Vec<u64>,
+    },
+    /// The members of the buckets a `Digest` showed differ (M34). ⚠️ Never answered: a
+    /// `Sync`'s reply rule ("answer if the member counts differ") would answer every one.
+    Part {
+        /// Who is answering.
+        from: NodeId,
+        /// The sender's members in the differing buckets.
+        members: Vec<Member>,
+    },
 }
 
 const PING: u8 = 1;
 const ACK: u8 = 2;
 const PING_REQ: u8 = 3;
 const SYNC: u8 = 4;
+const DIGEST: u8 = 5;
+const PART: u8 = 6;
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -178,7 +196,9 @@ impl Message {
             Self::Ping { from, .. }
             | Self::Ack { from, .. }
             | Self::PingReq { from, .. }
-            | Self::Sync { from, .. } => *from,
+            | Self::Sync { from, .. }
+            | Self::Digest { from, .. }
+            | Self::Part { from, .. } => *from,
         }
     }
 
@@ -217,6 +237,21 @@ impl Message {
                 out.extend_from_slice(from);
                 put_u64(&mut out, *seq);
                 out.extend_from_slice(target);
+            }
+            Self::Digest { from, buckets } => {
+                out.push(DIGEST);
+                out.extend_from_slice(from);
+                for b in buckets {
+                    put_u64(&mut out, *b);
+                }
+            }
+            Self::Part { from, members } => {
+                out.push(PART);
+                out.extend_from_slice(from);
+                out.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for m in members {
+                    put_member(&mut out, m);
+                }
             }
             Self::Sync { from, members } => {
                 out.push(SYNC);
@@ -263,6 +298,17 @@ impl Message {
                 target: r.id()?,
             },
             SYNC => Self::Sync {
+                from: r.id()?,
+                members: r.members()?,
+            },
+            // ⚠️ Exactly `BUCKETS` sums and no count: a count is a length to lie about.
+            DIGEST => Self::Digest {
+                from: r.id()?,
+                buckets: (0..crate::cluster::BUCKETS)
+                    .map(|_| r.u64())
+                    .collect::<Option<_>>()?,
+            },
+            PART => Self::Part {
                 from: r.id()?,
                 members: r.members()?,
             },

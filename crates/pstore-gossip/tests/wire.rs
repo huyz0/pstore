@@ -241,3 +241,41 @@ fn a_hostile_member_count_is_refused_without_reserving_it() {
         "a frame claiming u32::MAX members decoded"
     );
 }
+
+#[test]
+fn digest_and_part_round_trip() {
+    // M34: a `Digest` is exactly the sender and 16 bucket sums -- no count, so no length to
+    // lie about -- and a `Part` is encoded as a `Sync` under its own tag.
+    let digest = Message::Digest {
+        from: id(7),
+        buckets: (0..16u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect(),
+    };
+    let part = Message::Part {
+        from: id(8),
+        members: vec![member(1, State::Alive), member(2, State::Suspect)],
+    };
+    for m in [&digest, &part] {
+        let bytes = m.encode();
+        assert_eq!(Message::decode(&bytes).as_ref(), Some(m), "{m:?}");
+        assert!(
+            Message::decode(&bytes[..bytes.len() - 1]).is_none(),
+            "a truncated {m:?} decoded"
+        );
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(
+            Message::decode(&longer).is_none(),
+            "{m:?} with a trailing byte decoded"
+        );
+    }
+    assert_eq!(digest.encode().len(), 145);
+    // A `Part` is not a `Sync`: a `Sync`'s reply rule would answer every one.
+    let sync = Message::Sync {
+        from: id(8),
+        members: vec![member(1, State::Alive), member(2, State::Suspect)],
+    };
+    assert_ne!(part.encode()[0], sync.encode()[0]);
+    assert_ne!(Message::decode(&part.encode()), Some(sync));
+}

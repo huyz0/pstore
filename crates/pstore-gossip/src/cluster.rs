@@ -94,6 +94,26 @@ pub struct Cluster {
     me: NodeId,
     members: BTreeMap<NodeId, Member>,
     checksum: u64,
+    /// The checksum split by bucket (M34), kept beside it in `insert`: their wrapping sum is
+    /// the checksum, so two nodes that disagree can find WHERE in 16 sums.
+    buckets: [u64; BUCKETS],
+}
+
+/// How many buckets the checksum is split into (M34). A `Digest` carries one sum per bucket,
+/// and a `Part` the members of the buckets that differ: about N/16 per differing bucket.
+pub const BUCKETS: usize = 16;
+
+/// A member's bucket: FNV-1a over its id, mod [`BUCKETS`]. ⚠️ Every node must compute the same
+/// one, in a fleet of mixed versions too, so it is written out rather than taken from a
+/// hasher whose output may change.
+#[must_use]
+pub fn bucket_of(id: &NodeId) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h % BUCKETS as u64) as usize
 }
 
 impl Cluster {
@@ -104,6 +124,7 @@ impl Cluster {
             me,
             members: BTreeMap::new(),
             checksum: 0,
+            buckets: [0; BUCKETS],
         };
         c.insert(Member {
             id: me,
@@ -186,6 +207,12 @@ impl Cluster {
     #[must_use]
     pub fn checksum(&self) -> u64 {
         self.checksum
+    }
+
+    /// The checksum, split by bucket (M34): what a `Digest` carries.
+    #[must_use]
+    pub fn buckets(&self) -> [u64; BUCKETS] {
+        self.buckets
     }
 
     /// The same value, computed from the whole set.
@@ -299,10 +326,17 @@ impl Cluster {
     /// O(1) checksum silently becomes wrong, and a wrong checksum means two nodes agree to
     /// stay divergent.
     fn insert(&mut self, m: Member) {
-        if let Some(old) = self.members.get(&m.id) {
-            self.checksum = self.checksum.wrapping_sub(old.fingerprint());
+        let old = self.members.get(&m.id).map(Member::fingerprint);
+        if let Some(old) = old {
+            self.checksum = self.checksum.wrapping_sub(old);
         }
         self.checksum = self.checksum.wrapping_add(m.fingerprint());
+        // `bucket_of` is below `BUCKETS` by construction, so this always finds its slot.
+        if let Some(slot) = self.buckets.get_mut(bucket_of(&m.id)) {
+            *slot = slot
+                .wrapping_sub(old.unwrap_or(0))
+                .wrapping_add(m.fingerprint());
+        }
         self.members.insert(m.id, m);
     }
 }

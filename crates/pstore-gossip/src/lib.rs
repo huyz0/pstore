@@ -21,6 +21,6 @@ mod cluster;
 mod protocol;
 mod wire;
 
-pub use cluster::{Cluster, Member, NodeId, State};
+pub use cluster::{BUCKETS, Cluster, Member, NodeId, State, bucket_of};
 pub use protocol::Protocol;
 pub use wire::Message;

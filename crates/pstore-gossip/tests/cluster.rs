@@ -298,3 +298,45 @@ fn members_that_differ_have_different_fingerprints() {
         seen.len()
     );
 }
+
+#[test]
+fn buckets_match_a_from_scratch_sum() {
+    // M34: the 16 bucket sums are kept incrementally, beside the checksum, and must never drift
+    // from either a recount or the checksum they partition.
+    let recount = |c: &Cluster| {
+        let mut b = [0u64; pstore_gossip::BUCKETS];
+        for m in c.members() {
+            let one = Cluster::new(m.id, m.addr.clone(), m.zone.clone());
+            let mut solo = one;
+            solo.upsert(m.clone());
+            let i = pstore_gossip::bucket_of(&m.id);
+            b[i] = b[i].wrapping_add(solo.checksum());
+        }
+        b
+    };
+    let mut c = cluster_of(40);
+    let check = |c: &Cluster, why: &str| {
+        assert_eq!(c.buckets(), recount(c), "{why}");
+        let sum = c.buckets().iter().fold(0u64, |a, b| a.wrapping_add(*b));
+        assert_eq!(
+            sum,
+            c.checksum(),
+            "{why}: the buckets do not sum to the checksum"
+        );
+    };
+    check(&c, "joined");
+    c.suspect(&id(3));
+    check(&c, "suspected");
+    c.refute(&id(3), 5);
+    check(&c, "refuted");
+    c.declare_dead(&id(4));
+    check(&c, "dead");
+    c.join(id(200), addr(200), String::new());
+    c.fill_zone(&id(200), "az-b");
+    check(&c, "zone filled");
+    // FNV-1a of the 16-byte id, mod 16, computed outside this code.
+    assert_eq!(
+        [1u8, 2, 200].map(|n| pstore_gossip::bucket_of(&id(n))),
+        [4, 7, 13]
+    );
+}

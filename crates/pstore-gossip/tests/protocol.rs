@@ -39,7 +39,9 @@ struct Sim {
     sent: u64,
     /// Sent last period, delivered this one.
     in_flight: Vec<(String, String, Message)>,
-    /// `Sync` datagrams delivered (M24): a converged fleet sends none.
+    /// Reconciliation datagrams delivered -- `Sync`, and since M34 `Digest` and `Part`: a
+    /// converged fleet sends none. ⚠️ Counting only `Sync` would let a fleet that `Digest`s
+    /// forever pass every "goes quiet" test.
     syncs: u64,
     /// Hops delivered within one period (M33): 1 delivers a reply the period after its
     /// request, the pessimistic model every other test uses; 4 lets an indirect probe's four
@@ -126,7 +128,10 @@ impl Sim {
             let mut replies: Vec<(String, String, Message)> = Vec::new();
             for (from, to, msg) in arriving {
                 self.sent += 1;
-                if matches!(msg, Message::Sync { .. }) {
+                if matches!(
+                    msg,
+                    Message::Sync { .. } | Message::Digest { .. } | Message::Part { .. }
+                ) {
                     self.syncs += 1;
                 }
                 self.bytes += msg.encode().len() as u64;
@@ -733,17 +738,157 @@ fn gossip_cost_under_loss_on_both_models() {
         agree >= 350 && bytes <= 200,
         "20 members at 2% loss, real hops: {agree}/400 agreeing at {bytes} B/node/round"
     );
-    // ⚠️ TRIPWIRES, not floors (BACKLOG row 52): they pin the open problem, and M34's fix is
-    // expected to trip them. Lowering them then is the fix landing, not a threshold weakened.
+    // M34: what were M33's tripwires, now the fix's bounds. Bucketed reconciliation measured
+    // 3,457 here (M33: 7,961) and 796 at 100 members and 2% (M33: 5,533).
     let (bytes, _) = cost(50, 10, 4);
-    // Measured at 7,961 (M33), so a fix that saves an eighth trips it.
     assert!(
-        bytes >= 7_000,
-        "50 members at 10% loss cost {bytes} B/node/round: the Sync storm moved -- update row 52"
+        bytes <= 4_000,
+        "50 members at 10% loss cost {bytes} B/node/round: reconciliation ships whole lists"
+    );
+    let (bytes, _) = cost(100, 50, 4);
+    assert!(
+        bytes <= 1_000,
+        "100 members at 2% loss cost {bytes} B/node/round: reconciliation ships whole lists"
     );
     let (_, agree) = cost(20, 50, 1);
     assert!(
         agree <= 10,
         "the one-hop model agreed in {agree}/400 rounds: the protocol or the model changed"
     );
+}
+
+#[test]
+fn bucketed_reconciliation_manufactures_no_deaths() {
+    // M34: throttling `Sync` manufactured deaths (M33), because a `Sync` is what rescues a
+    // refutation whose piggybacked copies were lost. A `Part` must still carry it.
+    let mut sim = Sim::new(100, true);
+    sim.waves = 4;
+    for r in 0..50 {
+        sim.round(r);
+    }
+    sim.drop_every = 10;
+    for r in 50..450 {
+        sim.round(r);
+    }
+    let worst = sim
+        .nodes
+        .iter()
+        .map(|p| p.cluster().alive().len())
+        .min()
+        .unwrap_or(0);
+    assert_eq!(
+        worst, 100,
+        "at 10% loss with every node alive, a view fell to {worst}"
+    );
+}
+
+/// Rounds from `from` until every checksum agrees and five more rounds pass with no
+/// reconciliation at all, or `None` within `limit`.
+fn converges_then_quiets(sim: &mut Sim, from: u64, limit: u64) -> Option<u64> {
+    for r in from..from + limit {
+        sim.round(r);
+        if sim.checksums_agree() {
+            let before = sim.syncs;
+            for q in 0..5 {
+                sim.round(r + 10_000 + q);
+            }
+            if sim.checksums_agree() && sim.syncs == before {
+                return Some(r - from);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn reconciliation_above_32_converges_then_quiets() {
+    // M34: above 32 members a mismatch is a `Digest` and a `Part`, not a `Sync`. Each case the
+    // full `Sync` was tested on, again on the bucketed path -- and across the switch, since
+    // each node chooses by its own view's size.
+    for half in [20usize, 40] {
+        let mut sim = Sim::new((half * 2) as u16, true);
+        let held: BTreeMap<String, usize> = sim.by_addr.clone();
+        sim.by_addr
+            .retain(|a, _| held.get(a).is_some_and(|i| *i < half));
+        for r in 0..60 {
+            sim.round(r);
+        }
+        sim.by_addr = held;
+        assert!(
+            converges_then_quiets(&mut sim, 100, 400).is_some(),
+            "a healed partition of two {half}s never converged and went quiet"
+        );
+        assert!(sim.all_see(half * 2));
+    }
+    let mut sim = Sim::new(40, true);
+    sim.nodes[0]
+        .cluster_mut()
+        .join(id(900), addr(900), "az-a".to_owned());
+    assert!(
+        converges_then_quiets(&mut sim, 0, 200).is_some(),
+        "a new member"
+    );
+    // Known everywhere. It never answers a probe -- nothing listens at its address -- so by
+    // now it may be suspected; what reconciliation owes is that every view holds it.
+    assert!(
+        sim.nodes
+            .iter()
+            .all(|p| p.cluster().member(&id(900)).is_some()),
+        "a new member did not reach every view"
+    );
+    let mut sim = Sim::new(40, true);
+    sim.nodes[0]
+        .cluster_mut()
+        .join(id(700), addr(700), "az-a".to_owned());
+    sim.nodes[1]
+        .cluster_mut()
+        .join(id(800), addr(800), "az-a".to_owned());
+    assert!(
+        converges_then_quiets(&mut sim, 0, 200).is_some(),
+        "a two-sided difference"
+    );
+    let zones: Vec<&str> = (0..40).map(|i| ["az-a", "az-b", "az-c"][i % 3]).collect();
+    let mut sim = Sim::zoned(&zones, |i| if i == 0 { vec![] } else { vec![0] });
+    assert!(
+        (0..200).any(|r| {
+            sim.round(r);
+            sim.zones_known(&zones)
+        }),
+        "zones over 40 members never learned"
+    );
+    assert!(converges_then_quiets(&mut sim, 300, 200).is_some(), "zones");
+}
+
+#[test]
+fn whole_sync_up_to_32_members_and_a_digest_past_it() {
+    // M34's switch, at its boundary (code review): a mismatch in a view of 32 is a whole
+    // `Sync`, and in a view of 33 a `Digest`.
+    let answer = |n: u16| {
+        let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
+        for j in 1..n {
+            c.join(id(j), addr(j), "az-a".to_owned());
+        }
+        let mut p = Protocol::new(c);
+        p.receive(
+            &addr(1),
+            &Message::Ping {
+                from: id(1),
+                seq: 1,
+                checksum: 0,
+                updates: Vec::new(),
+            },
+        )
+    };
+    let kinds = |out: &[(String, Message)]| {
+        out.iter()
+            .map(|(_, m)| match m {
+                Message::Ack { .. } => "ack",
+                Message::Sync { .. } => "sync",
+                Message::Digest { .. } => "digest",
+                _ => "other",
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&answer(32)), ["ack", "sync"]);
+    assert_eq!(kinds(&answer(33)), ["ack", "digest"]);
 }
