@@ -123,6 +123,12 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by M33
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 52 | ⚠️ **Under loss, gossip's cost grows with the fleet: every exchange between disagreeing members ships the whole member list.** Measured by [M33](M33/VERIFIED.md) on a model where a period holds an indirect probe's four hops, as a real network's does, in bytes per node per round: 20 members at 10% loss pay 2,748; 50 at 2% pay 1,786; 50 at 10% pay 7,961; 100 at 2% pay 5,533; 100 at 10% pay 15,225. Checksums agree in 5 to 54 of 400 rounds, against 74 bytes and 400 of 400 without loss. **Throttling `Sync` is not the fix.** No `Sync` while updates are pending, a per-peer cooldown and a global one-per-10-periods limit were each measured: each barely moved the bytes, or cut them ~10× and manufactured deaths (as few as 94 of 100 alive), because `Sync` is what rescues a refutation whose piggybacked copies were lost. The designs left are a `Sync` that sends only what differs (bucketed checksums, then only the differing buckets) and refutations disseminated with priority (Lifeguard). `gossip_cost_under_loss_on_both_models` pins tripwires that a fix is meant to trip: lowering them then is the fix landing, not a threshold weakened. | [M33](M33/SPEC.md) | M |
+
 ## Opened by M27
 
 | # | Task | From | Size |
@@ -133,7 +139,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 50 | **Under constant 10% loss a gossip fleet's checksums almost never agree.** Six members that know every zone from the start agree on one checksum in 7 of 400 simulated rounds (`pstore-gossip`'s lockstep `Sim`, every tenth datagram dropped), identically before and after M24: suspicions and their refutations raise incarnations faster than a `Sync` spreads them. Not a correctness failure -- members stay alive and every zone is learned -- but every disagreeing pair trades `Sync` datagrams, so the steady-state cost under loss is not the 74-byte checksum D-79's gossip was sized on. Needs a measurement of `Sync` bytes per round against loss before a fix is chosen. Found by M24's criterion 3. | [M24](M24/VERIFIED.md) | M |
+| ~~50~~ | **MEASURED by [M33](M33/VERIFIED.md), and handed on as row 52.** The lockstep `Sim` delivers one hop per period, so its indirect probe can never complete. A real node handles each datagram as it arrives. On a model with real hops, 20 members at 2% loss agree in 395 of 400 rounds, where row 50's model gave 4. The remainder is real, and is row 52. | [M24](M24/VERIFIED.md) | M |
 
 ## Opened by M23
 

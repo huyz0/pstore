@@ -526,6 +526,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M30 | **The schema's text field decides where text is indexed** ([VERIFIED](../../milestones/M30/VERIFIED.md)): filled by the first fold with text, and used by every seal; a vector-only segment no longer refuses a text query | [BACKLOG](../../milestones/BACKLOG.md) row 29, and two failures measured while planning it |
 | M31 | **`pstore-node`'s `main` wires, its library decides** ([VERIFIED](../../milestones/M31/VERIFIED.md)): the loop's decisions under both gates, and the heal cadence back to `HEAL_PERIOD` at sub-second polls | [BACKLOG](../../milestones/BACKLOG.md) row 34 |
 | M32 | **No dictionary read a query knows is absent** ([VERIFIED](../../milestones/M32/VERIFIED.md)): HEAD records each segment's dictionaries, and a sparse query over a mixed index answers | [BACKLOG](../../milestones/BACKLOG.md) row 51 |
+| M33 | **Gossip's cost under loss, measured on a model of the real network** ([VERIFIED](../../milestones/M33/VERIFIED.md)): the `Sim` models real hops; the `Sync` storm is pinned and handed to M34 | [BACKLOG](../../milestones/BACKLOG.md) row 50 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
