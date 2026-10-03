@@ -48,6 +48,9 @@ struct Sim {
     /// hops land inside one, as on a real network, where a node handles each datagram as it
     /// arrives and only probes once a period.
     waves: u64,
+    /// Replies a period's last wave produced, carried to the next period (M38). ⚠️ Not a loop
+    /// detector: a loop the wave cap cuts short can carry fewer (spec review, M38).
+    carried: u64,
 }
 
 impl Sim {
@@ -73,6 +76,7 @@ impl Sim {
             in_flight: Vec::new(),
             syncs: 0,
             waves: 1,
+            carried: 0,
         }
     }
 
@@ -152,6 +156,7 @@ impl Sim {
             if wave + 1 < self.waves {
                 self.in_flight = replies;
             } else {
+                self.carried += replies.len() as u64;
                 produced = replies;
             }
         }
@@ -740,15 +745,23 @@ fn gossip_cost_under_loss_on_both_models() {
     );
     // M34: what were M33's tripwires, now the fix's bounds. Bucketed reconciliation measured
     // 3,457 here (M33: 7,961) and 796 at 100 members and 2% (M33: 5,533).
+    // M38: tightened again. A helper no longer suspects on its own relay's timeout, and a
+    // stale claim is not refuted twice: suspicion is what loss predicts, so churn fell
+    // (spec review measured 326, 90 and 734; the parent 3,457, 796 and 9,662).
     let (bytes, _) = cost(50, 10, 4);
     assert!(
-        bytes <= 4_000,
-        "50 members at 10% loss cost {bytes} B/node/round: reconciliation ships whole lists"
+        bytes <= 600,
+        "50 members at 10% loss cost {bytes} B/node/round: suspicion churn"
     );
     let (bytes, _) = cost(100, 50, 4);
     assert!(
+        bytes <= 150,
+        "100 members at 2% loss cost {bytes} B/node/round: suspicion churn"
+    );
+    let (bytes, _) = cost(100, 10, 4);
+    assert!(
         bytes <= 1_000,
-        "100 members at 2% loss cost {bytes} B/node/round: reconciliation ships whole lists"
+        "100 members at 10% loss cost {bytes} B/node/round: suspicion churn"
     );
     let (_, agree) = cost(20, 50, 1);
     assert!(
@@ -891,4 +904,89 @@ fn whole_sync_up_to_32_members_and_a_digest_past_it() {
     };
     assert_eq!(kinds(&answer(32)), ["ack", "sync"]);
     assert_eq!(kinds(&answer(33)), ["ack", "digest"]);
+}
+
+#[test]
+fn suspicion_is_what_loss_predicts() {
+    // M38, BACKLOG row 53. Loss alone predicts about 0.77% of probes ending in suspicion:
+    // 19% direct failure, times 4% for all three four-hop indirect paths. The parent
+    // originated 3,063 suspicions in 400 rounds, and the sum of own incarnations reached
+    // 16,232.
+    let mut sim = Sim::new(100, true);
+    sim.waves = 4;
+    for r in 0..50 {
+        sim.round(r);
+    }
+    sim.carried = 0;
+    sim.drop_every = 10;
+    for r in 50..450 {
+        sim.round(r);
+    }
+    let incarnations: u64 = sim
+        .nodes
+        .iter()
+        .map(|p| p.cluster().incarnation(p.cluster().me()).unwrap_or(0))
+        .sum();
+    // ⚠️ 200, not 300 (code review, M38): a helper suspecting on its own relay again
+    // measured 295, which 300 let through. 151 measured.
+    assert!(
+        incarnations <= 200,
+        "the sum of own incarnations reached {incarnations}"
+    );
+    assert!(
+        sim.carried <= 15_000,
+        "{} replies were carried past a period's wave cap",
+        sim.carried
+    );
+}
+
+/// `me`'s view of 40 members, all alive at incarnation 0.
+fn forty(me: u16) -> Cluster {
+    let mut c = Cluster::new(id(me), addr(me), "az-a".to_owned());
+    for j in 0..40 {
+        c.join(id(j), addr(j), "az-a".to_owned());
+    }
+    c
+}
+
+#[test]
+fn a_stale_claim_ends_in_a_few_hops() {
+    // ⚠️ Spec review, M38: ignoring a stale claim outright made a loop. P holds A dead at an
+    // old incarnation; A's ack makes P send that record as evidence; A ignored it and acked
+    // again, and above 32 members its `Digest` taught P nothing. Measured past 10,000 hops.
+    let mut p = forty(0);
+    p.refute(&id(1), 1);
+    p.declare_dead(&id(1));
+    let mut a = forty(1);
+    a.refute(&id(1), 3);
+    let mut nodes = [Protocol::new(p), Protocol::new(a)];
+    // P probes A.
+    let mut queue: Vec<(usize, Message)> = vec![(
+        1,
+        Message::Ping {
+            from: id(0),
+            seq: 1,
+            checksum: nodes[0].cluster().checksum(),
+            updates: Vec::new(),
+        },
+    )];
+    let mut hops = 0;
+    while let Some((to, msg)) = queue.pop() {
+        hops += 1;
+        assert!(hops <= 20, "still exchanging after {hops} hops");
+        let from = addr(if to == 0 { 1 } else { 0 });
+        for (dest, reply) in nodes[to].receive(&from, &msg) {
+            if dest == addr(0) {
+                queue.push((0, reply));
+            } else if dest == addr(1) {
+                queue.push((1, reply));
+            }
+        }
+    }
+    assert_eq!(
+        nodes[0].cluster().state(&id(1)),
+        Some(pstore_gossip::State::Alive)
+    );
+    assert_eq!(nodes[0].cluster().incarnation(&id(1)), Some(3));
+    assert_eq!(nodes[1].cluster().incarnation(&id(1)), Some(3));
 }

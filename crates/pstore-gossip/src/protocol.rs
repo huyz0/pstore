@@ -82,14 +82,26 @@ const RECONCILE_WHOLE_UP_TO: usize = 2 * crate::cluster::BUCKETS;
 /// exists to remove. What does not fit propagates on the next round, one hop later.
 const MAX_PIGGYBACK: usize = 6;
 
+/// What a pending probe is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// Our own direct probe: its timeout asks peers to probe for us.
+    Direct,
+    /// Our own probe, already asked of peers: its timeout is evidence.
+    Asked,
+    /// A probe made on a peer's behalf (M38). Its timeout is one path failing, which is the
+    /// asker's to weigh against the others it asked: never evidence here. A helper that
+    /// suspected on it originated 2,953 of 3,063 suspicions at 100 members and 10% loss.
+    Relayed,
+}
+
 /// One node's protocol state.
 #[derive(Debug)]
 pub struct Protocol {
     cluster: Cluster,
     seq: u64,
-    /// Probes awaiting an ack: sequence number to (target, tick sent, whether the indirect
-    /// round has already been tried).
-    pending: BTreeMap<u64, (NodeId, u64, bool)>,
+    /// Probes awaiting an ack: sequence number to (target, tick sent, what it is for).
+    pending: BTreeMap<u64, (NodeId, u64, Probe)>,
     /// Probes we are making on someone else's behalf: our sequence to (who asked, their
     /// sequence). ⚠️ The ack has to be **relayed back**, or the requester learns nothing from
     /// the indirect round and suspects anyway — which makes the whole indirect step
@@ -142,7 +154,8 @@ impl Protocol {
         // wearing a constant's clothing.
         if let Some(target) = self.pick_peer(seed) {
             self.seq = self.seq.wrapping_add(1);
-            self.pending.insert(self.seq, (target.id, self.tick, false));
+            self.pending
+                .insert(self.seq, (target.id, self.tick, Probe::Direct));
             out.push((
                 target.addr.clone(),
                 Message::Ping {
@@ -247,7 +260,8 @@ impl Protocol {
                 let mut out = Vec::new();
                 if let Some(addr) = self.addr_of(target) {
                     self.seq = self.seq.wrapping_add(1);
-                    self.pending.insert(self.seq, (*target, self.tick, true));
+                    self.pending
+                        .insert(self.seq, (*target, self.tick, Probe::Relayed));
                     if let Some(asker) = self.addr_of(from) {
                         self.relaying.insert(self.seq, (asker, *seq));
                     }
@@ -345,8 +359,21 @@ impl Protocol {
             if m.id == *self.cluster.me() {
                 // ⚠️ Someone believes we are not alive. Only we can say otherwise, and only by
                 // raising our own incarnation above the one their claim carries.
+                //
+                // ⚠️ **Only at or above our own incarnation** (M38). A lower claim is already
+                // outranked by our record, and raising again made one suspicion cost five
+                // refutations, each changing every checksum. It is answered with that record
+                // instead: ignored outright, a claimant whose evidence ping we ack sends it
+                // again, forever (spec review, M38). Each one re-arms our record's
+                // retransmits, so it holds one of the piggyback's slots while stale claims keep
+                // arriving: bounded, and over once the claimants hold it.
                 if m.state != State::Alive {
-                    self.refute_self_above(m.incarnation);
+                    let mine = self.cluster.incarnation(&m.id).unwrap_or(0);
+                    if m.incarnation >= mine {
+                        self.refute_self_above(m.incarnation);
+                    } else {
+                        self.note_update(&m.id);
+                    }
                 }
                 continue;
             }
@@ -456,18 +483,24 @@ impl Protocol {
     /// became a suspicion. So a direct timeout asks other peers, and only a second timeout,
     /// with their answers also missing, is evidence of absence.
     fn expire_probes(&mut self, out: &mut Vec<(String, Message)>) {
-        let due: Vec<(u64, NodeId, bool)> = self
+        let due: Vec<(u64, NodeId, Probe)> = self
             .pending
             .iter()
             .filter(|(_, (_, sent, _))| self.tick.saturating_sub(*sent) >= PROBE_TIMEOUT)
-            .map(|(seq, (id, _, asked))| (*seq, *id, *asked))
+            .map(|(seq, (id, _, kind))| (*seq, *id, *kind))
             .collect();
-        for (seq, id, already_asked) in due {
+        for (seq, id, kind) in due {
             self.pending.remove(&seq);
+            if kind == Probe::Relayed {
+                // ⚠️ And the relay entry with it (M38): cleared only by an ack before, so every
+                // relayed probe never answered stayed for the life of the node.
+                self.relaying.remove(&seq);
+                continue;
+            }
             if self.cluster.state(&id) != Some(State::Alive) {
                 continue;
             }
-            if already_asked {
+            if kind == Probe::Asked {
                 // The indirect round produced nothing either. Now it is evidence.
                 self.cluster.suspect(&id);
                 self.suspected_at.entry(id).or_insert(self.tick);
@@ -485,7 +518,7 @@ impl Protocol {
                 ));
             }
             // Re-arm: the same probe, now waiting on the indirect answers.
-            self.pending.insert(seq, (id, self.tick, true));
+            self.pending.insert(seq, (id, self.tick, Probe::Asked));
         }
     }
 
@@ -652,6 +685,55 @@ mod tests {
 
     fn honest(p: &Protocol) {
         assert_eq!(p.cluster.checksum(), p.cluster.checksum_from_scratch());
+    }
+
+    #[test]
+    fn a_relay_that_times_out_suspects_nobody() {
+        // M38: a helper's one relayed path failing is not evidence. At 100 members and 10%
+        // loss it originated 2,953 of 3,063 suspicions, and every one changed every checksum.
+        let mut p = protocol(&[1, 2], &[]);
+        let out = p.receive(
+            "n2",
+            &Message::PingReq {
+                from: nid(2),
+                seq: 9,
+                target: nid(1),
+            },
+        );
+        assert_eq!(out.len(), 1, "the relayed ping: {out:?}");
+        assert_eq!(p.relaying.len(), 1);
+        for _ in 0..=2 * PROBE_TIMEOUT {
+            p.tick += 1;
+            let mut out = Vec::new();
+            p.expire_probes(&mut out);
+            assert!(out.is_empty(), "a relay ran an indirect round: {out:?}");
+        }
+        assert_eq!(p.cluster.state(&nid(1)), Some(State::Alive));
+        assert!(p.relaying.is_empty(), "the relay entry leaked");
+        assert!(p.pending.is_empty());
+    }
+
+    #[test]
+    fn a_stale_claim_is_not_refuted() {
+        // M38: a claim below our incarnation is already outranked. Raising it again made one
+        // suspicion cost five refutations, each changing every checksum.
+        let mut p = protocol(&[1], &[]);
+        p.cluster.refute(&nid(0), 3);
+        p.updates.clear();
+        p.absorb(&[record(0, "az-a", 2, State::Suspect)]);
+        p.absorb(&[record(0, "az-a", 2, State::Dead)]);
+        assert_eq!(p.cluster.incarnation(&nid(0)), Some(3));
+        // ⚠️ But answered, with the record that outranks it (spec review): ignored outright,
+        // a claimant whose evidence ping is acked sends it again, forever.
+        let ours = p.piggyback();
+        assert!(
+            ours.iter()
+                .any(|m| m.id == nid(0) && m.incarnation == 3 && m.state == State::Alive),
+            "{ours:?}"
+        );
+        // A claim at our own incarnation is still refuted.
+        p.absorb(&[record(0, "az-a", 3, State::Suspect)]);
+        assert_eq!(p.cluster.incarnation(&nid(0)), Some(4));
     }
 
     #[test]

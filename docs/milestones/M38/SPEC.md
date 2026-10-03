@@ -94,7 +94,7 @@ corrected in spec review: the first draft's figures were measured with fix 2 app
    - 100 at 2%: at most 150 (today 796; M34's bound was 1,000).
    - M33's 20-member floor holds unchanged.
 4. **Suspicion is what loss predicts.** At 100 members and 10% loss over 400 rounds, the sum of
-   every node's own incarnation is at most 300, and at most 15,000 replies are carried past a
+   every node's own incarnation is at most 200 (300 in the spec as approved; tightened in code review, since a helper suspecting on its relay measured 295), and at most 15,000 replies are carried past a
    period's wave cap (spec review measured 11,775; the parent 31,260).
    - ⚠️ That counter does not detect a reply loop. Fix 2 without its re-gossip carried
      *fewer* (11,261). Criterion 2b is what catches the loop.
