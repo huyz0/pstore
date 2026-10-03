@@ -340,3 +340,50 @@ fn buckets_match_a_from_scratch_sum() {
         [4, 7, 13]
     );
 }
+
+#[test]
+fn leaves_match_a_from_scratch_sum() {
+    // M43: the 256 leaf sums are kept in the same `insert` as the buckets and the checksum, and
+    // must never drift from a recount or from the bucket each partitions.
+    let recount = |c: &Cluster| {
+        let mut l = [0u64; pstore_gossip::LEAVES];
+        for m in c.members() {
+            let mut solo = Cluster::new(m.id, m.addr.clone(), m.zone.clone());
+            solo.upsert(m.clone());
+            let i = pstore_gossip::leaf_of(&m.id);
+            l[i] = l[i].wrapping_add(solo.checksum());
+        }
+        l
+    };
+    let check = |c: &Cluster, why: &str| {
+        assert_eq!(*c.leaves(), recount(c), "{why}");
+        for (b, bucket) in c.buckets().iter().enumerate() {
+            let per = pstore_gossip::LEAVES_PER_BUCKET;
+            let sum = c.leaves()[b * per..(b + 1) * per]
+                .iter()
+                .fold(0u64, |a, l| a.wrapping_add(*l));
+            assert_eq!(sum, *bucket, "{why}: bucket {b} is not its leaves' sum");
+        }
+    };
+    let mut c = cluster_of(120);
+    check(&c, "joined");
+    c.suspect(&id(3));
+    check(&c, "suspected");
+    c.refute(&id(3), 5);
+    check(&c, "refuted");
+    c.declare_dead(&id(4));
+    check(&c, "dead");
+    c.suspect(&id(5));
+    c.declare_dead(&id(5));
+    c.refute(&id(5), 2);
+    check(&c, "suspected, dead, refuted");
+    c.join(id(200), addr(200), String::new());
+    c.fill_zone(&id(200), "az-b");
+    check(&c, "zone filled");
+    // FNV-1a of the 16-byte id: (h mod 16) * 16 + ((h >> 32) mod 16), computed outside this
+    // code by a Python FNV-1a checked against the published vectors for "", "a" and "foobar".
+    assert_eq!(
+        [1u8, 2, 200].map(|n| pstore_gossip::leaf_of(&id(n))),
+        [65, 121, 216]
+    );
+}

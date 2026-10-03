@@ -100,6 +100,7 @@ existing bound.
 | 1 | `a_tagged_digest_cuts_heavy_loss_at_200` (`tests/protocol.rs`) | 1,648 on the parent; tags ignored (the whole bucket always) |
 | 2 | `tagged_reconciliation_converges` | ⚠️ a guard, green on the parent but for its count of `TaggedDigest`s. Red when a `TaggedDigest` is never answered (spec review: the partition never quiets, and a view falls to 196). It does not catch a dropped collision fallback: no simulation here collides |
 | 3 | `a_tag_collision_sends_the_whole_bucket` (`protocol.rs` unit), both halves | the fallback dropped: the only test that catches it |
+| 3b | `a_bucket_of_four_is_sent_whole_and_of_five_by_leaf` (`protocol.rs` unit; added in code review, which found the ≤4 rule untested) | the ≤4 rule deleted, or inverted |
 | 4 | `leaves_match_a_from_scratch_sum` (`cluster.rs` unit) | a leaf not updated on replace; the leaf hash changed |
 | 5 | `tagged_digest_round_trips` (`tests/wire.rs`) | a wrong tag or length |
 | 6 | `a_digest_up_to_112_members_and_a_tagged_one_past_it` | the switch at the wrong size; a size check on the answer path that answers nothing at 112 or fewer |

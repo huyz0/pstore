@@ -97,7 +97,16 @@ pub struct Cluster {
     /// The checksum split by bucket (M34), kept beside it in `insert`: their wrapping sum is
     /// the checksum, so two nodes that disagree can find WHERE in 16 sums.
     buckets: [u64; BUCKETS],
+    /// Each bucket split again into [`LEAVES_PER_BUCKET`] leaves (M43), kept in the same
+    /// `insert`: leaf `b * 16 + j` is bucket `b`'s `j`th, and a bucket is its leaves' sum.
+    leaves: [u64; LEAVES],
 }
+
+/// How many leaves each bucket is split into (M43).
+pub const LEAVES_PER_BUCKET: usize = 16;
+
+/// Every leaf: one tag each in a `TaggedDigest` (M43).
+pub const LEAVES: usize = BUCKETS * LEAVES_PER_BUCKET;
 
 /// How many buckets the checksum is split into (M34). A `Digest` carries one sum per bucket,
 /// and a `Part` the members of the buckets that differ: about N/16 per differing bucket.
@@ -108,12 +117,26 @@ pub const BUCKETS: usize = 16;
 /// hasher whose output may change.
 #[must_use]
 pub fn bucket_of(id: &NodeId) -> usize {
+    (fnv(id) % BUCKETS as u64) as usize
+}
+
+fn fnv(id: &NodeId) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in id {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
-    (h % BUCKETS as u64) as usize
+    h
+}
+
+/// A member's leaf (M43): its bucket times 16, plus a second index from the high half of the
+/// same FNV-1a, so it is independent of the low bits that chose the bucket. ⚠️ Written out for
+/// the same reason [`bucket_of`] is: every node in a mixed fleet must compute the same one.
+#[must_use]
+pub fn leaf_of(id: &NodeId) -> usize {
+    let h = fnv(id);
+    (h % BUCKETS as u64) as usize * LEAVES_PER_BUCKET
+        + ((h >> 32) % LEAVES_PER_BUCKET as u64) as usize
 }
 
 impl Cluster {
@@ -125,6 +148,7 @@ impl Cluster {
             members: BTreeMap::new(),
             checksum: 0,
             buckets: [0; BUCKETS],
+            leaves: [0; LEAVES],
         };
         c.insert(Member {
             id: me,
@@ -213,6 +237,22 @@ impl Cluster {
     #[must_use]
     pub fn buckets(&self) -> [u64; BUCKETS] {
         self.buckets
+    }
+
+    /// The 256 leaf sums (M43), each bucket's 16 in a row.
+    #[must_use]
+    pub fn leaves(&self) -> &[u64; LEAVES] {
+        &self.leaves
+    }
+
+    /// One byte per leaf (M43): the top byte of the leaf's sum times a 64-bit odd constant, so
+    /// two views that hold a leaf differently differ in its tag 255 times in 256. What a
+    /// `TaggedDigest` carries. ⚠️ An array, not a `Vec`: the answer path computes it per
+    /// `TaggedDigest` received and allocates nothing for it.
+    #[must_use]
+    pub fn leaf_tags(&self) -> [u8; LEAVES] {
+        self.leaves
+            .map(|s| (s.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8)
     }
 
     /// The same value, computed from the whole set.
@@ -333,6 +373,11 @@ impl Cluster {
         self.checksum = self.checksum.wrapping_add(m.fingerprint());
         // `bucket_of` is below `BUCKETS` by construction, so this always finds its slot.
         if let Some(slot) = self.buckets.get_mut(bucket_of(&m.id)) {
+            *slot = slot
+                .wrapping_sub(old.unwrap_or(0))
+                .wrapping_add(m.fingerprint());
+        }
+        if let Some(slot) = self.leaves.get_mut(leaf_of(&m.id)) {
             *slot = slot
                 .wrapping_sub(old.unwrap_or(0))
                 .wrapping_add(m.fingerprint());

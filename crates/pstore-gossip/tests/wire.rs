@@ -279,3 +279,30 @@ fn digest_and_part_round_trip() {
     assert_ne!(part.encode()[0], sync.encode()[0]);
     assert_ne!(Message::decode(&part.encode()), Some(sync));
 }
+
+#[test]
+fn tagged_digest_round_trips() {
+    // M43: the sender, 16 bucket sums and 256 one-byte leaf tags -- fixed, no count, 401 bytes.
+    let tagged = Message::TaggedDigest {
+        from: id(7),
+        buckets: (0..16u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect(),
+        tags: (0..=255u8).collect(),
+    };
+    let bytes = tagged.encode();
+    assert_eq!(bytes.len(), 401);
+    assert_eq!(Message::decode(&bytes), Some(tagged.clone()));
+    assert!(
+        Message::decode(&bytes[..bytes.len() - 1]).is_none(),
+        "a truncated TaggedDigest decoded"
+    );
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(
+        Message::decode(&longer).is_none(),
+        "a TaggedDigest with a trailing byte decoded"
+    );
+    // Its own tag: not a `Digest`'s, nor anything an older build understands.
+    assert_eq!(bytes[0], 7);
+}

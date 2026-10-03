@@ -51,6 +51,9 @@ struct Sim {
     /// Replies a period's last wave produced, carried to the next period (M38). ⚠️ Not a loop
     /// detector: a loop the wave cap cuts short can carry fewer (spec review, M38).
     carried: u64,
+    /// `TaggedDigest`s delivered (M43), so a test of the tagged path can show it ran there
+    /// rather than passing on M34's.
+    tagged: u64,
 }
 
 impl Sim {
@@ -77,6 +80,7 @@ impl Sim {
             syncs: 0,
             waves: 1,
             carried: 0,
+            tagged: 0,
         }
     }
 
@@ -134,9 +138,15 @@ impl Sim {
                 self.sent += 1;
                 if matches!(
                     msg,
-                    Message::Sync { .. } | Message::Digest { .. } | Message::Part { .. }
+                    Message::Sync { .. }
+                        | Message::Digest { .. }
+                        | Message::Part { .. }
+                        | Message::TaggedDigest { .. }
                 ) {
                     self.syncs += 1;
+                }
+                if matches!(msg, Message::TaggedDigest { .. }) {
+                    self.tagged += 1;
                 }
                 self.bytes += msg.encode().len() as u64;
                 if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
@@ -989,4 +999,107 @@ fn a_stale_claim_ends_in_a_few_hops() {
     );
     assert_eq!(nodes[0].cluster().incarnation(&id(1)), Some(3));
     assert_eq!(nodes[1].cluster().incarnation(&id(1)), Some(3));
+}
+
+#[test]
+fn a_tagged_digest_cuts_heavy_loss_at_200() {
+    // M43, BACKLOG row 53: under heavy loss most of the 16 buckets differ between any two
+    // members, so M34's `Part` carried most of the member list. Tags narrow it to the leaves
+    // that differ. Spec review measured this run at 1,648 on the parent and 1,043 on the
+    // prototype. ⚠️ Cost and survival asserted on ONE run, so a cut bought with deaths fails.
+    let n = 200u16;
+    let mut sim = Sim::new(n, true);
+    sim.waves = 4;
+    for r in 0..50 {
+        sim.round(r);
+    }
+    let before = sim.bytes;
+    sim.drop_every = 10;
+    for r in 50..250 {
+        sim.round(r);
+    }
+    let bytes = (sim.bytes - before) / 200 / u64::from(n);
+    let worst = sim
+        .nodes
+        .iter()
+        .map(|p| p.cluster().alive().len())
+        .min()
+        .unwrap_or(0);
+    assert!(
+        bytes <= 1_300,
+        "200 members at 10% loss cost {bytes} B/node/round"
+    );
+    assert_eq!(
+        worst, 200,
+        "at 10% loss with every node alive, a view fell to {worst}"
+    );
+}
+
+#[test]
+fn tagged_reconciliation_converges() {
+    // M43: a healed partition of two 80s, on the tagged path -- every view holds 160, past
+    // 112 -- agrees and then goes quiet.
+    let mut sim = Sim::new(160, true);
+    let held: BTreeMap<String, usize> = sim.by_addr.clone();
+    sim.by_addr
+        .retain(|a, _| held.get(a).is_some_and(|i| *i < 80));
+    for r in 0..60 {
+        sim.round(r);
+    }
+    sim.by_addr = held;
+    let before = sim.tagged;
+    assert!(
+        converges_then_quiets(&mut sim, 100, 400).is_some(),
+        "a healed partition of two 80s never converged and went quiet"
+    );
+    assert!(sim.all_see(160));
+    assert!(
+        sim.tagged > before,
+        "no TaggedDigest was sent: this passed on M34's path"
+    );
+}
+
+#[test]
+fn a_digest_up_to_112_members_and_a_tagged_one_past_it() {
+    // M43's switch, at its boundary: a mismatch in a view of 112 is a `Digest`, in 113 a
+    // `TaggedDigest`. And the answer depends on the message, not the receiver: a view of 112
+    // answers a `TaggedDigest` with a `Part` (spec review).
+    let view = |n: u16| {
+        let mut c = Cluster::new(id(0), addr(0), "az-a".to_owned());
+        for j in 1..n {
+            c.join(id(j), addr(j), "az-a".to_owned());
+        }
+        Protocol::new(c)
+    };
+    let kinds = |out: &[(String, Message)]| {
+        out.iter()
+            .map(|(_, m)| match m {
+                Message::Ack { .. } => "ack",
+                Message::Digest { .. } => "digest",
+                Message::TaggedDigest { .. } => "tagged",
+                Message::Part { .. } => "part",
+                _ => "other",
+            })
+            .collect::<Vec<_>>()
+    };
+    let ping = Message::Ping {
+        from: id(1),
+        seq: 1,
+        checksum: 0,
+        updates: Vec::new(),
+    };
+    assert_eq!(
+        kinds(&view(112).receive(&addr(1), &ping)),
+        ["ack", "digest"]
+    );
+    assert_eq!(
+        kinds(&view(113).receive(&addr(1), &ping)),
+        ["ack", "tagged"]
+    );
+    let tagged = Message::TaggedDigest {
+        from: id(1),
+        buckets: vec![0; 16],
+        tags: vec![0; 256],
+    };
+    assert_eq!(kinds(&view(112).receive(&addr(1), &tagged)), ["part"]);
 }

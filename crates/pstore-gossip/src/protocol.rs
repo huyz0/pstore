@@ -76,6 +76,16 @@ const RETRANSMITS: u8 = 4;
 /// whole `Sync`'s 395, for no bytes saved.
 const RECONCILE_WHOLE_UP_TO: usize = 2 * crate::cluster::BUCKETS;
 
+/// The largest fleet whose mismatch still sends a `Digest` (M43): seven members a bucket.
+/// Above it a mismatch sends a `TaggedDigest`. Measured at 10% loss: at 100 members its 256
+/// tag bytes cost more than they save (757 B per node per round against 734), and at 128 they
+/// save (838 against 926). ⚠️ One schedule, one loss rate, interpolated: a cost knob.
+const TAG_ABOVE: usize = 7 * crate::cluster::BUCKETS;
+
+/// A differing bucket holding at most this many of the answerer's members is answered whole,
+/// whatever its tags say (M43): too few to be worth filtering.
+const LEAF_ABOVE: usize = 4;
+
 /// How many changes ride along on a probe.
 ///
 /// ⚠️ Bounded, so a fleet in churn cannot turn a probe back into the O(N) message this crate
@@ -304,6 +314,40 @@ impl Protocol {
                 }
                 out
             }
+            Message::TaggedDigest {
+                from,
+                buckets,
+                tags,
+            } => {
+                // M43: answered whatever this view's size -- the answer depends on the
+                // message, never on the receiver (spec review).
+                self.mark_alive(from);
+                let send = self.leaves_to_send(buckets, tags);
+                let mut out = Vec::new();
+                if send.iter().any(|m| *m != 0)
+                    && let Some(addr) = self.addr_of(from)
+                {
+                    let members = self
+                        .cluster
+                        .members()
+                        .filter(|m| {
+                            let leaf = crate::cluster::leaf_of(&m.id);
+                            let per = crate::cluster::LEAVES_PER_BUCKET;
+                            send.get(leaf / per)
+                                .is_some_and(|mask| mask & (1 << (leaf % per)) != 0)
+                        })
+                        .cloned()
+                        .collect();
+                    out.push((
+                        addr,
+                        Message::Part {
+                            from: *self.cluster.me(),
+                            members,
+                        },
+                    ));
+                }
+                out
+            }
             Message::Part { from, members } => {
                 self.absorb(members);
                 self.mark_alive(from);
@@ -326,9 +370,15 @@ impl Protocol {
 
     /// What a checksum mismatch sends (M34): a `Digest` past [`RECONCILE_WHOLE_UP_TO`]
     /// members, else a whole `Sync`, which is cheap at that size and converges in fewer
-    /// exchanges.
+    /// exchanges. Past [`TAG_ABOVE`], a `TaggedDigest` (M43).
     fn reconcile(&self) -> Message {
-        if self.cluster.len() > RECONCILE_WHOLE_UP_TO {
+        if self.cluster.len() > TAG_ABOVE {
+            Message::TaggedDigest {
+                from: *self.cluster.me(),
+                buckets: self.cluster.buckets().to_vec(),
+                tags: self.cluster.leaf_tags().to_vec(),
+            }
+        } else if self.cluster.len() > RECONCILE_WHOLE_UP_TO {
             Message::Digest {
                 from: *self.cluster.me(),
                 buckets: self.cluster.buckets().to_vec(),
@@ -336,6 +386,40 @@ impl Protocol {
         } else {
             self.sync()
         }
+    }
+
+    /// Which leaves a `TaggedDigest` is answered with (M43): one 16-bit mask per bucket, so
+    /// the answer is one pass over the members against 256 bits, never a list searched per
+    /// member (spec review). For each bucket whose sum differs:
+    /// - every leaf, when this view holds [`LEAF_ABOVE`] or fewer of its members;
+    /// - every leaf, when no tag in it differs: a collision. ⚠️ So a difference the 64-bit
+    ///   sums show is never left unanswered;
+    /// - otherwise, the leaves whose tags differ.
+    fn leaves_to_send(&self, buckets: &[u64], tags: &[u8]) -> [u16; crate::cluster::BUCKETS] {
+        let per = crate::cluster::LEAVES_PER_BUCKET;
+        let mine = self.cluster.buckets();
+        let my_tags = self.cluster.leaf_tags();
+        let mut count = [0usize; crate::cluster::BUCKETS];
+        for m in self.cluster.members() {
+            if let Some(c) = count.get_mut(crate::cluster::bucket_of(&m.id)) {
+                *c += 1;
+            }
+        }
+        let mut send = [0u16; crate::cluster::BUCKETS];
+        for (b, mask) in send.iter_mut().enumerate() {
+            if buckets.get(b) == mine.get(b) {
+                continue;
+            }
+            let differing = (0..per)
+                .filter(|j| tags.get(b * per + j) != my_tags.get(b * per + j))
+                .fold(0u16, |acc, j| acc | (1 << j));
+            *mask = if count.get(b).copied().unwrap_or(0) <= LEAF_ABOVE || differing == 0 {
+                u16::MAX
+            } else {
+                differing
+            };
+        }
+        send
     }
 
     fn sync(&self) -> Message {
@@ -681,6 +765,154 @@ mod tests {
             .member(&nid(n))
             .map(|m| m.zone.clone())
             .unwrap_or_default()
+    }
+
+    /// `me`'s view of members 0 to 120, all alive at incarnation 0.
+    fn tagged_view(me: u8) -> Protocol {
+        let mut c = Cluster::new(nid(me), format!("n{me}"), "az-a".to_owned());
+        for n in 0..=120 {
+            c.join(nid(n), format!("n{n}"), "az-a".to_owned());
+        }
+        Protocol::new(c)
+    }
+
+    /// `p`'s `TaggedDigest`, with every tag `copy` says replaced by `from`'s: a collision.
+    fn colliding(p: &Protocol, from: &Protocol, copy: impl Fn(usize) -> bool) -> Message {
+        let Message::TaggedDigest {
+            from: sender,
+            buckets,
+            mut tags,
+        } = p.reconcile()
+        else {
+            panic!("a view of 121 did not send a TaggedDigest");
+        };
+        let theirs = from.cluster.leaf_tags();
+        for (l, t) in tags.iter_mut().enumerate() {
+            if copy(l) {
+                *t = theirs[l];
+            }
+        }
+        Message::TaggedDigest {
+            from: sender,
+            buckets,
+            tags,
+        }
+    }
+
+    /// The members of the one `Part` `out` holds, by id.
+    fn part_of(out: &[(String, Message)]) -> Vec<NodeId> {
+        match out {
+            [(to, Message::Part { members, .. })] if to == "n1" => {
+                members.iter().map(|m| m.id).collect()
+            }
+            _ => panic!("expected one Part to n1, got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tag_collision_sends_the_whole_bucket() {
+        // M43: a bucket whose sums differ but whose tags all agree is a collision, and is
+        // answered whole -- a difference the 64-bit sums show is never left unanswered.
+        // A bucket of more than `LEAF_ABOVE` members with two members in different leaves,
+        // neither of them node 0 or 1.
+        let (b, m1, m2) = (0..crate::cluster::BUCKETS)
+            .find_map(|b| {
+                let ids: Vec<NodeId> = (0..=120)
+                    .map(nid)
+                    .filter(|i| crate::cluster::bucket_of(i) == b)
+                    .collect();
+                let m1 = *ids.iter().find(|i| i[0] > 1)?;
+                let m2 = *ids.iter().find(|i| {
+                    i[0] > 1 && crate::cluster::leaf_of(i) != crate::cluster::leaf_of(&m1)
+                })?;
+                (ids.len() > LEAF_ABOVE).then_some((b, m1, m2))
+            })
+            .expect("no bucket of more than 4 with two leaves");
+        let (l1, l2) = (crate::cluster::leaf_of(&m1), crate::cluster::leaf_of(&m2));
+        let bucket = |p: &Protocol| -> Vec<NodeId> {
+            p.cluster
+                .members()
+                .filter(|m| crate::cluster::bucket_of(&m.id) == b)
+                .map(|m| m.id)
+                .collect()
+        };
+
+        // A full collision: every tag equal, the bucket's sums not.
+        let mut a = tagged_view(0);
+        let p = tagged_view(1);
+        a.cluster.refute(&m1, 1);
+        let digest = colliding(&p, &a, |_| true);
+        assert_eq!(part_of(&a.receive("n1", &digest)), bucket(&a));
+
+        // A partial one: the answerer holds the newer copy of both leaves; l1's tags differ
+        // and l2's collide. The first `Part` carries l1 alone.
+        let mut a = tagged_view(0);
+        let mut p = tagged_view(1);
+        a.cluster.refute(&m1, 1);
+        a.cluster.refute(&m2, 1);
+        let digest = colliding(&p, &a, |l| l == l2);
+        let mut out = a.receive("n1", &digest);
+        let first = part_of(&out);
+        assert!(
+            first.contains(&m1),
+            "the first Part lacks the leaf that differs"
+        );
+        assert!(
+            first.iter().all(|i| crate::cluster::leaf_of(i) == l1),
+            "the first Part carried more than leaf {l1}"
+        );
+        let Some((_, part)) = out.pop() else {
+            unreachable!()
+        };
+        p.receive("n0", &part);
+        assert_eq!(p.cluster.leaves()[l1], a.cluster.leaves()[l1]);
+        assert_ne!(p.cluster.buckets()[b], a.cluster.buckets()[b]);
+        // l1 now agrees and l2 still collides: no tag in the bucket differs, so it goes whole.
+        let digest = colliding(&p, &a, |l| l == l2);
+        let mut out = a.receive("n1", &digest);
+        assert_eq!(part_of(&out), bucket(&a));
+        let Some((_, part)) = out.pop() else {
+            unreachable!()
+        };
+        p.receive("n0", &part);
+        assert_eq!(p.cluster.checksum(), a.cluster.checksum());
+    }
+
+    #[test]
+    fn a_bucket_of_four_is_sent_whole_and_of_five_by_leaf() {
+        // M43 code review: the answerer's own count decides. A differing bucket of at most
+        // `LEAF_ABOVE` of its members goes whole; past that, only the leaves whose tags differ.
+        let b = (0..crate::cluster::BUCKETS)
+            .find(|b| *b != crate::cluster::bucket_of(&nid(0)))
+            .expect("a bucket without node 0");
+        let ids: Vec<NodeId> = (1..=250)
+            .map(nid)
+            .filter(|i| crate::cluster::bucket_of(i) == b)
+            .collect();
+        assert!(ids.len() > LEAF_ABOVE, "too few ids in bucket {b}");
+        let leaf = crate::cluster::leaf_of(&ids[0]);
+        for size in [LEAF_ABOVE, LEAF_ABOVE + 1] {
+            let mut c = Cluster::new(nid(0), "n0".to_owned(), "az-a".to_owned());
+            for i in &ids[..size] {
+                c.join(*i, format!("n{}", i[0]), "az-a".to_owned());
+            }
+            let a = Protocol::new(c);
+            let mut buckets = a.cluster.buckets().to_vec();
+            buckets[b] ^= 1;
+            let mut tags = a.cluster.leaf_tags().to_vec();
+            tags[leaf] ^= 1;
+            let mask = a.leaves_to_send(&buckets, &tags);
+            let want = if size <= LEAF_ABOVE {
+                u16::MAX
+            } else {
+                1 << (leaf % crate::cluster::LEAVES_PER_BUCKET)
+            };
+            assert_eq!(mask[b], want, "a bucket of {size}");
+            assert!(
+                mask.iter().enumerate().all(|(j, m)| j == b || *m == 0),
+                "a bucket whose sums agree was sent: {mask:?}"
+            );
+        }
     }
 
     fn honest(p: &Protocol) {

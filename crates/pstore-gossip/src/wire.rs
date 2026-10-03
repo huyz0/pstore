@@ -67,6 +67,17 @@ pub enum Message {
         /// The sender's members in the differing buckets.
         members: Vec<Member>,
     },
+    /// A `Digest` that also carries a one-byte tag per leaf (M43), sent on a mismatch past 112
+    /// members: answered with a `Part` of only the members of leaves whose tags differ, in the
+    /// one hop a `Digest` takes. 401 bytes, fixed; an old node decodes it to nothing.
+    TaggedDigest {
+        /// Who is reconciling.
+        from: NodeId,
+        /// One sum per bucket, exactly `BUCKETS` of them.
+        buckets: Vec<u64>,
+        /// One tag per leaf, exactly `LEAVES` of them.
+        tags: Vec<u8>,
+    },
 }
 
 const PING: u8 = 1;
@@ -75,6 +86,7 @@ const PING_REQ: u8 = 3;
 const SYNC: u8 = 4;
 const DIGEST: u8 = 5;
 const PART: u8 = 6;
+const TAGGED_DIGEST: u8 = 7;
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -198,7 +210,8 @@ impl Message {
             | Self::PingReq { from, .. }
             | Self::Sync { from, .. }
             | Self::Digest { from, .. }
-            | Self::Part { from, .. } => *from,
+            | Self::Part { from, .. }
+            | Self::TaggedDigest { from, .. } => *from,
         }
     }
 
@@ -244,6 +257,18 @@ impl Message {
                 for b in buckets {
                     put_u64(&mut out, *b);
                 }
+            }
+            Self::TaggedDigest {
+                from,
+                buckets,
+                tags,
+            } => {
+                out.push(TAGGED_DIGEST);
+                out.extend_from_slice(from);
+                for b in buckets {
+                    put_u64(&mut out, *b);
+                }
+                out.extend_from_slice(tags);
             }
             Self::Part { from, members } => {
                 out.push(PART);
@@ -307,6 +332,14 @@ impl Message {
                 buckets: (0..crate::cluster::BUCKETS)
                     .map(|_| r.u64())
                     .collect::<Option<_>>()?,
+            },
+            // ⚠️ Fixed length, no counts: exactly 16 sums and 256 tags.
+            TAGGED_DIGEST => Self::TaggedDigest {
+                from: r.id()?,
+                buckets: (0..crate::cluster::BUCKETS)
+                    .map(|_| r.u64())
+                    .collect::<Option<_>>()?,
+                tags: r.take(crate::cluster::LEAVES)?.to_vec(),
             },
             PART => Self::Part {
                 from: r.id()?,
