@@ -123,11 +123,17 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by M34
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 53 | **Under heavy loss, gossip still pays for suspicion churn, and a `Part` grows at N/16.** At 100 members and 10% loss, [M34](M34/VERIFIED.md) still measures 9,662 B per node per round, because a probe ends in a suspicion about 0.75% of the time, and every one changes checksums fleet-wide. At 10,000 members, one differing bucket is about 625 members, roughly 37 KB in one datagram. The churn is Lifeguard's territory: local health awareness and suspicion confirmation (D-4, OQ-12). The slope wants buckets scaled to the fleet, or a digest in two levels. Measure first, on M33's real-hop model. | [M34](M34/SPEC.md) | M |
+
 ## Opened by M33
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 52 | ⚠️ **Under loss, gossip's cost grows with the fleet: every exchange between disagreeing members ships the whole member list.** Measured by [M33](M33/VERIFIED.md) on a model where a period holds an indirect probe's four hops, as a real network's does, in bytes per node per round: 20 members at 10% loss pay 2,748; 50 at 2% pay 1,786; 50 at 10% pay 7,961; 100 at 2% pay 5,533; 100 at 10% pay 15,225. Checksums agree in 5 to 54 of 400 rounds, against 74 bytes and 400 of 400 without loss. **Throttling `Sync` is not the fix.** No `Sync` while updates are pending, a per-peer cooldown and a global one-per-10-periods limit were each measured: each barely moved the bytes, or cut them ~10× and manufactured deaths (as few as 94 of 100 alive), because `Sync` is what rescues a refutation whose piggybacked copies were lost. The designs left are a `Sync` that sends only what differs (bucketed checksums, then only the differing buckets) and refutations disseminated with priority (Lifeguard). `gossip_cost_under_loss_on_both_models` pins tripwires that a fix is meant to trip: lowering them then is the fix landing, not a threshold weakened. | [M33](M33/SPEC.md) | M |
+| ~~52~~ | **CLOSED by [M34](M34/VERIFIED.md)**: past 32 members a checksum mismatch sends a `Digest` of 16 bucket sums, answered with only the differing buckets' members. 100 members at 2% loss fell from 5,533 to 796 B per node per round, and 50 at 10% from 7,961 to 3,457, with no deaths manufactured and M33's agreement floor unchanged. The remainder is row 53. | [M33](M33/SPEC.md) | M |
 
 ## Opened by M27
 
