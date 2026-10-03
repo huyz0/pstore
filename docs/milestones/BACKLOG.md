@@ -127,7 +127,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 51 | **A query with a sparse or text leg asks for each segment's dictionary even where none exists.** The dictionaries are fetched in the open round beside the footer that would say whether they exist, so a segment with no sparse vectors, or no text, answers with a 404 no cache keeps -- row 46's cost for the other two legs. HEAD records no per-segment "has a dictionary" bit, so unlike row 46 it needs one there, or a third round. Measure how often it happens first: an index written with text has text in every segment. | [M27](M27/SPEC.md) | S |
+| ~~51~~ | **CLOSED by [M32](M32/VERIFIED.md)**: HEAD records which dictionaries each segment has, one byte per segment in an optional section, and the open round asks for no other. Measured first, at 8 of 9 dictionary reads being 404s over a mixed index. Found with it: a sparse query over an index with any segment lacking the sparse field was refused outright. It now answers, as M30 made text answer. | [M27](M27/SPEC.md) | S |
 
 ## Opened by M24
 
