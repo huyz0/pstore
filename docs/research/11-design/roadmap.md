@@ -532,6 +532,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M36 | **A row carries its writer's text field, and every fold judges it by that** ([VERIFIED](../../milestones/M36/VERIFIED.md)): `$text` stamped at the door; a text-field conflict or a sibling race is quarantined by any fold | [BACKLOG](../../milestones/BACKLOG.md) row 54 |
 | M37 | **An unstamped row was written under the default text field** ([VERIFIED](../../milestones/M37/VERIFIED.md)): the server stamps nothing, so nothing leaks in a rolling upgrade; a sealed row keeps its field across a patch | [BACKLOG](../../milestones/BACKLOG.md) row 55 |
 | M38 | **A relay that times out suspects nobody, and a stale claim is not refuted twice** ([VERIFIED](../../milestones/M38/VERIFIED.md)): gossip under 10% loss at 100 members falls from 9,662 to 734 B per node per round | [BACKLOG](../../milestones/BACKLOG.md) row 53 |
+| M39 | **A flush re-reads its lane's watermark within half the reap age** ([VERIFIED](../../milestones/M39/VERIFIED.md)): a second writer's folded and reaped bundle is refused as `LaneTaken`, never written again below the watermark | [BACKLOG](../../milestones/BACKLOG.md) row 24 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
