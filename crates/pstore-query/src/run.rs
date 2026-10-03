@@ -83,6 +83,9 @@ pub enum QueryError {
 pub struct Target {
     /// The segment object.
     pub segment: Key,
+    /// Its length in bytes, when HEAD recorded it (M45): the open reads an absolute range
+    /// rather than a suffix, which a backend without suffix ranges (Azure, C-14) can serve.
+    pub segment_len: Option<u64>,
     /// Its centroid table, or `None` when the caller knows it has none (M27), and the open
     /// round asks for nothing. Absent in the store is not an error either: D-10 reads both as
     /// "scan me exactly".
@@ -737,7 +740,7 @@ async fn open<S: BlobStore>(
         }
     };
     let (segment, cen, dict, terms, deleted) = futures_util::future::join5(
-        Segment::open(store, key),
+        Segment::open_at(store, key, target.segment_len),
         maybe(store, centroids.clone().filter(|_| wants_dense)),
         maybe(
             store,

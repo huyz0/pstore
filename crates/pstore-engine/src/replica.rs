@@ -828,6 +828,8 @@ impl<S: BlobStore> Engine<S> {
                     rows: r.rows,
                     // M32: the copy's sidecars are the source's.
                     dicts: r.dicts,
+                    // M45: and its bytes, so its length.
+                    len: r.len,
                 });
                 let want = src_head.deletes.get(&head::dv_ref(index, &r.key)).cloned();
                 let Some((k, n)) = want else {

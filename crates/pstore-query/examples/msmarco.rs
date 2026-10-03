@@ -135,6 +135,7 @@ async fn main() {
             .expect("segment");
         store.put(&key, seg).await.unwrap();
         targets.push(Target {
+            segment_len: None,
             centroids: Some(Key::new(format!("{}.cen", key.as_str()))),
             deleted: None,
             sparse_dict: true,

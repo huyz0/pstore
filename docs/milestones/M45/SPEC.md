@@ -128,7 +128,10 @@ Two honest qualifications (spec review):
      one that reaches the check (spec review);
    - a segment shorter than `SUFFIX_FETCH` opens with a known length, reading from offset 0.
    - Test: `pstore-format` `reader::tests::a_recorded_length_is_checked_against_the_footer`.
-7. **Every existing test passes, unchanged except for the new field** in the struct literals.
+7. **Every existing test passes, unchanged except for the new field** in the struct literals,
+   and two byte pins that count HEAD's bytes (code review): `patch.rs` and `served_epoch.rs`
+   each move by exactly the section, 18 bytes for one index named `docs` holding one segment
+   whose length is a 2-byte varint. Their read counts do not move.
    This includes the server's cost and depth tests, which count requests. `./scripts/gates.sh`,
    and `./scripts/depth.sh`.
 8. **Mutation:** the incremental sweep of the changed lines misses 0. `./scripts/mutants.sh`.

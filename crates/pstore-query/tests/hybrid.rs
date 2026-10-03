@@ -37,6 +37,7 @@ const GAP: u64 = 256;
 /// one would give every segment's dense leg another segment's clusters.
 fn one(segment: &Key, centroids: &Key) -> [Target; 1] {
     [Target {
+        segment_len: None,
         segment: segment.clone(),
         centroids: Some(centroids.clone()),
         deleted: None,

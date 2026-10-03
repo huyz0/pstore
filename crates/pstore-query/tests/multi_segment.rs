@@ -56,6 +56,7 @@ async fn put<S: BlobStore>(store: &S, name: &str, docs: &[Document]) -> Target {
         .await
         .unwrap();
     Target {
+        segment_len: None,
         centroids: Some(Key::new(format!("t/idx/{name}.centroids"))),
         deleted: None,
         sparse_dict: true,

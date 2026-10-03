@@ -1968,7 +1968,7 @@ impl<S: BlobStore> Engine<S> {
         text_field: Option<&str>,
         fts: &FullText,
         trigram: &[String],
-    ) -> Result<(Key, Dicts), EngineError> {
+    ) -> Result<(Key, Dicts, u64), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
         let text_field = text_field.filter(|f| {
@@ -2047,7 +2047,8 @@ impl<S: BlobStore> Engine<S> {
                     }
                 }
                 if all {
-                    return Ok((key, dicts));
+                    // M45: the length HEAD records, so an open never needs a suffix read.
+                    return Ok((key, dicts, built.segment.len() as u64));
                 }
             }
             refused += 1;
@@ -2569,7 +2570,7 @@ impl<S: BlobStore> Engine<S> {
                 let clustered = dims > 0 && r.rows > 0;
                 // Round 2: the footer, the delete vector, the centroid table, together.
                 let (seg, dv, cen) = futures_util::future::join3(
-                    Segment::open(store, &t.segment),
+                    Segment::open_at(store, &t.segment, t.segment_len),
                     sidecar(store, t.deleted.as_ref(), true),
                     sidecar(store, t.centroids.as_ref().filter(|_| clustered), false),
                 )
@@ -3779,7 +3780,7 @@ impl<S: BlobStore> Engine<S> {
                 }
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();
-                let (seg_key, dicts) = self
+                let (seg_key, dicts, len) = self
                     .seal(
                         names,
                         &self.segment_key(next.epoch, idx),
@@ -3798,6 +3799,7 @@ impl<S: BlobStore> Engine<S> {
                         key: seg_key.as_str().to_owned(),
                         rows: docs.len() as u32,
                         dicts: Some(dicts),
+                        len: Some(len),
                     });
             }
             // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
@@ -3998,8 +4000,9 @@ impl<S: BlobStore> Engine<S> {
                 // M16: the vector as this index records it, scoped when it borrows the segment.
                 let dv = head::dv_ref(index, &r.key);
                 let old = head.deletes.get(&dv).map(|(k, _)| k.clone());
-                let (seg, before) =
-                    futures_util::future::join(Segment::open(&*self.store, &key), async {
+                let (seg, before) = futures_util::future::join(
+                    Segment::open_at(&*self.store, &key, r.len),
+                    async {
                         match &old {
                             Some(k) => self
                                 .store
@@ -4008,8 +4011,9 @@ impl<S: BlobStore> Engine<S> {
                                 .map(|raw| pstore_query::deletes::decode(&raw)),
                             None => Ok(std::collections::HashSet::new()),
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 let (seg, deleted) = (seg?, before?);
                 let mut kept = Vec::new();
                 let rows: Vec<(usize, Document)> = if let Some(keep) = keep {
@@ -4489,9 +4493,12 @@ impl<S: BlobStore> Engine<S> {
 
         // Opened and scanned together, like every other multi-segment read: n inputs are
         // n parallel fetches, not n round trips.
-        let opened =
-            futures_util::future::try_join_all(keys.iter().map(|k| Segment::open(&*self.store, k)))
-                .await?;
+        let opened = futures_util::future::try_join_all(
+            keys.iter()
+                .zip(&inputs)
+                .map(|(k, r)| Segment::open_at(&*self.store, k, r.len)),
+        )
+        .await?;
         // ⚠️ **The inputs' delete vectors as this HEAD names them** (M9c.2): the merge drops the
         // rows they name, and is abandoned below if a fold changes any of them first -- a merge
         // sealed before a delete and committed after it would resurrect the deleted row.
@@ -4566,10 +4573,13 @@ impl<S: BlobStore> Engine<S> {
         // partway is buried too (M19) -- and never a name it was refused (M23).
         let empty = rows.is_empty();
         let mut out_dicts = Dicts::default();
+        let mut out_len = None;
         if !empty {
-            (out_key, out_dicts) = self
+            let len;
+            (out_key, out_dicts, len) = self
                 .seal(names, &out_key, &rows, text_field, &fts, &trigram)
                 .await?;
+            out_len = Some(len);
         }
         if let Some(f) = interfere {
             f.await;
@@ -4587,7 +4597,7 @@ impl<S: BlobStore> Engine<S> {
             // refused, and comparing keys would re-seal on every retry at an unchanged epoch.
             let want = at.head.epoch.next();
             if want != sealed_at && !empty {
-                let (key, dicts) = self
+                let (key, dicts, len) = self
                     .seal(
                         names,
                         &self.compacted_key(want, index),
@@ -4599,12 +4609,15 @@ impl<S: BlobStore> Engine<S> {
                     .await?;
                 out_key = key;
                 out_dicts = dicts;
+                // ⚠️ M45: the re-seal's length, never the abandoned attempt's.
+                out_len = Some(len);
                 sealed_at = want;
             }
             let out = SegmentRef {
                 key: out_key.as_str().to_owned(),
                 rows: rows.len() as u32,
                 dicts: Some(out_dicts),
+                len: out_len,
             };
             let current: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
             // ⚠️ The discard condition. If any input is no longer named by HEAD, another
@@ -4696,7 +4709,9 @@ impl<S: BlobStore> Engine<S> {
             let keys: Vec<Key> = refs.iter().map(|r| Key::new(r.key.clone())).collect();
 
             let opened = futures_util::future::try_join_all(
-                keys.iter().map(|k| Segment::open(&*self.store, k)),
+                keys.iter()
+                    .zip(&refs)
+                    .map(|(k, r)| Segment::open_at(&*self.store, k, r.len)),
             )
             .await?;
             let scanned = futures_util::future::try_join_all(
@@ -4875,9 +4890,12 @@ impl<S: BlobStore> Engine<S> {
                 )
                 .await?;
         }
+        // M45: its own length, as HEAD would record it.
+        let segment_len = Some(built.segment.len() as u64);
         store.put(&key, built.segment).await?;
 
         let target = pstore_query::Target {
+            segment_len,
             // `None` when its own build made no table (M27): no read for a known 404.
             centroids: built
                 .centroids
@@ -5979,6 +5997,8 @@ fn segment_targets(
                     .map(|(key, _)| Key::new(key.clone())),
                 shadowed,
                 segment,
+                // M45: absent for a ref HEAD knows no length of: the open reads a suffix.
+                segment_len: r.len,
             }
         })
         .collect()

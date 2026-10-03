@@ -373,9 +373,10 @@ async fn a_plain_fold_reads_what_it_did_before_m13() {
     let f = fold(a).await;
     // Measured on the code before M13 (reads 13, bytes 859): a fold with no deferred
     // operation takes no base read. M32 adds 37 bytes to the one HEAD it reads -- the earlier
-    // optional sections' zero counts, and the dictionaries section -- and no read.
+    // optional sections' zero counts, and the dictionaries section -- and no read. M45 adds
+    // 18 more, its lengths section: a count, the name `docs`, a count, and one 2-byte varint.
     assert_eq!(f["cost"]["blob_reads"], 13, "{f}");
-    assert_eq!(f["cost"]["bytes_read"], 896, "{f}");
+    assert_eq!(f["cost"]["bytes_read"], 896 + 18, "{f}");
 }
 
 #[tokio::test]

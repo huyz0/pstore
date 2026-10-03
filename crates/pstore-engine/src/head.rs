@@ -20,6 +20,11 @@ pub struct SegmentRef {
     /// Which dictionaries it has (M32), or `None` when HEAD does not say: a HEAD from before
     /// M32, or a ref resurrected for `as_of`. Unknown asks, as every query did before.
     pub dicts: Option<Dicts>,
+    /// The segment object's length in bytes (M45), or `None` when HEAD does not say: a HEAD
+    /// from before M45 or rewritten by a node from before it, or a ref resurrected for
+    /// `as_of`. A known length opens by an absolute range; unknown, by the suffix read that
+    /// Azure has no form of (C-14).
+    pub len: Option<u64>,
 }
 
 /// Which dictionary sidecars a segment has (M32). Fixed when it is sealed, never changed.
@@ -471,7 +476,9 @@ impl Head {
         // ⚠️ M15.2: an earlier optional section is written, with a count of 0, whenever a later
         // one is -- otherwise the later count would be read as the earlier one's.
         // M32: the dictionaries are the last section, written whenever any ref's are known.
-        let dicts = self.indexes.values().flatten().any(|r| r.dicts.is_some());
+        // M45: the lengths follow the dictionaries, and force them, by the same rule.
+        let lens = self.indexes.values().flatten().any(|r| r.len.is_some());
+        let dicts = lens || self.indexes.values().flatten().any(|r| r.dicts.is_some());
         let more = !self.replications.is_empty() || !self.quarantine.is_empty() || dicts;
         if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() || more {
             out.extend_from_slice(&(fts.len() as u32).to_le_bytes());
@@ -536,6 +543,18 @@ impl Head {
                 out.extend(refs.iter().map(|r| Dicts::byte(r.dicts)));
             }
         }
+        // ⚠️ M45: a varint per segment, 0 for unknown -- three bytes for a megabyte segment,
+        // where a fixed `u64` would be eight on every HEAD every query reads.
+        if lens {
+            out.extend_from_slice(&(self.indexes.len() as u32).to_le_bytes());
+            for (name, refs) in &self.indexes {
+                put_str(&mut out, name);
+                out.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+                for r in refs {
+                    put_varint(&mut out, r.len.unwrap_or(0));
+                }
+            }
+        }
         out
     }
 
@@ -569,6 +588,7 @@ impl Head {
                     key: c.string()?,
                     rows: c.u32()?,
                     dicts: None,
+                    len: None,
                 });
             }
             h.indexes.insert(name, segs);
@@ -781,6 +801,22 @@ impl Head {
                 r.dicts = Dicts::of(c.u8()?)?;
             }
         }
+        // ⚠️ M45: end of buffer is "no length known", as above. A decoder from before M45
+        // returns before this section, ignoring it, and re-encodes without it.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let n = c.u32()? as usize;
+            let refs = h.indexes.get_mut(&name).ok_or(EngineError::CorruptHead)?;
+            if refs.len() != n {
+                return Err(EngineError::CorruptHead);
+            }
+            for r in refs.iter_mut() {
+                r.len = Some(c.varint()?).filter(|l| *l != 0);
+            }
+        }
         Ok(h)
     }
 
@@ -851,6 +887,7 @@ impl Head {
                             key: segment.to_owned(),
                             rows: 0,
                             dicts: None,
+                            len: None,
                         });
                     }
                     continue;
@@ -867,6 +904,7 @@ impl Head {
                         key: key.clone(),
                         rows: 0,
                         dicts: None,
+                        len: None,
                     });
                 }
             }
@@ -926,6 +964,16 @@ impl Head {
     }
 }
 
+/// Unsigned LEB128 (M45): seven bits a byte, low first, the top bit set on every byte but
+/// the last.
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v & 0x7F) as u8 + 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
@@ -966,6 +1014,27 @@ impl Cur<'_> {
                 .try_into()
                 .map_err(|_| EngineError::CorruptHead)?,
         ))
+    }
+    /// [`put_varint`]'s inverse, refusing anything it would not have written: past 10 bytes,
+    /// past `u64`, or longer than the shortest form, so a decode re-encodes byte for byte.
+    fn varint(&mut self) -> Result<u64, EngineError> {
+        let mut v = 0u64;
+        for i in 0..10 {
+            let b = self.u8()?;
+            // The tenth byte holds bit 63 alone.
+            if i == 9 && b > 1 {
+                return Err(EngineError::CorruptHead);
+            }
+            v += u64::from(b & 0x7F) << (7 * i);
+            if b < 0x80 {
+                // A last byte of 0 after another is a longer form of a shorter number.
+                if i > 0 && b == 0 {
+                    return Err(EngineError::CorruptHead);
+                }
+                return Ok(v);
+            }
+        }
+        Err(EngineError::CorruptHead)
     }
     fn string(&mut self) -> Result<String, EngineError> {
         let n = self.u32()? as usize;
@@ -1110,11 +1179,13 @@ mod tests {
                         sparse: false,
                         text: true,
                     }),
+                    len: None,
                 },
                 SegmentRef {
                     key: "k/2.seg".to_owned(),
                     rows: 5,
                     dicts: None,
+                    len: None,
                 },
             ],
         );
@@ -1176,6 +1247,112 @@ mod tests {
         let old = Head::decode(body)?;
         assert!(old.indexes.values().flatten().all(|r| r.dicts.is_none()));
         Ok(())
+    }
+
+    /// M45: [`with_dicts`]' index with lengths `lens`, in its segments' order.
+    fn with_lens(lens: [Option<u64>; 2]) -> Head {
+        let mut h = with_dicts();
+        for (r, l) in h.indexes.values_mut().flatten().zip(lens) {
+            r.len = l;
+        }
+        h
+    }
+
+    #[test]
+    fn the_lengths_section_round_trips_and_refuses_malformed_input() -> Result<(), EngineError> {
+        for l in [1, 127, 128, 1 << 32, u64::MAX] {
+            let h = with_lens([Some(l), None]);
+            assert_eq!(Head::decode(&h.encode())?, h, "{l}");
+        }
+        // With no dictionaries known, the lengths still force that section (code review): a
+        // section skipped there would be read as the dictionaries.
+        let mut bare = with_lens([Some(9), None]);
+        for r in bare.indexes.values_mut().flatten() {
+            r.dicts = None;
+        }
+        assert_eq!(Head::decode(&bare.encode())?, bare);
+        // Beside every other optional section too.
+        let mut all = sample();
+        all.indexes = with_lens([Some(5), Some(300)]).indexes;
+        all.quarantine
+            .insert("q".to_owned(), vec![("k/1.q".to_owned(), 1)]);
+        assert_eq!(Head::decode(&all.encode())?, all);
+
+        // None known: byte for byte what the encoder before M45 wrote (the dicts test pins it).
+        let none = with_lens([None, None]);
+        assert_eq!(none.encode(), with_dicts().encode());
+
+        // The section is the last 4 + (4 + 1) + 4 + 2 bytes for two one-byte lengths.
+        let h = with_lens([Some(9), Some(10)]);
+        let good = h.encode();
+        let body = good
+            .get(..good.len() - 15)
+            .ok_or(EngineError::CorruptHead)?;
+        let section = |name: &str, n: u32, lens: &[u8]| {
+            let mut b = body.to_vec();
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&n.to_le_bytes());
+            b.extend_from_slice(lens);
+            b
+        };
+        assert_eq!(Head::decode(&section("a", 2, &[9, 10]))?, h);
+        // 0 is unknown; the largest length takes ten bytes, the last of them 1.
+        let max = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let mut both = max.to_vec();
+        both.push(0);
+        assert_eq!(
+            Head::decode(&section("a", 2, &both))?,
+            with_lens([Some(u64::MAX), None])
+        );
+        let mut over = max[..9].to_vec();
+        over.extend_from_slice(&[2, 0]);
+        let mut eleven = max[..9].to_vec();
+        eleven.extend_from_slice(&[0x81, 0x01, 0]);
+        for (why, bad) in [
+            ("a truncated varint", section("a", 2, &[9, 0x80])),
+            ("an 11-byte varint", section("a", 2, &eleven)),
+            ("a varint past u64", section("a", 2, &over)),
+            (
+                "a varint longer than its shortest form",
+                section("a", 2, &[9, 0x80, 0x00]),
+            ),
+            ("a count that disagrees", section("a", 1, &[9])),
+            ("an index HEAD does not name", section("b", 2, &[9, 10])),
+        ] {
+            assert!(
+                matches!(Head::decode(&bad), Err(EngineError::CorruptHead)),
+                "{why} was accepted"
+            );
+        }
+
+        // Truncated at the section, as a decoder from before M45 re-encodes it: unknown.
+        let old = Head::decode(body)?;
+        assert!(old.indexes.values().flatten().all(|r| r.len.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn lengths_cost_three_bytes_a_megabyte_segment() {
+        let refs = |len: Option<u64>| {
+            (0..100)
+                .map(|i| SegmentRef {
+                    key: format!("k/{i}.seg"),
+                    rows: 10,
+                    dicts: Some(Dicts::default()),
+                    len,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut known = Head::default();
+        known.indexes.insert("idx".to_owned(), refs(Some(1 << 20)));
+        let mut unknown = Head::default();
+        unknown.indexes.insert("idx".to_owned(), refs(None));
+        assert_eq!(
+            known.encode().len() - unknown.encode().len(),
+            4 + (4 + 3) + 4 + 3 * 100
+        );
     }
 
     #[test]

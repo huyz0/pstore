@@ -26,11 +26,13 @@ fn populated() -> Head {
                 key: "a/1.seg".to_owned(),
                 rows: 100,
                 dicts: None,
+                len: None,
             },
             SegmentRef {
                 key: "a/2.seg".to_owned(),
                 rows: 7,
                 dicts: None,
+                len: None,
             },
         ],
     );

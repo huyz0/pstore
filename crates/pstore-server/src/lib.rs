@@ -3173,11 +3173,13 @@ pub struct CacheConfig {
 
 /// Where a server keeps its data.
 ///
-/// ⚠️ **There is no `azure` and no `gcs`, and their absence is a decision.** Every segment
-/// open is a suffix read (`Segment::open`), and C-14 records suffix ranges as absent on Azure
-/// three ways — the client refuses them before building a request, Azurite answers `bytes=-1`
-/// with a 500, and the REST API has no suffix form. A server pointed at Azure would start and
-/// then fail every query. `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which
+/// ⚠️ **There is no `azure` and no `gcs`, and their absence is a decision.** A segment open
+/// whose length HEAD does not record is a suffix read (`Segment::open_at` with `None`), and
+/// C-14 records suffix ranges as absent on Azure three ways — the client refuses them before
+/// building a request, Azurite answers `bytes=-1` with a 500, and the REST API has no suffix
+/// form. Since M45 HEAD records every length it seals, but a HEAD from before M45, one an
+/// older node rewrote, and every `as_of` read still open by suffix: a server pointed at Azure
+/// would start and then fail those. `fake-gcs-server` accepts `ifGenerationMatch` and ignores it, which
 /// is the worst shape a precondition can have. Neither is offered, so neither can be reached
 /// by an operator who has not read this comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

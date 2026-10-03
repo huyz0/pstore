@@ -28,14 +28,40 @@ impl Segment {
     /// segment is small, its whole index section; only a segment whose index section did
     /// not fit needs the second.
     pub async fn open<S: BlobStore>(store: &S, key: &Key) -> Result<Self, FormatError> {
+        Self::open_at(store, key, None).await
+    }
+
+    /// [`Self::open`], knowing the object's length when HEAD recorded it (M45).
+    ///
+    /// With a length, the first read is the same bytes by **absolute** offsets: a backend
+    /// with no suffix range (Azure, C-14) can serve it, and the request count is unchanged.
+    /// ⚠️ A length the footer disagrees with is refused, never read past.
+    pub async fn open_at<S: BlobStore>(
+        store: &S,
+        key: &Key,
+        len: Option<u64>,
+    ) -> Result<Self, FormatError> {
         // One suffix read. No `head` first: it is billed as a read, so requiring one
         // would double every cold open -- found by the request counter, not by inspection.
         // ⚠️ `Meta`, not the default `Bulk`. This suffix IS the index section for most
         // segments, it is read by every query on that segment, and it is <0.1% of the bytes
         // — D-21 exists so a burst of scan traffic cannot evict it.
-        let tail = store
-            .get_suffix_as(key, SUFFIX_FETCH, pstore_blob::Class::Meta)
-            .await?;
+        let tail = match len {
+            Some(len) => {
+                store
+                    .get_range_as(
+                        key,
+                        len.saturating_sub(SUFFIX_FETCH)..len,
+                        pstore_blob::Class::Meta,
+                    )
+                    .await?
+            }
+            None => {
+                store
+                    .get_suffix_as(key, SUFFIX_FETCH, pstore_blob::Class::Meta)
+                    .await?
+            }
+        };
 
         let foot_at = tail
             .len()
@@ -63,6 +89,9 @@ impl Segment {
         // Where in the object the bytes we hold begin. Derived from the footer's own
         // offsets rather than from a separately-fetched length.
         let seg_len = meta_offset + u64::from(meta_len) + FOOTER_LEN as u64;
+        if len.is_some_and(|len| len != seg_len) {
+            return Err(FormatError::Corrupt("recorded length disagrees"));
+        }
         let tail_start = seg_len.saturating_sub(tail.len() as u64);
         let idx_bytes = {
             if meta_offset >= tail_start {
@@ -1110,5 +1139,58 @@ mod tests {
         // Version 1 reads no tail, as before M9h.1.
         let untyped = Segment::decode_index(&index(0, &[]), VERSION).unwrap();
         assert!(!untyped[0].zones.complete);
+    }
+
+    /// M45: a segment of `n` rows, each carrying 200 bytes of attribute.
+    fn segment(n: usize) -> Bytes {
+        let mut w = crate::SegmentWriter::new(4);
+        for i in 0..n {
+            let mut d = crate::Document::new(format!("d{i}"), vec![i as f32]);
+            d.attrs
+                .insert("pad".to_owned(), crate::Value::Str("x".repeat(200)));
+            w.push(d);
+        }
+        w.finish()
+    }
+
+    #[tokio::test]
+    async fn a_recorded_length_is_checked_against_the_footer() {
+        use pstore_blob::{BlobStore, MemoryStore};
+        use pstore_testkit::broken::{Broken, Defect};
+        let key = Key::new("x");
+        let big = segment(100);
+        let len = big.len() as u64;
+        assert!(len > SUFFIX_FETCH, "{len}");
+
+        let store = MemoryStore::new();
+        store.put(&key, big.clone()).await.unwrap();
+        let seg = Segment::open_at(&store, &key, Some(len)).await.unwrap();
+        assert_eq!(seg.row_count(), 100);
+        assert!(matches!(
+            Segment::open_at(&store, &key, Some(len - 1)).await,
+            Err(FormatError::Corrupt(_))
+        ));
+        assert!(matches!(
+            Segment::open_at(&store, &key, Some(len + 1)).await,
+            Err(FormatError::Blob(_))
+        ));
+
+        // A store that answers past the end with a short body, as S3 does: only the length
+        // check stands between this and a segment opened at a length it does not have.
+        let short = Broken::new(Defect::ShortReadsPastTheEnd);
+        short.put(&key, big).await.unwrap();
+        assert_eq!(
+            Segment::open_at(&short, &key, Some(len + 1)).await.err(),
+            Some(FormatError::Corrupt("recorded length disagrees"))
+        );
+
+        // Shorter than the suffix fetch: read from offset 0.
+        let small = segment(2);
+        assert!((small.len() as u64) < SUFFIX_FETCH);
+        store.put(&key, small.clone()).await.unwrap();
+        let seg = Segment::open_at(&store, &key, Some(small.len() as u64))
+            .await
+            .unwrap();
+        assert_eq!(seg.row_count(), 2);
     }
 }

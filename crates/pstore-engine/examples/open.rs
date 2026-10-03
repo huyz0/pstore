@@ -171,6 +171,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                                 key: format!("t/{i:08}/seg/{j:08}"),
                                 rows: 64,
                                 dicts: None,
+                                len: None,
                             }],
                         )
                     })

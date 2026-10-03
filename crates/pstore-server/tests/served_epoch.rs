@@ -105,11 +105,12 @@ async fn a_read_only_process_reports_the_epoch_it_served() {
     // already read, so reporting it costs nothing. M27 removed one read from each vector
     // query: the 404 for the small segment's centroid table, which HEAD's count says is absent.
     // M32 adds 37 bytes to the HEAD each reads (the optional sections' zero counts and the
-    // dictionaries section), and no read.
+    // dictionaries section), and no read. M45 adds 18 more, its lengths section: a count, the
+    // name `docs`, a count, and the one segment's 2-byte length.
     let reads: Vec<_> = costs.iter().map(|c| c["blob_reads"].clone()).collect();
     let bytes: Vec<_> = costs.iter().map(|c| c["bytes_read"].clone()).collect();
     assert_eq!(json!(reads), json!([4, 3, 6]));
-    assert_eq!(json!(bytes), json!([582, 574, 590]));
+    assert_eq!(json!(bytes), json!([582 + 18, 574 + 18, 590 + 18]));
     assert!(costs.iter().all(|c| c["blob_lists"] == 0));
     for q in [relevance(), ordered(), strong] {
         assert_eq!(query(&b, &q).await["meta"]["epoch"], e, "{q}");

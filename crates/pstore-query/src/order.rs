@@ -235,7 +235,7 @@ where
 {
     let opened = futures_util::future::try_join_all(targets.iter().map(|t| async move {
         let (segment, deleted) =
-            futures_util::future::join(Segment::open(store, &t.segment), async {
+            futures_util::future::join(Segment::open_at(store, &t.segment, t.segment_len), async {
                 match &t.deleted {
                     // As the ranked query reads it: an unreadable vector is an error, never
                     // an answer that includes the rows it deletes.
