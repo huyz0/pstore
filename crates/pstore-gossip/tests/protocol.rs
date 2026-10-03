@@ -41,6 +41,11 @@ struct Sim {
     in_flight: Vec<(String, String, Message)>,
     /// `Sync` datagrams delivered (M24): a converged fleet sends none.
     syncs: u64,
+    /// Hops delivered within one period (M33): 1 delivers a reply the period after its
+    /// request, the pessimistic model every other test uses; 4 lets an indirect probe's four
+    /// hops land inside one, as on a real network, where a node handles each datagram as it
+    /// arrives and only probes once a period.
+    waves: u64,
 }
 
 impl Sim {
@@ -65,6 +70,7 @@ impl Sim {
             sent: 0,
             in_flight: Vec::new(),
             syncs: 0,
+            waves: 1,
         }
     }
 
@@ -109,28 +115,43 @@ impl Sim {
     /// protocol that, on a real fleet under 10% loss, flapped indefinitely. A simulation more
     /// generous than the network is worse than none: it certifies the bug.
     fn round(&mut self, seed: u64) {
-        // Deliver what was sent last period, collecting whatever it provokes.
+        // Deliver what was sent last period, collecting whatever it provokes -- and, with more
+        // than one wave, deliver what THAT provokes too, up to `waves` hops (M33).
         let mut produced: Vec<(String, String, Message)> = Vec::new();
-        for (from, to, msg) in std::mem::take(&mut self.in_flight) {
-            self.sent += 1;
-            if matches!(msg, Message::Sync { .. }) {
-                self.syncs += 1;
+        for wave in 0..self.waves {
+            let arriving = std::mem::take(&mut self.in_flight);
+            if wave > 0 && arriving.is_empty() {
+                break;
             }
-            self.bytes += msg.encode().len() as u64;
-            if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
-                continue;
+            let mut replies: Vec<(String, String, Message)> = Vec::new();
+            for (from, to, msg) in arriving {
+                self.sent += 1;
+                if matches!(msg, Message::Sync { .. }) {
+                    self.syncs += 1;
+                }
+                self.bytes += msg.encode().len() as u64;
+                if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
+                    continue;
+                }
+                if let Some(&i) = self.by_addr.get(&to)
+                    && let Some(n) = self.nodes.get_mut(i)
+                {
+                    let here = to.clone();
+                    replies.extend(
+                        n.receive(&from, &msg)
+                            .into_iter()
+                            .map(|(t, m)| (here.clone(), t, m)),
+                    );
+                }
             }
-            if let Some(&i) = self.by_addr.get(&to)
-                && let Some(n) = self.nodes.get_mut(i)
-            {
-                let here = to.clone();
-                produced.extend(
-                    n.receive(&from, &msg)
-                        .into_iter()
-                        .map(|(t, m)| (here.clone(), t, m)),
-                );
+            if wave + 1 < self.waves {
+                self.in_flight = replies;
+            } else {
+                produced = replies;
             }
         }
+        // The last wave's replies, or those an early-ended period left, go next period.
+        produced.append(&mut self.in_flight);
         // Then let every node take its period.
         for (i, n) in self.nodes.iter_mut().enumerate() {
             let from = addr(i as u16);
@@ -624,5 +645,105 @@ fn a_fleet_over_three_zones_converges_with_and_without_loss() {
     assert!(
         rounds_until(&mut lossy, 100, |s| s.zones_known(&zones)).is_some(),
         "a fleet at 10% loss did not learn every zone in 100 rounds"
+    );
+}
+
+/// Removes the first `Ping` `from` has in flight, and names its target. ⚠️ Assumed to be its
+/// direct probe: true in a loss-free, seeded fleet, where nothing is suspected and no evidence
+/// or relayed ping exists yet (code review, M33).
+fn lose_a_ping(sim: &mut Sim, from: &str) -> Option<String> {
+    let at = sim
+        .in_flight
+        .iter()
+        .position(|(f, _, m)| f == from && matches!(m, Message::Ping { .. }))?;
+    Some(sim.in_flight.remove(at).1)
+}
+
+/// Whether node 0, after losing one direct ping, ever suspects its target.
+fn suspects_after_one_lost_ping(waves: u64) -> bool {
+    let mut sim = Sim::new(3, true);
+    sim.waves = waves;
+    let me = addr(0);
+    let mut r = 0;
+    let target = loop {
+        sim.round(r);
+        r += 1;
+        if let Some(t) = lose_a_ping(&mut sim, &me) {
+            break t;
+        }
+        assert!(r < 20, "node 0 never probed");
+    };
+    let i = sim.by_addr[&target];
+    let id = *sim.nodes[i].cluster().me();
+    (r..r + 12).any(|r| {
+        sim.round(r);
+        sim.nodes[0].cluster().state(&id) != Some(State::Alive)
+    })
+}
+
+#[test]
+fn a_real_network_completes_an_indirect_round() {
+    // Every other test runs on the pessimistic model: a simulation more generous than the
+    // network certifies the bug.
+    assert_eq!(
+        Sim::new(3, true).waves,
+        1,
+        "the default model is no longer one hop a period"
+    );
+    // M33: a real node handles each datagram as it arrives and probes once a period, so the
+    // indirect round's four hops land inside one. The lockstep model delivers one hop per
+    // period, and there the round can never finish within `PROBE_TIMEOUT`.
+    assert!(
+        !suspects_after_one_lost_ping(4),
+        "one lost ping was a suspicion with the indirect round completing in time"
+    );
+    assert!(
+        suspects_after_one_lost_ping(1),
+        "the one-hop-per-period model no longer turns a lost ping into a suspicion: \\
+         the protocol or the model changed"
+    );
+}
+
+/// Bytes per node per round, and rounds whose checksums all agree, over 400 rounds at
+/// `drop_every` after 50 loss-free ones.
+fn cost(n: u16, drop_every: u64, waves: u64) -> (u64, u32) {
+    let mut sim = Sim::new(n, true);
+    sim.waves = waves;
+    for r in 0..50 {
+        sim.round(r);
+    }
+    let before = sim.bytes;
+    sim.drop_every = drop_every;
+    let mut agree = 0;
+    for r in 50..450 {
+        sim.round(r);
+        if sim.checksums_agree() {
+            agree += 1;
+        }
+    }
+    ((sim.bytes - before) / 400 / u64::from(n), agree)
+}
+
+#[test]
+fn gossip_cost_under_loss_on_both_models() {
+    // BACKLOG row 50's measurement (M33), pinned. Every value is deterministic: the drops are
+    // every Nth datagram and the fleet is ordered.
+    let (bytes, agree) = cost(20, 50, 4);
+    assert!(
+        agree >= 350 && bytes <= 200,
+        "20 members at 2% loss, real hops: {agree}/400 agreeing at {bytes} B/node/round"
+    );
+    // ⚠️ TRIPWIRES, not floors (BACKLOG row 52): they pin the open problem, and M34's fix is
+    // expected to trip them. Lowering them then is the fix landing, not a threshold weakened.
+    let (bytes, _) = cost(50, 10, 4);
+    // Measured at 7,961 (M33), so a fix that saves an eighth trips it.
+    assert!(
+        bytes >= 7_000,
+        "50 members at 10% loss cost {bytes} B/node/round: the Sync storm moved -- update row 52"
+    );
+    let (_, agree) = cost(20, 50, 1);
+    assert!(
+        agree <= 10,
+        "the one-hop model agreed in {agree}/400 rounds: the protocol or the model changed"
     );
 }
