@@ -166,7 +166,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 34 | ⚠️ **`pstore-node/src/main.rs` makes decisions no gate can see.** It decides when to heal (`ticks % heal_every == jitter(...)`), whether to republish (`size != last_size`) and the ownership cadence. Coverage has excluded binary entry points since M5, and since M8d mutation does too, so the nightly's 39 misses there stopped being a signal rather than being fixed. The crate's own rule is "`main.rs` wires, `lib.rs` decides": move each of those decisions into the library, where both gates measure it, until what is left in `main` is wiring. | [M8d](M8d/SPEC.md) | M |
+| ~~34~~ | **CLOSED by [M31](M31/VERIFIED.md)**: the loop's cadences, its order, its filters and its settings are `pstore_node::schedule` and `policy`, measured by both gates. `main.rs` holds no `%`, comparison or filter outside comments. Moving them found a bug: the heal cadence counted polls against a count of views, so at a 200 ms poll a node healed every 50 s rather than every 10 s. | [M8d](M8d/SPEC.md) | M |
 
 ## Opened by M7e
 

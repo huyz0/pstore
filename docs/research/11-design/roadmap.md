@@ -524,6 +524,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M28 | **The read cache's three loose ends** ([VERIFIED](../../milestones/M28/VERIFIED.md)): a scan claims no gate and only a claimant removes one, recency is O(log entries), and the disk hash is defined by the entry format | [BACKLOG](../../milestones/BACKLOG.md) rows 45, 47 and 48, from M20's reviews |
 | M29 | **A committing compaction buries everything it abandoned** ([VERIFIED](../../milestones/M29/VERIFIED.md)): its commit buries its whole record, as the fold's does | [BACKLOG](../../milestones/BACKLOG.md) rows 49 and 43, from M23's and M19's reviews |
 | M30 | **The schema's text field decides where text is indexed** ([VERIFIED](../../milestones/M30/VERIFIED.md)): filled by the first fold with text, and used by every seal; a vector-only segment no longer refuses a text query | [BACKLOG](../../milestones/BACKLOG.md) row 29, and two failures measured while planning it |
+| M31 | **`pstore-node`'s `main` wires, its library decides** ([VERIFIED](../../milestones/M31/VERIFIED.md)): the loop's decisions under both gates, and the heal cadence back to `HEAL_PERIOD` at sub-second polls | [BACKLOG](../../milestones/BACKLOG.md) row 34 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
