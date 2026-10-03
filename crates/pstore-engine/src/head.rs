@@ -34,7 +34,10 @@ pub struct Dicts {
 impl Dicts {
     /// HEAD's byte for a ref: bit 0 sparse, bit 1 text, `0xFF` unknown.
     fn byte(d: Option<Self>) -> u8 {
-        d.map_or(0xFF, |d| u8::from(d.sparse) | (u8::from(d.text) << 1))
+        // A sum, not `|`: the bits are disjoint, so `|` and `^` agree and a sweep cannot tell
+        // them apart (M32's sweep found it); every mutation of this one changes a byte or
+        // panics.
+        d.map_or(0xFF, |d| u8::from(d.sparse) + 2 * u8::from(d.text))
     }
 
     fn of(b: u8) -> Result<Option<Self>, EngineError> {
