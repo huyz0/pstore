@@ -529,6 +529,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M33 | **Gossip's cost under loss, measured on a model of the real network** ([VERIFIED](../../milestones/M33/VERIFIED.md)): the `Sim` models real hops; the `Sync` storm is pinned and handed to M34 | [BACKLOG](../../milestones/BACKLOG.md) row 50 |
 | M34 | **Reconcile only the buckets that differ** ([VERIFIED](../../milestones/M34/VERIFIED.md)): past 32 members a mismatch sends a 145-byte `Digest`, and only the differing buckets come back | [BACKLOG](../../milestones/BACKLOG.md) row 52 |
 | M35 | **A wrong row is refused at the door, and never blocks a lane** ([VERIFIED](../../milestones/M35/VERIFIED.md)): a first write reads HEAD once; a flush refuses a conflict once, then the fold quarantines it | [BACKLOG](../../milestones/BACKLOG.md) row 27 |
+| M36 | **A row carries its writer's text field, and every fold judges it by that** ([VERIFIED](../../milestones/M36/VERIFIED.md)): `$text` stamped at the door; a text-field conflict or a sibling race is quarantined by any fold | [BACKLOG](../../milestones/BACKLOG.md) row 54 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.

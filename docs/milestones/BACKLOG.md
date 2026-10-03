@@ -123,11 +123,18 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by M36
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 55 | **A rolling upgrade leaks `$text` into segments.** An engine older than [M36](M36/SPEC.md) neither reads nor strips the stamp, so while one folds, every texted row an M36 engine wrote is sealed with `$text` as a visible attribute, and a client re-writing such a document as read is refused (`$` names are reserved). A compaction carries it on. A fleet should upgrade every folder before any writer stamps; the fix is a two-phase knob (read and strip first, stamp second), or stripping `$` names from segment rows on read and at compaction. | [M36](M36/SPEC.md) | S |
+| 56 | **Reserved names at the edges of M36** (code review, minor). An unstamped row (an older build's) is still judged by the folding engine's text field, so whether a row with text under another attribute has text depends on which engine folds it; a scan's filter is applied before reserved names are stripped, so a filter on `$text` or `$metric` matches unfolded rows only; and a text field can be recorded from a row that is never sealed (deleted or a failed condition in the same fold), consistently with the field the fold judged by. | [M36](M36/VERIFIED.md) | S |
+
 ## Opened by M35
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 54 | **A text-field conflict accepted before the schema was known still blocks its whole lane until a restart.** [M35](M35/VERIFIED.md) waives every conflict the fold quarantines, but a row does not record its writer's text field, so a fold run by another engine cannot see this one: waived, the row went into the index with its text unindexed. So it is refused at every flush of that engine, on every index, as before M35. Reachable only in the race M35 names (the first write read HEAD before any text field was recorded). The fix wants the text field on the row, or the bundle, so any fold can quarantine it. Also recorded: after a drop and re-create, a stale cached schema can admit a row the fold then quarantines (code review, minor). | [M35](M35/SPEC.md) | S |
+| ~~54~~ | **CLOSED by [M36](M36/VERIFIED.md)**, wider than this row: every row that carries text is stamped at the door with its writer's text field (`$text`, stripped before any seal), and every fold judges it by that. A text-field conflict is quarantined by whichever engine folds it, so M35's waiver covers it; and the sibling race spec review measured (two cold writers over different fields, one row sealed unindexed with no count) is caught. Residue: rows 55 and 56. | [M35](M35/SPEC.md) | S |
 
 ## Opened by M34
 
