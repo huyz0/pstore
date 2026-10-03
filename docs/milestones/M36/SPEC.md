@@ -36,13 +36,19 @@ hole spec review measured while reviewing this milestone's first draft.
 2. **One reader, `text_of(row)`, gives the field a row's text is under:**
    - `$text`, when the row carries non-empty text under that name (spec review round 2,
      minor 2: `merged` keeps a stamp after a patch unsets the text);
+     - ⚠️ **Corrected in implementation: the guard is unreachable**, so it is not written.
+       The reject pass judges every row before resolution, and the field it judged against
+       is what is recorded. So the one reader of resolved rows, the fill, runs only when no
+       stamped row conformed, and then no resolved row carries a stamp. A guard there would
+       be a mutant no test can kill.
    - else this engine's field, when the row carries text under it. That covers a row from an
      older build, or one buffered by the test hook that skips the door;
    - else none.
    - Every check that judged by the folding engine's field reads this instead:
      - `row_conflict`, so the flush and the reject pass;
-     - `implied`, for a new index;
-     - the reject pass's schema, for an index whose text field is empty;
+     - the reject pass's schema, for a new index or one whose text field is empty. ⚠️
+       Found in implementation: `implied` then records no field of its own, since the pass
+       fills every created schema;
      - the fill itself (M30), and the sealing loop, which records the field the pass judged
        against rather than recomputing it.
    - ⚠️ **The field an empty schema takes is the first `text_of` of a row that passes every
@@ -98,6 +104,7 @@ In `crates/pstore-engine/tests/schema.rs`.
 |---|---|---|
 | 1 | `a_waiver_never_covers_a_text_field` → **renamed and inverted** `any_fold_quarantines_a_text_field_conflict` | the second flush refused; `row_conflict` not reading the stamp |
 | 2 | `two_writers_text_fields_never_share_an_index` | both rows held; the reject pass's empty field not filled from the rows |
+| 2c | `the_field_a_fold_judged_by_is_the_field_it_records` (added in implementation) | the judged field not recorded when the row that chose it is deleted in the fold, over an existing index and a new one |
 | 3 | `a_foreign_fold_indexes_the_writers_field` | the field empty; `implied` not reading the stamp |
 | 2b | `a_wrong_row_never_chooses_the_text_field` | the first `text_of` taken from a row rejected for its width |
 | 4 | `the_text_stamp_is_never_served` | ⚠️ a scan carries nothing on the parent, so this test is green there by design. It guards `$text` left out of `stripped`, and a stamp on a vector-only row |

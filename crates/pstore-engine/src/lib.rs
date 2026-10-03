@@ -1010,22 +1010,6 @@ fn describe(f: &FullText) -> String {
     )
 }
 
-/// Whether a fold sets a row with this conflict aside in its quarantine (M25), whichever
-/// engine runs it, so a flush may waive it (M35).
-///
-/// ⚠️ **Not a text-field conflict**: it is decided against the folding engine's own text
-/// field, which a row does not carry, so a fold run by a correctly configured engine sees
-/// none and indexes the row with its text unindexed.
-fn quarantinable(e: &EngineError) -> bool {
-    !matches!(
-        e,
-        EngineError::SchemaConflict {
-            what: "the text field",
-            ..
-        }
-    )
-}
-
 /// An analyzer conflict, from what the index has and what a row declares.
 fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError {
     EngineError::SchemaConflict {
@@ -1040,8 +1024,23 @@ fn fts_conflict(index: &str, expected: &FullText, got: &FullText) -> EngineError
     }
 }
 
-/// The row as it is sealed and served: without its metric or its declared analyzer.
+/// Whether `doc` carries a non-empty string under `field`.
+fn has_text(doc: &Document, field: &str) -> bool {
+    matches!(
+        doc.attrs.get(field),
+        Some(pstore_format::Value::Str(s)) if !s.is_empty()
+    )
+}
+
+/// The reserved attribute a row carries its writer's text field in (M36), stamped at the
+/// door on every row that carries text under it, so every engine's fold judges the row by the
+/// field it was written for rather than by its own. Stripped before anything is sealed.
+const TEXT_ATTR: &str = "$text";
+
+/// The row as it is sealed and served: without its metric, its declared analyzer, or its
+/// writer's text field.
 fn stripped(mut d: Document) -> Document {
+    d.attrs.remove(TEXT_ATTR);
     d.attrs.remove(METRIC_ATTR);
     d.attrs.remove(FTS_ATTR);
     d.attrs.remove(TRGM_ATTR);
@@ -1674,16 +1673,14 @@ impl<S: BlobStore> Engine<S> {
     ///
     /// ⚠️ The metric too (M9d), from the same first row: the schema a fold creates is recorded
     /// BEFORE its reject pass, so the other rows are checked against it.
+    ///
+    /// ⚠️ **With no text field** (M36): the reject pass fills it from the rows, with
+    /// [`Self::filled`], and the fold records the field it judged against.
     fn implied(&self, docs: &[Document]) -> head::IndexSchema {
         let first = docs.iter().find(|d| !is_rowless(d));
-        let has_text = docs.iter().any(|d| !is_rowless(d) && self.carries_text(d));
         head::IndexSchema {
             dims: first.map_or(0, |d| d.vector().len() as u32),
-            text_field: if has_text {
-                self.text_field.clone()
-            } else {
-                String::new()
-            },
+            text_field: String::new(),
             metric: first.map(metric_of).unwrap_or_default(),
             // M14: the first declaration in the fold, else the default. Only here does an
             // undeclared row mean the default.
@@ -1700,6 +1697,29 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
+    /// `schema`, with an empty text field filled as this fold will fill it (M30, M36): the
+    /// field of the first row with text that passes every other check.
+    ///
+    /// ⚠️ **Every other check first** (spec review, M36): a wrong-width row first in the fold
+    /// choosing the field would quarantine every correct row with it, where the blast radius
+    /// of a contradiction is the contradicting row.
+    fn filled(
+        &self,
+        index: &str,
+        mut schema: head::IndexSchema,
+        docs: &[Document],
+    ) -> head::IndexSchema {
+        if schema.text_field.is_empty()
+            && let Some(f) = docs
+                .iter()
+                .filter(|d| !is_rowless(d) && self.row_conflict(index, &schema, d).is_none())
+                .find_map(|d| self.text_of(d))
+        {
+            schema.text_field = f.to_owned();
+        }
+        schema
+    }
+
     /// Whether this row has text in the attribute this process indexes.
     /// The attribute an index's text is indexed over (M30): the one its schema records, else
     /// this process's. ⚠️ Never this process's when the schema records one: a process
@@ -1712,10 +1732,21 @@ impl<S: BlobStore> Engine<S> {
     }
 
     fn carries_text(&self, doc: &Document) -> bool {
-        matches!(
-            doc.attrs.get(self.text_field.as_str()),
-            Some(pstore_format::Value::Str(s)) if !s.is_empty()
-        )
+        has_text(doc, &self.text_field)
+    }
+
+    /// The field a row's text is under (M36): its writer's stamp, else this engine's field
+    /// when it carries text under that -- a row from an older build, or one buffered past the
+    /// door by a test. `None` when it carries none.
+    ///
+    /// ⚠️ The door stamps only a row with text. A stamped row whose text a patch unset (spec
+    /// review, M36) reaches no reader: the reject pass judges every row before resolution,
+    /// so the one reader of resolved rows, the fill, runs only when no stamped row conformed.
+    fn text_of<'a>(&'a self, doc: &'a Document) -> Option<&'a str> {
+        match doc.attrs.get(TEXT_ATTR) {
+            Some(pstore_format::Value::Str(f)) => Some(f),
+            _ => self.carries_text(doc).then_some(self.text_field.as_str()),
+        }
     }
 
     /// Why this row cannot join this index, if it cannot.
@@ -1768,14 +1799,14 @@ impl<S: BlobStore> Engine<S> {
             });
         }
         if !schema.text_field.is_empty()
-            && self.text_field != schema.text_field
-            && self.carries_text(doc)
+            && let Some(field) = self.text_of(doc)
+            && field != schema.text_field
         {
             return Some(EngineError::SchemaConflict {
                 index: index.to_owned(),
                 what: "the text field",
                 expected: schema.text_field.clone(),
-                got: self.text_field.clone(),
+                got: field.to_owned(),
             });
         }
         None
@@ -2228,6 +2259,13 @@ impl<S: BlobStore> Engine<S> {
                 d.attrs.insert(
                     METRIC_ATTR.to_owned(),
                     pstore_format::Value::Int(metric.code()),
+                );
+            }
+            // M36: the writer's text field, on a row whose text is under it.
+            if self.carries_text(d) {
+                d.attrs.insert(
+                    TEXT_ATTR.to_owned(),
+                    pstore_format::Value::Str(self.text_field.clone()),
                 );
             }
             if let Some(f) = &declared.fts {
@@ -2754,9 +2792,9 @@ impl<S: BlobStore> Engine<S> {
         // restart. Waived, they become durable and the fold quarantines them, counted and
         // exportable. Anything written after the refusal meets the schema at the door.
         //
-        // ⚠️ **Never a text-field conflict** (code review, M35): a row does not record its
-        // writer's text field, so a fold run by another engine cannot see it, and a waived row
-        // went into the index with its text unindexed. That one stays refused at every flush.
+        // ⚠️ **Every conflict, the text field's included** (M36): the row carries its writer's
+        // text field, so whichever engine folds it sees the conflict. M35 had to refuse that
+        // one at every flush, because a foreign fold sealed it with its text unindexed.
         let watermark = if lane.is_none() || (check && self.schemas_unseen()) {
             let at = head::read(&*self.store, self.tenant).await?;
             self.remember_schemas(&at.head);
@@ -2764,13 +2802,10 @@ impl<S: BlobStore> Engine<S> {
         } else {
             0
         };
-        if check {
-            let waived = self.waived.load(std::sync::atomic::Ordering::SeqCst);
+        if check && !self.waived.load(std::sync::atomic::Ordering::SeqCst) {
             let refusal = pending.iter().find_map(|(index, docs)| {
                 let schema = self.cached_schema(index)?;
-                docs.iter()
-                    .filter_map(|d| self.row_conflict(index, &schema, d))
-                    .find(|e| !waived || !quarantinable(e))
+                self.batch_conflict(index, &schema, docs)
             });
             if let Some(e) = refusal {
                 self.waived.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3475,10 +3510,14 @@ impl<S: BlobStore> Engine<S> {
                 .filter(|(idx, _)| !at.head.schemas.contains_key(*idx))
                 .map(|(idx, docs)| (idx.clone(), self.implied(docs)))
                 .collect();
+            // M36: the text field each index was judged against, which the seal records.
+            let mut judged: BTreeMap<String, String> = BTreeMap::new();
             for (idx, docs) in &mut by_index {
                 let Some(schema) = at.head.schemas.get(idx).or_else(|| created.get(idx)) else {
                     continue;
                 };
+                let schema = &self.filled(idx, schema.clone(), docs);
+                judged.insert(idx.clone(), schema.text_field.clone());
                 // ⚠️ **Per row, not per index.** Dropping the whole index's rows would
                 // discard every *correct* row any writer had flushed for it in this span —
                 // acknowledged by writers that passed both the door and the flush — and the
@@ -3580,6 +3619,15 @@ impl<S: BlobStore> Engine<S> {
             // One segment per index. Folding every index into one object would make each
             // index's ref point at the whole thing, and a scan would return its
             // neighbours' rows.
+            // ⚠️ **The text field each index was judged against is the one recorded** (M36),
+            // whether or not anything is left to seal: a row quarantined against `prose`
+            // and an index recording another field would let the next fold accept it.
+            // `filled` never changes a field already recorded.
+            for (idx, f) in &judged {
+                if let Some(s) = next.schemas.get_mut(idx) {
+                    s.text_field.clone_from(f);
+                }
+            }
             for (idx, docs) in &by_index {
                 // ⚠️ **The only place a schema is created**, and it records what the rows
                 // ARE rather than what this process is configured with: an index of pure
@@ -3596,6 +3644,10 @@ impl<S: BlobStore> Engine<S> {
                         schema.fts = c.fts;
                         schema.trigram.clone_from(&c.trigram);
                     }
+                    // M36: and the text field it was judged against, as above.
+                    if let Some(f) = judged.get(idx) {
+                        schema.text_field.clone_from(f);
+                    }
                     next.schemas.insert(idx.clone(), schema);
                 }
                 // Without `$metric` (M9d): the schema holds it now, and a segment never does.
@@ -3605,11 +3657,15 @@ impl<S: BlobStore> Engine<S> {
                 // processes configured with different fields could each fold text in, and every
                 // compaction of the index would then be refused. Judged on the rows sealed --
                 // `seal`'s own predicate -- so a patch that adds text fills it too.
+                //
+                // ⚠️ **By the rows' own field** (M36), never this engine's, which a row written
+                // under another field does not carry its text under. The reject pass already
+                // filled it from every row with text, so only a patch reaches here.
                 if let Some(s) = next.schemas.get_mut(idx)
                     && s.text_field.is_empty()
-                    && sealed.iter().any(|d| self.carries_text(d))
+                    && let Some(f) = docs.iter().find_map(|d| self.text_of(d))
                 {
-                    s.text_field.clone_from(&self.text_field);
+                    s.text_field = f.to_owned();
                 }
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();

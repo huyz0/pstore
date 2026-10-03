@@ -1011,40 +1011,6 @@ async fn a_failed_first_read_refuses_no_write() {
 }
 
 #[tokio::test]
-async fn a_waiver_never_covers_a_text_field() {
-    // ⚠️ Code review, M35: a row does not record its writer's text field, so a fold run by
-    // another engine cannot quarantine it, and a waived row went into the index with its text
-    // unindexed. That one conflict is refused at every flush, as it was before M35.
-    let store = Arc::new(MemoryStore::new());
-    let wrong = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
-    wrong
-        .write("docs", vec![texted("p", "prose", "revenue")])
-        .await
-        .unwrap();
-    let right = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
-    into(&right, "docs", vec![texted("a", "body", "revenue")]).await;
-
-    for attempt in ["first", "second"] {
-        let err = wrong
-            .flush()
-            .await
-            .expect_err("a contradicting text field was written");
-        assert!(
-            matches!(
-                err,
-                EngineError::SchemaConflict {
-                    what: "the text field",
-                    ..
-                }
-            ),
-            "{attempt}: {err:?}"
-        );
-    }
-    right.fold().await.unwrap();
-    assert_eq!(ids_in(&right, "docs").await, ["a"]);
-}
-
-#[tokio::test]
 async fn a_stale_row_of_another_metric_refuses_no_write() {
     // Code review, M35: the schema is authoritative at the door for every property, not the
     // width alone.
@@ -1068,4 +1034,257 @@ async fn a_stale_row_of_another_metric_refuses_no_write() {
     e.fold().await.unwrap();
     assert_eq!(ids_in(&e, "docs").await, ["a", "right"]);
     assert_eq!(quarantined(&e, "docs").await, ["e"]);
+}
+
+// ---- M36: a row carries its writer's text field, and every fold judges it by that ----
+
+/// The ids a text query over `field` names in `index`, as `e` sees them; empty when refused.
+async fn text_hits(
+    e: &Engine<impl BlobStore + 'static>,
+    index: &str,
+    field: &str,
+    q: &str,
+) -> Vec<String> {
+    let legs = vec![pstore_query::Prefetch::Text {
+        field: field.to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }];
+    match e
+        .query(index, &legs, pstore_query::Fusion::default(), 10)
+        .await
+    {
+        Ok(answer) => {
+            let mut ids: Vec<String> = e.resolve(&answer).into_iter().map(|(id, _)| id).collect();
+            ids.sort();
+            ids
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Each quarantined row of `index`: its id, and its `$text` stamp if it has one.
+async fn stamps(e: &Engine<impl BlobStore + 'static>, index: &str) -> Vec<(String, Option<Value>)> {
+    let mut rows: Vec<(String, Option<Value>)> = e
+        .quarantine(index)
+        .await
+        .unwrap()
+        .map(|q| {
+            q.rows
+                .into_iter()
+                .map(|r| (r.document.id, r.reserved.get("$text").cloned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+fn prose(s: &str) -> Option<Value> {
+    Some(Value::Str(s.to_owned()))
+}
+
+#[tokio::test]
+async fn any_fold_quarantines_a_text_field_conflict() {
+    // ⚠️ M35 code review measured a waived row sealed with its text unindexed by a foreign
+    // fold, and M35 kept the conflict out of its waiver: it then blocked the lane until a
+    // restart. Inverted by M36, which stamps the writer's field on the row.
+    let store = Arc::new(MemoryStore::new());
+    let wrong = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
+    wrong
+        .write("docs", vec![texted("p", "prose", "revenue")])
+        .await
+        .unwrap();
+    let right = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("body");
+    into(&right, "docs", vec![texted("a", "body", "revenue")]).await;
+
+    let err = wrong
+        .flush()
+        .await
+        .expect_err("the flush wrote a known conflict");
+    assert!(
+        matches!(
+            err,
+            EngineError::SchemaConflict {
+                what: "the text field",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    wrong
+        .flush()
+        .await
+        .expect("a text-field conflict blocked the lane past one refusal");
+    right.fold().await.unwrap();
+    assert_eq!(ids_in(&right, "docs").await, ["a"]);
+    assert_eq!(
+        stamps(&right, "docs").await,
+        [("p".to_owned(), prose("prose"))]
+    );
+    assert_eq!(
+        committed(&*store).await.schema_rejects.get("docs").copied(),
+        Some(1)
+    );
+}
+
+/// Engines over `prose` (lane 1) and `body` (lane 2) each write and flush one texted row to
+/// `index`, and the `body` engine folds.
+async fn race_two_fields(store: &Arc<MemoryStore>, index: &str) -> Engine<MemoryStore> {
+    let p = Engine::new(Arc::clone(store), T, LaneId(1)).with_text_field("prose");
+    let b = Engine::new(Arc::clone(store), T, LaneId(2)).with_text_field("body");
+    p.write(index, vec![texted("p", "prose", "revenue")])
+        .await
+        .unwrap();
+    b.write(index, vec![texted("b", "body", "revenue")])
+        .await
+        .unwrap();
+    p.flush().await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    b
+}
+
+#[tokio::test]
+async fn two_writers_text_fields_never_share_an_index() {
+    // ⚠️ Spec review, M36, measured on the parent: both rows sealed, the quarantine empty, and
+    // one row's text unindexed with no refusal and no count. Lane order decides which field
+    // wins; whichever does, the other row is set aside.
+    let store = Arc::new(MemoryStore::new());
+    let b = race_two_fields(&store, "fresh").await;
+    assert_eq!(
+        committed(&*store).await.schemas["fresh"].text_field,
+        "prose"
+    );
+    assert_eq!(ids_in(&b, "fresh").await, ["p"]);
+    assert_eq!(text_hits(&b, "fresh", "prose", "revenue").await, ["p"]);
+    assert_eq!(stamps(&b, "fresh").await, [("b".to_owned(), prose("body"))]);
+
+    // And over an index that already exists with an empty text field (M30).
+    let v = Engine::new(Arc::clone(&store), T, LaneId(3));
+    into(&v, "vecs", vec![doc("v", 4)]).await;
+    assert_eq!(committed(&*store).await.schemas["vecs"].text_field, "");
+    let b = race_two_fields(&store, "vecs").await;
+    assert_eq!(committed(&*store).await.schemas["vecs"].text_field, "prose");
+    assert_eq!(ids_in(&b, "vecs").await, ["p", "v"]);
+    assert_eq!(text_hits(&b, "vecs", "prose", "revenue").await, ["p"]);
+    assert_eq!(stamps(&b, "vecs").await, [("b".to_owned(), prose("body"))]);
+}
+
+#[tokio::test]
+async fn a_wrong_row_never_chooses_the_text_field() {
+    // Spec review round 2, M36: "the blast radius of a contradiction is the contradicting
+    // row". A wrong-width row first in the fold must not pick the field and take every
+    // correct row with it.
+    let store = Arc::new(MemoryStore::new());
+    let p = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("prose");
+    let mut wide = doc("w", 8);
+    wide.attrs
+        .insert("prose".to_owned(), Value::Str("revenue".to_owned()));
+    // Before the index exists, so the door cannot know its width.
+    p.write("docs", vec![wide]).await.unwrap();
+    let v = Engine::new(Arc::clone(&store), T, LaneId(3));
+    into(&v, "docs", vec![doc("v", 4)]).await;
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    b.write(
+        "docs",
+        vec![
+            texted("b1", "body", "revenue"),
+            texted("b2", "body", "revenue"),
+        ],
+    )
+    .await
+    .unwrap();
+    b.flush().await.unwrap();
+    p.flush()
+        .await
+        .expect_err("the width conflict was not refused once");
+    p.flush().await.unwrap();
+
+    b.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["docs"].text_field, "body");
+    assert_eq!(ids_in(&b, "docs").await, ["b1", "b2", "v"]);
+    assert_eq!(text_hits(&b, "docs", "body", "revenue").await, ["b1", "b2"]);
+    assert_eq!(quarantined(&b, "docs").await, ["w"]);
+}
+
+#[tokio::test]
+async fn a_foreign_fold_indexes_the_writers_field() {
+    let store = Arc::new(MemoryStore::new());
+    let p = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("prose");
+    p.write("docs", vec![texted("p", "prose", "revenue")])
+        .await
+        .unwrap();
+    p.flush().await.unwrap();
+    // An engine configured otherwise, which wrote nothing, folds it.
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    b.fold().await.unwrap();
+    assert_eq!(committed(&*store).await.schemas["docs"].text_field, "prose");
+    assert_eq!(text_hits(&b, "docs", "prose", "revenue").await, ["p"]);
+}
+
+#[tokio::test]
+async fn the_text_stamp_is_never_served() {
+    // ⚠️ Green on the parent by design: nothing stamps there. It guards `$text` left out of
+    // `stripped`, and a stamp on a row that carries no text.
+    let store = Arc::new(MemoryStore::new());
+    let p = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("prose");
+    let served = |rows: Vec<Document>| {
+        assert!(!rows.is_empty());
+        for d in rows {
+            assert!(!d.attrs.contains_key("$text"), "{} served its stamp", d.id);
+        }
+    };
+    p.write("docs", vec![texted("p", "prose", "revenue")])
+        .await
+        .unwrap();
+    served(p.scan("docs", None).await.unwrap());
+    p.flush().await.unwrap();
+    served(p.scan("docs", None).await.unwrap());
+    p.fold().await.unwrap();
+    served(p.scan("docs", None).await.unwrap());
+
+    // A row with no text is never stamped: one quarantined for its width exports no stamp.
+    let cold = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("prose");
+    cold.write("vecs", vec![doc("w", 2)]).await.unwrap();
+    into(&p, "vecs", vec![doc("v", 4)]).await;
+    cold.flush()
+        .await
+        .expect_err("the width conflict was not refused once");
+    cold.flush().await.unwrap();
+    cold.fold().await.unwrap();
+    assert_eq!(stamps(&cold, "vecs").await, [("w".to_owned(), None)]);
+}
+
+#[tokio::test]
+async fn the_field_a_fold_judged_by_is_the_field_it_records() {
+    // The row that chose the field is deleted in the same fold. The other writer's row was
+    // quarantined against `prose`, so `prose` is recorded: anything else would make that
+    // quarantine arbitrary, and let the next fold accept what this one refused. Over an index
+    // with an empty field, and over a new one that keeps a vector row.
+    let store = Arc::new(MemoryStore::new());
+    let v = Engine::new(Arc::clone(&store), T, LaneId(3));
+    into(&v, "docs", vec![doc("v", 4)]).await;
+    let p = Engine::new(Arc::clone(&store), T, LaneId(1)).with_text_field("prose");
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2)).with_text_field("body");
+    for index in ["docs", "fresh"] {
+        p.write(index, vec![texted("p", "prose", "revenue"), doc("x", 4)])
+            .await
+            .unwrap();
+        p.delete(index, vec!["p".to_owned()]).await.unwrap();
+        b.write(index, vec![texted("b", "body", "revenue")])
+            .await
+            .unwrap();
+    }
+    p.flush().await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    for index in ["docs", "fresh"] {
+        assert_eq!(quarantined(&b, index).await, ["b"], "{index}");
+        assert_eq!(
+            committed(&*store).await.schemas[index].text_field,
+            "prose",
+            "{index}"
+        );
+    }
 }
