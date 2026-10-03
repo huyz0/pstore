@@ -4725,9 +4725,15 @@ impl<S: BlobStore> Engine<S> {
             let shadow: std::collections::HashSet<&str> =
                 unfolded.iter().map(|d| d.id.as_str()).collect();
             out.retain(|d| !shadow.contains(d.id.as_str()));
+            // M40: stripped first, so the filter sees the row as it is served -- as a folded
+            // row is, whose segment never stored a reserved name.
             for d in newest(unfolded) {
-                if !is_tombstone(&d) && filter.is_none_or(|f| f.matches(&d)) {
-                    out.push(stripped(d));
+                if is_tombstone(&d) {
+                    continue;
+                }
+                let d = stripped(d);
+                if filter.is_none_or(|f| f.matches(&d)) {
+                    out.push(d);
                 }
             }
             return Ok(out);

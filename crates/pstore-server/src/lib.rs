@@ -2874,6 +2874,15 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
                 .as_str()
                 .ok_or_else(|| bad("the attribute is a string".to_owned()))?
                 .to_owned();
+            // M40: a reserved name -- `$` metadata, or the empty tombstone mark -- holds nothing
+            // a filter can see: it is stripped before anything is sealed or served, and a
+            // write's condition judged it against stamps on rows still unfolded in its fold.
+            if attr.is_empty() || attr.starts_with('$') {
+                return Err(bad(format!(
+                    "attribute {attr:?} is reserved: names beginning `$`, and the empty name, \
+                     are metadata no filter may name"
+                )));
+            }
             let op = op
                 .as_str()
                 .ok_or_else(|| bad("the operator is a string".to_owned()))?;

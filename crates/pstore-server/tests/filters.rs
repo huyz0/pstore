@@ -335,3 +335,51 @@ async fn each_leg_is_masked_before_its_own_limit() {
     let q = json!({"text": "apple", "vector": [1.0, 1.0], "top_k": limit, "filters": admit});
     assert_eq!(ranked(&api, &q).await, want);
 }
+
+#[tokio::test]
+async fn a_filter_naming_a_reserved_attribute_is_refused() {
+    // M40, BACKLOG row 56: a reserved name never holds data a filter can see -- it is
+    // stripped before anything is sealed or served -- and a write's condition judged it
+    // against stamps on rows still unfolded in the same fold.
+    let api = seeded(false).await;
+    for (f, name) in [
+        (json!(["$metric", "Eq", 2]), "$metric"),
+        (
+            json!(["And", [["n", "Gte", 0], ["Not", ["$text", "Eq", "x"]]]]),
+            "$text",
+        ),
+        (json!(["", "Eq", null]), ""),
+    ] {
+        let q = json!({"vector": [1.0, 0.5], "filters": f});
+        let (s, b) = send(&api, request("POST", "/v1/indexes/docs/query", Some(&q))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{f}: {b}");
+        // ⚠️ The message's own words (code review): the leaf it quotes holds the name anyway.
+        let message = b["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            message.contains(&format!("attribute {name:?} is reserved")),
+            "the refusal names {name:?}: {b}"
+        );
+    }
+    for w in [
+        json!({"delete_by_filter": ["$op", "Eq", 1]}),
+        json!({"patch_by_filter": {"filters": ["$op", "Eq", 1], "attributes": {"tag": "x"}}}),
+    ] {
+        let (s, b) = send(&api, request("PUT", "/v1/indexes/docs/documents", Some(&w))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{w}: {b}");
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("\"$op\" is reserved")),
+            "refused for another reason: {b}"
+        );
+    }
+    let all = json!({"vector": [1.0, 0.5], "top_k": 20});
+    assert_eq!(ids(&api, &all).await.len(), 10, "a refused write wrote");
+    // An ordinary attribute in the same positions is still read.
+    let ordinary = json!({"vector": [1.0, 0.5], "top_k": 20,
+        "filters": ["And", [["n", "Gte", 0], ["Not", ["lang", "Eq", "x"]]]]});
+    assert_eq!(ids(&api, &ordinary).await.len(), 10);
+}

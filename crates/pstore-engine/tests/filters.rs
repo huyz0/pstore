@@ -140,3 +140,34 @@ async fn a_filter_adds_no_round_trip() {
         "a filter cost a sequential round trip"
     );
 }
+
+#[tokio::test]
+async fn a_scan_filters_what_it_serves() {
+    // M40: the library's scan applied its legacy filter to unfolded rows before stripping them,
+    // so a reserved name matched a row until its fold and never after.
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(40), LaneId(1));
+    e.write_as(
+        "idx",
+        vec![Document::new("e", vec![1.0, 2.0])],
+        pstore_engine::Metric::EuclideanSquared,
+    )
+    .await
+    .unwrap();
+    let reserved = pstore_format::Filter::Eq(
+        "$metric".to_owned(),
+        Value::Int(pstore_engine::Metric::EuclideanSquared.code()),
+    );
+    for folded in [false, true] {
+        if folded {
+            e.flush().await.unwrap();
+            e.fold().await.unwrap();
+        }
+        let rows = e.scan("idx", Some(&reserved)).await.unwrap();
+        assert!(rows.is_empty(), "folded {folded}: {rows:?}");
+        assert_eq!(
+            e.scan("idx", None).await.unwrap().len(),
+            1,
+            "folded {folded}"
+        );
+    }
+}

@@ -274,12 +274,15 @@ async fn the_metric_a_row_carries_is_never_returned_or_filtered_on() {
             json!({"n": 1}),
             "folded {folded}: {r}"
         );
-        let (_, r) = query(
+        // ⚠️ M40: refused, where it answered `200` with no results. A filter on a reserved
+        // name could never match -- the name is stripped before anything is served -- so the
+        // stronger answer is that it is wrong.
+        let (s, r) = query(
             &api,
             &json!({"vector": [1.0, 2.0], "filters": ["$metric", "Eq", 1]}),
         )
         .await;
-        assert_eq!(r["results"], json!([]), "folded {folded}: {r}");
+        assert_eq!(s, StatusCode::BAD_REQUEST, "folded {folded}: {r}");
     }
 }
 
