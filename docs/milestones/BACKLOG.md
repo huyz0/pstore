@@ -140,7 +140,7 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 53 | ⚠️ **NARROWED by [M38](M38/VERIFIED.md), not closed.** The churn was two bugs, not Lifeguard's territory: a `PingReq` helper suspected its target whenever its one relayed path timed out (2,953 of 3,063 suspicions at 100 members and 10% loss), and a node raised its incarnation on claims below it. Fixed, 100 members at 10% loss cost 734 B per node per round, down from 9,662, with suspicion at what loss predicts. The residue: **a `Part` still grows at N/16** per differing bucket, about 625 members (roughly 37 KB in one datagram) at 10,000 members. The slope wants buckets scaled to the fleet, or a digest in two levels. Measure first, on M33's real-hop model, at a fleet size where it binds. | [M34](M34/SPEC.md) | M |
+| 53 | ⚠️ **NARROWED by [M38](M38/VERIFIED.md) and [M43](M43/VERIFIED.md), not closed.** M38 fixed the churn, two bugs. M43 measured the residue binding under heavy loss (400 members at 10% loss: 6,457 B per node per round, a `Part` carrying most of the member list) and, above 112 members, sends a 401-byte `TaggedDigest` answered with only the differing leaves' members: 200 members 1,721 → 1,083, 400 members 6,457 → 1,918. **The residue:** still linear at a smaller slope (a `Part` of about N/256 members per differing leaf, about 39 at 10,000 members); a `Part` is uncapped, and a garbage digest draws the member list; a rolling upgrade past 112 members learns old nodes' state by piggyback alone. Leaves scaled to the fleet, or a third level, when a fleet reaches the size where this binds. | [M34](M34/SPEC.md) | M |
 
 ## Opened by M33
 

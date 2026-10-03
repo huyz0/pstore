@@ -536,6 +536,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 | M40 | **A filter never names a reserved attribute** ([VERIFIED](../../milestones/M40/VERIFIED.md)): the API refuses `$` names in filters and conditions; a scan filters what it serves | [BACKLOG](../../milestones/BACKLOG.md) row 56 |
 | M41 | **A fresh view never matches another writer's row** ([VERIFIED](../../milestones/M41/VERIFIED.md)): row 56's last item measured unreachable, and pinned | [BACKLOG](../../milestones/BACKLOG.md) row 56 |
 | M42 | **Ids beside codes, priced** ([VERIFIED](../../milestones/M42/VERIFIED.md)): the fourth round's alternative costs +21% bytes at gap 0 and +35–42% at the production gap, for dense id-only queries only; left to a human | [BACKLOG](../../milestones/BACKLOG.md) row 26 |
+| M43 | **A tagged digest: reconcile only the leaves that differ** ([VERIFIED](../../milestones/M43/VERIFIED.md)): above 112 members, gossip under 10% loss at 400 members falls from 6,457 to 1,918 B per node per round | [BACKLOG](../../milestones/BACKLOG.md) row 53 |
 
 **Not planned,** with the reason in the parity tables:
 - CMEK, sharding and backpressure: declined for now.
