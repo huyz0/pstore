@@ -320,9 +320,11 @@ mod tests {
     #[test]
     fn azure_declares_no_suffix_and_batches_of_256() {
         // M46: what the Azure client does, whatever profile the caps came from.
+        // `delete_is_free: true` in, so the override is visible (the sweep found it was not).
         let profile = Capabilities {
             cas: Support::Supported,
             create_if_absent: Support::Supported,
+            delete_is_free: true,
             ..ObjectStoreBackend::unprobed("azure")
         };
         let az = ObjectStoreBackend::azure(

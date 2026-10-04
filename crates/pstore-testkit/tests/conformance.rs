@@ -67,6 +67,40 @@ async fn a_store_without_suffix_reads_conforms_on_everything_else() {
     assert_eq!(r.observed.cas, Support::Supported);
     assert_eq!(r.observed.create_if_absent, Support::Supported);
     assert!(!r.observed.suffix_read);
+
+    // What the suite does not ask (the sweep found both unpinned): both suffix forms refuse,
+    // and a listing is forwarded.
+    use pstore_blob::{Class, Key};
+    let ns = pstore_testkit::no_suffix::NoSuffix::new(MemoryStore::new());
+    let key = Key::new("p/one");
+    ns.put(&key, bytes::Bytes::from_static(b"body"))
+        .await
+        .unwrap();
+    assert!(ns.get_suffix(&key, 2).await.is_err());
+    assert!(ns.get_suffix_as(&key, 2, Class::Meta).await.is_err());
+    assert_eq!(
+        ns.list_unrestricted(&Key::new("p/")).await.unwrap(),
+        std::slice::from_ref(&key)
+    );
+    // And the forms the segment open uses, with their classes.
+    assert_eq!(ns.head(&key).await.unwrap(), 4);
+    assert_eq!(
+        &ns.get_range_as(&key, 1..3, Class::Meta).await.unwrap()[..],
+        b"od"
+    );
+    assert_eq!(
+        ns.get_ranges_as(&key, &[0..1, 3..4], Class::Bulk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.to_vec())
+            .collect::<Vec<_>>(),
+        [b"b".to_vec(), b"y".to_vec()]
+    );
+    assert_eq!(
+        &ns.get_immutable(&key, Class::Pinned).await.unwrap()[..],
+        b"body"
+    );
 }
 
 #[tokio::test]
