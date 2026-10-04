@@ -86,6 +86,12 @@ const TAG_ABOVE: usize = 7 * crate::cluster::BUCKETS;
 /// whatever its tags say (M43): too few to be worth filtering.
 const LEAF_ABOVE: usize = 4;
 
+/// How many `TaggedDigest`s a peer may leave unanswered before it is sent M34's `Digest`
+/// instead (M48). A build from before M43 decodes tag 7 to nothing; a current one always
+/// answers. Three silences in a row are ~0.7% at 10% loss (the digest or its answer lost,
+/// ~19% each), and a false mark only costs M34's price for that peer.
+const UNANSWERED: u8 = 3;
+
 /// How many changes ride along on a probe.
 ///
 /// ⚠️ Bounded, so a fleet in churn cannot turn a probe back into the O(N) message this crate
@@ -123,6 +129,11 @@ pub struct Protocol {
     /// it has already ridden along.
     updates: Vec<(Member, u8)>,
     tick: u64,
+    /// `TaggedDigest`s sent to each peer since its last `Part` (M48).
+    unanswered: BTreeMap<NodeId, u8>,
+    /// Peers sent M34's `Digest` because they left [`UNANSWERED`] tags unanswered: until they
+    /// send a `TaggedDigest` themselves, which only a build that reads tags does.
+    untagged: std::collections::BTreeSet<NodeId>,
 }
 
 impl Protocol {
@@ -137,6 +148,8 @@ impl Protocol {
             suspected_at: BTreeMap::new(),
             updates: Vec::new(),
             tick: 0,
+            unanswered: BTreeMap::new(),
+            untagged: std::collections::BTreeSet::new(),
         }
     }
 
@@ -215,7 +228,7 @@ impl Protocol {
                     // ⚠️ Only on disagreement. Sending state alongside every ack is what makes
                     // a checksum decorative.
                     if *checksum != self.cluster.checksum() {
-                        out.push((addr, self.reconcile()));
+                        out.push((addr, self.reconcile(from)));
                     }
                 }
                 out
@@ -258,7 +271,7 @@ impl Protocol {
                             },
                         ));
                     } else if *checksum != self.cluster.checksum() {
-                        out.push((addr, self.reconcile()));
+                        out.push((addr, self.reconcile(from)));
                     }
                 }
                 out
@@ -316,11 +329,15 @@ impl Protocol {
                 // M43: answered whatever this view's size -- the answer depends on the
                 // message, never on the receiver (spec review).
                 self.mark_alive(from);
+                // M48: it reads tags, so it is no longer sent a `Digest` for want of them.
+                self.untagged.remove(from);
+                self.unanswered.remove(from);
                 let send = self.leaves_to_send(buckets, tags);
                 let mut out = Vec::new();
-                if send.iter().any(|m| *m != 0)
-                    && let Some(addr) = self.addr_of(from)
-                {
+                // ⚠️ Answered even when nothing differs (M48): one empty `Part`, so the
+                // sender's silence means an old build or loss -- never a peer that piggyback
+                // already levelled.
+                if let Some(addr) = self.addr_of(from) {
                     let members = self
                         .cluster
                         .members()
@@ -337,6 +354,7 @@ impl Protocol {
                 out
             }
             Message::Part { from, members } => {
+                self.unanswered.remove(from);
                 self.absorb(members);
                 self.mark_alive(from);
                 Vec::new()
@@ -389,14 +407,23 @@ impl Protocol {
     /// What a checksum mismatch sends (M34): a `Digest` past [`RECONCILE_WHOLE_UP_TO`]
     /// members, else a whole `Sync`, which is cheap at that size and converges in fewer
     /// exchanges. Past [`TAG_ABOVE`], a `TaggedDigest` (M43).
-    fn reconcile(&self) -> Message {
-        if self.cluster.len() > TAG_ABOVE {
-            Message::TaggedDigest {
-                from: *self.cluster.me(),
-                buckets: self.cluster.buckets().to_vec(),
-                tags: self.cluster.leaf_tags().to_vec(),
+    ///
+    /// M48: a peer that has left [`UNANSWERED`] tags unanswered is sent a `Digest`, which
+    /// every build since M34 answers, so a mixed-version fleet still reconciles.
+    fn reconcile(&mut self, peer: &NodeId) -> Message {
+        if self.cluster.len() > TAG_ABOVE && !self.untagged.contains(peer) {
+            let sent = self.unanswered.entry(*peer).or_insert(0);
+            if *sent < UNANSWERED {
+                *sent += 1;
+                return Message::TaggedDigest {
+                    from: *self.cluster.me(),
+                    buckets: self.cluster.buckets().to_vec(),
+                    tags: self.cluster.leaf_tags().to_vec(),
+                };
             }
-        } else if self.cluster.len() > RECONCILE_WHOLE_UP_TO {
+            self.untagged.insert(*peer);
+        }
+        if self.cluster.len() > RECONCILE_WHOLE_UP_TO {
             Message::Digest {
                 from: *self.cluster.me(),
                 buckets: self.cluster.buckets().to_vec(),
@@ -825,11 +852,12 @@ mod tests {
 
     /// `p`'s `TaggedDigest`, with every tag `copy` says replaced by `from`'s: a collision.
     fn colliding(p: &Protocol, from: &Protocol, copy: impl Fn(usize) -> bool) -> Message {
+        // A fresh copy's first reconciliation, so `p`'s own unanswered count is untouched (M48).
         let Message::TaggedDigest {
             from: sender,
             buckets,
             mut tags,
-        } = p.reconcile()
+        } = Protocol::new(p.cluster.clone()).reconcile(&nid(1))
         else {
             panic!("a view of 121 did not send a TaggedDigest");
         };
@@ -1423,5 +1451,148 @@ mod tests {
             got.push(ids(members));
         }
         assert_eq!(got, vec![vec![0, 1, 2], vec![3], vec![4, 5]]);
+    }
+
+    /// M48: the reconciliation message in `out`, which a mismatched ping from `n1` drew.
+    fn reconciled(out: &[(String, Message)]) -> &Message {
+        out.iter()
+            .map(|(_, m)| m)
+            .find(|m| !matches!(m, Message::Ack { .. }))
+            .expect("a mismatch drew no reconciliation")
+    }
+
+    /// M48: a ping from `n1` whose checksum differs from `p`'s.
+    fn mismatched(p: &Protocol, seq: u64) -> Message {
+        Message::Ping {
+            from: nid(1),
+            seq,
+            checksum: p.cluster.checksum().wrapping_add(1),
+            updates: Vec::new(),
+        }
+    }
+
+    fn agreeing(p: &Protocol) -> Message {
+        Message::TaggedDigest {
+            from: nid(1),
+            buckets: p.cluster.buckets().to_vec(),
+            tags: p.cluster.leaf_tags().to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_agreeing_tagged_digest_is_answered_empty() {
+        // M48: silence must mean an old build or loss, never a peer that already agrees.
+        let mut p = tagged_view(0);
+        let digest = agreeing(&p);
+        let out = p.receive("n1", &digest);
+        assert!(
+            matches!(&out[..], [(to, Message::Part { members, .. })] if to == "n1" && members.is_empty()),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_never_answers_tags_is_sent_a_digest() {
+        let mut p = tagged_view(0);
+        let kinds = |p: &mut Protocol, seq| match reconciled(&p.receive("n1", &mismatched(p, seq)))
+        {
+            Message::TaggedDigest { .. } => "tagged",
+            Message::Digest { .. } => "digest",
+            other => panic!("{other:?}"),
+        };
+        let first: Vec<_> = (1..=4).map(|seq| kinds(&mut p, seq)).collect();
+        assert_eq!(first, ["tagged", "tagged", "tagged", "digest"]);
+        // Marked: an answer to the `Digest` does not unmark it...
+        p.receive(
+            "n1",
+            &Message::Part {
+                from: nid(1),
+                members: Vec::new(),
+            },
+        );
+        assert_eq!(kinds(&mut p, 5), "digest");
+        // ...a `TaggedDigest` from it does, because only a build that reads tags sends one.
+        let digest = agreeing(&p);
+        p.receive("n1", &digest);
+        assert_eq!(kinds(&mut p, 6), "tagged");
+    }
+
+    #[test]
+    fn an_answering_peer_keeps_its_tags() {
+        let mut p = tagged_view(0);
+        for seq in 1..=10 {
+            assert!(
+                matches!(
+                    reconciled(&p.receive("n1", &mismatched(&p, seq))),
+                    Message::TaggedDigest { .. }
+                ),
+                "mismatch {seq}"
+            );
+            p.receive(
+                "n1",
+                &Message::Part {
+                    from: nid(1),
+                    members: Vec::new(),
+                },
+            );
+        }
+    }
+
+    /// M48: `me`'s view of members 0 to 120, all but nodes 0 and 1 Dead.
+    fn mostly_dead(me: u8) -> Protocol {
+        let mut p = tagged_view(me);
+        for n in 2..=120 {
+            p.cluster.declare_dead(&nid(n));
+        }
+        p
+    }
+
+    #[test]
+    fn a_mixed_version_pair_converges() {
+        // Node 0 runs this build; node 1 is emulated as one from before M43: it drops every
+        // `TaggedDigest` delivered to it, and sends M34's `Digest` where this build tags.
+        let mut new = mostly_dead(0);
+        let mut old = mostly_dead(1);
+        // A record only the old node holds, past any piggyback.
+        let newer = Member {
+            id: nid(50),
+            addr: "n50".to_owned(),
+            zone: "az-a".to_owned(),
+            incarnation: 9,
+            state: State::Dead,
+        };
+        old.cluster.upsert(newer.clone());
+        assert_ne!(new.cluster.checksum(), old.cluster.checksum());
+
+        let as_old = |m: Message, old: &Protocol| match m {
+            Message::TaggedDigest { from, .. } => Message::Digest {
+                from,
+                buckets: old.cluster.buckets().to_vec(),
+            },
+            other => other,
+        };
+        for t in 0..6u64 {
+            let mut queue: Vec<(String, Message)> = new.tick(t);
+            queue.extend(old.tick(t).into_iter().map(|(to, m)| (to, as_old(m, &old))));
+            let mut steps = 0;
+            while let Some((to, m)) = queue.pop() {
+                steps += 1;
+                assert!(steps < 1_000, "the exchange did not settle");
+                if to == "n1" {
+                    if matches!(m, Message::TaggedDigest { .. }) {
+                        continue;
+                    }
+                    let replies = old.receive("n0", &m);
+                    queue.extend(replies.into_iter().map(|(to, m)| (to, as_old(m, &old))));
+                } else if to == "n0" {
+                    queue.extend(new.receive("n1", &m));
+                }
+            }
+            if new.cluster.member(&nid(50)) == Some(&newer) {
+                break;
+            }
+        }
+        assert_eq!(new.cluster.member(&nid(50)), Some(&newer));
+        assert_eq!(new.cluster.checksum(), old.cluster.checksum());
     }
 }
