@@ -39,7 +39,7 @@ match our differentiation claims.
 
 ### Latency
 - Cold / warm p50, p90, p99, p999, separately.
-- **Sequential round-trip depth per query** — asserted ≤3 in tests (D-34).
+- **Sequential round-trip depth per query** — asserted ≤3 to rank and ≤4 with the fetch, in tests (D-34 restated by M47).
 - Time-to-first-result for streaming responses.
 
 ### Efficiency (the ones that differentiate us)

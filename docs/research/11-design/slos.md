@@ -14,13 +14,15 @@ Latency objectives are therefore `blocked` on M0b, each with the measurement it 
 
 ## Request-count and depth objectives — enforced
 
+⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md).
+
 | Objective | Value | Status | Gate |
 |---|---|---|---|
 | A write batch costs one write-class request, whatever it carries | 1 PUT | enforced | `the_whole_flow_stays_inside_its_request_budget` |
 | A lane's first flush additionally registers the lane and reads the schemas | 2 W + 2 R, once per process | enforced | `a_durable_write_costs_its_lane_registration_once_then_one_put` |
 | A batched write costs nothing | 0 requests | enforced | `a_batched_write_costs_nothing` |
-| A cold vector query's sequential depth | ≤ 3 round trips | enforced | `a_cold_query_from_head_costs_three_round_trips` |
-| A query through the API, including id resolution | **4**, flat in the segment count | enforced | `a_query_costs_four_round_trips_however_many_segments_it_has` |
+| A cold vector query's ranking depth | ≤ 3 round trips | enforced | `a_cold_query_from_head_costs_three_round_trips` |
+| A query through the API, ranked and fetched: D-34 as restated | **4**, flat in the segment count | enforced | `a_query_costs_four_round_trips_however_many_segments_it_has` |
 | A query answered from the memtable reads HEAD once and nothing else | 1 R | enforced | `a_memtable_query_reads_head_and_nothing_else` |
 | Time travel costs no more than a live query | 1 HEAD read, 0 LIST | enforced | `time_travel_costs_one_head_read_and_no_lists` |
 | Enumerating a tenant's indexes | 1 R, 0 LIST | enforced | `no_endpoint_lists` |

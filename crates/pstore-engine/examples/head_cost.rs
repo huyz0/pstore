@@ -123,7 +123,7 @@ async fn main() {
     );
     println!(
         "\n⚠️ Reads are 3 at every K above, so this is a byte cost and not a depth cost. The \
-         budget being traded away is the one that is flat: D-34 allows three sequential round \
+         budget being traded away is the one that is flat: D-34 ranks in three sequential round \
          trips and an open already uses all three."
     );
 }

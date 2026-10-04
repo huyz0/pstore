@@ -67,6 +67,8 @@ re-analysis.
 **Exit:** write, read, filter, exact-search a single index on real S3. Measured
 `RA(write) = 1 W` and `RA(cold read) ≤ 3 Rseq`, **asserted in tests** (D-34).
 
+⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md).
+
 ### M2 — Multi-writer correctness (3–4 weeks)
 - `pstore-sim`: deterministic simulation harness (**built before the distributed features**,
   D-32).
@@ -548,7 +550,7 @@ is a sequence and not a set of specs: each milestone is specified when it is nex
 
 | Discipline | Enforcement |
 |---|---|
-| Round-trip depth ≤3 | Test assertion against the fault-injecting store (D-34) |
+| Round-trip depth ≤3 to rank, +1 to fetch the rows ranked (D-34 restated by M47) | Test assertion against the fault-injecting store (D-34) |
 | Zero LIST on hot paths | Lint + the awkward `list_unrestricted` API name (D-2) |
 | Blob requests per op | Counter assertions in tests; per-tenant metrics in prod |
 | Recall / NDCG | CI gates (D-35) |

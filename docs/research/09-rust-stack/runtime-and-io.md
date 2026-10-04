@@ -107,6 +107,8 @@ Non-negotiable, from the first commit:
   tenant, `memory.events.high`, and PSI memory `full avg60`. See
   [`memory-management.md`](memory-management.md) §9.
 
+> ⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md).
+>
 > **D-34.** Round-trip depth is a **tested invariant**, not a metric to look at later. A test
 > that runs a cold query against the fault-injecting blob store and asserts the sequential
 > depth is ≤3 will catch the single most likely class of performance regression.

@@ -1229,7 +1229,7 @@ pub struct Answer {
     /// ⚠️ **Carried, because resolving it later costs round trips that the budget does not
     /// have.** A caller re-opening each segment to look a row up pays two data-dependent
     /// rounds per segment — measured at **19 sequential round trips** for an eight-segment
-    /// index, against D-34's three. Resolved inside the query, it is one fan-out round
+    /// index, against D-34's budget. Resolved inside the query, it is one fan-out round
     /// however many segments there are.
     pub ids: Vec<Option<String>>,
     /// The attributes of every hit, in `hits` order: **empty** for a hit on the unfolded

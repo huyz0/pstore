@@ -432,15 +432,14 @@ async fn summed<S: BlobStore>(
 /// its row, and only this function still has the opened segments: a caller doing it would
 /// re-open each one — `Segment::open` then `ids_at`, two data-dependent rounds **per
 /// segment**, serially. Measured that way at eight segments: **19 sequential round trips**
-/// for one query, against a budget of three. Here it is a single fan-out round whatever the
+/// for one query, against D-34's budget. Here it is a single fan-out round whatever the
 /// segment count, because the opens already happened and no block's address depends on
 /// another's contents.
 ///
-/// ⚠️ **It is still a fourth round, and D-34 allows three.** The ranking is three; carrying
-/// the ids costs one more, because a payload's address cannot be known before the ranking
-/// exists. The way to three is a format change — ids fetched alongside the vectors the leg
-/// already reads — and that is a decision about what a segment stores, recorded in the
-/// backlog rather than made here.
+/// ⚠️ **It is a fourth round, and D-34 as restated by M47 allows it:** three to rank, one
+/// to fetch what was ranked. A payload's address cannot be known before the ranking exists.
+/// The way to three -- ids beside the vectors the leg already reads -- was priced by M42 at
+/// +12.7% to +41.9% bytes, and the project's owner declined it.
 ///
 /// ⚠️ **And each hit's attributes, from the same round** (M9a). The blocks that resolve the
 /// ids carry the attributes, so they are kept rather than decoded and dropped; each document

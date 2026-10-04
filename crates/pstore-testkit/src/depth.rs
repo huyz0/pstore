@@ -2,8 +2,8 @@
 //! denominated in.
 //!
 //! Counting requests is easy and wrong: a query issuing 200 ranged reads concurrently
-//! costs one round trip, while one issuing 4 in a loop costs four. D-34 caps the second
-//! number at three and says nothing about the first, so the counter has to tell them
+//! costs one round trip, while one issuing 4 in a loop costs four. D-34 bounds the second --
+//! three to rank, one more to fetch, as M47 restated it -- and says nothing about the first, so the counter has to tell them
 //! apart.
 //!
 //! The rule: **a new round begins whenever a request starts while nothing is in flight.**

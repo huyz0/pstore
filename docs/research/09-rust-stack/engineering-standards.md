@@ -171,9 +171,11 @@ This is the part that distinguishes *this* project. We have derived hard invaria
 research; every one is testable, and each has been asserted somewhere in the docs as though it
 were documentation. It should be a test.
 
+⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md).
+
 | Invariant | Source | Test mechanism |
 |---|---|---|
-| **≤3 sequential blob round trips** on any cold user query | D-34 | Depth counter in the fault-injecting store; assert |
+| **≤3 sequential blob round trips to rank** any cold user query, and **one more to fetch** the rows ranked (D-34 restated by M47) | D-34 | Depth counter in the fault-injecting store; assert |
 | **RA(write batch) = 1 W** | write-path | Request-class counter assertion |
 | **Zero LIST** on read/write/startup paths | Design rule 4 | `list_unrestricted` is the only listing API; assert count = 0 |
 | **Invariant I1** — no in-place mutation; every transition CASes on the observed version | consistency-model | Simulation + property test |

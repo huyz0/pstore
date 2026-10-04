@@ -111,7 +111,9 @@ reasoning, with numbers and sources, is in `INDEX.md`.
 - Never add a blob request that scales with **records, documents, indexes, or elapsed
   time per index**. Requests scale with nodes and bytes.
 - Never put a **data-dependent chain** of blob fetches on a user-facing path. The budget
-  is three sequential round trips; fan-out within a round is free, depth is not.
+  is three sequential round trips to rank, and one more to fetch the rows ranked (D-34,
+  restated by M47 by the owner's decision); `rerank: exact` is an opt-in outside it.
+  Fan-out within a round is free, depth is not.
 - Never add a **lock, lease, or leader election** for correctness. CAS on a blob is the
   fencing mechanism — a paused or partitioned writer is already safe.
 - Never give a node **ownership** of data. Nodes own nothing; that is what makes scaling

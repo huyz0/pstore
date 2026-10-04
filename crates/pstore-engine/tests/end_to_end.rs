@@ -87,7 +87,8 @@ async fn write_read_filter_and_search_one_index() {
 #[tokio::test]
 async fn the_whole_flow_stays_inside_its_request_budget() {
     // The milestone's exit condition as one assertion: RA(write) = 1 W, and a cold read
-    // is at most three sequential round trips however the index is laid out.
+    // ranks in at most three sequential round trips, whatever the index's layout (the ranking
+    // half of D-34 as M47 restated it; the API's fetch round is `depth.rs`'s).
     let s = Arc::new(DepthCounting::new(MemoryStore::new()));
     let t = TenantId(101);
     let e = Engine::new(Arc::clone(&s), t, LaneId(1));

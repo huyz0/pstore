@@ -10,7 +10,8 @@
 
 //! D-34: the round-trip budget is a **tested invariant**, not a design claim.
 //!
-//! ~30 ms per hop against a ~100 ms budget allows about three sequential fetches. Every
+//! ~30 ms per hop against a ~100 ms budget: three sequential fetches to rank, and one more to
+//! fetch what was ranked (D-34, restated by M47). Every
 //! added hop is a third of the budget, and no functional test can see one — the answer is
 //! identical either way, only slower.
 use pstore_blob::MemoryStore;

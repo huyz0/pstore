@@ -35,6 +35,8 @@ turbopuffer states the same discipline: cold queries take 3–4 round trips of ~
 
 **Three round trips. ~100–150 ms cold, dominated by network latency, not compute.**
 
+⚠️ **D-34 restated by M47** (the project owner's decision, 2026-10-04): a cold user query ranks in at most three sequential round trips, and fetches the rows it ranked in at most one more. `rerank: exact`, an opt-in, adds a round to the ranking and is outside the bound. This weakens the written bound by decision, not to make a check pass: the code has asserted four since M7c. See [M47](../../milestones/M47/SPEC.md). The implementation fetches the ranked rows' ids and attributes in that fourth round: about 120 ms cold at ~30 ms a round, inside the ~100–150 ms above.
+
 The critical structural property: **RT-A merges everything that can be known without looking
 at data.** A naive implementation would fetch HEAD, *then* the manifest, *then* the index
 section, *then* the centroids — four sequential hops before any real work. Avoiding that is

@@ -100,7 +100,7 @@ The real payoff is a set of questions that were parked pending cloud accounts:
 | 412 vs 409 handling | ✅ Inject 409 deliberately; assert we retry without rebasing |
 | Congestion controller under `503 SlowDown` | ✅ Inject 503 with `Retry-After`; assert per-prefix backoff behaves |
 | Retry / timeout / partial-body handling | ✅ Truncated bodies, mid-stream connection resets |
-| Round-trip depth invariant (**D-34**) end-to-end | ✅ Inject a latency distribution matching published S3 figures; assert sequential depth ≤3 **over real HTTP**, not just in-process |
+| Round-trip depth invariant (**D-34**) end-to-end | ✅ Inject a latency distribution matching published S3 figures; assert sequential depth ≤3 to rank and +1 to fetch (D-34 restated by M47) **over real HTTP**, not just in-process |
 | Read-after-overwrite and 304 semantics | ✅ |
 
 **Still blocked, and honestly so:** real latency distributions, real CAS throughput under
