@@ -92,6 +92,12 @@ const LEAF_ABOVE: usize = 4;
 /// ~19% each), and a false mark only costs M34's price for that peer.
 const UNANSWERED: u8 = 3;
 
+/// The bytes of digest answers a node sends per tick past the tick's first answer (M49):
+/// four datagrams. Honest traffic never reaches it (`budget_drops` is asserted 0 under heavy
+/// loss); a flood of digests draws at most this plus one answer a tick, where before M49 it
+/// drew a full answer per datagram.
+const ANSWER_BUDGET: usize = 4 * crate::wire::MAX_DATAGRAM;
+
 /// How many changes ride along on a probe.
 ///
 /// ⚠️ Bounded, so a fleet in churn cannot turn a probe back into the O(N) message this crate
@@ -134,6 +140,14 @@ pub struct Protocol {
     /// Peers sent M34's `Digest` because they left [`UNANSWERED`] tags unanswered: until they
     /// send a `TaggedDigest` themselves, which only a build that reads tags does.
     untagged: std::collections::BTreeSet<NodeId>,
+    /// Peers whose digest was answered (or dropped) this tick (M49). Cleared by `tick`.
+    answered: std::collections::BTreeSet<NodeId>,
+    /// Bytes of digest answers sent this tick (M49). Cleared by `tick`.
+    spent: usize,
+    /// Digests dropped because the tick's [`ANSWER_BUDGET`] was spent (M49).
+    budget_drops: u64,
+    /// Digests dropped because their peer was already answered this tick (M49).
+    repeat_drops: u64,
 }
 
 impl Protocol {
@@ -150,6 +164,10 @@ impl Protocol {
             tick: 0,
             unanswered: BTreeMap::new(),
             untagged: std::collections::BTreeSet::new(),
+            answered: std::collections::BTreeSet::new(),
+            spent: 0,
+            budget_drops: 0,
+            repeat_drops: 0,
         }
     }
 
@@ -167,6 +185,9 @@ impl Protocol {
     /// One protocol period. Returns the datagrams to send.
     pub fn tick(&mut self, seed: u64) -> Vec<(String, Message)> {
         self.tick += 1;
+        // M49: a new tick's answer budget, and every peer may be answered once more.
+        self.answered.clear();
+        self.spent = 0;
         let mut out = Vec::new();
 
         self.expire_probes(&mut out);
@@ -319,7 +340,7 @@ impl Protocol {
                         .collect();
                     out.extend(self.parts(&addr, split(members)));
                 }
-                out
+                self.budgeted(from, out)
             }
             Message::TaggedDigest {
                 from,
@@ -351,7 +372,7 @@ impl Protocol {
                         .collect();
                     out.extend(self.parts(&addr, split(members)));
                 }
-                out
+                self.budgeted(from, out)
             }
             Message::Part { from, members } => {
                 self.unanswered.remove(from);
@@ -383,9 +404,46 @@ impl Protocol {
                         out.extend(self.parts(&addr, chunks));
                     }
                 }
-                out
+                self.budgeted(from, out)
             }
         }
+    }
+
+    /// `out`, a digest's answer to `from`, if this tick may still send it (M49): once per peer
+    /// per tick, and past the tick's first answer only within [`ANSWER_BUDGET`].
+    /// ⚠️ The first answer goes whatever its size: a full-view answer past the budget is a
+    /// cold joiner's, a heal's, or an untagged peer's, and would otherwise never be sent.
+    fn budgeted(&mut self, from: &NodeId, out: Vec<(String, Message)>) -> Vec<(String, Message)> {
+        if out.is_empty() {
+            return out;
+        }
+        if !self.answered.insert(*from) {
+            self.repeat_drops += 1;
+            return Vec::new();
+        }
+        let len: usize = out.iter().map(|(_, m)| answer_len(m)).sum();
+        if self.spent > 0 && self.spent + len > ANSWER_BUDGET {
+            self.budget_drops += 1;
+            return Vec::new();
+        }
+        self.spent += len;
+        out
+    }
+
+    /// Digests dropped because a tick's answer budget was spent (M49). Honest traffic leaves
+    /// this at 0.
+    #[must_use]
+    pub fn budget_drops(&self) -> u64 {
+        self.budget_drops
+    }
+
+    /// Digests dropped because their peer had been answered that tick (M49). The two carry
+    /// the same state, so nothing is lost -- but a dropped repeat can leave one on M48's
+    /// unanswered count, so false `untagged` marks rose from 37 to 74 over the 200-member
+    /// heavy-loss run (code review): bounded, and correct, at M34's price.
+    #[must_use]
+    pub fn repeat_drops(&self) -> u64 {
+        self.repeat_drops
     }
 
     /// `chunks` to `addr`, one `Part` each (M44).
@@ -756,6 +814,18 @@ impl Protocol {
     }
 }
 
+/// A digest answer's encoded length (M49): a `Part`'s or `Sync`'s header and members, as
+/// [`split`] sums them.
+fn answer_len(m: &Message) -> usize {
+    use crate::wire::{MEMBERS_HEADER, member_len};
+    match m {
+        Message::Part { members, .. } | Message::Sync { members, .. } => {
+            MEMBERS_HEADER + members.iter().map(member_len).sum::<usize>()
+        }
+        other => other.encode().len(),
+    }
+}
+
 /// `members`, in order, cut into chunks whose `Part` or `Sync` encodes to at most
 /// [`MAX_DATAGRAM`](crate::wire::MAX_DATAGRAM) bytes (M44).
 ///
@@ -925,6 +995,8 @@ mod tests {
         let mut p = tagged_view(1);
         a.cluster.refute(&m1, 1);
         a.cluster.refute(&m2, 1);
+        // M49: a peer's digests are answered once a tick, and each exchange here is a round.
+        a.tick(0);
         let digest = colliding(&p, &a, |l| l == l2);
         let mut out = a.receive("n1", &digest);
         let first = part_of(&out);
@@ -943,6 +1015,7 @@ mod tests {
         assert_eq!(p.cluster.leaves()[l1], a.cluster.leaves()[l1]);
         assert_ne!(p.cluster.buckets()[b], a.cluster.buckets()[b]);
         // l1 now agrees and l2 still collides: no tag in the bucket differs, so it goes whole.
+        a.tick(0);
         let digest = colliding(&p, &a, |l| l == l2);
         let mut out = a.receive("n1", &digest);
         assert_eq!(part_of(&out), bucket(&a));
@@ -1594,5 +1667,101 @@ mod tests {
         }
         assert_eq!(new.cluster.member(&nid(50)), Some(&newer));
         assert_eq!(new.cluster.checksum(), old.cluster.checksum());
+    }
+
+    #[test]
+    fn a_peer_draws_one_answer_a_tick() {
+        // M49: a second digest from the same peer in one tick is not answered.
+        let mut p = tagged_view(0);
+        assert!(!p.receive("n1", &zero_digest(nid(1))).is_empty());
+        assert!(p.receive("n1", &zero_digest(nid(1))).is_empty());
+        assert_eq!((p.repeat_drops(), p.budget_drops()), (1, 0));
+        assert!(
+            !p.receive("n2", &zero_digest(nid(2))).is_empty(),
+            "another peer, the same tick"
+        );
+        p.tick(0);
+        assert!(!p.receive("n1", &zero_digest(nid(1))).is_empty());
+    }
+
+    #[test]
+    fn a_tick_sends_at_most_its_answer_budget() {
+        // M49: about 81 KB an answer, so three fit in four datagrams and a fourth does not.
+        let mut p = crowd(1_000);
+        let answered = (1..=10u16)
+            .filter(|i| !p.receive("x", &zero_digest(wide(*i))).is_empty())
+            .count();
+        assert_eq!(answered, 3);
+        assert_eq!((p.budget_drops(), p.repeat_drops()), (7, 0));
+        p.tick(0);
+        assert!(!p.receive("x", &zero_digest(wide(1))).is_empty());
+    }
+
+    #[test]
+    fn a_sync_answer_counts_against_the_budget() {
+        let mut p = crowd(1_000);
+        for i in 1..=3u16 {
+            assert!(!p.receive("x", &zero_digest(wide(i))).is_empty());
+        }
+        let sender = p.cluster.member(&wide(11)).cloned().expect("a member");
+        let msg = Message::Sync {
+            from: wide(11),
+            members: vec![sender],
+        };
+        assert!(
+            p.receive("x", &msg).is_empty(),
+            "a whole view past the budget"
+        );
+    }
+
+    #[test]
+    fn the_ticks_first_answer_is_sent_whatever_its_size() {
+        // M49: about 284 KB, past the budget, and still sent -- or a view this large could
+        // never answer a joiner.
+        let mut p = crowd(3_500);
+        let out = p.receive("x", &zero_digest(wide(1)));
+        assert_eq!(parts_of(&out).concat(), view_of(&p));
+        assert!(p.receive("x", &zero_digest(wide(2))).is_empty());
+        p.tick(0);
+        assert!(!p.receive("x", &zero_digest(wide(2))).is_empty());
+    }
+
+    #[test]
+    fn answers_that_exactly_fill_the_budget_are_sent() {
+        // M49: two answers of exactly half the budget each: both go, and the next does not.
+        // Members 0-2 are 36 bytes; 3 and 4 have addresses sized so the whole view splits
+        // into two `Part`s totalling 2 x 21 + 108 + (34 + 65,344) + (34 + 65,452) = 131,014.
+        let mut c = Cluster::new(nid(0), "n0".to_owned(), "z".to_owned());
+        c.join(nid(1), "n1".to_owned(), "z".to_owned());
+        c.join(nid(2), "n2".to_owned(), "z".to_owned());
+        c.join(nid(3), "a".repeat(65_344), "z".to_owned());
+        c.join(nid(4), "b".repeat(65_452), "z".to_owned());
+        let mut p = Protocol::new(c);
+        let len =
+            |out: &[(String, Message)]| out.iter().map(|(_, m)| m.encode().len()).sum::<usize>();
+        let first = p.receive("n1", &zero_digest(nid(1)));
+        assert_eq!(len(&first), ANSWER_BUDGET / 2);
+        let second = p.receive("n2", &zero_digest(nid(2)));
+        assert_eq!(
+            len(&second),
+            ANSWER_BUDGET / 2,
+            "the budget, exactly, is within it"
+        );
+        assert!(p.receive("n3", &zero_digest(nid(3))).is_empty());
+        assert_eq!(p.budget_drops(), 1);
+    }
+
+    #[test]
+    fn a_digest_that_draws_nothing_does_not_spend_its_peers_answer() {
+        // M49: only an answer counts. A digest that agrees draws nothing, and the same peer's
+        // next digest that tick is still answered.
+        let mut p = tagged_view(0);
+        let agreeing = Message::Digest {
+            from: nid(1),
+            buckets: p.cluster.buckets().to_vec(),
+        };
+        assert!(p.receive("n1", &agreeing).is_empty());
+        assert!(!p.receive("n1", &zero_digest(nid(1))).is_empty());
+        assert_eq!(p.repeat_drops(), 0);
     }
 }

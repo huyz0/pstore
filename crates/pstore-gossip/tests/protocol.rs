@@ -358,6 +358,11 @@ fn a_lossy_network_does_not_manufacture_deaths() {
         "with every node alive and 10% loss, the worst view fell to {worst} of 100: lost \
          datagrams are being read as deaths"
     );
+    // M49: honest traffic never reaches a tick's answer budget.
+    assert!(
+        sim.nodes.iter().all(|n| n.budget_drops() == 0),
+        "an honest fleet dropped a digest for want of budget"
+    );
 }
 
 #[test]
@@ -803,6 +808,11 @@ fn bucketed_reconciliation_manufactures_no_deaths() {
         worst, 100,
         "at 10% loss with every node alive, a view fell to {worst}"
     );
+    // M49: honest traffic never reaches a tick's answer budget.
+    assert!(
+        sim.nodes.iter().all(|n| n.budget_drops() == 0),
+        "an honest fleet dropped a digest for want of budget"
+    );
 }
 
 /// Rounds from `from` until every checksum agrees and five more rounds pass with no
@@ -948,6 +958,11 @@ fn suspicion_is_what_loss_predicts() {
         "{} replies were carried past a period's wave cap",
         sim.carried
     );
+    // M49: honest traffic never reaches a tick's answer budget.
+    assert!(
+        sim.nodes.iter().all(|n| n.budget_drops() == 0),
+        "an honest fleet dropped a digest for want of budget"
+    );
 }
 
 /// `me`'s view of 40 members, all alive at incarnation 0.
@@ -1032,6 +1047,11 @@ fn a_tagged_digest_cuts_heavy_loss_at_200() {
     assert_eq!(
         worst, 200,
         "at 10% loss with every node alive, a view fell to {worst}"
+    );
+    // M49: honest traffic never reaches a tick's answer budget.
+    assert!(
+        sim.nodes.iter().all(|n| n.budget_drops() == 0),
+        "an honest fleet dropped a digest for want of budget"
     );
 }
 
