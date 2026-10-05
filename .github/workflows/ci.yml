@@ -91,6 +91,9 @@ jobs:
       # 20,000-document fixture cost 36 seconds each time -- four and a half hours across a
       # sweep.
       - run: ./scripts/depth.sh
+      # M51: the gossip cost bound per loss pattern, at every phase. Here for depth.sh's
+      # reason: 50 Sim runs take minutes, and a sweep reruns the suite per mutant.
+      - run: ./scripts/gossip-loss.sh
 
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
   # Only the second one makes 95% mean something (D-111).

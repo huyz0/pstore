@@ -36,6 +36,9 @@ struct Sim {
     bytes: u64,
     /// Fraction of datagrams dropped, as a deterministic every-Nth rather than a random draw.
     drop_every: u64,
+    /// Where in each `drop_every` datagrams the drop lands (M51): one is dropped when
+    /// `sent + phase` is a multiple of `drop_every`. 0 everywhere but the loss-curve gate.
+    phase: u64,
     sent: u64,
     /// Sent last period, delivered this one.
     in_flight: Vec<(String, String, Message)>,
@@ -75,6 +78,7 @@ impl Sim {
             by_addr,
             bytes: 0,
             drop_every: 0,
+            phase: 0,
             sent: 0,
             in_flight: Vec::new(),
             syncs: 0,
@@ -149,7 +153,7 @@ impl Sim {
                     self.tagged += 1;
                 }
                 self.bytes += msg.encode().len() as u64;
-                if self.drop_every > 0 && self.sent.is_multiple_of(self.drop_every) {
+                if self.drop_every > 0 && (self.sent + self.phase).is_multiple_of(self.drop_every) {
                     continue;
                 }
                 if let Some(&i) = self.by_addr.get(&to)
@@ -1126,4 +1130,84 @@ fn a_digest_up_to_112_members_and_a_tagged_one_past_it() {
         tags: vec![0; 256],
     };
     assert_eq!(kinds(&view(112).receive(&addr(1), &tagged)), ["part"]);
+}
+
+/// M51: bytes per node per round over 200 lossy rounds after 50 converged, at 4 waves, and
+/// whether every view stayed whole and no digest was dropped for want of budget.
+fn lossy_run(n: u16, drop_every: u64, phase: u64) -> (u64, bool) {
+    let mut sim = Sim::new(n, true);
+    sim.waves = 4;
+    for r in 0..50 {
+        sim.round(r);
+    }
+    let before = sim.bytes;
+    sim.drop_every = drop_every;
+    sim.phase = phase;
+    for r in 50..250 {
+        sim.round(r);
+    }
+    let bytes = (sim.bytes - before) / 200 / u64::from(n);
+    let whole = sim
+        .nodes
+        .iter()
+        .all(|p| p.cluster().alive().len() == usize::from(n) && p.budget_drops() == 0);
+    (bytes, whole)
+}
+
+#[test]
+#[ignore = "gate scale: ./scripts/gossip-loss.sh runs it in release (M51)"]
+fn the_loss_curve_holds_at_every_phase() {
+    // M51: a bound per (members, loss), held at EVERY phase of the drop pattern, where the
+    // suite's point test holds one. Each bound is the measured maximum over phases plus 10%:
+    // a regression guard, never moved to absorb a reading past it.
+    let rows: [(u16, u64, u64); 5] = [
+        (100, 10, 830),
+        (200, 7, 2_470),
+        (200, 10, 1_230),
+        (200, 13, 700),
+        (400, 10, 1_990),
+    ];
+    let mut spans = Vec::new();
+    for (n, d, bound) in rows {
+        let costs: Vec<u64> = (0..d)
+            .map(|phase| {
+                let (bytes, whole) = lossy_run(n, d, phase);
+                assert!(
+                    bytes <= bound,
+                    "{n} members at 1/{d}, phase {phase}: {bytes} B/node/round, bound {bound}"
+                );
+                assert!(whole, "{n} members at 1/{d}, phase {phase}: a view fell or a digest was budget-dropped");
+                bytes
+            })
+            .collect();
+        let (min, max) = (
+            costs.iter().min().copied().unwrap_or(0),
+            costs.iter().max().copied().unwrap_or(0),
+        );
+        // Phase is a real input: a `Sim` that ignored it would replay phase 0 every time.
+        assert!(max > min, "{n} members at 1/{d}: every phase cost {min}");
+        println!("{n} members at 1/{d}: {min}..{max} B/node/round over {d} phases, bound {bound}");
+        spans.push(((n, d), (min, max)));
+    }
+    // More loss costs more at every phase: at 200 members, the cheapest phase of each rate
+    // above the dearest of the next lower one.
+    let span = |n, d| {
+        spans
+            .iter()
+            .find(|(k, _)| *k == (n, d))
+            .map(|(_, s)| *s)
+            .expect("a row the ordering names is in the table")
+    };
+    assert!(
+        span(200, 7).0 > span(200, 10).1,
+        "1/7 against 1/10: {:?} {:?}",
+        span(200, 7),
+        span(200, 10)
+    );
+    assert!(
+        span(200, 10).0 > span(200, 13).1,
+        "1/10 against 1/13: {:?} {:?}",
+        span(200, 10),
+        span(200, 13)
+    );
 }
