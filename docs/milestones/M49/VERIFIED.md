@@ -31,7 +31,12 @@ before the code and seen red against it.
    - a second digest that tick is dropped;
    - one is answered after a `tick`.
    - Red before the code.
-5. **Honest traffic never reaches the budget, measured.** The four `Sim` tests
+5. ⚠️ **Corrected by [M52](../M52/SPEC.md):** measured at 200 members only. At 1,600 the
+   parent of M52 took 98,601 budget drops in 200 lossy rounds, all on the three nodes every
+   timed-out probe asked to relay; M52 spreads the relays, and its gate asserts 0 drops at 800
+   and 1,600.
+
+   **Honest traffic never reaches the budget, measured.** The four `Sim` tests
    `a_lossy_network_does_not_manufacture_deaths`,
    `bucketed_reconciliation_manufactures_no_deaths`, `suspicion_is_what_loss_predicts` and
    `a_tagged_digest_cuts_heavy_loss_at_200` now assert that every node's `budget_drops()` is 0,

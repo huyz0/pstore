@@ -1211,3 +1211,40 @@ fn the_loss_curve_holds_at_every_phase() {
         span(200, 13)
     );
 }
+
+#[test]
+#[ignore = "gate scale: ./scripts/gossip-loss.sh runs it in release (M52)"]
+fn the_cost_scales_with_the_fleet() {
+    // M52: past 400 members the leaves double with the fleet. Bounds are the prototype's
+    // figures plus 10%. The 800 row is a regression guard only: the parent's 3,445 passes it
+    // too. The 1,600 row is the one the parent (10,159 B, 391 marks) fails.
+    for (n, bound, marks_at_most) in [(800u16, 3_480u64, 100u64), (1_600, 6_740, 100)] {
+        let mut sim = Sim::new(n, true);
+        sim.waves = 4;
+        for r in 0..50 {
+            sim.round(r);
+        }
+        let before = sim.bytes;
+        sim.drop_every = 10;
+        for r in 50..250 {
+            sim.round(r);
+        }
+        let bytes = (sim.bytes - before) / 200 / u64::from(n);
+        let marks: u64 = sim.nodes.iter().map(|p| p.untagged_marks()).sum();
+        println!("{n} members at 1/10: {bytes} B/node/round, {marks} untagged marks");
+        assert!(
+            bytes <= bound,
+            "{n} members: {bytes} B/node/round, bound {bound}"
+        );
+        assert!(
+            marks <= marks_at_most,
+            "{n} members: {marks} untagged marks"
+        );
+        assert!(
+            sim.nodes
+                .iter()
+                .all(|p| p.cluster().alive().len() == usize::from(n) && p.budget_drops() == 0),
+            "{n} members: a view fell or a digest was budget-dropped"
+        );
+    }
+}

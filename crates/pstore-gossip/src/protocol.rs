@@ -86,16 +86,41 @@ const TAG_ABOVE: usize = 7 * crate::cluster::BUCKETS;
 /// whatever its tags say (M43): too few to be worth filtering.
 const LEAF_ABOVE: usize = 4;
 
+/// Members a view holds per 256 leaves before a `TaggedDigest` doubles them (M52): about 1.56
+/// a leaf. Measured at 10% loss on the `Sim`: 512 leaves at 800 members cost ~3,161 B per node
+/// per round against 3,445, and 1,024 at 1,600 ~6,122 against 10,159; 1,024 at 400 cost more
+/// (2,818 against 1,672), since tags dominate a small fleet.
+const TAG_SCALE: usize = 400;
+
+/// Leaves per bucket for a view of `len` members (M52): 16 × 2^k for the smallest k with
+/// `len ≤ TAG_SCALE × 2^k`, at most 2^7.
+fn leaves_per_bucket(len: usize) -> usize {
+    let mut k = 0;
+    while k < crate::wire::MAX_LEAF_SHIFT && len > TAG_SCALE << k {
+        k += 1;
+    }
+    crate::cluster::LEAVES_PER_BUCKET << k
+}
+
 /// How many `TaggedDigest`s a peer may leave unanswered before it is sent M34's `Digest`
 /// instead (M48). A build from before M43 decodes tag 7 to nothing; a current one always
 /// answers. Three silences in a row are ~0.7% at 10% loss (the digest or its answer lost,
 /// ~19% each), and a false mark only costs M34's price for that peer.
 const UNANSWERED: u8 = 3;
 
+/// Ticks a peer stays stepped down to 256 tags before finer ones are tried again (M52).
+/// ⚠️ The expiry is what keeps two current nodes from holding each other at 256 for good when
+/// both were stepped down by loss (code review): one tries finer, the other answers it and,
+/// having received finer tags, drops its own entry. A build from before M52 costs three
+/// unanswered digests per expiry.
+const COARSE_TICKS: u64 = 64;
+
 /// The bytes of digest answers a node sends per tick past the tick's first answer (M49):
-/// four datagrams. Honest traffic never reaches it (`budget_drops` is asserted 0 under heavy
-/// loss); a flood of digests draws at most this plus one answer a tick, where before M49 it
-/// drew a full answer per datagram.
+/// four datagrams. Honest traffic does not reach it in the `Sim` at 200, 800 or 1,600
+/// members under heavy loss (`budget_drops` asserted 0). ⚠️ At 1,600 only since M52 spread
+/// the indirect probes: before, the three relays every node asked took 98,601 drops. A flood
+/// of digests draws at most this plus one answer a tick, where before M49 it drew a full
+/// answer per datagram.
 const ANSWER_BUDGET: usize = 4 * crate::wire::MAX_DATAGRAM;
 
 /// How many changes ride along on a probe.
@@ -152,6 +177,10 @@ pub struct Protocol {
     reconciled: std::collections::BTreeSet<NodeId>,
     /// Times a peer was newly marked untagged (M50): how M48's fallback is counted.
     untagged_marks: u64,
+    /// Members stepped down to 256 tags (M52), with the tick they were: they left
+    /// [`UNANSWERED`] finer digests unanswered, as a build from before M52 does. Until they
+    /// send a finer digest, or [`COARSE_TICKS`] pass and finer tags are tried again.
+    coarse: BTreeMap<NodeId, u64>,
 }
 
 impl Protocol {
@@ -174,6 +203,7 @@ impl Protocol {
             repeat_drops: 0,
             reconciled: std::collections::BTreeSet::new(),
             untagged_marks: 0,
+            coarse: BTreeMap::new(),
         }
     }
 
@@ -362,7 +392,17 @@ impl Protocol {
                 self.mark_alive(from);
                 // M48: it reads tags, so it is no longer sent a `Digest` for want of them.
                 self.untagged.remove(from);
-                self.unanswered.remove(from);
+                // M52: but 256 tags show only that it reads 256. Its unanswered count is
+                // cleared when it reads what we send it: finer tags from it, or 256 when 256
+                // is what it is sent. ⚠️ Receiving 256 never steps a peer down by itself:
+                // that held two growing current views at 256 for good (code review).
+                if tags.len() > crate::cluster::LEAVES {
+                    self.coarse.remove(from);
+                    self.unanswered.remove(from);
+                } else if self.leaves_for(from) == crate::cluster::LEAVES_PER_BUCKET {
+                    self.unanswered.remove(from);
+                }
+                let per = tags.len() / crate::cluster::BUCKETS;
                 let send = self.leaves_to_send(buckets, tags);
                 let mut out = Vec::new();
                 // ⚠️ Answered even when nothing differs (M48): one empty `Part`, so the
@@ -372,12 +412,7 @@ impl Protocol {
                     let members = self
                         .cluster
                         .members()
-                        .filter(|m| {
-                            let leaf = crate::cluster::leaf_of(&m.id);
-                            let per = crate::cluster::LEAVES_PER_BUCKET;
-                            send.get(leaf / per)
-                                .is_some_and(|mask| mask & (1 << (leaf % per)) != 0)
-                        })
+                        .filter(|m| send.get(crate::cluster::leaf_at(&m.id, per)) == Some(&true))
                         .cloned()
                         .collect();
                     out.extend(self.parts(&addr, split(members)));
@@ -441,7 +476,8 @@ impl Protocol {
     }
 
     /// Digests dropped because a tick's answer budget was spent (M49). Honest traffic leaves
-    /// this at 0.
+    /// this at 0 in the `Sim` at 200, 800 and 1,600 members, since M52 spread the indirect
+    /// probes.
     #[must_use]
     pub fn budget_drops(&self) -> u64 {
         self.budget_drops
@@ -488,13 +524,24 @@ impl Protocol {
     /// every build since M34 answers, so a mixed-version fleet still reconciles.
     fn reconcile(&mut self, peer: &NodeId) -> Message {
         if self.cluster.len() > TAG_ABOVE && !self.untagged.contains(peer) {
+            let mut per = self.leaves_for(peer);
+            // M52: a member that left finer tags unanswered is stepped down to 256 before it
+            // is sent a `Digest`, since a build from M43 to M51 reads 256.
+            if per > crate::cluster::LEAVES_PER_BUCKET
+                && self.unanswered.get(peer) >= Some(&UNANSWERED)
+                && self.cluster.state(peer).is_some()
+            {
+                self.coarse.insert(*peer, self.tick);
+                self.unanswered.remove(peer);
+                per = crate::cluster::LEAVES_PER_BUCKET;
+            }
             let sent = self.unanswered.entry(*peer).or_insert(0);
             if *sent < UNANSWERED {
                 *sent += 1;
                 return Message::TaggedDigest {
                     from: *self.cluster.me(),
                     buckets: self.cluster.buckets().to_vec(),
-                    tags: self.cluster.leaf_tags().to_vec(),
+                    tags: self.cluster.leaf_tags_at(per),
                 };
             }
             if self.untagged.insert(*peer) {
@@ -511,39 +558,44 @@ impl Protocol {
         }
     }
 
-    /// Which leaves a `TaggedDigest` is answered with (M43): one 16-bit mask per bucket, so
-    /// the answer is one pass over the members against 256 bits, never a list searched per
-    /// member (spec review). For each bucket whose sum differs:
+    /// Leaves per bucket in a `TaggedDigest` to `peer` (M52): the view's, unless `peer` was
+    /// stepped down within the last [`COARSE_TICKS`].
+    fn leaves_for(&self, peer: &NodeId) -> usize {
+        match self.coarse.get(peer) {
+            Some(at) if self.tick - at < COARSE_TICKS => crate::cluster::LEAVES_PER_BUCKET,
+            _ => leaves_per_bucket(self.cluster.len()),
+        }
+    }
+
+    /// Which leaves a `TaggedDigest` is answered with (M43): one flag per leaf at the peer's
+    /// leaf count (M52), so the answer is one pass over the members against it, never a list
+    /// searched per member (spec review). For each bucket whose sum differs:
     /// - every leaf, when this view holds [`LEAF_ABOVE`] or fewer of its members;
     /// - every leaf, when no tag in it differs: a collision. ⚠️ So a difference the 64-bit
     ///   sums show is never left unanswered;
     /// - otherwise, the leaves whose tags differ.
-    fn leaves_to_send(&self, buckets: &[u64], tags: &[u8]) -> [u16; crate::cluster::BUCKETS] {
-        let per = crate::cluster::LEAVES_PER_BUCKET;
+    fn leaves_to_send(&self, buckets: &[u64], tags: &[u8]) -> Vec<bool> {
+        // M52: the leaf count is the peer's, read from its tags; the decoder admits only
+        // 256 × 2^k of them.
+        let per = tags.len() / crate::cluster::BUCKETS;
         let mine = self.cluster.buckets();
-        let my_tags = self.cluster.leaf_tags();
+        let my_tags = self.cluster.leaf_tags_at(per);
         let mut count = [0usize; crate::cluster::BUCKETS];
         for m in self.cluster.members() {
             if let Some(c) = count.get_mut(crate::cluster::bucket_of(&m.id)) {
                 *c += 1;
             }
         }
-        let mut send = [0u16; crate::cluster::BUCKETS];
-        for (b, mask) in send.iter_mut().enumerate() {
+        let mut send = vec![false; tags.len()];
+        for (b, leaves) in send.chunks_mut(per).enumerate() {
             if buckets.get(b) == mine.get(b) {
                 continue;
             }
-            // A sum of distinct bits, not an `|` fold (M43 sweep): over distinct bits `|` and
-            // `^` agree, so a fold is a mutant no test can kill.
-            let differing: u16 = (0..per)
-                .filter(|j| tags.get(b * per + j) != my_tags.get(b * per + j))
-                .map(|j| 1u16 << j)
-                .sum();
-            *mask = if count.get(b).copied().unwrap_or(0) <= LEAF_ABOVE || differing == 0 {
-                u16::MAX
-            } else {
-                differing
-            };
+            let differ = |j: usize| tags.get(b * per + j) != my_tags.get(b * per + j);
+            let whole = count.get(b).copied().unwrap_or(0) <= LEAF_ABOVE || !(0..per).any(differ);
+            for (j, leaf) in leaves.iter_mut().enumerate() {
+                *leaf = whole || differ(j);
+            }
         }
         send
     }
@@ -823,12 +875,32 @@ impl Protocol {
             .map(|m| (*m).clone())
     }
 
+    /// The peers asked to probe `avoid` for us: [`INDIRECT_PROBES`] consecutive members of the
+    /// live view, less this node and the target, from a start drawn from both ids and the tick
+    /// (M52).
+    /// ⚠️ Before M52 every node took the first three of its view, so the whole fleet relayed
+    /// through three nodes: at 1,600 members they spent M49's answer budget every tick, 98,601
+    /// drops in 200 rounds, and their lost answers were M48's false marks.
     fn helpers(&self, avoid: &NodeId) -> Vec<String> {
-        self.cluster
+        let me = self.cluster.me();
+        let live: Vec<&Member> = self
+            .cluster
             .alive()
             .into_iter()
-            .filter(|m| m.id != *self.cluster.me() && m.id != *avoid)
-            .take(INDIRECT_PROBES)
+            .filter(|m| m.id != *me && m.id != *avoid)
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+        let h = mix(
+            crate::cluster::fnv(me) ^ crate::cluster::fnv(avoid),
+            self.tick,
+        );
+        let start = (h % live.len() as u64) as usize;
+        live.iter()
+            .cycle()
+            .skip(start)
+            .take(INDIRECT_PROBES.min(live.len()))
             .map(|m| m.addr.clone())
             .collect()
     }
@@ -1069,17 +1141,17 @@ mod tests {
             buckets[b] ^= 1;
             let mut tags = a.cluster.leaf_tags().to_vec();
             tags[leaf] ^= 1;
+            // M52: the mask is a flag per leaf, where M43's was 16 bits a bucket; the same
+            // three facts are asserted.
             let mask = a.leaves_to_send(&buckets, &tags);
-            let want = if size <= LEAF_ABOVE {
-                u16::MAX
+            let per = crate::cluster::LEAVES_PER_BUCKET;
+            let sent: Vec<usize> = (0..mask.len()).filter(|l| mask[*l]).collect();
+            let want: Vec<usize> = if size <= LEAF_ABOVE {
+                (b * per..(b + 1) * per).collect()
             } else {
-                1 << (leaf % crate::cluster::LEAVES_PER_BUCKET)
+                vec![leaf]
             };
-            assert_eq!(mask[b], want, "a bucket of {size}");
-            assert!(
-                mask.iter().enumerate().all(|(j, m)| j == b || *m == 0),
-                "a bucket whose sums agree was sent: {mask:?}"
-            );
+            assert_eq!(sent, want, "a bucket of {size}");
         }
     }
 
@@ -1317,6 +1389,76 @@ mod tests {
             Some(State::Dead),
             "a suspect that answered was buried on the timer it answered"
         );
+    }
+
+    /// M52: every timed-out probe asked the first three members of its view, so a 1,600-member
+    /// fleet relayed through three nodes and they spent M49's budget every tick.
+    #[test]
+    fn relays_are_spread_across_the_view() {
+        let live: Vec<u8> = (1..=64).collect();
+        let mut p = protocol(&live, &[]);
+        let mut asked = std::collections::BTreeSet::new();
+        for tick in 1..=64 {
+            p.tick = tick;
+            let helpers = p.helpers(&nid(1));
+            let mut distinct = helpers.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), INDIRECT_PROBES, "tick {tick}: {helpers:?}");
+            assert!(
+                !helpers.iter().any(|h| h == "n0" || h == "n1"),
+                "tick {tick}: this node or the target asked to relay: {helpers:?}"
+            );
+            asked.extend(helpers);
+        }
+        assert!(
+            asked.len() >= 32,
+            "64 ticks asked only {} members",
+            asked.len()
+        );
+
+        let mut first = std::collections::BTreeSet::new();
+        for me in 65..=80u8 {
+            let mut c = Cluster::new(nid(me), format!("n{me}"), "az-a".to_owned());
+            for &n in &live {
+                c.join(nid(n), format!("n{n}"), "az-a".to_owned());
+            }
+            let mut q = Protocol::new(c);
+            q.tick = 7;
+            first.extend(q.helpers(&nid(1)).into_iter().take(1));
+        }
+        assert!(
+            first.len() >= 8,
+            "16 nodes chose {} first helpers",
+            first.len()
+        );
+
+        // Pinned against an independent model of the rule (Python, in the M52 ledger).
+        for (target, tick, want) in [
+            (1u8, 1u64, ["n38", "n39", "n40"]),
+            (5, 2, ["n3", "n4", "n6"]),
+            (64, 3, ["n11", "n12", "n13"]),
+            (33, 1_000, ["n20", "n21", "n22"]),
+        ] {
+            p.tick = tick;
+            assert_eq!(
+                p.helpers(&nid(target)),
+                want,
+                "target {target} at tick {tick}"
+            );
+        }
+        p.tick = 7;
+        let by_target: std::collections::BTreeSet<String> = (1..=16u8)
+            .filter_map(|t| p.helpers(&nid(t)).into_iter().next())
+            .collect();
+        assert!(
+            by_target.len() >= 8,
+            "16 targets drew {} first helpers",
+            by_target.len()
+        );
+
+        let small = protocol(&[1, 2], &[]);
+        assert_eq!(small.helpers(&nid(1)), vec!["n2".to_owned()]);
     }
 
     #[test]
@@ -1837,5 +1979,208 @@ mod tests {
         );
         p.tick(0);
         assert!(reconciles(&p.receive("n1", &mismatched(&p, 4))));
+    }
+
+    /// M52: the tag count of `p`'s `TaggedDigest` to node 1.
+    fn tag_count(p: &mut Protocol) -> usize {
+        match p.reconcile(&nid(1)) {
+            Message::TaggedDigest { tags, .. } => tags.len(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_leaf_count_follows_the_view() {
+        // `crowd(n)` holds n + 1 members.
+        for (members, tags) in [(400u16, 256), (401, 512), (800, 512), (801, 1_024)] {
+            assert_eq!(
+                tag_count(&mut crowd(members - 1)),
+                tags,
+                "{members} members"
+            );
+        }
+        // The cap: 7 doublings from 25,601 members up, never 8 (code review).
+        for (members, per) in [
+            (0usize, 16usize),
+            (25_600, 1_024),
+            (25_601, 2_048),
+            (51_200, 2_048),
+            (51_201, 2_048),
+            (usize::MAX, 2_048),
+        ] {
+            assert_eq!(leaves_per_bucket(members), per, "{members} members");
+        }
+    }
+
+    /// M52: two views of 801 members, the second holding member `m` at a newer incarnation.
+    fn differing_in(m: NodeId) -> (Protocol, Protocol) {
+        let a = crowd(800);
+        let mut b = crowd(800);
+        b.cluster.refute(&m, 1);
+        (a, b)
+    }
+
+    #[test]
+    fn a_finer_answer_sends_only_the_fine_leaf() {
+        // A member whose coarse leaf holds more of the view than its fine leaf at 1,024.
+        let a = crowd(800);
+        let ids: Vec<NodeId> = a.cluster.members().map(|m| m.id).collect();
+        let fine = |m: &NodeId| crate::cluster::leaf_at(m, 64);
+        let coarse = |m: &NodeId| crate::cluster::leaf_of(m);
+        let m = *ids
+            .iter()
+            .find(|m| {
+                let c = ids.iter().filter(|i| coarse(i) == coarse(m)).count();
+                let f = ids.iter().filter(|i| fine(i) == fine(m)).count();
+                m[..2] != [0, 0] && m[..2] != [1, 0] && c > f && c > LEAF_ABOVE
+            })
+            .expect("a member whose coarse leaf is larger");
+        let (mut a, b) = differing_in(m);
+        let mut want: Vec<NodeId> = ids
+            .iter()
+            .filter(|i| fine(i) == fine(&m))
+            .copied()
+            .collect();
+        want.sort_unstable();
+        // `b` asks `a` at its own leaf count, 1,024.
+        let digest = Protocol::new(b.cluster.clone()).reconcile(&wide(256));
+        let Message::TaggedDigest { tags, .. } = &digest else {
+            panic!("{digest:?}")
+        };
+        assert_eq!(tags.len(), 1_024);
+        let mut got: Vec<NodeId> = parts_of(&a.receive("x", &digest))
+            .concat()
+            .iter()
+            .map(|x| x.id)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, want, "the fine leaf, and nothing else");
+        // The same difference asked at 256 leaves draws the larger coarse leaf.
+        a.tick(0);
+        let coarse_digest = Message::TaggedDigest {
+            from: wide(1),
+            buckets: b.cluster.buckets().to_vec(),
+            tags: b.cluster.leaf_tags().to_vec(),
+        };
+        let coarse_n = parts_of(&a.receive("x", &coarse_digest)).concat().len();
+        assert!(coarse_n > want.len(), "{coarse_n} against {}", want.len());
+    }
+
+    /// M52: the tag count of `p`'s reconciliation with `peer`.
+    fn tags_to(p: &mut Protocol, peer: NodeId) -> usize {
+        match p.reconcile(&peer) {
+            Message::TaggedDigest { tags, .. } => tags.len(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// M52: a `TaggedDigest` from `from` carrying `p`'s own sums at `per` leaves a bucket.
+    fn digest_from(p: &Protocol, from: NodeId, per: usize) -> Message {
+        Message::TaggedDigest {
+            from,
+            buckets: p.cluster.buckets().to_vec(),
+            tags: p.cluster.leaf_tags_at(per),
+        }
+    }
+
+    #[test]
+    fn a_peer_that_leaves_finer_tags_unanswered_is_stepped_down() {
+        // M52: a build from M43 to M51 refuses more than 256 tags, but sends 256 itself.
+        let mut p = crowd(800);
+        let old = wide(1);
+        let addr = format!("{:040}", 1);
+        for _ in 0..UNANSWERED {
+            assert_eq!(tags_to(&mut p, old), 1_024);
+            // Its own 256-tag digests show only that it reads 256: the count stands.
+            let d = digest_from(&p, old, 16);
+            p.receive(&addr, &d);
+            p.tick(0);
+        }
+        assert_eq!(
+            tags_to(&mut p, old),
+            256,
+            "stepped down after three silences"
+        );
+        assert_eq!(p.untagged_marks(), 0, "stepped down, not sent a Digest");
+        // Sent 256, a 256-tag digest from it now clears the count: no Digest follows.
+        assert_eq!(tags_to(&mut p, old), 256);
+        let d = digest_from(&p, old, 16);
+        p.receive(&addr, &d);
+        for _ in 0..UNANSWERED {
+            assert_eq!(tags_to(&mut p, old), 256);
+        }
+        // A finer digest from it ends the step-down at once.
+        let fine = digest_from(&p, old, 64);
+        p.receive(&addr, &fine);
+        assert_eq!(tags_to(&mut p, old), 1_024);
+    }
+
+    #[test]
+    fn a_step_down_expires() {
+        let mut p = crowd(800);
+        // Away from 0, so the expiry is measured from the step-down, not from the start.
+        p.tick = 1_000;
+        let old = wide(1);
+        for _ in 0..UNANSWERED {
+            assert_eq!(tags_to(&mut p, old), 1_024);
+        }
+        assert_eq!(tags_to(&mut p, old), 256);
+        // Set directly: driving `tick` 64 times would probe, suspect and reconcile too.
+        let at = p.tick;
+        p.tick = at + COARSE_TICKS - 1;
+        assert_eq!(tags_to(&mut p, old), 256, "within COARSE_TICKS");
+        p.tick = at + COARSE_TICKS;
+        assert_eq!(tags_to(&mut p, old), 1_024, "finer tags tried again");
+    }
+
+    #[test]
+    fn receiving_coarse_tags_never_steps_a_peer_down() {
+        // M52 code review: a first version stepped down any peer that sent 256 tags to a view
+        // past 400, so two current views growing through 400 held each other at 256 for good.
+        let mut p = crowd(800);
+        let peer = wide(1);
+        let addr = format!("{:040}", 1);
+        for _ in 0..10 {
+            assert_eq!(tags_to(&mut p, peer), 1_024);
+            let d = digest_from(&p, peer, 16);
+            p.receive(&addr, &d);
+            p.receive(
+                &addr,
+                &Message::Part {
+                    from: peer,
+                    members: Vec::new(),
+                },
+            );
+            p.tick(0);
+        }
+        assert!(p.coarse.is_empty(), "{:?}", p.coarse);
+    }
+
+    #[test]
+    fn only_a_member_past_400_is_stepped_down() {
+        // M52 code review: the record must stay bounded by the view.
+        let mut p = crowd(800);
+        let stranger = nid(200);
+        assert!(p.cluster.state(&stranger).is_none());
+        for _ in 0..UNANSWERED {
+            assert_eq!(tags_to(&mut p, stranger), 1_024);
+        }
+        assert!(matches!(p.reconcile(&stranger), Message::Digest { .. }));
+        assert!(p.coarse.is_empty(), "{:?}", p.coarse);
+        // At 400 members there is nothing finer to step down from: M48's fallback, as before,
+        // and a 256-tag digest from the peer clears its count, as before.
+        let mut small = crowd(399);
+        let old = wide(1);
+        let addr = format!("{:040}", 1);
+        for _ in 0..UNANSWERED - 1 {
+            assert_eq!(tags_to(&mut small, old), 256);
+        }
+        let d = digest_from(&small, old, 16);
+        small.receive(&addr, &d);
+        for _ in 0..UNANSWERED {
+            assert_eq!(tags_to(&mut small, old), 256);
+        }
+        assert!(matches!(small.reconcile(&old), Message::Digest { .. }));
+        assert!(small.coarse.is_empty(), "{:?}", small.coarse);
     }
 }

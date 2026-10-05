@@ -56,14 +56,24 @@ its view at most 1.5625 members a leaf, capped at k = 7: k = 0 up to 400 members
    32,768 (a 32,913-byte message). Any other count is refused. A node from M43 to M51 refuses
    a count above 256, decoding it to nothing, so M48's fallback sends it `Digest`s once. After
    that, rule 5 keeps it on 256 tags.
-5. **A peer that sends a 256-tag digest is sent 256 tags back** while our view is over 400,
-   until it sends a finer one (spec review). Without this, a node from M43 to M51 in a fleet
-   over 400 would refuse every finer digest. M48 would mark it, its own 256-tag digest would
-   unmark it, and the cycle would repeat: three wasted ~1,169-byte digests per cycle at 1,600.
-   - The record is a set of peer ids. An entry is removed when the peer sends a finer digest.
-     Members are never removed from a view, so the set is bounded by the view.
-   - A current peer whose view is at 400 or fewer also sends 256 tags, and gets 256 tags back:
-     correct, at M43's price.
+5. **A member that leaves finer tags unanswered is stepped down to 256 tags** before M48 sends
+   it a `Digest` (amended by code review). A node from M43 to M51 refuses every finer digest
+   but reads 256; without this, M48 would mark it, its own 256-tag digest would unmark it, and
+   the cycle would repeat: three wasted ~1,169-byte digests per cycle at 1,600.
+   - **The signal is silence, not the peer's own tag count.** After `UNANSWERED` (3) finer
+     digests go unanswered, the next carries 256 tags; three more unanswered at 256 fall to
+     M48's `Digest` as before.
+   - **A 256-tag digest from a peer clears its unanswered count only when it is being sent
+     256.** A finer one clears it, and ends any step-down, at once.
+   - **A step-down lasts 64 ticks** (`COARSE_TICKS`), then finer tags are tried again: three
+     unanswered digests per 64 ticks for an old node.
+   - **Only a member is recorded**, so the record is bounded by the view: members are never
+     removed from it.
+   - ⚠️ **The first version stepped down any peer that sent 256 tags to a view over 400**
+     (code review). Two current nodes whose views grew through 112 to 400 while the other's
+     was past 400 then held each other at 256 for good: each sent 256 because the other had.
+     That is every cold start. It also recorded unvalidated sender ids without bound.
+
 6. **Every fleet of 400 or fewer keeps 256 leaves** (k = 0), and every existing test and bound
    holds. Its bytes move only through rule 7.
 
@@ -112,7 +122,8 @@ number here says what it costs.
 ## Acceptance criteria
 
 1. **The leaf count follows the view.** `reconcile` sends 256 tags at 400 members, 512 at 401 and
-   at 800, and 1,024 at 801. Test: `pstore-gossip` `protocol::tests::the_leaf_count_follows_the_view`.
+   at 800, and 1,024 at 801; the cap holds 2,048 leaves a bucket from 25,601 members up, never
+   more. Test: `pstore-gossip` `protocol::tests::the_leaf_count_follows_the_view`.
 2. **Finer leaves nest and agree.**
    - The on-demand sums at k = 0 equal the incremental `leaves()`.
    - At k = 1 and 2, every member's fine leaf maps to its coarse leaf by the parent formula
@@ -127,10 +138,19 @@ number here says what it costs.
    - the answer's members are exactly that fine leaf's;
    - a 256-tag digest to the same view is answered by the coarse leaf, which is larger.
    - Test: `protocol::tests::a_finer_answer_sends_only_the_fine_leaf`.
-4b. **An old node is sent what it reads.** A view of 801 receives a 256-tag `TaggedDigest` from a
-   peer. Its next reconciliation to that peer carries 256 tags. After the peer sends a
-   1,024-tag digest, it carries 1,024 again. Test:
-   `protocol::tests::a_peer_that_sends_coarse_tags_is_sent_coarse_tags`.
+4b. **An old node is sent what it reads, and only an old node.** A view of 801 and a member
+   peer:
+   - the peer's own 256-tag digests do not clear the count: after 3 unanswered 1,024-tag
+     digests the 4th carries 256, with no untagged mark; sent 256, a 256-tag digest from it
+     clears the count; a 1,024-tag digest from it brings 1,024 back. Test:
+     `protocol::tests::a_peer_that_leaves_finer_tags_unanswered_is_stepped_down`;
+   - 63 ticks after a step-down the peer is still sent 256, at 64 it is sent 1,024. Test:
+     `protocol::tests::a_step_down_expires`;
+   - a peer that sends 256-tag digests and answers ours is never stepped down. Test:
+     `protocol::tests::receiving_coarse_tags_never_steps_a_peer_down`;
+   - a non-member is never recorded, and at 400 members M48's fallback is unchanged. Test:
+     `protocol::tests::only_a_member_past_400_is_stepped_down`.
+
 5. **Cost at scale, measured.** A gate-scale `#[ignore]`d test, `the_cost_scales_with_the_fleet`,
    run by `scripts/gossip-loss.sh` beside M51's:
    - 800 members at 1/10, phase 0: at most **3,480 B**, the prototype's 3,161 plus 10%. ⚠️ This

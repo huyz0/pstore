@@ -120,7 +120,7 @@ pub fn bucket_of(id: &NodeId) -> usize {
     (fnv(id) % BUCKETS as u64) as usize
 }
 
-fn fnv(id: &NodeId) -> u64 {
+pub(crate) fn fnv(id: &NodeId) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in id {
         h ^= u64::from(*b);
@@ -134,9 +134,24 @@ fn fnv(id: &NodeId) -> u64 {
 /// the same reason [`bucket_of`] is: every node in a mixed fleet must compute the same one.
 #[must_use]
 pub fn leaf_of(id: &NodeId) -> usize {
+    leaf_at(id, LEAVES_PER_BUCKET)
+}
+
+/// A member's leaf when each bucket is split into `per` leaves (M52): M43's formula with
+/// `per` in place of 16, so at 16 it is [`leaf_of`].
+///
+/// ⚠️ **Finer leaves nest by low bits, not by range.** Taking `(h >> 32) mod per` keeps the
+/// low bits, so the coarse leaf of a fine one at index `c` within its bucket is
+/// `c mod per_coarse`, and a coarse leaf's children are spaced `per_coarse` apart.
+#[must_use]
+pub fn leaf_at(id: &NodeId, per: usize) -> usize {
     let h = fnv(id);
-    (h % BUCKETS as u64) as usize * LEAVES_PER_BUCKET
-        + ((h >> 32) % LEAVES_PER_BUCKET as u64) as usize
+    (h % BUCKETS as u64) as usize * per + ((h >> 32) % per as u64) as usize
+}
+
+/// A leaf sum's one-byte tag (M43).
+fn tag_of(sum: u64) -> u8 {
+    (sum.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8
 }
 
 impl Cluster {
@@ -251,8 +266,30 @@ impl Cluster {
     /// `TaggedDigest` received and allocates nothing for it.
     #[must_use]
     pub fn leaf_tags(&self) -> [u8; LEAVES] {
-        self.leaves
-            .map(|s| (s.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8)
+        self.leaves.map(tag_of)
+    }
+
+    /// The leaf sums when each bucket is split into `per` leaves (M52): the incremental 256 at
+    /// `per` 16, and otherwise one pass over the view. ⚠️ Above 16 this allocates, once per
+    /// `TaggedDigest` sent or answered: about twice a node a round.
+    #[must_use]
+    pub fn leaf_sums(&self, per: usize) -> Vec<u64> {
+        if per == LEAVES_PER_BUCKET {
+            return self.leaves.to_vec();
+        }
+        let mut sums = vec![0u64; BUCKETS * per];
+        for m in self.members.values() {
+            if let Some(s) = sums.get_mut(leaf_at(&m.id, per)) {
+                *s = s.wrapping_add(m.fingerprint());
+            }
+        }
+        sums
+    }
+
+    /// [`Self::leaf_tags`] at `per` leaves a bucket (M52).
+    #[must_use]
+    pub fn leaf_tags_at(&self, per: usize) -> Vec<u8> {
+        self.leaf_sums(per).into_iter().map(tag_of).collect()
     }
 
     /// The same value, computed from the whole set.

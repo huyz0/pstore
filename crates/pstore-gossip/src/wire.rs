@@ -92,6 +92,10 @@ const DIGEST: u8 = 5;
 const PART: u8 = 6;
 const TAGGED_DIGEST: u8 = 7;
 
+/// The most a `TaggedDigest`'s leaves are doubled (M52): 256 × 2^7 = 32,768 tags, a
+/// 32,913-byte message, inside [`MAX_DATAGRAM`].
+pub(crate) const MAX_LEAF_SHIFT: u32 = 7;
+
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -355,7 +359,18 @@ impl Message {
                 buckets: (0..crate::cluster::BUCKETS)
                     .map(|_| r.u64())
                     .collect::<Option<_>>()?,
-                tags: r.take(crate::cluster::LEAVES)?.to_vec(),
+                // M52: 256 × 2^k tags, k at most 7, read as the rest of the frame; any other
+                // count is refused, so a frame cut short is never read as a coarser digest.
+                tags: {
+                    let n = r.buf.len().checked_sub(r.at)?;
+                    if !n.is_power_of_two()
+                        || !(crate::cluster::LEAVES..=crate::cluster::LEAVES << MAX_LEAF_SHIFT)
+                            .contains(&n)
+                    {
+                        return None;
+                    }
+                    r.take(n)?.to_vec()
+                },
             },
             PART => Self::Part {
                 from: r.id()?,

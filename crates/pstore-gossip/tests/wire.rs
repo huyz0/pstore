@@ -306,3 +306,31 @@ fn tagged_digest_round_trips() {
     // Its own tag: not a `Digest`'s, nor anything an older build understands.
     assert_eq!(bytes[0], 7);
 }
+
+#[test]
+fn a_tagged_digest_carries_any_power_of_two_leaves() {
+    // M52: 256 × 2^k tags for k = 0..=7, and no other count.
+    let digest = |n: usize| Message::TaggedDigest {
+        from: id(1),
+        buckets: (0..16u64).collect(),
+        tags: (0..n).map(|i| i as u8).collect(),
+    };
+    for n in [256, 512, 1_024, 32_768] {
+        let m = digest(n);
+        assert_eq!(Message::decode(&m.encode()), Some(m), "{n} tags");
+    }
+    for n in [0, 384, 65_536] {
+        assert_eq!(
+            Message::decode(&digest(n).encode()),
+            None,
+            "{n} tags accepted"
+        );
+    }
+    let mut cut = digest(1_024).encode();
+    cut.pop();
+    assert_eq!(
+        Message::decode(&cut),
+        None,
+        "a truncated digest was read as a coarser one"
+    );
+}

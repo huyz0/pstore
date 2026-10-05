@@ -387,3 +387,31 @@ fn leaves_match_a_from_scratch_sum() {
         [65, 121, 216]
     );
 }
+
+#[test]
+fn finer_leaves_nest() {
+    // M52: the on-demand sums at 16 a bucket are M43's incremental ones, and finer leaves nest
+    // by low bits: a fine leaf's coarse leaf is its index within the bucket mod the coarse count.
+    let mut c = Cluster::new(id(0), "n0".to_owned(), "z".to_owned());
+    for n in 1..=250u8 {
+        c.join(id(n), format!("n{n}"), "z".to_owned());
+    }
+    c.declare_dead(&id(7));
+    assert_eq!(c.leaf_sums(16), c.leaves().to_vec());
+    for (coarse, fine) in [(16usize, 32usize), (16, 64), (32, 64)] {
+        let parent = |l: usize| (l / fine) * coarse + (l % fine) % coarse;
+        for n in 0..=250u8 {
+            assert_eq!(
+                parent(pstore_gossip::leaf_at(&id(n), fine)),
+                pstore_gossip::leaf_at(&id(n), coarse),
+                "member {n}, {fine} to {coarse}"
+            );
+        }
+        let (cs, fs) = (c.leaf_sums(coarse), c.leaf_sums(fine));
+        let mut folded = vec![0u64; cs.len()];
+        for (l, s) in fs.iter().enumerate() {
+            folded[parent(l)] = folded[parent(l)].wrapping_add(*s);
+        }
+        assert_eq!(folded, cs, "{fine} folded to {coarse}");
+    }
+}
