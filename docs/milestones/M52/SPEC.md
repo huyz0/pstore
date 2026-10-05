@@ -64,10 +64,46 @@ its view at most 1.5625 members a leaf, capped at k = 7: k = 0 up to 400 members
      Members are never removed from a view, so the set is bounded by the view.
    - A current peer whose view is at 400 or fewer also sends 256 tags, and gets 256 tags back:
      correct, at M43's price.
-6. **Every fleet of 400 or fewer is unchanged**, byte for byte: k = 0. That includes every
-   existing test, every bound, and M51's gate rows.
+6. **Every fleet of 400 or fewer keeps 256 leaves** (k = 0), and every existing test and bound
+   holds. Its bytes move only through rule 7.
+
+7. **Indirect probes are spread over the view** (amendment, below). A timed-out probe asks
+   three helpers from a list L: `Cluster::alive()` (which includes suspects), in id order, with
+   `me` and the target removed. Today `helpers` takes the **first three** members of every
+   view, so the whole fleet relays through the same three nodes.
+   - The first is at index `mix(fnv(me) ^ fnv(target), tick) mod |L|`; the next two follow it
+     in L, wrapping. Fewer than three only when L is shorter.
+   - `fnv` is cluster.rs's written-out FNV-1a, made `pub(crate)`, never a std hasher: the choice
+     must not change with the toolchain.
+   - The doc comments on `ANSWER_BUDGET` and `budget_drops` ("honest traffic never reaches it",
+     "leaves this at 0") are corrected to say where that was measured, and M49's
+     `VERIFIED.md` gains a correction banner on criterion 5 pointing here.
 
 **Not changed:** buckets, `Digest`, `Sync`, M44's splitting, M48 to M50.
+
+## Amendment: the relay hotspot (found by AC5)
+
+AC5's first run on the implemented change failed at 1,600 members on "no budget drops", with
+every view whole. Measured on the scratch copy, release, phase 0:
+
+- **All drops are on three nodes**, the first three in id order (nodes 0, 256 and 512): 14,541,
+  14,273 and 13,912 drops. Sampled drops show each answering 96 to 204 peers in one tick.
+- **The parent has it too**: 98,601 drops at 1,600, also with every view whole. M49's "honest
+  traffic never reaches it" was measured at 200 members, where three relays a node suffice.
+- **The cause is `helpers`**: every timed-out probe in the fleet asks the same three members to
+  relay. Their pings provoke a digest from each target whose view differs, and the answers
+  exceed M49's 262,028-byte budget. Lost answers are also M48's untagged marks: the 64 marks at
+  1,600 were this.
+- **Spread relays (rule 7), prototyped on the M52 copy**: 1,600 members, **5,885 B, 0 marks, 0
+  budget drops**, views whole; 800 members, **3,295 B, 0 marks**; every unit test passes.
+- **It moves the fleets of 400 or fewer**, so rule 6 and AC6 change. M51's bounds and orderings
+  all still hold, unmoved. Its ranges shift: 100 at 1/10, 532–631 (was 550–753); 200 at 1/7,
+  2,253–2,357 (2,139–2,245); 200 at 1/10, 910–1,072 (937–1,116); 200 at 1/13, 497–560
+  (389–629); 400 at 1/10, 1,617–1,803 (1,649–1,809).
+
+It belongs here because the gate this milestone adds cannot pass without it, on the parent or on
+the change, and the hotspot is a cost that grows with the fleet, the residue this milestone
+serves.
 
 **Not measured, and not claimed:** 10,000 members. The `Sim` takes 238 s at 1,600, and 10,000
 would take hours. The rule extends to it (k = 5, 8,192 leaves, an 8,337-byte digest), but no
@@ -102,12 +138,28 @@ number here says what it costs.
    - 1,600 members at 1/10, phase 0: at most **6,740 B**, the prototype's 6,122 plus 10%,
      against 10,159 on the parent, which fails the bound;
    - every view whole, no budget drops, and at most 100 marks at 1,600, where the parent had
-     391.
+     391 marks and 98,601 budget drops (see the amendment).
 
    The ledger records each figure measured on the parent and on the change. The runtime, about
    283 s on this container and perhaps two to three times that on a CI runner, is
    `provisional`. The byte counts are deterministic.
-6. **Nothing at 400 or fewer moves.** `./scripts/gates.sh`, and M51's
-   `./scripts/gossip-loss.sh` rows, identical to M51's ledger.
+6. **Nothing at 400 or fewer moves but the relays.** `./scripts/gates.sh` passes, and M51's
+   `./scripts/gossip-loss.sh` test passes with every bound and ordering unmoved. The ledger
+   records each row's range beside M51's.
 7. **Mutation:** the incremental sweep of the changed lines misses 0
    (`--no-config --profile mutants`). `./scripts/mutants.sh`.
+8. **Relays are spread, and pinned.** Node `nid(0)` with live members `nid(1)` to `nid(64)`:
+   - **exact helpers, from an independent Python model of rule 7** (the way M8f pinned `mix`):
+     target 1 at tick 1 asks n38, n39, n40; target 5 at tick 2 asks n3, n4, n6 (the target
+     skipped); target 64 at tick 3 asks n11, n12, n13; target 33 at tick 1,000 asks n20, n21,
+     n22;
+   - every call returns 3 distinct helpers, never `me` or the target;
+   - over ticks 1 to 64 for target 1, at least 32 distinct members are asked (model: 60; today: 3);
+   - at tick 7, 16 different askers (`nid(65)` to `nid(80)`), each with a view of `nid(1)` to
+     `nid(64)` and itself, about target 1 choose at least 8 distinct first helpers (model: 14;
+     today: 1 or 2);
+   - at tick 7, `nid(0)` asking about targets 1 to 16 chooses at least 8 distinct first
+     helpers (model: 15);
+   - a view of only `me`, the target and one other returns that one.
+   - Test: `protocol::tests::relays_are_spread_across_the_view`. The existing
+     `indirect_probes_go_to_live_peers_other_than_the_target` keeps its assertions.
