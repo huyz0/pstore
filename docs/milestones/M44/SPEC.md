@@ -1,5 +1,9 @@
 # M44 — A `Part` that fits a datagram
 
+> ⚠️ **Corrected by [M53](../M53/SPEC.md):** `MAX_DATAGRAM` is now 65,419, a UDP payload less
+> the 88-byte seal M53 reserves, and the SWIM receive buffer is `MAX_DATAGRAM + SEAL`, still
+> 65,507. Where this spec says 65,507 for the largest message, read 65,419.
+
 **Serves:** [BACKLOG](../BACKLOG.md) row 53's residue, which [M43](../M43/VERIFIED.md) narrowed:
 "a `Part` is uncapped".
 

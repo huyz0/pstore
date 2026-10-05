@@ -135,3 +135,71 @@ pub fn owns_period(raw: Option<&str>) -> u64 {
 pub fn chitchat(raw: Option<&str>) -> bool {
     raw == Some("chitchat")
 }
+
+/// The gossip key's text (M53): `PSTORE_GOSSIP_KEY`, or the file `PSTORE_GOSSIP_KEY_FILE`
+/// names, its trailing whitespace trimmed.
+///
+/// # Errors
+/// Both set, or a file that cannot be read.
+pub fn gossip_key_source(key: Option<&str>, file: Option<&str>) -> Result<Option<String>, String> {
+    match (key, file) {
+        (Some(_), Some(_)) => {
+            Err("set PSTORE_GOSSIP_KEY or PSTORE_GOSSIP_KEY_FILE, not both".to_owned())
+        }
+        (Some(k), None) => Ok(Some(k.to_owned())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(|s| Some(s.trim_end().to_owned()))
+            .map_err(|e| format!("PSTORE_GOSSIP_KEY_FILE {path}: {e}")),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The gossip keys (M53): one or two, hex, comma-separated, each at least 32 bytes. The first
+/// seals and either opens, so a key rotates through a running fleet in three passes.
+///
+/// ⚠️ **No key is refused** unless `insecure` is exactly `"1"`: an unauthenticated fleet
+/// believes any datagram, and that is a choice to make out loud, not a default to inherit.
+///
+/// # Errors
+/// No key and no `"1"`; a key with chitchat, which cannot honour it; and a malformed key.
+pub fn gossip_keys(
+    key: Option<&str>,
+    insecure: Option<&str>,
+    chitchat: bool,
+) -> Result<Option<Vec<Vec<u8>>>, String> {
+    let Some(text) = key else {
+        return if insecure == Some("1") {
+            Ok(None)
+        } else {
+            Err("gossip needs PSTORE_GOSSIP_KEY or PSTORE_GOSSIP_KEY_FILE, \
+                 or PSTORE_GOSSIP_INSECURE=1 to run unauthenticated"
+                .to_owned())
+        };
+    };
+    if chitchat {
+        return Err("PSTORE_GOSSIP_KEY is SWIM's: chitchat cannot seal".to_owned());
+    }
+    let keys: Vec<Vec<u8>> = text
+        .split(',')
+        .map(|k| hex(k.trim()))
+        .collect::<Option<_>>()
+        .ok_or("PSTORE_GOSSIP_KEY: not hex")?;
+    if keys.len() > 2 {
+        return Err("PSTORE_GOSSIP_KEY: at most two keys".to_owned());
+    }
+    if keys.iter().any(|k| k.len() < 32) {
+        return Err("PSTORE_GOSSIP_KEY: each key at least 32 bytes, 64 hex digits".to_owned());
+    }
+    Ok(Some(keys))
+}
+
+/// `text` as bytes, two hex digits each; `None` for anything else.
+fn hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}

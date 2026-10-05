@@ -43,6 +43,11 @@ refuses to start unless it is told explicitly to run unauthenticated.**
    - All integers little-endian. Verified with `ring::hmac::verify`, which is constant-time,
      before any other field is read.
 2. **Freshness:** a `time` more than 60 s from the receiver's clock, either way, is refused.
+   - **And a `time` before the receiver's own epoch is refused** (amended by code review). A
+     node keeps its id across a restart, and its replay table does not survive one, so a
+     datagram captured in the minute before a restart would otherwise be believed again
+     after it. The cost: a sender whose clock runs s behind the receiver's is refused for s
+     after the receiver starts.
 3. **Destination:** a frame whose `dest` is not the receiver's own id is refused. Without it,
    a datagram captured on its way to X and replayed to Y within 60 s would carry a counter Y
    has never seen, and be accepted (spec review).
@@ -50,7 +55,9 @@ refuses to start unless it is told explicitly to run unauthenticated.**
    - a reply to the source address of a datagram just opened is for that datagram's `sealer`,
      verified by the seal. That holds when the observed source differs from the sender's
      advertised address (NAT, a `0.0.0.0` bind);
-   - any other datagram is for the member the view holds at that address;
+   - any other datagram is for the member the view holds at that address, one not declared
+     dead first (amended by code review: a seed joined under a derived id can share an
+     address with the id the node really has);
    - failing that, `derive_id(address)`, as seeds are joined today.
    - ⚠️ So a node dialled by an address other than the one it advertises cannot be reached by
      a keyed fleet until it dials first. That is the assumption `derive_id` already makes for
@@ -65,8 +72,9 @@ refuses to start unless it is told explicitly to run unauthenticated.**
    - **Each datagram is sealed immediately before its own `send_to`**, never a batch sealed
      ahead. So datagrams reordered by up to 63 sends are accepted, including the receiver and
      ticker tasks sealing for the same peer concurrently.
-   - **At most 2 live epochs a sealer.** A third replaces the one with the oldest newest
-     `time`. A restart overlaps its old epoch, which no honest sender needs more than that.
+   - **At most 2 live epochs a sealer.** A third replaces the lower of the two, and an epoch
+     lower than both is refused and replaces nothing (amended by code review: evicting by
+     newest `time` could set the floor above a live epoch). A restart overlaps its old epoch, which no honest sender needs more than that.
    - **An epoch floor a sealer:** the highest epoch evicted so far. An epoch at or below it
      is refused, so a datagram of an evicted epoch, still fresh, cannot open a new entry
      (spec review). Epochs are start times, so they rise across restarts. The floor goes with
@@ -139,13 +147,19 @@ refuses to start unless it is told explicitly to run unauthenticated.**
    - Test: `seal::tests::a_seal_opens_only_unaltered_under_its_key`.
 2. **Freshness.** A `time` 60 s either side of the receiver's clock opens, and 60 s plus 1 µs
    does not. Test: `seal::tests::a_stale_seal_is_refused`.
+   - A `time` 1 µs before the receiver's epoch is refused, and one at it opens. Tests:
+     `seal::tests::a_frame_sealed_before_this_node_started_is_refused`, and over a socket,
+     `a_frame_sealed_before_the_node_started_is_refused`.
 3. **Replay.** For one `(sealer, epoch)`:
    - each counter is accepted once;
    - counters arriving out of order, 1 to 63 below the highest, are accepted once each, 63
      included;
    - 64 below the highest is refused;
-   - a third epoch of one sealer evicts the oldest of its two, and a datagram of the evicted
-     epoch is then refused, as is any epoch below it;
+   - a third epoch of one sealer evicts the lower of its two, and a datagram of the evicted
+     epoch is then refused, as is any epoch below it, also once a sweep has left the sealer a
+     single live epoch (`seal::tests::an_evicted_epoch_stays_refused_when_its_sealer_holds_one`);
+   - an epoch lower than both live ones is refused and evicts nothing
+     (`seal::tests::an_epoch_older_than_both_live_ones_evicts_nothing`);
    - a second epoch of the same sealer has its own window, so a restart is accepted;
    - two sealers sealing the same `from` (a relayed `Ack`) do not share a window.
    - Test: `seal::tests::a_replay_is_refused_and_reordering_within_the_window_is_not`.
@@ -153,7 +167,8 @@ refuses to start unless it is told explicitly to run unauthenticated.**
    - a reply to the source of a datagram sealed by S, from an address whose `derive_id` is
      not S, is for S;
    - a datagram to an address the view holds is for that member;
-   - one to an unknown address is for `derive_id` of it.
+   - one to an unknown address is for `derive_id` of it;
+   - of two members at one address, the one not declared dead; both dead, the first.
    - Test: `seal::tests::a_reply_is_sealed_for_its_verified_sender`, or the transport's
      equivalent.
 4. **The table shrinks.** An entry whose newest `time` is more than 60 s old is evicted by the
@@ -166,8 +181,9 @@ refuses to start unless it is told explicitly to run unauthenticated.**
      0. Test: `a_member_with_another_key_is_refused`;
    - a keyed node refuses an unkeyed one, and an unkeyed node refuses a keyed one. Test:
      `keyed_and_unkeyed_members_refuse_each_other`;
-   - a node holding the old and new keys gossips with a node holding only the old one. Test:
-     `a_second_key_lets_a_rotation_roll`;
+   - rotation pass 1, a node holding the old and new keys beside one holding only the old,
+     and pass 2, one sealing with the new key beside one sealing with the old, each holding
+     both: both pairs meet. Test: `a_second_key_lets_a_rotation_roll`;
    - **the largest datagram arrives:** a sealed `Part` of exactly `MAX_DATAGRAM` bytes,
      65,507 sealed, sent from a raw socket and sealed for that node, adds its member to a keyed node's view. Test:
      `the_largest_sealed_part_is_received`.

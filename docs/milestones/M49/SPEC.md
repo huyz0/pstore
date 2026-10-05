@@ -1,5 +1,9 @@
 # M49 — A digest cannot draw unbounded answers
 
+> ⚠️ **Corrected by [M53](../M53/SPEC.md):** `MAX_DATAGRAM` is now 65,419, so `ANSWER_BUDGET` is
+> 4 × 65,419 = 261,676 bytes, not 262,028. The exact-fill test sizes its members from the
+> constant.
+
 **Serves:** [BACKLOG](../BACKLOG.md) row 53's residue, "a garbage digest draws the member list",
 which [M44](../M44/VERIFIED.md) made deliverable rather than dropped. The project owner chose
 to bound it on 2026-10-04, before closing the row.

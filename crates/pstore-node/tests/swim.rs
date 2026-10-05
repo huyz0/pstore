@@ -13,6 +13,7 @@
 //! accounting — and it is the part that shipped a hostname to `SocketAddr::parse` in M4b and
 //! killed every node in the fleet at startup. A mocked transport would have been happy.
 
+use pstore_node::seal::{self, Header, Keys};
 use pstore_node::swim;
 use std::time::Duration;
 
@@ -192,4 +193,246 @@ async fn two_members_in_two_zones_learn_each_others_zone() {
         ma.members_zoned().await,
         mb.members_zoned().await
     );
+}
+
+// ---- M53: sealed gossip ------------------------------------------------------------------
+
+/// Keys of 32 bytes each, every byte the given one: `keyed(&[8, 7])` seals with 8.
+fn keyed(k: &[u8]) -> Option<Keys> {
+    Keys::new(&k.iter().map(|b| vec![*b; 32]).collect::<Vec<_>>())
+}
+
+async fn member_keyed(port: u16, seeds: &[String], keys: Option<Keys>) -> swim::Member {
+    let addr = format!("127.0.0.1:{port}");
+    swim::start_with(&addr, &addr, "az-a", seeds, 0.0, FAST, keys)
+        .await
+        .expect("a member must start on loopback")
+}
+
+/// Whether `a` and `b` both count two members within 100 periods.
+async fn meet(a: &swim::Member, b: &swim::Member) -> bool {
+    for _ in 0..100 {
+        if a.member_count().await == 2 && b.member_count().await == 2 {
+            return true;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    false
+}
+
+/// Whether `a` stays alone for 2 s, refusing what it is sent.
+async fn stays_alone(a: &swim::Member) -> bool {
+    for _ in 0..40 {
+        if a.member_count().await != 1 {
+            return false;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn keyed_members_find_each_other() {
+    let (pa, pb) = (free_port(), free_port());
+    let a = member_keyed(pa, &[], keyed(&[7])).await;
+    let b = member_keyed(pb, &[format!("127.0.0.1:{pa}")], keyed(&[7])).await;
+    assert!(meet(&a, &b).await, "keyed members never met");
+    assert_eq!(a.refused(), 0);
+    assert_eq!(b.refused(), 0);
+}
+
+#[tokio::test]
+async fn a_member_with_another_key_is_refused() {
+    let (pa, pb) = (free_port(), free_port());
+    let a = member_keyed(pa, &[], keyed(&[7])).await;
+    let _b = member_keyed(pb, &[format!("127.0.0.1:{pa}")], keyed(&[8])).await;
+    assert!(stays_alone(&a).await, "a member with another key joined");
+    assert!(a.refused() > 0, "nothing was refused");
+}
+
+#[tokio::test]
+async fn keyed_and_unkeyed_members_refuse_each_other() {
+    let (pa, pb) = (free_port(), free_port());
+    let a = member_keyed(pa, &[], keyed(&[7])).await;
+    let _b = member_keyed(pb, &[format!("127.0.0.1:{pa}")], None).await;
+    assert!(
+        stays_alone(&a).await,
+        "an unkeyed member joined a keyed one"
+    );
+    assert!(a.refused() > 0, "nothing was refused");
+
+    let (pc, pd) = (free_port(), free_port());
+    let c = member_keyed(pc, &[], None).await;
+    let _d = member_keyed(pd, &[format!("127.0.0.1:{pc}")], keyed(&[7])).await;
+    assert!(
+        stays_alone(&c).await,
+        "a keyed member joined an unkeyed one"
+    );
+}
+
+#[tokio::test]
+async fn a_second_key_lets_a_rotation_roll() {
+    // Pass 1: the new key added second, beside a node that holds only the old.
+    let (pa, pb) = (free_port(), free_port());
+    let a = member_keyed(pa, &[], keyed(&[7, 8])).await;
+    let b = member_keyed(pb, &[format!("127.0.0.1:{pa}")], keyed(&[7])).await;
+    assert!(meet(&a, &b).await, "pass 1 split the fleet");
+    // Pass 2: one node already seals with the new key, the other still with the old, and each
+    // opens the other's with its second key.
+    let (pa, pb) = (free_port(), free_port());
+    let a = member_keyed(pa, &[], keyed(&[8, 7])).await;
+    let b = member_keyed(pb, &[format!("127.0.0.1:{pa}")], keyed(&[7, 8])).await;
+    assert!(meet(&a, &b).await, "a rotating fleet split");
+    assert_eq!(a.refused(), 0);
+}
+
+#[test]
+fn a_reply_is_sealed_for_its_verified_sender() {
+    let mut view = pstore_gossip::Cluster::new([0; 16], "10.0.0.1:7946".to_owned(), "z".to_owned());
+    view.join([5; 16], "10.0.0.5:7946".to_owned(), "z".to_owned());
+    // A reply to the source of a datagram sealed by S is for S, whatever that address says.
+    let s = [9; 16];
+    assert_eq!(
+        swim::dest_for("192.0.2.1:1", Some(("192.0.2.1:1", s)), &view),
+        s
+    );
+    // Anything else: the member the view holds there, else the id the address derives.
+    assert_eq!(
+        swim::dest_for("10.0.0.5:7946", Some(("192.0.2.1:1", s)), &view),
+        [5; 16]
+    );
+    assert_eq!(swim::dest_for("10.0.0.5:7946", None, &view), [5; 16]);
+    let unknown = swim::dest_for("10.0.0.6:7946", None, &view);
+    assert_ne!(unknown, [0; 16]);
+    assert_ne!(unknown, [5; 16]);
+    let empty = pstore_gossip::Cluster::new([0; 16], "x".to_owned(), "z".to_owned());
+    assert_eq!(
+        swim::dest_for("10.0.0.6:7946", None, &empty),
+        unknown,
+        "derived, not looked up"
+    );
+    // Two ids at one address, the lower declared dead: the live one (code review).
+    view.join([3; 16], "10.0.0.5:7946".to_owned(), "z".to_owned());
+    view.declare_dead(&[3; 16]);
+    assert_eq!(swim::dest_for("10.0.0.5:7946", None, &view), [5; 16]);
+    // Both dead: still the one there, not a derived id nobody holds.
+    view.declare_dead(&[5; 16]);
+    assert_eq!(swim::dest_for("10.0.0.5:7946", None, &view), [3; 16]);
+}
+
+#[tokio::test]
+async fn the_largest_sealed_part_is_received() {
+    // ⚠️ A receive buffer of `MAX_DATAGRAM` truncates this, and its seal fails (spec review).
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let a = member_keyed(port, &[], keyed(&[7])).await;
+    let empty = pstore_gossip::Cluster::new([0; 16], "x".to_owned(), "z".to_owned());
+    let dest = swim::dest_for(&addr, None, &empty);
+    // A `Part` of exactly `MAX_DATAGRAM` bytes: one member whose address fills it.
+    let part = |len: usize| pstore_gossip::Message::Part {
+        from: [3; 16],
+        members: vec![pstore_gossip::Member {
+            addr: "a".repeat(len),
+            ..pstore_gossip::Cluster::new([4; 16], String::new(), "z".to_owned())
+                .members()
+                .next()
+                .expect("a cluster holds itself")
+                .clone()
+        }],
+    };
+    let base = part(0).encode().len();
+    let msg = part(pstore_gossip::MAX_DATAGRAM - base);
+    let payload = msg.encode();
+    assert_eq!(payload.len(), pstore_gossip::MAX_DATAGRAM);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let h = Header {
+        sealer: [3; 16],
+        dest,
+        epoch: now,
+        counter: 0,
+        time: now,
+    };
+    let frame = seal::seal(keyed(&[7]).as_ref().unwrap(), &payload, &h);
+    assert_eq!(frame.len(), 65_507);
+    let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    raw.send_to(&frame, &addr).unwrap();
+    // Waits for the `Part`'s own member by address: counting members would see the sender
+    // learned too, and then each probed to death (code review).
+    let long = "a".repeat(pstore_gossip::MAX_DATAGRAM - base);
+    for _ in 0..100 {
+        if a.members().await.contains(&long) {
+            assert_eq!(a.refused(), 0);
+            return;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    panic!(
+        "the largest sealed datagram never arrived: {} refused",
+        a.refused()
+    );
+}
+
+#[tokio::test]
+async fn a_frame_sealed_before_the_node_started_is_refused() {
+    // Code review: a node keeps its id across a restart, and its replay table does not, so a
+    // frame captured in the minute before must not be believed after.
+    let micros = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let before = micros();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let a = member_keyed(port, &[], keyed(&[7])).await;
+    let empty = pstore_gossip::Cluster::new([0; 16], "x".to_owned(), "z".to_owned());
+    let msg = pstore_gossip::Message::Part {
+        from: [3; 16],
+        members: vec![
+            pstore_gossip::Cluster::new([4; 16], "10.9.9.9:1".to_owned(), "z".to_owned())
+                .members()
+                .next()
+                .expect("a cluster holds itself")
+                .clone(),
+        ],
+    };
+    let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let send = |time: u64, counter: u64| {
+        let h = Header {
+            sealer: [3; 16],
+            dest: swim::dest_for(&addr, None, &empty),
+            epoch: before,
+            counter,
+            time,
+        };
+        let frame = seal::seal(keyed(&[7]).as_ref().unwrap(), &msg.encode(), &h);
+        raw.send_to(&frame, &addr).unwrap();
+    };
+    send(before, 0);
+    for _ in 0..20 {
+        if a.refused() == 1 {
+            break;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    assert_eq!(
+        a.refused(),
+        1,
+        "a frame sealed before the node started was not refused"
+    );
+    assert!(!a.members().await.contains(&"10.9.9.9:1".to_owned()));
+    // The same, sealed now, is believed.
+    send(micros(), 1);
+    for _ in 0..100 {
+        if a.members().await.contains(&"10.9.9.9:1".to_owned()) {
+            return;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    panic!("a fresh frame was refused: {} refused", a.refused());
 }

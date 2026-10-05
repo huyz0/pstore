@@ -105,6 +105,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ⚠️ No default. A node with no zone joins the wrong cell, and joining the wrong cell is
     // silent: placement still answers, and every cross-AZ byte is billed.
     let zone = policy::zone_from_env()?;
+    let chitchat = schedule::chitchat(std::env::var("PSTORE_GOSSIP").ok().as_deref());
+    // M53: SWIM seals every datagram under the cluster key, or runs unauthenticated only when
+    // told to in so many words. Read before any network work, so a bad key refuses at once.
+    let keys = schedule::gossip_keys(
+        schedule::gossip_key_source(
+            std::env::var("PSTORE_GOSSIP_KEY").ok().as_deref(),
+            std::env::var("PSTORE_GOSSIP_KEY_FILE").ok().as_deref(),
+        )?
+        .as_deref(),
+        std::env::var("PSTORE_GOSSIP_INSECURE").ok().as_deref(),
+        chitchat,
+    )?;
+    if keys.is_none() {
+        println!("GOSSIP unauthenticated: PSTORE_GOSSIP_INSECURE=1");
+    }
     let cell = pstore_cluster::Cell::new(&cluster, &zone);
     let node_id = env("PSTORE_NODE_ID", &fresh_node_id());
     let listen = env("PSTORE_GOSSIP_ADDR", "0.0.0.0:7946");
@@ -144,12 +159,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ⚠️ Both protocols stay runnable, on one harness, deliberately. Replacing a membership
     // layer and measuring only the replacement compares two runs rather than two protocols —
     // and every difference in the host, the harness or the day lands in the result.
-    let handle = if schedule::chitchat(std::env::var("PSTORE_GOSSIP").ok().as_deref()) {
+    let handle = if chitchat {
         Membership::Chitchat(
             gossip::start(&node_id, &listen, &advertise, &seeds, loss, period).await?,
         )
     } else {
-        Membership::Swim(swim::start(&listen, &advertise, &zone, &seeds, loss, period).await?)
+        let keys = keys.as_deref().and_then(pstore_node::seal::Keys::new);
+        Membership::Swim(
+            swim::start_with(&listen, &advertise, &zone, &seeds, loss, period, keys).await?,
+        )
     };
     // ⚠️ The address gossip reports for THIS node, not the name it was configured with.
     // chitchat advertises a resolved `SocketAddr`, so peers see `10.0.0.7:7946` while the

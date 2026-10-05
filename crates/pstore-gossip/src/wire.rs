@@ -80,9 +80,16 @@ pub enum Message {
     },
 }
 
-/// The largest message this crate puts on the wire (M44): a UDP payload over IPv4. A
-/// reader's buffer is this size, and an answer that would exceed it is split into `Part`s.
-pub const MAX_DATAGRAM: usize = 65_507;
+/// Bytes a transport may add after a message (M53): `pstore-node`'s seal, two ids, three
+/// `u64`s and an HMAC-SHA256 tag. Reserved whether or not the transport seals, so a message
+/// never depends on the transport's configuration to fit.
+pub const SEAL: usize = 16 + 16 + 8 + 8 + 8 + 32;
+
+/// The largest message this crate puts on the wire (M44): a UDP payload over IPv4, less
+/// [`SEAL`] (M53). An answer that would exceed it is split into `Part`s. A reader's buffer is
+/// `MAX_DATAGRAM + SEAL`: ⚠️ a buffer of `MAX_DATAGRAM` truncates a full sealed datagram, whose
+/// seal then fails (spec review).
+pub const MAX_DATAGRAM: usize = 65_507 - SEAL;
 
 const PING: u8 = 1;
 const ACK: u8 = 2;

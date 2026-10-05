@@ -13,7 +13,10 @@
 //! in `main`, where no gate could see it, under a comment saying it had been fixed.
 
 use pstore_node::policy::jitter;
-use pstore_node::schedule::{Cadence, Clock, Tick, chitchat, owns_period, periods, probe_loss};
+use pstore_node::schedule::{
+    Cadence, Clock, Tick, chitchat, gossip_key_source, gossip_keys, owns_period, periods,
+    probe_loss,
+};
 use pstore_node::{DEFAULT_GOSSIP_PERIOD, HEAL_PERIOD};
 use std::time::Duration;
 
@@ -133,4 +136,63 @@ fn settings_fall_back_as_main_did() {
     for other in [None, Some("swim"), Some(""), Some("Chitchat")] {
         assert!(!chitchat(other), "{other:?}");
     }
+}
+
+#[test]
+fn a_gossip_key_is_required_well_formed_and_swim_only() {
+    // M53.
+    let k32 = "ab".repeat(32);
+    let other = "cd".repeat(32);
+    assert_eq!(
+        gossip_keys(Some(&k32), None, false),
+        Ok(Some(vec![vec![0xab; 32]]))
+    );
+    let two = format!("{k32}, {other}");
+    assert_eq!(
+        gossip_keys(Some(&two), None, false),
+        Ok(Some(vec![vec![0xab; 32], vec![0xcd; 32]]))
+    );
+    assert_eq!(
+        gossip_keys(Some(&"AB".repeat(40)), None, false),
+        Ok(Some(vec![vec![0xab; 40]]))
+    );
+    for bad in [
+        "ab".repeat(31),
+        format!("{k32}a"),
+        format!("{}zz", "ab".repeat(32)),
+        format!("+f{}", "ab".repeat(32)),
+        format!("{k32},{k32},{k32}"),
+        format!("{k32},"),
+        String::new(),
+    ] {
+        assert!(gossip_keys(Some(&bad), None, false).is_err(), "{bad:?}");
+    }
+    assert!(
+        gossip_keys(Some(&k32), None, true).is_err(),
+        "chitchat cannot seal"
+    );
+    assert!(
+        gossip_keys(None, None, false).is_err(),
+        "no key, no opt-out"
+    );
+    assert_eq!(gossip_keys(None, Some("1"), false), Ok(None));
+    assert_eq!(gossip_keys(None, Some("1"), true), Ok(None));
+    for no in ["true", "0", "yes", ""] {
+        assert!(gossip_keys(None, Some(no), false).is_err(), "{no:?}");
+    }
+    assert!(gossip_key_source(Some(&k32), Some("/x")).is_err(), "both");
+    assert_eq!(gossip_key_source(Some(&k32), None), Ok(Some(k32.clone())));
+    assert_eq!(gossip_key_source(None, None), Ok(None));
+}
+
+#[test]
+fn a_gossip_key_file_is_read_and_trimmed() {
+    // M53.
+    let k32 = "ab".repeat(32);
+    let path = std::env::temp_dir().join(format!("pstore-gossip-key-{}", std::process::id()));
+    std::fs::write(&path, format!("{k32}\n")).unwrap();
+    let got = gossip_key_source(None, path.to_str());
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(got, Ok(Some(k32)));
+    assert!(gossip_key_source(None, path.to_str()).is_err(), "gone");
 }

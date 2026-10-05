@@ -1,5 +1,8 @@
 # M52 — Leaves scaled to the fleet
 
+> ⚠️ **Corrected by [M53](../M53/SPEC.md):** M49's budget, quoted here as 262,028 bytes, is
+> 261,676 since M53 reserved its seal out of `MAX_DATAGRAM`.
+
 **Serves:** the gossip residue the project owner asked to address on 2026-10-05: "scale with fleet
 size". [M43](../M43/VERIFIED.md) fixed 256 leaves, and row 53 named "leaves scaled to the
 fleet" as the move when a fleet reaches the size where this binds.

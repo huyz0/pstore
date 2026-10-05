@@ -114,6 +114,13 @@ up)
   # ⚠️ Started in parallel batches. `docker run` costs ~200ms of daemon time, so 1,000
   # sequential starts is six minutes of the measurement window spent launching -- and the
   # first node then sits alone for six minutes, which is a partition the test manufactured.
+  # M53: SWIM seals its gossip under a key, here a fixed development one; chitchat cannot
+  # seal, and runs unauthenticated only because it is told to.
+  if [ "${GOSSIP:-swim}" = chitchat ]; then
+    gossip_auth="PSTORE_GOSSIP_INSECURE=1"
+  else
+    gossip_auth="PSTORE_GOSSIP_KEY=$(printf 'de%.0s' $(seq 32))"
+  fi
   start_one() {
     i="$1"
     port=$((7946 + i))
@@ -125,6 +132,7 @@ up)
       -e PSTORE_OWNS_PERIOD_S="${OWNS_S:-5}" \
       -e PSTORE_POLL_PERIOD_MS="${POLL_MS:-0}" \
       -e PSTORE_GOSSIP="${GOSSIP:-swim}" \
+      -e "$gossip_auth" \
       -e PSTORE_GOSSIP_ADDR="0.0.0.0:$port" \
       -e PSTORE_ADVERTISE="127.0.0.1:$port" \
       -e PSTORE_S3_ENDPOINT="http://127.0.0.1:$STORE_PORT" \

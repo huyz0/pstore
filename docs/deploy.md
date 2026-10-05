@@ -218,6 +218,14 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_SOURCE_<NAME>_ACCESS_KEY` / `_SECRET_KEY` | the provider's credential chain | Both or neither; half a pair is refused. |
 | `PSTORE_SOURCE_<NAME>_REGION` | `us-east-1` | |
 
+`pstore-node`'s gossip ([M53](milestones/M53/SPEC.md)):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PSTORE_GOSSIP_KEY` | — | One or two keys, hex, comma-separated, each at least 32 bytes (64 hex digits). Every SWIM datagram is sealed with the first under HMAC-SHA256, and one that does not open under either, is for another node, is over 60 s off this node's clock or sealed before this node started, or is a replay, is refused. **Rotation** is three rolling passes: add the new key second, move it first, drop the old. |
+| `PSTORE_GOSSIP_KEY_FILE` | — | The same, read from a file; trailing whitespace is ignored. Setting both refuses to start. |
+| `PSTORE_GOSSIP_INSECURE` | — | ⚠️ **With no key, a node refuses to start** unless this is exactly `1`. Then gossip believes any datagram, as before M53. Required with `PSTORE_GOSSIP=chitchat`, which cannot seal and refuses a key. Turning the key on in a running unauthenticated fleet splits it until every node has restarted. |
+
 ## Observability
 
 `GET /metrics` serves Prometheus text: blob requests and bytes by class, HTTP responses by

@@ -1572,10 +1572,11 @@ mod tests {
 
     #[test]
     fn a_part_of_exactly_the_datagram_is_one_part() {
-        // M44: two members whose `Part` is exactly 65,507 bytes travel together; one byte
-        // more and they travel apart. Node 1 is 36 bytes; node 0 the rest.
+        // M44: two members whose `Part` is exactly `MAX_DATAGRAM` bytes travel together; one
+        // byte more and they travel apart. Node 1 is 36 bytes; node 0 the rest. ⚠️ Sized from
+        // the constant since M53 reserved the seal out of it: a literal 65,507 went stale.
         for (extra, parts) in [(0, 1), (1, 2)] {
-            let addr = "a".repeat(65_507 - 21 - 36 - 34 + extra);
+            let addr = "a".repeat(crate::wire::MAX_DATAGRAM - 21 - 36 - 34 + extra);
             let mut c = Cluster::new(nid(0), addr, "z".to_owned());
             c.join(nid(1), "n1".to_owned(), "z".to_owned());
             let mut p = Protocol::new(c);
@@ -1901,12 +1902,22 @@ mod tests {
     fn answers_that_exactly_fill_the_budget_are_sent() {
         // M49: two answers of exactly half the budget each: both go, and the next does not.
         // Members 0-2 are 36 bytes; 3 and 4 have addresses sized so the whole view splits
-        // into two `Part`s totalling 2 x 21 + 108 + (34 + 65,344) + (34 + 65,452) = 131,014.
+        // into two `Part`s of exactly `MAX_DATAGRAM` each: 21 + 108 + (34 + a) and 21 + (34 + b).
+        // ⚠️ Sized from the constant since M53 (spec review): with the old literals, member 4's
+        // own `Part` outgrew the smaller datagram and could not be sent at all.
         let mut c = Cluster::new(nid(0), "n0".to_owned(), "z".to_owned());
         c.join(nid(1), "n1".to_owned(), "z".to_owned());
         c.join(nid(2), "n2".to_owned(), "z".to_owned());
-        c.join(nid(3), "a".repeat(65_344), "z".to_owned());
-        c.join(nid(4), "b".repeat(65_452), "z".to_owned());
+        c.join(
+            nid(3),
+            "a".repeat(crate::wire::MAX_DATAGRAM - 21 - 108 - 34),
+            "z".to_owned(),
+        );
+        c.join(
+            nid(4),
+            "b".repeat(crate::wire::MAX_DATAGRAM - 21 - 34),
+            "z".to_owned(),
+        );
         let mut p = Protocol::new(c);
         let len =
             |out: &[(String, Message)]| out.iter().map(|(_, m)| m.encode().len()).sum::<usize>();
