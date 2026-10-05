@@ -148,6 +148,10 @@ pub struct Protocol {
     budget_drops: u64,
     /// Digests dropped because their peer was already answered this tick (M49).
     repeat_drops: u64,
+    /// Peers reconciled with this tick (M50), on either path. Cleared by `tick`.
+    reconciled: std::collections::BTreeSet<NodeId>,
+    /// Times a peer was newly marked untagged (M50): how M48's fallback is counted.
+    untagged_marks: u64,
 }
 
 impl Protocol {
@@ -168,6 +172,8 @@ impl Protocol {
             spent: 0,
             budget_drops: 0,
             repeat_drops: 0,
+            reconciled: std::collections::BTreeSet::new(),
+            untagged_marks: 0,
         }
     }
 
@@ -187,6 +193,8 @@ impl Protocol {
         self.tick += 1;
         // M49: a new tick's answer budget, and every peer may be answered once more.
         self.answered.clear();
+        // M50: and every peer may be reconciled with once more.
+        self.reconciled.clear();
         self.spent = 0;
         let mut out = Vec::new();
 
@@ -247,8 +255,9 @@ impl Protocol {
                         },
                     ));
                     // ⚠️ Only on disagreement. Sending state alongside every ack is what makes
-                    // a checksum decorative.
-                    if *checksum != self.cluster.checksum() {
+                    // a checksum decorative. And once a tick per peer (M50): a second digest
+                    // carries the same state, is dropped by M49, and left M48 a false count.
+                    if *checksum != self.cluster.checksum() && self.reconciled.insert(*from) {
                         out.push((addr, self.reconcile(from)));
                     }
                 }
@@ -291,7 +300,8 @@ impl Protocol {
                                 updates: evidence,
                             },
                         ));
-                    } else if *checksum != self.cluster.checksum() {
+                    } else if *checksum != self.cluster.checksum() && self.reconciled.insert(*from)
+                    {
                         out.push((addr, self.reconcile(from)));
                     }
                 }
@@ -439,11 +449,19 @@ impl Protocol {
 
     /// Digests dropped because their peer had been answered that tick (M49). The two carry
     /// the same state, so nothing is lost -- but a dropped repeat can leave one on M48's
-    /// unanswered count, so false `untagged` marks rose from 37 to 74 over the 200-member
-    /// heavy-loss run (code review): bounded, and correct, at M34's price.
+    /// unanswered count: false `untagged` marks rose from 37 to 74 over the 200-member
+    /// heavy-loss run (M49's code review). M50 sends a peer one reconciliation a tick, which
+    /// took that run to 15 repeats and 1 mark.
     #[must_use]
     pub fn repeat_drops(&self) -> u64 {
         self.repeat_drops
+    }
+
+    /// Times a peer was newly marked untagged, M48's fallback (M50). Every current build
+    /// reads tags, so in a fleet of them each mark is false.
+    #[must_use]
+    pub fn untagged_marks(&self) -> u64 {
+        self.untagged_marks
     }
 
     /// `chunks` to `addr`, one `Part` each (M44).
@@ -479,7 +497,9 @@ impl Protocol {
                     tags: self.cluster.leaf_tags().to_vec(),
                 };
             }
-            self.untagged.insert(*peer);
+            if self.untagged.insert(*peer) {
+                self.untagged_marks += 1;
+            }
         }
         if self.cluster.len() > RECONCILE_WHOLE_UP_TO {
             Message::Digest {
@@ -1567,14 +1587,21 @@ mod tests {
     #[test]
     fn a_peer_that_never_answers_tags_is_sent_a_digest() {
         let mut p = tagged_view(0);
-        let kinds = |p: &mut Protocol, seq| match reconciled(&p.receive("n1", &mismatched(p, seq)))
-        {
+        // M50: each mismatch is a round, so a tick before each: a peer is reconciled once a
+        // tick.
+        let kinds = |p: &mut Protocol, seq| match reconciled(&{
+            p.tick(0);
+            p.receive("n1", &mismatched(p, seq))
+        }) {
             Message::TaggedDigest { .. } => "tagged",
             Message::Digest { .. } => "digest",
             other => panic!("{other:?}"),
         };
-        let first: Vec<_> = (1..=4).map(|seq| kinds(&mut p, seq)).collect();
+        let first: Vec<_> = (1..=3).map(|seq| kinds(&mut p, seq)).collect();
+        assert_eq!(p.untagged_marks(), 0, "marked before its fourth silence");
+        let first: Vec<_> = first.into_iter().chain([kinds(&mut p, 4)]).collect();
         assert_eq!(first, ["tagged", "tagged", "tagged", "digest"]);
+        assert_eq!(p.untagged_marks(), 1);
         // Marked: an answer to the `Digest` does not unmark it...
         p.receive(
             "n1",
@@ -1594,6 +1621,8 @@ mod tests {
     fn an_answering_peer_keeps_its_tags() {
         let mut p = tagged_view(0);
         for seq in 1..=10 {
+            // M50: each mismatch is a round, and a peer is reconciled once a tick.
+            p.tick(0);
             assert!(
                 matches!(
                     reconciled(&p.receive("n1", &mismatched(&p, seq))),
@@ -1763,5 +1792,50 @@ mod tests {
         assert!(p.receive("n1", &agreeing).is_empty());
         assert!(!p.receive("n1", &zero_digest(nid(1))).is_empty());
         assert_eq!(p.repeat_drops(), 0);
+    }
+
+    #[test]
+    fn a_peer_is_reconciled_once_a_tick() {
+        // M50: one reconciliation a peer a tick, whichever path the mismatch arrives on.
+        let reconciles = |out: &[(String, Message)]| {
+            out.iter().any(|(_, m)| {
+                matches!(
+                    m,
+                    Message::TaggedDigest { .. } | Message::Digest { .. } | Message::Sync { .. }
+                )
+            })
+        };
+        let mut p = tagged_view(0);
+        let wrong = p.cluster.checksum().wrapping_add(1);
+        assert!(reconciles(&p.receive("n1", &mismatched(&p, 1))));
+        // The case that left M49's marks: the same peer's `Ack`, mismatched, that tick.
+        let ack = Message::Ack {
+            from: nid(1),
+            seq: 99,
+            checksum: wrong,
+            updates: Vec::new(),
+        };
+        assert!(
+            !reconciles(&p.receive("n1", &ack)),
+            "the Ack path reconciled again"
+        );
+        let again = p.receive("n1", &mismatched(&p, 2));
+        assert!(!reconciles(&again));
+        assert!(
+            again.iter().any(|(_, m)| matches!(m, Message::Ack { .. })),
+            "a ping is still acked"
+        );
+        let other = Message::Ping {
+            from: nid(2),
+            seq: 3,
+            checksum: wrong,
+            updates: Vec::new(),
+        };
+        assert!(
+            reconciles(&p.receive("n2", &other)),
+            "another peer, the same tick"
+        );
+        p.tick(0);
+        assert!(reconciles(&p.receive("n1", &mismatched(&p, 4))));
     }
 }

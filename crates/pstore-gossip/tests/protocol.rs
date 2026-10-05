@@ -1053,6 +1053,10 @@ fn a_tagged_digest_cuts_heavy_loss_at_200() {
         sim.nodes.iter().all(|n| n.budget_drops() == 0),
         "an honest fleet dropped a digest for want of budget"
     );
+    // M50: one reconciliation a peer a tick leaves M48 almost nothing to mark falsely. The
+    // parent marked 74 current peers over this run; the change measured 1.
+    let marks: u64 = sim.nodes.iter().map(|n| n.untagged_marks()).sum();
+    assert!(marks <= 5, "{marks} current peers marked untagged");
 }
 
 #[test]
