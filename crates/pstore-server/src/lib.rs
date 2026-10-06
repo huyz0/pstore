@@ -33,7 +33,7 @@ mod peers;
 mod replication;
 mod session;
 mod types;
-pub use peers::PeerConfig;
+pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
@@ -659,7 +659,57 @@ impl<S: BlobStore + 'static> Api<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// This query's view of the peers, when there are any (M54).
+    /// Takes the peer list from a SWIM membership this server runs (M56): its member declares
+    /// `config.url` as its zone, and once a period the list becomes every member whose zone is
+    /// a server's URL. Until the first refresh the list is this server alone.
+    ///
+    /// The returned handle keeps the member and the refresh running; dropping it, or
+    /// [`PeerGossip::stop`], ends both.
+    ///
+    /// # Errors
+    /// Peers already set, by a list or an earlier call (code review: a second cluster would
+    /// reset the counters and orphan the first refresh); no HTTP client for the peers; or a
+    /// member that cannot start (its address in use).
+    pub async fn join_peers(&self, config: GossipConfig) -> Result<PeerGossip, ConfigError> {
+        if self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return Err(ConfigError::Peers(
+                "PSTORE_PEER_GOSSIP_ADDR",
+                config.listen,
+                "this server's peers are set already: a static list or gossip, once",
+            ));
+        }
+        let cluster = Arc::new(peers::Cluster::new(PeerConfig {
+            servers: vec![config.url.clone()],
+            me: 0,
+            timeout: config.timeout,
+        })?);
+        let gossip = PeerGossip::start(&config, Arc::clone(&cluster)).await?;
+        *self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cluster);
+        Ok(gossip)
+    }
+
+    /// The peer list a query would take now (M56's tests); empty when unpeered.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn peer_list(&self) -> Vec<String> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|c| c.list().servers.clone())
+            .unwrap_or_default()
+    }
+
+    /// This query's view of the peers, when there are any (M54): one snapshot of the list,
+    /// which every share of the query then reads (M56).
     fn query_peers(&self, tenant: TenantId, req: &QueryRequest) -> Option<peers::QueryPeers> {
         let cluster = self
             .peers
@@ -667,6 +717,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()?;
         Some(peers::QueryPeers {
+            list: cluster.list(),
             cluster,
             tenant,
             filters: req.filters.clone(),
@@ -1060,18 +1111,24 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
-    // M54: parts of queries sent to peers, those that failed, and those run for peers.
-    let (sent, failed) = api
+    // M54: parts of queries sent to peers, those that failed, and those run for peers. M56:
+    // and how many servers the list holds now, this one included.
+    let (sent, failed, servers) = api
         .peers
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .map_or((0, 0), |c| {
+        .map_or((0, 0, 1), |c| {
             (
                 c.sent.load(std::sync::atomic::Ordering::Relaxed),
                 c.failed.load(std::sync::atomic::Ordering::Relaxed),
+                c.list().servers.len(),
             )
         });
+    out.push_str(&format!(
+        "# HELP pstore_peer_servers Servers a query may split across now, this one included.\n\
+         # TYPE pstore_peer_servers gauge\npstore_peer_servers {servers}\n"
+    ));
     out.push_str(&format!(
         "# HELP pstore_peer_parts_sent Parts of this server's queries sent to peers (M54).\n\
          # TYPE pstore_peer_parts_sent counter\npstore_peer_parts_sent {sent}\n\
@@ -3253,6 +3310,8 @@ pub struct Config {
     pub engines: usize,
     /// The servers a query's vector legs may run on, from `PSTORE_PEERS` (M54).
     pub peers: Option<PeerConfig>,
+    /// Or a SWIM membership to take them from, `PSTORE_PEER_GOSSIP_*` (M56).
+    pub gossip: Option<GossipConfig>,
 }
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
@@ -3509,6 +3568,7 @@ impl Config {
             lane_recheck: reap_age(&get)? / 2,
             cache: cache_config(&get, backend)?,
             peers: PeerConfig::from_vars(&get)?,
+            gossip: GossipConfig::from_vars(&get)?,
             replication: replication_policy(&get)?,
             sources: source_configs(&get)?,
             engines: match get("PSTORE_ENGINES") {

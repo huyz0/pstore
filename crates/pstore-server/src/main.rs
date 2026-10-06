@@ -143,6 +143,17 @@ async fn run<S: BlobStore + 'static>(
         eprintln!("pstore-server: refusing to serve: {e}");
         return std::process::ExitCode::FAILURE;
     }
+    // M56: or from a SWIM membership of its own, held for the life of the process.
+    let _gossip = match config.gossip.clone() {
+        None => None,
+        Some(g) => match api.join_peers(g).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("pstore-server: refusing to serve: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+    };
     let mut sources = std::collections::BTreeMap::new();
     for s in &config.sources {
         match source(s) {

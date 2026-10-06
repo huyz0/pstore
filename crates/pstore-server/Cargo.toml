@@ -19,6 +19,8 @@ pstore-index  = { path = "../pstore-index" }
 pstore-query  = { path = "../pstore-query" }
 pstore-types  = { path = "../pstore-types" }
 pstore-jobs   = { path = "../pstore-jobs" }
+# M56: a server's own SWIM member, and the gossip key read as pstore-node reads it.
+pstore-node   = { path = "../pstore-node" }
 # ⚠️ `axum` lives here and nowhere else, by the same argument that confines `object_store`
 # to `pstore-blob`: a transport in a library crate is a transport every crate above it
 # inherits, and the engine must stay callable without one.

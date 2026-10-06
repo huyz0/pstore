@@ -88,12 +88,38 @@ bit, and the depth stays at four rounds.
 - **Every server lists every server,** itself included, and `PSTORE_PEER_SELF` names which one
   it is. Both or neither, or the server refuses to start. The list is static: a server added
   is a restart of the others.
+- **Or the list comes from gossip** ([M56](milestones/M56/SPEC.md)). With
+  `PSTORE_PEER_GOSSIP_ADDR` set, each server runs a SWIM member of its own. The member declares
+  `PSTORE_PEER_SELF` as its URL, and once a period the list becomes every member whose
+  declared URL is a server's. This replaces `PSTORE_PEERS`, and setting both is refused.
+  - **Addresses are IP literals with a port.** A hostname is refused: a member first heard by
+    probe is held at its source address, so a name and its IP would be two members. Behind NAT
+    or in a container, set `PSTORE_PEER_GOSSIP_ADVERTISE` to the address the others reach. An
+    unspecified (`0.0.0.0`, `::`) or port-0 advertise address is refused.
+  - **Open the UDP gossip port between servers.** Gossip is sealed under
+    `PSTORE_GOSSIP_KEY`, as `pstore-node`'s is (M53); `PSTORE_GOSSIP_INSECURE=1` runs it
+    unsealed. ⚠️ Unsealed, any datagram can add a URL to every list, and queries' shares,
+    tenant filters included, are then sent to it.
+  - **A new server takes segments** once the others' views hold it, usually within a few
+    periods. **A server that dies is sent shares until it is declared dead**: about 14 periods
+    (14 s at the default 1 s). Each of those shares fails, counted in
+    `pstore_peer_parts_failed`, and runs on the coordinator. There is no graceful leave.
+  - **Seeds are static** (`PSTORE_PEER_GOSSIP_SEEDS`); the first server may have none.
+  - A wrong `PSTORE_PEER_SELF` puts an unreachable URL in every list, and every share sent to
+    it fails.
+  - Sharing a key with `pstore-node` puts the servers in that fleet's `member_count`. Nodes
+    never place work on them: no node's zone is a URL.
+  - Membership is a hint, never correctness. Two servers whose views differ for a moment
+    assign a segment differently, and both answer exactly.
 - **A segment's scan always lands on the same server,** so with `PSTORE_CACHE_DIR` set, a large
   index's segments stay warm across the fleet rather than each in every cache.
 - **A peer that is down, slow or on another build costs rounds, never answers.** The
   coordinator runs that share itself after `PSTORE_PEER_TIMEOUT_MS`, and counts it in
   `pstore_peer_parts_failed`.
 - **Not split:** `sum` fusion, `order_by`, aggregations, `as_of`, and indexes of one segment.
+- **`pstore_peer_servers`** is the list's length now, this server included (1 when unpeered).
+  Read it beside `pstore_peer_parts_failed`: a count that holds while failures rise is a
+  server still listed but no longer answering.
 - **A peer holds a text query's opened segments between its two exchanges:** at most 10 s,
   256 parts and about 256 MiB, oldest out first, counted in `pstore_peer_parts_expired`.
 - ⚠️ `POST /v1/internal/part` authenticates its caller no more than the public API does: keep
@@ -244,6 +270,11 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_PEERS` | — | Every server's base URL, comma-separated, this one included (M54, above). |
 | `PSTORE_PEER_SELF` | — | This server's URL, as it appears in `PSTORE_PEERS`. Both or neither. |
 | `PSTORE_PEER_TIMEOUT_MS` | `2000` | How long a peer has to answer a share before this server runs it itself. |
+| `PSTORE_PEER_GOSSIP_ADDR` | — | The UDP `ip:port` this server's gossip member listens on (M56). With it, `PSTORE_PEER_SELF` alone names this server, and `PSTORE_PEERS` is refused. |
+| `PSTORE_PEER_GOSSIP_ADVERTISE` | the listen address | The `ip:port` the others reach this member on. Never unspecified, never port 0. |
+| `PSTORE_PEER_GOSSIP_SEEDS` | — | `ip:port`s of members to join first, comma-separated. |
+| `PSTORE_PEER_GOSSIP_PERIOD_MS` | `1000` | The SWIM period. A dead server is dropped from the list after about 14. |
+| `PSTORE_GOSSIP_KEY` / `PSTORE_GOSSIP_KEY_FILE` | — | The cluster key, as `pstore-node` reads it (M53). Required with gossip unless `PSTORE_GOSSIP_INSECURE=1`. |
 
 `pstore-node`'s gossip ([M53](milestones/M53/SPEC.md)):
 

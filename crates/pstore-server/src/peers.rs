@@ -70,21 +70,11 @@ impl PeerConfig {
         let refuse = |var: &'static str, v: &str, why: &'static str| {
             ConfigError::Peers(var, v.to_owned(), why)
         };
-        let timeout = match get("PSTORE_PEER_TIMEOUT_MS") {
-            None => DEFAULT_TIMEOUT,
-            Some(v) => match v.parse::<u64>() {
-                Ok(ms) if ms > 0 => Duration::from_millis(ms),
-                _ => {
-                    return Err(refuse(
-                        "PSTORE_PEER_TIMEOUT_MS",
-                        &v,
-                        "a positive number of milliseconds",
-                    ));
-                }
-            },
-        };
+        let timeout = timeout_of(&get)?;
         let (list, me) = match (get("PSTORE_PEERS"), get("PSTORE_PEER_SELF")) {
             (None, None) => return Ok(None),
+            // M56: a server that gossips names only itself; `GossipConfig` reads the rest.
+            (None, Some(_)) if get("PSTORE_PEER_GOSSIP_ADDR").is_some() => return Ok(None),
             (Some(list), Some(me)) => (list, me),
             (Some(list), None) => {
                 return Err(refuse(
@@ -108,10 +98,7 @@ impl PeerConfig {
             .collect();
         // ⚠️ Plain HTTP only (code review): this build's client has no TLS, so an `https://`
         // peer would fail every part at run time, counted, instead of here.
-        if let Some(bad) = servers.iter().find(|s| {
-            s.strip_prefix("http://")
-                .is_none_or(|rest| rest.is_empty() || rest.contains('/'))
-        }) {
+        if let Some(bad) = servers.iter().find(|s| peer_url(s).is_none()) {
             return Err(refuse(
                 "PSTORE_PEERS",
                 bad,
@@ -138,10 +125,269 @@ impl PeerConfig {
     }
 }
 
+/// `PSTORE_PEER_TIMEOUT_MS`, or the default.
+fn timeout_of(get: &impl Fn(&str) -> Option<String>) -> Result<Duration, ConfigError> {
+    match get("PSTORE_PEER_TIMEOUT_MS") {
+        None => Ok(DEFAULT_TIMEOUT),
+        Some(v) => match v.parse::<u64>() {
+            Ok(ms) if ms > 0 => Ok(Duration::from_millis(ms)),
+            _ => Err(ConfigError::Peers(
+                "PSTORE_PEER_TIMEOUT_MS",
+                v,
+                "a positive number of milliseconds",
+            )),
+        },
+    }
+}
+
+/// `s` as a server's URL, `http://host:port` without a trailing `/`; `None` for anything else
+/// (M54's rule, and M56's filter on a member's zone).
+fn peer_url(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('/');
+    let rest = s.strip_prefix("http://")?;
+    (!rest.is_empty() && !rest.contains('/')).then(|| s.to_owned())
+}
+
+/// A server's peers from a SWIM membership of its own (M56): `PSTORE_PEER_SELF` and the
+/// `PSTORE_PEER_GOSSIP_*` variables, read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipConfig {
+    /// This server's URL, which its member declares as its zone.
+    pub url: String,
+    /// The UDP address to listen on, normalised.
+    pub listen: String,
+    /// The UDP address to advertise, normalised: an IP, never unspecified, never port 0.
+    pub advertise: String,
+    /// Members to join first, normalised.
+    pub seeds: Vec<String>,
+    /// The SWIM period.
+    pub period: Duration,
+    /// The cluster keys (M53), or `None` with `PSTORE_GOSSIP_INSECURE=1`.
+    pub keys: Option<Vec<Vec<u8>>>,
+    /// How long a peer has to answer a part, as M54's.
+    pub timeout: Duration,
+}
+
+impl GossipConfig {
+    /// The gossip configuration from the environment, or `None` when there is none.
+    ///
+    /// # Errors
+    /// Each refusal of M56's rule 1: beside `PSTORE_PEERS`, without `PSTORE_PEER_SELF`, a
+    /// gossip variable without `PSTORE_PEER_GOSSIP_ADDR`, an address that is not an IP literal
+    /// with a port, an unroutable advertise address, a bad period, and the key's refusals.
+    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let refuse = |var: &'static str, v: &str, why: &'static str| {
+            ConfigError::Peers(var, v.to_owned(), why)
+        };
+        let Some(listen) = get("PSTORE_PEER_GOSSIP_ADDR") else {
+            for var in [
+                "PSTORE_PEER_GOSSIP_ADVERTISE",
+                "PSTORE_PEER_GOSSIP_SEEDS",
+                "PSTORE_PEER_GOSSIP_PERIOD_MS",
+            ] {
+                if let Some(v) = get(var) {
+                    return Err(refuse(var, &v, "set PSTORE_PEER_GOSSIP_ADDR too"));
+                }
+            }
+            return Ok(None);
+        };
+        if let Some(list) = get("PSTORE_PEERS") {
+            return Err(refuse(
+                "PSTORE_PEERS",
+                &list,
+                "a static list or gossip, never both",
+            ));
+        }
+        let url = get("PSTORE_PEER_SELF").ok_or_else(|| {
+            refuse(
+                "PSTORE_PEER_GOSSIP_ADDR",
+                &listen,
+                "set PSTORE_PEER_SELF too: the URL this server's member declares",
+            )
+        })?;
+        let url = peer_url(&url).ok_or_else(|| {
+            refuse(
+                "PSTORE_PEER_SELF",
+                &url,
+                "this server is http://host:port: no TLS, no path",
+            )
+        })?;
+        // ⚠️ IP literals only (spec review): a member first heard by probe is held at its
+        // source address, so a name and its IP would be two members. Re-displayed, so two
+        // spellings of one IP are one.
+        let addr = |var: &'static str, v: &str| {
+            v.trim()
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| refuse(var, v, "an IP address and a port, never a hostname"))
+        };
+        let listen_at = addr("PSTORE_PEER_GOSSIP_ADDR", &listen)?;
+        let (advertise_var, advertise_at) = match get("PSTORE_PEER_GOSSIP_ADVERTISE") {
+            Some(v) => (
+                "PSTORE_PEER_GOSSIP_ADVERTISE",
+                addr("PSTORE_PEER_GOSSIP_ADVERTISE", &v)?,
+            ),
+            // Code review: name the variable the operator set, not one they never did.
+            None => (
+                "PSTORE_PEER_GOSSIP_ADDR (advertised, as PSTORE_PEER_GOSSIP_ADVERTISE is unset)",
+                listen_at,
+            ),
+        };
+        if advertise_at.ip().is_unspecified() || advertise_at.port() == 0 {
+            return Err(refuse(
+                advertise_var,
+                &advertise_at.to_string(),
+                "unroutable, and every server would derive the same identity from it: set an \
+                 address the others can reach",
+            ));
+        }
+        let seeds = match get("PSTORE_PEER_GOSSIP_SEEDS") {
+            None => Vec::new(),
+            Some(v) => v
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| addr("PSTORE_PEER_GOSSIP_SEEDS", s).map(|a| a.to_string()))
+                .collect::<Result<_, _>>()?,
+        };
+        let period = match get("PSTORE_PEER_GOSSIP_PERIOD_MS") {
+            None => Duration::from_millis(1_000),
+            Some(v) => match v.parse::<u64>() {
+                Ok(ms) if ms > 0 => Duration::from_millis(ms),
+                _ => {
+                    return Err(refuse(
+                        "PSTORE_PEER_GOSSIP_PERIOD_MS",
+                        &v,
+                        "a positive number of milliseconds",
+                    ));
+                }
+            },
+        };
+        // The key, read by `pstore-node`'s own functions, with their refusals (M53).
+        let key = pstore_node::schedule::gossip_key_source(
+            get("PSTORE_GOSSIP_KEY").as_deref(),
+            get("PSTORE_GOSSIP_KEY_FILE").as_deref(),
+        )
+        .map_err(|e| ConfigError::Peers("PSTORE_GOSSIP_KEY", e, "the gossip key"))?;
+        let keys = pstore_node::schedule::gossip_keys(
+            key.as_deref(),
+            get("PSTORE_GOSSIP_INSECURE").as_deref(),
+            false,
+        )
+        .map_err(|e| ConfigError::Peers("PSTORE_GOSSIP_KEY", e, "the gossip key"))?;
+        Ok(Some(Self {
+            url,
+            listen: listen_at.to_string(),
+            advertise: advertise_at.to_string(),
+            seeds,
+            period,
+            keys,
+            timeout: timeout_of(&get)?,
+        }))
+    }
+}
+
+/// The peer list a view gives (M56): every member whose zone is a server's URL, and `me`;
+/// deduplicated and sorted; with `me`'s position. A member with another zone -- a
+/// `pstore-node` on the same key, or one whose zone gossip has not filled yet -- is no server.
+#[must_use]
+pub fn peer_list_of(members: &[(String, String)], me: &str) -> (Vec<String>, usize) {
+    let me = peer_url(me).unwrap_or_else(|| me.to_owned());
+    let mut list: Vec<String> = members
+        .iter()
+        .filter_map(|(_, zone)| peer_url(zone))
+        .chain(std::iter::once(me.clone()))
+        .collect();
+    list.sort();
+    list.dedup();
+    let at = list.iter().position(|s| *s == me).unwrap_or(0);
+    (list, at)
+}
+
+/// The servers a query may split across, and which one is this (M56: swapped whole, so a
+/// query reads one list however the view moves).
+#[derive(Debug)]
+pub(crate) struct List {
+    pub(crate) servers: Vec<String>,
+    pub(crate) me: usize,
+}
+
+/// A server's own SWIM member and the task that refreshes its peer list from it (M56).
+pub struct PeerGossip {
+    member: Arc<pstore_node::swim::Member>,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl PeerGossip {
+    /// Starts the member, declaring `config.url` as its zone, and the refresh, once a period.
+    pub(crate) async fn start(
+        config: &GossipConfig,
+        cluster: Arc<Cluster>,
+    ) -> Result<Self, ConfigError> {
+        let keys = config
+            .keys
+            .as_deref()
+            .and_then(pstore_node::seal::Keys::new);
+        let member = Arc::new(
+            pstore_node::swim::start_with(
+                &config.listen,
+                &config.advertise,
+                &config.url,
+                &config.seeds,
+                0.0,
+                config.period,
+                keys,
+            )
+            .await
+            .map_err(|e| {
+                ConfigError::Peers(
+                    "PSTORE_PEER_GOSSIP_ADDR",
+                    format!("{}: {e}", config.listen),
+                    "the gossip member did not start",
+                )
+            })?,
+        );
+        let refresh = {
+            let (member, url, period) = (Arc::clone(&member), config.url.clone(), config.period);
+            tokio::spawn(async move {
+                loop {
+                    let view = member.members_zoned().await;
+                    let (servers, me) = peer_list_of(&view, &url);
+                    cluster.set_list(List { servers, me });
+                    tokio::time::sleep(period).await;
+                }
+            })
+        };
+        Ok(Self { member, refresh })
+    }
+
+    /// Stops the refresh and the member; the member's port is free when this returns. The
+    /// others declare this server dead by timeout: there is no leave message.
+    pub async fn stop(&self) {
+        self.refresh.abort();
+        self.member.stop().await;
+    }
+}
+
+impl Drop for PeerGossip {
+    fn drop(&mut self) {
+        // The refresh holds the member: once it is gone, so is the member, and with it its
+        // tasks (M56.1).
+        self.refresh.abort();
+    }
+}
+
+impl std::fmt::Debug for PeerGossip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerGossip")
+            .field("member", &self.member.self_addr())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The peers, a client to reach them, and what `GET /metrics` reports of them.
 #[derive(Debug)]
 pub(crate) struct Cluster {
-    config: PeerConfig,
+    /// Swapped by the membership refresh (M56); a static list never moves.
+    list: std::sync::RwLock<Arc<List>>,
     client: reqwest::Client,
     pub(crate) sent: AtomicU64,
     pub(crate) failed: AtomicU64,
@@ -163,10 +409,31 @@ impl Cluster {
             })?;
         Ok(Self {
             client,
-            config,
+            list: std::sync::RwLock::new(Arc::new(List {
+                servers: config.servers,
+                me: config.me,
+            })),
             sent: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         })
+    }
+
+    /// The list now: one snapshot, for one query.
+    pub(crate) fn list(&self) -> Arc<List> {
+        Arc::clone(
+            &self
+                .list
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Replaces the list (M56). The client and the counters stay.
+    pub(crate) fn set_list(&self, list: List) {
+        *self
+            .list
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(list);
     }
 }
 
@@ -174,17 +441,19 @@ impl Cluster {
 /// not -- the tenant, and the filter as the client wrote it.
 pub(crate) struct QueryPeers {
     pub(crate) cluster: Arc<Cluster>,
+    /// The list as it was when this query began (M56).
+    pub(crate) list: Arc<List>,
     pub(crate) tenant: TenantId,
     pub(crate) filters: Option<serde_json::Value>,
 }
 
 impl Peers for QueryPeers {
     fn servers(&self) -> &[String] {
-        &self.cluster.config.servers
+        &self.list.servers
     }
 
     fn me(&self) -> usize {
-        self.cluster.config.me
+        self.list.me
     }
 
     fn part(
@@ -193,8 +462,8 @@ impl Peers for QueryPeers {
         part: Part,
     ) -> futures_util::future::BoxFuture<'static, Result<PartHits, String>> {
         let cluster = Arc::clone(&self.cluster);
-        let url = cluster
-            .config
+        let url = self
+            .list
             .servers
             .get(server)
             .map(|s| format!("{s}/v1/internal/part"));
@@ -214,7 +483,7 @@ impl Peers for QueryPeers {
 
     fn phased(&self, server: usize, part: Part) -> Phased {
         let cluster = Arc::clone(&self.cluster);
-        let base = cluster.config.servers.get(server).cloned();
+        let base = self.list.servers.get(server).cloned();
         let url = base.as_ref().map(|s| format!("{s}/v1/internal/part"));
         let body = serde_json::to_vec(&WirePart::opening(&part, self.filters.clone()));
         let tenant = self.tenant;
@@ -1250,15 +1519,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_phase_says_why() {
+        let cluster = Arc::new(
+            Cluster::new(PeerConfig {
+                servers: vec!["http://127.0.0.1:1".to_owned()],
+                me: 0,
+                timeout: Duration::from_secs(1),
+            })
+            .unwrap(),
+        );
         let peers = QueryPeers {
-            cluster: Arc::new(
-                Cluster::new(PeerConfig {
-                    servers: vec!["http://127.0.0.1:1".to_owned()],
-                    me: 0,
-                    timeout: Duration::from_secs(1),
-                })
-                .unwrap(),
-            ),
+            list: cluster.list(),
+            cluster,
             tenant: TenantId(7),
             filters: None,
         };

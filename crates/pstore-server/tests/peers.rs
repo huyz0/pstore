@@ -1086,3 +1086,438 @@ async fn a_part_never_scanned_expires_without_more_traffic() {
     tokio::time::advance(Duration::from_secs(11)).await;
     assert_eq!(metric(&server.api, "pstore_peer_parts_expired").await, 1);
 }
+
+// ---- M56: the peer list from membership ----
+
+const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let map: std::collections::HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    move |k| map.get(k).cloned()
+}
+
+#[test]
+fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
+    use pstore_server::GossipConfig;
+    let base = [
+        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080/"),
+        ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
+        ("PSTORE_GOSSIP_KEY", KEY),
+    ];
+    let g = GossipConfig::from_vars(vars(&base)).unwrap().unwrap();
+    assert_eq!(g.url, "http://10.0.0.1:8080");
+    assert_eq!(
+        (g.listen.as_str(), g.advertise.as_str()),
+        ("10.0.0.1:7000", "10.0.0.1:7000")
+    );
+    assert!(g.seeds.is_empty());
+    assert_eq!(g.period, Duration::from_millis(1_000));
+    assert_eq!(g.keys.as_ref().map(Vec::len), Some(1));
+    assert_eq!(g.timeout, Duration::from_millis(2_000));
+    // ... and the static list is then not configured, nor refused for a lone PSTORE_PEER_SELF.
+    assert_eq!(PeerConfig::from_vars(vars(&base)).unwrap(), None);
+
+    let mut all = base.to_vec();
+    all.extend([
+        ("PSTORE_PEER_GOSSIP_ADDR", "0.0.0.0:7000"),
+        ("PSTORE_PEER_GOSSIP_ADVERTISE", "[0:0:0:0:0:0:0:1]:7000"),
+        (
+            "PSTORE_PEER_GOSSIP_SEEDS",
+            " 10.0.0.2:7000, [0:0:0:0:0:0:0:1]:7001 ,",
+        ),
+        ("PSTORE_PEER_GOSSIP_PERIOD_MS", "250"),
+        ("PSTORE_PEER_TIMEOUT_MS", "900"),
+    ]);
+    let g = GossipConfig::from_vars(vars(&all)).unwrap().unwrap();
+    assert_eq!(g.listen, "0.0.0.0:7000");
+    // Normalised: two spellings of one address are one member.
+    assert_eq!(g.advertise, "[::1]:7000");
+    assert_eq!(
+        g.seeds,
+        vec!["10.0.0.2:7000".to_owned(), "[::1]:7001".to_owned()]
+    );
+    assert_eq!(g.period, Duration::from_millis(250));
+    assert_eq!(g.timeout, Duration::from_millis(900));
+    let insecure = [
+        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080"),
+        ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
+        ("PSTORE_GOSSIP_INSECURE", "1"),
+    ];
+    assert!(
+        GossipConfig::from_vars(vars(&insecure))
+            .unwrap()
+            .unwrap()
+            .keys
+            .is_none()
+    );
+
+    // None of it: no gossip, and M54's list the only way to have peers.
+    assert_eq!(GossipConfig::from_vars(vars(&[])).unwrap(), None);
+    let listed = [
+        ("PSTORE_PEERS", "http://a:1,http://b:1"),
+        ("PSTORE_PEER_SELF", "http://a:1"),
+    ];
+    assert_eq!(GossipConfig::from_vars(vars(&listed)).unwrap(), None);
+    assert!(PeerConfig::from_vars(vars(&listed)).unwrap().is_some());
+    assert!(
+        PeerConfig::from_vars(vars(&[("PSTORE_PEER_SELF", "http://a:1")])).is_err(),
+        "without gossip, a lone PSTORE_PEER_SELF is still refused"
+    );
+
+    let refused: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("beside a list", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEERS", "http://10.0.0.1:8080"));
+            v
+        }),
+        (
+            "no self",
+            vec![
+                ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
+                ("PSTORE_GOSSIP_KEY", KEY),
+            ],
+        ),
+        ("https self", {
+            let mut v = base.to_vec();
+            v[0] = ("PSTORE_PEER_SELF", "https://10.0.0.1:8080");
+            v
+        }),
+        (
+            "advertise alone",
+            vec![("PSTORE_PEER_GOSSIP_ADVERTISE", "10.0.0.1:7000")],
+        ),
+        (
+            "seeds alone",
+            vec![("PSTORE_PEER_GOSSIP_SEEDS", "10.0.0.1:7000")],
+        ),
+        (
+            "period alone",
+            vec![("PSTORE_PEER_GOSSIP_PERIOD_MS", "100")],
+        ),
+        ("a hostname to listen on", {
+            let mut v = base.to_vec();
+            v[1] = ("PSTORE_PEER_GOSSIP_ADDR", "node-1:7000");
+            v
+        }),
+        ("a hostname to advertise", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEER_GOSSIP_ADVERTISE", "node-1:7000"));
+            v
+        }),
+        ("a hostname seed", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEER_GOSSIP_SEEDS", "10.0.0.2:7000,node-2:7000"));
+            v
+        }),
+        ("an unspecified advertise", {
+            let mut v = base.to_vec();
+            v[1] = ("PSTORE_PEER_GOSSIP_ADDR", "0.0.0.0:7000");
+            v
+        }),
+        ("an unspecified v6 advertise", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEER_GOSSIP_ADVERTISE", "[::]:7000"));
+            v
+        }),
+        ("advertise port 0", {
+            let mut v = base.to_vec();
+            v[1] = ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:0");
+            v
+        }),
+        ("period 0", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEER_GOSSIP_PERIOD_MS", "0"));
+            v
+        }),
+        ("period not a number", {
+            let mut v = base.to_vec();
+            v.push(("PSTORE_PEER_GOSSIP_PERIOD_MS", "fast"));
+            v
+        }),
+        ("no key", base[..2].to_vec()),
+        ("a bad key", {
+            let mut v = base.to_vec();
+            v[2] = ("PSTORE_GOSSIP_KEY", "00");
+            v
+        }),
+    ];
+    for (name, v) in refused {
+        assert!(
+            GossipConfig::from_vars(vars(&v)).is_err(),
+            "{name} was accepted"
+        );
+    }
+}
+
+#[test]
+fn the_peer_list_is_the_servers_in_the_view() {
+    let m = |addr: &str, zone: &str| (addr.to_owned(), zone.to_owned());
+    let me = "http://10.0.0.2:8080";
+    let view = vec![
+        m("10.0.0.3:7000", "http://10.0.0.3:8080"),
+        m("10.0.0.9:7000", "us-east-1a"),
+        m("10.0.0.8:7000", ""),
+        m("10.0.0.1:7000", "http://10.0.0.1:8080/"),
+        m("10.0.0.1:7001", "http://10.0.0.1:8080"),
+        m("10.0.0.6:7000", "https://10.0.0.6:8080"),
+        m("10.0.0.7:7000", "http://10.0.0.7:8080/path"),
+        m("[::1]:7000", "http://[::1]:8080"),
+    ];
+    let (list, at) = pstore_server::peer_list_of(&view, me);
+    assert_eq!(
+        list,
+        vec![
+            "http://10.0.0.1:8080".to_owned(),
+            "http://10.0.0.2:8080".to_owned(),
+            "http://10.0.0.3:8080".to_owned(),
+            "http://[::1]:8080".to_owned(),
+        ]
+    );
+    assert_eq!(at, 1);
+    // Its own member present: still once.
+    let mut with_me = view.clone();
+    with_me.push(m("10.0.0.2:7000", me));
+    assert_eq!(pstore_server::peer_list_of(&with_me, me), (list.clone(), 1));
+    // Alone.
+    assert_eq!(
+        pstore_server::peer_list_of(&[], me),
+        (vec![me.to_owned()], 0)
+    );
+}
+
+/// A server with a gossip member of its own, at a 100 ms period, and an HTTP listener that
+/// `stop` shuts.
+struct Gossiping {
+    server: Server,
+    gossip: pstore_server::PeerGossip,
+    http: tokio::sync::oneshot::Sender<()>,
+    serving: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+const PERIOD: Duration = Duration::from_millis(100);
+
+/// A free UDP port. ⚠️ Released before the member binds it, so another process could take it
+/// in between: a small risk on a shared box, accepted as `free_port` in `pstore-node` does.
+fn udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn gossiping(store: &MemoryStore, lane: u64, seeds: &[String]) -> (Gossiping, String) {
+    let (server, listener) = start(store, lane).await;
+    let gossip_at = format!("127.0.0.1:{}", udp_port());
+    let config = pstore_server::GossipConfig {
+        url: server.url.clone(),
+        listen: gossip_at.clone(),
+        advertise: gossip_at.clone(),
+        seeds: seeds.to_vec(),
+        period: PERIOD,
+        keys: Some(vec![vec![7u8; 32]]),
+        timeout: Duration::from_secs(5),
+    };
+    let gossip = server.api.join_peers(config).await.unwrap();
+    let (http, rx) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(pstore_server::serve(
+        Arc::clone(&server.api),
+        listener,
+        async move {
+            let _ = rx.await;
+        },
+    ));
+    (
+        Gossiping {
+            server,
+            gossip,
+            http,
+            serving,
+        },
+        gossip_at,
+    )
+}
+
+/// Three gossiping servers, the second and third seeded with the first, and one alone.
+async fn fleet() -> (MemoryStore, Vec<Gossiping>, Server) {
+    let store = MemoryStore::new();
+    let (first, at) = gossiping(&store, 1, &[]).await;
+    let mut fleet = vec![first];
+    for lane in 2..=3 {
+        fleet.push(gossiping(&store, lane, std::slice::from_ref(&at)).await.0);
+    }
+    let (alone, _) = start(&store, 9).await;
+    (store, fleet, alone)
+}
+
+/// Polls every `PERIOD` until `done`, for at most 40 periods.
+async fn within_40_periods(mut done: impl AsyncFnMut() -> bool) -> bool {
+    for _ in 0..40 {
+        if done().await {
+            return true;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    done().await
+}
+
+// ⚠️ Multi-threaded (code review): three members' tickers on one thread beside `fill`'s folds
+// could miss probes for whole periods and suspect a live server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servers_take_their_peers_from_membership() {
+    let (store, fleet, alone) = fleet().await;
+    let mut urls: Vec<String> = fleet.iter().map(|g| g.server.url.clone()).collect();
+    urls.sort();
+    let found =
+        within_40_periods(async || fleet.iter().all(|g| g.server.api.peer_list() == urls)).await;
+    assert!(
+        found,
+        "lists: {:?}",
+        fleet
+            .iter()
+            .map(|g| g.server.api.peer_list())
+            .collect::<Vec<_>>()
+    );
+    for g in &fleet {
+        assert_eq!(metric(&g.server.api, "pstore_peer_servers").await, 3);
+    }
+    // What a log shows of a membership: its gossip address (from the sweep).
+    let shown = format!("{:?}", fleet[0].gossip);
+    assert!(
+        shown.contains("PeerGossip") && shown.contains("127.0.0.1:"),
+        "{shown}"
+    );
+    assert_eq!(metric(&alone.api, "pstore_peer_servers").await, 1);
+    fill(&store, &fleet[0].server.api, &urls, 8).await;
+    for q in [
+        json!({"vector": Q, "top_k": 10}),
+        json!({"text": "word2 tag1", "top_k": 10}),
+    ] {
+        let (_, want) = query(&alone.api, &q).await;
+        for (i, g) in fleet.iter().enumerate() {
+            let sent = metric(&g.server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&g.server.api, &q).await;
+            assert_eq!(s, 200, "{got}");
+            assert_eq!(answer(&got), answer(&want), "{q} at {i}");
+            assert!(
+                metric(&g.server.api, "pstore_peer_parts_sent").await > sent,
+                "{q} at {i} was not split"
+            );
+        }
+    }
+    for g in &fleet {
+        assert_eq!(metric(&g.server.api, "pstore_peer_parts_failed").await, 0);
+    }
+    // Once only (code review): a second membership, or one beside a list, is refused.
+    let again = pstore_server::GossipConfig {
+        url: fleet[0].server.url.clone(),
+        listen: format!("127.0.0.1:{}", udp_port()),
+        advertise: format!("127.0.0.1:{}", udp_port()),
+        seeds: vec![],
+        period: PERIOD,
+        keys: None,
+        timeout: Duration::from_secs(5),
+    };
+    assert!(fleet[0].server.api.join_peers(again.clone()).await.is_err());
+    alone
+        .api
+        .set_peers(Some(PeerConfig {
+            servers: vec![alone.url.clone()],
+            me: 0,
+            timeout: Duration::from_secs(5),
+        }))
+        .unwrap();
+    assert!(alone.api.join_peers(again).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_leaves_is_sent_nothing() {
+    let (store, mut fleet, alone) = fleet().await;
+    let mut urls: Vec<String> = fleet.iter().map(|g| g.server.url.clone()).collect();
+    urls.sort();
+    assert!(
+        within_40_periods(async || fleet.iter().all(|g| g.server.api.peer_list() == urls)).await,
+        "the fleet never found itself"
+    );
+    fill(&store, &fleet[0].server.api, &urls, 8).await;
+    let q = json!({"vector": Q, "text": "word2 tag1", "top_k": 10});
+    let (_, want) = query(&alone.api, &q).await;
+    // The third leaves: its member and its HTTP listener both stop.
+    let leaving = fleet.pop().unwrap();
+    leaving.gossip.stop().await;
+    let _ = leaving.http.send(());
+    let gone = leaving.server.url.clone();
+    // Its listener and every connection closed: awaited, never a sleep's guess (code review).
+    tokio::time::timeout(Duration::from_secs(5), leaving.serving)
+        .await
+        .expect("the stopped server's HTTP did not shut down")
+        .unwrap()
+        .unwrap();
+    // Before the others drop it, its share fails, and runs here.
+    let failed = metric(&fleet[0].server.api, "pstore_peer_parts_failed").await;
+    let (s, got) = query(&fleet[0].server.api, &q).await;
+    assert_eq!(s, 200, "{got}");
+    assert_eq!(answer(&got), answer(&want));
+    assert!(
+        metric(&fleet[0].server.api, "pstore_peer_parts_failed").await > failed,
+        "a share to the stopped server did not fail"
+    );
+    assert!(
+        within_40_periods(async || {
+            fleet
+                .iter()
+                .all(|g| !g.server.api.peer_list().contains(&gone))
+        })
+        .await,
+        "a stopped server was still listed after 40 periods"
+    );
+    let failed: Vec<u64> = futures_util::future::join_all(
+        fleet
+            .iter()
+            .map(|g| metric(&g.server.api, "pstore_peer_parts_failed")),
+    )
+    .await;
+    for _ in 0..10 {
+        for g in &fleet {
+            let sent = metric(&g.server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&g.server.api, &q).await;
+            assert_eq!(s, 200, "{got}");
+            assert_eq!(answer(&got), answer(&want));
+            assert!(
+                metric(&g.server.api, "pstore_peer_parts_sent").await > sent,
+                "not split"
+            );
+        }
+    }
+    for (g, before) in fleet.iter().zip(failed) {
+        assert_eq!(
+            metric(&g.server.api, "pstore_peer_parts_failed").await,
+            before,
+            "a share was still sent to the server that left"
+        );
+    }
+    assert_eq!(metric(&fleet[0].server.api, "pstore_peer_servers").await, 2);
+    drop(leaving.gossip);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_membership_leaves_the_list_too() {
+    // From the sweep: dropping the handle, not only `stop`, must end the member -- or a server
+    // that lost its handle on an error path would stay in every list, answering probes.
+    let store = MemoryStore::new();
+    let (first, at) = gossiping(&store, 1, &[]).await;
+    let (second, _) = gossiping(&store, 2, std::slice::from_ref(&at)).await;
+    assert!(
+        within_40_periods(async || first.server.api.peer_list().len() == 2).await,
+        "the two never met"
+    );
+    let gone = second.server.url.clone();
+    drop(second.gossip);
+    assert!(
+        within_40_periods(async || !first.server.api.peer_list().contains(&gone)).await,
+        "a dropped membership was still listed after 40 periods"
+    );
+}
