@@ -5114,6 +5114,7 @@ impl<S: BlobStore> Engine<S> {
             part.shadow,
             &pstore_index::text::Stats::default(),
             &part.fts,
+            part.sum,
         )
         .await
     }
@@ -5151,6 +5152,7 @@ impl<S: BlobStore> Engine<S> {
             part.shadow,
             stats,
             &part.fts,
+            part.sum,
         )
         .await
     }
@@ -5253,6 +5255,7 @@ impl<S: BlobStore> Engine<S> {
                 fts,
                 shadow.len(),
                 fusion,
+                top_k,
                 MAX_PART_SEGMENTS,
             )
         });
@@ -6135,6 +6138,8 @@ pub struct Part {
     /// Every text leg's terms, analysed by `fts` (M55): the `df` a share's statistics carry.
     /// Empty for a share in one exchange.
     pub terms: Vec<String>,
+    /// Under `sum` fusion, how the share is cut (M58); `None` otherwise.
+    pub sum: Option<pstore_query::SumCut>,
 }
 
 /// The server, of `servers`, a segment's vector legs run on (M54): the highest
@@ -6187,8 +6192,9 @@ pub const MAX_PART_SEGMENTS: usize = 4096;
 ///   the statistics of every segment before it can score any.
 /// - **Otherwise**, with its vector legs, in one exchange (M54).
 ///
-/// ⚠️ Never under `Sum` (code review, M55 spec review): its legs are whole, so a share's reply
-/// would be every matching row of every segment.
+/// ⚠️ Under `Sum` only with a text leg, in two phases, carrying its [`pstore_query::SumCut`]
+/// (M58): its legs are whole, so a share's reply is cut by sum to `top_k + |shadow|` rows,
+/// never every matching row of every segment.
 #[allow(
     clippy::too_many_arguments,
     reason = "the query's parts a share is cut from"
@@ -6201,6 +6207,7 @@ fn shares(
     fts: pstore_format::text::FullText,
     shadow: usize,
     fusion: pstore_query::Fusion,
+    top_k: usize,
     cap: usize,
 ) -> Vec<pstore_query::Elsewhere<'static>> {
     let text: Vec<&String> = prefetch
@@ -6224,10 +6231,16 @@ fn shares(
     terms.sort();
     terms.dedup();
     let servers = peers.servers();
-    if legs.is_empty()
-        || durable.len() < SPLIT_FROM
-        || servers.len() < 2
-        || matches!(fusion, pstore_query::Fusion::Sum { .. })
+    // M58: `sum` splits in two phases, cut by sum -- so only with a text leg. The server
+    // refuses `sum` without one; the engine does not, and never splits it (spec review).
+    let sum = match fusion {
+        pstore_query::Fusion::Sum { weights } => Some(pstore_query::SumCut {
+            weights,
+            keep: top_k.saturating_add(shadow),
+        }),
+        _ => None,
+    };
+    if legs.is_empty() || durable.len() < SPLIT_FROM || servers.len() < 2 || (sum.is_some() && !two)
     {
         return Vec::new();
     }
@@ -6252,6 +6265,7 @@ fn shares(
                 targets,
                 shadow,
                 terms: terms.clone(),
+                sum,
             };
             pstore_query::Elsewhere {
                 targets: ordinals,
@@ -6483,7 +6497,7 @@ mod split_tests {
         let fts = pstore_format::text::FullText::default();
         let rrf = pstore_query::Fusion::default();
         let split = |t: &[pstore_query::Target], legs, fusion, cap| {
-            shares(&peers, "x", t, legs, fts, 0, fusion, cap)
+            shares(&peers, "x", t, legs, fts, 0, fusion, 10, cap)
                 .into_iter()
                 .map(|e| e.targets)
                 .collect::<Vec<_>>()
@@ -6518,6 +6532,7 @@ mod split_tests {
                 fts,
                 0,
                 fusion,
+                10,
                 MAX_PART_SEGMENTS,
             )
             .into_iter()
@@ -6526,7 +6541,23 @@ mod split_tests {
         };
         assert_eq!(kinds(&text, rrf), [true, true], "text, phased");
         assert_eq!(kinds(&dense, rrf), [false, false], "dense, one exchange");
-        assert!(kinds(&text, sum).is_empty(), "sum over text");
+        // M58: `sum` over text splits in two phases too, carrying its cut; never without text.
+        assert_eq!(kinds(&text, sum), [true, true], "sum over text, phased");
+        // Two servers are enough to split (sweep: `servers.len() < 2` as `<= 2`). One is not,
+        // and is no share by assignment as well: everything is this server's.
+        let two_servers = Named(vec!["http://a".into(), "http://b".into()]);
+        let pair = shares(
+            &two_servers,
+            "x",
+            &targets,
+            &dense,
+            fts,
+            0,
+            rrf,
+            10,
+            MAX_PART_SEGMENTS,
+        );
+        assert_eq!(pair.len(), 1, "two servers: one share, the other's");
         // Segments another server holds, so whether they split is the count's alone.
         let theirs: Vec<pstore_query::Target> = targets
             .iter()

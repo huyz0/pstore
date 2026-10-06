@@ -1,7 +1,7 @@
 //! Running the legs — concurrently, over one open segment.
 
 use crate::filter::{Mask, Predicate};
-use crate::fuse::{Fusion, Hit, fuse};
+use crate::fuse::{Fusion, Hit, Weights, fuse};
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
 use pstore_format::{Document, FormatError, Segment};
@@ -304,12 +304,70 @@ pub fn only(mut stats: Stats, terms: &[String]) -> Stats {
     stats
 }
 
+/// A `sum` query's cut for one share (M58): every leg of the share run whole, fused by
+/// `weights` exactly as the coordinator fuses, and only the share's top `keep` rows kept --
+/// every leg's hit for each. `keep` is the query's `top_k` plus its shadow's size, what
+/// `summed` resolves before dropping the shadowed.
+///
+/// ⚠️ Exact because a row lives in one segment, and every leg of a segment runs on one
+/// server: its sum is the coordinator's to the bit, the share's order is the global order
+/// restricted to the share, and so any row of the global top `keep` is in its share's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SumCut {
+    /// The query's weights, by global leg number.
+    pub weights: Weights,
+    /// How many rows the share keeps.
+    pub keep: usize,
+}
+
+/// `hits` cut to the share's top `cut.keep` rows by weighted sum, every leg's hit for each.
+fn cut_sum(hits: PartHits, cut: SumCut) -> PartHits {
+    // Never wider than a query may be (code review): a leg's number sizes this.
+    let width = hits
+        .iter()
+        .map(|(_, j, _)| j.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+        .min(crate::MAX_LEGS);
+    let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); width];
+    for (_, j, h) in &hits {
+        if let Some(leg) = legs.get_mut(*j) {
+            leg.extend(h.iter().copied());
+        }
+    }
+    let kept: std::collections::HashSet<(usize, usize)> = fuse(
+        &legs,
+        Fusion::Sum {
+            weights: cut.weights,
+        },
+        cut.keep,
+    )
+    .iter()
+    .map(|h| (h.segment, h.row))
+    .collect();
+    hits.into_iter()
+        .map(|(i, j, h)| {
+            (
+                i,
+                j,
+                h.into_iter()
+                    .filter(|x| kept.contains(&(x.segment, x.row)))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// Phase 2 of a share (M55): every leg over the held segments, scored with `stats`, masked by
 /// `filter`, rid of deleted rows and cut to what a shadow of `shadow` ids can leave -- exactly
 /// as [`run`] does over its own segments, because it is the same function.
 ///
 /// # Errors
 /// As [`query`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a share's parts, each needed by a leg"
+)]
 pub async fn scan_part<S: BlobStore>(
     store: &S,
     part: &OpenPart,
@@ -317,6 +375,7 @@ pub async fn scan_part<S: BlobStore>(
     shadow: usize,
     stats: &Stats,
     text: &FullText,
+    sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
     let runnable = part
         .legs
@@ -329,18 +388,23 @@ pub async fn scan_part<S: BlobStore>(
         .zip(&part.opened)
         .map(|((i, t), o)| (*i, t, o))
         .collect();
-    candidates(
+    // M58: under `sum` the legs run whole, as `run` runs its own, and the share is cut by sum.
+    let hits = candidates(
         store,
         &items,
         &runnable,
         |_, _| true,
         filter,
         shadow,
-        false,
+        sum.is_some(),
         stats,
         text,
     )
-    .await
+    .await?;
+    Ok(match sum {
+        Some(cut) => cut_sum(hits, cut),
+        None => hits,
+    })
 }
 
 /// One server's share of a query in one call (M54): [`open_part`] then [`scan_part`], scored
@@ -349,6 +413,10 @@ pub async fn scan_part<S: BlobStore>(
 ///
 /// # Errors
 /// As [`query`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a share's parts, each needed by a leg"
+)]
 pub async fn part<S: BlobStore>(
     store: &S,
     targets: &[(usize, Target)],
@@ -357,6 +425,7 @@ pub async fn part<S: BlobStore>(
     shadow: usize,
     stats: &Stats,
     text: &FullText,
+    sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened =
@@ -367,7 +436,7 @@ pub async fn part<S: BlobStore>(
         legs: legs.to_vec(),
         opened,
     };
-    scan_part(store, &held, filter, shadow, stats, text).await
+    scan_part(store, &held, filter, shadow, stats, text, sum).await
 }
 
 /// Every running `(segment, leg)` pair's candidates: each leg widened by what the segment may
@@ -718,6 +787,15 @@ async fn run<S: BlobStore>(
                     shadow.len(),
                     stats,
                     text,
+                    // M58 (spec review): under `sum` it runs whole and is cut by sum, as the
+                    // peer would have -- never cut leg by leg at its limit.
+                    match fusion {
+                        Fusion::Sum { weights } => Some(SumCut {
+                            weights,
+                            keep: top_k.saturating_add(shadow.len()),
+                        }),
+                        _ => None,
+                    },
                 )
                 .await
             }
@@ -734,6 +812,7 @@ async fn run<S: BlobStore>(
                     shadow.len(),
                     stats,
                     text,
+                    None,
                 )
                 .await
             }

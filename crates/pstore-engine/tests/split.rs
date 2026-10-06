@@ -73,6 +73,12 @@ struct Three {
     stray: Arc<AtomicU64>,
     /// Every part opened in phase 1: its segments, and what `OpenPart::bytes` says it holds.
     held: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    /// The `sum` cut each phased share carried, in the order they were made (M58).
+    cuts: Arc<std::sync::Mutex<Vec<Option<usize>>>>,
+    /// The most distinct rows any phase 2 sent back (M58).
+    most_rows: Arc<AtomicU64>,
+    /// Every segment ordinal a phased share was given (M58).
+    given: Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>>,
     /// Which phase fails, if any: 1 or 2.
     fails: u8,
 }
@@ -89,6 +95,9 @@ impl Three {
             text_legs: Arc::default(),
             stray: Arc::default(),
             held: Arc::default(),
+            cuts: Arc::default(),
+            most_rows: Arc::default(),
+            given: Arc::default(),
             fails: 0,
         }
     }
@@ -124,6 +133,12 @@ impl Peers for Three {
         let (opens, scans, fails) = (Arc::clone(&self.opens), Arc::clone(&self.scans), self.fails);
         let stray = Arc::clone(&self.stray);
         let sizes = Arc::clone(&self.held);
+        self.cuts.lock().unwrap().push(part.sum.map(|c| c.keep));
+        self.given
+            .lock()
+            .unwrap()
+            .extend(part.targets.iter().map(|(i, _)| *i));
+        let most_rows = Arc::clone(&self.most_rows);
         let text = part
             .legs
             .iter()
@@ -157,10 +172,12 @@ impl Peers for Three {
                     return Err("lost between phases".to_owned());
                 }
                 let open = held.lock().unwrap().take().ok_or("nothing held")?;
-                engine
+                let hits = engine
                     .scan_part(&part, &open, filter.as_ref(), &sum)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                most_rows.fetch_max(rows_of(&hits) as u64, Ordering::SeqCst);
+                Ok(hits)
             }) as futures_util::future::BoxFuture<'static, _>
         });
         Phased { stats, scan }
@@ -1034,4 +1051,143 @@ async fn a_share_sums_only_what_its_legs_and_head_ask_for() {
         .await
         .unwrap();
     assert!(st.doc_count > 0 && st.df.contains_key("alpha"), "{st:?}");
+}
+
+/// What a `sum` share returned: the most distinct rows any one share sent back (M58 AC2).
+fn rows_of(hits: &PartHits) -> usize {
+    hits.iter()
+        .flat_map(|(_, _, h)| h.iter().map(|x| (x.segment, x.row)))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+#[tokio::test]
+async fn a_split_sum_query_equals_the_unsplit_one() {
+    let store = Tdicts {
+        inner: MemoryStore::new(),
+        read: Arc::default(),
+    };
+    let w = tengine(&store, 1);
+    tfill(&w, "idx", 8, false).await;
+    let weights = pstore_query::Weights::of(&[2.0, 0.5]).unwrap();
+    let sum = Fusion::Sum { weights };
+    // A limit of 1 a leg: `sum` runs its legs whole, so the limit must change nothing -- and a
+    // share run leg by leg at its limit, anywhere, loses rows the answer has.
+    let one = |q: &str| Prefetch::Text {
+        field: "text".to_owned(),
+        query: q.to_owned(),
+        limit: 1,
+    };
+    let legs = vec![one("alpha word2"), one("tag1 n3")];
+    let eventual = pstore_engine::Consistency::Eventual;
+
+    // The corpus has a row first by sum that neither leg ranks first alone.
+    let first = |a: &pstore_engine::Answer| a.ids.first().cloned().flatten();
+    let whole = w
+        .query_filtered_as("idx", &legs, None, sum, 5, eventual)
+        .await
+        .unwrap();
+    let alone: Vec<Option<String>> = futures_util::future::join_all(legs.iter().map(|l| {
+        let w = &w;
+        async move {
+            let a = w
+                .query_filtered_as("idx", std::slice::from_ref(l), None, sum, 1, eventual)
+                .await
+                .unwrap();
+            first(&a)
+        }
+    }))
+    .await;
+    assert!(
+        !alone.contains(&first(&whole)),
+        "the fixture's best sum is some leg's best: {:?} vs {alone:?}",
+        first(&whole)
+    );
+
+    // Then the best rows are shadowed by unfolded writes of the same ids, which no longer
+    // match: a share cut at `top_k`, not `top_k + |shadow|`, loses the rows that replace them.
+    let shadowed: Vec<Document> = whole
+        .ids
+        .iter()
+        .take(3)
+        .flatten()
+        .map(|id| {
+            let i: u32 = id.trim_start_matches('d').parse().unwrap();
+            let mut d = tdoc(i, true);
+            d.attrs
+                .insert("text".to_owned(), Value::Str("zeta".to_owned()));
+            d
+        })
+        .collect();
+    let filtered = Predicate::Cmp("n".to_owned(), Op::Gt, Value::Int(20));
+    let cases: Vec<(&str, Option<Predicate>, usize, u8, bool)> = vec![
+        ("sum", None, 5, 0, false),
+        ("sum, filtered", Some(filtered.clone()), 5, 0, false),
+        ("top_k past every match", None, 500, 0, false),
+        ("sum, phase 2 failing", None, 5, 2, false),
+        ("sum, shadowed", None, 5, 0, true),
+        ("sum, shadowed, phase 2 failing", None, 5, 2, true),
+    ];
+    let mut wrote = false;
+    for (name, filter, top_k, fails, shadow) in cases {
+        if shadow && !wrote {
+            w.write("idx", shadowed.clone()).await.unwrap();
+            wrote = true;
+        }
+        let unsplit = w
+            .query_filtered_as("idx", &legs, filter.as_ref(), sum, top_k, eventual)
+            .await
+            .unwrap();
+        let mut peers = peers_of(&store, filter.clone());
+        peers.fails = fails;
+        let split = w
+            .query_split_as(
+                "idx",
+                &legs,
+                filter.as_ref(),
+                sum,
+                top_k,
+                eventual,
+                Some(&peers),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exactly(&split), exactly(&unsplit), "{name}");
+        let opens = peers.opens.load(Ordering::SeqCst);
+        assert!(opens >= 1, "{name}: not split");
+        assert_eq!(peers.parts.load(Ordering::SeqCst), 0, "{name}");
+        // Every share carried the cut, and none sent back more rows than it keeps.
+        let keep = top_k + if shadow { 3 } else { 0 };
+        assert_eq!(
+            peers.cuts.lock().unwrap().clone(),
+            vec![Some(keep); usize::try_from(opens).unwrap()],
+            "{name}: the cut each share carried"
+        );
+        let most = peers.most_rows.load(Ordering::SeqCst);
+        assert!(
+            most <= keep as u64,
+            "{name}: a share sent {most} rows, past {keep}"
+        );
+        if fails == 0 && top_k == 5 {
+            // Measured, not vacuous: each share matched far more rows than it kept.
+            assert!(most > 0, "{name}: no share sent anything back");
+        }
+        if name == "sum" {
+            // Code review: what the fixture rests on lies in a peer's share -- the best sum,
+            // and at least one of the rows the later cases shadow.
+            let given = peers.given.lock().unwrap().clone();
+            assert!(
+                given.contains(&whole.hits[0].segment),
+                "the best sum is the coordinator's own"
+            );
+            assert!(
+                whole
+                    .hits
+                    .iter()
+                    .take(3)
+                    .any(|h| given.contains(&h.segment)),
+                "every shadowed row is the coordinator's own"
+            );
+        }
+    }
 }

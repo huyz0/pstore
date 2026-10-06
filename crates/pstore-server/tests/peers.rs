@@ -345,6 +345,12 @@ fn queries() -> Vec<(&'static str, Value)> {
         ),
         // M55: text legs split too.
         ("text", json!({"text": "word2 tag1", "top_k": 10})),
+        // M58: `sum` splits too, cut by sum.
+        (
+            "sum, weighted",
+            json!({"text": ["word2 tag1", "common word3"], "top_k": 10,
+                   "fusion": {"sum": {"weights": [2.0, 0.5]}}}),
+        ),
         (
             "text, filtered",
             json!({"text": "word3 common", "top_k": 10, "filters": filter}),
@@ -675,20 +681,25 @@ async fn queries_that_cannot_be_split_run_on_one_server() {
     let a = &servers[0].api;
     let (_, past) = query(a, &json!({"vector": Q, "top_k": 1})).await;
     let epoch = past["meta"]["epoch"].clone();
-    // M55 narrowed this list: a text-only query splits now (its own assertion below).
+    // M55 narrowed this list: a text-only query splits now; M58: `sum` too (their own
+    // assertions below).
     let unsplit = [
         json!({"rank_by": ["n", "asc"], "top_k": 5}),
         json!({"aggregate_by": {"c": ["Count", "id"]}}),
-        json!({"text": "word2", "top_k": 5, "fusion": {"sum": {}}}),
         json!({"vector": Q, "top_k": 5, "as_of": epoch}),
     ];
-    let sent = metric(a, "pstore_peer_parts_sent").await;
-    let (s, body) = query(a, &json!({"text": "word2", "top_k": 5})).await;
-    assert_eq!(s, 200, "{body}");
-    assert!(
-        metric(a, "pstore_peer_parts_sent").await > sent,
-        "text-only, M55"
-    );
+    for (q, name) in [
+        (json!({"text": "word2", "top_k": 5}), "text-only, M55"),
+        (
+            json!({"text": "word2", "top_k": 5, "fusion": {"sum": {}}}),
+            "sum, M58",
+        ),
+    ] {
+        let sent = metric(a, "pstore_peer_parts_sent").await;
+        let (s, body) = query(a, &q).await;
+        assert_eq!(s, 200, "{body}");
+        assert!(metric(a, "pstore_peer_parts_sent").await > sent, "{name}");
+    }
     for q in &unsplit {
         let sent = metric(a, "pstore_peer_parts_sent").await;
         let (s, body) = query(a, q).await;
@@ -1520,4 +1531,123 @@ async fn a_dropped_membership_leaves_the_list_too() {
         within_40_periods(async || !first.server.api.peer_list().contains(&gone)).await,
         "a dropped membership was still listed after 40 periods"
     );
+}
+
+#[tokio::test]
+async fn a_sum_part_is_protocol_three() {
+    // A peer that records each part's protocol and refuses 3, as a server of M55's build does.
+    let seen: Arc<Mutex<Vec<(u64, String)>>> = Arc::default();
+    let fake = {
+        let seen = Arc::clone(&seen);
+        axum::Router::new().route(
+            "/v1/internal/part",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().push((
+                        v["protocol"].as_u64().unwrap_or(0),
+                        v["phase"].as_str().unwrap_or("").to_owned(),
+                    ));
+                    (axum::http::StatusCode::CONFLICT, "protocol_mismatch")
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let (store, servers, alone) = cluster(std::slice::from_ref(&old)).await;
+    let mut all = urls(&servers);
+    all.push(old);
+    fill(&store, &servers[0].api, &all, 8).await;
+    let q = json!({"text": ["word2 tag1", "common word3"], "top_k": 10,
+                   "fusion": {"sum": {"weights": [2.0, 0.5]}}});
+    let (_, want) = query(&alone.api, &q).await;
+    let failed = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+    let (s, got) = query(&servers[0].api, &q).await;
+    assert_eq!(s, 200, "{got}");
+    assert_eq!(answer(&got), answer(&want));
+    assert_eq!(
+        metric(&servers[0].api, "pstore_peer_parts_failed").await,
+        failed + 1
+    );
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![(3, "open".to_owned())],
+        "a sum part opens at protocol 3"
+    );
+    // And a real server refuses a cut by sum at protocol 2, and protocol 3 without one.
+    let open = |protocol: u64, sum: Value| {
+        json!({"protocol": protocol, "phase": "open", "index": "docs",
+               "fts": pstore_format::text::FullText::default().encode(),
+               "filters": null, "shadow": 0, "legs": [], "targets": [], "sum": sum})
+    };
+    let cut = json!({"weights": [2.0f32.to_bits(), 0.5f32.to_bits()], "keep": 10});
+    for (protocol, sum) in [(2, cut.clone()), (3, Value::Null)] {
+        let (status, body) = send(
+            &servers[1].api,
+            "POST",
+            "/v1/internal/part",
+            open(protocol, sum.clone()),
+        )
+        .await;
+        assert_eq!(status, 400, "protocol {protocol}, sum {sum}: {body}");
+    }
+    let (status, body) = send(
+        &servers[1].api,
+        "POST",
+        "/v1/internal/part",
+        open(3, cut.clone()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Code review: a leg numbered past MAX_LEGS, or twice, is refused before anything runs --
+    // a cut by sum sizes its legs by that number.
+    let leg =
+        |j: u64| json!({"kind": "text", "j": j, "field": "text", "query": "word2", "limit": 1});
+    for legs in [
+        json!([leg(1_000_000_000_000)]),
+        json!([leg(16)]),
+        json!([leg(1), leg(1)]),
+    ] {
+        let mut part = open(3, cut.clone());
+        part["legs"] = legs.clone();
+        let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", part).await;
+        assert_eq!(status, 400, "{legs}: {body}");
+    }
+    let mut part = open(3, cut.clone());
+    part["legs"] = json!([leg(15)]);
+    let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", part).await;
+    assert_eq!(status, 200, "leg 15 is the last a query may have: {body}");
+    // A cut by sum in one exchange is refused.
+    let mut whole = open(1, cut.clone());
+    whole.as_object_mut().unwrap().remove("phase");
+    let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", whole).await;
+    assert_eq!(status, 400, "protocol 1 with a cut: {body}");
+    // A scan speaks its part's protocol.
+    for (opened, scan) in [(3u64, 2u64), (2, 3)] {
+        let sum = if opened == 3 {
+            cut.clone()
+        } else {
+            Value::Null
+        };
+        let (status, body) = send(
+            &servers[1].api,
+            "POST",
+            "/v1/internal/part",
+            open(opened, sum),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = send(
+            &servers[1].api,
+            "POST",
+            "/v1/internal/part",
+            json!({"protocol": scan, "phase": "scan", "id": body["id"], "index": "docs",
+                   "stats": {"doc_count": 0, "total_tokens": 0, "df": []}}),
+        )
+        .await;
+        assert_eq!(status, 400, "opened at {opened}, scanned at {scan}: {body}");
+    }
 }

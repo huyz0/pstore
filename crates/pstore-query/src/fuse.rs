@@ -91,6 +91,12 @@ impl Weights {
         self.0.iter().take(legs).all(|w| *w == 0.0)
     }
 
+    /// Every weight, in leg order (M58: a `sum` share carries them to its peer).
+    #[must_use]
+    pub fn all(&self) -> [f32; MAX_LEGS] {
+        self.0
+    }
+
     /// Leg `i`'s weight.
     fn get(&self, i: usize) -> f32 {
         self.0.get(i).copied().unwrap_or(1.0)
@@ -179,6 +185,11 @@ mod tests {
         );
         assert!(Weights::of(&[1.0; MAX_LEGS]).is_some());
         assert!(Weights::of(&[1.0; MAX_LEGS + 1]).is_none());
+        // M58: every weight, in leg order, for a `sum` share's peer.
+        let mut all = [1.0; MAX_LEGS];
+        all[0] = 2.0;
+        all[1] = 0.5;
+        assert_eq!(w.all().map(f32::to_bits), all.map(f32::to_bits));
         let zeros = Weights::of(&[0.0, 0.0, 3.0]).unwrap();
         assert!(zeros.all_zero(2));
         assert!(!zeros.all_zero(3));

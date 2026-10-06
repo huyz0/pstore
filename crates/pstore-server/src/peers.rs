@@ -36,6 +36,11 @@ pub(crate) const PROTOCOL: u32 = 1;
 /// stay at [`PROTOCOL`], which both builds speak.
 pub(crate) const PHASED: u32 = 2;
 
+/// The two-phase exchange of a `sum` query (M58): a part that runs its legs whole and is cut
+/// by sum. A peer of M55's build would cut each leg at its limit, so it must refuse this, and
+/// does: it speaks 1 and 2 only.
+pub(crate) const SUMMED: u32 = 3;
+
 /// How long a part is held between its phases (M55).
 pub(crate) const HOLD_FOR: Duration = Duration::from_secs(10);
 /// The most parts held at once (M55).
@@ -488,6 +493,7 @@ impl Peers for QueryPeers {
         let body = serde_json::to_vec(&WirePart::opening(&part, self.filters.clone()));
         let tenant = self.tenant;
         let index = part.index.clone();
+        let sum_part = part.sum.is_some();
         // The id phase 1 returns, for phase 2; and whether this part's failure is counted yet:
         // once per part, whichever phase fails (spec rule 11).
         let held: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
@@ -533,7 +539,7 @@ impl Peers for QueryPeers {
                 let got = match id {
                     Some(id) => {
                         let body = serde_json::to_vec(&WireScan {
-                            protocol: PHASED,
+                            protocol: if sum_part { SUMMED } else { PHASED },
                             phase: "scan".to_owned(),
                             id,
                             index,
@@ -664,6 +670,33 @@ struct WirePart {
     /// The text legs' analysed terms (M55).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     terms: Vec<String>,
+    /// A `sum` part's cut (M58), protocol 3 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sum: Option<WireSum>,
+}
+
+/// A `sum` part's cut on the wire (M58): every weight as its bits, and how many rows to keep.
+#[derive(Debug, Serialize, Deserialize)]
+struct WireSum {
+    weights: Vec<u32>,
+    keep: usize,
+}
+
+impl WireSum {
+    fn of(cut: pstore_query::SumCut) -> Self {
+        Self {
+            weights: cut.weights.all().iter().map(|w| w.to_bits()).collect(),
+            keep: cut.keep,
+        }
+    }
+
+    fn cut(&self) -> Option<pstore_query::SumCut> {
+        let weights: Vec<f32> = self.weights.iter().map(|b| f32::from_bits(*b)).collect();
+        Some(pstore_query::SumCut {
+            weights: pstore_query::Weights::of(&weights)?,
+            keep: self.keep,
+        })
+    }
 }
 
 /// Phase 2 of a phased part (M55).
@@ -780,9 +813,10 @@ impl WirePart {
     /// Phase 1 of a phased part (M55): every leg, and the text legs' terms.
     fn opening(part: &Part, filters: Option<serde_json::Value>) -> Self {
         Self {
-            protocol: PHASED,
+            protocol: if part.sum.is_some() { SUMMED } else { PHASED },
             phase: Some("open".to_owned()),
             terms: part.terms.clone(),
+            sum: part.sum.map(WireSum::of),
             ..Self::of(part, filters)
         }
     }
@@ -792,6 +826,7 @@ impl WirePart {
             protocol: PROTOCOL,
             phase: None,
             terms: Vec::new(),
+            sum: None,
             index: part.index.clone(),
             fts: part.fts.encode(),
             filters,
@@ -919,6 +954,21 @@ fn guard(tenant: TenantId, wire: &WirePart) -> Result<(), ApiError> {
     if wire.targets.len() > MAX_SEGMENTS {
         return Err(refuse(format!("at most {MAX_SEGMENTS} segments a part")));
     }
+    // ⚠️ A leg's number is a query position, under `MAX_LEGS` and named once (code review,
+    // M58): a cut by sum sizes its legs by it, so an unbounded one was an allocation the
+    // caller chose.
+    let mut named = std::collections::BTreeSet::new();
+    for leg in &wire.legs {
+        let j = match leg {
+            WireLeg::Dense { j, .. } | WireLeg::Sparse { j, .. } | WireLeg::Text { j, .. } => *j,
+        };
+        if j >= pstore_query::MAX_LEGS || !named.insert(j) {
+            return Err(refuse(format!(
+                "leg {j}: each leg once, numbered under {}",
+                pstore_query::MAX_LEGS
+            )));
+        }
+    }
     let prefix = index_prefix(tenant);
     // ⚠️ A `..` path COMPONENT, not substring (code review): an index may be named `a..b`.
     let ours = |k: &str| k.starts_with(&prefix) && !k.split('/').any(|c| c == "..");
@@ -1027,6 +1077,13 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
             )
         })
         .collect();
+    let sum = match &wire.sum {
+        None => None,
+        Some(s) => Some(
+            s.cut()
+                .ok_or_else(|| refuse("a sum part's weights: at most one a leg"))?,
+        ),
+    };
     Ok((
         Part {
             index: wire.index,
@@ -1035,6 +1092,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
             targets,
             shadow: wire.shadow,
             terms: wire.terms,
+            sum,
         },
         wire.filters,
     ))
@@ -1067,14 +1125,18 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
     let phase = raw.get("phase").and_then(serde_json::Value::as_str);
     match (protocol, phase) {
         (Some(p), None) if p == u64::from(PROTOCOL) => serve_whole(&api, tenant, raw).await,
-        (Some(p), Some("open")) if p == u64::from(PHASED) => serve_open(&api, tenant, raw).await,
-        (Some(p), Some("scan")) if p == u64::from(PHASED) => serve_scan(&api, tenant, raw).await,
+        (Some(p), Some("open")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
+            serve_open(&api, tenant, raw).await
+        }
+        (Some(p), Some("scan")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
+            serve_scan(&api, tenant, raw).await
+        }
         _ => Err(ApiError::new(
             StatusCode::CONFLICT,
             "protocol_mismatch",
             format!(
-                "this server speaks part protocols {PROTOCOL} and {PHASED} (open, scan), not \
-                 {protocol:?} {phase:?}"
+                "this server speaks part protocols {PROTOCOL}, and {PHASED} and {SUMMED} (open, \
+                 scan), not {protocol:?} {phase:?}"
             ),
         )),
     }
@@ -1092,6 +1154,14 @@ async fn serve_whole<S: BlobStore + 'static>(
 ) -> Result<Response, ApiError> {
     let wire: WirePart = wire_of(raw)?;
     guard(tenant, &wire)?;
+    // M58 (code review): a cut by sum is protocol 3's alone, never one exchange's.
+    if wire.sum.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_part",
+            "a part cut by sum is protocol 3, in two phases",
+        ));
+    }
     let (part, filters) = decode(wire)?;
     if part.legs.iter().any(|(_, p)| !pstore_query::splittable(p)) {
         return Err(ApiError::new(
@@ -1118,6 +1188,15 @@ async fn serve_open<S: BlobStore + 'static>(
 ) -> Result<Response, ApiError> {
     let wire: WirePart = wire_of(raw)?;
     guard(tenant, &wire)?;
+    // M58: a cut by sum is protocol 3's, and protocol 3 is a cut by sum. `WirePart` ignores a
+    // field it does not know, so nothing else would refuse a `sum` sent at 2.
+    if (wire.protocol == SUMMED) != wire.sum.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_part",
+            "a part cut by sum is protocol 3, and protocol 3 is cut by sum",
+        ));
+    }
     let (part, filters) = decode(wire)?;
     // Parsed now, so a filter that cannot be is refused before anything is held.
     filters.as_ref().map(predicate).transpose()?;
@@ -1168,6 +1247,14 @@ async fn serve_scan<S: BlobStore + 'static>(
                 "no part is held under this id for this tenant and index",
             )
         })?;
+    // M58 (code review): a scan speaks its part's protocol, 3 for a cut by sum and 2 else.
+    if (wire.protocol == SUMMED) != held.part.sum.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_part",
+            "a scan's protocol is its part's: 3 for a part cut by sum, 2 otherwise",
+        ));
+    }
     let filter = held.filters.as_ref().map(predicate).transpose()?;
     let engine = api.engine(tenant).await;
     engine
@@ -1365,6 +1452,7 @@ mod tests {
             )],
             shadow: 6,
             terms: vec!["alpha".to_owned(), "zeta".to_owned()],
+            sum: None,
         };
         let filters = Some(serde_json::json!(["k", "Eq", 1]));
         // M55: phase 1 carries every leg -- the text leg too -- and the terms.
@@ -1473,6 +1561,7 @@ mod tests {
             protocol: PROTOCOL,
             phase: None,
             terms: vec![],
+            sum: None,
             index: "docs".to_owned(),
             fts: String::new(),
             filters: None,
@@ -1501,6 +1590,7 @@ mod tests {
                 targets: vec![],
                 shadow: 0,
                 terms: vec![],
+                sum: None,
             },
             filters: None,
             open,
@@ -1540,6 +1630,7 @@ mod tests {
             targets: vec![],
             shadow: 0,
             terms: vec![],
+            sum: None,
         };
         let Phased { stats, scan } = peers.phased(5, part());
         assert_eq!(stats.await.unwrap_err(), "no such server");

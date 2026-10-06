@@ -116,7 +116,11 @@ bit, and the depth stays at four rounds.
 - **A peer that is down, slow or on another build costs rounds, never answers.** The
   coordinator runs that share itself after `PSTORE_PEER_TIMEOUT_MS`, and counts it in
   `pstore_peer_parts_failed`.
-- **Not split:** `sum` fusion, `order_by`, aggregations, `as_of`, and indexes of one segment.
+- **`sum` fusion splits too** ([M58](milestones/M58/SPEC.md)): a peer runs its legs whole and
+  returns only its share's top `top_k + |shadow|` rows by sum, which keeps the answer exact.
+  It travels as part protocol 3, which a server of an older build refuses, and the
+  coordinator then runs that share itself.
+- **Not split:** `order_by`, aggregations, `as_of`, and indexes of one segment.
 - **`pstore_peer_servers`** is the list's length now, this server included (1 when unpeered).
   Read it beside `pstore_peer_parts_failed`: a count that holds while failures rise is a
   server still listed but no longer answering.
