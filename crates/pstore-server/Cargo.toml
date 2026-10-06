@@ -38,6 +38,10 @@ thiserror     = "2"
 # M20: the store id is 128 random bits. Already in the lockfile.
 getrandom     = "0.3"
 tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# M54: a query's parts, sent to its peers. Already in the lockfile through `object_store`; no
+# TLS, because peers are servers of one deployment on its own network, as the blob store's
+# endpoint is.
+reqwest       = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }

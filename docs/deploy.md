@@ -76,6 +76,28 @@ one read.
   balancer, addressed directly.
 - Without `PSTORE_CACHE_DIR` it is refused with `409 no_read_cache` and costs nothing.
 
+## Several servers, one query
+
+With `PSTORE_PEERS` set, a query's vector legs are split by segment across the servers it
+lists ([M54](milestones/M54/SPEC.md)). Each folded segment's dense and sparse legs run on the
+server a rendezvous hash assigns it. The server that took the request reads HEAD, runs the
+text legs, fuses, and fetches the rows. The answer is the one a single server gives, bit for
+bit, and the depth stays at four rounds.
+
+- **Every server lists every server,** itself included, and `PSTORE_PEER_SELF` names which one
+  it is. Both or neither, or the server refuses to start. The list is static: a server added
+  is a restart of the others.
+- **A segment's scan always lands on the same server,** so with `PSTORE_CACHE_DIR` set, a large
+  index's segments stay warm across the fleet rather than each in every cache.
+- **A peer that is down, slow or on another build costs rounds, never answers.** The
+  coordinator runs that share itself after `PSTORE_PEER_TIMEOUT_MS`, and counts it in
+  `pstore_peer_parts_failed`.
+- **Not split:** text-only queries, `order_by`, aggregations, `as_of`, and indexes of one
+  segment. A text leg needs statistics summed over every segment.
+- ⚠️ `POST /v1/internal/part` authenticates its caller no more than the public API does: keep
+  it on the deployment's own network, as the public endpoints already must be.
+- `meta.cost` counts the receiving server's requests only.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket
@@ -217,6 +239,9 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_SOURCE_<NAME>_ENDPOINT` / `_BUCKET` | — | Required for each name. |
 | `PSTORE_SOURCE_<NAME>_ACCESS_KEY` / `_SECRET_KEY` | the provider's credential chain | Both or neither; half a pair is refused. |
 | `PSTORE_SOURCE_<NAME>_REGION` | `us-east-1` | |
+| `PSTORE_PEERS` | — | Every server's base URL, comma-separated, this one included (M54, above). |
+| `PSTORE_PEER_SELF` | — | This server's URL, as it appears in `PSTORE_PEERS`. Both or neither. |
+| `PSTORE_PEER_TIMEOUT_MS` | `2000` | How long a peer has to answer a share before this server runs it itself. |
 
 `pstore-node`'s gossip ([M53](milestones/M53/SPEC.md)):
 

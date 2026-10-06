@@ -1571,6 +1571,7 @@ dependencies = [
  "pstore-testkit",
  "pstore-types",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

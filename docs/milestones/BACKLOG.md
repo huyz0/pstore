@@ -123,6 +123,14 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by M54
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 57 | **Split text legs too.** BM25 scores against statistics summed over every segment, so a text leg runs on the coordinator. Splitting it needs the statistics first: per-segment `doc_count`, `total_tokens` and the query terms' `df` in HEAD (a format change) or a statistics round (D-34 has none to spare). | [M54](M54/SPEC.md) | M |
+| 58 | **Take the peer list from membership.** `PSTORE_PEERS` is static. The gossip view (M50–M53) knows who is alive, and the same rendezvous hash over it would move a segment's scan only when its server leaves. | [M54](M54/SPEC.md) | M |
+| 59 | **Measure what a split buys.** The evidence here is who read what and that depth stays four; whether a large index answers faster split three ways is a latency on real machines, and `slos.md` blocks every latency on M0b. | [M54](M54/SPEC.md) | S |
+
 ## Opened by M36
 
 | # | Task | From | Size |

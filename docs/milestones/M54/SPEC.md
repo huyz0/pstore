@@ -182,9 +182,11 @@ and every single-server answer.
    - deleted rows;
    - a filter.
 
-   `query_rows_split`, with each share computed by `part` over its own counting store, equals
-   `query_rows_filtered` with no shares, hit for hit and in score bits. Test:
-   `a_split_query_equals_the_unsplit_one`, in `crates/pstore-query/tests/split.rs`.
+   An engine's `query_split_as`, each share run by `Engine::part` on another engine over the
+   same store (the call the endpoint makes), equals its `query_filtered_as`, hit for hit, in
+   score and `$dist` bits, ids and attributes. Test: `a_split_query_equals_the_unsplit_one`, in
+   `crates/pstore-engine/tests/split.rs` (amended in implementation: real folds build real
+   clustered and sparse segments, which the query layer's tests would have to hand-build).
 2. **Each segment is scanned once, by its assigned server.** In AC1's setup, each server's
    store is wrapped to record the keys it reads. For a dense query asked of server A:
    - each segment's centroid table (`.cen`) is read by exactly the server `assign` names, and by
@@ -195,8 +197,10 @@ and every single-server answer.
      two on A.
 
    Test: `each_segment_is_scanned_once_by_its_server`.
-3. **Depth, end to end.** The shared store injects 250 ms per request (`Faulty`'s latency),
-   so rounds cannot overlap by accident, and all caches are cold.
+3. **Depth, end to end.** Each server's view of the shared store waits 250 ms before every
+   request, so rounds cannot overlap by accident, and all caches are cold. (Amended in
+   implementation: a wait switched on after the fixture is written, which `Faulty`'s latency,
+   fixed at construction, cannot do.)
    - A split dense query completes in under 4.5 × 250 ms. A chain of five rounds, such as the
      peers called only after the coordinator's open, takes at least 1,250 ms.
    - The test is seen to fail with the peer call moved after the open.

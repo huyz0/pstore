@@ -161,9 +161,181 @@ pub async fn query_with<S: BlobStore>(
         &std::collections::HashSet::new(),
         fusion,
         top_k,
+        Vec::new(),
     )
     .await?
     .0)
+}
+
+/// Each `(segment, leg)` pair's hits from one share of a query, numbered by the coordinator's
+/// segment ordinals and leg positions (M54).
+pub type PartHits = Vec<(usize, usize, Vec<Hit>)>;
+
+/// The vector legs of some of a query's segments, run by another server (M54).
+///
+/// ⚠️ **An error is never the query's.** `run` runs a share that failed itself, over the
+/// same segments: a peer that is down, slow or wrong costs rounds, never an answer.
+pub struct Elsewhere<'a> {
+    /// The segment ordinals, into the query's `targets`, whose vector legs it runs.
+    pub targets: Vec<usize>,
+    /// Their hits, or why there are none.
+    pub hits: futures_util::future::BoxFuture<'a, Result<PartHits, String>>,
+}
+
+/// Whether a leg may run on another server (M54): dense and sparse score each row by itself,
+/// so their hits over two segments compare wherever they were computed. A text leg scores
+/// against statistics summed over every segment, which only the coordinator has.
+#[must_use]
+pub fn splittable(p: &Prefetch) -> bool {
+    matches!(p, Prefetch::Dense { .. } | Prefetch::Sparse { .. })
+}
+
+/// One server's share of a query (M54): `legs` -- each with its position in the query --
+/// over `targets` -- each with its ordinal -- opened, scanned, masked by `filter`, rid of
+/// deleted rows and cut to what a shadow of `shadow` ids can leave, exactly as [`run`] does
+/// over its own segments. Both call the same code, so the share a peer returns is the share
+/// the coordinator would have computed.
+///
+/// # Errors
+/// As [`query`], and [`QueryError::Unimplemented`] for a leg that is not [`splittable`].
+pub async fn part<S: BlobStore>(
+    store: &S,
+    targets: &[(usize, Target)],
+    legs: &[(usize, Prefetch)],
+    filter: Option<&Predicate>,
+    shadow: usize,
+) -> Result<PartHits, QueryError> {
+    if legs.iter().any(|(_, p)| !splittable(p)) {
+        return Err(QueryError::Unimplemented("a text leg on another server"));
+    }
+    let runnable = legs
+        .iter()
+        .map(|(j, p)| Runnable::try_from(p).map(|r| (*j, r)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
+    let opened =
+        futures_util::future::try_join_all(targets.iter().map(|(_, t)| open(store, t, &prefetch)))
+            .await?;
+    let items: Vec<(usize, &Target, &Opened)> = targets
+        .iter()
+        .zip(&opened)
+        .map(|((i, t), o)| (*i, t, o))
+        .collect();
+    candidates(
+        store,
+        &items,
+        &runnable,
+        |_, _| true,
+        filter,
+        shadow,
+        false,
+        &Stats::default(),
+        &FullText::default(),
+    )
+    .await
+}
+
+/// Every running `(segment, leg)` pair's candidates: each leg widened by what the segment may
+/// exclude, or exhaustive under a filter or `Sum`; masked; rid of deleted rows; and cut to what
+/// can survive the shadow. `runs` says which pairs run here (M54).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
+async fn candidates<S: BlobStore>(
+    store: &S,
+    items: &[(usize, &Target, &Opened)],
+    legs: &[(usize, Runnable<'_>)],
+    runs: impl Fn(usize, usize) -> bool,
+    filter: Option<&Predicate>,
+    shadow: usize,
+    whole: bool,
+    stats: &Stats,
+    text: &FullText,
+) -> Result<PartHits, QueryError> {
+    let runs = &runs;
+    // ⚠️ N x R futures, still one round: no leg's ranges depend on another's contents.
+    //
+    // ⚠️ **With a filter, every leg is exhaustive and the mask rides the same round** (M9b).
+    // A leg that stopped at its `limit` and was filtered afterwards would return fewer than
+    // `limit` whenever the predicate is selective, silently -- so each leg returns every
+    // candidate (the dense leg probing every list: `p` costs bytes, not depth), the mask
+    // removes what the predicate does not admit, and only then is the limit applied. The
+    // mask's blocks are addressable the moment the segment is open, exactly as the legs'
+    // ranges are, so fetching it alongside them adds no round trip.
+    //
+    // ⚠️ **Superseded rows are excluded the same way** (M9c): a row in a segment's delete
+    // vector, or -- in a shadowed segment -- one whose id has a newer unfolded operation. Without
+    // a filter the legs need not be exhaustive: at most `deleted + shadowed` of a segment's rows
+    // can be excluded, so a leg asked for that many more still has `limit` left after them.
+    // ⚠️ **Under `Sum`, every leg is whole** (M9g.2, spec review): a leg cut at its limit drops
+    // a row's contribution, so the best sum can be a row no leg ranks first -- and whether it
+    // survives would hang on how the index is cut into segments. So the leg is exhaustive and
+    // no cut is re-applied; the fused ranking is what is cut, below.
+    let legs_fut = futures_util::future::try_join_all(items.iter().flat_map(|&(i, t, o)| {
+        legs.iter()
+            .filter(move |(j, _)| runs(i, *j))
+            .map(move |&(j, r)| async move {
+                let hidden = o.deleted.len() + if t.shadowed { shadow } else { 0 };
+                let r = if filter.is_some() || whole {
+                    r.exhaustive(o.segment.index_row_count())
+                } else {
+                    r.widened(hidden, o.segment.row_count())
+                };
+                leg(store, &t.segment, o, &r, i, stats, text)
+                    .await
+                    .map(|hits| (i, j, hits))
+            })
+    }));
+    // ⚠️ A mask only for a segment some leg runs over here (M54): a segment whose vector legs
+    // run elsewhere is masked there.
+    let masks_fut = futures_util::future::try_join_all(items.iter().map(|&(i, t, o)| async move {
+        match filter {
+            Some(f) if legs.iter().any(|(j, _)| runs(i, *j)) => {
+                mask(store, &t.segment, &o.segment, f)
+                    .await
+                    .map(|m| (i, Some(m)))
+            }
+            _ => Ok((i, None)),
+        }
+    }));
+    let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
+    let masks: std::collections::BTreeMap<usize, Mask> = masks
+        .into_iter()
+        .filter_map(|(i, m)| m.map(|m| (i, m)))
+        .collect();
+    let by_ordinal: std::collections::BTreeMap<usize, (&Target, &Opened)> =
+        items.iter().map(|&(i, t, o)| (i, (t, o))).collect();
+    Ok(per_segment
+        .into_iter()
+        .map(|(i, j, hits)| {
+            let admitted = masks.get(&i);
+            let deleted = by_ordinal.get(&i).map(|(_, o)| &o.deleted);
+            // ⚠️ **Cut to what can survive the shadow**, before its documents are fetched
+            // (review of M9c.2): at most `|shadow|` of a segment's candidates are shadowed, so
+            // the rest of the widened list can never reach the answer -- and fetching it read a
+            // block per candidate, a number that grows with the deleted count.
+            let room = if whole {
+                usize::MAX
+            } else {
+                legs.iter()
+                    .find(|(k, _)| *k == j)
+                    .map_or(0, |(_, r)| r.limit())
+                    + if by_ordinal.get(&i).is_some_and(|(t, _)| t.shadowed) {
+                        shadow
+                    } else {
+                        0
+                    }
+            };
+            let kept = hits
+                .into_iter()
+                .filter(|h| filter.is_none() || admitted.is_some_and(|m| m.contains(&h.row)))
+                .filter(|h| deleted.is_none_or(|d| !d.contains(&h.row)))
+                .take(room)
+                .collect();
+            (i, j, kept)
+        })
+        .collect())
 }
 
 /// The ranking **and the segments it was computed over**, still open.
@@ -184,6 +356,7 @@ async fn run<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
+    elsewhere: Vec<Elsewhere<'_>>,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
@@ -202,104 +375,110 @@ async fn run<S: BlobStore>(
     // this argument with a measurement: a loop over segment refs "turns a ten-segment index
     // into a twenty-one-hop query", which is six times the whole latency budget. Width is
     // free; depth is not.
-    let opened =
-        futures_util::future::try_join_all(targets.iter().map(|t| open(store, t, prefetch)))
+    //
+    // ⚠️ **A segment whose vector legs run elsewhere is opened for its text legs only** (M54):
+    // its footer, delete vector and term dictionary, which the text legs, the shadow check and
+    // the row fetch need -- never the centroid table or sparse dictionary its peer reads.
+    let remote: std::collections::BTreeSet<usize> = elsewhere
+        .iter()
+        .flat_map(|e| e.targets.iter().copied())
+        .collect();
+    let (shares, futures): (Vec<Vec<usize>>, Vec<_>) =
+        elsewhere.into_iter().map(|e| (e.targets, e.hits)).unzip();
+    let text_legs: Vec<Prefetch> = prefetch
+        .iter()
+        .filter(|p| !splittable(p))
+        .cloned()
+        .collect();
+    let whole = matches!(fusion, Fusion::Sum { .. });
+    let legs: Vec<(usize, Runnable<'_>)> = runnable.iter().copied().enumerate().collect();
+    let here = |i: usize, j: usize| {
+        !remote.contains(&i) || prefetch.get(j).is_some_and(|p| !splittable(p))
+    };
+    let local = async {
+        let opened =
+            futures_util::future::try_join_all(targets.iter().enumerate().map(|(i, t)| {
+                let wanted = if remote.contains(&i) {
+                    text_legs.as_slice()
+                } else {
+                    prefetch
+                };
+                open(store, t, wanted)
+            }))
             .await?;
 
-    // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
-    // summaries ride in the term dictionaries the open round already fetched. That is what
-    // D-30's two-pass IDF must not cost, and per-segment IDF is wrong exactly when the
-    // query's discriminating term is the one whose frequency differs between segments.
-    //
-    // ⚠️ A segment with no text index contributes nothing, and that is correct rather than an
-    // omission: it holds no documents containing the field, so it is not part of BM25's
-    // corpus.
-    //
-    // ⚠️ The other case — postings present, dictionary unreadable — would drop the segment
-    // out of `doc_count` and every `df`, scoring the whole query against a corpus one segment
-    // too small. It cannot produce a wrong ANSWER, because that segment's own text leg fails
-    // on the same missing sidecar and `try_join_all` fails the query with it. A guard here
-    // was written first and removed: no test could distinguish it, and the mutation gate said
-    // so. `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` pins the property
-    // wherever it is enforced.
-    let stats: &Stats = &Stats::merge(opened.iter().filter_map(|o| {
-        let raw = o.terms.as_ref()?;
-        TextIndex::from_segment(&o.segment, raw.as_ref())
-            .ok()
-            .map(|idx| idx.summary())
-    }));
-
-    // ⚠️ N x R futures, still one round: no leg's ranges depend on another's contents.
-    //
-    // ⚠️ **With a filter, every leg is exhaustive and the mask rides the same round** (M9b).
-    // A leg that stopped at its `limit` and was filtered afterwards would return fewer than
-    // `limit` whenever the predicate is selective, silently -- so each leg returns every
-    // candidate (the dense leg probing every list: `p` costs bytes, not depth), the mask
-    // removes what the predicate does not admit, and only then is the limit applied. The
-    // mask's blocks are addressable the moment the segment is open, exactly as the legs'
-    // ranges are, so fetching it alongside them adds no round trip.
-    //
-    // ⚠️ **Superseded rows are excluded the same way** (M9c): a row in a segment's delete
-    // vector, or -- in a shadowed segment -- one whose id has a newer unfolded operation. Without
-    // a filter the legs need not be exhaustive: at most `deleted + shadowed` of a segment's rows
-    // can be excluded, so a leg asked for that many more still has `limit` left after them.
-    // ⚠️ **Under `Sum`, every leg is whole** (M9g.2, spec review): a leg cut at its limit drops
-    // a row's contribution, so the best sum can be a row no leg ranks first -- and whether it
-    // survives would hang on how the index is cut into segments. So the leg is exhaustive and
-    // no cut is re-applied; the fused ranking is what is cut, below.
-    let whole = matches!(fusion, Fusion::Sum { .. });
-    let legs_fut =
-        futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().flat_map(
-            |(i, (o, t))| {
-                runnable.iter().enumerate().map(move |(j, r)| async move {
-                    let hidden = o.deleted.len() + if t.shadowed { shadow.len() } else { 0 };
-                    let r = if filter.is_some() || whole {
-                        r.exhaustive(o.segment.index_row_count())
-                    } else {
-                        r.widened(hidden, o.segment.row_count())
-                    };
-                    leg(store, &t.segment, o, &r, i, stats, text)
-                        .await
-                        .map(|hits| (i, j, hits))
-                })
-            },
-        ));
-    let masks_fut =
-        futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
-            match filter {
-                Some(f) => mask(store, &t.segment, &o.segment, f).await.map(Some),
-                None => Ok(None),
-            }
+        // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
+        // summaries ride in the term dictionaries the open round already fetched. That is what
+        // D-30's two-pass IDF must not cost, and per-segment IDF is wrong exactly when the
+        // query's discriminating term is the one whose frequency differs between segments.
+        //
+        // ⚠️ A segment with no text index contributes nothing, and that is correct rather than an
+        // omission: it holds no documents containing the field, so it is not part of BM25's
+        // corpus.
+        //
+        // ⚠️ The other case — postings present, dictionary unreadable — would drop the segment
+        // out of `doc_count` and every `df`, scoring the whole query against a corpus one segment
+        // too small. It cannot produce a wrong ANSWER, because that segment's own text leg fails
+        // on the same missing sidecar and `try_join_all` fails the query with it. A guard here
+        // was written first and removed: no test could distinguish it, and the mutation gate said
+        // so. `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` pins the property
+        // wherever it is enforced.
+        let stats = Stats::merge(opened.iter().filter_map(|o| {
+            let raw = o.terms.as_ref()?;
+            TextIndex::from_segment(&o.segment, raw.as_ref())
+                .ok()
+                .map(|idx| idx.summary())
         }));
-    let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
-    let candidates: Vec<(usize, usize, Vec<Hit>)> = per_segment
-        .into_iter()
-        .map(|(i, j, hits)| {
-            let admitted = masks.get(i).and_then(Option::as_ref);
-            let deleted = opened.get(i).map(|o| &o.deleted);
-            // ⚠️ **Cut to what can survive the shadow**, before its documents are fetched
-            // (review of M9c.2): at most `|shadow|` of a segment's candidates are shadowed, so
-            // the rest of the widened list can never reach the answer -- and fetching it read a
-            // block per candidate, a number that grows with the deleted count.
-            let room = if whole {
-                usize::MAX
-            } else {
-                runnable.get(j).map_or(0, Runnable::limit)
-                    + if targets.get(i).is_some_and(|t| t.shadowed) {
-                        shadow.len()
-                    } else {
-                        0
-                    }
-            };
-            let kept = hits
-                .into_iter()
-                .filter(|h| admitted.is_none_or(|m| m.contains(&h.row)))
-                .filter(|h| deleted.is_none_or(|d| !d.contains(&h.row)))
-                .take(room)
-                .collect();
-            (i, j, kept)
-        })
-        .collect();
+        let items: Vec<(usize, &Target, &Opened)> = targets
+            .iter()
+            .zip(&opened)
+            .enumerate()
+            .map(|(i, (t, o))| (i, t, o))
+            .collect();
+        let found = candidates(
+            store,
+            &items,
+            &legs,
+            here,
+            filter,
+            shadow.len(),
+            whole,
+            &stats,
+            text,
+        )
+        .await?;
+        Ok::<_, QueryError>((opened, found))
+    };
+    // ⚠️ **Beside the open round, not after it** (M54): a peer's share is two rounds on its
+    // own store, the same two the coordinator spends here, so the slowest path stays HEAD,
+    // open, legs, rows.
+    let (local, shared) =
+        futures_util::future::join(local, futures_util::future::join_all(futures)).await;
+    let (opened, mut candidates_found) = local?;
+    // ⚠️ **Every failed share run here, and together** (M54, code review): a failed share
+    // costs two rounds, never the answer -- and two rounds however many failed, which one
+    // after another would make two per peer.
+    let mut failed: Vec<(usize, Target)> = Vec::new();
+    for (share, got) in shares.iter().zip(shared) {
+        match got {
+            Ok(hits) => candidates_found.extend(hits),
+            Err(_) => failed.extend(
+                share
+                    .iter()
+                    .filter_map(|i| targets.get(*i).map(|t| (*i, t.clone()))),
+            ),
+        }
+    }
+    if !failed.is_empty() {
+        let vector: Vec<(usize, Prefetch)> = prefetch
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| splittable(p))
+            .map(|(j, p)| (j, p.clone()))
+            .collect();
+        candidates_found.extend(part(store, &failed, &vector, filter, shadow.len()).await?);
+    }
+    let candidates = candidates_found;
 
     if whole {
         return summed(
@@ -466,8 +645,43 @@ pub async fn query_rows_filtered<S: BlobStore>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
+    query_rows_split(
+        store,
+        targets,
+        prefetch,
+        text,
+        filter,
+        shadow,
+        fusion,
+        top_k,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`query_rows_filtered`], with the vector legs of some segments run by other servers
+/// (M54). The answer is the one [`query_rows_filtered`] gives: each share is the same
+/// per-segment work, merged as the coordinator merges its own.
+///
+/// # Errors
+/// As [`query_rows_filtered`]. A share that fails is never an error: it is run here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
+pub async fn query_rows_split<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    text: &FullText,
+    filter: Option<&Predicate>,
+    shadow: &std::collections::HashSet<String>,
+    fusion: Fusion,
+    top_k: usize,
+    elsewhere: Vec<Elsewhere<'_>>,
+) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
     let (hits, opened, known, dense) = run(
-        store, targets, prefetch, text, filter, shadow, fusion, top_k,
+        store, targets, prefetch, text, filter, shadow, fusion, top_k, elsewhere,
     )
     .await?;
     Ok(resolve_rows(store, targets, &opened, &hits, known)

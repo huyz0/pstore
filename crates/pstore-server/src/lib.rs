@@ -29,9 +29,11 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod peers;
 mod replication;
 mod session;
 mod types;
+pub use peers::PeerConfig;
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
@@ -129,6 +131,13 @@ pub struct Api<S> {
     /// Replication (M22): its policy and named sources, the register of tenants with running
     /// replications, and what this process's worker holds.
     replicating: replication::Replicating<S>,
+    /// The servers a query's vector legs may run on (M54), or `None` for a single server.
+    peers: Mutex<Option<Arc<peers::Cluster>>>,
+    /// Parts of other servers' queries this one ran (M54).
+    parts_served: std::sync::atomic::AtomicU64,
+    /// Index parameters every engine is built with, when set (M54's tests cluster small
+    /// segments with them).
+    index_params: Mutex<Option<pstore_index::cluster::Params>>,
 }
 
 /// One tenant's engine in the registry (M26).
@@ -301,6 +310,9 @@ impl<S: BlobStore + 'static> Api<S> {
             requested: Mutex::new(std::collections::HashSet::new()),
             reap_backoff: Mutex::new(HashMap::new()),
             replicating: replication::Replicating::default(),
+            peers: Mutex::new(None),
+            parts_served: std::sync::atomic::AtomicU64::new(0),
+            index_params: Mutex::new(None),
         }))
     }
 
@@ -538,6 +550,8 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
             .route("/v1/indexes/{index}/query", post(query_index::<S>))
+            // M54: one share of another server's query.
+            .route("/v1/internal/part", post(peers::serve_part::<S>))
             .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
             .route(
                 "/v1/indexes/{index}/quarantine",
@@ -576,6 +590,10 @@ impl<S: BlobStore + 'static> Api<S> {
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
         let recheck = self.registry_mut().lane_recheck;
+        let params = *self
+            .index_params
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut engines = self.engines.lock().await;
         let slot = engines.entry(tenant).or_insert_with(|| {
             let engine = Engine::new(
@@ -586,6 +604,10 @@ impl<S: BlobStore + 'static> Api<S> {
                 tenant,
                 self.lane,
             );
+            let engine = match params {
+                Some(p) => engine.with_index_params(p),
+                None => engine,
+            };
             Slot {
                 engine: Arc::new(match recheck {
                     Some(within) => engine.with_lane_recheck(within),
@@ -603,6 +625,42 @@ impl<S: BlobStore + 'static> Api<S> {
     #[doc(hidden)]
     pub async fn hold_engine_for_test(&self, tenant: TenantId) -> Arc<Tenant<S>> {
         self.engine(tenant).await
+    }
+
+    /// Splits each query's vector legs across `peers` (M54); `None` answers every query here.
+    ///
+    /// # Errors
+    /// No HTTP client can be built for the peers.
+    pub fn set_peers(&self, peers: Option<PeerConfig>) -> Result<(), ConfigError> {
+        let cluster = peers.map(peers::Cluster::new).transpose()?.map(Arc::new);
+        *self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cluster;
+        Ok(())
+    }
+
+    /// Builds every engine from now on with `params` (M54's tests: small clustered segments).
+    #[doc(hidden)]
+    pub fn set_index_params_for_test(&self, params: pstore_index::cluster::Params) {
+        *self
+            .index_params
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(params);
+    }
+
+    /// This query's view of the peers, when there are any (M54).
+    fn query_peers(&self, tenant: TenantId, req: &QueryRequest) -> Option<peers::QueryPeers> {
+        let cluster = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        Some(peers::QueryPeers {
+            cluster,
+            tenant,
+            filters: req.filters.clone(),
+        })
     }
 
     /// Caps the registry at `cap` engines, `0` for unbounded (M26, `PSTORE_ENGINES`): past it,
@@ -992,6 +1050,27 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
+    // M54: parts of queries sent to peers, those that failed, and those run for peers.
+    let (sent, failed) = api
+        .peers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map_or((0, 0), |c| {
+            (
+                c.sent.load(std::sync::atomic::Ordering::Relaxed),
+                c.failed.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+    out.push_str(&format!(
+        "# HELP pstore_peer_parts_sent Parts of this server's queries sent to peers (M54).\n\
+         # TYPE pstore_peer_parts_sent counter\npstore_peer_parts_sent {sent}\n\
+         # HELP pstore_peer_parts_failed Parts a peer did not answer, run here instead.\n\
+         # TYPE pstore_peer_parts_failed counter\npstore_peer_parts_failed {failed}\n\
+         # HELP pstore_peer_parts_served Parts of other servers' queries run here.\n\
+         # TYPE pstore_peer_parts_served counter\npstore_peer_parts_served {}\n",
+        api.parts_served.load(std::sync::atomic::Ordering::Relaxed)
+    ));
     out.push_str("# HELP pstore_refusals_total Refusals by their stable code.\n");
     out.push_str("# TYPE pstore_refusals_total counter\n");
     // ⚠️ Every code the table can produce is emitted, at zero if it has not happened: a series
@@ -1476,8 +1555,12 @@ async fn query_index<S: BlobStore + 'static>(
         let plan = plan(&req)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
+        let peers = api.query_peers(tenant, &req);
         let got = api
-            .requesting(tenant, run(&engine, &index, &req, plan, &token).await)
+            .requesting(
+                tenant,
+                run(&engine, &index, &req, plan, &token, peers.as_ref()).await,
+            )
             .await?;
         let session = got.token.encode();
         return Ok(with_session(
@@ -1502,10 +1585,13 @@ async fn query_index<S: BlobStore + 'static>(
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
+    let peers: Vec<Option<peers::QueryPeers>> =
+        reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
     let got = futures_util::future::try_join_all(
         reqs.iter()
             .zip(plans)
-            .map(|(req, plan)| run(&engine, &index, req, plan, &token)),
+            .zip(&peers)
+            .map(|((req, plan), p)| run(&engine, &index, req, plan, &token, p.as_ref())),
     )
     .await;
     let got = api.requesting(tenant, got).await?;
@@ -1873,6 +1959,7 @@ async fn run<E: BlobStore>(
     req: &QueryRequest,
     plan: Plan,
     token: &session::Token,
+    peers: Option<&peers::QueryPeers>,
 ) -> Result<Answered, ApiError> {
     let missing = || {
         ApiError::new(
@@ -1994,13 +2081,14 @@ async fn run<E: BlobStore>(
         }
         None => {
             engine
-                .query_filtered_as(
+                .query_split_as(
                     index,
                     &legs,
                     filter.as_ref(),
                     fusion,
                     req.top_k,
                     consistency,
+                    peers.map(|p| p as &dyn pstore_engine::Peers),
                 )
                 .await?
         }
@@ -3144,6 +3232,8 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// The engine registry's cap, from `PSTORE_ENGINES` (M26): 10 000 by default, `0` for none.
     pub engines: usize,
+    /// The servers a query's vector legs may run on, from `PSTORE_PEERS` (M54).
+    pub peers: Option<PeerConfig>,
 }
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
@@ -3335,6 +3425,9 @@ pub enum ConfigError {
     /// A replication source that is not fully configured (M22).
     #[error("replication source {0:?}: {1}")]
     Source(String, &'static str),
+    /// A `PSTORE_PEER*` value that cannot be used (M54).
+    #[error("{0}={1} is refused: {2}")]
+    Peers(&'static str, String, &'static str),
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
@@ -3396,6 +3489,7 @@ impl Config {
             gc: gc_policy(&get)?,
             lane_recheck: reap_age(&get)? / 2,
             cache: cache_config(&get, backend)?,
+            peers: PeerConfig::from_vars(&get)?,
             replication: replication_policy(&get)?,
             sources: source_configs(&get)?,
             engines: match get("PSTORE_ENGINES") {

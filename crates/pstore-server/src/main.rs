@@ -138,6 +138,11 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     api.limit_engines(config.engines);
+    // M54: a query's vector legs split across the servers PSTORE_PEERS names.
+    if let Err(e) = api.set_peers(config.peers.clone()) {
+        eprintln!("pstore-server: refusing to serve: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
     let mut sources = std::collections::BTreeMap::new();
     for s in &config.sources {
         match source(s) {

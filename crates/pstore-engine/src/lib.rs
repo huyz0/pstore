@@ -4995,6 +4995,30 @@ impl<S: BlobStore> Engine<S> {
         top_k: usize,
         consistency: Consistency,
     ) -> Result<Answer, EngineError> {
+        self.query_split_as(index, prefetch, filter, fusion, top_k, consistency, None)
+            .await
+    }
+
+    /// [`Self::query_filtered_as`], with the vector legs of the segments [`assign`] gives to
+    /// another of `peers`' servers run there (M54). The answer is the one
+    /// [`Self::query_filtered_as`] gives; a share that fails is run here.
+    ///
+    /// # Errors
+    /// As [`Self::query_filtered_as`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, and where to split it"
+    )]
+    pub async fn query_split_as(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        peers: Option<&dyn Peers>,
+    ) -> Result<Answer, EngineError> {
         // ⚠️ A read served from the `bounded` cache that fails is retried once from a fresh
         // HEAD (M11.2): `gc` may have reaped a segment the cached HEAD still names.
         let mut hit = false;
@@ -5008,6 +5032,7 @@ impl<S: BlobStore> Engine<S> {
                 consistency,
                 true,
                 &mut hit,
+                peers,
             )
             .await;
         match first {
@@ -5023,6 +5048,7 @@ impl<S: BlobStore> Engine<S> {
                     consistency,
                     false,
                     &mut hit,
+                    peers,
                 )
                 .await
             }
@@ -5044,6 +5070,7 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         allow_hit: bool,
         hit: &mut bool,
+        peers: Option<&dyn Peers>,
     ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
@@ -5052,7 +5079,9 @@ impl<S: BlobStore> Engine<S> {
             .await?;
         *hit = got.hit;
         let (mut answer, settled) = futures_util::future::try_join(
-            self.answer(index, &got.at, got.fresh, prefetch, filter, fusion, top_k),
+            self.answer(
+                index, &got.at, got.fresh, prefetch, filter, fusion, top_k, peers,
+            ),
             self.settled(&got.at.head, got.lanes.as_deref()),
         )
         .await?;
@@ -5062,6 +5091,29 @@ impl<S: BlobStore> Engine<S> {
         } else {
             Err(EngineError::NotFolded)
         }
+    }
+
+    /// Runs one share of another server's query (M54): `part`'s vector legs over its
+    /// segments, masked by `filter` bound to `part`'s schema -- the bind the coordinator made.
+    /// Reads no HEAD: the coordinator read it, and `part` says what it named.
+    ///
+    /// # Errors
+    /// What [`pstore_query::part`] raises: a segment or sidecar that cannot be read, a leg
+    /// over a field or of a dimension the segment does not have.
+    pub async fn part(
+        &self,
+        part: &Part,
+        filter: Option<&pstore_query::Predicate>,
+    ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
+        let bound = filter.map(|f| f.bound(&part.fts.analyzer));
+        pstore_query::part(
+            &*self.store,
+            &part.targets,
+            &part.legs,
+            bound.as_ref(),
+            part.shadow,
+        )
+        .await
     }
 
     /// The query's rounds after HEAD: its segments and blocks.
@@ -5078,6 +5130,7 @@ impl<S: BlobStore> Engine<S> {
         filter: Option<&pstore_query::Predicate>,
         fusion: pstore_query::Fusion,
         top_k: usize,
+        peers: Option<&dyn Peers>,
     ) -> Result<Answer, EngineError> {
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
@@ -5150,8 +5203,22 @@ impl<S: BlobStore> Engine<S> {
             durable: Arc::clone(&self.store),
             fresh: fresh_store,
         };
-        let resolved = pstore_query::query_rows_filtered(
-            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k,
+        // M54: the folded segments only; the fresh one is this process's alone.
+        let elsewhere = peers.map_or_else(Vec::new, |p| {
+            let durable = targets.get(..unfolded_at).unwrap_or_default();
+            shares(
+                p,
+                index,
+                durable,
+                prefetch,
+                fts,
+                shadow.len(),
+                fusion,
+                MAX_PART_SEGMENTS,
+            )
+        });
+        let resolved = pstore_query::query_rows_split(
+            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k, elsewhere,
         )
         .await
         .map_err(|e| query_error(metric, e))?;
@@ -5974,6 +6041,144 @@ fn may_have_centroids(rows: u32, threshold: usize) -> bool {
     rows == 0 || rows as usize >= threshold
 }
 
+/// Where one query's vector legs may run besides this server (M54): every server of a fixed
+/// list, by the name [`assign`] hashes, and the call that runs a share on one of them.
+pub trait Peers: Send + Sync {
+    /// Every server, this one included, by base URL.
+    fn servers(&self) -> &[String];
+    /// This server's position in [`Self::servers`].
+    fn me(&self) -> usize;
+    /// Runs `part` on `server`. An error is the coordinator's cue to run it itself.
+    fn part(
+        &self,
+        server: usize,
+        part: Part,
+    ) -> futures_util::future::BoxFuture<'static, Result<pstore_query::PartHits, String>>;
+}
+
+/// One server's share of a query (M54): its vector legs over some of the segments, numbered
+/// as the coordinator numbers them.
+#[derive(Debug, Clone)]
+pub struct Part {
+    /// The index queried.
+    pub index: String,
+    /// Its full-text schema, which binds the filter's token predicates as the coordinator's
+    /// are bound.
+    pub fts: pstore_format::text::FullText,
+    /// The splittable legs, each with its position in the query -- after the metric's
+    /// transform, so the vectors the peer scores are the coordinator's, bit for bit.
+    pub legs: Vec<(usize, pstore_query::Prefetch)>,
+    /// The segments, each with its ordinal in the query.
+    pub targets: Vec<(usize, pstore_query::Target)>,
+    /// How many ids the query's shadow holds: what each segment's candidates are cut to
+    /// leave room for.
+    pub shadow: usize,
+}
+
+/// The server, of `servers`, a segment's vector legs run on (M54): the highest
+/// `mix(fnv(server ‖ 0 ‖ key))`, rendezvous hashing, a server's URL read without a trailing
+/// `/`. Every coordinator computes the same one, so a segment stays warm in one server's
+/// cache; a server added takes about `1/N` of the keys, and only from the others.
+///
+/// ⚠️ `mix` because FNV alone avalanches poorly (spec review): keys differing in their last
+/// bytes would land on servers by those bytes' low bits.
+#[must_use]
+pub fn assign(key: &str, servers: &[String]) -> usize {
+    let mut best: Option<(usize, u64)> = None;
+    for (i, s) in servers.iter().enumerate() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s
+            .trim_end_matches('/')
+            .bytes()
+            .chain([0])
+            .chain(key.bytes())
+        {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        // SplitMix64's finaliser, less its last shift: that shift moves only the low 33 bits,
+        // and the highest hash is decided by the high ones (the sweep found it changed nothing).
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+        // Ties to the earlier server: a fixed rule, so every coordinator agrees.
+        if best.is_none_or(|(_, top)| h > top) {
+            best = Some((i, h));
+        }
+    }
+    best.map_or(0, |(i, _)| i)
+}
+
+/// The fewest folded segments a query is split over (M54): one segment is one scan.
+const SPLIT_FROM: usize = 2;
+
+/// The most segments one part may name (M54): a peer refuses more, so a query whose share for
+/// one peer would exceed it is not split at all -- never sent to be refused on every query.
+pub const MAX_PART_SEGMENTS: usize = 4096;
+
+/// `durable`'s segments grouped by the server [`assign`] gives each, less this one's, as
+/// shares for [`pstore_query::query_rows_split`] (M54). None when the query has no
+/// splittable leg, the index is too small, or every segment is this server's.
+///
+/// ⚠️ Never under `Sum` (code review): its legs are whole, and a peer's share is widened and
+/// cut as every other fusion's is. The API cannot ask it of a vector leg; the engine can.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts a share is cut from"
+)]
+fn shares(
+    peers: &dyn Peers,
+    index: &str,
+    durable: &[pstore_query::Target],
+    prefetch: &[pstore_query::Prefetch],
+    fts: pstore_format::text::FullText,
+    shadow: usize,
+    fusion: pstore_query::Fusion,
+    cap: usize,
+) -> Vec<pstore_query::Elsewhere<'static>> {
+    let legs: Vec<(usize, pstore_query::Prefetch)> = prefetch
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| pstore_query::splittable(p))
+        .map(|(j, p)| (j, p.clone()))
+        .collect();
+    let servers = peers.servers();
+    if legs.is_empty()
+        || durable.len() < SPLIT_FROM
+        || servers.len() < 2
+        || matches!(fusion, pstore_query::Fusion::Sum { .. })
+    {
+        return Vec::new();
+    }
+    let mut by_server: BTreeMap<usize, Vec<(usize, pstore_query::Target)>> = BTreeMap::new();
+    for (i, t) in durable.iter().enumerate() {
+        let server = assign(t.segment.as_str(), servers);
+        if server != peers.me() {
+            by_server.entry(server).or_default().push((i, t.clone()));
+        }
+    }
+    if by_server.values().any(|t| t.len() > cap) {
+        return Vec::new();
+    }
+    by_server
+        .into_iter()
+        .map(|(server, targets)| pstore_query::Elsewhere {
+            targets: targets.iter().map(|(i, _)| *i).collect(),
+            hits: peers.part(
+                server,
+                Part {
+                    index: index.to_owned(),
+                    fts,
+                    legs: legs.clone(),
+                    targets,
+                    shadow,
+                },
+            ),
+        })
+        .collect()
+}
+
 /// Query targets for HEAD's segments, each with its delete vector (M9c.2), and its centroid
 /// table only where one may exist (M27).
 fn segment_targets(
@@ -6117,9 +6322,118 @@ fn query_error(metric: Metric, e: pstore_query::QueryError) -> EngineError {
     clippy::expect_used,
     reason = "assertions in tests are the reporting mechanism"
 )]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
 mod split_tests {
     use super::*;
     use pstore_blob::MemoryStore;
+
+    /// Three servers, this one the first; a share is never run.
+    struct Named(Vec<String>);
+
+    impl Peers for Named {
+        fn servers(&self) -> &[String] {
+            &self.0
+        }
+        fn me(&self) -> usize {
+            0
+        }
+        fn part(
+            &self,
+            _: usize,
+            _: Part,
+        ) -> futures_util::future::BoxFuture<'static, Result<pstore_query::PartHits, String>>
+        {
+            Box::pin(async { Err("not run".to_owned()) })
+        }
+    }
+
+    #[test]
+    fn a_query_is_split_only_where_rule_seven_allows() {
+        // M54: by server, never this one; not under `Sum`; not without a vector leg; not over
+        // one segment; and not when a share would exceed the cap a peer refuses past.
+        let peers = Named(vec![
+            "http://a".into(),
+            "http://b".into(),
+            "http://c".into(),
+        ]);
+        let targets: Vec<pstore_query::Target> = (0..40)
+            .map(|i| pstore_query::Target {
+                segment: Key::new(format!("0001/tnt/1/idx/x/seg/L0/{i}.seg")),
+                segment_len: None,
+                centroids: None,
+                deleted: None,
+                sparse_dict: false,
+                text_dict: false,
+                shadowed: false,
+            })
+            .collect();
+        let dense = vec![pstore_query::Prefetch::Dense {
+            field: "vector".to_owned(),
+            query: vec![1.0],
+            limit: 10,
+            tune: pstore_index::vec_index::Query::default(),
+        }];
+        let text = vec![pstore_query::Prefetch::Text {
+            field: "text".to_owned(),
+            query: "a".to_owned(),
+            limit: 10,
+        }];
+        let fts = pstore_format::text::FullText::default();
+        let rrf = pstore_query::Fusion::default();
+        let split = |t: &[pstore_query::Target], legs, fusion, cap| {
+            shares(&peers, "x", t, legs, fts, 0, fusion, cap)
+                .into_iter()
+                .map(|e| e.targets)
+                .collect::<Vec<_>>()
+        };
+        let got = split(&targets, &dense, rrf, MAX_PART_SEGMENTS);
+        assert_eq!(got.len(), 2, "one share per other server");
+        let named: Vec<usize> = got.iter().flatten().copied().collect();
+        for (i, t) in targets.iter().enumerate() {
+            let mine = assign(t.segment.as_str(), &peers.0) == 0;
+            assert_eq!(!named.contains(&i), mine, "segment {i}");
+        }
+        let biggest = got.iter().map(Vec::len).max().unwrap();
+        assert_eq!(split(&targets, &dense, rrf, biggest).len(), 2, "at the cap");
+        assert!(
+            split(&targets, &dense, rrf, biggest - 1).is_empty(),
+            "past it"
+        );
+        let sum = pstore_query::Fusion::Sum {
+            weights: pstore_query::Weights::ONE,
+        };
+        assert!(
+            split(&targets, &dense, sum, MAX_PART_SEGMENTS).is_empty(),
+            "sum"
+        );
+        assert!(
+            split(&targets, &text, rrf, MAX_PART_SEGMENTS).is_empty(),
+            "text"
+        );
+        // Segments another server holds, so whether they split is the count's alone.
+        let theirs: Vec<pstore_query::Target> = targets
+            .iter()
+            .filter(|t| assign(t.segment.as_str(), &peers.0) != 0)
+            .take(2)
+            .cloned()
+            .collect();
+        assert!(
+            split(&theirs[..1], &dense, rrf, MAX_PART_SEGMENTS).is_empty(),
+            "one"
+        );
+        assert!(
+            !split(&theirs, &dense, rrf, MAX_PART_SEGMENTS).is_empty(),
+            "two"
+        );
+        // A tie goes to the earlier server: the same name twice hashes the same.
+        assert_eq!(
+            assign("k", &["http://a".to_owned(), "http://a".to_owned()]),
+            0
+        );
+    }
 
     /// ⚠️ The rest of `Split`'s routing, which only `head` had a test for (M7b). Reads route by
     /// key prefix; deletes and listings are the durable store's, because the fresh store is

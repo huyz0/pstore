@@ -26,4 +26,7 @@ pub use filter::{
 };
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
 pub use order::{OrderBy, Selector, select};
-pub use run::{Prefetch, QueryError, Target, query, query_rows_filtered, query_with};
+pub use run::{
+    Elsewhere, PartHits, Prefetch, QueryError, Target, part, query, query_rows_filtered,
+    query_rows_split, query_with, splittable,
+};
