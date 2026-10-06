@@ -41,6 +41,24 @@ pub struct Member {
     proto: Arc<Mutex<Protocol>>,
     stats: Arc<Stats>,
     me: String,
+    /// The receiver and the ticker (M56.1): held, so a member can be stopped. Detached, they
+    /// outlived it, and a server that had stopped serving went on answering probes.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// Aborts the tasks, which cannot be awaited here: the socket closes shortly after, not by the
+/// time the drop returns. Only [`Member::stop`] promises the port is free when it returns.
+impl Drop for Member {
+    fn drop(&mut self) {
+        for t in self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            t.abort();
+        }
+    }
 }
 
 impl Member {
@@ -94,6 +112,25 @@ impl Member {
     #[must_use]
     pub fn refused(&self) -> u64 {
         self.stats.refused.load(Ordering::Relaxed)
+    }
+
+    /// Stops this member: its receiver and ticker end, and its socket is released by the time
+    /// this returns (M56.1). It sends nothing more -- there is no leave message -- so the
+    /// others declare it dead by timeout.
+    pub async fn stop(&self) {
+        let tasks = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            // Cancelled is the expected end; either way the task, and its socket, are gone.
+            let _ = t.await;
+        }
     }
 
     /// Learn of a peer out of band — the roster, which is the partition-healing backstop.
@@ -212,6 +249,13 @@ pub async fn start_with(
 
     let me = derive_id(advertise).map_err(|()| "unusable advertise address")?;
     let mut cluster = Cluster::new(me, advertise.to_owned(), zone.to_owned());
+    // ⚠️ Incarnation from the clock, never 0 (M56.1): given a clock that has not stepped back
+    // past the old incarnation, a restart outranks every record the others hold of this
+    // address, so what it declares now -- its zone -- replaces what it declared before. At 0 it
+    // tied, and an equal incarnation never moves a zone. A clock stepped back leaves the old
+    // record winning, as 0 always did: `absorb` ignores this node's own Alive record at a higher
+    // incarnation, which is the gossip protocol's to fix (code review), not this milestone's.
+    cluster.refute(&me, now_micros());
     for s in seeds {
         if let Ok(id) = derive_id(s) {
             cluster.join(id, s.clone(), String::new());
@@ -236,13 +280,16 @@ pub async fn start_with(
             counter: AtomicU64::new(0),
         })
     });
-    spawn_receiver(&socket, &proto, &stats, loss, seed, sealing.clone());
-    spawn_ticker(&socket, &proto, &stats, loss, seed, period, sealing);
+    let tasks = vec![
+        spawn_receiver(&socket, &proto, &stats, loss, seed, sealing.clone()),
+        spawn_ticker(&socket, &proto, &stats, loss, seed, period, sealing),
+    ];
 
     Ok(Member {
         proto,
         stats,
         me: advertise.to_owned(),
+        tasks: std::sync::Mutex::new(tasks),
     })
 }
 
@@ -253,7 +300,7 @@ fn spawn_receiver(
     loss: f64,
     seed: u64,
     sealing: Option<Arc<Sealing>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let (socket, proto, stats) = (Arc::clone(socket), Arc::clone(proto), Arc::clone(stats));
     tokio::spawn(async move {
         // The largest message the protocol sends, never a size of our own (M44), plus the
@@ -303,7 +350,7 @@ fn spawn_receiver(
             };
             send_all(&socket, &stats, replies, loss, &mut rng, sealing.as_deref()).await;
         }
-    });
+    })
 }
 
 /// Each outgoing datagram with the node it is for, when the transport seals (M53).
@@ -333,7 +380,7 @@ fn spawn_ticker(
     seed: u64,
     period: std::time::Duration,
     sealing: Option<Arc<Sealing>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let (socket, proto, stats) = (Arc::clone(socket), Arc::clone(proto), Arc::clone(stats));
     tokio::spawn(async move {
         let mut rng = Bernoulli::new(seed);
@@ -348,7 +395,7 @@ fn spawn_ticker(
             };
             send_all(&socket, &stats, out, loss, &mut rng, sealing.as_deref()).await;
         }
-    });
+    })
 }
 
 /// Drop a fraction of outbound datagrams, and count the rest.

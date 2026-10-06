@@ -436,3 +436,127 @@ async fn a_frame_sealed_before_the_node_started_is_refused() {
     }
     panic!("a fresh frame was refused: {} refused", a.refused());
 }
+
+const PERIOD: Duration = Duration::from_millis(100);
+
+async fn member_at(port: u16, zone: &str, seeds: &[String]) -> swim::Member {
+    let at = format!("127.0.0.1:{port}");
+    // Sealed, as a server's member is (M56 AC3).
+    swim::start_with(&at, &at, zone, seeds, 0.0, PERIOD, keyed(&[8]))
+        .await
+        .expect("a member must start on loopback")
+}
+
+#[tokio::test]
+async fn a_stopped_member_falls_silent_and_is_declared_dead() {
+    // M56.1: a member's tasks ran detached, so a server that stopped serving went on answering
+    // probes for as long as its process lived.
+    let (a_port, b_port) = (free_port(), free_port());
+    let a = member_at(a_port, "az-a", &[]).await;
+    let b = member_at(b_port, "az-a", &[format!("127.0.0.1:{a_port}")]).await;
+    let mut met = false;
+    for _ in 0..40 {
+        if a.member_count().await == 2 {
+            met = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(met, "the two never met");
+    b.stop().await;
+    // Let anything in flight land, then the counters must not move again.
+    tokio::time::sleep(PERIOD * 2).await;
+    let (sent, recvd, _) = b.traffic();
+    let mut gone = false;
+    for _ in 0..40 {
+        if a.member_count().await == 1 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(
+        gone,
+        "a stopped member was still counted alive after 40 periods"
+    );
+    tokio::time::sleep(PERIOD * 10).await;
+    let (sent2, recvd2, _) = b.traffic();
+    assert_eq!(
+        (sent2, recvd2),
+        (sent, recvd),
+        "a stopped member still sent or received"
+    );
+    std::net::UdpSocket::bind(format!("127.0.0.1:{b_port}"))
+        .expect("a stopped member's port must be free again");
+}
+
+#[tokio::test]
+async fn a_member_restarted_with_a_new_zone_is_believed() {
+    // M56.1: a restart began at incarnation 0, which ties the record the others hold, and a
+    // zone never moves at an equal incarnation -- so a server restarted under a new URL kept
+    // its old one in every other view until something suspected it.
+    let (a_port, b_port) = (free_port(), free_port());
+    let a = member_at(a_port, "az-a", &[]).await;
+    let seeds = [format!("127.0.0.1:{a_port}")];
+    let b = member_at(b_port, "az-old", &seeds).await;
+    let zone_of_b = |zoned: Vec<(String, String)>| {
+        zoned
+            .into_iter()
+            .find(|(addr, _)| *addr == format!("127.0.0.1:{b_port}"))
+            .map(|(_, z)| z)
+    };
+    let mut met = false;
+    for _ in 0..40 {
+        if zone_of_b(a.members_zoned().await).as_deref() == Some("az-old") {
+            met = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(met, "a never learned b's first zone");
+    b.stop().await;
+    drop(b);
+    // At once, well inside the time a would take to suspect it.
+    let b = member_at(b_port, "az-new", &seeds).await;
+    let mut moved = false;
+    for _ in 0..40 {
+        if zone_of_b(a.members_zoned().await).as_deref() == Some("az-new") {
+            moved = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(moved, "a still holds b's old zone after 40 periods");
+    drop(b);
+}
+
+#[tokio::test]
+async fn a_dropped_member_falls_silent_too() {
+    // M56.1, from the sweep: a member dropped without `stop` ends its tasks as well, or a
+    // server that drops its handle on an error path would answer probes for ever.
+    let (a_port, b_port) = (free_port(), free_port());
+    let a = member_at(a_port, "az-a", &[]).await;
+    let b = member_at(b_port, "az-a", &[format!("127.0.0.1:{a_port}")]).await;
+    let mut met = false;
+    for _ in 0..40 {
+        if a.member_count().await == 2 {
+            met = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(met, "the two never met");
+    drop(b);
+    let mut gone = false;
+    for _ in 0..40 {
+        if a.member_count().await == 1 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(PERIOD).await;
+    }
+    assert!(
+        gone,
+        "a dropped member was still counted alive after 40 periods"
+    );
+}
