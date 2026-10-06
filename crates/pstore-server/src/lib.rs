@@ -135,6 +135,8 @@ pub struct Api<S> {
     peers: Mutex<Option<Arc<peers::Cluster>>>,
     /// Parts of other servers' queries this one ran (M54).
     parts_served: std::sync::atomic::AtomicU64,
+    /// Parts held between their two phases (M55).
+    held: Mutex<peers::Holder>,
     /// Index parameters every engine is built with, when set (M54's tests cluster small
     /// segments with them).
     index_params: Mutex<Option<pstore_index::cluster::Params>>,
@@ -312,6 +314,7 @@ impl<S: BlobStore + 'static> Api<S> {
             replicating: replication::Replicating::default(),
             peers: Mutex::new(None),
             parts_served: std::sync::atomic::AtomicU64::new(0),
+            held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
         }))
     }
@@ -647,6 +650,13 @@ impl<S: BlobStore + 'static> Api<S> {
             .index_params
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(params);
+    }
+
+    /// The parts held between their phases (M55).
+    fn holder(&self) -> std::sync::MutexGuard<'_, peers::Holder> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// This query's view of the peers, when there are any (M54).
@@ -1068,8 +1078,17 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
          # HELP pstore_peer_parts_failed Parts a peer did not answer, run here instead.\n\
          # TYPE pstore_peer_parts_failed counter\npstore_peer_parts_failed {failed}\n\
          # HELP pstore_peer_parts_served Parts of other servers' queries run here.\n\
-         # TYPE pstore_peer_parts_served counter\npstore_peer_parts_served {}\n",
-        api.parts_served.load(std::sync::atomic::Ordering::Relaxed)
+         # TYPE pstore_peer_parts_served counter\npstore_peer_parts_served {}\n\
+         # HELP pstore_peer_parts_expired Parts held between phases and dropped unscanned.\n\
+         # TYPE pstore_peer_parts_expired counter\npstore_peer_parts_expired {}\n",
+        api.parts_served.load(std::sync::atomic::Ordering::Relaxed),
+        {
+            // A scrape sweeps too (code review): a peer that gets no more phased traffic still
+            // drops, and counts, what has been held past its time.
+            let mut held = api.holder();
+            held.sweep(tokio::time::Instant::now());
+            held.expired
+        }
     ));
     out.push_str("# HELP pstore_refusals_total Refusals by their stable code.\n");
     out.push_str("# TYPE pstore_refusals_total counter\n");

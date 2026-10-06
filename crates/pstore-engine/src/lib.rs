@@ -5112,6 +5112,45 @@ impl<S: BlobStore> Engine<S> {
             &part.legs,
             bound.as_ref(),
             part.shadow,
+            &pstore_index::text::Stats::default(),
+            &part.fts,
+        )
+        .await
+    }
+
+    /// Phase 1 of a share of another server's query (M55): `part`'s segments opened for its
+    /// legs, and their statistics for `part.terms`. Whole or nothing: see
+    /// [`pstore_query::open_part`].
+    ///
+    /// # Errors
+    /// As [`Self::part`], and a term dictionary that should be there and is not.
+    pub async fn open_part(
+        &self,
+        part: &Part,
+    ) -> Result<(pstore_query::OpenPart, pstore_index::text::Stats), pstore_query::QueryError> {
+        pstore_query::open_part(&*self.store, &part.targets, &part.legs, &part.terms).await
+    }
+
+    /// Phase 2 (M55): every leg over `held`, scored against `stats`, the sum over every segment
+    /// of the query, and masked by `filter` bound to `part`'s schema.
+    ///
+    /// # Errors
+    /// As [`Self::part`].
+    pub async fn scan_part(
+        &self,
+        part: &Part,
+        held: &pstore_query::OpenPart,
+        filter: Option<&pstore_query::Predicate>,
+        stats: &pstore_index::text::Stats,
+    ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
+        let bound = filter.map(|f| f.bound(&part.fts.analyzer));
+        pstore_query::scan_part(
+            &*self.store,
+            held,
+            bound.as_ref(),
+            part.shadow,
+            stats,
+            &part.fts,
         )
         .await
     }
@@ -6054,6 +6093,26 @@ pub trait Peers: Send + Sync {
         server: usize,
         part: Part,
     ) -> futures_util::future::BoxFuture<'static, Result<pstore_query::PartHits, String>>;
+    /// Runs `part` on `server` in two phases (M55): its statistics for `part.terms`, then its
+    /// hits scored against the sum the coordinator adds up from every share's. An error in
+    /// either is the coordinator's cue to run it itself.
+    fn phased(&self, server: usize, part: Part) -> Phased;
+}
+
+/// A share's two phases (M55), as [`Peers::phased`] hands them to the coordinator: the first
+/// running from the moment it is made, the second only once called with the sum.
+pub struct Phased {
+    /// Phase 1: the share's statistics for the query's terms.
+    pub stats: futures_util::future::BoxFuture<'static, Result<pstore_index::text::Stats, String>>,
+    /// Phase 2: its hits, scored against the global sum.
+    pub scan: Box<
+        dyn FnOnce(
+                pstore_index::text::Stats,
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<pstore_query::PartHits, String>,
+            > + Send,
+    >,
 }
 
 /// One server's share of a query (M54): its vector legs over some of the segments, numbered
@@ -6073,6 +6132,9 @@ pub struct Part {
     /// How many ids the query's shadow holds: what each segment's candidates are cut to
     /// leave room for.
     pub shadow: usize,
+    /// Every text leg's terms, analysed by `fts` (M55): the `df` a share's statistics carry.
+    /// Empty for a share in one exchange.
+    pub terms: Vec<String>,
 }
 
 /// The server, of `servers`, a segment's vector legs run on (M54): the highest
@@ -6118,11 +6180,15 @@ const SPLIT_FROM: usize = 2;
 pub const MAX_PART_SEGMENTS: usize = 4096;
 
 /// `durable`'s segments grouped by the server [`assign`] gives each, less this one's, as
-/// shares for [`pstore_query::query_rows_split`] (M54). None when the query has no
-/// splittable leg, the index is too small, or every segment is this server's.
+/// shares for [`pstore_query::query_rows_split`] (M54). None when the index is too small, or
+/// every segment is this server's.
 ///
-/// ⚠️ Never under `Sum` (code review): its legs are whole, and a peer's share is widened and
-/// cut as every other fusion's is. The API cannot ask it of a vector leg; the engine can.
+/// - **A query with a text leg** is split with every leg, in two phases (M55): a text leg needs
+///   the statistics of every segment before it can score any.
+/// - **Otherwise**, with its vector legs, in one exchange (M54).
+///
+/// ⚠️ Never under `Sum` (code review, M55 spec review): its legs are whole, so a share's reply
+/// would be every matching row of every segment.
 #[allow(
     clippy::too_many_arguments,
     reason = "the query's parts a share is cut from"
@@ -6137,12 +6203,26 @@ fn shares(
     fusion: pstore_query::Fusion,
     cap: usize,
 ) -> Vec<pstore_query::Elsewhere<'static>> {
+    let text: Vec<&String> = prefetch
+        .iter()
+        .filter_map(|p| match p {
+            pstore_query::Prefetch::Text { query, .. } => Some(query),
+            _ => None,
+        })
+        .collect();
+    let two = !text.is_empty();
     let legs: Vec<(usize, pstore_query::Prefetch)> = prefetch
         .iter()
         .enumerate()
-        .filter(|(_, p)| pstore_query::splittable(p))
+        .filter(|(_, p)| two || pstore_query::splittable(p))
         .map(|(j, p)| (j, p.clone()))
         .collect();
+    let mut terms: Vec<String> = text
+        .iter()
+        .flat_map(|q| pstore_format::text::analyze(&fts.analyzer, q))
+        .collect();
+    terms.sort();
+    terms.dedup();
     let servers = peers.servers();
     if legs.is_empty()
         || durable.len() < SPLIT_FROM
@@ -6163,18 +6243,31 @@ fn shares(
     }
     by_server
         .into_iter()
-        .map(|(server, targets)| pstore_query::Elsewhere {
-            targets: targets.iter().map(|(i, _)| *i).collect(),
-            hits: peers.part(
-                server,
-                Part {
-                    index: index.to_owned(),
-                    fts,
-                    legs: legs.clone(),
-                    targets,
-                    shadow,
+        .map(|(server, targets)| {
+            let ordinals = targets.iter().map(|(i, _)| *i).collect();
+            let part = Part {
+                index: index.to_owned(),
+                fts,
+                legs: legs.clone(),
+                targets,
+                shadow,
+                terms: terms.clone(),
+            };
+            pstore_query::Elsewhere {
+                targets: ordinals,
+                share: if two {
+                    let Phased { stats, scan } = peers.phased(server, part);
+                    // The sum carries the query's terms only (code review): the coordinator's
+                    // own statistics hold its whole vocabulary, which grows with records.
+                    let terms = terms.clone();
+                    pstore_query::Share::Phased {
+                        stats,
+                        scan: Box::new(move |sum| scan(pstore_query::only(sum, &terms))),
+                    }
+                } else {
+                    pstore_query::Share::Hits(peers.part(server, part))
                 },
-            ),
+            }
         })
         .collect()
 }
@@ -6348,6 +6441,12 @@ mod split_tests {
         {
             Box::pin(async { Err("not run".to_owned()) })
         }
+        fn phased(&self, _: usize, _: Part) -> Phased {
+            Phased {
+                stats: Box::pin(async { Err("not run".to_owned()) }),
+                scan: Box::new(|_| Box::pin(async { Err("not run".to_owned()) })),
+            }
+        }
     }
 
     #[test]
@@ -6409,10 +6508,25 @@ mod split_tests {
             split(&targets, &dense, sum, MAX_PART_SEGMENTS).is_empty(),
             "sum"
         );
-        assert!(
-            split(&targets, &text, rrf, MAX_PART_SEGMENTS).is_empty(),
-            "text"
-        );
+        // M55: a text query splits too, in two phases; a vector-only one in one exchange.
+        let kinds = |legs: &[pstore_query::Prefetch], fusion| {
+            shares(
+                &peers,
+                "x",
+                &targets,
+                legs,
+                fts,
+                0,
+                fusion,
+                MAX_PART_SEGMENTS,
+            )
+            .into_iter()
+            .map(|e| matches!(e.share, pstore_query::Share::Phased { .. }))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&text, rrf), [true, true], "text, phased");
+        assert_eq!(kinds(&dense, rrf), [false, false], "dense, one exchange");
+        assert!(kinds(&text, sum).is_empty(), "sum over text");
         // Segments another server holds, so whether they split is the count's alone.
         let theirs: Vec<pstore_query::Target> = targets
             .iter()

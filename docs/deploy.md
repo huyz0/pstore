@@ -78,10 +78,11 @@ one read.
 
 ## Several servers, one query
 
-With `PSTORE_PEERS` set, a query's vector legs are split by segment across the servers it
-lists ([M54](milestones/M54/SPEC.md)). Each folded segment's dense and sparse legs run on the
-server a rendezvous hash assigns it. The server that took the request reads HEAD, runs the
-text legs, fuses, and fetches the rows. The answer is the one a single server gives, bit for
+With `PSTORE_PEERS` set, a query is split by segment across the servers it lists
+([M54](milestones/M54/SPEC.md)). Each folded segment's legs run on the server a rendezvous hash
+assigns it. A query with a text leg is split in two exchanges per peer: the segments' BM25
+statistics first, then the scan against their sum ([M55](milestones/M55/SPEC.md)). The server
+that took the request reads HEAD, fuses, and fetches the rows. The answer is the one a single server gives, bit for
 bit, and the depth stays at four rounds.
 
 - **Every server lists every server,** itself included, and `PSTORE_PEER_SELF` names which one
@@ -92,8 +93,9 @@ bit, and the depth stays at four rounds.
 - **A peer that is down, slow or on another build costs rounds, never answers.** The
   coordinator runs that share itself after `PSTORE_PEER_TIMEOUT_MS`, and counts it in
   `pstore_peer_parts_failed`.
-- **Not split:** text-only queries, `order_by`, aggregations, `as_of`, and indexes of one
-  segment. A text leg needs statistics summed over every segment.
+- **Not split:** `sum` fusion, `order_by`, aggregations, `as_of`, and indexes of one segment.
+- **A peer holds a text query's opened segments between its two exchanges:** at most 10 s,
+  256 parts and about 256 MiB, oldest out first, counted in `pstore_peer_parts_expired`.
 - ⚠️ `POST /v1/internal/part` authenticates its caller no more than the public API does: keep
   it on the deployment's own network, as the public endpoints already must be.
 - `meta.cost` counts the receiving server's requests only.

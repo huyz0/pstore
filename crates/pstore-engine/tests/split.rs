@@ -14,7 +14,7 @@
 //! server's endpoint makes.
 
 use pstore_blob::MemoryStore;
-use pstore_engine::{Engine, Part, Peers};
+use pstore_engine::{Engine, Part, Peers, Phased};
 use pstore_format::{Document, Impact, Value, VectorField};
 use pstore_query::{Fusion, Op, PartHits, Predicate, Prefetch};
 use pstore_types::{LaneId, TenantId};
@@ -59,12 +59,39 @@ fn doc(i: u32) -> Document {
 }
 
 /// Three servers by name; this one is the first. Each share runs on its server's engine, and
-/// is counted.
+/// is counted -- a phased one per phase, with the text legs it carried (M55).
 struct Three {
     names: Vec<String>,
     engines: Vec<Arc<Engine<MemoryStore>>>,
     filter: Option<Predicate>,
     parts: Arc<AtomicU64>,
+    opens: Arc<AtomicU64>,
+    scans: Arc<AtomicU64>,
+    text_legs: Arc<AtomicU64>,
+    /// The most `df` entries any phase 2 was sent that are not the query's terms (code
+    /// review): the sum must carry the query's terms only, never the coordinator's vocabulary.
+    stray: Arc<AtomicU64>,
+    /// Every part opened in phase 1: its segments, and what `OpenPart::bytes` says it holds.
+    held: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    /// Which phase fails, if any: 1 or 2.
+    fails: u8,
+}
+
+impl Three {
+    fn new(engines: Vec<Arc<Engine<MemoryStore>>>, filter: Option<Predicate>) -> Self {
+        Self {
+            names: vec!["http://a".into(), "http://b".into(), "http://c".into()],
+            engines,
+            filter,
+            parts: Arc::default(),
+            opens: Arc::default(),
+            scans: Arc::default(),
+            text_legs: Arc::default(),
+            stray: Arc::default(),
+            held: Arc::default(),
+            fails: 0,
+        }
+    }
 }
 
 impl Peers for Three {
@@ -89,6 +116,54 @@ impl Peers for Three {
                 .await
                 .map_err(|e| e.to_string())
         })
+    }
+
+    fn phased(&self, server: usize, part: Part) -> Phased {
+        let engine = Arc::clone(&self.engines[server]);
+        let filter = self.filter.clone();
+        let (opens, scans, fails) = (Arc::clone(&self.opens), Arc::clone(&self.scans), self.fails);
+        let stray = Arc::clone(&self.stray);
+        let sizes = Arc::clone(&self.held);
+        let text = part
+            .legs
+            .iter()
+            .filter(|(_, p)| matches!(p, Prefetch::Text { .. }))
+            .count() as u64;
+        self.text_legs.fetch_add(text, Ordering::SeqCst);
+        let held: Arc<std::sync::Mutex<Option<pstore_query::OpenPart>>> = Arc::default();
+        let part = Arc::new(part);
+        let stats = {
+            let (engine, held, part) = (Arc::clone(&engine), Arc::clone(&held), Arc::clone(&part));
+            Box::pin(async move {
+                opens.fetch_add(1, Ordering::SeqCst);
+                if fails == 1 {
+                    return Err("phase 1 down".to_owned());
+                }
+                let (open, stats) = engine.open_part(&part).await.map_err(|e| e.to_string())?;
+                sizes
+                    .lock()
+                    .unwrap()
+                    .push((part.targets.len(), open.bytes()));
+                *held.lock().unwrap() = Some(open);
+                Ok(stats)
+            }) as futures_util::future::BoxFuture<'static, _>
+        };
+        let scan = Box::new(move |sum: pstore_index::text::Stats| {
+            Box::pin(async move {
+                scans.fetch_add(1, Ordering::SeqCst);
+                let n = sum.df.keys().filter(|t| !part.terms.contains(*t)).count() as u64;
+                stray.fetch_max(n, Ordering::SeqCst);
+                if fails == 2 {
+                    return Err("lost between phases".to_owned());
+                }
+                let open = held.lock().unwrap().take().ok_or("nothing held")?;
+                engine
+                    .scan_part(&part, &open, filter.as_ref(), &sum)
+                    .await
+                    .map_err(|e| e.to_string())
+            }) as futures_util::future::BoxFuture<'static, _>
+        });
+        Phased { stats, scan }
     }
 }
 
@@ -216,12 +291,10 @@ async fn a_split_query_equals_the_unsplit_one() {
             .query_filtered("idx", &legs, filter.as_ref(), fusion, 10)
             .await
             .unwrap();
-        let peers = Three {
-            names: vec!["http://a".into(), "http://b".into(), "http://c".into()],
-            engines: vec![store_peer(10), store_peer(11), store_peer(12)],
-            filter: filter.clone(),
-            parts: Arc::new(AtomicU64::new(0)),
-        };
+        let peers = Three::new(
+            vec![store_peer(10), store_peer(11), store_peer(12)],
+            filter.clone(),
+        );
         let split = coordinator
             .query_split_as(
                 "idx",
@@ -235,7 +308,12 @@ async fn a_split_query_equals_the_unsplit_one() {
             .await
             .unwrap();
         assert!(!unsplit.hits.is_empty(), "{name}: nothing to compare");
-        assert_eq!(peers.parts.load(Ordering::SeqCst), 2, "{name}: not split");
+        // A share in one exchange, or -- with a text leg, M55 -- in two.
+        assert_eq!(
+            peers.parts.load(Ordering::SeqCst) + peers.opens.load(Ordering::SeqCst),
+            2,
+            "{name}: not split"
+        );
         assert_eq!(exactly(&split), exactly(&unsplit), "{name}");
     }
 }
@@ -261,6 +339,12 @@ async fn a_share_that_fails_is_run_here() {
                 n.fetch_add(1, Ordering::SeqCst);
                 Err("down".to_owned())
             })
+        }
+        fn phased(&self, _: usize, _: Part) -> Phased {
+            Phased {
+                stats: Box::pin(async { Err("down".to_owned()) }),
+                scan: Box::new(|_| Box::pin(async { Err("down".to_owned()) })),
+            }
         }
     }
     let store = Arc::new(MemoryStore::new());
@@ -337,4 +421,617 @@ fn assignment_is_stable_balanced_and_moves_only_to_a_new_server() {
     // mutants alive -- a weaker mix is still stable and roughly balanced.
     let pinned: Vec<usize> = keys[..16].iter().map(|k| assign(k, &four)).collect();
     assert_eq!(pinned, [2, 3, 3, 3, 3, 1, 0, 3, 3, 0, 0, 2, 1, 3, 2, 3]);
+}
+
+// ---- M55: text legs split too ------------------------------------------------------------
+
+/// Counts the term-dictionary reads of one engine's view of a shared store.
+#[derive(Debug, Clone)]
+struct Tdicts {
+    inner: MemoryStore,
+    read: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Tdicts {
+    fn saw(&self, key: &pstore_blob::Key) {
+        self.read.lock().unwrap().push(key.as_str().to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl pstore_blob::BlobStore for Tdicts {
+    fn capabilities(&self) -> &pstore_blob::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn get(&self, key: &pstore_blob::Key) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.saw(key);
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &pstore_blob::Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.saw(key);
+        self.inner.get_range(key, range).await
+    }
+    async fn get_ranges(
+        &self,
+        key: &pstore_blob::Key,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>, pstore_blob::BlobError> {
+        self.saw(key);
+        self.inner.get_ranges(key, ranges).await
+    }
+    async fn get_suffix(
+        &self,
+        key: &pstore_blob::Key,
+        n: u64,
+    ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+        self.saw(key);
+        self.inner.get_suffix(key, n).await
+    }
+    async fn get_with_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+        self.saw(key);
+        self.inner.get_with_tag(key).await
+    }
+    async fn get_tag(
+        &self,
+        key: &pstore_blob::Key,
+    ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+        self.inner.get_tag(key).await
+    }
+    async fn head(&self, key: &pstore_blob::Key) -> Result<u64, pstore_blob::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn put_conditional(
+        &self,
+        key: &pstore_blob::Key,
+        body: bytes::Bytes,
+        pre: pstore_blob::Precondition,
+    ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+        self.inner.put_conditional(key, body, pre).await
+    }
+    async fn delete_batch(&self, keys: &[pstore_blob::Key]) -> Result<(), pstore_blob::BlobError> {
+        self.inner.delete_batch(keys).await
+    }
+    async fn list_unrestricted(
+        &self,
+        prefix: &pstore_blob::Key,
+    ) -> Result<Vec<pstore_blob::Key>, pstore_blob::BlobError> {
+        self.inner.list_unrestricted(prefix).await
+    }
+}
+
+/// A row whose text a share's statistics differ on: `alpha` is common in the first two
+/// segments and absent after, so a peer scoring with its own `df` ranks differently.
+fn tdoc(i: u32, with_text: bool) -> Document {
+    let mut d = doc(i);
+    if with_text {
+        let alpha = if i < 48 { "alpha alpha" } else { "" };
+        d.attrs.insert(
+            "text".to_owned(),
+            Value::Str(format!(
+                "{alpha} common word{} tag{} n{}",
+                i % 5,
+                i % 3,
+                i % 11
+            )),
+        );
+    } else {
+        d.attrs.remove("text");
+    }
+    d
+}
+
+fn tengine(store: &Tdicts, lane: u64) -> Engine<Tdicts> {
+    Engine::new(Arc::new(store.clone()), T, LaneId(lane)).with_index_params(
+        pstore_index::cluster::Params {
+            exact_scan_threshold: 8,
+            ..pstore_index::cluster::Params::default()
+        },
+    )
+}
+
+/// Eight folded segments of 24 rows in `index`, the first `texts` of them with text; then
+/// unfolded writes whose text holds `zeta`, a term only the fresh segment has.
+async fn tfill(w: &Engine<Tdicts>, index: &str, texts: u32, unfolded: bool) {
+    for k in 0..8u32 {
+        w.write(
+            index,
+            (k * 24..k * 24 + 24).map(|i| tdoc(i, k < texts)).collect(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        w.fold().await.unwrap();
+    }
+    w.delete(
+        index,
+        (0..192).step_by(9).map(|i| format!("d{i:05}")).collect(),
+    )
+    .await
+    .unwrap();
+    w.flush().await.unwrap();
+    w.fold().await.unwrap();
+    if unfolded {
+        let fresh: Vec<Document> = (0..192)
+            .step_by(7)
+            .map(|i| {
+                let mut d = tdoc(i + 1_000, true);
+                d.attrs.insert(
+                    "text".to_owned(),
+                    Value::Str(format!("zeta common word{}", i % 5)),
+                );
+                d
+            })
+            .collect();
+        w.write(index, fresh).await.unwrap();
+    }
+}
+
+fn tquery(q: &str) -> Prefetch {
+    Prefetch::Text {
+        field: "text".to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }
+}
+
+/// `Engine<MemoryStore>` peers over the store a `Tdicts` coordinator writes through.
+fn peers_of(t: &Tdicts, filter: Option<Predicate>) -> Three {
+    let e = |lane| {
+        Arc::new(
+            Engine::new(Arc::new(t.inner.clone()), T, LaneId(lane)).with_index_params(
+                pstore_index::cluster::Params {
+                    exact_scan_threshold: 8,
+                    ..pstore_index::cluster::Params::default()
+                },
+            ),
+        )
+    };
+    Three::new(vec![e(10), e(11), e(12)], filter)
+}
+
+/// One case: its name, index, coordinator, legs, filter, fusion and consistency.
+type Case<'a> = (
+    &'static str,
+    &'static str,
+    &'a Engine<Tdicts>,
+    Vec<Prefetch>,
+    Option<Predicate>,
+    Fusion,
+    pstore_engine::Consistency,
+);
+
+#[tokio::test]
+async fn a_split_text_query_equals_the_unsplit_one() {
+    let store = Tdicts {
+        inner: MemoryStore::new(),
+        read: Arc::default(),
+    };
+    let w = tengine(&store, 1);
+    tfill(&w, "idx", 8, true).await;
+    // An index whose folded segments have no text: only the fresh segment does.
+    tfill(&w, "fresh", 0, true).await;
+    // A second writer's index with nothing unfolded, for `strong`.
+    let other = tengine(&store, 2);
+    tfill(&other, "folded", 8, false).await;
+    // Text in the first segment only: at least one peer's share has none.
+    tfill(&w, "mixed", 1, false).await;
+
+    let q = vec![0.3, 0.9, -0.2, 1.0];
+    let filtered = Predicate::Cmp("n".to_owned(), Op::Gt, Value::Int(40));
+    let max = Fusion::Max {
+        weights: pstore_query::Weights::ONE,
+    };
+    let rrf = Fusion::default();
+    let eventual = pstore_engine::Consistency::Eventual;
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "text",
+            "idx",
+            &w,
+            vec![tquery("alpha word2 zeta")],
+            None,
+            rrf,
+            eventual,
+        ),
+        (
+            "text, filtered",
+            "idx",
+            &w,
+            vec![tquery("alpha tag1 zeta")],
+            Some(filtered.clone()),
+            rrf,
+            eventual,
+        ),
+        (
+            "max",
+            "idx",
+            &w,
+            vec![tquery("alpha zeta"), tquery("word3 n4")],
+            None,
+            max,
+            eventual,
+        ),
+        (
+            "dense and text",
+            "idx",
+            &w,
+            vec![dense("vector", q.clone()), tquery("alpha word2")],
+            None,
+            rrf,
+            eventual,
+        ),
+        (
+            "dense, sparse and text, filtered",
+            "idx",
+            &w,
+            vec![
+                dense("vector", q.clone()),
+                sparse(),
+                tquery("alpha zeta n3"),
+            ],
+            Some(filtered.clone()),
+            rrf,
+            eventual,
+        ),
+        (
+            "an absent term",
+            "idx",
+            &w,
+            vec![tquery("nowhere")],
+            None,
+            rrf,
+            eventual,
+        ),
+        (
+            "only the fresh segment has text",
+            "fresh",
+            &w,
+            vec![tquery("zeta word1")],
+            None,
+            rrf,
+            eventual,
+        ),
+        (
+            "a share with no text",
+            "mixed",
+            &w,
+            vec![dense("vector", q.clone()), tquery("alpha word2")],
+            None,
+            rrf,
+            eventual,
+        ),
+        (
+            "strong",
+            "folded",
+            &other,
+            vec![tquery("alpha word2")],
+            None,
+            rrf,
+            pstore_engine::Consistency::Strong,
+        ),
+    ];
+    for (name, index, coord, legs, filter, fusion, consistency) in cases {
+        let unsplit = coord
+            .query_filtered_as(index, &legs, filter.as_ref(), fusion, 10, consistency)
+            .await
+            .unwrap();
+        let peers = peers_of(&store, filter.clone());
+        store.read.lock().unwrap().clear();
+        let split = coord
+            .query_split_as(
+                index,
+                &legs,
+                filter.as_ref(),
+                fusion,
+                10,
+                consistency,
+                Some(&peers),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exactly(&split), exactly(&unsplit), "{name}");
+        let opens = peers.opens.load(Ordering::SeqCst);
+        assert!(opens >= 1, "{name}: not split");
+        assert_eq!(
+            peers.scans.load(Ordering::SeqCst),
+            opens,
+            "{name}: a scan per open"
+        );
+        assert_eq!(
+            peers.parts.load(Ordering::SeqCst),
+            0,
+            "{name}: no one-exchange part"
+        );
+        assert!(
+            peers.text_legs.load(Ordering::SeqCst) >= opens,
+            "{name}: text legs sent"
+        );
+        assert_eq!(
+            peers.stray.load(Ordering::SeqCst),
+            0,
+            "{name}: phase 2 sent terms the query does not have"
+        );
+        // What a held part is budgeted at: 16 KiB a segment and its sidecars on top -- never
+        // less, and never as if it held a whole store.
+        for (n, bytes) in peers.held.lock().unwrap().iter() {
+            assert!(
+                *n > 0 && *bytes >= 16 * 1024 * n && *bytes < 16 * 1024 * n + (1 << 20),
+                "{name}: {n} segments held as {bytes} bytes"
+            );
+        }
+        // The coordinator read no term dictionary of a segment it gave away.
+        let names: Vec<String> = peers.names.clone();
+        let read = store.read.lock().unwrap().clone();
+        for k in read.iter().filter(|k| k.ends_with(".tdict")) {
+            let seg = k.trim_end_matches(".tdict");
+            assert_eq!(
+                pstore_engine::assign(seg, &names),
+                0,
+                "{name}: the coordinator read {k}, another server's"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_text_share_costs_rounds_not_answers() {
+    let store = Tdicts {
+        inner: MemoryStore::new(),
+        read: Arc::default(),
+    };
+    let w = tengine(&store, 1);
+    tfill(&w, "idx", 8, true).await;
+    let legs = vec![
+        dense("vector", vec![0.3, 0.9, -0.2, 1.0]),
+        tquery("alpha word2 zeta"),
+    ];
+    let unsplit = w
+        .query_filtered("idx", &legs, None, Fusion::default(), 10)
+        .await
+        .unwrap();
+    for fails in [1u8, 2] {
+        let mut peers = peers_of(&store, None);
+        peers.fails = fails;
+        let split = w
+            .query_split_as(
+                "idx",
+                &legs,
+                None,
+                Fusion::default(),
+                10,
+                pstore_engine::Consistency::Eventual,
+                Some(&peers),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exactly(&split), exactly(&unsplit), "phase {fails} failing");
+        assert_eq!(peers.opens.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            peers.scans.load(Ordering::SeqCst),
+            if fails == 1 { 0 } else { 2 },
+            "phase {fails}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_share_whose_term_dictionary_will_not_read_is_never_short() {
+    // Spec review: a share whose `.tdict` fails to read must fail phase 1, never sum one
+    // segment short. Here every peer's view loses the dictionaries, so every share fails and
+    // the coordinator runs it -- and answers as the unsplit query does.
+    #[derive(Debug, Clone)]
+    struct NoTdict(MemoryStore);
+    #[async_trait::async_trait]
+    impl pstore_blob::BlobStore for NoTdict {
+        fn capabilities(&self) -> &pstore_blob::Capabilities {
+            self.0.capabilities()
+        }
+        async fn get(
+            &self,
+            key: &pstore_blob::Key,
+        ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+            if key.as_str().ends_with(".tdict") {
+                return Err(pstore_blob::BlobError::Other("no".into()));
+            }
+            self.0.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &pstore_blob::Key,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+            self.0.get_range(key, range).await
+        }
+        async fn get_suffix(
+            &self,
+            key: &pstore_blob::Key,
+            n: u64,
+        ) -> Result<bytes::Bytes, pstore_blob::BlobError> {
+            self.0.get_suffix(key, n).await
+        }
+        async fn get_with_tag(
+            &self,
+            key: &pstore_blob::Key,
+        ) -> Result<(bytes::Bytes, pstore_types::CasTag), pstore_blob::BlobError> {
+            self.0.get_with_tag(key).await
+        }
+        async fn get_tag(
+            &self,
+            key: &pstore_blob::Key,
+        ) -> Result<Option<pstore_types::CasTag>, pstore_blob::BlobError> {
+            self.0.get_tag(key).await
+        }
+        async fn head(&self, key: &pstore_blob::Key) -> Result<u64, pstore_blob::BlobError> {
+            self.0.head(key).await
+        }
+        async fn put(
+            &self,
+            key: &pstore_blob::Key,
+            body: bytes::Bytes,
+        ) -> Result<pstore_blob::PutOutcome, pstore_blob::BlobError> {
+            self.0.put(key, body).await
+        }
+        async fn put_conditional(
+            &self,
+            key: &pstore_blob::Key,
+            body: bytes::Bytes,
+            pre: pstore_blob::Precondition,
+        ) -> Result<pstore_blob::PutOutcome, pstore_blob::CasError> {
+            self.0.put_conditional(key, body, pre).await
+        }
+        async fn delete_batch(
+            &self,
+            keys: &[pstore_blob::Key],
+        ) -> Result<(), pstore_blob::BlobError> {
+            self.0.delete_batch(keys).await
+        }
+        async fn list_unrestricted(
+            &self,
+            prefix: &pstore_blob::Key,
+        ) -> Result<Vec<pstore_blob::Key>, pstore_blob::BlobError> {
+            self.0.list_unrestricted(prefix).await
+        }
+    }
+    struct Blind(Vec<String>, Arc<Engine<NoTdict>>, Arc<AtomicU64>);
+    impl Peers for Blind {
+        fn servers(&self) -> &[String] {
+            &self.0
+        }
+        fn me(&self) -> usize {
+            0
+        }
+        fn part(
+            &self,
+            _: usize,
+            _: Part,
+        ) -> futures_util::future::BoxFuture<'static, Result<PartHits, String>> {
+            Box::pin(async { Err("unused".to_owned()) })
+        }
+        fn phased(&self, _: usize, part: Part) -> Phased {
+            let (engine, failed) = (Arc::clone(&self.1), Arc::clone(&self.2));
+            Phased {
+                stats: Box::pin(async move {
+                    let got = engine.open_part(&part).await.map(|(_, s)| s);
+                    if got.is_err() {
+                        failed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    got.map_err(|e| e.to_string())
+                }),
+                scan: Box::new(|_| Box::pin(async { Err("never reached".to_owned()) })),
+            }
+        }
+    }
+    let store = Tdicts {
+        inner: MemoryStore::new(),
+        read: Arc::default(),
+    };
+    let w = tengine(&store, 1);
+    tfill(&w, "idx", 8, true).await;
+    let legs = vec![tquery("alpha word2 zeta")];
+    let unsplit = w
+        .query_filtered("idx", &legs, None, Fusion::default(), 10)
+        .await
+        .unwrap();
+    let blind = Blind(
+        vec!["http://a".into(), "http://b".into(), "http://c".into()],
+        Arc::new(Engine::new(
+            Arc::new(NoTdict(store.inner.clone())),
+            T,
+            LaneId(20),
+        )),
+        Arc::default(),
+    );
+    let split = w
+        .query_split_as(
+            "idx",
+            &legs,
+            None,
+            Fusion::default(),
+            10,
+            pstore_engine::Consistency::Eventual,
+            Some(&blind),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        blind.2.load(Ordering::SeqCst),
+        2,
+        "each share's phase 1 refused"
+    );
+    assert_eq!(exactly(&split), exactly(&unsplit));
+}
+
+#[tokio::test]
+async fn a_share_sums_only_what_its_legs_and_head_ask_for() {
+    // Sweep: phase 1's strictness applies to a segment HEAD says has a term dictionary, under
+    // a part with a text leg -- and to nothing else, which would fail for want of a dictionary
+    // it never fetched.
+    let store = Tdicts {
+        inner: MemoryStore::new(),
+        read: Arc::default(),
+    };
+    let w = tengine(&store, 1);
+    tfill(&w, "idx", 8, false).await;
+    use pstore_blob::BlobStore as _;
+    let segs: Vec<String> = store
+        .inner
+        .list_unrestricted(&pstore_blob::Key::new(String::new()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.as_str().to_owned())
+        .filter(|k| k.ends_with(".seg"))
+        .collect();
+    assert!(segs.len() >= 8);
+    let targets = |text_dict: bool| -> Vec<(usize, pstore_query::Target)> {
+        segs.iter()
+            .enumerate()
+            .map(|(i, k)| {
+                (
+                    i,
+                    pstore_query::Target {
+                        segment: pstore_blob::Key::new(k.clone()),
+                        segment_len: None,
+                        centroids: None,
+                        deleted: None,
+                        sparse_dict: false,
+                        text_dict,
+                        shadowed: false,
+                    },
+                )
+            })
+            .collect()
+    };
+    let alpha = vec!["alpha".to_owned()];
+    // No text leg: nothing summed, and no dictionary required.
+    let dense_only = vec![(0, dense("vector", vec![0.3, 0.9, -0.2, 1.0]))];
+    let (_, st) = pstore_query::open_part(&store.inner, &targets(true), &dense_only, &alpha)
+        .await
+        .unwrap();
+    assert_eq!(st.doc_count, 0);
+    // A text leg, over segments HEAD says have none: nothing read, nothing required.
+    let text = vec![(0, tquery("alpha"))];
+    let (_, st) = pstore_query::open_part(&store.inner, &targets(false), &text, &alpha)
+        .await
+        .unwrap();
+    assert_eq!(st.doc_count, 0);
+    // And over segments that have them: every one summed.
+    let (_, st) = pstore_query::open_part(&store.inner, &targets(true), &text, &alpha)
+        .await
+        .unwrap();
+    assert!(st.doc_count > 0 && st.df.contains_key("alpha"), "{st:?}");
 }

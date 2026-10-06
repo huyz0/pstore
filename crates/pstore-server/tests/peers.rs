@@ -343,7 +343,33 @@ fn queries() -> Vec<(&'static str, Value)> {
             json!({"queries": [{"vector": Q, "top_k": 5},
                                {"vector": Q, "text": "word3", "top_k": 5}]}),
         ),
+        // M55: text legs split too.
+        ("text", json!({"text": "word2 tag1", "top_k": 10})),
+        (
+            "text, filtered",
+            json!({"text": "word3 common", "top_k": 10, "filters": filter}),
+        ),
     ]
+}
+
+/// Exchanges `api` has answered on the part endpoint: one per part in one exchange, two per
+/// phased part (M55).
+async fn exchanges(api: &Arc<Api<View>>) -> u64 {
+    let req = Request::builder()
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let res = Arc::clone(api).router().oneshot(req).await.unwrap();
+    let text =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    text.lines()
+        .find_map(|l| {
+            l.strip_prefix(
+                "pstore_http_requests_total{route=\"/v1/internal/part\",status=\"200\"} ",
+            )
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 #[tokio::test]
@@ -540,24 +566,46 @@ async fn a_peer_of_another_protocol_is_refused_and_run_here() {
     )
     .await;
     assert_eq!(status, 409, "{body}");
+    // A phase is protocol 2's alone (sweep): protocol 1 naming one is refused too.
+    for phase in ["open", "scan"] {
+        let (status, body) = send(
+            &servers[1].api,
+            "POST",
+            "/v1/internal/part",
+            json!({"protocol": 1, "phase": phase, "index": "docs", "fts": "", "filters": null,
+                   "shadow": 0, "legs": [], "targets": [], "id": "00", "stats": null}),
+        )
+        .await;
+        assert_eq!(status, 409, "{phase}: {body}");
+    }
 }
 
 #[tokio::test]
 async fn a_query_error_on_a_peer_is_the_clients() {
     let (store, servers, alone) = cluster(&[]).await;
     fill(&store, &servers[0].api, &urls(&servers), 8).await;
-    let q = json!({"vector": [1.0, 2.0], "top_k": 10});
-    let (s0, want) = query(&alone.api, &q).await;
-    let sent = metric(&servers[0].api, "pstore_peer_parts_sent").await;
-    let (s, got) = query(&servers[0].api, &q).await;
-    assert_eq!(
-        metric(&servers[0].api, "pstore_peer_parts_sent").await,
-        sent + 2,
-        "the wrong-dimension query must reach the peers to test their error"
-    );
-    assert_eq!((s, &got["error"]), (s0, &want["error"]), "{got} / {want}");
-    assert!((400..500).contains(&s), "{s} {got}");
-    assert_eq!(metric(&servers[0].api, "pstore_peer_parts_failed").await, 0);
+    // In one exchange, and in two (M55: the sweep found a phased `422` uncounted only by
+    // accident of the `&&` that counts it).
+    for q in [
+        json!({"vector": [1.0, 2.0], "top_k": 10}),
+        json!({"vector": [1.0, 2.0], "text": "word2", "top_k": 10}),
+    ] {
+        let (s0, want) = query(&alone.api, &q).await;
+        let sent = metric(&servers[0].api, "pstore_peer_parts_sent").await;
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_sent").await,
+            sent + 2,
+            "the wrong-dimension query must reach the peers to test their error: {q}"
+        );
+        assert_eq!((s, &got["error"]), (s0, &want["error"]), "{got} / {want}");
+        assert!((400..500).contains(&s), "{s} {got}");
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            0,
+            "{q}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -627,13 +675,20 @@ async fn queries_that_cannot_be_split_run_on_one_server() {
     let a = &servers[0].api;
     let (_, past) = query(a, &json!({"vector": Q, "top_k": 1})).await;
     let epoch = past["meta"]["epoch"].clone();
+    // M55 narrowed this list: a text-only query splits now (its own assertion below).
     let unsplit = [
         json!({"rank_by": ["n", "asc"], "top_k": 5}),
         json!({"aggregate_by": {"c": ["Count", "id"]}}),
-        json!({"text": "word2", "top_k": 5}),
         json!({"text": "word2", "top_k": 5, "fusion": {"sum": {}}}),
         json!({"vector": Q, "top_k": 5, "as_of": epoch}),
     ];
+    let sent = metric(a, "pstore_peer_parts_sent").await;
+    let (s, body) = query(a, &json!({"text": "word2", "top_k": 5})).await;
+    assert_eq!(s, 200, "{body}");
+    assert!(
+        metric(a, "pstore_peer_parts_sent").await > sent,
+        "text-only, M55"
+    );
     for q in &unsplit {
         let sent = metric(a, "pstore_peer_parts_sent").await;
         let (s, body) = query(a, q).await;
@@ -797,4 +852,237 @@ async fn a_split_filtered_query_masks_each_segment_on_its_server() {
         remote.len() - once,
         remote.len()
     );
+}
+
+// ---- M55: text legs split too ------------------------------------------------------------
+
+#[tokio::test]
+async fn each_text_segment_is_scanned_once_by_its_server() {
+    let (store, servers, _) = cluster(&[]).await;
+    let all = urls(&servers);
+    fill(&store, &servers[0].api, &all, 8).await;
+    let segs = segments(&store).await;
+    for (c, coordinator) in servers.iter().enumerate() {
+        for s in &servers {
+            s.view.take();
+        }
+        let (status, body) = query(
+            &coordinator.api,
+            &json!({"vector": Q, "text": "word2 tag1", "top_k": 10}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let read: Vec<Vec<String>> = servers.iter().map(|s| s.view.take()).collect();
+        let mut each = [0usize; 3];
+        for seg in &segs {
+            let tdict = format!("{seg}.tdict");
+            let owner = pstore_engine::assign(seg, &all);
+            for (i, r) in read.iter().enumerate() {
+                let n = r.iter().filter(|k| **k == tdict).count();
+                if i == owner {
+                    assert_eq!(
+                        n, 1,
+                        "coordinator {c}: {seg}'s dictionary read {n} times by {i}"
+                    );
+                    each[i] += 1;
+                } else {
+                    assert_eq!(n, 0, "coordinator {c}: {seg}'s dictionary read by {i}");
+                }
+            }
+        }
+        assert!(each.iter().all(|n| *n > 0), "coordinator {c}: {each:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_split_text_query_keeps_the_round_trip_budget() {
+    // As M54's, for a hybrid query in two phases: the statistics exchange between them is a
+    // round trip between servers, never a blob round.
+    let (store, servers, _) = cluster(&[]).await;
+    fill(&store, &servers[0].api, &urls(&servers), 8).await;
+    let q = json!({"vector": Q, "text": "word2 tag1", "top_k": 10});
+    let sent = metric(&servers[0].api, "pstore_peer_parts_sent").await;
+    for s in &servers {
+        s.view.delay_ms.store(250, Ordering::SeqCst);
+    }
+    let started = std::time::Instant::now();
+    let (status, body) = query(&servers[0].api, &q).await;
+    let took = started.elapsed();
+    for s in &servers {
+        s.view.delay_ms.store(0, Ordering::SeqCst);
+    }
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        metric(&servers[0].api, "pstore_peer_parts_sent").await,
+        sent + 2
+    );
+    assert!(
+        took < Duration::from_millis(1_125),
+        "a split text query took {took:?}: more than four rounds of 250 ms"
+    );
+}
+
+#[tokio::test]
+async fn a_vector_query_makes_one_exchange_and_an_old_peer_is_run_here() {
+    let (store, servers, alone) = cluster(&[]).await;
+    fill(&store, &servers[0].api, &urls(&servers), 8).await;
+    let before: Vec<u64> =
+        futures_util::future::join_all(servers.iter().map(|s| exchanges(&s.api))).await;
+    let (s, body) = query(&servers[0].api, &json!({"vector": Q, "top_k": 10})).await;
+    assert_eq!(s, 200, "{body}");
+    for (i, srv) in servers.iter().enumerate().skip(1) {
+        assert_eq!(
+            exchanges(&srv.api).await,
+            before[i] + 1,
+            "a vector part, at {i}"
+        );
+    }
+    let (s, body) = query(&servers[0].api, &json!({"text": "word2", "top_k": 10})).await;
+    assert_eq!(s, 200, "{body}");
+    for (i, srv) in servers.iter().enumerate().skip(1) {
+        assert_eq!(
+            exchanges(&srv.api).await,
+            before[i] + 3,
+            "a text part, at {i}"
+        );
+    }
+    // A protocol-1 part in one exchange is still served by this build.
+    let (status, body) = send(
+        &servers[1].api,
+        "POST",
+        "/v1/internal/part",
+        json!({"protocol": 1, "index": "docs",
+               "fts": pstore_format::text::FullText::default().encode(),
+               "filters": null, "shadow": 0, "legs": [], "targets": []}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // A peer of M54's build (code review): it decodes the part before it checks the version,
+    // and its legs have no `text` kind, so a phase-1 part with a text leg is `400 malformed
+    // part` -- not the `409` the spec expected. Any status but 200 and 422 runs the share here.
+    let fake = axum::Router::new().route(
+        "/v1/internal/part",
+        axum::routing::post(|body: axum::body::Bytes| async move {
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            let text = v["legs"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|l| l["kind"] == "text"));
+            if text {
+                (axum::http::StatusCode::BAD_REQUEST, "malformed part")
+            } else {
+                (axum::http::StatusCode::CONFLICT, "protocol_mismatch")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let (store, servers, alone2) = cluster(std::slice::from_ref(&old)).await;
+    let mut all = urls(&servers);
+    all.push(old);
+    fill(&store, &servers[0].api, &all, 8).await;
+    let q = json!({"vector": Q, "text": "word2 tag1", "top_k": 10});
+    let (_, want) = query(&alone2.api, &q).await;
+    let failed = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+    let (s, got) = query(&servers[0].api, &q).await;
+    assert_eq!(s, 200, "{got}");
+    assert_eq!(answer(&got), answer(&want));
+    assert_eq!(
+        metric(&servers[0].api, "pstore_peer_parts_failed").await,
+        failed + 1
+    );
+    let _ = alone;
+}
+
+#[tokio::test]
+async fn a_failed_text_peer_costs_rounds_not_answers() {
+    // Code review: a failure in each phase through the API. A dead peer fails phase 1; a peer
+    // that opens its part (by passing it to a real server) and has lost it by its scan fails
+    // phase 2 with the real server's `410`.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let opener: Arc<Mutex<String>> = Arc::default();
+    let fake = {
+        let opener = Arc::clone(&opener);
+        axum::Router::new().route(
+            "/v1/internal/part",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let opener = opener.lock().unwrap().clone();
+                    async move {
+                        let v: Value = serde_json::from_slice(&body).unwrap();
+                        if v["phase"] != "open" {
+                            return (axum::http::StatusCode::GONE, Bytes::from("part_gone"));
+                        }
+                        let res = reqwest::Client::builder()
+                            .no_proxy()
+                            .build()
+                            .unwrap()
+                            .post(format!("{opener}/v1/internal/part"))
+                            .header("x-pstore-tenant", headers["x-pstore-tenant"].clone())
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .send()
+                            .await
+                            .unwrap();
+                        let status =
+                            axum::http::StatusCode::from_u16(res.status().as_u16()).unwrap();
+                        (status, res.bytes().await.unwrap())
+                    }
+                },
+            ),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lost = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let (store, servers, alone) = cluster(&[dead.clone(), lost.clone()]).await;
+    *opener.lock().unwrap() = servers[1].url.clone();
+    let mut all = urls(&servers);
+    all.extend([dead, lost]);
+    fill(&store, &servers[0].api, &all, 8).await;
+    for (name, q) in queries()
+        .into_iter()
+        .filter(|(n, _)| n.starts_with("text") || n.starts_with("hybrid"))
+    {
+        let (_, want) = query(&alone.api, &q).await;
+        let before = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(s, 200, "{name}: {got}");
+        assert_eq!(answer(&got), answer(&want), "{name}");
+        // The dead peer's part and the lost one's, each counted once.
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            before + 2,
+            "{name}"
+        );
+        // The lost part really was opened, by the server the fake passed it to.
+        assert!(
+            servers[1].view.take().iter().any(|k| k.ends_with(".tdict")),
+            "{name}: nothing opened"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_part_never_scanned_expires_without_more_traffic() {
+    // Code review: expiry swept only on the next open or scan would leave a quiet peer holding
+    // an abandoned part, uncounted, for as long as no query came. A scrape sweeps too.
+    let (server, _listener) = start(&MemoryStore::new(), 1).await;
+    let (status, body) = send(
+        &server.api,
+        "POST",
+        "/v1/internal/part",
+        json!({"protocol": 2, "phase": "open", "index": "docs",
+               "fts": pstore_format::text::FullText::default().encode(),
+               "filters": null, "shadow": 0, "legs": [], "targets": [], "terms": []}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(metric(&server.api, "pstore_peer_parts_expired").await, 0);
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert_eq!(metric(&server.api, "pstore_peer_parts_expired").await, 1);
 }

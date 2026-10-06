@@ -171,54 +171,162 @@ pub async fn query_with<S: BlobStore>(
 /// segment ordinals and leg positions (M54).
 pub type PartHits = Vec<(usize, usize, Vec<Hit>)>;
 
-/// The vector legs of some of a query's segments, run by another server (M54).
+/// Some of a query's segments, whose legs another server runs (M54, M55).
 ///
 /// ⚠️ **An error is never the query's.** `run` runs a share that failed itself, over the
 /// same segments: a peer that is down, slow or wrong costs rounds, never an answer.
 pub struct Elsewhere<'a> {
-    /// The segment ordinals, into the query's `targets`, whose vector legs it runs.
+    /// The segment ordinals, into the query's `targets`, that it runs.
     pub targets: Vec<usize>,
-    /// Their hits, or why there are none.
-    pub hits: futures_util::future::BoxFuture<'a, Result<PartHits, String>>,
+    /// How.
+    pub share: Share<'a>,
 }
 
-/// Whether a leg may run on another server (M54): dense and sparse score each row by itself,
-/// so their hits over two segments compare wherever they were computed. A text leg scores
-/// against statistics summed over every segment, which only the coordinator has.
+/// One share's exchange with its server.
+pub enum Share<'a> {
+    /// M54: the vector legs only, in one exchange. The coordinator runs the text legs.
+    Hits(futures_util::future::BoxFuture<'a, Result<PartHits, String>>),
+    /// M55: every leg, in two exchanges -- the share's BM25 statistics for the query's terms,
+    /// then its hits scored against the sum over every segment, which only the coordinator can
+    /// add up.
+    Phased {
+        /// Phase 1: the share's statistics.
+        stats: futures_util::future::BoxFuture<'a, Result<Stats, String>>,
+        /// Phase 2: its hits, given the global sum.
+        scan: Box<
+            dyn FnOnce(Stats) -> futures_util::future::BoxFuture<'a, Result<PartHits, String>>
+                + Send
+                + 'a,
+        >,
+    },
+}
+
+/// Whether a leg may run on another server in one exchange (M54): dense and sparse score
+/// each row by itself, so their hits over two segments compare wherever they were computed.
+/// A text leg scores against statistics summed over every segment, so it needs two (M55).
 #[must_use]
 pub fn splittable(p: &Prefetch) -> bool {
     matches!(p, Prefetch::Dense { .. } | Prefetch::Sparse { .. })
 }
 
-/// One server's share of a query (M54): `legs` -- each with its position in the query --
-/// over `targets` -- each with its ordinal -- opened, scanned, masked by `filter`, rid of
-/// deleted rows and cut to what a shadow of `shadow` ids can leave, exactly as [`run`] does
-/// over its own segments. Both call the same code, so the share a peer returns is the share
-/// the coordinator would have computed.
+/// One share's segments, opened for its legs and held between a split query's two phases
+/// (M55). Owned: it outlives the request that opened it.
+pub struct OpenPart {
+    targets: Vec<(usize, Target)>,
+    legs: Vec<(usize, Prefetch)>,
+    opened: Vec<Opened>,
+}
+
+impl OpenPart {
+    /// Roughly what holding it costs: its sidecars and delete vectors, and 16 KiB a segment
+    /// for the footer it keeps decoded. An estimate for a budget, never a measurement.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.opened
+            .iter()
+            .map(|o| {
+                held_bytes(
+                    [&o.centroids, &o.dictionary, &o.terms]
+                        .iter()
+                        .map(|b| b.as_ref().map_or(0, bytes::Bytes::len))
+                        .sum::<usize>(),
+                    o.deleted.len(),
+                )
+            })
+            .sum()
+    }
+}
+
+/// One held segment's estimate: 16 KiB for its decoded footer, its sidecars' bytes, and 16
+/// bytes a deleted row.
+fn held_bytes(sidecars: usize, deleted: usize) -> usize {
+    16 * 1024 + sidecars + 16 * deleted
+}
+
+#[cfg(test)]
+mod held_tests {
+    #[test]
+    fn a_held_segment_is_priced_by_what_it_keeps() {
+        assert_eq!(super::held_bytes(0, 0), 16_384);
+        assert_eq!(super::held_bytes(1_000, 0), 17_384);
+        assert_eq!(super::held_bytes(1_000, 10), 17_544);
+    }
+}
+
+/// Phase 1 of a share (M55): `legs` over `targets` opened, and their BM25 statistics for
+/// `terms`.
+///
+/// ⚠️ **Whole or nothing** (spec review): a segment whose footer has a text field and which
+/// HEAD says has a term dictionary must yield a summary. The coordinator's own path drops an
+/// unreadable dictionary from the sum and relies on that segment's text leg failing the query;
+/// a share's statistics travel apart from its legs, so here the share fails instead, and a sum
+/// one segment short is never returned.
 ///
 /// # Errors
-/// As [`query`], and [`QueryError::Unimplemented`] for a leg that is not [`splittable`].
-pub async fn part<S: BlobStore>(
+/// As [`query`], and a term dictionary that should be there and is not.
+pub async fn open_part<S: BlobStore>(
     store: &S,
     targets: &[(usize, Target)],
     legs: &[(usize, Prefetch)],
-    filter: Option<&Predicate>,
-    shadow: usize,
-) -> Result<PartHits, QueryError> {
-    if legs.iter().any(|(_, p)| !splittable(p)) {
-        return Err(QueryError::Unimplemented("a text leg on another server"));
-    }
-    let runnable = legs
-        .iter()
-        .map(|(j, p)| Runnable::try_from(p).map(|r| (*j, r)))
-        .collect::<Result<Vec<_>, _>>()?;
+    terms: &[String],
+) -> Result<(OpenPart, Stats), QueryError> {
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened =
         futures_util::future::try_join_all(targets.iter().map(|(_, t)| open(store, t, &prefetch)))
             .await?;
-    let items: Vec<(usize, &Target, &Opened)> = targets
+    let wants_text = legs.iter().any(|(_, p)| matches!(p, Prefetch::Text { .. }));
+    let mut parts = Vec::new();
+    for ((_, t), o) in targets.iter().zip(&opened) {
+        if !wants_text || !t.text_dict || o.segment.text_fields().is_empty() {
+            continue;
+        }
+        let raw = o.terms.as_ref().ok_or(FormatError::Corrupt(
+            "a share's segment with text and no term dictionary",
+        ))?;
+        parts.push(TextIndex::from_segment(&o.segment, raw.as_ref())?.summary());
+    }
+    let stats = only(Stats::merge(parts), terms);
+    Ok((
+        OpenPart {
+            targets: targets.to_vec(),
+            legs: legs.to_vec(),
+            opened,
+        },
+        stats,
+    ))
+}
+
+/// `stats` with `df` kept for `terms` only (M55): BM25 reads no other term's, so a share
+/// sends the query's few rather than its whole vocabulary.
+#[must_use]
+pub fn only(mut stats: Stats, terms: &[String]) -> Stats {
+    stats.df.retain(|t, _| terms.contains(t));
+    stats
+}
+
+/// Phase 2 of a share (M55): every leg over the held segments, scored with `stats`, masked by
+/// `filter`, rid of deleted rows and cut to what a shadow of `shadow` ids can leave -- exactly
+/// as [`run`] does over its own segments, because it is the same function.
+///
+/// # Errors
+/// As [`query`].
+pub async fn scan_part<S: BlobStore>(
+    store: &S,
+    part: &OpenPart,
+    filter: Option<&Predicate>,
+    shadow: usize,
+    stats: &Stats,
+    text: &FullText,
+) -> Result<PartHits, QueryError> {
+    let runnable = part
+        .legs
         .iter()
-        .zip(&opened)
+        .map(|(j, p)| Runnable::try_from(p).map(|r| (*j, r)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let items: Vec<(usize, &Target, &Opened)> = part
+        .targets
+        .iter()
+        .zip(&part.opened)
         .map(|((i, t), o)| (*i, t, o))
         .collect();
     candidates(
@@ -229,10 +337,37 @@ pub async fn part<S: BlobStore>(
         filter,
         shadow,
         false,
-        &Stats::default(),
-        &FullText::default(),
+        stats,
+        text,
     )
     .await
+}
+
+/// One server's share of a query in one call (M54): [`open_part`] then [`scan_part`], scored
+/// with `stats` -- the global sum when a text leg is among `legs` (M55), and anything when
+/// none is.
+///
+/// # Errors
+/// As [`query`].
+pub async fn part<S: BlobStore>(
+    store: &S,
+    targets: &[(usize, Target)],
+    legs: &[(usize, Prefetch)],
+    filter: Option<&Predicate>,
+    shadow: usize,
+    stats: &Stats,
+    text: &FullText,
+) -> Result<PartHits, QueryError> {
+    let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
+    let opened =
+        futures_util::future::try_join_all(targets.iter().map(|(_, t)| open(store, t, &prefetch)))
+            .await?;
+    let held = OpenPart {
+        targets: targets.to_vec(),
+        legs: legs.to_vec(),
+        opened,
+    };
+    scan_part(store, &held, filter, shadow, stats, text).await
 }
 
 /// Every running `(segment, leg)` pair's candidates: each leg widened by what the segment may
@@ -379,12 +514,26 @@ async fn run<S: BlobStore>(
     // ⚠️ **A segment whose vector legs run elsewhere is opened for its text legs only** (M54):
     // its footer, delete vector and term dictionary, which the text legs, the shadow check and
     // the row fetch need -- never the centroid table or sparse dictionary its peer reads.
-    let remote: std::collections::BTreeSet<usize> = elsewhere
-        .iter()
-        .flat_map(|e| e.targets.iter().copied())
-        .collect();
-    let (shares, futures): (Vec<Vec<usize>>, Vec<_>) =
-        elsewhere.into_iter().map(|e| (e.targets, e.hits)).unzip();
+    // M54: a segment in a one-exchange share has its vector legs run elsewhere, and is opened
+    // here for its text legs. M55: a segment in a phased share has every leg run elsewhere, and
+    // is opened here for its footer and delete vector only -- what the shadow check and the row
+    // fetch need.
+    let mut vector_remote = std::collections::BTreeSet::new();
+    let mut all_remote = std::collections::BTreeSet::new();
+    let mut hit_shares: Vec<(Vec<usize>, futures_util::future::BoxFuture<'_, _>)> = Vec::new();
+    let mut phased: Vec<(Vec<usize>, futures_util::future::BoxFuture<'_, _>, _)> = Vec::new();
+    for e in elsewhere {
+        match e.share {
+            Share::Hits(f) => {
+                vector_remote.extend(e.targets.iter().copied());
+                hit_shares.push((e.targets, f));
+            }
+            Share::Phased { stats, scan } => {
+                all_remote.extend(e.targets.iter().copied());
+                phased.push((e.targets, stats, scan));
+            }
+        }
+    }
     let text_legs: Vec<Prefetch> = prefetch
         .iter()
         .filter(|p| !splittable(p))
@@ -392,20 +541,38 @@ async fn run<S: BlobStore>(
         .collect();
     let whole = matches!(fusion, Fusion::Sum { .. });
     let legs: Vec<(usize, Runnable<'_>)> = runnable.iter().copied().enumerate().collect();
-    let here = |i: usize, j: usize| {
-        !remote.contains(&i) || prefetch.get(j).is_some_and(|p| !splittable(p))
-    };
-    let local = async {
-        let opened =
-            futures_util::future::try_join_all(targets.iter().enumerate().map(|(i, t)| {
-                let wanted = if remote.contains(&i) {
-                    text_legs.as_slice()
-                } else {
-                    prefetch
-                };
-                open(store, t, wanted)
-            }))
-            .await?;
+    let all_legs: Vec<(usize, Prefetch)> = prefetch.iter().cloned().enumerate().collect();
+    let vector_legs: Vec<(usize, Prefetch)> = all_legs
+        .iter()
+        .filter(|(_, p)| splittable(p))
+        .cloned()
+        .collect();
+    let opening = futures_util::future::try_join_all(targets.iter().enumerate().map(|(i, t)| {
+        let wanted: &[Prefetch] = if all_remote.contains(&i) {
+            &[]
+        } else if vector_remote.contains(&i) {
+            text_legs.as_slice()
+        } else {
+            prefetch
+        };
+        open(store, t, wanted)
+    }));
+    let (mut phase_ones, mut scans): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+    let mut phased_targets = Vec::new();
+    for (t, stats, scan) in phased {
+        phased_targets.push(t);
+        phase_ones.push(stats);
+        scans.push(scan);
+    }
+    let (hit_targets, hit_futures): (Vec<Vec<usize>>, Vec<_>) = hit_shares.into_iter().unzip();
+    // ⚠️ **Beside the open round, not after it** (M54): a peer's share is two rounds on its
+    // own store -- or, phased (M55), one round before the statistics and one after -- the same
+    // rounds the coordinator spends here, so the slowest path stays HEAD, open, legs, rows.
+    let hits_started = futures_util::future::join_all(hit_futures);
+    let main = async {
+        let (opened, firsts) =
+            futures_util::future::join(opening, futures_util::future::join_all(phase_ones)).await;
+        let opened = opened?;
 
         // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
         // summaries ride in the term dictionaries the open round already fetched. That is what
@@ -423,61 +590,158 @@ async fn run<S: BlobStore>(
         // was written first and removed: no test could distinguish it, and the mutation gate said
         // so. `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` pins the property
         // wherever it is enforced.
-        let stats = Stats::merge(opened.iter().filter_map(|o| {
+        let mut stats = Stats::merge(opened.iter().filter_map(|o| {
             let raw = o.terms.as_ref()?;
             TextIndex::from_segment(&o.segment, raw.as_ref())
                 .ok()
                 .map(|idx| idx.summary())
         }));
+        // M55: each phased share's statistics, or -- for a share whose phase 1 failed -- its
+        // segments opened here, one more round, so the sum is never a share short.
+        let mut scan_here: Vec<(usize, Target)> = Vec::new();
+        let mut to_scan = Vec::new();
+        let mut summed_parts = Vec::new();
+        for ((share, first), scan) in phased_targets.iter().zip(firsts).zip(scans) {
+            match first {
+                Ok(st) => {
+                    summed_parts.push(st);
+                    to_scan.push((share, scan));
+                }
+                Err(_) => scan_here.extend(
+                    share
+                        .iter()
+                        .filter_map(|i| targets.get(*i).map(|t| (*i, t.clone()))),
+                ),
+            }
+        }
+        let opened_here = futures_util::future::try_join_all(
+            scan_here.iter().map(|(_, t)| open(store, t, prefetch)),
+        )
+        .await?;
+        stats = Stats::merge(std::iter::once(stats).chain(summed_parts).chain(
+            opened_here.iter().filter_map(|o| {
+                let raw = o.terms.as_ref()?;
+                TextIndex::from_segment(&o.segment, raw.as_ref())
+                    .ok()
+                    .map(|idx| idx.summary())
+            }),
+        ));
+        let stats = &stats;
+
+        let in_scan_here: std::collections::BTreeSet<usize> =
+            scan_here.iter().map(|(i, _)| *i).collect();
+        let here = |i: usize, j: usize| {
+            !all_remote.contains(&i)
+                && (!vector_remote.contains(&i) || prefetch.get(j).is_some_and(|p| !splittable(p)))
+        };
         let items: Vec<(usize, &Target, &Opened)> = targets
             .iter()
             .zip(&opened)
             .enumerate()
             .map(|(i, (t, o))| (i, t, o))
+            .filter(|(i, _, _)| !in_scan_here.contains(i))
+            .chain(
+                scan_here
+                    .iter()
+                    .zip(&opened_here)
+                    .map(|((i, t), o)| (*i, t, o)),
+            )
             .collect();
-        let found = candidates(
+        // A segment whose phase 1 failed runs here, from the copy opened for it above.
+        let local = candidates(
             store,
             &items,
             &legs,
-            here,
+            |i, j| here(i, j) || in_scan_here.contains(&i),
             filter,
             shadow.len(),
             whole,
-            &stats,
+            stats,
             text,
-        )
-        .await?;
-        Ok::<_, QueryError>((opened, found))
+        );
+        // Each scan's segments carried beside it (code review): never recovered by filtering,
+        // which would shift every later share's hits if a share were ever empty.
+        let (scanned_targets, scans): (Vec<&Vec<usize>>, Vec<_>) = to_scan.into_iter().unzip();
+        let phase_twos =
+            futures_util::future::join_all(scans.into_iter().map(|scan| scan(stats.clone())));
+        let (local, seconds) = futures_util::future::join(local, phase_twos).await;
+        Ok::<_, QueryError>((
+            opened,
+            local?,
+            seconds,
+            scanned_targets.into_iter().cloned().collect::<Vec<_>>(),
+            stats.clone(),
+        ))
     };
-    // ⚠️ **Beside the open round, not after it** (M54): a peer's share is two rounds on its
-    // own store, the same two the coordinator spends here, so the slowest path stays HEAD,
-    // open, legs, rows.
-    let (local, shared) =
-        futures_util::future::join(local, futures_util::future::join_all(futures)).await;
-    let (opened, mut candidates_found) = local?;
+    // ⚠️ The one-exchange shares run beside ALL of it -- open, statistics and legs -- as M54's
+    // did beside the open round: they wait for nothing here.
+    let (main, shared) = futures_util::future::join(main, hits_started).await;
+    let (opened, local, seconds, scanned_targets, stats) = main?;
+    let stats = &stats;
+    let mut candidates_found = local;
     // ⚠️ **Every failed share run here, and together** (M54, code review): a failed share
     // costs two rounds, never the answer -- and two rounds however many failed, which one
-    // after another would make two per peer.
-    let mut failed: Vec<(usize, Target)> = Vec::new();
-    for (share, got) in shares.iter().zip(shared) {
+    // after another would make two per peer. A failed phase 2 runs with the global sum it
+    // already has (M55, spec review): never the defaults.
+    let mut failed_phased: Vec<(usize, Target)> = Vec::new();
+    for (share, got) in scanned_targets.iter().zip(seconds) {
         match got {
             Ok(hits) => candidates_found.extend(hits),
-            Err(_) => failed.extend(
+            Err(_) => failed_phased.extend(
                 share
                     .iter()
                     .filter_map(|i| targets.get(*i).map(|t| (*i, t.clone()))),
             ),
         }
     }
-    if !failed.is_empty() {
-        let vector: Vec<(usize, Prefetch)> = prefetch
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| splittable(p))
-            .map(|(j, p)| (j, p.clone()))
-            .collect();
-        candidates_found.extend(part(store, &failed, &vector, filter, shadow.len()).await?);
+    let mut failed_hits: Vec<(usize, Target)> = Vec::new();
+    for (share, got) in hit_targets.iter().zip(shared) {
+        match got {
+            Ok(hits) => candidates_found.extend(hits),
+            Err(_) => failed_hits.extend(
+                share
+                    .iter()
+                    .filter_map(|i| targets.get(*i).map(|t| (*i, t.clone()))),
+            ),
+        }
     }
+    let (again_phased, again_hits) = futures_util::future::try_join(
+        async {
+            if failed_phased.is_empty() {
+                Ok(Vec::new())
+            } else {
+                part(
+                    store,
+                    &failed_phased,
+                    &all_legs,
+                    filter,
+                    shadow.len(),
+                    stats,
+                    text,
+                )
+                .await
+            }
+        },
+        async {
+            if failed_hits.is_empty() {
+                Ok(Vec::new())
+            } else {
+                part(
+                    store,
+                    &failed_hits,
+                    &vector_legs,
+                    filter,
+                    shadow.len(),
+                    stats,
+                    text,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+    candidates_found.extend(again_phased);
+    candidates_found.extend(again_hits);
     let candidates = candidates_found;
 
     if whole {

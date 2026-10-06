@@ -127,8 +127,9 @@ outcome — confirming coverage needs `--list` with the same filter.
 
 | # | Task | From | Size |
 |---|---|---|---|
-| 57 | **Split text legs too.** BM25 scores against statistics summed over every segment, so a text leg runs on the coordinator. Splitting it needs the statistics first: per-segment `doc_count`, `total_tokens` and the query terms' `df` in HEAD (a format change) or a statistics round (D-34 has none to spare). | [M54](M54/SPEC.md) | M |
+| ~~57~~ | **CLOSED by [M55](M55/VERIFIED.md)**: a text leg splits in two exchanges, statistics then scan, exact and four rounds deep. **Before:** **Split text legs too.** BM25 scores against statistics summed over every segment, so a text leg runs on the coordinator. Splitting it needs the statistics first: per-segment `doc_count`, `total_tokens` and the query terms' `df` in HEAD (a format change) or a statistics round (D-34 has none to spare). | [M54](M54/SPEC.md) | M |
 | 58 | **Take the peer list from membership.** `PSTORE_PEERS` is static. The gossip view (M50–M53) knows who is alive, and the same rendezvous hash over it would move a segment's scan only when its server leaves. | [M54](M54/SPEC.md) | M |
+| 60 | **Split `sum` fusion too.** Its legs are whole, so a share's reply would be every matching row of every segment. Exact with a cut: every leg of a segment now runs on one server, so a peer can sum per row and keep each segment's top `top_k + |shadow|` -- the global top is a subset of their union. | [M55](M55/SPEC.md) | S |
 | 59 | **Measure what a split buys.** The evidence here is who read what and that depth stays four; whether a large index answers faster split three ways is a latency on real machines, and `slos.md` blocks every latency on M0b. | [M54](M54/SPEC.md) | S |
 
 ## Opened by M36
