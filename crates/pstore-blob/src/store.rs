@@ -205,14 +205,15 @@ pub trait BlobStore: Send + Sync + 'static {
 }
 
 /// A store chosen at run time -- a replication source named by configuration (M22) -- is a
-/// store, so it can be accounted and billed like any other.
+/// store, so it can be accounted and billed like any other. And any shared store is one (M59):
+/// a query's legs each run on a task of their own, and each task holds the store.
 ///
 /// ⚠️ **Every method forwards, the defaulted ones too**: a default here would re-derive a
 /// classed read as an unclassed one, or re-plan a coalesced read the inner store plans
 /// differently, and the difference would be invisible until a cache or a request count
 /// disagreed.
 #[async_trait::async_trait]
-impl BlobStore for std::sync::Arc<dyn BlobStore> {
+impl<S: BlobStore + ?Sized> BlobStore for std::sync::Arc<S> {
     fn capabilities(&self) -> &Capabilities {
         (**self).capabilities()
     }

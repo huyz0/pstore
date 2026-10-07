@@ -431,6 +431,17 @@ struct Split<S> {
     fresh: Option<Arc<pstore_blob::MemoryStore>>,
 }
 
+/// A handle, so each of a query's leg tasks holds one (M59). By hand: a derive would ask `S`
+/// to be `Clone`, and only the `Arc`s are cloned.
+impl<S> Clone for Split<S> {
+    fn clone(&self) -> Self {
+        Self {
+            durable: Arc::clone(&self.durable),
+            fresh: self.fresh.clone(),
+        }
+    }
+}
+
 impl<S: BlobStore> Split<S> {
     fn is_fresh(key: &Key) -> bool {
         key.as_str().starts_with("mem/")
@@ -5107,7 +5118,7 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
         let bound = filter.map(|f| f.bound(&part.fts.analyzer));
         pstore_query::part(
-            &*self.store,
+            &self.store,
             &part.targets,
             &part.legs,
             bound.as_ref(),
@@ -5146,7 +5157,7 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
         let bound = filter.map(|f| f.bound(&part.fts.analyzer));
         pstore_query::scan_part(
-            &*self.store,
+            &self.store,
             held,
             bound.as_ref(),
             part.shadow,
@@ -5565,7 +5576,7 @@ impl<S: BlobStore> Engine<S> {
         let filter = bound.as_ref();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
-            &*self.store,
+            &self.store,
             &targets,
             &prefetch,
             &schema.fts,

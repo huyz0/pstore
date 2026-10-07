@@ -44,6 +44,10 @@ store. Backlog row 59 stays open for that, on M0b.
    - ⚠️ **The layout is not fixed.** The corpus and queries come from fixed seeds, but
      `assign` hashes the servers' URLs, which carry ports the OS picks. So the segments each
      server held differed between runs: 16/17/15 earlier, 8/20/20 here.
+   - ⚠️ **Corrected by [M59](../M59/VERIFIED.md):** the "seven waits" below were four blob
+     rounds plus about 48 ms of scoring run serially in one task, about 1 ms a segment. There
+     was no queueing and no extra request. M59 scores segments in parallel. Much of the split's
+     gain measured here was that serial scoring spread over three processes.
    - Under `wait`, an unsplit dense query took about 138 ms, roughly seven waits of 20 ms
      where D-34 counts four rounds. This benchmark does not say why: the extra wait may be
      requests queued behind a concurrency limit. A split query's 114 ms is consistent with

@@ -8,6 +8,7 @@ use pstore_format::{Document, FormatError, Segment};
 use pstore_index::sparse::SparseIndex;
 use pstore_index::text::{Stats, TextIndex};
 use pstore_index::vec_index::{self, VecIndex};
+use std::sync::Arc;
 
 /// One retriever's request (D-73).
 #[derive(Debug, Clone)]
@@ -122,7 +123,7 @@ struct Opened {
 /// Depth is the **max** of the legs, not the sum: the open round fetches the footer, the
 /// centroid table and the dictionary together, and the legs then issue their ranges in one
 /// further round each, concurrently.
-pub async fn query<S: BlobStore>(
+pub async fn query<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
@@ -144,7 +145,7 @@ pub async fn query<S: BlobStore>(
 ///
 /// # Errors
 /// As [`query`].
-pub async fn query_with<S: BlobStore>(
+pub async fn query_with<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
@@ -368,7 +369,7 @@ fn cut_sum(hits: PartHits, cut: SumCut) -> PartHits {
     clippy::too_many_arguments,
     reason = "a share's parts, each needed by a leg"
 )]
-pub async fn scan_part<S: BlobStore>(
+pub async fn scan_part<S: BlobStore + Clone>(
     store: &S,
     part: &OpenPart,
     filter: Option<&Predicate>,
@@ -397,7 +398,7 @@ pub async fn scan_part<S: BlobStore>(
         filter,
         shadow,
         sum.is_some(),
-        stats,
+        &Arc::new(stats.clone()),
         text,
     )
     .await?;
@@ -417,7 +418,7 @@ pub async fn scan_part<S: BlobStore>(
     clippy::too_many_arguments,
     reason = "a share's parts, each needed by a leg"
 )]
-pub async fn part<S: BlobStore>(
+pub async fn part<S: BlobStore + Clone>(
     store: &S,
     targets: &[(usize, Target)],
     legs: &[(usize, Prefetch)],
@@ -446,7 +447,7 @@ pub async fn part<S: BlobStore>(
     clippy::too_many_arguments,
     reason = "the query's parts, each needed by a leg"
 )]
-async fn candidates<S: BlobStore>(
+async fn candidates<S: BlobStore + Clone>(
     store: &S,
     items: &[(usize, &Target, &Opened)],
     legs: &[(usize, Runnable<'_>)],
@@ -454,7 +455,7 @@ async fn candidates<S: BlobStore>(
     filter: Option<&Predicate>,
     shadow: usize,
     whole: bool,
-    stats: &Stats,
+    stats: &Arc<Stats>,
     text: &FullText,
 ) -> Result<PartHits, QueryError> {
     let runs = &runs;
@@ -476,21 +477,45 @@ async fn candidates<S: BlobStore>(
     // a row's contribution, so the best sum can be a row no leg ranks first -- and whether it
     // survives would hang on how the index is cut into segments. So the leg is exhaustive and
     // no cut is re-applied; the fused ranking is what is cut, below.
-    let legs_fut = futures_util::future::try_join_all(items.iter().flat_map(|&(i, t, o)| {
-        legs.iter()
-            .filter(move |(j, _)| runs(i, *j))
-            .map(move |&(j, r)| async move {
-                let hidden = o.deleted.len() + if t.shadowed { shadow } else { 0 };
-                let r = if filter.is_some() || whole {
-                    r.exhaustive(o.segment.index_row_count())
-                } else {
-                    r.widened(hidden, o.segment.row_count())
-                };
-                leg(store, &t.segment, o, &r, i, stats, text)
+    //
+    // ⚠️ **Each pair on a task of its own** (M59). Joined in one task, every segment's scoring
+    // -- the index's, right after its read -- held the only thread the query had: 48 segments
+    // scored one after another while the runtime's other workers sat idle, about 1 ms each at
+    // 2,000 rows. A task owns what it reads: the store's handle, the segment's footer and
+    // sidecars, the leg rebuilt owned, and the query's statistics, shared -- never copied a
+    // task: the coordinator's hold its whole vocabulary.
+    let mut tasks = Tasks(Vec::new());
+    for &(i, t, o) in items {
+        // One copy a segment, shared by its legs (code review), without the delete vector: a
+        // leg never reads it, and deleted rows are dropped below, from `items`.
+        let shared = Arc::new(Opened {
+            segment: o.segment.clone(),
+            centroids: o.centroids.clone(),
+            dictionary: o.dictionary.clone(),
+            terms: o.terms.clone(),
+            deleted: std::collections::HashSet::new(),
+        });
+        for &(j, r) in legs.iter().filter(|(j, _)| runs(i, *j)) {
+            let hidden = o.deleted.len() + if t.shadowed { shadow } else { 0 };
+            let r = if filter.is_some() || whole {
+                r.exhaustive(o.segment.index_row_count())
+            } else {
+                r.widened(hidden, o.segment.row_count())
+            };
+            let owned = r.owned();
+            let (store, key, stats, text) =
+                (store.clone(), t.segment.clone(), Arc::clone(stats), *text);
+            let opened = Arc::clone(&shared);
+            tasks.0.push(tokio::spawn(async move {
+                // Cannot fail: `legs` holds only legs this build runs, refused before any I/O.
+                let r = Runnable::try_from(&owned)?;
+                leg(&store, &key, &opened, &r, i, &stats, &text)
                     .await
                     .map(|hits| (i, j, hits))
-            })
-    }));
+            }));
+        }
+    }
+    let legs_fut = tasks.join();
     // ⚠️ A mask only for a segment some leg runs over here (M54): a segment whose vector legs
     // run elsewhere is masked there.
     let masks_fut = futures_util::future::try_join_all(items.iter().map(|&(i, t, o)| async move {
@@ -551,7 +576,7 @@ async fn candidates<S: BlobStore>(
     clippy::too_many_arguments,
     reason = "the query's parts, each needed by a leg"
 )]
-async fn run<S: BlobStore>(
+async fn run<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
@@ -695,7 +720,8 @@ async fn run<S: BlobStore>(
                     .map(|idx| idx.summary())
             }),
         ));
-        let stats = &stats;
+        // Shared by every leg task (M59), and built once.
+        let stats = &Arc::new(stats);
 
         let in_scan_here: std::collections::BTreeSet<usize> =
             scan_here.iter().map(|(i, _)| *i).collect();
@@ -732,7 +758,7 @@ async fn run<S: BlobStore>(
         // which would shift every later share's hits if a share were ever empty.
         let (scanned_targets, scans): (Vec<&Vec<usize>>, Vec<_>) = to_scan.into_iter().unzip();
         let phase_twos =
-            futures_util::future::join_all(scans.into_iter().map(|scan| scan(stats.clone())));
+            futures_util::future::join_all(scans.into_iter().map(|scan| scan((**stats).clone())));
         let (local, seconds) = futures_util::future::join(local, phase_twos).await;
         Ok::<_, QueryError>((
             opened,
@@ -978,7 +1004,7 @@ async fn summed<S: BlobStore>(
     clippy::too_many_arguments,
     reason = "the query's parts, each needed by a leg"
 )]
-pub async fn query_rows_filtered<S: BlobStore>(
+pub async fn query_rows_filtered<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
@@ -1012,7 +1038,7 @@ pub async fn query_rows_filtered<S: BlobStore>(
     clippy::too_many_arguments,
     reason = "the query's parts, each needed by a leg"
 )]
-pub async fn query_rows_split<S: BlobStore>(
+pub async fn query_rows_split<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
@@ -1138,6 +1164,41 @@ enum Runnable<'a> {
 }
 
 impl Runnable<'_> {
+    /// The same leg, owning its field and query (M59): what a leg's task carries.
+    fn owned(&self) -> Prefetch {
+        match *self {
+            Self::Text {
+                field,
+                query,
+                limit,
+            } => Prefetch::Text {
+                field: field.to_owned(),
+                query: query.to_owned(),
+                limit,
+            },
+            Self::Dense {
+                field,
+                query,
+                limit,
+                tune,
+            } => Prefetch::Dense {
+                field: field.to_owned(),
+                query: query.to_vec(),
+                limit,
+                tune,
+            },
+            Self::Sparse {
+                field,
+                query,
+                limit,
+            } => Prefetch::Sparse {
+                field: field.to_owned(),
+                query: query.to_vec(),
+                limit,
+            },
+        }
+    }
+
     /// Rows this leg contributes at most.
     fn limit(&self) -> usize {
         match self {
@@ -1328,6 +1389,53 @@ async fn maybe<S: BlobStore>(store: &S, key: Option<Key>) -> Option<bytes::Bytes
         .get_immutable(&key, pstore_blob::Class::Pinned)
         .await
         .ok()
+}
+
+/// A query's leg tasks (M59), aborted if the query is dropped before they finish -- by a
+/// client hanging up, or a peer's timeout -- so none reads and scores for nobody.
+struct Tasks(Vec<tokio::task::JoinHandle<LegHits>>);
+
+/// One `(segment, leg)` pair's candidates, or why there are none.
+type LegHits = Result<(usize, usize, Vec<Hit>), QueryError>;
+
+impl Tasks {
+    /// Every task's result, in the order the tasks were made, as `try_join_all` returned the
+    /// futures they replaced. Waited on as they finish (code review), so the first error to
+    /// arrive is the query's and aborts the rest, as `try_join_all`'s did. A leg's panic is
+    /// resumed here, as an inline one would have been.
+    async fn join(mut self) -> Result<Vec<(usize, usize, Vec<Hit>)>, QueryError> {
+        use futures_util::StreamExt as _;
+        let mut slots: Vec<Option<(usize, usize, Vec<Hit>)>> = Vec::new();
+        slots.resize_with(self.0.len(), || None);
+        let mut pending: futures_util::stream::FuturesUnordered<_> = self
+            .0
+            .iter_mut()
+            .enumerate()
+            .map(|(k, task)| async move { (k, task.await) })
+            .collect();
+        while let Some((k, got)) = pending.next().await {
+            let done = match got {
+                Ok(done) => done?,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                // Only `Drop` aborts, and it cannot run while this waits; a runtime shutting
+                // down under the query is the one other way, and is an error.
+                Err(_) => return Err(QueryError::Unimplemented("a leg cancelled")),
+            };
+            if let Some(slot) = slots.get_mut(k) {
+                *slot = Some(done);
+            }
+        }
+        drop(pending);
+        Ok(slots.into_iter().flatten().collect())
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// One retriever's ranked answer.

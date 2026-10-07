@@ -16,6 +16,8 @@ pstore-blob   = { path = "../pstore-blob" }
 pstore-format = { path = "../pstore-format" }
 pstore-index  = { path = "../pstore-index" }
 thiserror     = "2"
+# M59: each segment's leg on a task of its own, so a query's scoring uses every worker.
+tokio         = { version = "1", default-features = false, features = ["rt"] }
 # M15: Regex, and Glob compiled to it.
 regex         = { version = "1", default-features = false, features = ["std", "unicode"] }
 # M15.2: the parsed pattern, for the literals every match must contain.
@@ -24,5 +26,6 @@ regex-syntax  = { version = "0.8", default-features = false, features = ["std", 
 [dev-dependencies]
 bytes          = "1"
 pstore-testkit = { path = "../pstore-testkit" }
+async-trait    = "0.1"
 pstore-types   = { path = "../pstore-types" }
 tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

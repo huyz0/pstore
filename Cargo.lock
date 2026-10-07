@@ -1536,6 +1536,7 @@ dependencies = [
 name = "pstore-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures-util",
  "pstore-blob",
