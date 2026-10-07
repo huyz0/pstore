@@ -108,7 +108,7 @@ async fn a_query_admits() {
 
 #[tokio::test]
 async fn a_compaction_over_deleted_rows_admits_no_bulk() {
-    // With a delete vector, the live rows are read by `rows_where`, not `scan`.
+    // With a delete vector, the live rows are read by `scan` too (M60), still as bulk.
     let w = world().await;
     w.e.delete("idx", vec!["d0-1".into(), "d1-2".into()])
         .await
@@ -117,7 +117,7 @@ async fn a_compaction_over_deleted_rows_admits_no_bulk() {
     w.e.fold().await.unwrap();
     let before = w.bulk();
     w.e.compact("idx").await.unwrap().unwrap();
-    assert_eq!(w.bulk(), before, "a compaction's rows_where was admitted");
+    assert_eq!(w.bulk(), before, "a compaction's scan was admitted");
     assert_eq!(w.e.scan("idx", None).await.unwrap().len(), 598);
 }
 

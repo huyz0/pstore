@@ -4389,8 +4389,8 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// A segment's rows `filter` admits, less the rows its delete vector names, in row order
-    /// (M9c.2). A segment without a vector is a plain scan; with one, the same zone pruning
-    /// through `rows_where`, which also says which row each document is.
+    /// (M9c.2). A segment without a delete vector is a plain scan; with one, the whole segment,
+    /// numbered by position (M60).
     async fn live_rows(
         &self,
         seg: &Segment,
@@ -4401,23 +4401,20 @@ impl<S: BlobStore> Engine<S> {
         let Some((dv, _)) = vector else {
             return Ok(seg.scan(&self.scanning(), key, filter).await?);
         };
+        // ⚠️ **Every row, every field, by position** (M60). This read `rows_where`, which
+        // decodes the blocks alone -- and a block carries no vector, so compaction sealed every
+        // live document of a segment with deletes without one, and the index lost them. The
+        // whole segment is read, with its vectors, and the deleted rows dropped by position; a
+        // filtered export pays the blocks the zones would have pruned (bytes, never requests).
         let (raw, rows) = futures_util::future::join(
             self.store.get(&Key::new(dv.clone())),
-            seg.rows_where(&self.scanning(), key, |zones| {
-                filter.is_none_or(|f| {
-                    // The legacy filter matches structurally: only int rows, which the int
-                    // zone covers whole.
-                    zones
-                        .ints
-                        .get(f.column())
-                        .is_none_or(|(lo, hi)| f.could_match(*lo, *hi))
-                })
-            }),
+            seg.scan(&self.scanning(), key, None),
         )
         .await;
         let deleted = pstore_query::deletes::decode(&raw?);
         Ok(rows?
             .into_iter()
+            .enumerate()
             .filter(|(row, d)| !deleted.contains(row) && filter.is_none_or(|f| f.matches(d)))
             .map(|(_, d)| d)
             .collect())

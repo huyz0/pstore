@@ -291,3 +291,86 @@ async fn a_fold_landing_mid_compaction_is_not_swallowed_by_it() {
     );
     assert_eq!(ids.len(), 8, "{} rows for 8 writes: a duplicate", ids.len());
 }
+
+#[tokio::test]
+async fn compaction_keeps_every_vector_of_a_segment_with_deletes() {
+    // M60: a segment with a delete vector was read by its blocks alone, which carry no vector,
+    // and compaction sealed what it read -- every vector of every live document lost, `vector`
+    // and every named field.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), TenantId(1), LaneId(1));
+    let written = |i: u32| {
+        let x = i as f32;
+        let mut d = Document::new(format!("d{i:03}"), vec![x.sin(), x.cos(), 1.0]);
+        d.attrs
+            .insert("n".to_owned(), pstore_format::Value::Int(i64::from(i)));
+        // Named after `vector`, so field order is not what this tests (M61 fixes that).
+        d.vectors.insert(
+            "words".to_owned(),
+            pstore_format::VectorField::Dense((0..i % 3 + 1).map(|j| vec![x, j as f32]).collect()),
+        );
+        d
+    };
+    for k in 0..3u32 {
+        e.write("idx", (k * 20..k * 20 + 20).map(written).collect())
+            .await
+            .unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    let gone = ["d005", "d025", "d045"];
+    e.delete("idx", gone.iter().map(|s| (*s).to_owned()).collect())
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let legs = vec![pstore_query::Prefetch::Dense {
+        field: pstore_format::DEFAULT_FIELD.to_owned(),
+        query: vec![0.3, 0.9, 1.0],
+        limit: 5,
+        tune: pstore_index::vec_index::Query {
+            exact: true,
+            ..Default::default()
+        },
+    }];
+    let before = e
+        .query_filtered("idx", &legs, None, pstore_query::Fusion::default(), 5)
+        .await
+        .unwrap();
+    // Filtered, while the segments still carry their delete vectors (code review): the filter
+    // is all that selects a deleted segment's rows, so it must exclude live ones, and keep the
+    // vectors of those it admits.
+    let filter = pstore_format::Filter::Gt("n".to_owned(), 30);
+    let mut some = e.scan("idx", Some(&filter)).await.unwrap();
+    some.sort_by(|a, b| a.id.cmp(&b.id));
+    let want_some: Vec<Document> = (31..60u32)
+        .filter(|i| !gone.contains(&format!("d{i:03}").as_str()))
+        .map(written)
+        .collect();
+    assert_eq!(some.len(), want_some.len());
+    for (got, want) in some.iter().zip(&want_some) {
+        assert_eq!((&got.id, &got.vectors), (&want.id, &want.vectors));
+    }
+    assert!(
+        e.compact("idx").await.unwrap().is_some(),
+        "nothing compacted"
+    );
+    let after = e
+        .query_filtered("idx", &legs, None, pstore_query::Fusion::default(), 5)
+        .await
+        .unwrap();
+    assert_eq!(after.ids, before.ids);
+    assert_eq!(format!("{:?}", after.dists), format!("{:?}", before.dists));
+    // Every live document, with both fields as written.
+    let mut scanned = e.scan("idx", None).await.unwrap();
+    scanned.sort_by(|a, b| a.id.cmp(&b.id));
+    let want: Vec<Document> = (0..60u32)
+        .filter(|i| !gone.contains(&format!("d{i:03}").as_str()))
+        .map(written)
+        .collect();
+    assert_eq!(scanned.len(), want.len());
+    for (got, want) in scanned.iter().zip(&want) {
+        assert_eq!(got.id, want.id);
+        assert_eq!(got.vectors, want.vectors, "{}", got.id);
+    }
+}
