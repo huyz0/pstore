@@ -120,7 +120,8 @@ bit, and the depth stays at four rounds.
   returns only its share's top `top_k + |shadow|` rows by sum, which keeps the answer exact.
   It travels as part protocol 3, which a server of an older build refuses, and the
   coordinator then runs that share itself.
-- **Not split:** `order_by`, aggregations, `as_of`, and indexes of one segment.
+- **Not split:** `order_by`, aggregations, `as_of`, a `multi` leg (M61), and indexes of one
+  segment.
 - **`pstore_peer_servers`** is the list's length now, this server included (1 when unpeered).
   Read it beside `pstore_peer_parts_failed`: a count that holds while failures rise is a
   server still listed but no longer answering.
@@ -129,6 +130,33 @@ bit, and the depth stays at four rounds.
 - ⚠️ `POST /v1/internal/part` authenticates its caller no more than the public API does: keep
   it on the deployment's own network, as the public endpoints already must be.
 - `meta.cost` counts the receiving server's requests only.
+
+## Multi-vector documents
+
+A document may carry named fields of several vectors each, beside `vector`
+([M61](milestones/M61/SPEC.md)): `"vectors": {"late": [[…], […]]}`, ColBERT-style. A query's
+`multi` leg, `{"field": "late", "vectors": [[…], …]}`, scores every row holding the field by
+MaxSim, `Σᵢ maxⱼ ⟨qᵢ, dⱼ⟩`, under the index's metric: cosine normalizes each vector, and under
+`euclidean_squared` the ranking is the Chamfer distance. It fuses with dense and text legs by
+RRF; `sum` and `max` refuse it.
+
+- ⚠️ **A `multi` query reads every vector of the field, in every segment.** It is exact and
+  stays four rounds deep, but its bytes are the field's whole size: 100 vectors a document at
+  128 dimensions is 51 KB a document, so a million-document index reads about 51 GB a query.
+  Keep fields small, or the index small, until candidates come from quantized codes (backlog
+  row 63).
+- **CPU is `m × n × d` a row**, query vectors by document vectors by dimensions, spread over
+  the server's workers a segment each (M59).
+- **A field holds one width an index.** The door refuses a width that disagrees with rows this
+  process still holds, and a fold quarantines a row that disagrees with that fold's first.
+  Once every row is folded, a new width is accepted, and every `multi` query then meets both
+  and is refused with `schema_conflict`: rewrite the field at one width. A compaction over two
+  segments of different widths fails, loudly, and leaves them.
+- **Limits:** 8 named fields a document, 1,024 vectors a field, names of 1–64 bytes other than
+  `vector`. A dense query searches `vector` only.
+- **Not split** across peers (backlog row 64).
+- **A segment's export or compaction reads each named field in a round of its own.** Queries
+  never do.
 
 ## Replication
 

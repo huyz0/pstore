@@ -116,6 +116,11 @@ pub enum Section {
     TrigramSketch = 16,
 }
 
+/// Where the third and later dense fields' vector sections are numbered from (M61): field `k`
+/// is `FIELD_SECTIONS + k`. No [`Section`] uses an id near it, and a reader finds each field's
+/// through the [`Section::Fields`] table, never by guessing.
+pub const FIELD_SECTIONS: u16 = 0x1000;
+
 /// How a vector field is laid out in a segment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldLayout {

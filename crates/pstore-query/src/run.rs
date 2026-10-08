@@ -33,6 +33,16 @@ pub enum Prefetch {
         /// Rows this leg contributes at most.
         limit: usize,
     },
+    /// MaxSim over a field holding several vectors a document (M61, D-28): each query vector's
+    /// best dot product with the document's, summed.
+    Multi {
+        /// The field to search.
+        field: String,
+        /// The query's vectors.
+        query: Vec<Vec<f32>>,
+        /// Rows this leg contributes at most.
+        limit: usize,
+    },
     /// BM25 over the segment's text field.
     ///
     /// ⚠️ `query` is a **`String`**, analyzed at query time. D-73's premise is that the
@@ -667,6 +677,21 @@ async fn run<S: BlobStore + Clone>(
         let (opened, firsts) =
             futures_util::future::join(opening, futures_util::future::join_all(phase_ones)).await;
         let opened = opened?;
+        // ⚠️ A `multi` field no segment carries is a typo or a field never written (M61):
+        // refused, decided from the footers the open round read, at no request -- never an
+        // empty answer a caller cannot tell from "nothing matched".
+        let nowhere = |field: &str| {
+            !opened
+                .iter()
+                .any(|o| o.segment.field_layout(field).is_some())
+        };
+        if !opened.is_empty()
+            && prefetch
+                .iter()
+                .any(|p| matches!(p, Prefetch::Multi { field, .. } if nowhere(field)))
+        {
+            return Err(FormatError::UnknownField.into());
+        }
 
         // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
         // summaries ride in the term dictionaries the open round already fetched. That is what
@@ -1161,6 +1186,11 @@ enum Runnable<'a> {
         query: &'a [(u32, f32)],
         limit: usize,
     },
+    Multi {
+        field: &'a str,
+        query: &'a [Vec<f32>],
+        limit: usize,
+    },
 }
 
 impl Runnable<'_> {
@@ -1196,15 +1226,25 @@ impl Runnable<'_> {
                 query: query.to_vec(),
                 limit,
             },
+            Self::Multi {
+                field,
+                query,
+                limit,
+            } => Prefetch::Multi {
+                field: field.to_owned(),
+                query: query.to_vec(),
+                limit,
+            },
         }
     }
 
     /// Rows this leg contributes at most.
     fn limit(&self) -> usize {
         match self {
-            Self::Text { limit, .. } | Self::Dense { limit, .. } | Self::Sparse { limit, .. } => {
-                *limit
-            }
+            Self::Text { limit, .. }
+            | Self::Dense { limit, .. }
+            | Self::Sparse { limit, .. }
+            | Self::Multi { limit, .. } => *limit,
         }
     }
 
@@ -1228,6 +1268,15 @@ impl Runnable<'_> {
                 query,
                 limit,
             } => Self::Sparse {
+                field,
+                query,
+                limit: limit + extra,
+            },
+            Self::Multi {
+                field,
+                query,
+                limit,
+            } => Self::Multi {
                 field,
                 query,
                 limit: limit + extra,
@@ -1264,6 +1313,12 @@ impl Runnable<'_> {
                 limit: rows,
             },
             Self::Sparse { field, query, .. } => Self::Sparse {
+                field,
+                query,
+                limit: rows,
+            },
+            // Every row with vectors: `rows` counts index rows, never fewer than data rows.
+            Self::Multi { field, query, .. } => Self::Multi {
                 field,
                 query,
                 limit: rows,
@@ -1319,6 +1374,15 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 query,
                 limit,
             } => Ok(Self::Text {
+                field,
+                query,
+                limit: *limit,
+            }),
+            Prefetch::Multi {
+                field,
+                query,
+                limit,
+            } => Ok(Self::Multi {
                 field,
                 query,
                 limit: *limit,
@@ -1438,6 +1502,25 @@ impl Drop for Tasks {
     }
 }
 
+/// `MaxSim(q, d) = Σᵢ maxⱼ ⟨qᵢ, dⱼ⟩` (M61), in a fixed order -- i, then j, each dot over the
+/// dimensions in order -- so the same vectors score the same bits wherever they are scored.
+/// `None` for a document with no vectors: no candidate, never a zero.
+fn maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> Option<f32> {
+    if doc.is_empty() {
+        return None;
+    }
+    Some(
+        query
+            .iter()
+            .map(|q| {
+                doc.iter()
+                    .map(|d| q.iter().zip(d).map(|(a, b)| a * b).sum::<f32>())
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
+            .sum(),
+    )
+}
+
 /// One retriever's ranked answer.
 async fn leg<S: BlobStore>(
     store: &S,
@@ -1503,6 +1586,17 @@ async fn leg<S: BlobStore>(
             // refused it (`Segment::search` compares against the row it read); the
             // approximate one did not, and the two disagreeing is worse than either.
             // Found through the API in M7c.
+            // ⚠️ A field of several vectors a row is MaxSim's (M61): searched as dense it would
+            // read another field's codes, and its offset table as vectors.
+            if opened
+                .segment
+                .field_layout(field)
+                .is_some_and(|f| f.per_row == 0)
+            {
+                return Err(QueryError::Unimplemented(
+                    "a dense leg over a field of several vectors a document: search it with `multi`",
+                ));
+            }
             let dim = opened
                 .segment
                 .field_layout(field)
@@ -1529,6 +1623,45 @@ async fn leg<S: BlobStore>(
                 )
                 .await?;
             Ok(hits
+                .into_iter()
+                .map(|(row, score)| Hit {
+                    segment,
+                    row,
+                    score,
+                })
+                .collect())
+        }
+        Runnable::Multi {
+            field,
+            query,
+            limit,
+        } => {
+            // A segment without the field answers nothing, as an index written before the
+            // field existed should; a field no segment carries is refused in `run`.
+            let Some(layout) = opened.segment.field_layout(field) else {
+                return Ok(Vec::new());
+            };
+            if layout.kind != 0 {
+                return Err(FormatError::UnknownField.into());
+            }
+            let dims = layout.dims as usize;
+            if let Some(odd) = query.iter().find(|q| q.len() != dims) {
+                return Err(FormatError::DimensionMismatch {
+                    expected: dims,
+                    got: odd.len(),
+                }
+                .into());
+            }
+            // ⚠️ One ranged read, the field whole: the leg round's, beside the other legs'.
+            let rows = opened.segment.field_vectors(store, key, field).await?;
+            let mut scored: Vec<(usize, f32)> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, d)| maxsim(query, d).map(|s| (row, s)))
+                .collect();
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            scored.truncate(*limit);
+            Ok(scored
                 .into_iter()
                 .map(|(row, score)| Hit {
                     segment,

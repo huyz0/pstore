@@ -267,9 +267,20 @@ async fn segments(store: &MemoryStore) -> Vec<String> {
 /// Folds segments of 24 rows through `api` until there are at least `min` and every one of
 /// `urls` is assigned at least one; then deletes some rows and folds once more.
 async fn fill(store: &MemoryStore, api: &Arc<Api<View>>, urls: &[String], min: usize) {
+    fill_with(store, api, urls, min, doc).await;
+}
+
+/// [`fill`], with documents `make` writes.
+async fn fill_with(
+    store: &MemoryStore,
+    api: &Arc<Api<View>>,
+    urls: &[String],
+    min: usize,
+    make: fn(usize) -> Value,
+) {
     let mut k = 0;
     loop {
-        let docs: Vec<Value> = (k * 24..k * 24 + 24).map(doc).collect();
+        let docs: Vec<Value> = (k * 24..k * 24 + 24).map(make).collect();
         let (s, b) = send(
             api,
             "PUT",
@@ -729,6 +740,41 @@ async fn queries_that_cannot_be_split_run_on_one_server() {
     .await;
     assert_eq!(s, 200, "{body}");
     assert_eq!(metric(a, "pstore_peer_parts_sent").await, sent);
+}
+
+#[tokio::test]
+async fn a_multi_query_is_not_split() {
+    // M61: the part protocol carries no `multi` leg, so a share would answer without it. The
+    // whole query runs on the server asked, alone or beside a leg that would split.
+    let (store, servers, alone) = cluster(&[]).await;
+    let late = |i: usize| {
+        let mut d = doc(i);
+        let x = i as f32;
+        d["vectors"] = json!({"late": [[x.sin(), 1.0], [x.cos(), -1.0]]});
+        d
+    };
+    fill_with(&store, &servers[0].api, &urls(&servers), 8, late).await;
+    let multi = json!({"field": "late", "vectors": [[0.5, 0.25]]});
+    for q in [
+        json!({"multi": multi, "top_k": 10}),
+        json!({"multi": multi, "text": "word2", "top_k": 10}),
+        json!({"multi": multi, "vector": Q, "top_k": 10}),
+    ] {
+        let (s0, want) = query(&alone.api, &q).await;
+        assert_eq!(s0, 200, "{q}: {want}");
+        assert_eq!(want["results"].as_array().map(Vec::len), Some(10), "{want}");
+        for (i, server) in servers.iter().enumerate() {
+            let sent = metric(&server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&server.api, &q).await;
+            assert_eq!(s, 200, "{q} at {i}: {got}");
+            assert_eq!(answer(&got), answer(&want), "{q} at {i}");
+            assert_eq!(
+                metric(&server.api, "pstore_peer_parts_sent").await,
+                sent,
+                "{q} at {i} was split"
+            );
+        }
+    }
 }
 
 #[test]

@@ -872,6 +872,7 @@ impl WirePart {
                         limit: *limit,
                     }),
                     Prefetch::Trigram { .. } => None,
+                    Prefetch::Multi { .. } => None,
                 })
                 .collect(),
             targets: part

@@ -45,6 +45,10 @@ pub struct DocumentIn {
     /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d).
     #[serde(deserialize_with = "vector")]
     pub vector: Vec<f32>,
+    /// Named fields of several vectors each (M61): `{"late": [vector, …]}`, each vector
+    /// spelled as `vector` is. Searched by a query's `multi` leg.
+    #[serde(default, deserialize_with = "named_vectors")]
+    pub vectors: std::collections::BTreeMap<String, Vec<Vec<f32>>>,
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
@@ -159,6 +163,40 @@ fn vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> 
     decode_vector(VectorIn::deserialize(d)?)
 }
 
+fn many_vectors<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+    Vec::<VectorIn>::deserialize(d)?
+        .into_iter()
+        .map(decode_vector)
+        .collect()
+}
+
+type Named = std::collections::BTreeMap<String, Vec<VectorIn>>;
+
+fn named_vectors<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, Vec<Vec<f32>>>, D::Error> {
+    Named::deserialize(d)?
+        .into_iter()
+        .map(|(name, vs)| {
+            vs.into_iter()
+                .map(decode_vector)
+                .collect::<Result<_, _>>()
+                .map(|vs| (name, vs))
+        })
+        .collect()
+}
+
+/// A query's `multi` leg (M61): MaxSim of `vectors` over a named field's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiIn {
+    /// The named field to search.
+    pub field: String,
+    /// The query's vectors, each spelled as `vector` is.
+    #[serde(deserialize_with = "many_vectors")]
+    pub vectors: Vec<Vec<f32>>,
+}
+
 fn some_vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
     Option::<VectorIn>::deserialize(d)?
         .map(decode_vector)
@@ -195,6 +233,9 @@ pub struct QueryRequest {
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
     pub field: Option<String>,
+    /// The `multi` leg (M61): MaxSim over a named field of several vectors a document.
+    #[serde(default)]
+    pub multi: Option<MultiIn>,
     /// The BM25 leg's query text -- or several, each its own leg (M9g).
     #[serde(default)]
     pub text: Option<TextIn>,

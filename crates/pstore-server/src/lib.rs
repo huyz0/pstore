@@ -977,6 +977,10 @@ impl From<EngineError> for ApiError {
             EngineError::DimensionMismatch { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
+            // M61: a `multi` leg's field that no segment holds; no retry mends it.
+            EngineError::UnknownField(_) => {
+                Self::new(StatusCode::BAD_REQUEST, "unknown_field", e.to_string())
+            }
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
@@ -1752,6 +1756,7 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
     };
     for (field, present) in [
         ("vector", req.vector.is_some()),
+        ("multi", req.multi.is_some()),
         ("text", req.text.is_some()),
         ("rank_by", req.rank_by.is_some()),
         ("offset", req.offset.is_some()),
@@ -2248,7 +2253,7 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
                 .collect::<Result<Vec<f32>, _>>()?;
             if ws.len() != legs {
                 return Err(bad(&format!(
-                    "{} weights for {legs} legs; one per leg, the dense leg first",
+                    "{} weights for {legs} legs; one per leg: dense, then multi, then text",
                     ws.len()
                 )));
             }
@@ -2272,8 +2277,8 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
         }
         // Text legs only (spec review): a dense score can be negative, so a row the dense leg
         // retrieved would rank below one it never found, whose missing leg adds nothing.
-        "sum" | "max" if req.vector.is_some() => Err(bad(&format!(
-            "{kind} combines text legs' scores; a dense leg's can be negative"
+        "sum" | "max" if req.vector.is_some() || req.multi.is_some() => Err(bad(&format!(
+            "{kind} combines text legs' scores; a dense or multi leg's can be negative"
         ))),
         // `k` is RRF's alone, and a parameter is never accepted to be ignored (code review).
         "sum" | "max" if params.contains_key("k") => {
@@ -2673,14 +2678,15 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
         }
     };
     if req.vector.is_some()
+        || req.multi.is_some()
         || req.text.is_some()
         || req.field.is_some()
         || req.exact
         || req.fusion.is_some()
     {
         return Err(ApiError::bad_request(
-            "rank_by orders by an attribute; it cannot be combined with vector, text, field, \
-             exact or fusion",
+            "rank_by orders by an attribute; it cannot be combined with vector, multi, text, \
+             field, exact or fusion",
         ));
     }
     if req.top_k.saturating_add(req.offset.unwrap_or(0)) > MAX_ORDERED {
@@ -2694,21 +2700,37 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
 /// The legs a query asks for. A query with none is a request nobody meant to make.
 fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError> {
     let mut legs = Vec::new();
+    // ⚠️ `vector` only (M61): a dense leg over a named field would search `vector`'s
+    // clustering (backlog row 65), and over a field of several vectors it means MaxSim.
+    if let Some(f) = &req.field
+        && f != pstore_format::DEFAULT_FIELD
+    {
+        return Err(ApiError::bad_request(format!(
+            "field {f:?}: a dense query searches `vector`; search a named field with `multi`"
+        )));
+    }
     if let Some(v) = &req.vector {
         if v.is_empty() {
             return Err(ApiError::bad_request("an empty query vector"));
         }
         legs.push(pstore_query::Prefetch::Dense {
-            field: req
-                .field
-                .clone()
-                .unwrap_or_else(|| pstore_format::DEFAULT_FIELD.to_owned()),
+            field: pstore_format::DEFAULT_FIELD.to_owned(),
             query: v.clone(),
             limit: req.top_k,
             tune: pstore_index::vec_index::Query {
                 exact: req.exact,
                 ..pstore_index::vec_index::Query::default()
             },
+        });
+    }
+    if let Some(m) = &req.multi {
+        let field = named_field(&m.field)?;
+        let query =
+            many(&m.vectors).map_err(|why| ApiError::bad_request(format!("multi: {why}")))?;
+        legs.push(pstore_query::Prefetch::Multi {
+            field,
+            query,
+            limit: req.top_k,
         });
     }
     let texts = req.text.as_ref().map(TextIn::queries).unwrap_or_default();
@@ -2727,10 +2749,54 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
     }
     if legs.is_empty() {
         return Err(ApiError::bad_request(
-            "a query must name a vector, text, or both",
+            "a query must name a vector, multi, text, or several",
         ));
     }
+    if legs.len() > pstore_query::MAX_LEGS {
+        return Err(ApiError::bad_request(format!(
+            "{} legs: a query has at most {}",
+            legs.len(),
+            pstore_query::MAX_LEGS
+        )));
+    }
     Ok(legs)
+}
+
+/// Named vector fields a document holds at most (M61).
+const MAX_NAMED_FIELDS: usize = 8;
+/// Vectors a named field holds at most, in a document or a query (M61).
+const MAX_FIELD_VECTORS: usize = 1024;
+/// Bytes a named field's name holds at most (M61).
+const MAX_FIELD_NAME: usize = 64;
+
+/// A named field's name, or why it cannot be one (M61): `vector` is the dense field's.
+fn named_field(name: &str) -> Result<String, ApiError> {
+    if name.is_empty() || name.len() > MAX_FIELD_NAME {
+        return Err(ApiError::bad_request(format!(
+            "a named vector field's name is 1 to {MAX_FIELD_NAME} bytes"
+        )));
+    }
+    if name == pstore_format::DEFAULT_FIELD {
+        return Err(ApiError::bad_request(
+            "`vector` is the dense field: a named vector field takes another name",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+/// A named field's vectors, or why they cannot be (M61): 1 to [`MAX_FIELD_VECTORS`], none
+/// empty. Non-finite components are refused as `vector`'s are, when they are read.
+fn many(vs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+    if !(1..=MAX_FIELD_VECTORS).contains(&vs.len()) {
+        return Err(format!(
+            "1 to {MAX_FIELD_VECTORS} vectors, not {}",
+            vs.len()
+        ));
+    }
+    if vs.iter().any(Vec::is_empty) {
+        return Err("an empty vector".to_owned());
+    }
+    Ok(vs.to_vec())
 }
 
 /// The wire document, as the format's — or the reason it cannot be one.
@@ -2978,6 +3044,22 @@ fn to_document(
             return Err(refuse(name, "is the text field and must be a string"));
         }
         doc.attrs.insert(name.clone(), v);
+    }
+    if d.vectors.len() > MAX_NAMED_FIELDS {
+        return Err(ApiError::bad_request(format!(
+            "document {}: {} named vector fields, at most {MAX_NAMED_FIELDS}",
+            d.id,
+            d.vectors.len()
+        )));
+    }
+    for (name, vs) in &d.vectors {
+        let name = named_field(name)
+            .map_err(|e| ApiError::bad_request(format!("document {}: {}", d.id, e.message)))?;
+        let vs = many(vs).map_err(|why| {
+            ApiError::bad_request(format!("document {}: field `{name}`: {why}", d.id))
+        })?;
+        doc.vectors
+            .insert(name, pstore_format::VectorField::Dense(vs));
     }
     if let Some(t) = &d.text {
         // `attributes.text` and top-level `text` are one field spelled twice; which one

@@ -529,3 +529,114 @@ async fn absent_sections_read_as_absent_not_as_errors() {
     // Asking for no rows fetches nothing.
     assert!(seg.vector_rows(&s, &key, &[]).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn every_field_reads_its_own_vectors_and_vector_is_field_zero() {
+    // M61: the third and later dense fields all took `FieldVectors`, and the reader keeps one
+    // span an id, so one field read another's vectors. And `late` sorts before `vector`, which
+    // must keep field 0 -- the fixed-width section the index and the exact scan read.
+    let docs: Vec<Document> = (0..12)
+        .map(|i| {
+            let x = i as f32;
+            doc(
+                i,
+                &[
+                    (DEFAULT_FIELD, vec![vec![x, 1.0, 2.0]]),
+                    ("late", (0..i % 4).map(|j| vec![x, j as f32]).collect()),
+                    ("m2", vec![vec![x * 2.0; 5]]),
+                    ("m3", vec![vec![-x; 7], vec![x; 7]]),
+                ],
+            )
+        })
+        .collect();
+    let (seg, store, key, _) = round_trip(docs.clone()).await;
+    assert_eq!(seg.fields()[0].name, DEFAULT_FIELD);
+    for name in ["vector", "late", "m2", "m3"] {
+        let got = seg.field_vectors(&store, &key, name).await.unwrap();
+        let want: Vec<Vec<Vec<f32>>> = docs.iter().map(|d| d.field(name).to_vec()).collect();
+        assert_eq!(got, want, "{name}");
+    }
+    // Every field's section is its own.
+    let spans: std::collections::BTreeSet<_> = ["vector", "late", "m2", "m3"]
+        .iter()
+        .map(|n| format!("{:?}", seg.field_section(n, Section::Vectors)))
+        .collect();
+    assert_eq!(spans.len(), 4);
+    // Only fields 0 and 1 have code sections; the rest have none, never another's.
+    let ids: Vec<(u16, u16)> = seg.fields().iter().map(|f| (f.rabitq, f.sq8)).collect();
+    assert_eq!(
+        ids,
+        [
+            (Section::RaBitQ as u16, Section::Sq8 as u16),
+            (Section::FieldRaBitQ as u16, Section::FieldSq8 as u16),
+            (0, 0),
+            (0, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_field_of_mixed_widths_is_refused() {
+    // M61: the writer padded or truncated every vector of a field to the first row's width,
+    // so a row of another width was stored as vectors it never had. Refused, in one row or
+    // across two -- and a field of one width still seals.
+    let seal = |rows: &[Vec<Vec<f32>>]| {
+        let mut w = SegmentWriter::new(8);
+        for (i, vs) in rows.iter().enumerate() {
+            w.push(doc(
+                i,
+                &[(DEFAULT_FIELD, vec![vec![1.0, 2.0]]), ("late", vs.clone())],
+            ));
+        }
+        w.try_finish()
+    };
+    assert!(seal(&[vec![vec![1.0; 3], vec![2.0; 3]], vec![vec![3.0; 3]]]).is_ok());
+    assert!(
+        seal(&[vec![vec![1.0; 3], vec![2.0; 4]]]).is_err(),
+        "within a row"
+    );
+    assert!(
+        seal(&[vec![vec![1.0; 3]], vec![], vec![vec![2.0; 2]]]).is_err(),
+        "across rows"
+    );
+    // And `vector` too: nothing else stops two widths of it meeting in one writer.
+    let mut w = SegmentWriter::new(8);
+    w.push(Document::new("a", vec![1.0, 2.0]));
+    w.push(Document::new("b", vec![1.0, 2.0, 3.0]));
+    assert!(w.try_finish().is_err(), "`vector` across rows");
+}
+
+/// FNV-1a over a segment's bytes: a fingerprint to pin a layout by.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// One field, and `vector` with a second field named after it.
+fn pinned() -> [u64; 2] {
+    let seal = |fields: usize| {
+        let mut w = SegmentWriter::new(8);
+        for i in 0..20 {
+            let x = i as f32;
+            let mut f: Vec<(&str, Vec<Vec<f32>>)> = vec![(DEFAULT_FIELD, vec![vec![x, 1.0, -x]])];
+            if fields > 1 {
+                f.push(("words", (0..i % 4).map(|j| vec![x, j as f32]).collect()));
+            }
+            w.push(doc(i, &f));
+        }
+        fnv(&w.try_finish().unwrap())
+    };
+    [seal(1), seal(2)]
+}
+
+#[test]
+fn a_segment_of_one_or_two_fields_is_written_as_before() {
+    // M61 rule 1: fields 0 and 1 keep their section ids, so these bytes are the M60 writer's.
+    // Fingerprinted by running this fixture against the M60 tree (`9a3c040`). A second field
+    // named BEFORE `vector` is not pinned: M60 wrote it as field 0, which was the bug.
+    assert_eq!(
+        pinned(),
+        [13_750_670_745_238_121_986, 16_091_175_590_787_194_448]
+    );
+}

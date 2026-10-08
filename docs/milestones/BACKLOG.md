@@ -123,6 +123,14 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by M61
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 63 | **Multi-vector candidates from quantized codes.** A `multi` leg reads every float of its field in every segment: exact, and 51 KB a document at 100 vectors of 128 dimensions. Per-vector 1-bit codes (as RaBitQ is for `vector`) would let a query read codes, pick candidates, and score only those exactly -- a format change. | [M61](M61/SPEC.md) | L |
+| 64 | **Split a `multi` leg across peers.** The part protocol carries no `multi` leg, so `shares` refuses every query holding one, and it runs on the server asked. | [M61](M61/SPEC.md) | S |
+| 65 | **Dense search over a named field, and a width an index for every field.** A dense leg over a named field would search `vector`'s clustering (`VecIndex::search_field`); the API refuses it. And no schema records a named field's width, so two widths folded apart are refused at query time, and their compaction fails, rather than refused at the door. | [M61](M61/SPEC.md) | M |
+
 ## Opened by M54
 
 | # | Task | From | Size |

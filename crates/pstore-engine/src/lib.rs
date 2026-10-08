@@ -265,6 +265,11 @@ pub enum EngineError {
         /// What the query carried.
         got: usize,
     },
+    /// A `multi` leg names a field no searched segment holds (M61): a typo, or a field never
+    /// written. The second query failure a client causes and can fix, typed for the same
+    /// reason: as a string it was `500 internal`, retryable, for a request no retry mends.
+    #[error("no segment of the index holds a vector field `{0}`")]
+    UnknownField(String),
     /// The rows contradict the index's recorded schema.
     ///
     /// ⚠️ Raised at the **door** and at the **flush**, never at the fold: a fold is
@@ -1091,6 +1096,59 @@ fn stripped(mut d: Document) -> Document {
     d.attrs.remove(FTS_ATTR);
     d.attrs.remove(TRGM_ATTR);
     d
+}
+
+/// The first vector of a named dense field in `d` whose width is not the one `widths` holds
+/// for that field, or than the field's first in `d`, as `(expected, got)` (M61). Records
+/// `d`'s widths only when it has none, so a row refused never decides a width.
+///
+/// `vector` is the schema's (`row_conflict`), and is skipped here.
+fn odd_width(widths: &mut BTreeMap<String, usize>, d: &Document) -> Option<(usize, usize)> {
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+    for (name, field) in &d.vectors {
+        let pstore_format::VectorField::Dense(vs) = field else {
+            continue;
+        };
+        if name == pstore_format::DEFAULT_FIELD {
+            continue;
+        }
+        for v in vs {
+            let want = widths
+                .get(name)
+                .copied()
+                .or_else(|| seen.iter().find(|(n, _)| n == name).map(|(_, w)| *w));
+            match want {
+                Some(w) if w != v.len() => return Some((w, v.len())),
+                Some(_) => {}
+                None => seen.push((name, v.len())),
+            }
+        }
+    }
+    widths.extend(seen.into_iter().map(|(n, w)| (n.to_owned(), w)));
+    None
+}
+
+/// Why `docs` cannot join `index` by a named field's width (M61): against the rows this
+/// process holds for it, then each other, in the width the client wrote.
+fn field_width_conflict(
+    index: &str,
+    held: &[&Document],
+    docs: &[Document],
+    metric: Metric,
+) -> Option<EngineError> {
+    let mut widths = BTreeMap::new();
+    for d in held {
+        // A held row that disagrees was accepted before this check could see it; it decides
+        // nothing, and the fold quarantines it.
+        let _ = odd_width(&mut widths, d);
+    }
+    let (expected, got) = docs.iter().find_map(|d| odd_width(&mut widths, d))?;
+    Some(EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "a named vector field's width",
+        expected: expected.saturating_sub(metric.extra()).to_string(),
+        got: got.saturating_sub(metric.extra()).to_string(),
+    })
 }
 
 /// `v` as `metric` stores it (M9d), or `None` when the metric cannot measure it: a zero
@@ -2438,8 +2496,17 @@ impl<S: BlobStore> Engine<S> {
         // before the schema was known, which the fold will quarantine. Comparing against them
         // refused every correct write after one wrong one. The schema records every property
         // the rungs below infer from rows, so they are for an index with no schema yet.
+        // M61: a named field's width, which no schema records, against the same rows.
+        let held: Vec<&Document> = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .collect();
+        let named = || field_width_conflict(index, &held, docs, metric);
         if let Some(schema) = self.cached_schema(index) {
-            return self.batch_conflict(index, &schema, docs);
+            return self.batch_conflict(index, &schema, docs).or_else(named);
         }
         // ⚠️ **Falls back to the batch's own first row**, which closes the case a reviewer
         // spotted next to the one this ladder was built for: a brand-new index created by a
@@ -2503,7 +2570,7 @@ impl<S: BlobStore> Engine<S> {
                 got: odd.vector().len().saturating_sub(metric.extra()),
             });
         }
-        None
+        named()
     }
 
     /// Deletes `ids` from `index` (M9c.2): buffered as tombstones, in the same ordered log as
@@ -3629,9 +3696,17 @@ impl<S: BlobStore> Engine<S> {
                 // watermark advances past their bundles, so a later fold never sees them and
                 // GC reaps them. Code review measured that: one wrong row cost two innocent
                 // ones. The blast radius of a contradiction is the contradicting row.
-                let (keep, out): (Vec<Document>, Vec<Document>) = std::mem::take(docs)
+                let (keep, mut out): (Vec<Document>, Vec<Document>) = std::mem::take(docs)
                     .into_iter()
                     .partition(|d| self.row_conflict(idx, schema, d).is_none());
+                // ⚠️ **And one width a named field** (M61), which no schema records: two
+                // processes' rows first meet here, each past its own door, and a segment of
+                // two widths cannot be sealed. The fold's first row of a field decides it.
+                let mut widths = BTreeMap::new();
+                let (keep, odd): (Vec<Document>, Vec<Document>) = keep
+                    .into_iter()
+                    .partition(|d| odd_width(&mut widths, d).is_none());
+                out.extend(odd);
                 *docs = keep;
                 if !out.is_empty() {
                     rejects.insert(idx.clone(), out.len() as u64);
@@ -3717,7 +3792,29 @@ impl<S: BlobStore> Engine<S> {
                     })
                     .collect();
                 let (changed, sealed) = resolve(docs, &base, &mut cx);
-                touched.insert(idx.clone(), changed.into_iter().collect());
+                // ⚠️ **And the widths again, over what is sealed** (M61 code review): a patch
+                // merges into its base row here, after the width pass, and the base row keeps
+                // its folded fields. A row that disagrees with this fold's first of a field, in
+                // arrival order, is set aside and its id left untouched, so its version already
+                // folded stands: it costs that operation, never the fold, which the writer
+                // would refuse whole.
+                let mut widths = BTreeMap::new();
+                let (sealed, odd): (Vec<Document>, Vec<Document>) = sealed
+                    .into_iter()
+                    .partition(|d| odd_width(&mut widths, d).is_none());
+                let odd_ids: std::collections::HashSet<&str> =
+                    odd.iter().map(|d| d.id.as_str()).collect();
+                touched.insert(
+                    idx.clone(),
+                    changed
+                        .into_iter()
+                        .filter(|id| !odd_ids.contains(id.as_str()))
+                        .collect(),
+                );
+                if !odd.is_empty() {
+                    *rejects.entry(idx.clone()).or_default() += odd.len() as u64;
+                    rejected.entry(idx.clone()).or_default().extend(odd);
+                }
                 by_index.insert(idx.clone(), sealed);
                 prepared_for.insert(idx, prepared);
             }
@@ -5271,7 +5368,7 @@ impl<S: BlobStore> Engine<S> {
             &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k, elsewhere,
         )
         .await
-        .map_err(|e| query_error(metric, e))?;
+        .map_err(|e| query_error(metric, prefetch, e))?;
         let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
         Ok(Answer {
             hits,
@@ -5583,7 +5680,7 @@ impl<S: BlobStore> Engine<S> {
             top_k,
         )
         .await
-        .map_err(|e| query_error(metric, e))?;
+        .map_err(|e| query_error(metric, &prefetch, e))?;
         let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
         Ok(Answer {
             hits,
@@ -6218,6 +6315,14 @@ fn shares(
     top_k: usize,
     cap: usize,
 ) -> Vec<pstore_query::Elsewhere<'static>> {
+    // ⚠️ A `multi` leg is not split (M61): the part protocol carries no such leg, so a share
+    // would answer without it. The whole query runs here (backlog row 64).
+    if prefetch
+        .iter()
+        .any(|p| matches!(p, pstore_query::Prefetch::Multi { .. }))
+    {
+        return Vec::new();
+    }
     let text: Vec<&String> = prefetch
         .iter()
         .filter_map(|p| match p {
@@ -6410,6 +6515,21 @@ fn scored_by(
                     tune: *tune,
                 })
             }
+            // M61: each of a `multi` leg's vectors as a dense query is, so its dot products
+            // are the metric's -- under euclidean, MaxSim ranks by Chamfer distance.
+            pstore_query::Prefetch::Multi {
+                field,
+                query,
+                limit,
+            } => Ok(pstore_query::Prefetch::Multi {
+                field: field.clone(),
+                query: query
+                    .iter()
+                    .map(|q| transform_query(metric, q))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| EngineError::Unmeasurable("the query".to_owned()))?,
+                limit: *limit,
+            }),
             other => Ok(other.clone()),
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
@@ -6418,16 +6538,33 @@ fn scored_by(
 
 /// A query's error as the engine reports it: a width mismatch in the width the CLIENT used,
 /// not the stored one the metric's transform widened (M9d).
-fn query_error(metric: Metric, e: pstore_query::QueryError) -> EngineError {
-    match e {
-        pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
-            expected,
-            got,
-        }) => EngineError::DimensionMismatch {
+fn query_error(
+    metric: Metric,
+    prefetch: &[pstore_query::Prefetch],
+    e: pstore_query::QueryError,
+) -> EngineError {
+    // Only `run`'s refusal of a `multi` leg's field is the client's: a dense leg's missing
+    // field is a segment without the index's vectors, which is ours.
+    let multi = prefetch.iter().find_map(|p| match p {
+        pstore_query::Prefetch::Multi { field, .. } => Some(field.clone()),
+        _ => None,
+    });
+    match (e, multi) {
+        (
+            pstore_query::QueryError::Format(pstore_format::FormatError::UnknownField),
+            Some(field),
+        ) => EngineError::UnknownField(field),
+        (
+            pstore_query::QueryError::Format(pstore_format::FormatError::DimensionMismatch {
+                expected,
+                got,
+            }),
+            _,
+        ) => EngineError::DimensionMismatch {
             expected: expected.saturating_sub(metric.extra()),
             got: got.saturating_sub(metric.extra()),
         },
-        other => EngineError::Query(other.to_string()),
+        (other, _) => EngineError::Query(other.to_string()),
     }
 }
 

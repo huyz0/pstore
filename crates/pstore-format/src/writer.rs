@@ -1,8 +1,12 @@
 //! Building a segment.
 
 use crate::codec::{Enc, checksum};
-use crate::{BlockMeta, Document, FOOTER_LEN, FormatError, MAGIC, Section, VERSION, Value, Zones};
+use crate::{
+    BlockMeta, Document, FOOTER_LEN, FormatError, MAGIC, Section, VERSION, Value, VectorField,
+    Zones,
+};
 use bytes::Bytes;
+use std::collections::BTreeMap;
 
 /// Accumulates documents and emits one immutable segment.
 ///
@@ -298,6 +302,25 @@ impl SegmentWriter {
         for d in &self.docs {
             crate::check_storable(d)?;
         }
+        // ⚠️ **One width a field** (M61): the seal pads or truncates every vector of a field
+        // to the first one's width, so a vector of another width would be stored as one it
+        // never was. The engine's door and fold keep a segment's rows to one width; this is
+        // what makes any other path -- a compaction over two segments that disagree -- loud.
+        let mut widths: BTreeMap<&str, usize> = BTreeMap::new();
+        for d in &self.docs {
+            for (name, field) in &d.vectors {
+                let VectorField::Dense(vs) = field else {
+                    continue;
+                };
+                for v in vs {
+                    if *widths.entry(name.as_str()).or_insert(v.len()) != v.len() {
+                        return Err(FormatError::Unsupported(
+                            "a vector field holds vectors of more than one width",
+                        ));
+                    }
+                }
+            }
+        }
         // ⚠️ The refusal M3b's `check_storable` arm becomes, narrowed rather than deleted.
         // Its lesson was never "sparse is unsupported"; it was that a writer which accepts a
         // document and stores nothing of it is the bug. The postings are built a layer up and
@@ -356,11 +379,22 @@ impl SegmentWriter {
             .collect();
         names.sort();
         names.dedup();
+        // ⚠️ **The default field first** (M61). Field 0 takes the legacy `Vectors` section,
+        // which the index and the exact scan read at a fixed width; a many-vectors field named
+        // before it (`late` < `vector`) would have taken it, and every dense query would have
+        // decoded its offset table as vectors. Every segment written before M61 had at most
+        // `vector` and fields after it in name order, so none of them changes.
+        if let Some(at) = names.iter().position(|n| n == crate::DEFAULT_FIELD) {
+            let default = names.remove(at);
+            names.insert(0, default);
+        }
 
         let mut dir: Vec<(Section, u64, u64)> = Vec::new();
         let mut fields: Vec<crate::FieldLayout> = Vec::new();
         // Each dense field's section body, written after the blocks once their size is known.
         let mut bodies: Vec<(Section, Vec<u8>)> = Vec::new();
+        // The third and later dense fields' bodies, each under an id of its own (M61).
+        let mut field_bodies: Vec<(u16, Vec<u8>)> = Vec::new();
         // ⚠️ Counted over DENSE fields only. Field 0 keeps the legacy section ids and names
         // are sorted, so counting sparse fields here would let one named `body_sparse` take
         // slot 0 from a dense `vector`: ids 2/3/4 would never be written, and a search over
@@ -384,10 +418,18 @@ impl SegmentWriter {
                 });
                 continue;
             }
+            // ⚠️ **An id a field** (M61): fields 1, 2, … all took `FieldVectors`, and the
+            // reader keeps one span an id, so a third field read the second's vectors -- or
+            // the other way round. Fields 0 and 1 keep their ids, so a segment of one or two
+            // dense fields is written byte for byte as before; the rest are numbered from
+            // `FIELD_SECTIONS`, an id range no section uses, which any reader finds through
+            // this table.
             let vectors_id = if fi == 0 {
-                Section::Vectors
+                Section::Vectors as u16
+            } else if fi == 1 {
+                Section::FieldVectors as u16
             } else {
-                Section::FieldVectors
+                crate::FIELD_SECTIONS.saturating_add(u16::try_from(fi).unwrap_or(u16::MAX))
             };
             let dims = docs
                 .iter()
@@ -426,23 +468,31 @@ impl SegmentWriter {
                     }
                 }
             }
-            bodies.push((vectors_id, body));
+            match fi {
+                1 => bodies.push((Section::Vectors, body)),
+                2 => bodies.push((Section::FieldVectors, body)),
+                _ => field_bodies.push((vectors_id, body)),
+            }
             fields.push(crate::FieldLayout {
                 name: name.clone(),
                 kind: 0,
                 metric: 0,
                 dims: dims as u32,
                 per_row,
-                vectors: vectors_id as u16,
+                vectors: vectors_id,
                 rabitq: if fi == 1 {
                     Section::RaBitQ as u16
-                } else {
+                } else if fi == 2 {
                     Section::FieldRaBitQ as u16
+                } else {
+                    0
                 },
                 sq8: if fi == 1 {
                     Section::Sq8 as u16
-                } else {
+                } else if fi == 2 {
                     Section::FieldSq8 as u16
+                } else {
+                    0
                 },
             });
         }
@@ -499,6 +549,7 @@ impl SegmentWriter {
         // plus the two tables, all known before a block is sealed.
         const ENTRY: usize = 2 + 8 + 8;
         let sections = bodies.len()
+            + field_bodies.len()
             + self.extra.iter().filter(|(_, b)| !b.is_empty()).count()
             + self.raw_extra.iter().filter(|(_, b)| !b.is_empty()).count()
             + usize::from(!fields_bytes.is_empty())
@@ -574,6 +625,10 @@ impl SegmentWriter {
             out.raw(body);
         }
         let mut raw_dir: Vec<(u16, u64, u64)> = Vec::new();
+        for (id, body) in &field_bodies {
+            raw_dir.push((*id, out.len() as u64, body.len() as u64));
+            out.raw(body);
+        }
         for (section, bytes) in &self.extra {
             if bytes.is_empty() {
                 continue;
