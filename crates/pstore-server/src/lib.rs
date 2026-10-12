@@ -30,6 +30,7 @@ use std::sync::Arc;
 use types::Schema as SchemaOut;
 
 mod boost;
+mod highlight;
 mod peers;
 mod replication;
 mod session;
@@ -1865,11 +1866,38 @@ enum Plan {
         Option<pstore_query::Predicate>,
         pstore_query::Fusion,
         Option<boost::Boost>,
+        Option<highlight::Highlight>,
     ),
 }
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
+    // M63: checked first, before an aggregation or an order returns, so every refusal names it.
+    let highlight = req
+        .highlight
+        .as_ref()
+        .map(highlight::parse)
+        .transpose()
+        .map_err(|why| ApiError::bad_request(format!("highlight: {why}")))?;
+    if highlight.is_some() {
+        let with = if req.rank_by.is_some() {
+            Some("rank_by")
+        } else if req.aggregate_by.is_some() {
+            Some("aggregate_by")
+        } else {
+            None
+        };
+        if let Some(what) = with {
+            return Err(ApiError::bad_request(format!(
+                "highlight marks a text leg's terms: it cannot be combined with {what}"
+            )));
+        }
+        if req.text.is_none() {
+            return Err(ApiError::bad_request(
+                "highlight marks a text leg's terms: the query has none",
+            ));
+        }
+    }
     // M62: a boost rescores a relevance ranking; an order or an aggregation has none.
     if req.boost.is_some() && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
         return Err(ApiError::bad_request(
@@ -1897,7 +1925,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     // below `top_k` would otherwise never reach the fusion the boost rescores.
     let legs = prefetch(req, boost.as_ref().map_or(req.top_k, |b| b.window))?;
     let fusion = fusion(req, legs.len())?;
-    Ok(Plan::Ranked(legs, filter, fusion, boost))
+    Ok(Plan::Ranked(legs, filter, fusion, boost, highlight))
 }
 
 /// What a query asked to reflect (M9i.2, M11.1).
@@ -2076,7 +2104,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
-    let (legs, filter, fusion, boost) = match plan {
+    let (legs, filter, fusion, boost, highlight) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
             let group_by = spec.group_by.clone();
@@ -2155,6 +2183,7 @@ async fn run<E: BlobStore>(
                         id: d.id,
                         score: None,
                         dist: None,
+                        highlight: None,
                     })
                     .collect(),
                 epoch: got.epoch.0,
@@ -2162,7 +2191,9 @@ async fn run<E: BlobStore>(
                 consistency: level_name(level),
             });
         }
-        Plan::Ranked(legs, filter, fusion, boost) => (legs, filter, fusion, boost),
+        Plan::Ranked(legs, filter, fusion, boost, highlight) => {
+            (legs, filter, fusion, boost, highlight)
+        }
     };
     // M62: the engine ranks the window, and the boost cuts it to `top_k`.
     let top_k = boost.as_ref().map_or(req.top_k, |b| b.window);
@@ -2227,10 +2258,31 @@ async fn run<E: BlobStore>(
                 .count()
         }
     };
+    // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
+    // only, from the attributes the row round returned, whatever `include_attributes` asks.
+    let marks = highlight.as_ref().map(|h| {
+        let terms: std::collections::HashSet<String> = req
+            .text
+            .as_ref()
+            .map(TextIn::queries)
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|q| pstore_format::text::analyze(&answer.fts.analyzer, q))
+            .collect();
+        (h, terms)
+    });
     Ok(Answered {
         results: rows
             .into_iter()
             .map(|(id, score, attrs, dist)| ResultRow {
+                highlight: marks
+                    .as_ref()
+                    .and_then(|(h, terms)| match attrs.get(&h.attr) {
+                        Some(pstore_format::Value::Str(text)) => {
+                            Some(h.render(text, &answer.fts.analyzer, terms))
+                        }
+                        _ => None,
+                    }),
                 attributes: selected(req, &attrs),
                 id,
                 score: Some(score),

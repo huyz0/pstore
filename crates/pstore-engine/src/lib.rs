@@ -1331,6 +1331,10 @@ pub struct Answer {
     /// How old that manifest was when served: zero unless a `bounded` read took it from the
     /// cache (M11.2).
     pub staleness: std::time::Duration,
+    /// The full-text settings the query was answered under (M63): the schema's -- the epoch's
+    /// under `as_of` -- else the unfolded rows', else the default. A client marking a result's
+    /// text must use the analyzer the ranking did.
+    pub fts: pstore_format::text::FullText,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -5339,6 +5343,7 @@ impl<S: BlobStore> Engine<S> {
                 epoch: at.head.epoch,
                 watermarks: at.head.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
+                fts,
             });
         }
 
@@ -5381,6 +5386,7 @@ impl<S: BlobStore> Engine<S> {
             epoch: at.head.epoch,
             watermarks: at.head.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
+            fts,
         })
     }
 
@@ -5640,6 +5646,9 @@ impl<S: BlobStore> Engine<S> {
             false,
             self.params.exact_scan_threshold,
         );
+        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
+        // (M9f.2). Read before the empty return, which reports its analyzer too (M63).
+        let schema = schema_at(&at.head, index, epoch);
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -5652,6 +5661,7 @@ impl<S: BlobStore> Engine<S> {
                 epoch: then.epoch,
                 watermarks: then.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
+                fts: schema.fts,
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -5661,9 +5671,6 @@ impl<S: BlobStore> Engine<S> {
         // an empty list and vanish. The test found it; the live path has always used this
         // value for the same reason.
         let unfolded_at = refs.len();
-        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
-        // (M9f.2).
-        let schema = schema_at(&at.head, index, epoch);
         let metric = schema.metric;
         // M14.2: bound to that epoch's analyzer.
         let bound = filter.map(|f| f.bound(&schema.fts.analyzer));
@@ -5693,6 +5700,7 @@ impl<S: BlobStore> Engine<S> {
             epoch: then.epoch,
             watermarks: then.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
+            fts: schema.fts,
         })
     }
 

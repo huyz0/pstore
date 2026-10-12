@@ -300,3 +300,118 @@ fn a_corpus_with_no_text_has_an_empty_dictionary() {
     assert!(built.postings.is_empty());
     assert!(dict.lookup("anything").is_none());
 }
+
+/// M63: `tokens` is `analyze` with the byte span of each token it came from.
+#[test]
+fn tokens_spans_cover_what_analyze_returns() {
+    use pstore_format::text::{Analyzer, Language, analyze, tokens};
+    let english = Analyzer {
+        language: Language::English,
+        stemming: true,
+        remove_stopwords: true,
+        case_sensitive: false,
+        ascii_folding: true,
+    };
+    let sensitive = Analyzer {
+        case_sensitive: true,
+        remove_stopwords: true,
+        ..Analyzer::default()
+    };
+    let analyzers = [Analyzer::default(), english, sensitive];
+    let texts = [
+        "The quick brown foxes were running, and Runs!",
+        "İstanbul ½ café cafe\u{301} CAFÉ",
+        "The THE the",
+        "  leading and trailing  ",
+        "中文测试 mixed 中文 text",
+        "",
+        "...---...",
+        "a1 b2-c3_d4 ünï",
+    ];
+    for a in &analyzers {
+        for s in texts {
+            let toks = tokens(a, s);
+            // The terms are `analyze`'s, in order: a stopword has a span and no term.
+            let terms: Vec<String> = toks.iter().filter_map(|t| t.term.clone()).collect();
+            assert_eq!(terms, analyze(a, s), "{a:?} {s:?}");
+            let mut end = 0;
+            for t in &toks {
+                assert!(
+                    t.span.start >= end,
+                    "overlap or disorder in {s:?}: {toks:?}"
+                );
+                end = t.span.end;
+                let piece = &s[t.span.clone()];
+                // One maximal alphanumeric run of the input.
+                assert!(
+                    !piece.is_empty() && piece.chars().all(char::is_alphanumeric),
+                    "{piece:?}"
+                );
+                assert!(
+                    s[..t.span.start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_alphanumeric()),
+                    "{piece:?} starts mid-run in {s:?}"
+                );
+                assert!(
+                    s[t.span.end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric()),
+                    "{piece:?} ends mid-run in {s:?}"
+                );
+                // Analyzed alone, the token gives its own term, or none.
+                assert_eq!(
+                    analyze(a, piece).into_iter().next(),
+                    t.term,
+                    "{a:?} {piece:?} in {s:?}"
+                );
+            }
+        }
+    }
+    // A stopword has a span and no term; case decides under a case-sensitive analyzer.
+    let t = tokens(&sensitive, "The the");
+    assert_eq!(t.len(), 2);
+    assert_eq!(t[0].term.as_deref(), Some("The"));
+    assert_eq!(t[1].term, None);
+}
+
+#[test]
+fn extend_over_marks_keeps_an_accent_with_its_letter() {
+    use pstore_format::text::extend_over_marks;
+    // `cafe` + U+0301 (two bytes) + `x`: the token `cafe` ends at 4, its accent at 6.
+    let s = "cafe\u{301}x";
+    assert_eq!(extend_over_marks(s, 4), 6);
+    // No mark after the end: unchanged. A letter is not a mark.
+    assert_eq!(extend_over_marks(s, 6), 6);
+    assert_eq!(extend_over_marks("cafex", 4), 4);
+    // Several marks in a row, and the end of the text.
+    let two = "a\u{301}\u{323}";
+    assert_eq!(extend_over_marks(two, 1), two.len());
+    assert_eq!(extend_over_marks(two, two.len()), two.len());
+    // An end past the text, or inside a character, extends nothing and never panics.
+    assert_eq!(extend_over_marks("ab", 9), 9);
+    assert_eq!(extend_over_marks("\u{301}", 1), 1);
+}
+
+#[test]
+fn extending_over_marks_stops_at_the_next_token() {
+    // Code review: U+0345 is a combining mark that is also alphabetic, so it starts a token.
+    // Extending a marked token over it would overlap that token, and mark it twice.
+    use pstore_format::text::{Analyzer, extend_over_marks, tokens};
+    assert!(
+        '\u{345}'.is_alphanumeric(),
+        "the premise: it is a letter to the splitter"
+    );
+    let s = "e\u{301}\u{345}x";
+    let toks = tokens(&Analyzer::default(), s);
+    assert_eq!(toks.len(), 2, "{toks:?}");
+    let end = extend_over_marks(s, toks[0].span.end);
+    assert!(
+        end <= toks[1].span.start,
+        "{end} overlaps {:?}",
+        toks[1].span
+    );
+    assert_eq!(&s[toks[0].span.start..end], "e\u{301}");
+}

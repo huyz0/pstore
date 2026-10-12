@@ -174,6 +174,22 @@ attributes added to its score. `linear`, `saturate` (`x / (x + pivot)`), `decay`
   blocks and more leg bytes. `meta.cost` reports it.
 - A term over an attribute a document lacks, or holds as another type, adds nothing.
 
+## Highlighting
+
+A ranked query with a text leg may carry `highlight` ([M63](milestones/M63/SPEC.md)):
+`{"attr": "text", "pre": "<em>", "post": "</em>", "max_chars": 200}`. Each result whose
+attribute is a string gets `$highlight`: a fragment of at most `max_chars` characters (default
+200, at most 2,000) holding the most marked tokens, every token the query's text matched
+wrapped in `pre` and `post`, and `…` where it was cut.
+
+- ⚠️ **The text is not escaped.** `pre` and `post` are yours, and so is making the output safe
+  for where it is shown: a document containing `<script>` comes back as written.
+- **It marks what BM25 matched,** under the index's analyzer: stemming, folding and stopwords
+  included, and the analyzer of the epoch under `as_of`.
+- It costs no request: the text is an attribute the row round already returns. It reads the
+  attribute whatever `include_attributes` and `exclude_attributes` say.
+- Phrase and proximity are not considered: each term is marked wherever it appears.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

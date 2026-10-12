@@ -258,32 +258,81 @@ impl FullText {
 /// not repaired: repairing it is a different analyzer, and analyzers are fixed per index.
 #[must_use]
 pub fn analyze(a: &Analyzer, s: &str) -> Vec<String> {
+    tokens(a, s).into_iter().filter_map(|t| t.term).collect()
+}
+
+/// One token of a text (M63): the byte span it came from, and the term the analyzer made of
+/// it -- `None` for a stopword, which has a span and no term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    /// The token's bytes in the input: one maximal run of alphanumeric characters.
+    pub span: std::ops::Range<usize>,
+    /// What [`analyze`] returns for it, or `None` when the analyzer drops it.
+    pub term: Option<String>,
+}
+
+/// [`analyze`] with the span of each token (M63): `analyze` is the terms of this.
+///
+/// ⚠️ **One pipeline.** Highlighting must mark exactly the tokens BM25 matched, so the two
+/// cannot be separate implementations of "split, fold, drop, stem".
+#[must_use]
+pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
     use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
     let stemmer = a
         .stemming
         .then(|| rust_stemmers::Stemmer::create(a.language.algorithm()));
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| {
-            if a.case_sensitive {
-                t.to_owned()
-            } else {
-                t.to_lowercase()
+    let mut out = Vec::new();
+    let mut start = None;
+    // The sentinel space closes a token that runs to the end of the text.
+    for (i, c) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(from)) => {
+                start = None;
+                let raw = &s[from..i];
+                let t = if a.case_sensitive {
+                    raw.to_owned()
+                } else {
+                    raw.to_lowercase()
+                };
+                let t: String = if a.ascii_folding {
+                    t.nfkd().filter(|c| !is_combining_mark(*c)).collect()
+                } else {
+                    t
+                };
+                let term = if a.remove_stopwords && STOPWORDS.contains(&t.as_str()) {
+                    None
+                } else {
+                    Some(match &stemmer {
+                        Some(st) => st.stem(&t).into_owned(),
+                        None => t,
+                    })
+                };
+                out.push(Token {
+                    span: from..i,
+                    term,
+                });
             }
-        })
-        .map(|t| {
-            if a.ascii_folding {
-                t.nfkd().filter(|c| !is_combining_mark(*c)).collect()
-            } else {
-                t
-            }
-        })
-        .filter(|t| !(a.remove_stopwords && STOPWORDS.contains(&t.as_str())))
-        .map(|t| match &stemmer {
-            Some(st) => st.stem(&t).into_owned(),
-            None => t,
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `end` moved forward over the combining marks that follow it (M63). In decomposed text an
+/// accent is not alphanumeric, so [`tokens`] ends a token before it; a client marking the
+/// token must keep the accent inside its marks, or it lands after the closing one.
+#[must_use]
+pub fn extend_over_marks(s: &str, end: usize) -> usize {
+    use unicode_normalization::char::is_combining_mark;
+    end + s
+        .get(end..)
+        .unwrap_or_default()
+        .chars()
+        // Not a mark that is also a letter (U+0345): the splitter starts a token at that one.
+        .take_while(|c| is_combining_mark(*c) && !c.is_alphanumeric())
+        .map(char::len_utf8)
+        .sum::<usize>()
 }
 
 /// The three byte strings a text field becomes.

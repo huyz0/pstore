@@ -233,6 +233,9 @@ pub struct QueryRequest {
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
     pub field: Option<String>,
+    /// The query's terms marked in each result's text (M63).
+    #[serde(default)]
+    pub highlight: Option<serde_json::Value>,
     /// Attribute terms that rescore a window of the ranking's candidates (M62).
     #[serde(default)]
     pub boost: Option<serde_json::Value>,
@@ -322,6 +325,10 @@ pub struct ResultRow {
     /// did not ask gets exactly the response it always did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The highlighted text, when the query asked for `highlight` and the attribute is a
+    /// string (M63). The query's terms are wrapped in `pre` and `post`, and nothing is escaped.
+    #[serde(rename = "$highlight", skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<String>,
 }
 
 /// What the answer cost and how fresh it is.

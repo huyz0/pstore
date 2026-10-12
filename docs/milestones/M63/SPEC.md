@@ -47,7 +47,8 @@ in `pre` and `post`. It costs no request.**
 3. **Marking.** Every token whose term is a query term is wrapped as `pre`, the token's
    original bytes, `post`. A marked span extends over the combining marks that follow the
    token (spec review: in decomposed text an accent is not alphanumeric, and would land
-   after `post`). Everything else is the original text, byte for byte. The text is not
+   after `post`), but not over one that is also a letter, such as U+0345, which begins the
+   next token (code review: it would have been marked twice). Everything else is the original text, byte for byte. The text is not
    escaped: `pre` and `post` are the client's, and so is escaping (`docs/deploy.md` says
    so, and a test reads that sentence).
 4. **A fragment.** Characters are Unicode scalar values (Rust `char`), counted in the
@@ -60,7 +61,8 @@ in `pre` and `post`. It costs no request.**
      run` beats `run fast`, deliberately. The window with the highest score is chosen, and
      the smallest *i* among equals; with nothing marked, that is the first token's.
    - **A token longer than `max_chars`** (a CJK sentence is one token; so is a URL) is cut
-     at `max_chars` characters on a character boundary, and marked if its term matches.
+     at `max_chars` characters on a character boundary, marked if its term matches, and
+     followed by `…` for what the cut lost.
    - `…` (U+2026, one character, no space) is prefixed when a token precedes the window, and
      appended when one follows it. Separators outside the window are dropped.
    - A text with no token is whole if it fits, and otherwise its first `max_chars`
@@ -93,7 +95,8 @@ in `pre` and `post`. It costs no request.**
    - under an English analyzer with stemming, stopwords and folding: the query `run` marks
      `running` and `Runs`, and not `ran`, which Snowball English leaves as `ran`; `the` is
      never marked; `café` and a decomposed `café` are marked for `cafe`, the accent inside
-     the marks;
+     the marks. `highlight_follows_the_indexs_analyzer` also queries `running` and `Café`,
+     which are the terms `run` and `cafe` only under that analyzer;
    - punctuation and spacing are kept byte for byte, and two text legs' terms are both
      marked;
    - custom `pre` and `post`.
@@ -110,8 +113,9 @@ in `pre` and `post`. It costs no request.**
    - present with `include_attributes` false and with `exclude_attributes: ["text"]`;
    - unfolded and folded alike;
    - under `as_of` an epoch before the index was dropped and re-created with another
-     analyzer, marked by the old analyzer.
-   - `docs/deploy.md` says the text is not escaped.
+     analyzer, marked by the old analyzer: `highlight_uses_the_epochs_analyzer`.
+   - `the_docs_say_marks_are_not_escaped`: `docs/deploy.md` has a Highlighting section that
+     says the text is not escaped.
 4. **`analyze` is `tokens`.** `tokens_spans_cover_what_analyze_returns`, in
    `crates/pstore-format/tests/text.rs`: for several analyzers and texts, the terms of
    `tokens` are `analyze`; every `s[span]` is exactly one maximal alphanumeric run of the
