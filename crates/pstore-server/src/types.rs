@@ -233,6 +233,9 @@ pub struct QueryRequest {
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
     pub field: Option<String>,
+    /// Attribute terms that rescore a window of the ranking's candidates (M62).
+    #[serde(default)]
+    pub boost: Option<serde_json::Value>,
     /// The `multi` leg (M61): MaxSim over a named field of several vectors a document.
     #[serde(default)]
     pub multi: Option<MultiIn>,

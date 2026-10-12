@@ -29,6 +29,7 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod boost;
 mod peers;
 mod replication;
 mod session;
@@ -1858,16 +1859,24 @@ enum Plan {
     Aggregate(pstore_query::AggregateSpec, Option<pstore_query::Predicate>),
     /// A `rank_by` order (M9e).
     Ordered(pstore_query::OrderBy, Option<pstore_query::Predicate>),
-    /// A relevance ranking: its legs, filter and fusion.
+    /// A relevance ranking: its legs, filter and fusion, and its boost (M62).
     Ranked(
         Vec<pstore_query::Prefetch>,
         Option<pstore_query::Predicate>,
         pstore_query::Fusion,
+        Option<boost::Boost>,
     ),
 }
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
+    // M62: a boost rescores a relevance ranking; an order or an aggregation has none.
+    if req.boost.is_some() && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
+        return Err(ApiError::bad_request(
+            "boost rescores a relevance ranking: it cannot be combined with rank_by or \
+             aggregate_by",
+        ));
+    }
     let filter = req.filters.as_ref().map(predicate).transpose()?;
     // Before both: an aggregation has no vector, text or order by definition (M12).
     if let Some(spec) = aggregation(req)? {
@@ -1878,9 +1887,17 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     if let Some(by) = order_by(req)? {
         return Ok(Plan::Ordered(by, filter));
     }
-    let legs = prefetch(req)?;
+    let boost = req
+        .boost
+        .as_ref()
+        .map(|b| boost::parse(b, req.top_k))
+        .transpose()
+        .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
+    // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
+    // below `top_k` would otherwise never reach the fusion the boost rescores.
+    let legs = prefetch(req, boost.as_ref().map_or(req.top_k, |b| b.window))?;
     let fusion = fusion(req, legs.len())?;
-    Ok(Plan::Ranked(legs, filter, fusion))
+    Ok(Plan::Ranked(legs, filter, fusion, boost))
 }
 
 /// What a query asked to reflect (M9i.2, M11.1).
@@ -2059,7 +2076,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
-    let (legs, filter, fusion) = match plan {
+    let (legs, filter, fusion, boost) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
             let group_by = spec.group_by.clone();
@@ -2145,8 +2162,10 @@ async fn run<E: BlobStore>(
                 consistency: level_name(level),
             });
         }
-        Plan::Ranked(legs, filter, fusion) => (legs, filter, fusion),
+        Plan::Ranked(legs, filter, fusion, boost) => (legs, filter, fusion, boost),
     };
+    // M62: the engine ranks the window, and the boost cuts it to `top_k`.
+    let top_k = boost.as_ref().map_or(req.top_k, |b| b.window);
     let answer = match req.as_of {
         Some(e) => {
             engine
@@ -2156,7 +2175,7 @@ async fn run<E: BlobStore>(
                     &legs,
                     filter.as_ref(),
                     fusion,
-                    req.top_k,
+                    top_k,
                 )
                 .await?
         }
@@ -2167,7 +2186,7 @@ async fn run<E: BlobStore>(
                     &legs,
                     filter.as_ref(),
                     fusion,
-                    req.top_k,
+                    top_k,
                     consistency,
                     peers.map(|p| p as &dyn pstore_engine::Peers),
                 )
@@ -2181,14 +2200,35 @@ async fn run<E: BlobStore>(
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
     // than HEAD's segments -- M5f's finding, where keying on the row alone merged two
     // unrelated documents into one.
-    let unfolded_hits = answer
-        .hits
-        .iter()
-        .filter(|h| h.segment == answer.unfolded_at)
-        .count();
+    let mut rows = engine.resolve_rows(&answer);
+    let unfolded_hits = match &boost {
+        None => answer
+            .hits
+            .iter()
+            .filter(|h| h.segment == answer.unfolded_at)
+            .count(),
+        Some(b) => {
+            for (_, score, attrs, _) in &mut rows {
+                *score = b.score(*score, attrs);
+            }
+            // Stable, so equal finals keep the engine's order.
+            rows.sort_by(|x, y| y.1.total_cmp(&x.1));
+            rows.truncate(req.top_k);
+            // A hit on the unfolded rows is one whose id an unfolded row carries: ids are
+            // unique in one answer, an id's newest version being the only one served.
+            let fresh: std::collections::HashSet<&str> = answer
+                .hits
+                .iter()
+                .filter(|h| h.segment == answer.unfolded_at)
+                .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
+                .collect();
+            rows.iter()
+                .filter(|(id, ..)| fresh.contains(id.as_str()))
+                .count()
+        }
+    };
     Ok(Answered {
-        results: engine
-            .resolve_rows(&answer)
+        results: rows
             .into_iter()
             .map(|(id, score, attrs, dist)| ResultRow {
                 attributes: selected(req, &attrs),
@@ -2698,7 +2738,7 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
 }
 
 /// The legs a query asks for. A query with none is a request nobody meant to make.
-fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError> {
+fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefetch>, ApiError> {
     let mut legs = Vec::new();
     // ⚠️ `vector` only (M61): a dense leg over a named field would search `vector`'s
     // clustering (backlog row 65), and over a field of several vectors it means MaxSim.
@@ -2716,7 +2756,7 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
         legs.push(pstore_query::Prefetch::Dense {
             field: pstore_format::DEFAULT_FIELD.to_owned(),
             query: v.clone(),
-            limit: req.top_k,
+            limit,
             tune: pstore_index::vec_index::Query {
                 exact: req.exact,
                 ..pstore_index::vec_index::Query::default()
@@ -2730,7 +2770,7 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
         legs.push(pstore_query::Prefetch::Multi {
             field,
             query,
-            limit: req.top_k,
+            limit,
         });
     }
     let texts = req.text.as_ref().map(TextIn::queries).unwrap_or_default();
@@ -2744,7 +2784,7 @@ fn prefetch(req: &QueryRequest) -> Result<Vec<pstore_query::Prefetch>, ApiError>
         legs.push(pstore_query::Prefetch::Text {
             field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
             query: t.to_owned(),
-            limit: req.top_k,
+            limit,
         });
     }
     if legs.is_empty() {
@@ -4134,7 +4174,7 @@ mod tests {
 
     fn dense_tune(body: serde_json::Value) -> pstore_index::vec_index::Query {
         let req: QueryRequest = serde_json::from_value(body).unwrap();
-        match prefetch(&req).unwrap().first() {
+        match prefetch(&req, req.top_k).unwrap().first() {
             Some(pstore_query::Prefetch::Dense { tune, .. }) => *tune,
             other => panic!("{other:?}"),
         }

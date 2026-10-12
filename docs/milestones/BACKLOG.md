@@ -123,6 +123,23 @@ outcome — confirming coverage needs `--list` with the same filter.
 | ~~47~~ | **CLOSED by [M28](M28/VERIFIED.md)**: a scan never claims, but still waits on a claim it finds. Only a claimant removes its gate, through a drop guard, so a failed or cancelled claim still wakes its waiters. N bulk readers behind a scan's miss cost 1 request, not N. | [M20](M20/SPEC.md) | S |
 | ~~48~~ | **CLOSED by [M28](M28/VERIFIED.md)**: `Id`'s `Hash` is written over its disk encoding, pinned to independently computed `XxHash64` values. The entry format is `pstore-cache/2`, so a directory filled under the old hash is emptied once. | [M20](M20/SPEC.md) | S |
 
+## Opened by the comparison of 2026-10-08
+
+The project owner asked to compare pstore with Vespa, turbopuffer, Milvus, Qdrant, Weaviate,
+Pinecone, Elasticsearch, OpenSearch, LanceDB and S3 Vectors, and to plan and deliver what it
+found. pstore leads on storage, cost and tenancy, and trails on ranking and result shaping. In
+order, smallest and most certain first:
+
+| # | Task | From | Size |
+|---|---|---|---|
+| 66 | **Ranking expressions**: attribute boosts -- linear, saturating, decay, equality -- rescoring a window of candidates in the row round (turbopuffer `rank_by` functions, Qdrant score boosting, Weaviate Boost API, Vespa rank phases). Milestone M62. | comparison | M |
+| 67 | **Highlighting**: a fragment of a text attribute per result with the query's terms marked (turbopuffer `Highlight`, Elasticsearch). M63. | comparison | S |
+| 68 | **MMR diversity** over a window of candidates' vectors (Qdrant, Weaviate). M64. | comparison | M |
+| 69 | **Facets beside a search**: an aggregation over the filter's rows, answered with a ranked query (Milvus 3.0, Elasticsearch). M65. | comparison | S |
+| 70 | **Geo**: radius and box filters over a `[lat, lon]` attribute, and a geo decay boost (Elasticsearch, Vespa, Weaviate, Qdrant). M66. | comparison | M |
+| 71 | **Multi-vector at scale** by a fixed-dimensional encoding (MUVERA, as Weaviate ships it), clustered as a dense field, with exact MaxSim over its candidates. Closes rows 63 and 65. M67. | comparison | L |
+| 72 | **Index data in place in the customer's bucket** (Parquet, Lance; Milvus 3.0's lake-native turn). An open question first, [OQ-169](../research/00-plan/open-questions.md), not a spec. | comparison | L |
+
 ## Opened by M61
 
 | # | Task | From | Size |

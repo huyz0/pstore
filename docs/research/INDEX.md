@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 57 documents, 48 research questions answered, 168 open
+**Status: research phase complete.** 57 documents, 48 research questions answered, 169 open
 questions logged. Workspace scaffold live: `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`,
 `crates/pstore-types`. Dev scaffold in [`dev/`](../../dev/README.md). Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
@@ -52,7 +52,7 @@ If you read nothing else:
 | Doc | Answers | Status |
 |---|---|---|
 | [research-plan.md](00-plan/research-plan.md) | — | The plan: 48 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **168 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **169 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |

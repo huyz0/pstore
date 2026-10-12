@@ -158,6 +158,22 @@ RRF; `sum` and `max` refuse it.
 - **A segment's export or compaction reads each named field in a round of its own.** Queries
   never do.
 
+## Boosting a ranking
+
+A ranked query may carry `boost` ([M62](milestones/M62/SPEC.md)): terms over a candidate's
+attributes added to its score. `linear`, `saturate` (`x / (x + pivot)`), `decay` (`exp`,
+`gauss` or `linear`, 1 at `origin` and 0.5 at `scale`, over a number or a datetime) and
+`eq`. Every leg and the engine rank `window` candidates (default `min(1000, max(100,
+2·top_k))`), the server rescores them, and the first `top_k` are returned.
+
+- ⚠️ **Mind the scale.** Under the default RRF a score is about 1/60, so a weight of 1
+  swamps the ranking. `sum` or `max` fusion gives raw leg scores.
+- **Exact within the window, and nothing beyond it.** A document ranked below `window` is
+  never rescored.
+- **It costs what the query costs at `top_k = window`:** the same four rounds, more row
+  blocks and more leg bytes. `meta.cost` reports it.
+- A term over an attribute a document lacks, or holds as another type, adds nothing.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

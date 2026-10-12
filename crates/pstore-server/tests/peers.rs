@@ -743,6 +743,36 @@ async fn queries_that_cannot_be_split_run_on_one_server() {
 }
 
 #[tokio::test]
+async fn a_split_boosted_query_answers_as_one_server_does() {
+    // M62: the legs and the engine's `top_k` are the window, so a split query's candidates are
+    // the unpeered server's, and so is their rescoring.
+    let (store, servers, alone) = cluster(&[]).await;
+    fill(&store, &servers[0].api, &urls(&servers), 8).await;
+    let boost = json!({"window": 40, "terms": [
+        {"attr": "n", "fn": "decay", "weight": 0.02, "origin": 100, "scale": 30},
+        {"attr": "n", "fn": "linear", "weight": 0.0001}]});
+    for q in [
+        json!({"vector": Q, "top_k": 10, "boost": boost}),
+        json!({"text": "word2 tag1", "top_k": 10, "boost": boost}),
+        json!({"vector": Q, "text": "word2", "top_k": 10, "boost": boost}),
+    ] {
+        let (s0, want) = query(&alone.api, &q).await;
+        assert_eq!(s0, 200, "{q}: {want}");
+        assert_eq!(want["results"].as_array().map(Vec::len), Some(10), "{want}");
+        for (i, server) in servers.iter().enumerate() {
+            let sent = metric(&server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&server.api, &q).await;
+            assert_eq!(s, 200, "{q} at {i}: {got}");
+            assert_eq!(answer(&got), answer(&want), "{q} at {i}");
+            assert!(
+                metric(&server.api, "pstore_peer_parts_sent").await > sent,
+                "{q} at {i} was not split"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_multi_query_is_not_split() {
     // M61: the part protocol carries no `multi` leg, so a share would answer without it. The
     // whole query runs on the server asked, alone or beside a leg that would split.
