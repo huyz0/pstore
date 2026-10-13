@@ -78,6 +78,7 @@ Commands:
        `vec![]`) by the peers tests, with the `fde` cases added to `a_multi_query_is_not_split`.
        Re-swept with `pstore-engine --test multi` and the server's `peers` and `multi_fde`:
        `write_marked` and `shares`, **7 mutants, 6 caught, 1 unviable, 0 missed.**
+     - **`pstore-format` `fde.rs` and `reader.rs` whole, on the final tree** (after the last edit): **138 mutants, 138 caught, 0 missed.**
      - **Re-swept on the final tree** (after the encoding's restructuring, `bffd251`), changed
        lines only: `pstore-query` `run.rs`, 14 mutants, 9 caught, 5 unviable, 0 missed;
        `pstore-server` `lib.rs`, 14 mutants (a worker restart split the run; 9 then 5),
