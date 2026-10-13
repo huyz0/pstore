@@ -74,11 +74,13 @@ Commands:
        - `encode`'s `per` as `!=`: it only sizes an allocation (`Vec::with_capacity`);
        - the projection's `a * sign` as `a / sign`: `sign` is exactly `±1.0`, and both are
          bit-identical;
-       - `field_rows`' `kind == 0 && dims > 0` as `||`, and `dims > 0` as `>=`: they differ only
-         for a dense layout of width 0 or a sparse one with `dims > 0`, and no segment the writer
-         produces has either (the test tries a zero-width field; the writer refuses it, or the
-         call returns empty). Where an empty row list reaches the first, `get_ranges` of nothing
-         returns the same empty map.
+       - `field_rows`' `kind == 0 && dims > 0` as `||`, and `dims > 0` as `>=`: a dense layout
+         of width 0 does not exist, and a sparse layout has `kind == 1` and `dims == 0`, both
+         **asserted** by `a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width` (the
+         writer accepts a field of empty vectors, records no layout for it, and `field_rows`
+         refuses it as an unknown field before reaching the guard). With neither case
+         reachable the guards' two arms agree; for an empty row list the call returns the same
+         empty map either way.
      - `pstore-engine` `lib.rs` (against `multi`, `quarantine`, `compaction` and the server's
        `multi_fde`; `split_rows`' constant-tuple replacements excluded as in M64): 20 mutants,
        11 caught, 7 unviable, **2 missed**:

@@ -508,21 +508,38 @@ fn a_zero_vector_falls_in_bucket_zero() {
 }
 
 #[tokio::test]
-async fn field_rows_of_a_zero_width_field_is_empty_not_a_panic() {
+async fn a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width() {
+    // The two guards in `field_rows` (`dims > 0`, `kind == 0`) are reached by neither: the writer
+    // accepts a field of empty vectors but records no layout for it, so the call is refused as
+    // an unknown field; and a sparse field's layout has width 0, so `kind` and `dims` agree.
     let store = MemoryStore::new();
     let mut w = SegmentWriter::new(4);
+    let mut all = Vec::new();
     for i in 0..3usize {
         let mut d = Document::new(format!("z{i}"), vec![1.0, 0.0, 0.0, 0.5]);
         d.vectors
             .insert("flat".to_owned(), VectorField::Dense(vec![Vec::new()]));
+        d.vectors.insert(
+            "terms".to_owned(),
+            VectorField::Sparse(vec![(1, pstore_format::Impact::new(1.0))]),
+        );
+        all.push(d.clone());
         w.push(d);
     }
+    let postings =
+        pstore_format::sparse::build(&all, "terms", pstore_format::sparse::DEFAULT_ENCODING);
     let key = Key::new("t/idx/z.seg");
-    let Ok(bytes) = w.try_finish() else { return };
+    let bytes = w
+        .with_section(Section::SparsePostings, postings.section)
+        .try_finish()
+        .unwrap();
     store.put(&key, bytes).await.unwrap();
     let seg = Segment::open(&store, &key).await.unwrap();
-    if seg.field_layout("flat").is_some() {
-        let got = seg.field_rows(&store, &key, "flat", &[0, 1]).await;
-        assert!(got.is_ok_and(|m| m.values().all(Vec::is_empty)));
-    }
+    assert!(
+        seg.field_layout("flat").is_none(),
+        "no layout for zero width"
+    );
+    assert!(seg.field_rows(&store, &key, "flat", &[0]).await.is_err());
+    let terms = seg.field_layout("terms").unwrap();
+    assert_eq!((terms.kind, terms.dims), (1, 0));
 }
