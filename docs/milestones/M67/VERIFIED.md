@@ -58,22 +58,27 @@ Commands:
        added: the `MultiFde` arm of `widened` (`+` as `-`) and the leg's dot product (`*` as
        `+`, `/`), killed by `fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced`.
      - `pstore-format` `reader.rs` (`field_rows`) and `fde.rs`: 146 mutants; the first sweep
-       missed 43, and tests were added for the 20 that were behaviour: row == end (`<` as
-       `<=`), corrupt offset tables (three guard mutants), rows holding no vectors (the
-       empty-range filter), the Hamming fill (`^`), the bucket shift, the gaussian
-       distribution and the projection scale. **23 remain, none behaviour a caller can tell:**
-       - 11 in `mix` and `hash`, the splitmix64 mixing: any mixing that stays deterministic and
-         well spread gives an encoding with the same properties, which the determinism, balance,
-         locality, norm and recall tests pin;
-       - 6 in `gauss` and `dot`: the Box-Muller arithmetic and the hyperplane dot product,
-         whose mutants still produce a symmetric, balanced, local hash;
-       - `sign`'s `==` as `!=` and the projection's `a * sign` as `a / sign`: the sign matrix's
-         entries are ±1, so negating every sign or dividing by it changes nothing;
-       - `bucket`'s `|` as `^` (distinct bits) and `>` as `<` or `>=` (relabels or a measure-zero
-         tie);
-       - `encode`'s `per` as `!=` (it sizes an allocation only);
-       - `field_rows`' `dims > 0` and `kind == 0` guards: `dims` is 0 only for a field the sparse
-         guard already returns on.
+       missed 43. Tests were added for the behaviour among them: row == end, corrupt offset
+       tables, rows holding no vectors, the Hamming fill, the bucket shift and a zero vector's
+       bucket, the gaussian distribution, the projection scale, and
+       **`the_encoding_is_frozen`**, which pins index-weighted sums of six encodings (queries and
+       documents, with and without projection, at two dimensions) recorded from this
+       implementation: the hash mixing, gaussians, signs, bucketing and aggregation are a fixed
+       function that stored encodings depend on, so any change to them moves these and is a
+       migration. That killed 17 of the 23 that had survived. **6 remain, each shown
+       equivalent:**
+       - `gauss`'s `+ 0.5` as `- 0.5` in the unit interval: it moves `u` by `2^-53`, below an
+         `f32` encoding's resolution (and differs in kind only at `h >> 11 == 0`, probability
+         `2^-53`);
+       - `bucket`'s `|` as `^`: the shifted bits are distinct, so the results are identical;
+       - `encode`'s `per` as `!=`: it only sizes an allocation (`Vec::with_capacity`);
+       - the projection's `a * sign` as `a / sign`: `sign` is exactly `±1.0`, and both are
+         bit-identical;
+       - `field_rows`' `kind == 0 && dims > 0` as `||`, and `dims > 0` as `>=`: they differ only
+         for a dense layout of width 0 or a sparse one with `dims > 0`, and no segment the writer
+         produces has either (the test tries a zero-width field; the writer refuses it, or the
+         call returns empty). Where an empty row list reaches the first, `get_ranges` of nothing
+         returns the same empty map.
      - `pstore-engine` `lib.rs` (against `multi`, `quarantine`, `compaction` and the server's
        `multi_fde`; `split_rows`' constant-tuple replacements excluded as in M64): 20 mutants,
        11 caught, 7 unviable, **2 missed**:

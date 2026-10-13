@@ -453,3 +453,76 @@ fn fde_fills_an_empty_bucket_by_hamming_distance_not_by_order() {
     // 0b10 is one bit from 0b00 and two from 0b01: the earlier one.
     assert_eq!(chunk(0b10), a);
 }
+
+/// Index-weighted sum: moves if any element, or its position, does.
+fn weighted(e: &[f32]) -> f64 {
+    e.iter()
+        .enumerate()
+        .map(|(i, x)| f64::from(*x) * (i as f64 + 1.0))
+        .sum()
+}
+
+/// The encoding is a fixed function of `(seed, repetition, dimension)`: a stored encoding and a
+/// later query meet only if it never changes. These values were recorded from this
+/// implementation, and any change to its hashing, gaussians, signs, bucketing or aggregation
+/// moves them -- which is a migration of every stored encoding, not a refactor.
+#[test]
+fn the_encoding_is_frozen() {
+    let doc = vec![
+        vec![0.5f32, -1.0, 2.0, 0.25],
+        vec![1.5, 0.75, -0.5, -2.0],
+        vec![-1.0, 1.0, 1.0, 1.0],
+    ];
+    let none = Params {
+        d_proj: 0,
+        ..DEFAULT
+    };
+    let big = vecs(21, 7, 16);
+    let near = |got: f64, want: f64| assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+    near(weighted(&encode_doc(&DEFAULT, &doc)), 13725.0625);
+    near(weighted(&encode_query(&DEFAULT, &doc[..2])), 2393.375);
+    near(weighted(&encode_doc(&none, &doc)), 2617.5);
+    near(weighted(&encode_doc(&DEFAULT, &big)), 12145.114970439114);
+    near(weighted(&encode_query(&DEFAULT, &big)), 3475.830445945263);
+    near(weighted(&encode_doc(&none, &big)), 7548.075128495693);
+}
+
+#[test]
+fn a_zero_vector_falls_in_bucket_zero() {
+    // One bit, two buckets, no projection. `dot > 0` is false for the zero vector, whatever
+    // the hyperplane: it is bucket 0, and a document of it and a vector in bucket 1 keeps them
+    // apart (a tie broken the other way would pool them and leave bucket 0 to a fill).
+    let p = Params {
+        reps: 1,
+        k_sim: 1,
+        d_proj: 0,
+        seed: 11,
+    };
+    let v = vecs(3, 200, 4)
+        .into_iter()
+        .find(|v| bucket_of(&p, v) == 1)
+        .unwrap();
+    let e = encode_doc(&p, &[vec![0.0; 4], v.clone()]);
+    assert_eq!(&e[..4], &[0.0; 4], "the zero vector is bucket 0 alone");
+    assert_eq!(&e[4..], v.as_slice(), "and the other keeps bucket 1");
+}
+
+#[tokio::test]
+async fn field_rows_of_a_zero_width_field_is_empty_not_a_panic() {
+    let store = MemoryStore::new();
+    let mut w = SegmentWriter::new(4);
+    for i in 0..3usize {
+        let mut d = Document::new(format!("z{i}"), vec![1.0, 0.0, 0.0, 0.5]);
+        d.vectors
+            .insert("flat".to_owned(), VectorField::Dense(vec![Vec::new()]));
+        w.push(d);
+    }
+    let key = Key::new("t/idx/z.seg");
+    let Ok(bytes) = w.try_finish() else { return };
+    store.put(&key, bytes).await.unwrap();
+    let seg = Segment::open(&store, &key).await.unwrap();
+    if seg.field_layout("flat").is_some() {
+        let got = seg.field_rows(&store, &key, "flat", &[0, 1]).await;
+        assert!(got.is_ok_and(|m| m.values().all(Vec::is_empty)));
+    }
+}
