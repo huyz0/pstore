@@ -530,6 +530,20 @@ impl Segment {
             .collect())
     }
 
+    /// Whether [`Self::vector_rows`] reads the `vector` field's vectors (M64): that field is a
+    /// dense one holding exactly one vector a row, in the legacy `Vectors` section.
+    ///
+    /// ⚠️ `Section::Vectors` is the segment's *first dense field*. The writer puts `vector`
+    /// first when there is one, but a segment without it hands the section to another field,
+    /// and a field of several vectors a row stores an offset table in it: `vector_rows` then
+    /// returns misaligned floats and no error. A caller that wants `vector`'s rows asks here
+    /// first.
+    #[must_use]
+    pub fn reads_vector_rows(&self) -> bool {
+        self.field_layout(crate::DEFAULT_FIELD)
+            .is_some_and(|f| f.kind == 0 && f.per_row == 1 && f.vectors == Section::Vectors as u16)
+    }
+
     /// The full-precision vectors, one row at a time.
     ///
     /// Width is derived by dividing the section by the row count, so the format needs no

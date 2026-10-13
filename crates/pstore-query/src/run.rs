@@ -173,6 +173,7 @@ pub async fn query_with<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
+        false,
     )
     .await?
     .0)
@@ -596,6 +597,7 @@ async fn run<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
+    with_vectors: bool,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
@@ -884,6 +886,7 @@ async fn run<S: BlobStore + Clone>(
             shadow,
             fusion,
             top_k,
+            with_vectors,
         )
         .await;
     }
@@ -899,7 +902,7 @@ async fn run<S: BlobStore + Clone>(
             .iter()
             .flat_map(|(i, _, hits)| hits.iter().map(move |h| (*i, h.row)))
             .collect();
-        fetch_rows(store, targets, &opened, &wanted).await?
+        fetch_rows(store, targets, &opened, &wanted, with_vectors).await?
     } else {
         std::collections::BTreeMap::new()
     };
@@ -975,6 +978,7 @@ async fn summed<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
+    with_vectors: bool,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); leg_count];
     for (_, j, hits) in candidates {
@@ -987,7 +991,7 @@ async fn summed<S: BlobStore>(
         Known::new()
     } else {
         let wanted: Vec<(usize, usize)> = fused.iter().map(|h| (h.segment, h.row)).collect();
-        fetch_rows(store, targets, &opened, &wanted).await?
+        fetch_rows(store, targets, &opened, &wanted, with_vectors).await?
     };
     fused.retain(|h| {
         !targets.get(h.segment).is_some_and(|t| t.shadowed)
@@ -1049,6 +1053,7 @@ pub async fn query_rows_filtered<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
+        false,
     )
     .await
 }
@@ -1073,19 +1078,31 @@ pub async fn query_rows_split<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
+    with_vectors: bool,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
     let (hits, opened, known, dense) = run(
-        store, targets, prefetch, text, filter, shadow, fusion, top_k, elsewhere,
+        store,
+        targets,
+        prefetch,
+        text,
+        filter,
+        shadow,
+        fusion,
+        top_k,
+        elsewhere,
+        with_vectors,
     )
     .await?;
-    Ok(resolve_rows(store, targets, &opened, &hits, known)
-        .await?
-        .into_iter()
-        .map(|(h, d)| {
-            let score = dense.get(&(h.segment, h.row)).copied();
-            (h, d, score)
-        })
-        .collect())
+    Ok(
+        resolve_rows(store, targets, &opened, &hits, known, with_vectors)
+            .await?
+            .into_iter()
+            .map(|(h, d)| {
+                let score = dense.get(&(h.segment, h.row)).copied();
+                (h, d, score)
+            })
+            .collect(),
+    )
 }
 
 /// The data rows of one segment `filter` admits, from its blocks, zone-map pruned.
@@ -1108,11 +1125,16 @@ async fn mask<S: BlobStore>(
 type Known = std::collections::BTreeMap<(usize, usize), Document>;
 
 /// The documents at `(segment, row)` pairs: one fan-out round over the segments holding them.
+///
+/// With `with_vectors` (M64), each document also carries the segment's `vector` for its row,
+/// read **in the same fan-out** as the row: the two reads are joined, never awaited one after
+/// the other, or the depth would grow by one at a single segment.
 async fn fetch_rows<S: BlobStore>(
     store: &S,
     targets: &[Target],
     opened: &[Opened],
     wanted: &[(usize, usize)],
+    with_vectors: bool,
 ) -> Result<Known, QueryError> {
     let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -1128,7 +1150,29 @@ async fn fetch_rows<S: BlobStore>(
             let (Some(t), Some(o)) = (targets.get(*segment), opened.get(*segment)) else {
                 return Ok::<_, QueryError>((*segment, Vec::new()));
             };
-            let docs = o.segment.rows_at(store, &t.segment, rows).await?;
+            // ⚠️ Only a segment whose `Vectors` section IS the `vector` field: another dense
+            // field in it, or several vectors a row, would read as misaligned floats.
+            let vectors = async {
+                if with_vectors && o.segment.reads_vector_rows() {
+                    o.segment.vector_rows(store, &t.segment, rows).await
+                } else {
+                    Ok(std::collections::BTreeMap::new())
+                }
+            };
+            let (docs, vectors) = futures_util::future::try_join(
+                async { o.segment.rows_at(store, &t.segment, rows).await },
+                vectors,
+            )
+            .await?;
+            let mut docs = docs;
+            for (row, doc) in rows.iter().zip(docs.iter_mut()) {
+                if let (Some(doc), Some(v)) = (doc.as_mut(), vectors.get(row)) {
+                    doc.vectors.insert(
+                        pstore_format::DEFAULT_FIELD.to_owned(),
+                        pstore_format::VectorField::Dense(vec![v.clone()]),
+                    );
+                }
+            }
             Ok((*segment, rows.iter().copied().zip(docs).collect::<Vec<_>>()))
         },
     ))
@@ -1151,6 +1195,7 @@ async fn resolve_rows<S: BlobStore>(
     opened: &[Opened],
     hits: &[Hit],
     mut known: Known,
+    with_vectors: bool,
 ) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
     // Only what the shadow check did not already fetch (M9c.2): when it ran, this is nothing.
     let missing: Vec<(usize, usize)> = hits
@@ -1159,7 +1204,7 @@ async fn resolve_rows<S: BlobStore>(
         .filter(|k| !known.contains_key(k))
         .collect();
     if !missing.is_empty() {
-        known.extend(fetch_rows(store, targets, opened, &missing).await?);
+        known.extend(fetch_rows(store, targets, opened, &missing, with_vectors).await?);
     }
     Ok(hits
         .iter()

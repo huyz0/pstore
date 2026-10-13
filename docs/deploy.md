@@ -174,6 +174,28 @@ attributes added to its score. `linear`, `saturate` (`x / (x + pivot)`), `decay`
   blocks and more leg bytes. `meta.cost` reports it.
 - A term over an attribute a document lacks, or holds as another type, adds nothing.
 
+## Diversifying a ranking
+
+A ranked query may carry `diversify` ([M64](milestones/M64/SPEC.md)):
+`{"lambda": 0.5, "window": 100}`. The engine ranks `window` candidates, reads their `vector`
+in the same fetch that reads their rows, and the server picks `top_k` of them by maximal
+marginal relevance: each pick maximizes `lambda · relevance − (1 − lambda) · similarity to
+what is already picked`. `lambda` 1 is the fused order; 0 is diversity alone.
+
+- ⚠️ **The answer is not sorted by score.** Each row keeps its fused (or boosted) `score` and
+  `$dist`, and the order is the pick order. A client that assumes descending scores is wrong.
+- **Similarity is the cosine of the vectors for every metric,** deliberately: it asks whether
+  two results are alike, which is direction, whatever the ranking weighs. A result without a
+  usable `vector` (another dimension, a zero vector) has similarity 0 to everything.
+- **One window governs a boost and a diversify:** either names it, and both naming different
+  ones is refused. The default is `min(1000, max(100, 2·top_k))`.
+- **It costs bytes, not rounds:** the same four rounds, and the candidates' vectors, up to
+  `window × dims × 4` bytes. With something unfolded, the rows of every leg's candidates are
+  fetched before fusion, so up to `legs × window` vectors.
+- ⚠️ **Similarity reads the `vector` field only.** A dense leg on another `field`, or an index
+  with no `vector`, gives every candidate similarity 0 and `diversify` is then a relevance cut.
+- Not with `as_of`, `rank_by`, `aggregate_by` or `offset`.
+
 ## Highlighting
 
 A ranked query with a text leg may carry `highlight` ([M63](milestones/M63/SPEC.md)):

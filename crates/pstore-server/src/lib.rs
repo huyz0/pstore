@@ -30,6 +30,7 @@ use std::sync::Arc;
 use types::Schema as SchemaOut;
 
 mod boost;
+mod diversify;
 mod highlight;
 mod peers;
 mod replication;
@@ -1867,6 +1868,7 @@ enum Plan {
         pstore_query::Fusion,
         Option<boost::Boost>,
         Option<highlight::Highlight>,
+        Option<diversify::Diversify>,
     ),
 }
 
@@ -1898,6 +1900,41 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
             ));
         }
     }
+    // M64: checked at the top too, so every refusal names it. One window governs a boost and
+    // a diversify: either names it, and both naming different ones is refused.
+    let named_boost = req.boost.as_ref().and_then(diversify::named_window);
+    let named_diversify = req.diversify.as_ref().and_then(diversify::named_window);
+    if let (Some(b), Some(d)) = (named_boost, named_diversify)
+        && b != d
+    {
+        return Err(ApiError::bad_request(format!(
+            "diversify: window {d} differs from the boost's {b}; one window governs both"
+        )));
+    }
+    let diversify = req
+        .diversify
+        .as_ref()
+        .map(|d| diversify::parse(d, req.top_k, named_boost))
+        .transpose()
+        .map_err(|why| ApiError::bad_request(format!("diversify: {why}")))?;
+    if diversify.is_some() {
+        let with = if req.rank_by.is_some() {
+            Some("rank_by")
+        } else if req.aggregate_by.is_some() {
+            Some("aggregate_by")
+        } else if req.offset.is_some() {
+            Some("offset")
+        } else if req.as_of.is_some() {
+            Some("as_of")
+        } else {
+            None
+        };
+        if let Some(what) = with {
+            return Err(ApiError::bad_request(format!(
+                "diversify re-orders a relevance ranking: it cannot be combined with {what}"
+            )));
+        }
+    }
     // M62: a boost rescores a relevance ranking; an order or an aggregation has none.
     if req.boost.is_some() && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
         return Err(ApiError::bad_request(
@@ -1918,14 +1955,20 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     let boost = req
         .boost
         .as_ref()
-        .map(|b| boost::parse(b, req.top_k))
+        .map(|b| boost::parse(b, req.top_k, named_diversify))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
     // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
     // below `top_k` would otherwise never reach the fusion the boost rescores.
-    let legs = prefetch(req, boost.as_ref().map_or(req.top_k, |b| b.window))?;
+    let window = boost
+        .as_ref()
+        .map(|b| b.window)
+        .or(diversify.map(|d| d.window));
+    let legs = prefetch(req, window.unwrap_or(req.top_k))?;
     let fusion = fusion(req, legs.len())?;
-    Ok(Plan::Ranked(legs, filter, fusion, boost, highlight))
+    Ok(Plan::Ranked(
+        legs, filter, fusion, boost, highlight, diversify,
+    ))
 }
 
 /// What a query asked to reflect (M9i.2, M11.1).
@@ -2104,7 +2147,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
-    let (legs, filter, fusion, boost, highlight) = match plan {
+    let (legs, filter, fusion, boost, highlight, diversify) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
             let group_by = spec.group_by.clone();
@@ -2191,12 +2234,16 @@ async fn run<E: BlobStore>(
                 consistency: level_name(level),
             });
         }
-        Plan::Ranked(legs, filter, fusion, boost, highlight) => {
-            (legs, filter, fusion, boost, highlight)
+        Plan::Ranked(legs, filter, fusion, boost, highlight, diversify) => {
+            (legs, filter, fusion, boost, highlight, diversify)
         }
     };
     // M62: the engine ranks the window, and the boost cuts it to `top_k`.
-    let top_k = boost.as_ref().map_or(req.top_k, |b| b.window);
+    let top_k = boost
+        .as_ref()
+        .map(|b| b.window)
+        .or(diversify.map(|d| d.window))
+        .unwrap_or(req.top_k);
     let answer = match req.as_of {
         Some(e) => {
             engine
@@ -2207,6 +2254,20 @@ async fn run<E: BlobStore>(
                     filter.as_ref(),
                     fusion,
                     top_k,
+                )
+                .await?
+        }
+        // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.)
+        None if diversify.is_some() => {
+            engine
+                .query_split_vectors(
+                    index,
+                    &legs,
+                    filter.as_ref(),
+                    fusion,
+                    top_k,
+                    consistency,
+                    peers.map(|p| p as &dyn pstore_engine::Peers),
                 )
                 .await?
         }
@@ -2231,32 +2292,52 @@ async fn run<E: BlobStore>(
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
     // than HEAD's segments -- M5f's finding, where keying on the row alone merged two
     // unrelated documents into one.
-    let mut rows = engine.resolve_rows(&answer);
-    let unfolded_hits = match &boost {
-        None => answer
+    let mut paired = engine.resolve_rows_with_vectors(&answer);
+    if let Some(b) = &boost {
+        for ((_, score, attrs, _), _) in &mut paired {
+            *score = b.score(*score, attrs);
+        }
+        // Stable, so equal finals keep the engine's order.
+        paired.sort_by(|x, y| y.0.1.total_cmp(&x.0.1));
+    }
+    if let Some(d) = diversify {
+        // M64: the pick is `top_k × window × dims` multiply-adds, off the runtime's workers.
+        let scores: Vec<f64> = paired.iter().map(|r| f64::from(r.0.1)).collect();
+        let vectors: Vec<Option<Vec<f32>>> = paired.iter_mut().map(|r| r.1.take()).collect();
+        let k = req.top_k;
+        let order =
+            tokio::task::spawn_blocking(move || diversify::select(&scores, &vectors, d.lambda, k))
+                .await
+                .map_err(|e| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+                })?;
+        let mut slots: Vec<Option<_>> = paired.into_iter().map(Some).collect();
+        paired = order
+            .into_iter()
+            .filter_map(|i| slots.get_mut(i).and_then(Option::take))
+            .collect();
+    }
+    paired.truncate(req.top_k);
+    let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
+    let unfolded_hits = if boost.is_none() && diversify.is_none() {
+        answer
             .hits
             .iter()
             .filter(|h| h.segment == answer.unfolded_at)
-            .count(),
-        Some(b) => {
-            for (_, score, attrs, _) in &mut rows {
-                *score = b.score(*score, attrs);
-            }
-            // Stable, so equal finals keep the engine's order.
-            rows.sort_by(|x, y| y.1.total_cmp(&x.1));
-            rows.truncate(req.top_k);
-            // A hit on the unfolded rows is one whose id an unfolded row carries: ids are
-            // unique in one answer, an id's newest version being the only one served.
-            let fresh: std::collections::HashSet<&str> = answer
-                .hits
-                .iter()
-                .filter(|h| h.segment == answer.unfolded_at)
-                .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
-                .collect();
-            rows.iter()
-                .filter(|(id, ..)| fresh.contains(id.as_str()))
-                .count()
-        }
+            .count()
+    } else {
+        // The rows were reordered and cut: a hit on the unfolded rows is one whose id an
+        // unfolded row carries. Ids are unique in one answer, an id's newest version being the
+        // only one served.
+        let fresh: std::collections::HashSet<&str> = answer
+            .hits
+            .iter()
+            .filter(|h| h.segment == answer.unfolded_at)
+            .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
+            .collect();
+        rows.iter()
+            .filter(|(id, ..)| fresh.contains(id.as_str()))
+            .count()
     };
     // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
     // only, from the attributes the row round returned, whatever `include_attributes` asks.

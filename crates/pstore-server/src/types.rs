@@ -233,6 +233,9 @@ pub struct QueryRequest {
     /// The dense leg's field. Defaults to the engine's default vector field.
     #[serde(default)]
     pub field: Option<String>,
+    /// A window of the ranking diversified by maximal marginal relevance (M64).
+    #[serde(default)]
+    pub diversify: Option<serde_json::Value>,
     /// The query's terms marked in each result's text (M63).
     #[serde(default)]
     pub highlight: Option<serde_json::Value>,

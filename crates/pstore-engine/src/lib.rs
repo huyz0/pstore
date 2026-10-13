@@ -1335,6 +1335,10 @@ pub struct Answer {
     /// under `as_of` -- else the unfolded rows', else the default. A client marking a result's
     /// text must use the analyzer the ranking did.
     pub fts: pstore_format::text::FullText,
+    /// Each hit's `vector`, in **client space** (M64): one entry a hit, `None` for a hit with
+    /// no readable `vector`. **Empty** for every query that did not ask for them, which is
+    /// every query but [`Engine::query_split_vectors`].
+    pub vectors: Vec<Option<Vec<f32>>>,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -2790,6 +2794,17 @@ impl<S: BlobStore> Engine<S> {
     /// [`Answer::attributes`], which came with its id.
     #[must_use]
     pub fn resolve_rows(&self, answer: &Answer) -> Vec<Resolved> {
+        self.resolve_rows_with_vectors(answer)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// [`Self::resolve_rows`], each row beside its client-space vector (M64): `None` when the
+    /// query did not ask for vectors, or the hit has none. Paired here, with the hit that
+    /// survived resolving, so a hit whose row vanished cannot misalign the rest.
+    #[must_use]
+    pub fn resolve_rows_with_vectors(&self, answer: &Answer) -> Vec<(Resolved, Option<Vec<f32>>)> {
         answer
             .hits
             .iter()
@@ -2809,7 +2824,8 @@ impl<S: BlobStore> Engine<S> {
                         .map(|id| (id, answer.attributes.get(i).cloned().unwrap_or_default()))
                 };
                 let dist = answer.dists.get(i).copied().flatten();
-                row.map(|(id, attrs)| (id, h.score, attrs, dist))
+                let vector = answer.vectors.get(i).cloned().flatten();
+                row.map(|(id, attrs)| ((id, h.score, attrs, dist), vector))
             })
             .collect()
     }
@@ -5128,6 +5144,67 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         peers: Option<&dyn Peers>,
     ) -> Result<Answer, EngineError> {
+        self.query_split_inner(
+            index,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+            consistency,
+            peers,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::query_split_as`], and each hit's `vector` in [`Answer::vectors`] (M64), read in
+    /// the same fetch as its row: the query stays as deep as it was. With something unfolded
+    /// the rows of every leg's candidates are fetched before fusion, and so are their vectors.
+    ///
+    /// # Errors
+    /// As [`Self::query_split_as`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, and where to split it"
+    )]
+    pub async fn query_split_vectors(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        peers: Option<&dyn Peers>,
+    ) -> Result<Answer, EngineError> {
+        self.query_split_inner(
+            index,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+            consistency,
+            peers,
+            true,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, and where to split it"
+    )]
+    async fn query_split_inner(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        peers: Option<&dyn Peers>,
+        vectors: bool,
+    ) -> Result<Answer, EngineError> {
         // ⚠️ A read served from the `bounded` cache that fails is retried once from a fresh
         // HEAD (M11.2): `gc` may have reaped a segment the cached HEAD still names.
         let mut hit = false;
@@ -5142,6 +5219,7 @@ impl<S: BlobStore> Engine<S> {
                 true,
                 &mut hit,
                 peers,
+                vectors,
             )
             .await;
         match first {
@@ -5158,6 +5236,7 @@ impl<S: BlobStore> Engine<S> {
                     false,
                     &mut hit,
                     peers,
+                    vectors,
                 )
                 .await
             }
@@ -5180,6 +5259,7 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
         peers: Option<&dyn Peers>,
+        vectors: bool,
     ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
@@ -5189,7 +5269,7 @@ impl<S: BlobStore> Engine<S> {
         *hit = got.hit;
         let (mut answer, settled) = futures_util::future::try_join(
             self.answer(
-                index, &got.at, got.fresh, prefetch, filter, fusion, top_k, peers,
+                index, &got.at, got.fresh, prefetch, filter, fusion, top_k, peers, vectors,
             ),
             self.settled(&got.at.head, got.lanes.as_deref()),
         )
@@ -5281,6 +5361,7 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
         peers: Option<&dyn Peers>,
+        vectors: bool,
     ) -> Result<Answer, EngineError> {
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
@@ -5344,6 +5425,7 @@ impl<S: BlobStore> Engine<S> {
                 watermarks: at.head.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
                 fts,
+                vectors: Vec::new(),
             });
         }
 
@@ -5370,11 +5452,11 @@ impl<S: BlobStore> Engine<S> {
             )
         });
         let resolved = pstore_query::query_rows_split(
-            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k, elsewhere,
+            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k, elsewhere, vectors,
         )
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;
-        let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
+        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, vectors);
         Ok(Answer {
             hits,
             ids,
@@ -5387,6 +5469,7 @@ impl<S: BlobStore> Engine<S> {
             watermarks: at.head.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
             fts,
+            vectors,
         })
     }
 
@@ -5662,6 +5745,7 @@ impl<S: BlobStore> Engine<S> {
                 watermarks: then.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
                 fts: schema.fts,
+                vectors: Vec::new(),
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -5688,7 +5772,7 @@ impl<S: BlobStore> Engine<S> {
         )
         .await
         .map_err(|e| query_error(metric, &prefetch, e))?;
-        let (hits, ids, attributes, dists) = split_rows(resolved, metric, q2);
+        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, false);
         Ok(Answer {
             hits,
             ids,
@@ -5701,6 +5785,7 @@ impl<S: BlobStore> Engine<S> {
             watermarks: then.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
             fts: schema.fts,
+            vectors,
         })
     }
 
@@ -6437,28 +6522,51 @@ fn segment_targets(
         .collect()
 }
 
-/// A resolved ranking, as `Answer`'s three parallel columns: hits, ids, attributes.
+/// `stored` as the client wrote it, up to the metric's transform (M64): the euclidean
+/// transform's extra component removed; cosine's normalization and dot product's raw vector
+/// as they are stored. One function for every source of a vector, folded or unfolded, so the
+/// two cannot disagree.
+fn client_space(metric: Metric, stored: &[f32]) -> Vec<f32> {
+    stored
+        .get(..stored.len().saturating_sub(metric.extra()))
+        .unwrap_or_default()
+        .to_vec()
+}
+
+/// A resolved ranking, as `Answer`'s parallel columns: hits, ids, attributes, `$dist`, and --
+/// when `vectors` asks (M64) -- each hit's vector in client space, else none at all.
 #[expect(
     clippy::type_complexity,
-    reason = "the three columns `Answer` stores, named there; a struct here would be `Answer` again"
+    reason = "the columns `Answer` stores, named there; a struct here would be `Answer` again"
 )]
 fn split_rows(
     resolved: Vec<(pstore_query::Hit, Option<Document>, Option<f32>)>,
     metric: Metric,
     q2: f32,
+    vectors: bool,
 ) -> (
     Vec<pstore_query::Hit>,
     Vec<Option<String>>,
     Vec<std::collections::BTreeMap<String, pstore_format::Value>>,
     Vec<Option<f32>>,
+    Vec<Option<Vec<f32>>>,
 ) {
     let mut hits = Vec::with_capacity(resolved.len());
     let mut ids = Vec::with_capacity(resolved.len());
     let mut attributes = Vec::with_capacity(resolved.len());
     let mut dists = Vec::with_capacity(resolved.len());
+    let mut vecs = Vec::new();
     for (h, d, score) in resolved {
         hits.push(h);
         dists.push(score.map(|s| distance(metric, s, q2)));
+        if vectors {
+            vecs.push(
+                d.as_ref()
+                    .map(Document::vector)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| client_space(metric, v)),
+            );
+        }
         match d {
             Some(d) => {
                 ids.push(Some(d.id));
@@ -6470,7 +6578,7 @@ fn split_rows(
             }
         }
     }
-    (hits, ids, attributes, dists)
+    (hits, ids, attributes, dists, vecs)
 }
 
 /// The schema `index` had at `epoch` (M9f.2): the schema of the first drop of that name after

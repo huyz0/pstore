@@ -15,6 +15,13 @@ pub(crate) const MAX_TERMS: usize = 8;
 /// The least window when the query names none.
 const DEFAULT_WINDOW: usize = 100;
 
+/// The window a query names none of, for `top_k`: twice it, so a boost can lift as well as
+/// reorder, between [`DEFAULT_WINDOW`] and [`MAX_WINDOW`]. One function for a boost and a
+/// diversify (M64), which share a window.
+pub(crate) fn default_window(top_k: usize) -> usize {
+    top_k.saturating_mul(2).clamp(DEFAULT_WINDOW, MAX_WINDOW)
+}
+
 /// A parsed `boost`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Boost {
@@ -63,14 +70,18 @@ enum Shape {
 ///
 /// # Errors
 /// Every refusal of M62's rule 6, as a message for a `400`.
-pub(crate) fn parse(raw: &serde_json::Value, top_k: usize) -> Result<Boost, String> {
+pub(crate) fn parse(
+    raw: &serde_json::Value,
+    top_k: usize,
+    shared: Option<usize>,
+) -> Result<Boost, String> {
     let o = raw.as_object().ok_or("boost is {\"window\", \"terms\"}")?;
     if let Some(k) = o.keys().find(|k| *k != "window" && *k != "terms") {
         return Err(format!("{k:?} is not a boost field; window and terms are"));
     }
     let window = match o.get("window") {
-        // Twice `top_k`, so a boost can lift as well as reorder (spec review).
-        None => top_k.saturating_mul(2).clamp(DEFAULT_WINDOW, MAX_WINDOW),
+        // The window a diversify named, if it did, else the default (M64).
+        None => shared.unwrap_or_else(|| default_window(top_k)),
         Some(w) => w
             .as_u64()
             .and_then(|w| usize::try_from(w).ok())
