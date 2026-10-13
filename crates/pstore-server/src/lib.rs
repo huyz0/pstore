@@ -3421,6 +3421,42 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
                         .ok_or_else(|| bad("Fuzzy's max_edits is 0, 1 or 2".to_owned()))?;
                     Ok(Predicate::Fuzzy(attr, v.to_owned(), k as u8))
                 }
+                // M66: a location is a two-number array; the clause's argument is numbers.
+                "GeoRadius" => {
+                    let Some(&[lat, lon, meters]) = geo_numbers(value, 3).as_deref() else {
+                        return Err(bad(
+                            "GeoRadius takes [lat, lon, meters], three numbers".to_owned()
+                        ));
+                    };
+                    if !geo_point(lat, lon) {
+                        return Err(bad(
+                            "GeoRadius's lat is -90 to 90 and lon -180 to 180".to_owned()
+                        ));
+                    }
+                    if !(0.0..=MAX_GEO_RADIUS_M).contains(&meters) {
+                        return Err(bad(format!(
+                            "GeoRadius's meters is 0 to {MAX_GEO_RADIUS_M}, half the circumference"
+                        )));
+                    }
+                    Ok(Predicate::GeoRadius(attr, lat, lon, meters))
+                }
+                "GeoBox" => {
+                    let Some(&[south, west, north, east]) = geo_numbers(value, 4).as_deref() else {
+                        return Err(bad(
+                            "GeoBox takes [south, west, north, east], four numbers".to_owned()
+                        ));
+                    };
+                    if !geo_point(south, west) || !geo_point(north, east) {
+                        return Err(bad(
+                            "GeoBox's latitudes are -90 to 90 and longitudes -180 to 180"
+                                .to_owned(),
+                        ));
+                    }
+                    if south > north {
+                        return Err(bad("GeoBox's south is not above its north".to_owned()));
+                    }
+                    Ok(Predicate::GeoBox(attr, south, west, north, east))
+                }
                 other => Err(bad(format!("unknown operator {other}"))),
             }
         }
@@ -3428,6 +3464,22 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             "expected [attr, op, value], [\"And\"|\"Or\", [..]] or [\"Not\", filter]".to_owned(),
         )),
     }
+}
+
+/// Half the Earth's circumference in meters, rounded up: the farthest two points are (M66).
+const MAX_GEO_RADIUS_M: f64 = 20_015_087.0;
+
+/// A JSON array of exactly `n` finite numbers (M66).
+fn geo_numbers(v: &serde_json::Value, n: usize) -> Option<Vec<f64>> {
+    let a = v.as_array().filter(|a| a.len() == n)?;
+    a.iter()
+        .map(|x| x.as_f64().filter(|f| f.is_finite()))
+        .collect()
+}
+
+/// Whether `lat`/`lon` are a point on the globe (M66).
+fn geo_point(lat: f64, lon: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
 /// One JSON value as an attribute value, in a write or a filter -- or why it is none.

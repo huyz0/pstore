@@ -337,6 +337,12 @@ pub enum Predicate {
     Pattern(String, Pattern),
     /// A scalar string attribute within `k` edits of the value (M15). Anything else is false.
     Fuzzy(String, String, u8),
+    /// A location within `meters` of `(lat, lon)`, inclusive (M66). An attribute that is not a
+    /// location (see [`pstore_format::geo::location`]) is false.
+    GeoRadius(String, f64, f64, f64),
+    /// A location in `[south, west, north, east]`, edges inclusive; `west > east` crosses the
+    /// antimeridian (M66). An attribute that is not a location is false.
+    GeoBox(String, f64, f64, f64, f64),
 }
 
 impl Predicate {
@@ -416,6 +422,22 @@ impl Predicate {
                 Some(Value::Str(s)) => p.re.is_match(&s),
                 _ => false,
             },
+            Self::GeoRadius(name, lat, lon, meters) => get(name)
+                .as_ref()
+                .and_then(pstore_format::geo::location)
+                .is_some_and(|at| pstore_format::geo::distance_m((*lat, *lon), at) <= *meters),
+            Self::GeoBox(name, south, west, north, east) => get(name)
+                .as_ref()
+                .and_then(pstore_format::geo::location)
+                .is_some_and(|(lat, lon)| {
+                    let across = west > east;
+                    (*south..=*north).contains(&lat)
+                        && if across {
+                            lon >= *west || lon <= *east
+                        } else {
+                            (*west..=*east).contains(&lon)
+                        }
+                }),
             Self::Fuzzy(name, v, k) => match get(name) {
                 Some(Value::Str(s)) => within(
                     &s.chars().collect::<Vec<_>>(),
@@ -477,8 +499,9 @@ impl Predicate {
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
             Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
-            // Tokens have no zone: every block could hold a match (M14.2).
-            Self::Tokens(..) => true,
+            // Tokens have no zone: every block could hold a match (M14.2). Nor has a
+            // location, an array of two numbers (M66).
+            Self::Tokens(..) | Self::GeoRadius(..) | Self::GeoBox(..) => true,
             // M15.2: a block whose sketch lacks a required trigram holds no match. No sketch,
             // or no filter for the attribute, rules nothing out.
             Self::Pattern(name, p) => zones

@@ -219,6 +219,31 @@ list -- and `meta.facets_epoch`.
   landed between the two. The consistency level and `as_of` apply to both.
 - Not with `rank_by`, `aggregate_by`, a query with no ranking leg, or inside `queries`.
 
+## Geo filters and a distance decay
+
+A location is a two-number array `[lat, lon]` in degrees under any attribute
+([M66](milestones/M66/SPEC.md)); nothing about writing changes. Two filter clauses read it:
+
+```json
+["loc", "GeoRadius", [48.8566, 2.3522, 5000]]          // lat, lon, meters
+["loc", "GeoBox", [south, west, north, east]]           // west > east crosses the antimeridian
+```
+
+- Distances are the great-circle (haversine) on a sphere of 6,371,008.8 m, **inclusive**.
+  Against WGS-84 the error is up to about 0.5%.
+- A value that is not a location (absent, a scalar, a longer array, out of range) is false for
+  both clauses, and `Not` admits it.
+- ⚠️ **A geo clause prunes no block.** A location has no zone map, so it is a scan over the
+  blocks the rest of the filter admits. Put a prunable clause beside it in an `And`.
+- A box's longitudes are compared as written: `-180` and `180` are the same meridian but
+  different numbers, and `west == east` is one meridian, not the world (use `-180` to `180`).
+- `meters` is 0 to 20,015,087; a point or box out of range is refused, naming the clause.
+- A boost's `decay` takes a pair as its `origin`, with `scale` in **meters**:
+  `{"attr": "loc", "fn": "decay", "origin": [48.85, 2.35], "scale": 5000, "shape": "gauss",
+  "weight": 0.1}`. At exactly `scale` meters every shape is one half. A row with no location
+  contributes nothing.
+- Not covered: sorting by distance, polygons, cell indexes.
+
 ## Highlighting
 
 A ranked query with a text leg may carry `highlight` ([M63](milestones/M63/SPEC.md)):

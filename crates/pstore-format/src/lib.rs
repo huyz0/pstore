@@ -18,6 +18,7 @@
 mod codec;
 pub mod datetime;
 mod docs;
+pub mod geo;
 mod reader;
 pub mod sparse;
 pub mod text;

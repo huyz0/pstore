@@ -140,6 +140,21 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
             put_str(b, v);
             b.push(*k);
         }
+        // M66: the name, then the numbers as `f64` bits.
+        Predicate::GeoRadius(a, lat, lon, m) => {
+            b.push(10);
+            put_str(b, a);
+            for x in [lat, lon, m] {
+                b.extend(x.to_bits().to_le_bytes());
+            }
+        }
+        Predicate::GeoBox(a, s, w, n, e) => {
+            b.push(11);
+            put_str(b, a);
+            for x in [s, w, n, e] {
+                b.extend(x.to_bits().to_le_bytes());
+            }
+        }
         // M14.2: the operator, the text, and the analyzer when one is bound.
         Predicate::Tokens(a, op, text, analyzer) => {
             b.push(7);
@@ -179,6 +194,10 @@ impl Reader<'_> {
 
     fn u8(&mut self) -> Option<u8> {
         self.take(1)?.first().copied()
+    }
+
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_bits(self.u64()?))
     }
 
     fn u32(&mut self) -> Option<usize> {
@@ -270,6 +289,14 @@ impl Reader<'_> {
                 Predicate::Pattern(a, Pattern::new(kind, &self.string()?).ok()?)
             }
             9 => Predicate::Fuzzy(self.string()?, self.string()?, self.u8()?),
+            10 => Predicate::GeoRadius(self.string()?, self.f64()?, self.f64()?, self.f64()?),
+            11 => Predicate::GeoBox(
+                self.string()?,
+                self.f64()?,
+                self.f64()?,
+                self.f64()?,
+                self.f64()?,
+            ),
             7 => {
                 let a = self.string()?;
                 let op = match self.u8()? {

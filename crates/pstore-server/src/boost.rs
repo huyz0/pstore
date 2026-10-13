@@ -57,6 +57,8 @@ enum Origin {
     Number(f64),
     /// For a `datetime`, in microseconds; the scale is in seconds.
     Instant(i64),
+    /// For a location, `(lat, lon)` in degrees; the scale is in meters (M66).
+    Place(f64, f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +157,23 @@ fn term(raw: &serde_json::Value) -> Result<Term, String> {
                 Some(serde_json::Value::String(s)) => pstore_format::datetime::parse(s)
                     .map(Origin::Instant)
                     .ok_or(format!("attr {attr}: origin {s:?} is no RFC 3339 datetime"))?,
+                Some(serde_json::Value::Array(pair)) => match pair
+                    .iter()
+                    .map(|x| x.as_f64().filter(|f| f.is_finite()))
+                    .collect::<Option<Vec<f64>>>()
+                    .as_deref()
+                {
+                    Some(&[lat, lon])
+                        if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) =>
+                    {
+                        Origin::Place(lat, lon)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "attr {attr}: an origin pair is [lat, lon], -90 to 90 and -180 to 180"
+                        ));
+                    }
+                },
                 Some(v) => v
                     .as_f64()
                     .filter(|x| x.is_finite())
@@ -255,6 +274,10 @@ impl Function {
                         micros / 1e6
                     }
                     (Origin::Number(o), v) => (number(v)? - o).abs(),
+                    (Origin::Place(lat, lon), v) => pstore_format::geo::distance_m(
+                        (*lat, *lon),
+                        pstore_format::geo::location(v)?,
+                    ),
                     _ => return None,
                 };
                 let r = d / scale;
