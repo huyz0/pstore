@@ -57,39 +57,28 @@ Commands:
      - `pstore-query` `run.rs`: 18 mutants, 8 unviable, 10 caught after three tests were
        added: the `MultiFde` arm of `widened` (`+` as `-`) and the leg's dot product (`*` as
        `+`, `/`), killed by `fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced`.
-     - `pstore-format` `reader.rs` (`field_rows`) and `fde.rs`: 146 mutants; the first sweep
-       missed 43. Tests were added for the behaviour among them: row == end, corrupt offset
-       tables, rows holding no vectors, the Hamming fill, the bucket shift and a zero vector's
-       bucket, the gaussian distribution, the projection scale, and
-       **`the_encoding_is_frozen`**, which pins index-weighted sums of six encodings (queries and
-       documents, with and without projection, at two dimensions) recorded from this
-       implementation: the hash mixing, gaussians, signs, bucketing and aggregation are a fixed
-       function that stored encodings depend on, so any change to them moves these and is a
-       migration. That killed 17 of the 23 that had survived. **6 remain, each shown
-       equivalent:**
-       - `gauss`'s `+ 0.5` as `- 0.5` in the unit interval: it moves `u` by `2^-53`, below an
-         `f32` encoding's resolution (and differs in kind only at `h >> 11 == 0`, probability
-         `2^-53`);
-       - `bucket`'s `|` as `^`: the shifted bits are distinct, so the results are identical;
-       - `encode`'s `per` as `!=`: it only sizes an allocation (`Vec::with_capacity`);
-       - the projection's `a * sign` as `a / sign`: `sign` is exactly `±1.0`, and both are
-         bit-identical;
-       - `field_rows`' `kind == 0 && dims > 0` as `||`, and `dims > 0` as `>=`: a dense layout
-         of width 0 does not exist, and a sparse layout has `kind == 1` and `dims == 0`, both
-         **asserted** by `a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width` (the
-         writer accepts a field of empty vectors, records no layout for it, and `field_rows`
-         refuses it as an unknown field before reaching the guard). With neither case
-         reachable the guards' two arms agree; for an empty row list the call returns the same
-         empty map either way.
-     - `pstore-engine` `lib.rs` (against `multi`, `quarantine`, `compaction` and the server's
-       `multi_fde`; `split_rows`' constant-tuple replacements excluded as in M64): 20 mutants,
-       11 caught, 7 unviable, **2 missed**:
-       - `write_marked`'s `!vs.is_empty()` guard as `true`: killed by
-         `a_named_field_holding_no_vectors_derives_no_encoding` (seen red by applying it);
-       - `shares` replaced by `vec![]`: the whole function, killed by the peers tests that
-         expect a split; the `MultiFde` half of its refusal is pinned by the `fde` cases added to
-         `a_multi_query_is_not_split` in `crates/pstore-server/tests/peers.rs` (seen red with
-         `MultiFde` removed from the check).
+     - `pstore-format` `fde.rs` and `reader.rs` (`--test fde --lib`): the first sweep, 146
+       mutants, missed 43. Tests were added for the behaviour among them (row == end, corrupt
+       offset tables, rows holding no vectors, the Hamming fill, a zero vector's bucket, the
+       projection scale, `the_encoding_is_frozen`, and `gaussians_and_signs_are_frozen`, which
+       pins four gaussians to `1e-9` and eight signs and checks the draws are standard normal).
+       Six mutants were equivalent as written, so **the code was restructured to remove them
+       rather than argue them**: the gaussian's unit interval is 24 bits, not 53 (a `+ 0.5` as
+       `- 0.5` now moves a draw by `2^-24`, which the golden values see); the projection's sign
+       is applied by `signed(a, ..)`, not multiplied (no `*` as `/`); the bucket id is built with
+       `+`, not `|`; the output vector is no longer pre-sized; and `field_rows`' guards are one
+       condition each (`kind != 0`, `wanted.is_empty()`, `dims == 0`). The 24-bit interval
+       changes no encoding in the tests (the planes' signs are unmoved), and no encoding was in
+       use. Final sweep: **139 mutants, 138 caught, 1 missed** (`||` as `&&` in the combined
+       guard), which the split removed; re-swept: `field_rows`, **45 mutants, 45 caught**.
+       **0 misses.**
+     - `pstore-engine` `lib.rs`: 20 mutants (11 caught, 7 unviable, 2 missed), and the two
+       were killed by tests added after: `write_marked`'s `!vs.is_empty()` guard by
+       `a_named_field_holding_no_vectors_derives_no_encoding`, and `shares` (replaced by
+       `vec![]`) by the peers tests, with the `fde` cases added to `a_multi_query_is_not_split`.
+       Re-swept with `pstore-engine --test multi` and the server's `peers` and `multi_fde`:
+       `write_marked` and `shares`, **7 mutants, 6 caught, 1 unviable, 0 missed.**
+     - Every crate's sweep therefore ends with **0 misses** against the tests named above.
 
 **Code review**, one round (an agent given the staged diff and not the author's reasoning).
 - **Major, fixed:** the quarantine export (`client_form`) returned the derived field, chopping

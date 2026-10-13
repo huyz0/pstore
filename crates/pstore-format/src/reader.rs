@@ -417,12 +417,22 @@ impl Segment {
         let mut wanted: Vec<usize> = rows.iter().copied().filter(|r| *r < n).collect();
         wanted.sort_unstable();
         wanted.dedup();
-        let (Some(span), true) = (
-            self.field_section(name, Section::Vectors),
-            f.kind == 0 && dims > 0 && !wanted.is_empty(),
-        ) else {
+        // A sparse field has no dense rows.
+        if f.kind != 0 {
+            return Ok(BTreeMap::new());
+        }
+        // Nothing asked is nothing read.
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let Some(span) = self.field_section(name, Section::Vectors) else {
             return Ok(BTreeMap::new());
         };
+        // ⚠️ A width of 0 would make `chunks_exact` panic. The writer records no layout for a
+        // zero-width field, so this guards a corrupt `Fields` table.
+        if dims == 0 {
+            return Ok(BTreeMap::new());
+        }
         let width = (dims * 4) as u64;
         let decode = |raw: &[u8]| -> Vec<Vec<f32>> {
             raw.chunks_exact(dims * 4)

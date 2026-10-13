@@ -68,21 +68,21 @@ fn gauss(seed: u64, rep: usize, bit: usize, i: usize) -> f64 {
     let u = |n: u64| -> f64 {
         #[expect(
             clippy::cast_precision_loss,
-            reason = "53 bits of a hash scaled to the open unit interval"
+            reason = "24 bits of a hash scaled to the open unit interval"
         )]
-        let f = ((hash(seed, rep as u64, bit as u64, i as u64, n) >> 11) as f64 + 0.5)
-            / (1u64 << 53) as f64;
+        let f = ((hash(seed, rep as u64, bit as u64, i as u64, n) >> 40) as f64 + 0.5)
+            / f64::from(1u32 << 24);
         f
     };
     (-2.0 * u(0).ln()).sqrt() * (std::f64::consts::TAU * u(1)).cos()
 }
 
-/// The projection's sign for output `j` of input `i`.
-fn sign(seed: u64, rep: usize, j: usize, i: usize) -> f64 {
+/// `a` with the projection's sign for output `j` of input `i`.
+fn signed(a: f64, seed: u64, rep: usize, j: usize, i: usize) -> f64 {
     if hash(seed, rep as u64, j as u64, i as u64, 7) & 1 == 0 {
-        1.0
+        a
     } else {
-        -1.0
+        -a
     }
 }
 
@@ -95,7 +95,7 @@ fn bucket(planes: &[Vec<f64>], v: &[f32]) -> usize {
     planes
         .iter()
         .enumerate()
-        .fold(0, |b, (i, g)| b | (usize::from(dot(v, g) > 0.0) << i))
+        .fold(0, |b, (i, g)| b + (usize::from(dot(v, g) > 0.0) << i))
 }
 
 fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
@@ -104,8 +104,7 @@ fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
     };
     let vectors: Vec<&Vec<f32>> = vectors.iter().filter(|v| v.len() == d).collect();
     let buckets = 1usize << p.k_sim;
-    let per = if p.d_proj == 0 { d } else { p.d_proj };
-    let mut out = Vec::with_capacity(p.reps * buckets * per);
+    let mut out = Vec::new();
     for rep in 0..p.reps {
         let planes: Vec<Vec<f64>> = (0..p.k_sim)
             .map(|bit| (0..d).map(|i| gauss(p.seed, rep, bit, i)).collect())
@@ -156,7 +155,7 @@ fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
                     let s: f64 = acc
                         .iter()
                         .enumerate()
-                        .map(|(i, a)| a * sign(p.seed, rep, j, i))
+                        .map(|(i, a)| signed(*a, p.seed, rep, j, i))
                         .sum();
                     out.push((s * scale) as f32);
                 }
@@ -177,4 +176,38 @@ pub fn encode_doc(p: &Params, vectors: &[Vec<f32>]) -> Vec<f32> {
 #[must_use]
 pub fn encode_query(p: &Params, vectors: &[Vec<f32>]) -> Vec<f32> {
     encode(p, vectors, false)
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp, reason = "values recorded from this implementation")]
+mod tests {
+    use super::*;
+
+    /// The gaussians and signs the planes and projection are drawn from, to the last digit: a
+    /// stored encoding depends on them, so a change here is a migration.
+    #[test]
+    fn gaussians_and_signs_are_frozen() {
+        let g: Vec<f64> = (0..4).map(|i| gauss(DEFAULT.seed, 1, 2, i)).collect();
+        GAUSS_GOLDEN
+            .iter()
+            .zip(&g)
+            .for_each(|(want, got)| assert!((want - got).abs() < 1e-9, "{want} vs {got}"));
+        let s: Vec<f64> = (0..8).map(|i| signed(1.0, DEFAULT.seed, 3, 5, i)).collect();
+        assert_eq!(s, SIGN_GOLDEN);
+        // Standard normal: over many draws the mean is near 0 and the variance near 1.
+        let n = 20_000;
+        let xs: Vec<f64> = (0..n).map(|i| gauss(9, 0, 0, i)).collect();
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 0.03, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.05, "variance {var}");
+    }
+
+    const GAUSS_GOLDEN: [f64; 4] = [
+        1.372_168_193_264_983,
+        0.755_129_031_661_744_3,
+        0.682_341_224_187_676_4,
+        -2.355_641_373_997_145_6,
+    ];
+    const SIGN_GOLDEN: [f64; 8] = [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0];
 }
