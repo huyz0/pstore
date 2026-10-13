@@ -196,6 +196,29 @@ what is already picked`. `lambda` 1 is the fused order; 0 is diversity alone.
   with no `vector`, gives every candidate similarity 0 and `diversify` is then a relevance cut.
 - Not with `as_of`, `rank_by`, `aggregate_by` or `offset`.
 
+## Facets beside a search
+
+A ranked query may carry `facets` ([M65](milestones/M65/SPEC.md)): an aggregation over the
+same `filters`, returned beside the hits in one call.
+
+```json
+{"vector": [...], "filters": [...], "top_k": 10,
+ "facets": {"aggregate_by": {"n": ["Count", "id"]}, "group_by": ["color"], "top_k": 20}}
+```
+
+The response carries `facets` -- M12's `aggregations` object, or its `aggregation_groups`
+list -- and `meta.facets_epoch`.
+
+- ⚠️ **Facets count the filtered set, not the ranked page or window.** `top_k`, `offset`,
+  `boost`, `diversify` and `highlight` do not change them.
+- `facets.top_k` (default 10) bounds the groups, not the hits. Every limit and refusal is
+  M12's, with the message prefixed `facets:`.
+- It runs concurrently with the ranking: depth is the deeper of the two, and the blob
+  requests are the ranking's plus the aggregation's.
+- It is a separate read of HEAD: `meta.facets_epoch` differs from `meta.epoch` only if a fold
+  landed between the two. The consistency level and `as_of` apply to both.
+- Not with `rank_by`, `aggregate_by`, a query with no ranking leg, or inside `queries`.
+
 ## Highlighting
 
 A ranked query with a text leg may carry `highlight` ([M63](milestones/M63/SPEC.md)):

@@ -236,6 +236,9 @@ pub struct QueryRequest {
     /// A window of the ranking diversified by maximal marginal relevance (M64).
     #[serde(default)]
     pub diversify: Option<serde_json::Value>,
+    /// An aggregation beside a ranked query, over its filter (M65).
+    #[serde(default)]
+    pub facets: Option<serde_json::Value>,
     /// The query's terms marked in each result's text (M63).
     #[serde(default)]
     pub highlight: Option<serde_json::Value>,
@@ -355,6 +358,10 @@ pub struct QueryMeta {
     /// How old the HEAD served was: zero unless a `bounded` read took it from the cache
     /// (M11.2). Design rule 10: every response carries the epoch and staleness it was served at.
     pub staleness_ms: u64,
+    /// The epoch the facets were read at (M65): `epoch`, unless a fold landed between the
+    /// two concurrent reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets_epoch: Option<u64>,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g).
@@ -416,6 +423,10 @@ pub struct QueryResponse {
     /// An aggregation with `group_by`: each group's key and totals, ascending by key (M12).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregation_groups: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    /// A ranked query's facets (M65): M12's `aggregations` object, or its groups, over the
+    /// query's filter -- the whole filtered set, not the ranked window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<serde_json::Value>,
     /// Cost and freshness.
     pub meta: QueryMeta,
 }

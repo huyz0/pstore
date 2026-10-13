@@ -31,6 +31,7 @@ use types::Schema as SchemaOut;
 
 mod boost;
 mod diversify;
+mod facets;
 mod highlight;
 mod peers;
 mod replication;
@@ -1635,23 +1636,34 @@ async fn query_index<S: BlobStore + 'static>(
     // sub-query refuses the request, and nothing partial is returned.
     let Some(subs) = raw.get("queries") else {
         let req = parse_query(raw)?;
+        // M65: checked first, so every refusal names `facets`.
+        let facet = facets::derive(&req)?;
         let plan = plan(&req)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
-        let got = api
-            .requesting(
-                tenant,
-                run(&engine, &index, &req, plan, &token, peers.as_ref()).await,
-            )
-            .await?;
+        // ⚠️ Together, never one after the other: depth is the deeper of the two (M65).
+        let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
+        let (got, faceted) = match facet {
+            None => (api.requesting(tenant, ranked.await).await?, None),
+            Some((freq, fplan)) => {
+                let beside = run(&engine, &index, &freq, fplan, &token, None);
+                let both = futures_util::future::try_join(ranked, beside).await;
+                let (got, faceted) = api.requesting(tenant, both).await?;
+                (got, Some(faceted))
+            }
+        };
+        let facets_epoch = faceted.as_ref().map(|f| f.epoch);
+        let facets = faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups));
         let session = got.token.encode();
         return Ok(with_session(
             axum::Json(QueryResponse {
                 results: got.results,
                 aggregations: got.aggregations,
                 aggregation_groups: got.aggregation_groups,
+                facets,
                 meta: QueryMeta {
+                    facets_epoch,
                     epoch: got.epoch,
                     unfolded_hits: got.unfolded_hits,
                     cost: api.spend(tenant).since(before),
@@ -1741,6 +1753,11 @@ fn multi_query(
             if q.get("aggregate_by").is_some() {
                 return Err(ApiError::bad_request(
                     "aggregate_by inside a multi-query is not offered",
+                ));
+            }
+            if q.get("facets").is_some_and(|f| !f.is_null()) {
+                return Err(ApiError::bad_request(
+                    "facets inside a multi-query is not offered",
                 ));
             }
             parse_query(q.clone())
