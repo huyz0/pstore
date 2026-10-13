@@ -5,6 +5,7 @@
 
 pub mod cluster;
 pub mod external;
+pub mod fde_clusters;
 pub mod ladder;
 pub mod lire;
 pub mod rabitq;
