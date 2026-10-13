@@ -43,6 +43,24 @@ pub enum Prefetch {
         /// Rows this leg contributes at most.
         limit: usize,
     },
+    /// A [`Self::Multi`] leg's candidates from its **fixed-dimensional encoding** (M67): the
+    /// query's vectors are encoded and scored by dot product against each row's stored
+    /// encoding (the derived `{field}$fde` field), approximating MaxSim from 2 KB a row instead
+    /// of every vector. With `rerank`, each segment's top `rerank` candidates (at least
+    /// `limit`) are re-scored by exact MaxSim, reading only those rows' vectors.
+    ///
+    /// ⚠️ **`rerank` is two reads in sequence after the leg's**, outside the depth budget as
+    /// any exact rerank is.
+    MultiFde {
+        /// The field whose encoding to search.
+        field: String,
+        /// The query's vectors, as for [`Self::Multi`].
+        query: Vec<Vec<f32>>,
+        /// Rows this leg contributes at most.
+        limit: usize,
+        /// The candidates re-scored exactly, or `None` for the encoding's own scores.
+        rerank: Option<usize>,
+    },
     /// BM25 over the segment's text field.
     ///
     /// ⚠️ `query` is a **`String`**, analyzed at query time. D-73's premise is that the
@@ -690,7 +708,7 @@ async fn run<S: BlobStore + Clone>(
         if !opened.is_empty()
             && prefetch
                 .iter()
-                .any(|p| matches!(p, Prefetch::Multi { field, .. } if nowhere(field)))
+                .any(|p| matches!(p, Prefetch::Multi { field, .. } | Prefetch::MultiFde { field, .. } if nowhere(field)))
         {
             return Err(FormatError::UnknownField.into());
         }
@@ -1236,6 +1254,12 @@ enum Runnable<'a> {
         query: &'a [Vec<f32>],
         limit: usize,
     },
+    MultiFde {
+        field: &'a str,
+        query: &'a [Vec<f32>],
+        limit: usize,
+        rerank: Option<usize>,
+    },
 }
 
 impl Runnable<'_> {
@@ -1280,6 +1304,17 @@ impl Runnable<'_> {
                 query: query.to_vec(),
                 limit,
             },
+            Self::MultiFde {
+                field,
+                query,
+                limit,
+                rerank,
+            } => Prefetch::MultiFde {
+                field: field.to_owned(),
+                query: query.to_vec(),
+                limit,
+                rerank,
+            },
         }
     }
 
@@ -1289,7 +1324,8 @@ impl Runnable<'_> {
             Self::Text { limit, .. }
             | Self::Dense { limit, .. }
             | Self::Sparse { limit, .. }
-            | Self::Multi { limit, .. } => *limit,
+            | Self::Multi { limit, .. }
+            | Self::MultiFde { limit, .. } => *limit,
         }
     }
 
@@ -1325,6 +1361,17 @@ impl Runnable<'_> {
                 field,
                 query,
                 limit: limit + extra,
+            },
+            Self::MultiFde {
+                field,
+                query,
+                limit,
+                rerank,
+            } => Self::MultiFde {
+                field,
+                query,
+                limit: limit + extra,
+                rerank,
             },
             Self::Dense {
                 field,
@@ -1367,6 +1414,17 @@ impl Runnable<'_> {
                 field,
                 query,
                 limit: rows,
+            },
+            Self::MultiFde {
+                field,
+                query,
+                rerank,
+                ..
+            } => Self::MultiFde {
+                field,
+                query,
+                limit: rows,
+                rerank,
             },
             Self::Dense {
                 field, query, tune, ..
@@ -1431,6 +1489,17 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 field,
                 query,
                 limit: *limit,
+            }),
+            Prefetch::MultiFde {
+                field,
+                query,
+                limit,
+                rerank,
+            } => Ok(Self::MultiFde {
+                field,
+                query,
+                limit: *limit,
+                rerank: *rerank,
             }),
             Prefetch::Trigram { .. } => Err(QueryError::Unimplemented("trigram")),
         }
@@ -1705,6 +1774,67 @@ async fn leg<S: BlobStore>(
                 .filter_map(|(row, d)| maxsim(query, d).map(|s| (row, s)))
                 .collect();
             scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            scored.truncate(*limit);
+            Ok(scored
+                .into_iter()
+                .map(|(row, score)| Hit {
+                    segment,
+                    row,
+                    score,
+                })
+                .collect())
+        }
+        Runnable::MultiFde {
+            field,
+            query,
+            limit,
+            rerank,
+        } => {
+            // A segment written before M67 has no encoding and answers nothing, as a segment
+            // without the field does for `multi`.
+            let derived = pstore_format::fde::field_name(field);
+            let (Some(layout), Some(_)) = (
+                opened.segment.field_layout(field),
+                opened.segment.field_layout(&derived),
+            ) else {
+                return Ok(Vec::new());
+            };
+            if layout.kind != 0 {
+                return Err(FormatError::UnknownField.into());
+            }
+            let dims = layout.dims as usize;
+            if let Some(odd) = query.iter().find(|q| q.len() != dims) {
+                return Err(FormatError::DimensionMismatch {
+                    expected: dims,
+                    got: odd.len(),
+                }
+                .into());
+            }
+            let encoded = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, query);
+            // ⚠️ One ranged read: the encodings only, 2 KB a row, in the leg round.
+            let rows = opened.segment.field_vectors(store, key, &derived).await?;
+            let mut scored: Vec<(usize, f32)> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, d)| {
+                    d.first()
+                        .map(|e| (row, e.iter().zip(&encoded).map(|(a, b)| a * b).sum::<f32>()))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if let Some(window) = rerank {
+                scored.truncate((*window).max(*limit));
+                let wanted: Vec<usize> = scored.iter().map(|(r, _)| *r).collect();
+                let exact = opened
+                    .segment
+                    .field_rows(store, key, field, &wanted)
+                    .await?;
+                scored = exact
+                    .iter()
+                    .filter_map(|(row, d)| maxsim(query, d).map(|s| (*row, s)))
+                    .collect();
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
             scored.truncate(*limit);
             Ok(scored
                 .into_iter()

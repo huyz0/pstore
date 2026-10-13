@@ -2917,11 +2917,31 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
         let field = named_field(&m.field)?;
         let query =
             many(&m.vectors).map_err(|why| ApiError::bad_request(format!("multi: {why}")))?;
-        legs.push(pstore_query::Prefetch::Multi {
-            field,
-            query,
-            limit,
-        });
+        let fde = match m.mode.as_ref() {
+            None => false,
+            Some(v) => match v.as_str() {
+                Some("exact") => false,
+                Some("fde") => true,
+                _ => {
+                    return Err(ApiError::bad_request("multi: mode is \"exact\" or \"fde\""));
+                }
+            },
+        };
+        let rerank = multi_rerank(m, fde, limit, req.filters.is_some())?;
+        if fde {
+            legs.push(pstore_query::Prefetch::MultiFde {
+                field,
+                query,
+                limit,
+                rerank,
+            });
+        } else {
+            legs.push(pstore_query::Prefetch::Multi {
+                field,
+                query,
+                limit,
+            });
+        }
     }
     let texts = req.text.as_ref().map(TextIn::queries).unwrap_or_default();
     if req.text.is_some() && !(1..pstore_query::MAX_LEGS).contains(&texts.len()) {
@@ -2959,8 +2979,61 @@ const MAX_FIELD_VECTORS: usize = 1024;
 /// Bytes a named field's name holds at most (M61).
 const MAX_FIELD_NAME: usize = 64;
 
+/// The rerank window of an `fde` multi leg, or `None` for none (M67).
+fn multi_rerank(
+    m: &types::MultiIn,
+    fde: bool,
+    limit: usize,
+    filtered: bool,
+) -> Result<Option<usize>, ApiError> {
+    let bad = |why: &str| ApiError::bad_request(format!("multi: {why}"));
+    let rerank = match m.rerank.as_ref() {
+        None => false,
+        Some(v) if v.as_str() == Some("exact") => true,
+        Some(_) => return Err(bad("rerank is \"exact\"")),
+    };
+    if !rerank {
+        return if m.rerank_window.is_some() {
+            Err(bad("rerank_window needs rerank"))
+        } else {
+            Ok(None)
+        };
+    }
+    if !fde {
+        return Err(bad(
+            "rerank re-scores an fde leg's candidates: it needs mode \"fde\"",
+        ));
+    }
+    // ⚠️ The mask is applied after the leg: a rerank would re-score candidates the filter
+    // then drops, and the survivors would carry the encoding's scores.
+    if filtered {
+        return Err(bad("rerank cannot be combined with filters"));
+    }
+    let window = match m.rerank_window.as_ref() {
+        None => limit.saturating_mul(4).clamp(limit, boost::MAX_WINDOW),
+        Some(w) => w
+            .as_u64()
+            .and_then(|w| usize::try_from(w).ok())
+            .filter(|w| (limit..=boost::MAX_WINDOW).contains(w))
+            .ok_or_else(|| {
+                bad(&format!(
+                    "rerank_window is a whole number from the leg's limit ({limit}) to {}",
+                    boost::MAX_WINDOW
+                ))
+            })?,
+    };
+    Ok(Some(window))
+}
+
 /// A named field's name, or why it cannot be one (M61): `vector` is the dense field's.
 fn named_field(name: &str) -> Result<String, ApiError> {
+    if name.ends_with(pstore_format::fde::FIELD_SUFFIX) {
+        return Err(ApiError::bad_request(format!(
+            "a named vector field's name may not end `{}`: that suffix holds the encoding the \
+             engine derives",
+            pstore_format::fde::FIELD_SUFFIX
+        )));
+    }
     if name.is_empty() || name.len() > MAX_FIELD_NAME {
         return Err(ApiError::bad_request(format!(
             "a named vector field's name is 1 to {MAX_FIELD_NAME} bytes"

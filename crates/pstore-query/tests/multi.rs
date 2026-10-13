@@ -286,3 +286,149 @@ async fn a_multi_leg_is_widened_past_deleted_rows() {
             .collect::<Vec<_>>()
     );
 }
+
+/// M67: a segment written before the encoding existed has no `late$fde`, and answers nothing in
+/// `fde` mode while answering fully in exact mode. One with it answers in both.
+#[tokio::test]
+async fn a_segment_without_the_encoding_answers_nothing() {
+    let store = MemoryStore::new();
+    let build = |name: &'static str, derived: bool| {
+        let store = store.clone();
+        async move {
+            let mut w = SegmentWriter::new(8);
+            for r in 0..20 {
+                let mut d = doc(r);
+                if let (true, Some(VectorField::Dense(vs))) = (derived, d.vectors.get(FIELD)) {
+                    let e = pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, vs);
+                    d.vectors.insert(
+                        pstore_format::fde::field_name(FIELD),
+                        VectorField::Dense(vec![e]),
+                    );
+                }
+                w.push(d);
+            }
+            let key = Key::new(format!("t/idx/{name}.seg"));
+            store.put(&key, w.try_finish().unwrap()).await.unwrap();
+            Target {
+                segment_len: None,
+                centroids: None,
+                deleted: None,
+                sparse_dict: false,
+                text_dict: false,
+                shadowed: false,
+                segment: key,
+            }
+        }
+    };
+    let (with, without) = (build("with", true).await, build("without", false).await);
+    let q = vec![vec![0.2, -0.5, 0.9]];
+    let fde = |rerank| Prefetch::MultiFde {
+        field: FIELD.to_owned(),
+        query: q.clone(),
+        limit: 100,
+        rerank,
+    };
+    let rows_with_vectors = (0..20).filter(|r| !late(*r).is_empty()).count();
+    for (target, fde_rows) in [(&with, rows_with_vectors), (&without, 0)] {
+        let t = std::slice::from_ref(target);
+        let got = query(&store, t, &[fde(None)], raw(), 100).await.unwrap();
+        assert_eq!(got.len(), fde_rows);
+        let got = query(&store, t, &[fde(Some(100))], raw(), 100)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), fde_rows);
+        let got = query(&store, t, &[multi(&q, 100)], raw(), 100)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), rows_with_vectors, "the exact leg is untouched");
+    }
+    // With a rerank window covering the segment, the encoding's candidates are scored exactly.
+    let reranked = query(
+        &store,
+        std::slice::from_ref(&with),
+        &[fde(Some(100))],
+        raw(),
+        100,
+    )
+    .await
+    .unwrap();
+    for h in &reranked {
+        assert_eq!(Some(h.score), maxsim(&q, &late(h.row)), "row {}", h.row);
+    }
+}
+
+/// M67: the leg's score is the dot product of the query's encoding and the row's, and shadowed
+/// rows are made up for by the widened limit.
+#[tokio::test]
+async fn fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced() {
+    let store = MemoryStore::new();
+    let mut w = SegmentWriter::new(8);
+    for r in 0..30 {
+        let mut d = doc(r);
+        if let Some(VectorField::Dense(vs)) = d.vectors.get(FIELD) {
+            let e = pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, vs);
+            d.vectors.insert(
+                pstore_format::fde::field_name(FIELD),
+                VectorField::Dense(vec![e]),
+            );
+        }
+        w.push(d);
+    }
+    let key = Key::new("t/idx/f.seg");
+    store.put(&key, w.try_finish().unwrap()).await.unwrap();
+    let target = Target {
+        segment_len: None,
+        centroids: None,
+        deleted: None,
+        sparse_dict: false,
+        text_dict: false,
+        shadowed: false,
+        segment: key,
+    };
+    let q = vec![vec![0.2, -0.5, 0.9], vec![-0.7, 0.1, 0.3]];
+    let leg = |limit| Prefetch::MultiFde {
+        field: FIELD.to_owned(),
+        query: q.clone(),
+        limit,
+        rerank: None,
+    };
+    let encoded = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, &q);
+    let hits = query(
+        &store,
+        std::slice::from_ref(&target),
+        &[leg(100)],
+        raw(),
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(!hits.is_empty());
+    for h in &hits {
+        let d = pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, &late(h.row));
+        let want: f32 = d.iter().zip(&encoded).map(|(a, b)| a * b).sum();
+        assert_eq!(h.score.to_bits(), want.to_bits(), "row {}", h.row);
+    }
+    // Shadow the leg's two best rows in a shadowed segment: the limit of 3 is still met.
+    let top: Vec<usize> = hits.iter().take(2).map(|h| h.row).collect();
+    let shadow: std::collections::HashSet<String> = top.iter().map(|r| format!("d{r}")).collect();
+    let shadowed = Target {
+        shadowed: true,
+        ..target.clone()
+    };
+    let got = pstore_query::query_rows_split(
+        &store,
+        std::slice::from_ref(&shadowed),
+        &[leg(3)],
+        &pstore_format::text::FullText::default(),
+        None,
+        &shadow,
+        raw(),
+        3,
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.len(), 3, "widened past the shadowed rows");
+    assert!(got.iter().all(|(h, ..)| !top.contains(&h.row)));
+}

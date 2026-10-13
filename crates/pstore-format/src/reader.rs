@@ -390,6 +390,119 @@ impl Segment {
         decode_field(&raw, &f, self.rows as usize)
     }
 
+    /// The named rows of a dense field, each as its vectors, reading only those rows (M67).
+    ///
+    /// A fixed-width field (one vector a row) is a computable range a row. A variable-width
+    /// one has its `rows + 1` offsets read first -- only the two the row needs, coalesced --
+    /// and then the vectors' ranges: **two reads in sequence**, which is why this serves the
+    /// opt-in rerank and no query's budgeted rounds. A row past the end, or a field that is
+    /// sparse, comes back absent.
+    ///
+    /// # Errors
+    /// [`FormatError::UnknownField`] for a field this segment lacks; a store failure; or a
+    /// corrupt offset table.
+    pub async fn field_rows<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        name: &str,
+        rows: &[usize],
+    ) -> Result<BTreeMap<usize, Vec<Vec<f32>>>, FormatError> {
+        let f = self
+            .field_layout(name)
+            .ok_or(FormatError::UnknownField)?
+            .clone();
+        let n = self.rows as usize;
+        let dims = f.dims as usize;
+        let mut wanted: Vec<usize> = rows.iter().copied().filter(|r| *r < n).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let (Some(span), true) = (
+            self.field_section(name, Section::Vectors),
+            f.kind == 0 && dims > 0 && !wanted.is_empty(),
+        ) else {
+            return Ok(BTreeMap::new());
+        };
+        let width = (dims * 4) as u64;
+        let decode = |raw: &[u8]| -> Vec<Vec<f32>> {
+            raw.chunks_exact(dims * 4)
+                .map(|v| {
+                    v.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                        .collect()
+                })
+                .collect()
+        };
+        let mut out = BTreeMap::new();
+        if f.per_row != 0 {
+            let ranges: Vec<std::ops::Range<u64>> = wanted
+                .iter()
+                .map(|r| {
+                    let lo = span.start + *r as u64 * width;
+                    lo..lo + width
+                })
+                .collect();
+            for (row, raw) in wanted.iter().zip(store.get_ranges(key, &ranges).await?) {
+                out.insert(*row, decode(&raw));
+            }
+            return Ok(out);
+        }
+        let table = (n as u64 + 1) * 8;
+        let pairs: Vec<std::ops::Range<u64>> = wanted
+            .iter()
+            .map(|r| {
+                let at = span.start + *r as u64 * 8;
+                at..at + 16
+            })
+            .collect();
+        let mut ranges = Vec::with_capacity(wanted.len());
+        for raw in store.get_ranges(key, &pairs).await? {
+            let (lo, hi) = raw
+                .get(..8)
+                .zip(raw.get(8..16))
+                .map(|(a, b)| {
+                    (
+                        u64::from_le_bytes(a.try_into().unwrap_or([0; 8])),
+                        u64::from_le_bytes(b.try_into().unwrap_or([0; 8])),
+                    )
+                })
+                .ok_or(FormatError::Truncated)?;
+            let (from, to) = (
+                span.start
+                    .checked_add(table)
+                    .and_then(|t| t.checked_add(lo)),
+                span.start
+                    .checked_add(table)
+                    .and_then(|t| t.checked_add(hi)),
+            );
+            match (from, to) {
+                (Some(from), Some(to)) if lo <= hi && to <= span.end => ranges.push(from..to),
+                _ => return Err(FormatError::Truncated),
+            }
+        }
+        // An empty range is neither fetched nor returned, so a row with no vectors is skipped
+        // here and read as empty below, never paired with another row's bytes.
+        let nonempty: Vec<(usize, std::ops::Range<u64>)> = wanted
+            .iter()
+            .copied()
+            .zip(ranges)
+            .filter(|(_, r)| r.start < r.end)
+            .collect();
+        let fetch: Vec<std::ops::Range<u64>> = nonempty.iter().map(|(_, r)| r.clone()).collect();
+        let bufs = if fetch.is_empty() {
+            Vec::new()
+        } else {
+            store.get_ranges(key, &fetch).await?
+        };
+        for row in &wanted {
+            out.insert(*row, Vec::new());
+        }
+        for ((row, _), raw) in nonempty.into_iter().zip(bufs) {
+            out.insert(row, decode(&raw));
+        }
+        Ok(out)
+    }
+
     /// The byte offset just past the last data block.
     ///
     /// Data blocks are addressed by the index rather than by the directory, so nothing else

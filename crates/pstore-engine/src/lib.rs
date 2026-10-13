@@ -105,6 +105,10 @@ fn client_form(mut d: Document, reason: Option<String>) -> Quarantined {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     d.attrs.retain(|k, _| !k.starts_with('$'));
+    // M67: a row is served as written; the encoding is the engine's, and a client could not
+    // write it back.
+    d.vectors
+        .retain(|name, _| !name.ends_with(pstore_format::fde::FIELD_SUFFIX));
     if metric == Metric::EuclideanSquared {
         for field in d.vectors.values_mut() {
             if let pstore_format::VectorField::Dense(vs) = field {
@@ -2397,6 +2401,18 @@ impl<S: BlobStore> Engine<S> {
                     d.id
                 )));
             }
+            if let Some(name) = d
+                .vectors
+                .keys()
+                .find(|k| k.ends_with(pstore_format::fde::FIELD_SUFFIX))
+            {
+                return Err(EngineError::Format(format!(
+                    "document {}: vector field `{name}` is reserved: names ending `{}` hold an \
+                     encoding the engine derives",
+                    d.id,
+                    pstore_format::fde::FIELD_SUFFIX
+                )));
+            }
             for field in d.vectors.values_mut() {
                 if let pstore_format::VectorField::Dense(vs) = field {
                     for v in vs.iter_mut() {
@@ -2406,6 +2422,23 @@ impl<S: BlobStore> Engine<S> {
                     }
                 }
             }
+            // M67: a named field's fixed-dimensional encoding, of the vectors as stored, so
+            // a query transformed the same way meets it. `vector` is searched by its own index.
+            let derived: Vec<(String, pstore_format::VectorField)> =
+                d.vectors
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != pstore_format::DEFAULT_FIELD)
+                    .filter_map(|(name, field)| match field {
+                        pstore_format::VectorField::Dense(vs) if !vs.is_empty() => Some((
+                            pstore_format::fde::field_name(name),
+                            pstore_format::VectorField::Dense(vec![
+                                pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, vs),
+                            ]),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+            d.vectors.extend(derived);
             if metric != Metric::DotProduct {
                 d.attrs.insert(
                     METRIC_ATTR.to_owned(),
@@ -4876,6 +4909,11 @@ impl<S: BlobStore> Engine<S> {
                     out.push(d);
                 }
             }
+            // M67: a document is served as it was written; the encoding is the engine's.
+            for d in &mut out {
+                d.vectors
+                    .retain(|name, _| !name.ends_with(pstore_format::fde::FIELD_SUFFIX));
+            }
             return Ok(out);
         }
         Err(EngineError::Lost)
@@ -6410,10 +6448,12 @@ fn shares(
 ) -> Vec<pstore_query::Elsewhere<'static>> {
     // ⚠️ A `multi` leg is not split (M61): the part protocol carries no such leg, so a share
     // would answer without it. The whole query runs here (backlog row 64).
-    if prefetch
-        .iter()
-        .any(|p| matches!(p, pstore_query::Prefetch::Multi { .. }))
-    {
+    if prefetch.iter().any(|p| {
+        matches!(
+            p,
+            pstore_query::Prefetch::Multi { .. } | pstore_query::Prefetch::MultiFde { .. }
+        )
+    }) {
         return Vec::new();
     }
     let text: Vec<&String> = prefetch
@@ -6646,6 +6686,21 @@ fn scored_by(
                     .ok_or_else(|| EngineError::Unmeasurable("the query".to_owned()))?,
                 limit: *limit,
             }),
+            pstore_query::Prefetch::MultiFde {
+                field,
+                query,
+                limit,
+                rerank,
+            } => Ok(pstore_query::Prefetch::MultiFde {
+                field: field.clone(),
+                query: query
+                    .iter()
+                    .map(|q| transform_query(metric, q))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| EngineError::Unmeasurable("the query".to_owned()))?,
+                limit: *limit,
+                rerank: *rerank,
+            }),
             other => Ok(other.clone()),
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
@@ -6662,7 +6717,8 @@ fn query_error(
     // Only `run`'s refusal of a `multi` leg's field is the client's: a dense leg's missing
     // field is a segment without the index's vectors, which is ours.
     let multi = prefetch.iter().find_map(|p| match p {
-        pstore_query::Prefetch::Multi { field, .. } => Some(field.clone()),
+        pstore_query::Prefetch::Multi { field, .. }
+        | pstore_query::Prefetch::MultiFde { field, .. } => Some(field.clone()),
         _ => None,
     });
     match (e, multi) {

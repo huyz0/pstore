@@ -195,6 +195,16 @@ pub struct MultiIn {
     /// The query's vectors, each spelled as `vector` is.
     #[serde(deserialize_with = "many_vectors")]
     pub vectors: Vec<Vec<f32>>,
+    /// `"exact"` (the default) or `"fde"`: candidates from the fixed-dimensional encoding
+    /// (M67).
+    #[serde(default)]
+    pub mode: Option<serde_json::Value>,
+    /// With `mode: "fde"`, `"exact"` re-scores the candidates by MaxSim (M67).
+    #[serde(default)]
+    pub rerank: Option<serde_json::Value>,
+    /// The candidates a rerank re-scores a segment (M67).
+    #[serde(default)]
+    pub rerank_window: Option<serde_json::Value>,
 }
 
 fn some_vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {

@@ -785,10 +785,15 @@ async fn a_multi_query_is_not_split() {
     };
     fill_with(&store, &servers[0].api, &urls(&servers), 8, late).await;
     let multi = json!({"field": "late", "vectors": [[0.5, 0.25]]});
+    let fde = json!({"field": "late", "vectors": [[0.5, 0.25]], "mode": "fde"});
     for q in [
         json!({"multi": multi, "top_k": 10}),
         json!({"multi": multi, "text": "word2", "top_k": 10}),
         json!({"multi": multi, "vector": Q, "top_k": 10}),
+        // M67: the encoding's leg is not split either, beside a leg that would be.
+        json!({"multi": fde, "top_k": 10}),
+        json!({"multi": fde, "text": "word2", "top_k": 10}),
+        json!({"multi": fde, "vector": Q, "top_k": 10}),
     ] {
         let (s0, want) = query(&alone.api, &q).await;
         assert_eq!(s0, 200, "{q}: {want}");

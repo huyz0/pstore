@@ -143,8 +143,7 @@ RRF; `sum` and `max` refuse it.
 - ⚠️ **A `multi` query reads every vector of the field, in every segment.** It is exact and
   stays four rounds deep, but its bytes are the field's whole size: 100 vectors a document at
   128 dimensions is 51 KB a document, so a million-document index reads about 51 GB a query.
-  Keep fields small, or the index small, until candidates come from quantized codes (backlog
-  row 63).
+  Use `"mode": "fde"` (below), or keep fields small.
 - **CPU is `m × n × d` a row**, query vectors by document vectors by dimensions, spread over
   the server's workers a segment each (M59).
 - **A field holds one width an index.** The door refuses a width that disagrees with rows this
@@ -157,6 +156,32 @@ RRF; `sum` and `max` refuse it.
 - **Not split** across peers (backlog row 64).
 - **A segment's export or compaction reads each named field in a round of its own.** Queries
   never do.
+
+### Candidates from a fixed-dimensional encoding
+
+`"mode": "fde"` on a `multi` leg ([M67](milestones/M67/SPEC.md), MUVERA) scores each row by one
+dot product against a 512-float encoding of its vectors, written beside the field as
+`{name}$fde`, instead of by MaxSim over all of them. Approximate; the encoding is 2 KB a
+document whatever the vector count, so the leg reads a fraction of the field: 64 vectors of 128
+dimensions is 16 times fewer bytes.
+
+```json
+{"multi": {"field": "late", "vectors": [[…]], "mode": "fde",
+           "rerank": "exact", "rerank_window": 40}, "top_k": 10}
+```
+
+- ⚠️ **`rerank: "exact"` is outside the depth budget:** each segment takes its top
+  `rerank_window` (default `4 × top_k`, at most 1,000) by encoding and re-scores them by MaxSim,
+  after the leg's own read, in two more reads in sequence. It reads only those rows' vectors.
+  Without `rerank` the scores are the encoding's own. `rerank` cannot be combined with
+  `filters`, which are applied after the leg.
+- ⚠️ **Documents written before M67 have no encoding** and are invisible to `fde` mode until
+  they are rewritten; exact mode still finds them.
+- A field name ending `$fde` is refused, and no read returns the derived field. The encoding's
+  parameters are fixed (4 repetitions of 8 buckets of 16 dimensions): changing them would
+  invalidate every stored encoding.
+- It is a flat scan of the encodings, not an index (backlog row 65), and not split across
+  peers (row 64).
 
 ## Boosting a ranking
 

@@ -31,7 +31,7 @@ For a set of `d`-dimensional vectors, `R` repetitions each do:
    vector of the document whose bucket id is nearest by Hamming distance (the earliest on a
    tie).
 3. **Project** each bucket's vector to `d_proj` dimensions by a random sign matrix
-   (`±1/√d_proj`); when `d <= d_proj` it is kept as is.
+   (`±1/√d_proj`), always -- so the width does not depend on `d` (`d_proj = 0`, used by tests, keeps `d`).
 4. **Concatenate** buckets, then repetitions: `R · B · d_proj` floats.
 
 The dot product of a query's and a document's encodings approximates the Chamfer similarity
@@ -44,8 +44,9 @@ document**, whatever the vectors' count or `d`. The seed derives from `(rep, d)`
 
 ## Delta
 
-1. **Write.** For every named field `name` a document carries, the server also writes the
-   encoding as a derived single-vector field **`name$fde`** (dense, 512 floats).
+1. **Write.** For every named field `name` a document carries, the engine's write also
+   derives the encoding, of the vectors as stored (after the metric's transform), as a
+   single-vector field **`name$fde`** (dense, 512 floats).
    - A field name ending in `$fde` is refused `400` (it is the derived field's), and the
      derived fields count against no limit of the document's: a document may hold 8 fields of
      its own and 8 derived.
@@ -66,9 +67,9 @@ document**, whatever the vectors' count or `d`. The seed derives from `(rep, d)`
      segment without the field answers nothing for `multi`; the docs say **documents written
      before M67 are invisible to `fde` mode** until they are rewritten.
    - Refused `400`: an unknown `mode`; `rerank` without `mode: "fde"`; any value of `rerank`
-     but `"exact"`; `rerank_window` without `rerank` or outside `limit..=1000`... (see AC).
+     but `"exact"`; `rerank_window` without `rerank` or outside `limit..=1000`; and `rerank` beside `filters` (the mask is applied after the leg, so a rerank would re-score rows the filter then drops).
 3. **One implementation,** `pstore_format::fde` (`encode_doc`, `encode_query`, and the
-   parameters), used by the server's write and the query layer's leg, so the two cannot
+   parameters), used by the engine's write and the query layer's leg, so the two cannot
    disagree about a bucket.
 4. **Reading rows.** `Segment::field_rows(store, key, name, rows)` reads the named field's
    offsets table and then only the named rows' ranges (coalesced), for the rerank.
@@ -86,7 +87,7 @@ the leg across peers (row 64); rebuilding old documents' encodings.
      twice and in a different process-independent order of calls; the width is 512 for `d` of
      8, 16 and 128 and for 1 and 1,000 vectors; a query and a document of the same vectors
      differ only as sum versus mean.
-   - `fde_with_one_bucket_is_sum_and_mean`: with parameters `k = 0`, `d_proj >= d` the
+   - `fde_with_one_bucket_is_sum_and_mean`: with parameters `k = 0`, `d_proj = 0` the
      document encoding is the mean of its vectors, the query's their sum, and their dot
      product is `Σ_q q · mean(d)`, by hand on a small example. (Parameters are an argument
      of the functions; the leg uses the fixed ones.)
@@ -132,7 +133,8 @@ the leg across peers (row 64); rebuilding old documents' encodings.
 
 ## RA budget
 
-- Write: +2 KB a document per named field, one dense field in the segment.
+- Write: +2 KB a document per named field, one dense field in the segment; about 65 thousand
+  hash mixes per field per document at 128 dimensions.
 - `fde` leg: one ranged read of `rows × (512 × 4 + 8)` bytes a segment, in the leg round,
   concurrent with the other legs. Depth unchanged. CPU: `rows × 512` multiply-adds.
 - `rerank: exact`: +2 sequential reads a segment (the offsets table, then the candidates),

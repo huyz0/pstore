@@ -54,6 +54,12 @@ async fn two_writers_widths_meet_in_the_fold() {
         doc("b", 2).field("late"),
         "quarantined intact"
     );
+    // M67: the encoding the engine derived is not part of the row a client could write again.
+    assert_eq!(
+        q.rows[0].document.vectors,
+        doc("b", 2).vectors,
+        "no derived field in the export"
+    );
     let multi = Prefetch::Multi {
         field: "late".to_owned(),
         query: vec![vec![1.0, 0.0, 0.0]],
@@ -117,4 +123,38 @@ async fn a_patch_beside_a_new_width_never_stops_the_fold() {
     e.write("docs", vec![doc("y", 4)]).await.unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_named_field_holding_no_vectors_derives_no_encoding() {
+    // M67: the engine's write encodes a named field's vectors; with none there is nothing to
+    // encode, and the row still writes, folds and is served as written.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let mut empty = Document::new("e", vec![1.0, 0.5, 0.25, 0.125]);
+    empty
+        .vectors
+        .insert("late".to_owned(), VectorField::Dense(Vec::new()));
+    e.write("docs", vec![doc("a", 3), empty]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let fde = Prefetch::MultiFde {
+        field: "late".to_owned(),
+        query: vec![vec![1.0, 0.0, 0.0]],
+        limit: 10,
+        rerank: None,
+    };
+    let answer = e
+        .query("docs", &[fde], Fusion::default(), 10)
+        .await
+        .unwrap();
+    let ids: BTreeSet<String> = answer.ids.into_iter().flatten().collect();
+    assert_eq!(ids, BTreeSet::from(["a".to_owned()]));
+    let rows = e.scan("docs", None).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|d| d.vectors.keys().all(|k| !k.ends_with("$fde")))
+    );
 }
