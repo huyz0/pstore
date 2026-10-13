@@ -1,0 +1,142 @@
+//! Vectors read in place out of an object the customer owns (M68, OQ-169).
+//!
+//! A row's vector is addressable by a ranged read exactly when the column is fixed-width and
+//! uncompressed, so its range is **computed**, not looked up. The object is **pinned** at
+//! the length and CAS tag it had when the column was recorded: Parquet and Lance never mutate
+//! a file in place, so a changed object is a different dataset and a read refuses it.
+
+use pstore_blob::{BlobError, BlobStore, Key};
+use pstore_types::CasTag;
+use std::collections::BTreeMap;
+use std::ops::Range;
+
+/// Why a column could not be pinned or read.
+#[derive(Debug, thiserror::Error)]
+pub enum ExternalError {
+    /// The column's shape is impossible or does not fit in the object.
+    #[error("external column does not fit: {0}")]
+    Shape(&'static str),
+    /// The object is no longer the one the column was pinned to.
+    #[error("the external object changed since it was pinned")]
+    Changed,
+    /// The store failed.
+    #[error("external object: {0}")]
+    Blob(#[from] BlobError),
+}
+
+/// A column of fixed-width `f32` vectors inside an external object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalColumn {
+    /// The object's key.
+    pub key: String,
+    /// The byte offset of row 0's vector.
+    pub base: u64,
+    /// Components in a vector.
+    pub dims: u32,
+    /// Bytes from one row's start to the next's: at least `dims * 4`.
+    pub stride: u64,
+    /// Rows in the column.
+    pub rows: u64,
+    /// The object's length when pinned.
+    pub len: u64,
+    /// The object's CAS tag when pinned, if the store has one.
+    pub tag: Option<CasTag>,
+}
+
+impl ExternalColumn {
+    /// Bytes a vector occupies.
+    fn width(&self) -> u64 {
+        u64::from(self.dims) * 4
+    }
+
+    /// Where row `row`'s vector is, or `None` past the column.
+    #[must_use]
+    pub fn row_range(&self, row: usize) -> Option<Range<u64>> {
+        let row = u64::try_from(row).ok().filter(|r| *r < self.rows)?;
+        let start = self.base.checked_add(row.checked_mul(self.stride)?)?;
+        Some(start..start.checked_add(self.width())?)
+    }
+
+    /// Records the object's length and tag, refusing a column that cannot fit in it.
+    ///
+    /// # Errors
+    /// [`ExternalError::Shape`] for zero dims, a stride under the vector's width, an overflow,
+    /// or a last row past the object's end; a store failure.
+    pub async fn pin<S: BlobStore>(
+        store: &S,
+        key: &Key,
+        base: u64,
+        dims: u32,
+        stride: u64,
+        rows: u64,
+    ) -> Result<Self, ExternalError> {
+        let len = store.head(key).await?;
+        let tag = store.get_tag(key).await?;
+        let col = Self {
+            key: key.as_str().to_owned(),
+            base,
+            dims,
+            stride,
+            rows,
+            len,
+            tag,
+        };
+        if dims == 0 {
+            return Err(ExternalError::Shape("zero dimensions"));
+        }
+        if stride < col.width() {
+            return Err(ExternalError::Shape("stride is narrower than a vector"));
+        }
+        if rows > 0 {
+            let end = (rows - 1)
+                .checked_mul(stride)
+                .and_then(|o| o.checked_add(base))
+                .and_then(|o| o.checked_add(col.width()))
+                .ok_or(ExternalError::Shape("offsets overflow"))?;
+            if end > len {
+                return Err(ExternalError::Shape("the last row ends past the object"));
+            }
+        }
+        Ok(col)
+    }
+
+    /// The named rows' vectors, read by ranged read. Duplicates and rows past the column are
+    /// dropped; nothing asked reads nothing.
+    ///
+    /// # Errors
+    /// [`ExternalError::Changed`] if the object's length or tag moved since the pin; a store
+    /// failure.
+    pub async fn read_rows<S: BlobStore>(
+        &self,
+        store: &S,
+        rows: &[usize],
+    ) -> Result<BTreeMap<usize, Vec<f32>>, ExternalError> {
+        let mut wanted: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|r| self.row_range(*r).is_some())
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let key = Key::new(self.key.clone());
+        if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
+            return Err(ExternalError::Changed);
+        }
+        let ranges: Vec<Range<u64>> = wanted.iter().filter_map(|r| self.row_range(*r)).collect();
+        let bufs = store.get_ranges(&key, &ranges).await?;
+        Ok(wanted
+            .into_iter()
+            .zip(bufs)
+            .map(|(row, raw)| {
+                let v = raw
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                    .collect();
+                (row, v)
+            })
+            .collect())
+    }
+}

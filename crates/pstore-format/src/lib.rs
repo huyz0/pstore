@@ -18,6 +18,7 @@
 mod codec;
 pub mod datetime;
 mod docs;
+pub mod external;
 pub mod fde;
 pub mod geo;
 mod reader;

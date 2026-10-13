@@ -138,7 +138,7 @@ order, smallest and most certain first:
 | 69 | **Facets beside a search**: an aggregation over the filter's rows, answered with a ranked query (Milvus 3.0, Elasticsearch). M65. | comparison | S |
 | 70 | **Geo**: radius and box filters over a `[lat, lon]` attribute, and a geo decay boost (Elasticsearch, Vespa, Weaviate, Qdrant). M66. | comparison | M |
 | 71 | **Multi-vector at scale** by a fixed-dimensional encoding (MUVERA, as Weaviate ships it), clustered as a dense field, with exact MaxSim over its candidates. Closes rows 63 and 65. M67. | comparison | L |
-| 72 | **Index data in place in the customer's bucket** (Parquet, Lance; Milvus 3.0's lake-native turn). An open question first, [OQ-169](../research/00-plan/open-questions.md), not a spec. | comparison | L |
+| 72 | **Index data in place in the customer's bucket** (Parquet, Lance; Milvus 3.0's lake-native turn). [OQ-169](../research/00-plan/open-questions.md) answered and its read path delivered by [M68](M68/SPEC.md) (a pinned external column). Open: footer/manifest readers, HEAD naming a source, an index over the column. | comparison | L |
 
 ## Opened by M61
 
