@@ -22,6 +22,20 @@ pub enum ExternalError {
     /// The store failed.
     #[error("external object: {0}")]
     Blob(#[from] BlobError),
+    /// A Parquet file or column that cannot be read in place.
+    #[error("{0}")]
+    Parquet(#[from] crate::parquet::ParquetError),
+}
+
+/// A run of contiguous vectors: rows `first_row..first_row + rows`, the first at `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// The first row the run holds.
+    pub first_row: u64,
+    /// Rows in the run.
+    pub rows: u64,
+    /// The byte offset of the run's first vector.
+    pub offset: u64,
 }
 
 /// A column of fixed-width `f32` vectors inside an external object.
@@ -41,6 +55,10 @@ pub struct ExternalColumn {
     pub len: u64,
     /// The object's CAS tag when pinned, if the store has one.
     pub tag: Option<CasTag>,
+    /// The column as runs of contiguous vectors (a Parquet file's data pages, M70). Empty means
+    /// the single run `base`, `stride`, `rows`; otherwise `base` and `stride` are unused and the
+    /// vectors in a run are `dims * 4` bytes apart.
+    pub extents: Vec<Extent>,
 }
 
 impl ExternalColumn {
@@ -53,6 +71,17 @@ impl ExternalColumn {
     #[must_use]
     pub fn row_range(&self, row: usize) -> Option<Range<u64>> {
         let row = u64::try_from(row).ok().filter(|r| *r < self.rows)?;
+        if !self.extents.is_empty() {
+            let i = self
+                .extents
+                .partition_point(|e| e.first_row <= row)
+                .checked_sub(1)?;
+            let e = self.extents.get(i)?;
+            let start = e
+                .offset
+                .checked_add((row - e.first_row).checked_mul(self.width())?)?;
+            return Some(start..start.checked_add(self.width())?);
+        }
         let start = self.base.checked_add(row.checked_mul(self.stride)?)?;
         Some(start..start.checked_add(self.width())?)
     }
@@ -80,6 +109,7 @@ impl ExternalColumn {
             rows,
             len,
             tag,
+            extents: Vec::new(),
         };
         if dims == 0 {
             return Err(ExternalError::Shape("zero dimensions"));
@@ -98,6 +128,73 @@ impl ExternalColumn {
             }
         }
         Ok(col)
+    }
+
+    /// Pins the column `column` of the Parquet object at `key`, found in its footer (M70).
+    ///
+    /// # Errors
+    /// [`ExternalError::Parquet`] for a file or column that cannot be read in place; a store
+    /// failure.
+    pub async fn pin_parquet<S: BlobStore>(
+        store: &S,
+        key: &Key,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let found = crate::parquet::locate(store, key, column).await?;
+        let tag = store.get_tag(key).await?;
+        if store.head(key).await? != found.len {
+            return Err(ExternalError::Changed);
+        }
+        Self::from_extents(key.as_str(), found.dims, found.len, tag, found.extents)
+    }
+
+    /// A column of `extents`, checked: non-empty, no zero-row run, rows contiguous from 0,
+    /// every run inside the object.
+    ///
+    /// # Errors
+    /// [`ExternalError::Shape`] for any of those.
+    pub fn from_extents(
+        key: &str,
+        dims: u32,
+        len: u64,
+        tag: Option<CasTag>,
+        extents: Vec<Extent>,
+    ) -> Result<Self, ExternalError> {
+        if dims == 0 {
+            return Err(ExternalError::Shape("zero dimensions"));
+        }
+        let width = u64::from(dims) * 4;
+        let mut next = 0u64;
+        for e in &extents {
+            let end = e
+                .rows
+                .checked_mul(width)
+                .and_then(|b| b.checked_add(e.offset))
+                .ok_or(ExternalError::Shape("offsets overflow"))?;
+            if e.rows == 0 {
+                return Err(ExternalError::Shape("a run holds no rows"));
+            }
+            if e.first_row != next {
+                return Err(ExternalError::Shape("runs are not contiguous from row 0"));
+            }
+            if end > len {
+                return Err(ExternalError::Shape("a run ends past the object"));
+            }
+            next += e.rows;
+        }
+        if extents.is_empty() {
+            return Err(ExternalError::Shape("no runs"));
+        }
+        Ok(Self {
+            key: key.to_owned(),
+            base: 0,
+            dims,
+            stride: width,
+            rows: next,
+            len,
+            tag,
+            extents,
+        })
     }
 
     /// The named rows' vectors, read by ranged read. Duplicates and rows past the column are

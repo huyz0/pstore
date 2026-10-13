@@ -8,10 +8,10 @@
 
 use crate::rabitq::{QuantError, Quantizer};
 use pstore_blob::{BlobError, BlobStore, Key};
-use pstore_format::external::{ExternalColumn, ExternalError};
+use pstore_format::external::{Extent, ExternalColumn, ExternalError};
 use pstore_types::CasTag;
 
-const MAGIC: &[u8; 4] = b"PXI1";
+const MAGIC: &[u8; 4] = b"PXI2";
 
 /// Why an external index could not be built, opened or searched.
 #[derive(Debug)]
@@ -134,6 +134,12 @@ impl ExternalIndex {
                 b.extend(t.as_str().as_bytes());
             }
         }
+        b.extend((c.extents.len() as u32).to_le_bytes());
+        for e in &c.extents {
+            for n in [e.first_row, e.rows, e.offset] {
+                b.extend(n.to_le_bytes());
+            }
+        }
         b.extend(&self.codes);
         b
     }
@@ -180,6 +186,15 @@ impl ExternalIndex {
             }
             _ => return Err(bad("bad tag flag")),
         };
+        let n = r.u32().ok_or(bad("truncated"))? as usize;
+        let mut extents = Vec::new();
+        for _ in 0..n {
+            extents.push(Extent {
+                first_row: r.u64().ok_or(bad("truncated"))?,
+                rows: r.u64().ok_or(bad("truncated"))?,
+                offset: r.u64().ok_or(bad("truncated"))?,
+            });
+        }
         let quantizer = Quantizer::new(dims as usize);
         let want = usize::try_from(rows)
             .ok()
@@ -188,6 +203,14 @@ impl ExternalIndex {
         let codes = r.rest();
         if dims == 0 || codes.len() != want {
             return Err(bad("codes are not rows × code length"));
+        }
+        if !extents.is_empty() {
+            let checked =
+                ExternalColumn::from_extents(&key, dims, len, tag.clone(), extents.clone())
+                    .map_err(|_| bad("the runs do not fit the object"))?;
+            if checked.rows != rows {
+                return Err(bad("the runs hold a different number of rows"));
+            }
         }
         Ok(Self {
             column: ExternalColumn {
@@ -198,10 +221,18 @@ impl ExternalIndex {
                 rows,
                 len,
                 tag,
+                extents,
             },
             quantizer,
             codes: codes.to_vec(),
         })
+    }
+
+    /// Runs the pinned column is made of: 0 for a single run.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn extent_count(&self) -> usize {
+        self.column.extents.len()
     }
 
     /// This index's codes over another column (a test's control: right codes, wrong rows).

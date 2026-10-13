@@ -323,3 +323,77 @@ async fn a_tagless_pin_round_trips_and_errors_say_what_they_are() {
     bad[at] = 7;
     assert!(ExternalIndex::from_bytes(&bad).is_err());
 }
+
+#[tokio::test]
+async fn an_index_over_a_parquet_file_finds_the_exact_neighbours() {
+    // `multipage.parquet` was written by pyarrow: 2,600 required FIXED_LEN_BYTE_ARRAY(32) rows
+    // in several data pages. `multipage.vectors.f32` holds the floats the generator wrote.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let file = std::fs::read(format!("{dir}multipage.parquet")).unwrap();
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(all.len(), 2_600);
+    let store = MemoryStore::new();
+    let key = Key::new("lake/multipage.parquet");
+    store.put(&key, file.clone().into()).await.unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(col.extents.len() > 1);
+    let built = ExternalIndex::build(&store, &codes_key(), col, 700)
+        .await
+        .unwrap();
+    let index = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    assert_eq!(
+        built.to_bytes(),
+        index.to_bytes(),
+        "the runs survive the blob"
+    );
+    for qi in [0usize, 999, 1024, 2_599] {
+        let q = &all[qi];
+        let mut exact: Vec<(usize, f64)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, cosine(q, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        // A window over every row makes the rerank exact.
+        let got = index.search(&store, q, 10, 2_600).await.unwrap();
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        assert_eq!(
+            got.iter().map(|g| g.0).collect::<Vec<_>>(),
+            want,
+            "query {qi}"
+        );
+        assert_eq!(got[0].0, qi, "a row is its own nearest neighbour");
+    }
+    // A changed object is refused.
+    let mut other = file;
+    other[4] ^= 0xFF;
+    store.put(&key, other.into()).await.unwrap();
+    assert!(index.search(&store, &all[0], 3, 50).await.is_err());
+    // Damage to the runs in the blob is refused: the first run's row count.
+    let blob = built.to_bytes();
+    let mut bad = blob.clone();
+    // Walk to the first run's row count: magic, dims, rows, key, base/stride/len, the tag, the
+    // run count, then `first_row`, then `rows`.
+    let mut at = 4 + 4 + 8 + 4 + "lake/multipage.parquet".len() + 24;
+    assert_eq!(blob[at], 1, "the memory store tags its objects");
+    let taglen = u32::from_le_bytes(blob[at + 1..at + 5].try_into().unwrap()) as usize;
+    at += 1 + 4 + taglen;
+    let runs = u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+    assert_eq!(runs as usize, built.extent_count());
+    at += 4 + 8;
+    bad[at] ^= 0x01;
+    assert!(
+        ExternalIndex::from_bytes(&bad).is_err(),
+        "runs that do not tile the rows"
+    );
+}

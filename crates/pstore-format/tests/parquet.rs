@@ -1,0 +1,566 @@
+//! ⚠️ Tests may panic: an assertion failure IS the reporting mechanism.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+
+//! M70: a vector column found in real Parquet files' footers. The fixtures in `tests/data` were
+//! written by pyarrow 26; `*.vectors.f32` holds the floats the generator wrote.
+
+use pstore_blob::{BlobStore, Key, MemoryStore};
+use pstore_format::external::{Extent, ExternalColumn, ExternalError};
+use pstore_format::parquet::{ParquetError, locate};
+
+const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+
+fn bytes(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{DIR}{name}")).unwrap()
+}
+
+async fn put(name: &str) -> (MemoryStore, Key) {
+    let store = MemoryStore::new();
+    let key = Key::new(format!("lake/{name}"));
+    store.put(&key, bytes(name).into()).await.unwrap();
+    (store, key)
+}
+
+fn floats(name: &str) -> Vec<f32> {
+    bytes(name)
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+async fn check_every_row(name: &str, vectors: &str, rows: usize, pages: usize) {
+    let (store, key) = put(name).await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert_eq!((col.dims, col.rows), (8, rows as u64));
+    assert_eq!(col.extents.len(), pages, "{name}: pages");
+    let want = floats(vectors);
+    let all: Vec<usize> = (0..rows).collect();
+    let got = col.read_rows(&store, &all).await.unwrap();
+    assert_eq!(got.len(), rows);
+    for (r, v) in &got {
+        assert_eq!(v.as_slice(), &want[r * 8..r * 8 + 8], "{name} row {r}");
+    }
+    assert!(col.row_range(rows).is_none());
+}
+
+#[tokio::test]
+async fn locate_finds_the_real_files_vectors() {
+    // Three row groups of 100 rows, one page each.
+    check_every_row("good.parquet", "good.vectors.f32", 300, 3).await;
+    // One row group of 2,600 rows split across several pages.
+    let (store, key) = put("multipage.parquet").await;
+    let found = locate(&store, &key, "embedding").await.unwrap();
+    assert!(found.extents.len() > 1, "{:?}", found.extents);
+    check_every_row(
+        "multipage.parquet",
+        "multipage.vectors.f32",
+        2600,
+        found.extents.len(),
+    )
+    .await;
+    // The id column is INT64, not a vector.
+    let err = locate(&store, &key, "id").await.unwrap_err();
+    assert!(err.to_string().contains("FIXED_LEN_BYTE_ARRAY"), "{err}");
+}
+
+#[tokio::test]
+async fn locate_refuses_what_cannot_be_reached() {
+    for (file, why) in [
+        ("snappy.parquet", "compressed"),
+        ("dict.parquet", "dictionary"),
+        ("optional.parquet", "REQUIRED"),
+        ("list.parquet", "repetition levels"),
+    ] {
+        let (store, key) = put(file).await;
+        let err = locate(&store, &key, "embedding").await.unwrap_err();
+        assert!(matches!(err, ParquetError::Unsupported(_)), "{file}: {err}");
+        assert!(err.to_string().contains(why), "{file}: {err}");
+    }
+    let (store, key) = put("good.parquet").await;
+    let err = locate(&store, &key, "nope").await.unwrap_err();
+    assert!(err.to_string().contains("no column"), "{err}");
+
+    let good = bytes("good.parquet");
+    let refuse = |name: &'static str, body: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let k = Key::new(format!("lake/bad-{name}"));
+            store.put(&k, body.into()).await.unwrap();
+            locate(&store, &k, "embedding").await
+        }
+    };
+    assert!(refuse("short", good[..4].to_vec()).await.is_err());
+    assert!(refuse("empty", Vec::new()).await.is_err());
+    assert!(
+        refuse("text", b"definitely not parquet, just words".to_vec())
+            .await
+            .is_err()
+    );
+    assert!(
+        refuse("trunc", good[..good.len() - 20].to_vec())
+            .await
+            .is_err()
+    );
+    // A footer length larger than the file.
+    let mut huge = good.clone();
+    let n = huge.len();
+    huge[n - 8..n - 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        refuse("huge", huge).await,
+        Err(ParquetError::Malformed(_))
+    ));
+    // A zero footer length.
+    let mut zero = good.clone();
+    zero[n - 8..n - 4].copy_from_slice(&0u32.to_le_bytes());
+    assert!(refuse("zero", zero).await.is_err());
+    // A damaged footer: flip bytes through it; none may panic, and the file is refused or,
+    // where the flip is harmless, still located. Every outcome is an answer.
+    let size = u32::from_le_bytes(good[n - 8..n - 4].try_into().unwrap()) as usize;
+    let mut refused = 0;
+    for at in (n - 8 - size..n - 8).step_by(3) {
+        let mut b = good.clone();
+        b[at] ^= 0xFF;
+        if refuse("flip", b).await.is_err() {
+            refused += 1;
+        }
+    }
+    assert!(refused > 10, "{refused} flips refused");
+    // Bad magic.
+    let mut magic = good.clone();
+    magic[n - 1] = b'X';
+    assert!(matches!(
+        refuse("magic", magic).await,
+        Err(ParquetError::Malformed(_))
+    ));
+}
+
+#[tokio::test]
+async fn extents_address_rows() {
+    let col = ExternalColumn::from_extents(
+        "k",
+        2,
+        1000,
+        None,
+        vec![
+            Extent {
+                first_row: 0,
+                rows: 3,
+                offset: 100,
+            },
+            Extent {
+                first_row: 3,
+                rows: 1,
+                offset: 200,
+            },
+            Extent {
+                first_row: 4,
+                rows: 5,
+                offset: 300,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(col.rows, 9);
+    let r = |i: usize| col.row_range(i);
+    assert_eq!(r(0), Some(100..108));
+    assert_eq!(r(2), Some(116..124));
+    assert_eq!(r(3), Some(200..208));
+    assert_eq!(r(4), Some(300..308));
+    assert_eq!(r(8), Some(332..340));
+    assert_eq!(r(9), None);
+    let shape =
+        |extents: Vec<Extent>, len: u64| ExternalColumn::from_extents("k", 2, len, None, extents);
+    let e = |first_row, rows, offset| Extent {
+        first_row,
+        rows,
+        offset,
+    };
+    assert!(shape(vec![], 100).is_err(), "none");
+    assert!(shape(vec![e(0, 0, 0)], 100).is_err(), "zero rows");
+    assert!(shape(vec![e(0, 2, 0), e(3, 1, 16)], 100).is_err(), "gap");
+    assert!(
+        shape(vec![e(0, 2, 0), e(1, 2, 16)], 100).is_err(),
+        "overlap"
+    );
+    assert!(shape(vec![e(1, 2, 0)], 100).is_err(), "not from 0");
+    assert!(shape(vec![e(0, 2, 90)], 100).is_err(), "past the object");
+    assert!(
+        shape(vec![e(0, 2, u64::MAX - 4)], u64::MAX).is_err(),
+        "overflow"
+    );
+    assert!(shape(vec![e(0, 2, 85)], 100).is_err(), "one byte past");
+    assert!(shape(vec![e(0, 2, 84)], 100).is_ok(), "exact fit");
+    assert!(ExternalColumn::from_extents("k", 0, 100, None, vec![e(0, 1, 0)]).is_err());
+
+    // A changed object is refused for a located column, as for a single run.
+    let (store, key) = put("good.parquet").await;
+    let pinned = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(pinned.read_rows(&store, &[5]).await.is_ok());
+    let mut other = bytes("good.parquet");
+    other[4] ^= 0xFF;
+    store.put(&key, other.into()).await.unwrap();
+    assert!(matches!(
+        pinned.read_rows(&store, &[5]).await,
+        Err(ExternalError::Changed)
+    ));
+}
+
+// ---- A tiny Parquet writer, to build the shapes pyarrow never produces ----------------------
+
+/// Thrift compact output.
+#[derive(Default)]
+struct Out(Vec<u8>);
+
+impl Out {
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.0.push((v as u8 & 0x7F) | 0x80);
+            v >>= 7;
+        }
+        self.0.push(v as u8);
+    }
+    fn zig(&mut self, v: i64) {
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
+    fn field(&mut self, last: &mut i16, id: i16, ty: u8) {
+        let delta = id - *last;
+        if (1..=15).contains(&delta) {
+            self.0.push((delta as u8) << 4 | ty);
+        } else {
+            self.0.push(ty);
+            self.zig(i64::from(id));
+        }
+        *last = id;
+    }
+    fn i32(&mut self, last: &mut i16, id: i16, v: i64) {
+        self.field(last, id, 5);
+        self.zig(v);
+    }
+    fn i64(&mut self, last: &mut i16, id: i16, v: i64) {
+        self.field(last, id, 6);
+        self.zig(v);
+    }
+    fn bin(&mut self, last: &mut i16, id: i16, v: &[u8]) {
+        self.field(last, id, 8);
+        self.varint(v.len() as u64);
+        self.0.extend(v);
+    }
+    fn list(&mut self, last: &mut i16, id: i16, elem: u8, n: usize) {
+        self.field(last, id, 9);
+        if n < 15 {
+            self.0.push((n as u8) << 4 | elem);
+        } else {
+            self.0.push(0xF0 | elem);
+            self.varint(n as u64);
+        }
+    }
+    fn stop(&mut self) {
+        self.0.push(0);
+    }
+}
+
+/// One synthetic data page: header fields and the number of body bytes actually written.
+#[derive(Clone)]
+struct Page {
+    values: i64,
+    compressed: i64,
+    uncompressed: i64,
+    encoding: i64,
+    kind: i64,
+    body: usize,
+}
+
+/// One column chunk, as its metadata claims.
+#[derive(Clone)]
+struct Chunk {
+    pages: Vec<Page>,
+    num_values: i64,
+    total_compressed: Option<i64>,
+    codec: i64,
+    encodings: Vec<i64>,
+    dictionary_offset: bool,
+    chunk_type: i64,
+    group_rows: i64,
+}
+
+#[derive(Clone)]
+struct Spec {
+    type_length: i64,
+    column_type: i64,
+    repetition: i64,
+    chunks: Vec<Chunk>,
+    path: &'static str,
+    extra_struct_field: bool,
+}
+
+fn page(dims: usize, values: i64) -> Page {
+    let bytes = values * dims as i64 * 4;
+    Page {
+        values,
+        compressed: bytes,
+        uncompressed: bytes,
+        encoding: 0,
+        kind: 0,
+        body: bytes as usize,
+    }
+}
+
+fn chunk(dims: usize, rows: &[i64]) -> Chunk {
+    let pages: Vec<Page> = rows.iter().map(|r| page(dims, *r)).collect();
+    let n = rows.iter().sum();
+    Chunk {
+        pages,
+        num_values: n,
+        total_compressed: None,
+        codec: 0,
+        encodings: vec![0, 3],
+        dictionary_offset: false,
+        chunk_type: 7,
+        group_rows: n,
+    }
+}
+
+fn spec(dims: usize, chunks: Vec<Chunk>) -> Spec {
+    Spec {
+        type_length: dims as i64 * 4,
+        column_type: 7,
+        repetition: 0,
+        chunks,
+        path: "v",
+        extra_struct_field: false,
+    }
+}
+
+/// The file's bytes, and each chunk's first page offset.
+fn build(s: &Spec) -> Vec<u8> {
+    let mut file = b"PAR1".to_vec();
+    let mut chunk_meta = Vec::new();
+    for c in &s.chunks {
+        let start = file.len();
+        for p in &c.pages {
+            let mut h = Out::default();
+            let mut l = 0;
+            h.i32(&mut l, 1, p.kind);
+            h.i32(&mut l, 2, p.uncompressed);
+            h.i32(&mut l, 3, p.compressed);
+            h.field(&mut l, 5, 12);
+            let mut d = 0;
+            h.i32(&mut d, 1, p.values);
+            h.i32(&mut d, 2, p.encoding);
+            h.i32(&mut d, 3, 3);
+            h.i32(&mut d, 4, 3);
+            h.stop();
+            h.stop();
+            file.extend(&h.0);
+            file.extend(std::iter::repeat_n(0x5A, p.body));
+        }
+        let size = (file.len() - start) as i64;
+        chunk_meta.push((start as i64, c.total_compressed.unwrap_or(size)));
+    }
+    let mut f = Out::default();
+    let mut l = 0;
+    f.i32(&mut l, 1, 1);
+    f.list(&mut l, 2, 12, 2);
+    // root
+    let mut e = 0;
+    f.bin(&mut e, 4, b"schema");
+    f.i32(&mut e, 5, 1);
+    f.stop();
+    // the column
+    let mut e = 0;
+    f.i32(&mut e, 1, s.column_type);
+    f.i32(&mut e, 2, s.type_length);
+    f.i32(&mut e, 3, s.repetition);
+    f.bin(&mut e, 4, s.path.as_bytes());
+    f.stop();
+    f.i64(&mut l, 3, s.chunks.iter().map(|c| c.group_rows).sum());
+    f.list(&mut l, 4, 12, s.chunks.len());
+    for (c, (start, total)) in s.chunks.iter().zip(chunk_meta) {
+        let mut g = 0;
+        f.list(&mut g, 1, 12, 1);
+        let mut cc = 0;
+        f.i64(&mut cc, 2, 0);
+        f.field(&mut cc, 3, 12);
+        let mut m = 0;
+        f.i32(&mut m, 1, c.chunk_type);
+        f.list(&mut m, 2, 5, c.encodings.len());
+        for e in &c.encodings {
+            f.zig(*e);
+        }
+        f.list(&mut m, 3, 8, 1);
+        f.varint(s.path.len() as u64);
+        f.0.extend(s.path.as_bytes());
+        f.i32(&mut m, 4, c.codec);
+        f.i64(&mut m, 5, c.num_values);
+        f.i64(&mut m, 7, total);
+        f.i64(&mut m, 9, start);
+        if c.dictionary_offset {
+            f.i64(&mut m, 11, start);
+        }
+        f.stop();
+        if s.extra_struct_field {
+            // A struct-typed field after the metadata that is not field 3.
+            f.field(&mut cc, 4, 12);
+            let mut x = 0;
+            f.i32(&mut x, 1, 99);
+            f.stop();
+        }
+        f.stop();
+        f.i64(&mut g, 3, c.group_rows);
+        f.stop();
+    }
+    f.stop();
+    let footer = f.0;
+    file.extend(&footer);
+    file.extend((footer.len() as u32).to_le_bytes());
+    file.extend(b"PAR1");
+    file
+}
+
+async fn run(s: &Spec) -> Result<pstore_format::parquet::Located, ParquetError> {
+    let store = MemoryStore::new();
+    let key = Key::new("lake/synth.parquet");
+    store.put(&key, build(s).into()).await.unwrap();
+    locate(&store, &key, "v").await
+}
+
+async fn refused(s: &Spec, why: &str) {
+    let err = run(s).await.unwrap_err();
+    assert!(err.to_string().contains(why), "wanted {why:?}, got {err}");
+}
+
+#[tokio::test]
+async fn the_writer_builds_what_locate_reads() {
+    let s = spec(2, vec![chunk(2, &[3, 2]), chunk(2, &[4])]);
+    let found = run(&s).await.unwrap();
+    assert_eq!((found.dims, found.extents.len()), (2, 3));
+    let rows: Vec<(u64, u64)> = found
+        .extents
+        .iter()
+        .map(|e| (e.first_row, e.rows))
+        .collect();
+    assert_eq!(rows, [(0, 3), (3, 2), (5, 4)]);
+    // Each page's body follows its header, and the pages follow one another.
+    for w in found.extents.windows(2) {
+        assert!(w[1].offset > w[0].offset + w[0].rows * 8);
+    }
+    // A struct field the reader does not know, after the metadata, is skipped.
+    let mut extra = s.clone();
+    extra.extra_struct_field = true;
+    assert_eq!(run(&extra).await.unwrap().extents, found.extents);
+    // A different column name in the file is simply not that column.
+    let mut other = s.clone();
+    other.path = "w";
+    refused(&other, "no column").await;
+}
+
+#[tokio::test]
+async fn locate_refuses_each_shape_it_cannot_read() {
+    let base = spec(4, vec![chunk(4, &[5])]);
+    let with = |f: &dyn Fn(&mut Spec)| {
+        let mut s = base.clone();
+        f(&mut s);
+        s
+    };
+    refused(&with(&|s| s.type_length = 6), "whole number").await;
+    refused(&with(&|s| s.type_length = 0), "whole number").await;
+    refused(&with(&|s| s.type_length = -4), "whole number").await;
+    refused(&with(&|s| s.column_type = 1), "FIXED_LEN_BYTE_ARRAY").await;
+    refused(&with(&|s| s.repetition = 1), "REQUIRED").await;
+    refused(&with(&|s| s.repetition = 2), "REQUIRED").await;
+    refused(&with(&|s| s.chunks[0].codec = 1), "compressed").await;
+    refused(
+        &with(&|s| s.chunks[0].dictionary_offset = true),
+        "dictionary",
+    )
+    .await;
+    refused(&with(&|s| s.chunks[0].encodings = vec![0, 5]), "PLAIN").await;
+    refused(&with(&|s| s.chunks[0].encodings = vec![8]), "PLAIN").await;
+    refused(&with(&|s| s.chunks[0].chunk_type = 1), "disagrees").await;
+    refused(&with(&|s| s.chunks[0].pages[0].encoding = 2), "PLAIN").await;
+    // A page that is compressed, or carries levels, is not `values × width` bytes.
+    refused(&with(&|s| s.chunks[0].pages[0].compressed -= 4), "levels").await;
+    refused(&with(&|s| s.chunks[0].pages[0].uncompressed += 4), "levels").await;
+    refused(
+        &with(&|s| {
+            s.chunks[0].pages[0].compressed += 4;
+            s.chunks[0].pages[0].uncompressed += 4;
+        }),
+        "levels",
+    )
+    .await;
+    // A dictionary page where a data page should be.
+    refused(&with(&|s| s.chunks[0].pages[0].kind = 2), "page header").await;
+    refused(&with(&|s| s.chunks[0].pages[0].kind = 3), "page header").await;
+    // Counts that disagree.
+    refused(&with(&|s| s.chunks[0].group_rows = 6), "one a row").await;
+    refused(&with(&|s| s.chunks[0].num_values = 6), "one a row").await;
+    refused(
+        &with(&|s| s.chunks[0].total_compressed = Some(1 << 40)),
+        "past the file",
+    )
+    .await;
+    // The chunk is shorter than its page claims.
+    refused(
+        &with(&|s| s.chunks[0].total_compressed = Some(30)),
+        "past its chunk",
+    )
+    .await;
+    // A page of no values.
+    refused(
+        &with(&|s| {
+            s.chunks[0] = chunk(4, &[0, 5]);
+        }),
+        "past its chunk",
+    )
+    .await;
+    // Fewer values in the pages than the chunk claims: the pages run out.
+    let mut short = base.clone();
+    short.chunks[0].num_values = 8;
+    short.chunks[0].group_rows = 8;
+    refused(&short, "end before").await;
+    // More values in the pages than the chunk claims.
+    let mut over = spec(4, vec![chunk(4, &[3, 3])]);
+    over.chunks[0].num_values = 4;
+    over.chunks[0].group_rows = 4;
+    refused(&over, "overshoot").await;
+    // A page body that is missing: the header's claim runs past the chunk.
+    let mut cut = base.clone();
+    cut.chunks[0].pages[0].body -= 8;
+    refused(&cut, "past its chunk").await;
+}
+
+#[tokio::test]
+async fn a_footer_that_is_all_there_is() {
+    // No row groups: a file of magic, footer, length, magic. It locates no extents.
+    let mut s = spec(2, vec![]);
+    s.chunks.clear();
+    let found = run(&s).await.unwrap();
+    assert!(found.extents.is_empty());
+    assert_eq!(found.len as usize, build(&s).len());
+    // A footer length that leaves no room for the leading magic is refused as out of range.
+    let store = MemoryStore::new();
+    let key = Key::new("lake/edge.parquet");
+    let good = build(&s);
+    let n = good.len();
+    let fit = |extra: u32| {
+        let mut b = good.clone();
+        let size = u32::from_le_bytes(b[n - 8..n - 4].try_into().unwrap());
+        b[n - 8..n - 4].copy_from_slice(&(size + extra).to_le_bytes());
+        b
+    };
+    for extra in [1u32, 2, 4] {
+        store.put(&key, fit(extra).into()).await.unwrap();
+        let err = locate(&store, &key, "v").await.unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{extra}: {err}");
+    }
+}
