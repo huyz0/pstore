@@ -251,3 +251,60 @@ async fn more_probes_read_more_and_all_of_them_read_everything() {
     );
     assert!(all_score >= default_score && default_score >= one_score * 0.999);
 }
+
+/// A `topical` document that also carries a second multi-vector field, `other`.
+fn two_field(i: usize) -> Document {
+    let mut d = topical(i);
+    let j = (i * 5) % 9_000;
+    let mut o = topical(j);
+    let v = o.vectors.remove("late").unwrap();
+    d.vectors.insert("other".to_owned(), v);
+    d
+}
+
+#[tokio::test]
+async fn two_fields_in_one_segment_each_use_their_clusters() {
+    let acct = Arc::new(pstore_blob::Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("two", (0..9_000).map(two_field).collect())
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    let head = e.head_for_test().await;
+    let seg = pstore_blob::Key::new(head.indexes["two"][0].key.clone());
+    let set = pstore_index::fde_clusters::FdeSet::open(&*store, &seg)
+        .await
+        .unwrap();
+    assert_eq!(set.len(), 2, "one sidecar names both fields");
+    let leg = |field: &str, probes| Prefetch::MultiFde {
+        field: field.to_owned(),
+        query: vec![vec![-2.0, 1.0, 4.0, 0.0]],
+        limit: 10,
+        rerank: None,
+        probes,
+    };
+    let moved = |field: &'static str, probes| {
+        let (e, acct) = (&e, Arc::clone(&acct));
+        async move {
+            acct.record_ranges();
+            let a = e
+                .query("two", &[leg(field, probes)], Fusion::default(), 10)
+                .await
+                .unwrap();
+            assert_eq!(a.hits.len(), 10, "{field}");
+            acct.ranges()
+                .iter()
+                .filter(|(k, _)| k.as_str().ends_with(".fdev"))
+                .map(|(_, r)| r.end - r.start)
+                .sum::<u64>()
+        }
+    };
+    for field in ["late", "other"] {
+        let some = moved(field, Some(1)).await;
+        let every = moved(field, Some(1024)).await;
+        assert!(some > 0 && some < every, "{field}: {some} of {every}");
+    }
+}

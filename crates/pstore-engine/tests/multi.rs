@@ -199,11 +199,11 @@ async fn a_big_segment_clusters_its_encoding_and_a_query_uses_it() {
     assert_eq!(refs.len(), 1);
     assert!(refs[0].dicts.unwrap().fde, "HEAD records the clusters");
     let seg = pstore_blob::Key::new(refs[0].key.clone());
-    let sidecar = pstore_index::fde_clusters::FdeClusters::open(&*store, &seg)
+    let sidecar = pstore_index::fde_clusters::FdeSet::open(&*store, &seg)
         .await
         .unwrap();
-    assert_eq!(sidecar.field(), "late");
-    assert!(sidecar.lists() > 1);
+    let (clusters, _) = sidecar.field("late").unwrap();
+    assert!(clusters.lists() > 1);
 
     let q = vec![vec![-2.0, 1.0, 4.0, 0.0], vec![3.0, -1.0, 0.0, 2.0]];
     let fde = Prefetch::MultiFde {

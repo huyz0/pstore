@@ -53,37 +53,38 @@ const MAX_COMMIT_ATTEMPTS: u32 = 24;
 /// not contention any retry fixes.
 const MAX_REFUSED_NAMES: u32 = 16;
 
-/// The one multi-vector field a segment's documents carry the encoding of, and the encodings in
-/// the segment's row order (M71.2). `None` when there is none, or more than one: the sidecar is
-/// per segment, so a second field stays a flat scan.
-fn fde_rows(docs: &[Document], order: &[usize]) -> Option<(String, Vec<Vec<f32>>)> {
-    let mut names = docs
+/// Every multi-vector field the segment's documents carry the encoding of, and the encodings in
+/// the segment's row order (M71.2, M74). Empty when there is none.
+fn fde_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)> {
+    let names: std::collections::BTreeSet<&str> = docs
         .iter()
         .flat_map(|d| d.vectors.keys())
-        .filter_map(|k| k.strip_suffix(pstore_format::fde::FIELD_SUFFIX));
-    let field = names.next()?.to_owned();
-    if names.any(|n| n != field) {
-        return None;
-    }
-    let derived = pstore_format::fde::field_name(&field);
+        .filter_map(|k| k.strip_suffix(pstore_format::fde::FIELD_SUFFIX))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let primary: Vec<usize> = order.iter().copied().filter(|i| seen.insert(*i)).collect();
-    let dim = docs.iter().find_map(|d| match d.vectors.get(&derived) {
-        Some(pstore_format::VectorField::Dense(v)) => v.first().map(Vec::len),
-        _ => None,
-    })?;
-    let rows = primary
-        .iter()
-        .map(
-            |i| match docs.get(*i).and_then(|d| d.vectors.get(&derived)) {
-                Some(pstore_format::VectorField::Dense(v)) => {
-                    v.first().cloned().unwrap_or_else(|| vec![0.0; dim])
-                }
-                _ => vec![0.0; dim],
-            },
-        )
-        .collect();
-    Some((field, rows))
+    names
+        .into_iter()
+        .filter_map(|field| {
+            let derived = pstore_format::fde::field_name(field);
+            let dim = docs.iter().find_map(|d| match d.vectors.get(&derived) {
+                Some(pstore_format::VectorField::Dense(v)) => v.first().map(Vec::len),
+                _ => None,
+            })?;
+            let rows = primary
+                .iter()
+                .map(
+                    |i| match docs.get(*i).and_then(|d| d.vectors.get(&derived)) {
+                        Some(pstore_format::VectorField::Dense(v)) => {
+                            v.first().cloned().unwrap_or_else(|| vec![0.0; dim])
+                        }
+                        _ => vec![0.0; dim],
+                    },
+                )
+                .collect();
+            Some((field.to_owned(), rows))
+        })
+        .collect()
 }
 
 /// A segment's sidecar: how its name derives from the segment's, and its bytes (M23).
@@ -2141,16 +2142,16 @@ impl<S: BlobStore> Engine<S> {
         // M71.2: the multi-vector encoding clustered, when the segment is big enough to have
         // more than one list. `built.order` repeats a replicated row, so the segment's own rows
         // are each document once, in first-appearance order.
-        if let Some((field, rows)) = fde_rows(docs, &built.order) {
-            let (clusters, vectors) = pstore_index::fde_clusters::FdeClusters::build(
-                &field,
-                &rows,
+        let fields = fde_rows(docs, &built.order);
+        if !fields.is_empty() {
+            let (set, vectors) = pstore_index::fde_clusters::FdeSet::build(
+                &fields,
                 pstore_index::cluster::Params::default(),
             );
-            if clusters.lists() > 1 {
+            if set.worth_writing() {
                 sidecars.push((
                     pstore_index::fde_clusters::key,
-                    bytes::Bytes::from(clusters.encode()),
+                    bytes::Bytes::from(set.encode()),
                 ));
                 sidecars.push((
                     pstore_index::fde_clusters::vectors_key,

@@ -190,6 +190,24 @@ impl FdeClusters {
         probes: usize,
         limit: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
+        self.search_at(store, segment_key, 0, query, probes, limit)
+            .await
+    }
+
+    /// [`Self::search`], with this field's vectors starting `base` bytes into `.fdev` (M74: a
+    /// segment's fields share the one object).
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    pub async fn search_at<S: BlobStore>(
+        &self,
+        store: &S,
+        segment_key: &Key,
+        base: u64,
+        query: &[Vec<f32>],
+        probes: usize,
+        limit: usize,
+    ) -> Result<Vec<(usize, f32)>, FormatError> {
         let q = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, query);
         let dim = self.centroids.first().map_or(0, Vec::len);
         let width = (dim * 4) as u64;
@@ -211,7 +229,7 @@ impl FdeClusters {
         let ranges: Vec<std::ops::Range<u64>> = chosen
             .iter()
             .filter_map(|i| {
-                let lo = *starts.get(*i)? * width;
+                let lo = base + *starts.get(*i)? * width;
                 Some(lo..lo + self.lists.get(*i)?.len() as u64 * width)
             })
             .collect();
@@ -237,5 +255,128 @@ impl FdeClusters {
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored.truncate(limit);
         Ok(scored)
+    }
+}
+
+const SET_MAGIC: &[u8; 4] = b"PFS1";
+
+/// The clusters of every multi-vector field a segment carries, in the one `.fdec` and `.fdev`
+/// pair (M74). One pair, not one a field: GC and replication derive sidecar keys from the
+/// segment's, and a LIST to discover per-field keys is forbidden.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FdeSet {
+    /// Each field's clusters, and where its vectors start in `.fdev`.
+    fields: Vec<(FdeClusters, u64)>,
+}
+
+impl FdeSet {
+    /// Clusters each `(field, encoded rows)`; the second value is the `.fdev` blob, the fields'
+    /// vectors back to back.
+    #[must_use]
+    pub fn build(fields: &[(String, Vec<Vec<f32>>)], params: Params) -> (Self, Vec<u8>) {
+        let mut blob = Vec::new();
+        let mut out = Vec::new();
+        for (name, rows) in fields {
+            let (c, v) = FdeClusters::build(name, rows, params);
+            out.push((c, blob.len() as u64));
+            blob.extend(v);
+        }
+        (Self { fields: out }, blob)
+    }
+
+    /// The field's clusters and where its vectors start, if the set has the field.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<(&FdeClusters, u64)> {
+        self.fields
+            .iter()
+            .find(|(c, _)| c.field() == name)
+            .map(|(c, at)| (c, *at))
+    }
+
+    /// Fields in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Whether the set holds no field.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Whether any field has more than one list (the point of writing the sidecar).
+    #[must_use]
+    pub fn worth_writing(&self) -> bool {
+        self.fields.iter().any(|(c, _)| c.lists() > 1)
+    }
+
+    /// The `.fdec` bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(SET_MAGIC);
+        b.extend((self.fields.len() as u32).to_le_bytes());
+        for (c, at) in &self.fields {
+            let e = c.encode();
+            b.extend((e.len() as u32).to_le_bytes());
+            b.extend(e);
+            b.extend(at.to_le_bytes());
+        }
+        b
+    }
+
+    /// Reads a set back, or `None` for anything truncated, mislabelled, with a field twice, or
+    /// with trailing bytes.
+    #[must_use]
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let s = raw.get(at..at.checked_add(n)?)?;
+            at += n;
+            Some(s)
+        };
+        if take(4)? != SET_MAGIC {
+            return None;
+        }
+        let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let mut fields: Vec<(FdeClusters, u64)> = Vec::new();
+        for _ in 0..n {
+            let len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+            let c = FdeClusters::decode(take(len)?)?;
+            let base = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            if fields.iter().any(|(o, _)| o.field() == c.field()) {
+                return None;
+            }
+            fields.push((c, base));
+        }
+        (at == raw.len()).then_some(Self { fields })
+    }
+
+    /// Writes both objects.
+    ///
+    /// # Errors
+    /// A store failure.
+    pub async fn put<S: BlobStore>(
+        &self,
+        store: &S,
+        segment_key: &Key,
+        vectors: Vec<u8>,
+    ) -> Result<(), pstore_blob::BlobError> {
+        store.put(&vectors_key(segment_key), vectors.into()).await?;
+        store.put(&key(segment_key), self.encode().into()).await?;
+        Ok(())
+    }
+
+    /// Reads the set for `segment_key`.
+    ///
+    /// # Errors
+    /// A store failure, or [`FormatError::Corrupt`] for a damaged sidecar.
+    pub async fn open<S: BlobStore>(store: &S, segment_key: &Key) -> Result<Self, FormatError> {
+        let raw = store
+            .get(&key(segment_key))
+            .await
+            .map_err(|_| FormatError::Truncated)?;
+        Self::decode(&raw).ok_or(FormatError::Corrupt("damaged multi-vector cluster sidecar"))
     }
 }

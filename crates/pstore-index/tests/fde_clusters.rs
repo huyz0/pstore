@@ -245,3 +245,70 @@ async fn clustered_search_reads_a_fraction() {
     eprintln!("flat {flat} part {part}");
     assert!(part * 2 < flat, "{part} of {flat}");
 }
+
+use pstore_index::fde_clusters::FdeSet;
+
+fn two_fields() -> Vec<(String, Vec<Vec<f32>>)> {
+    vec![
+        ("a".to_owned(), encoded(&corpus(11)[..600])),
+        ("b".to_owned(), encoded(&corpus(99)[..600])),
+    ]
+}
+
+#[test]
+fn a_set_round_trips_and_refuses_damage() {
+    let (set, blob) = FdeSet::build(&two_fields(), small());
+    assert_eq!(set.len(), 2);
+    assert!(!set.is_empty() && set.worth_writing());
+    let b = set.encode();
+    assert_eq!(FdeSet::decode(&b).unwrap(), set);
+    assert!(set.field("a").unwrap().1 == 0);
+    let second = set.field("b").unwrap().1;
+    assert!(second > 0 && (second as usize) < blob.len());
+    assert!(set.field("c").is_none());
+    assert!(FdeSet::decode(&[]).is_none());
+    assert!(FdeSet::decode(&b[..b.len() - 1]).is_none(), "truncated");
+    assert!(
+        FdeSet::decode(&[b.clone(), vec![0]].concat()).is_none(),
+        "trailing"
+    );
+    let mut magic = b.clone();
+    magic[0] ^= 0xFF;
+    assert!(FdeSet::decode(&magic).is_none());
+    let mut many = b.clone();
+    many[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(FdeSet::decode(&many).is_none(), "a count above the bytes");
+    // A field twice.
+    let twice = vec![two_fields().remove(0), two_fields().remove(0)];
+    let (dup, _) = FdeSet::build(&twice, small());
+    assert!(FdeSet::decode(&dup.encode()).is_none());
+    // A single-cluster set is not worth writing.
+    let (tiny, _) = FdeSet::build(
+        &[("a".to_owned(), encoded(&corpus(5)[..10]))],
+        Params::default(),
+    );
+    assert!(!tiny.worth_writing());
+    assert!(FdeSet::build(&[], small()).0.is_empty());
+}
+
+#[tokio::test]
+async fn each_field_searches_its_own_vectors() {
+    let fields = two_fields();
+    let store = MemoryStore::new();
+    let (set, blob) = FdeSet::build(&fields, small());
+    set.put(&store, &key(), blob).await.unwrap();
+    let opened = FdeSet::open(&store, &key()).await.unwrap();
+    assert_eq!(opened, set);
+    for (name, rows) in &fields {
+        let alone_store = MemoryStore::new();
+        let (alone, alone_blob) = FdeClusters::build(name, rows, small());
+        alone.put(&alone_store, &key(), alone_blob).await.unwrap();
+        let (c, base) = opened.field(name).unwrap();
+        for q in queries(11).iter().take(5) {
+            let want = alone.search(&alone_store, &key(), q, 3, 10).await.unwrap();
+            let got = c.search_at(&store, &key(), base, q, 3, 10).await.unwrap();
+            assert_eq!(got, want, "field {name}");
+        }
+    }
+    assert!(FdeSet::open(&store, &Key::new("t/none.seg")).await.is_err());
+}

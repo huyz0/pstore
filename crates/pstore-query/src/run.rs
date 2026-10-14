@@ -1842,20 +1842,21 @@ async fn leg<S: BlobStore>(
             let encoded = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, query);
             // M71.2: clustered when the segment has clusters for THIS field; the flat scan
             // otherwise. A sidecar that does not decode is an error, not a silent flat scan.
-            let clusters = match &opened.fde {
+            let set = match &opened.fde {
                 Some(raw) => Some(
-                    pstore_index::fde_clusters::FdeClusters::decode(raw)
+                    pstore_index::fde_clusters::FdeSet::decode(raw)
                         .ok_or(FormatError::Corrupt("damaged multi-vector cluster sidecar"))?,
-                )
-                .filter(|c| c.field() == *field),
+                ),
                 None => None,
             };
-            let mut scored: Vec<(usize, f32)> = if let Some(c) = clusters {
+            let clusters = set.as_ref().and_then(|s| s.field(field));
+            let mut scored: Vec<(usize, f32)> = if let Some((c, base)) = clusters {
                 // ⚠️ Provisional: a third of the lists, at least two.
                 let want = rerank.map_or(*limit, |w| w.max(*limit));
-                c.search(
+                c.search_at(
                     store,
                     key,
+                    base,
                     query,
                     probes.unwrap_or_else(|| c.lists().div_ceil(3).max(2)),
                     want,
