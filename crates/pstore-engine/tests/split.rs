@@ -287,6 +287,19 @@ async fn a_split_query_equals_the_unsplit_one() {
         ),
         ("sparse", vec![sparse()], None, Fusion::default()),
         (
+            // M78: a dense leg over a named field alone, and filtered: split equals unsplit.
+            "dense over a named field",
+            vec![dense("v2", vec![0.2, -0.4, 0.5])],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "dense over a named field, filtered",
+            vec![dense("v2", vec![0.2, -0.4, 0.5])],
+            Some(filtered.clone()),
+            Fusion::default(),
+        ),
+        (
             "two dense legs",
             vec![
                 dense("vector", q.clone()),
@@ -1191,4 +1204,57 @@ async fn a_split_sum_query_equals_the_unsplit_one() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_split_named_dense_query_ranks_that_field() {
+    // M78: not only split == unsplit (both could be wrong together, as they were before M77):
+    // the answer is the exact dot-product ranking of `v2`, which is not `vector`'s.
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    for k in 0..4u32 {
+        coordinator
+            .write("idx", (k * 25..k * 25 + 25).map(doc).collect())
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let q = vec![0.2f32, -0.4, 0.5];
+    let legs = [dense("v2", q.clone())];
+    let peers = Three::new(
+        vec![
+            Arc::new(engine(&store, 10)),
+            Arc::new(engine(&store, 11)),
+            Arc::new(engine(&store, 12)),
+        ],
+        None,
+    );
+    let split = coordinator
+        .query_split_as(
+            "idx",
+            &legs,
+            None,
+            Fusion::default(),
+            10,
+            pstore_engine::Consistency::Eventual,
+            Some(&peers),
+        )
+        .await
+        .unwrap();
+    assert_eq!(peers.parts.load(Ordering::SeqCst), 2, "it was split");
+    let v2 = |i: u32| {
+        let x = i as f32;
+        [(x * 0.11).cos(), (x * 0.7).sin(), 0.5]
+    };
+    let mut want: Vec<(u32, f32)> = (0..100)
+        .map(|i| (i, v2(i).iter().zip(&q).map(|(a, b)| a * b).sum()))
+        .collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let want: Vec<Option<String>> = want
+        .iter()
+        .take(10)
+        .map(|(i, _)| Some(format!("d{i:05}")))
+        .collect();
+    assert_eq!(split.ids, want);
 }
