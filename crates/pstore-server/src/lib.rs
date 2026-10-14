@@ -2890,21 +2890,18 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
 /// The legs a query asks for. A query with none is a request nobody meant to make.
 fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefetch>, ApiError> {
     let mut legs = Vec::new();
-    // ⚠️ `vector` only (M61): a dense leg over a named field would search `vector`'s
-    // clustering (backlog row 65), and over a field of several vectors it means MaxSim.
-    if let Some(f) = &req.field
-        && f != pstore_format::DEFAULT_FIELD
-    {
-        return Err(ApiError::bad_request(format!(
-            "field {f:?}: a dense query searches `vector`; search a named field with `multi`"
-        )));
-    }
+    // M77: a named field is scanned exactly over its own vectors. A name the engine reserves
+    // (the derived encoding's) is refused here, as `multi`'s is.
+    let dense_field = match &req.field {
+        Some(f) if f != pstore_format::DEFAULT_FIELD => named_field(f)?,
+        _ => pstore_format::DEFAULT_FIELD.to_owned(),
+    };
     if let Some(v) = &req.vector {
         if v.is_empty() {
             return Err(ApiError::bad_request("an empty query vector"));
         }
         legs.push(pstore_query::Prefetch::Dense {
-            field: pstore_format::DEFAULT_FIELD.to_owned(),
+            field: dense_field,
             query: v.clone(),
             limit,
             tune: pstore_index::vec_index::Query {

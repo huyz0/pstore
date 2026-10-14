@@ -704,7 +704,8 @@ async fn run<S: BlobStore + Clone>(
         let (opened, firsts) =
             futures_util::future::join(opening, futures_util::future::join_all(phase_ones)).await;
         let opened = opened?;
-        // ⚠️ A `multi` field no segment carries is a typo or a field never written (M61):
+        // ⚠️ A `multi` (or, since M77, a named dense) field no segment carries is a typo or a field
+        // never written (M61):
         // refused, decided from the footers the open round read, at no request -- never an
         // empty answer a caller cannot tell from "nothing matched".
         let nowhere = |field: &str| {
@@ -715,7 +716,8 @@ async fn run<S: BlobStore + Clone>(
         if !opened.is_empty()
             && prefetch
                 .iter()
-                .any(|p| matches!(p, Prefetch::Multi { field, .. } | Prefetch::MultiFde { field, .. } if nowhere(field)))
+                .any(|p| matches!(p, Prefetch::Multi { field, .. } | Prefetch::MultiFde { field, .. } if nowhere(field))
+                    || matches!(p, Prefetch::Dense { field, .. } if field != pstore_format::DEFAULT_FIELD && nowhere(field)))
         {
             return Err(FormatError::UnknownField.into());
         }
@@ -1738,6 +1740,42 @@ async fn leg<S: BlobStore>(
                 return Err(QueryError::Unimplemented(
                     "a dense leg over a field of several vectors a document: search it with `multi`",
                 ));
+            }
+            // M77: a named field is scanned exactly, over its own vectors. `search_field` would
+            // search `vector`'s codes and centroids and answer with another field's rows.
+            if *field != pstore_format::DEFAULT_FIELD {
+                let Some(layout) = opened.segment.field_layout(field) else {
+                    return Ok(Vec::new());
+                };
+                if layout.kind != 0 {
+                    return Err(FormatError::UnknownField.into());
+                }
+                if layout.dims as usize != query.len() {
+                    return Err(pstore_format::FormatError::DimensionMismatch {
+                        expected: layout.dims as usize,
+                        got: query.len(),
+                    }
+                    .into());
+                }
+                let rows = opened.segment.field_vectors(store, key, field).await?;
+                let mut scored: Vec<(usize, f32)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, d)| {
+                        d.first()
+                            .map(|v| (row, v.iter().zip(query.iter()).map(|(a, b)| a * b).sum()))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                scored.truncate(*limit);
+                return Ok(scored
+                    .into_iter()
+                    .map(|(row, score)| Hit {
+                        segment,
+                        row,
+                        score,
+                    })
+                    .collect());
             }
             let dim = opened
                 .segment

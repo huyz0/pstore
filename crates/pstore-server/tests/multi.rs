@@ -456,10 +456,9 @@ async fn multi_vectors_are_refused_at_the_door() {
         ("sum", q(json!({"fusion": {"sum": {}}}))),
         ("max", q(json!({"fusion": {"max": {}}}))),
         ("17 legs", q(json!({"vector": [1.0, 2.0], "text": texts}))),
-        (
-            "a dense field other than `vector`",
-            json!({"vector": [1.0, 2.0, 3.0], "field": "late"}),
-        ),
+        // M77 replaced M61's refusal of a dense query naming a field other than `vector`: that
+        // now scans the named field exactly (`named_dense.rs` pins it, and the refusals that
+        // remain: an unknown field, a wrong width, a field of several vectors).
         (
             "two weights for three legs",
             q(json!({"vector": [1.0, 2.0], "text": "w",

@@ -6776,11 +6776,15 @@ fn query_error(
     prefetch: &[pstore_query::Prefetch],
     e: pstore_query::QueryError,
 ) -> EngineError {
-    // Only `run`'s refusal of a `multi` leg's field is the client's: a dense leg's missing
-    // field is a segment without the index's vectors, which is ours.
+    // Only `run`'s refusal of a `multi` leg's field (or a named dense field's) is the client's:
+    // `vector`'s missing field is a segment without the index's vectors, which is ours.
     let multi = prefetch.iter().find_map(|p| match p {
         pstore_query::Prefetch::Multi { field, .. }
         | pstore_query::Prefetch::MultiFde { field, .. } => Some(field.clone()),
+        // M77: a named dense field is the client's to get wrong; `vector` is ours.
+        pstore_query::Prefetch::Dense { field, .. } if field != pstore_format::DEFAULT_FIELD => {
+            Some(field.clone())
+        }
         _ => None,
     });
     match (e, multi) {
@@ -6798,7 +6802,86 @@ fn query_error(
             expected: expected.saturating_sub(metric.extra()),
             got: got.saturating_sub(metric.extra()),
         },
+        // M77: a named dense leg over a field of several vectors a document is the client's
+        // to correct: it means `multi`.
+        (pstore_query::QueryError::Unimplemented(why), Some(field)) if why.contains("`multi`") => {
+            EngineError::Refused(format!(
+                "field `{field}` holds several vectors a document: search it with `multi`"
+            ))
+        }
         (other, _) => EngineError::Query(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod query_error_tests {
+    use super::*;
+    use pstore_format::FormatError;
+    use pstore_query::{Prefetch, QueryError};
+
+    fn dense(field: &str) -> Prefetch {
+        Prefetch::Dense {
+            field: field.to_owned(),
+            query: vec![1.0],
+            limit: 1,
+            tune: pstore_index::vec_index::Query::default(),
+        }
+    }
+
+    /// M77: which unknown-field and unimplemented errors are the client's to fix.
+    #[test]
+    fn only_a_named_dense_or_multi_field_is_the_clients() {
+        let unknown = || QueryError::Format(FormatError::UnknownField);
+        let m = Metric::DotProduct;
+        // A named dense field no segment carries is a client error naming it ...
+        assert!(matches!(
+            query_error(m, &[dense("tag")], unknown()),
+            EngineError::UnknownField(f) if f == "tag"
+        ));
+        // ... `vector`'s absence is ours ...
+        assert!(matches!(
+            query_error(m, &[dense("vector")], unknown()),
+            EngineError::Query(_)
+        ));
+        // A `multi` or `fde` leg's field is the client's as well.
+        let multi = Prefetch::Multi {
+            field: "late".to_owned(),
+            query: vec![vec![1.0]],
+            limit: 1,
+        };
+        let fde = Prefetch::MultiFde {
+            field: "later".to_owned(),
+            query: vec![vec![1.0]],
+            limit: 1,
+            rerank: None,
+            probes: None,
+        };
+        assert!(matches!(
+            query_error(m, &[multi], unknown()),
+            EngineError::UnknownField(f) if f == "late"
+        ));
+        assert!(matches!(
+            query_error(m, &[fde], unknown()),
+            EngineError::UnknownField(f) if f == "later"
+        ));
+        // ... and a leg-less query has no field to blame.
+        assert!(matches!(
+            query_error(m, &[], unknown()),
+            EngineError::Query(_)
+        ));
+        // A named dense leg over several vectors means `multi`; any other unimplemented
+        // retriever is ours.
+        let several = QueryError::Unimplemented(
+            "a dense leg over a field of several vectors a document: search it with `multi`",
+        );
+        assert!(matches!(
+            query_error(m, &[dense("late")], several),
+            EngineError::Refused(why) if why.contains("late") && why.contains("multi")
+        ));
+        assert!(matches!(
+            query_error(m, &[dense("late")], QueryError::Unimplemented("trigram")),
+            EngineError::Query(_)
+        ));
     }
 }
 
