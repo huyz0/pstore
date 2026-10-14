@@ -73,7 +73,7 @@ async fn locate_finds_the_real_files_vectors() {
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
     for (file, why) in [
-        ("snappy.parquet", "compressed"),
+        ("zstd.parquet", "compressed with codec"),
         ("dict.parquet", "dictionary"),
         ("optional.parquet", "REQUIRED"),
         ("list.parquet", "repetition levels"),
@@ -153,16 +153,19 @@ async fn extents_address_rows() {
                 first_row: 0,
                 rows: 3,
                 offset: 100,
+                compressed: 0,
             },
             Extent {
                 first_row: 3,
                 rows: 1,
                 offset: 200,
+                compressed: 0,
             },
             Extent {
                 first_row: 4,
                 rows: 5,
                 offset: 300,
+                compressed: 0,
             },
         ],
     )
@@ -178,6 +181,7 @@ async fn extents_address_rows() {
     let shape =
         |extents: Vec<Extent>, len: u64| ExternalColumn::from_extents("k", 2, len, None, extents);
     let e = |first_row, rows, offset| Extent {
+        compressed: 0,
         first_row,
         rows,
         offset,
@@ -477,7 +481,8 @@ async fn locate_refuses_each_shape_it_cannot_read() {
     refused(&with(&|s| s.column_type = 1), "FIXED_LEN_BYTE_ARRAY").await;
     refused(&with(&|s| s.repetition = 1), "REQUIRED").await;
     refused(&with(&|s| s.repetition = 2), "REQUIRED").await;
-    refused(&with(&|s| s.chunks[0].codec = 1), "compressed").await;
+    refused(&with(&|s| s.chunks[0].codec = 6), "compressed with codec").await;
+    refused(&with(&|s| s.chunks[0].codec = 2), "only snappy").await;
     refused(
         &with(&|s| s.chunks[0].dictionary_offset = true),
         "dictionary",
@@ -563,4 +568,146 @@ async fn a_footer_that_is_all_there_is() {
         let err = locate(&store, &key, "v").await.unwrap_err();
         assert!(err.to_string().contains("out of range"), "{extra}: {err}");
     }
+}
+
+// ---- M75: snappy pages ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_snappy_file_locates_and_reads_back() {
+    check_every_row("snappy.parquet", "good.vectors.f32", 300, 3).await;
+    let (store, key) = put("multipage-snappy.parquet").await;
+    let found = locate(&store, &key, "embedding").await.unwrap();
+    assert!(found.extents.len() > 1);
+    assert!(found.extents.iter().all(|e| e.compressed > 0));
+    check_every_row(
+        "multipage-snappy.parquet",
+        "multipage.vectors.f32",
+        2600,
+        found.extents.len(),
+    )
+    .await;
+    // A compressed row has no per-row range.
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(col.row_range(5).is_none());
+}
+
+#[tokio::test]
+async fn a_snappy_page_is_read_once_for_all_its_candidates() {
+    use pstore_blob::Accounted;
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(pstore_types::TenantId(1));
+    let key = Key::new("lake/ms.parquet");
+    store
+        .put(&key, bytes("multipage-snappy.parquet").into())
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let (a, b) = (&col.extents[0], &col.extents[1]);
+    let moved = |rows: Vec<usize>| {
+        let (acct, store, col, key) = (&acct, &store, &col, &key);
+        async move {
+            acct.record_ranges();
+            let got = col.read_rows(store, &rows).await.unwrap();
+            assert_eq!(got.len(), rows.len());
+            acct.bytes_in(key, 0..col.len)
+        }
+    };
+    let r0 = a.first_row as usize;
+    assert_eq!(moved(vec![r0, r0 + 1]).await, a.compressed, "one page once");
+    // Two adjacent pages: both, plus at most the page header the coalescer bridges.
+    let two = moved(vec![r0, b.first_row as usize]).await;
+    assert!(
+        (a.compressed + b.compressed..=a.compressed + b.compressed + 64).contains(&two),
+        "{two}"
+    );
+}
+
+#[tokio::test]
+async fn a_damaged_snappy_page_is_an_error() {
+    let (store, key) = put("multipage-snappy.parquet").await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let e = col.extents[0];
+    // Scribble over the compressed body: either it does not decode, or it decodes to the wrong
+    // length. Neither may return floats.
+    let mut bad = bytes("multipage-snappy.parquet");
+    for b in &mut bad[e.offset as usize..(e.offset + 40) as usize] {
+        *b = 0xFF;
+    }
+    store.put(&key, bad.into()).await.unwrap();
+    // The object changed, so re-pin to the damaged bytes: the footer still describes them.
+    let damaged = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(matches!(
+        damaged.read_rows(&store, &[e.first_row as usize]).await,
+        Err(ExternalError::Damaged)
+    ));
+    // A page that decompresses cleanly to the wrong length: snappy of 8 bytes where 32 are due.
+    let mut short = bytes("multipage-snappy.parquet");
+    let tiny = snap::raw::Encoder::new().compress_vec(&[7u8; 8]).unwrap();
+    let mut fixed = col.clone();
+    fixed.extents[0].compressed = tiny.len() as u64;
+    let at = e.offset as usize;
+    short[at..at + tiny.len()].copy_from_slice(&tiny);
+    store.put(&key, short.into()).await.unwrap();
+    fixed.tag = store.get_tag(&key).await.unwrap();
+    assert!(matches!(
+        fixed.read_rows(&store, &[e.first_row as usize]).await,
+        Err(ExternalError::Damaged)
+    ));
+}
+
+#[tokio::test]
+async fn snappy_pages_are_checked_against_their_claims() {
+    // Located as compressed: the page's on-disk size is the extent, not `values x width`.
+    let mut ok = spec(4, vec![chunk(4, &[5])]);
+    ok.chunks[0].codec = 1;
+    ok.chunks[0].pages[0].compressed = 30;
+    ok.chunks[0].pages[0].body = 30;
+    let found = run(&ok).await.unwrap();
+    assert_eq!(
+        (found.extents[0].rows, found.extents[0].compressed),
+        (5, 30)
+    );
+    // A compressed size of 0 holds nothing.
+    let mut empty = ok.clone();
+    empty.chunks[0].pages[0].compressed = 0;
+    empty.chunks[0].pages[0].body = 0;
+    refused(&empty, "levels").await;
+    // A page that decompresses to the wrong size carries levels or another layout.
+    let mut wrong = ok.clone();
+    wrong.chunks[0].pages[0].uncompressed += 4;
+    refused(&wrong, "levels").await;
+    let mut wrong = ok.clone();
+    wrong.chunks[0].pages[0].uncompressed -= 4;
+    refused(&wrong, "levels").await;
+    // A compressed page longer than its chunk.
+    let mut long = ok.clone();
+    long.chunks[0].pages[0].body -= 8;
+    refused(&long, "past its chunk").await;
+}
+
+#[test]
+fn a_compressed_extent_is_bounded_by_its_compressed_size() {
+    let e = |compressed| Extent {
+        first_row: 0,
+        rows: 1000,
+        offset: 10,
+        compressed,
+    };
+    // 1,000 rows of 2 floats would be 8,000 raw bytes, but the page is 50 on disk.
+    assert!(ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).is_ok());
+    assert!(ExternalColumn::from_extents("k", 2, 59, None, vec![e(50)]).is_err());
+    assert!(
+        ExternalColumn::from_extents("k", 2, 60, None, vec![e(0)]).is_err(),
+        "raw: 8,000 bytes"
+    );
+    let col = ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).unwrap();
+    assert!(col.row_range(3).is_none());
 }

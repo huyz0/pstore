@@ -330,6 +330,7 @@ fn page_header(b: &[u8]) -> Option<(i64, i64, i64, i64, usize)> {
 
 const TYPE_FLBA: i64 = 7;
 const CODEC_NONE: i64 = 0;
+const CODEC_SNAPPY: i64 = 1;
 const ENC_PLAIN: i64 = 0;
 const ENC_RLE: i64 = 3;
 const REQUIRED: i64 = 0;
@@ -399,9 +400,16 @@ pub async fn locate<S: BlobStore>(
         let (m, rows) = group
             .as_ref()
             .ok_or_else(|| ParquetError::Unsupported(format!("a row group lacks {column:?}")))?;
-        if m.codec != Some(CODEC_NONE) {
-            return unsupported("the column is compressed");
-        }
+        let snappy = match m.codec {
+            Some(CODEC_NONE) => false,
+            Some(CODEC_SNAPPY) => true,
+            other => {
+                return unsupported(format!(
+                    "the column is compressed with codec {}, and only snappy is read in place",
+                    other.map_or_else(|| "?".to_owned(), |c| c.to_string())
+                ));
+            }
+        };
         if m.dictionary_page_offset.is_some() {
             return unsupported("the column has a dictionary page");
         }
@@ -433,24 +441,30 @@ pub async fn locate<S: BlobStore>(
                 return unsupported("a data page is not PLAIN-encoded");
             }
             let values = u64::try_from(values).map_err(|_| bad("page values"))?;
-            if co != un || i64::try_from(values * u64::from(dims) * 4).ok() != Some(co) {
+            let plain = values * u64::from(dims) * 4;
+            // A raw page is exactly its values; a snappy page decompresses to exactly them.
+            // Either way a size that disagrees means levels or another layout.
+            let sized = if snappy {
+                i64::try_from(plain).ok() == Some(un) && co > 0
+            } else {
+                co == un && i64::try_from(plain).ok() == Some(co)
+            };
+            if !sized {
                 return unsupported("a data page is compressed or carries levels");
             }
+            let on_disk = u64::try_from(co).map_err(|_| bad("page size"))?;
             let body = at + hlen as u64;
-            if values == 0
-                || body
-                    .checked_add(values * u64::from(dims) * 4)
-                    .is_none_or(|e| e > end)
-            {
+            if values == 0 || body.checked_add(on_disk).is_none_or(|e| e > end) {
                 return Err(bad("a page runs past its chunk"));
             }
             extents.push(Extent {
                 first_row: first_row + got,
                 rows: values,
                 offset: body,
+                compressed: if snappy { on_disk } else { 0 },
             });
             got += values;
-            at = body + values * u64::from(dims) * 4;
+            at = body + on_disk;
         }
         if got != want {
             return Err(bad("pages overshoot the chunk's values"));

@@ -488,3 +488,54 @@ async fn search_is_search_where_allowing_all() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn an_index_over_a_snappy_file_finds_the_exact_neighbours() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/ms.parquet");
+    let file = std::fs::read(format!("{dir}multipage-snappy.parquet")).unwrap();
+    store.put(&key, file.clone().into()).await.unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(col.extents.iter().all(|e| e.compressed > 0));
+    let built = ExternalIndex::build(&store, &codes_key(), col, 700)
+        .await
+        .unwrap();
+    let index = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    assert_eq!(
+        built.to_bytes(),
+        index.to_bytes(),
+        "the compressed sizes survive the blob"
+    );
+    for qi in [0usize, 1_500, 2_599] {
+        let q = &all[qi];
+        let mut exact: Vec<(usize, f64)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, cosine(q, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let got = index.search(&store, q, 10, 2_600).await.unwrap();
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        assert_eq!(
+            got.iter().map(|g| g.0).collect::<Vec<_>>(),
+            want,
+            "query {qi}"
+        );
+    }
+    let mut other = file;
+    other[4] ^= 0xFF;
+    store.put(&key, other.into()).await.unwrap();
+    assert!(index.search(&store, &all[0], 3, 50).await.is_err());
+}

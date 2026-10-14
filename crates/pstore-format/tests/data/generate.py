@@ -32,3 +32,6 @@ t2=pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(v2)},schema=schema
 pq.write_table(t2,out+'multipage.parquet',compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
 open(out+'multipage.vectors.f32','wb').write(v2.tobytes())
 f=pq.ParquetFile(out+'multipage.parquet'); print(f.metadata.row_group(0).column(1).to_dict()['total_compressed_size'], M*32)
+# M75: compressed pages
+pq.write_table(t2,out+'multipage-snappy.parquet',compression='SNAPPY',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+pq.write_table(t,out+'zstd.parquet',compression='ZSTD',use_dictionary=False,write_statistics=False,row_group_size=100)

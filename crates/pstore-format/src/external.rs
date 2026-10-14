@@ -22,6 +22,9 @@ pub enum ExternalError {
     /// The store failed.
     #[error("external object: {0}")]
     Blob(#[from] BlobError),
+    /// A compressed page that does not decompress to the rows it should hold (M75).
+    #[error("a compressed page is damaged")]
+    Damaged,
     /// A Parquet file or column that cannot be read in place.
     #[error("{0}")]
     Parquet(#[from] crate::parquet::ParquetError),
@@ -36,6 +39,9 @@ pub struct Extent {
     pub rows: u64,
     /// The byte offset of the run's first vector.
     pub offset: u64,
+    /// 0 for a raw run. Otherwise the run is one snappy-compressed page of this many bytes at
+    /// `offset` (M75): its rows have no per-row range.
+    pub compressed: u64,
 }
 
 /// A column of fixed-width `f32` vectors inside an external object.
@@ -67,7 +73,17 @@ impl ExternalColumn {
         u64::from(self.dims) * 4
     }
 
-    /// Where row `row`'s vector is, or `None` past the column.
+    /// The index of the compressed extent holding `row`, if its extent is compressed.
+    fn compressed_extent(&self, row: usize) -> Option<usize> {
+        let row = u64::try_from(row).ok()?;
+        let i = self
+            .extents
+            .partition_point(|e| e.first_row <= row)
+            .checked_sub(1)?;
+        self.extents.get(i).filter(|e| e.compressed > 0).map(|_| i)
+    }
+
+    /// Where row `row`'s vector is, or `None` past the column or in a compressed page.
     #[must_use]
     pub fn row_range(&self, row: usize) -> Option<Range<u64>> {
         let row = u64::try_from(row).ok().filter(|r| *r < self.rows)?;
@@ -77,6 +93,9 @@ impl ExternalColumn {
                 .partition_point(|e| e.first_row <= row)
                 .checked_sub(1)?;
             let e = self.extents.get(i)?;
+            if e.compressed > 0 {
+                return None;
+            }
             let start = e
                 .offset
                 .checked_add((row - e.first_row).checked_mul(self.width())?)?;
@@ -166,11 +185,13 @@ impl ExternalColumn {
         let width = u64::from(dims) * 4;
         let mut next = 0u64;
         for e in &extents {
-            let end = e
-                .rows
-                .checked_mul(width)
-                .and_then(|b| b.checked_add(e.offset))
-                .ok_or(ExternalError::Shape("offsets overflow"))?;
+            let end = (if e.compressed > 0 {
+                Some(e.compressed)
+            } else {
+                e.rows.checked_mul(width)
+            })
+            .and_then(|b| b.checked_add(e.offset))
+            .ok_or(ExternalError::Shape("offsets overflow"))?;
             if e.rows == 0 {
                 return Err(ExternalError::Shape("a run holds no rows"));
             }
@@ -211,7 +232,7 @@ impl ExternalColumn {
         let mut wanted: Vec<usize> = rows
             .iter()
             .copied()
-            .filter(|r| self.row_range(*r).is_some())
+            .filter(|r| u64::try_from(*r).is_ok_and(|r| r < self.rows))
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -222,18 +243,54 @@ impl ExternalColumn {
         if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
             return Err(ExternalError::Changed);
         }
-        let ranges: Vec<Range<u64>> = wanted.iter().filter_map(|r| self.row_range(*r)).collect();
-        let bufs = store.get_ranges(&key, &ranges).await?;
-        Ok(wanted
-            .into_iter()
-            .zip(bufs)
-            .map(|(row, raw)| {
-                let v = raw
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                    .collect();
-                (row, v)
-            })
-            .collect())
+        // Raw rows by their own range; a compressed row by its whole page, once.
+        let mut raw_rows: Vec<usize> = Vec::new();
+        let mut pages: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for r in wanted {
+            match self.compressed_extent(r) {
+                Some(i) => pages.entry(i).or_default().push(r),
+                None => raw_rows.push(r),
+            }
+        }
+        let mut ranges: Vec<Range<u64>> =
+            raw_rows.iter().filter_map(|r| self.row_range(*r)).collect();
+        let page_at: Vec<(usize, &Extent)> = pages
+            .keys()
+            .filter_map(|i| self.extents.get(*i).map(|e| (*i, e)))
+            .collect();
+        ranges.extend(
+            page_at
+                .iter()
+                .map(|(_, e)| e.offset..e.offset + e.compressed),
+        );
+        let mut bufs = store.get_ranges(&key, &ranges).await?.into_iter();
+        let mut out = BTreeMap::new();
+        let floats = |raw: &[u8]| -> Vec<f32> {
+            raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                .collect()
+        };
+        for row in &raw_rows {
+            let raw = bufs.next().ok_or(ExternalError::Damaged)?;
+            out.insert(*row, floats(&raw));
+        }
+        for (i, e) in page_at {
+            let comp = bufs.next().ok_or(ExternalError::Damaged)?;
+            let page = snap::raw::Decoder::new()
+                .decompress_vec(&comp)
+                .map_err(|_| ExternalError::Damaged)?;
+            let width = usize::try_from(self.width()).map_err(|_| ExternalError::Damaged)?;
+            if u64::try_from(page.len()).ok() != e.rows.checked_mul(self.width()) {
+                return Err(ExternalError::Damaged);
+            }
+            for r in pages.get(&i).into_iter().flatten() {
+                let at = usize::try_from(*r as u64 - e.first_row)
+                    .map_err(|_| ExternalError::Damaged)?
+                    * width;
+                let raw = page.get(at..at + width).ok_or(ExternalError::Damaged)?;
+                out.insert(*r, floats(raw));
+            }
+        }
+        Ok(out)
     }
 }
