@@ -256,6 +256,22 @@ impl ExternalIndex {
         k: usize,
         window: usize,
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
+        self.search_where(store, query, k, window, &|_| true).await
+    }
+
+    /// [`Self::search`], over only the rows `allow` admits (M73): the others are never scored,
+    /// read or returned, so a filter cannot leave the window full of rows it then drops.
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    pub async fn search_where<S: BlobStore>(
+        &self,
+        store: &S,
+        query: &[f32],
+        k: usize,
+        window: usize,
+        allow: &dyn Fn(usize) -> bool,
+    ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
         if query.len() != self.column.dims as usize {
             return Err(ExternalIndexError::Vector("wrong width"));
         }
@@ -267,6 +283,9 @@ impl ExternalIndex {
             .chunks_exact(step)
             .enumerate()
             .filter_map(|(row, raw)| {
+                if !allow(row) {
+                    return None;
+                }
                 let code = self.quantizer.read_code(raw)?;
                 Some((row, self.quantizer.estimate_prepared(&code, &prepared)))
             })

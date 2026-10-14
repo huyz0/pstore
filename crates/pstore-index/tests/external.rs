@@ -397,3 +397,94 @@ async fn an_index_over_a_parquet_file_finds_the_exact_neighbours() {
         "runs that do not tile the rows"
     );
 }
+
+async fn parquet_index() -> (MemoryStore, ExternalIndex, Vec<Vec<f32>>) {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let file = std::fs::read(format!("{dir}multipage.parquet")).unwrap();
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/multipage.parquet");
+    store.put(&key, file.into()).await.unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 700)
+        .await
+        .unwrap();
+    (store, index, all)
+}
+
+#[tokio::test]
+async fn a_filter_prunes_before_the_window() {
+    let (store, index, all) = parquet_index().await;
+    let keep = |r: usize| r.is_multiple_of(5);
+    let q = &all[1_000];
+    let mut exact: Vec<(usize, f64)> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep(*i))
+        .map(|(i, v)| (i, cosine(q, v)))
+        .collect();
+    exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+    let full = index
+        .search_where(&store, q, 10, 2_600, &keep)
+        .await
+        .unwrap();
+    assert_eq!(full.iter().map(|g| g.0).collect::<Vec<_>>(), want);
+    assert!(full.iter().all(|g| keep(g.0)));
+    // A window of 20 would hold about 4 survivors if filtered after; pruned first, it holds 20.
+    let small = index.search_where(&store, q, 10, 20, &keep).await.unwrap();
+    assert_eq!(small.len(), 10);
+    assert!(small.iter().all(|g| keep(g.0)));
+}
+
+#[tokio::test]
+async fn a_predicate_that_allows_nothing_reads_nothing() {
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(TenantId(1));
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let key = Key::new("lake/multipage.parquet");
+    store
+        .put(
+            &key,
+            std::fs::read(format!("{dir}multipage.parquet"))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col.clone(), 700)
+        .await
+        .unwrap();
+    acct.record_ranges();
+    let got = index
+        .search_where(&store, &[1.0; 8], 10, 100, &|_| false)
+        .await
+        .unwrap();
+    assert!(got.is_empty());
+    assert_eq!(acct.bytes_in(&key, 0..col.len), 0);
+}
+
+#[tokio::test]
+async fn search_is_search_where_allowing_all() {
+    let (store, index, all) = parquet_index().await;
+    assert_eq!(
+        index.search(&store, &all[7], 10, 200).await.unwrap(),
+        index
+            .search_where(&store, &all[7], 10, 200, &|_| true)
+            .await
+            .unwrap()
+    );
+}
