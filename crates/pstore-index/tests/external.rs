@@ -532,10 +532,20 @@ async fn over_file(name: &str, vectors: &str) {
         .await
         .unwrap();
     assert!(col.extents.len() > 1, "{name}");
-    let built = ExternalIndex::build(&store, &codes_key(), col, 700)
+    let index = check_index(&store, col, &all).await;
+    let mut other = file;
+    other[4] ^= 0xFF;
+    store.put(&key, other.into()).await.unwrap();
+    assert!(index.search(&store, &all[0], 3, 50).await.is_err());
+}
+
+/// Builds the index over `col`, reopens it, and checks its top 10 against the exact cosine
+/// ranking for three queries. Returns the reopened index.
+async fn check_index(store: &MemoryStore, col: ExternalColumn, all: &[Vec<f32>]) -> ExternalIndex {
+    let built = ExternalIndex::build(store, &codes_key(), col, 700)
         .await
         .unwrap();
-    let index = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    let index = ExternalIndex::open(store, &codes_key()).await.unwrap();
     assert_eq!(
         built.to_bytes(),
         index.to_bytes(),
@@ -549,7 +559,7 @@ async fn over_file(name: &str, vectors: &str) {
             .map(|(i, v)| (i, cosine(q, v)))
             .collect();
         exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        let got = index.search(&store, q, 10, 2_600).await.unwrap();
+        let got = index.search(store, q, 10, 2_600).await.unwrap();
         let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
         assert_eq!(
             got.iter().map(|g| g.0).collect::<Vec<_>>(),
@@ -557,8 +567,63 @@ async fn over_file(name: &str, vectors: &str) {
             "query {qi}"
         );
     }
-    let mut other = file;
+    index
+}
+
+#[tokio::test]
+async fn an_index_over_a_lance_dataset_finds_the_exact_neighbours() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pstore-format/tests/data/lance/"
+    );
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let mut manifest = None;
+    let root = format!("{dir}one");
+    let mut stack = vec![std::path::PathBuf::from(&root)];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+            let key = Key::new(format!("lake/one/{rel}"));
+            store
+                .put(&key, std::fs::read(&p).unwrap().into())
+                .await
+                .unwrap();
+            if rel.ends_with(".manifest") {
+                manifest = Some(key);
+            }
+        }
+    }
+    let manifest = manifest.unwrap();
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    let data_key = Key::new(col.key.clone());
+    let index = check_index(&store, col, &all).await;
+    // A changed data file is refused by the search.
+    let mut other = std::fs::read(
+        std::fs::read_dir(format!("{root}/data"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
     other[4] ^= 0xFF;
-    store.put(&key, other.into()).await.unwrap();
+    store.put(&data_key, other.into()).await.unwrap();
     assert!(index.search(&store, &all[0], 3, 50).await.is_err());
 }

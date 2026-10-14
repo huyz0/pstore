@@ -28,6 +28,9 @@ pub enum ExternalError {
     /// A Parquet file or column that cannot be read in place.
     #[error("{0}")]
     Parquet(#[from] crate::parquet::ParquetError),
+    /// A Lance dataset or column that cannot be read in place (M82).
+    #[error("{0}")]
+    Lance(#[from] crate::lance::LanceError),
 }
 
 /// A run of contiguous vectors: rows `first_row..first_row + rows`, the first at `offset`.
@@ -308,6 +311,25 @@ impl ExternalColumn {
         let found = crate::parquet::locate(store, key, column).await?;
         let tag = store.get_tag(key).await?;
         if store.head(key).await? != found.len {
+            return Err(ExternalError::Changed);
+        }
+        Self::from_extents(key.as_str(), found.dims, found.len, tag, found.extents)
+    }
+
+    /// Pins the float32 fixed-size-list column `column` of the Lance dataset whose manifest is at
+    /// `manifest` (M82): the column of its one data file, bound to that file's key.
+    ///
+    /// # Errors
+    /// [`ExternalError::Lance`] for a dataset or column that cannot be read in place; a store
+    /// failure.
+    pub async fn pin_lance<S: BlobStore>(
+        store: &S,
+        manifest: &Key,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let (key, found) = crate::lance::locate(store, manifest, column).await?;
+        let tag = store.get_tag(&key).await?;
+        if store.head(&key).await? != found.len {
             return Err(ExternalError::Changed);
         }
         Self::from_extents(key.as_str(), found.dims, found.len, tag, found.extents)
