@@ -23,6 +23,13 @@ pub fn vectors_key(segment: &Key) -> Key {
     Key::new(format!("{}.fdev", segment.as_str()))
 }
 
+/// The name a named dense field's clusters carry in the set (M83). It starts with a NUL, which
+/// no field name may, so it can never be a multi-vector field's name.
+#[must_use]
+pub fn dense_name(field: &str) -> String {
+    format!("\0dense\0{field}")
+}
+
 /// Centroids of a segment's encoded rows, and the rows of each list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FdeClusters {
@@ -209,13 +216,32 @@ impl FdeClusters {
         limit: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
         let q = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, query);
+        self.search_vector_at(store, segment_key, base, &q, probes, limit)
+            .await
+    }
+
+    /// The top `limit` rows by dot product with `q`, over the rows of the `probes` best lists,
+    /// with this field's vectors `base` bytes into `.fdev`. `q` is already in the clustered
+    /// space: an encoded multi-vector query, or (M83) a named dense field's transformed query.
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    pub async fn search_vector_at<S: BlobStore>(
+        &self,
+        store: &S,
+        segment_key: &Key,
+        base: u64,
+        q: &[f32],
+        probes: usize,
+        limit: usize,
+    ) -> Result<Vec<(usize, f32)>, FormatError> {
         let dim = self.centroids.first().map_or(0, Vec::len);
         let width = (dim * 4) as u64;
         let mut order: Vec<(usize, f32)> = self
             .centroids
             .iter()
             .enumerate()
-            .map(|(i, c)| (i, dot(&q, c)))
+            .map(|(i, c)| (i, dot(q, c)))
             .collect();
         order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         // Where each list starts, in rows of `.fdev`.
@@ -245,7 +271,7 @@ impl FdeClusters {
             for (row, v) in list.iter().zip(raw.chunks_exact(dim.max(1) * 4)) {
                 let score: f32 = v
                     .chunks_exact(4)
-                    .zip(&q)
+                    .zip(q)
                     .map(|(b, x)| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])) * x)
                     .sum();
                 best.entry(*row as usize).or_insert(score);

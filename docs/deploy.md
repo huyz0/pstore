@@ -153,8 +153,9 @@ RRF; `sum` and `max` refuse it.
   segments of different widths fails, loudly, and leaves them.
 - **Limits:** 8 named fields a document, 1,024 vectors a field, names of 1–64 bytes other than
   `vector`. A dense query (`vector` with `field`) searches `vector` by default, or a named
-  field of one vector a document by an exact scan of that field (M77); a field of several
-  vectors is `multi`'s.
+  field of one vector a document by an exact scan of that field (M77), or -- when the segment is big enough to have
+  clusters and every row carries the field -- by the best `p` lists of its clusters (M83); a
+  field of several vectors is `multi`'s.
 - **Not split** across peers (backlog row 64).
 - **A segment's export or compaction reads each named field in a round of its own.** Queries
   never do.

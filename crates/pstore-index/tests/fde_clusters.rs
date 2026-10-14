@@ -5,6 +5,7 @@
     clippy::indexing_slicing,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
+    clippy::float_cmp,
     reason = "assertions in tests are the reporting mechanism"
 )]
 
@@ -311,4 +312,83 @@ async fn each_field_searches_its_own_vectors() {
         }
     }
     assert!(FdeSet::open(&store, &Key::new("t/none.seg")).await.is_err());
+}
+
+/// M83: a clustered vector query, in the clustered space as given (no encoding).
+#[tokio::test]
+async fn a_vector_query_scores_the_probed_lists_exactly() {
+    let mut s = 83u64;
+    let rows: Vec<Vec<f32>> = (0..9_000)
+        .map(|i| {
+            let topic = (i % 12) as f32;
+            (0..4)
+                .map(|d| topic * (d as f32 + 1.0) + rnd(&mut s))
+                .collect()
+        })
+        .collect();
+    let (clusters, blob) = FdeClusters::build("x", &rows, Params::default());
+    assert!(clusters.lists() > 1);
+    let store = MemoryStore::new();
+    let seg = Key::new("t/idx/s.seg");
+    store
+        .put(&fde_clusters::vectors_key(&seg), blob.into())
+        .await
+        .unwrap();
+    let q = vec![3.0f32, 6.0, 9.0, 12.0];
+    let dot = |v: &[f32]| v.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>();
+
+    // Every list: exactly the brute-force top 10, scores to the bit.
+    let all = clusters
+        .search_vector_at(&store, &seg, 0, &q, 1 << 20, 10)
+        .await
+        .unwrap();
+    let mut want: Vec<(usize, f32)> = rows.iter().enumerate().map(|(i, v)| (i, dot(v))).collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    want.truncate(10);
+    assert_eq!(all, want);
+
+    // One list: a subset of what exists, each score the true dot product, best first.
+    let one = clusters
+        .search_vector_at(&store, &seg, 0, &q, 1, 10)
+        .await
+        .unwrap();
+    assert!(!one.is_empty() && one.len() <= 10);
+    for (row, score) in &one {
+        assert_eq!(*score, dot(&rows[*row]));
+    }
+    assert!(one.windows(2).all(|w| w[0].1 >= w[1].1));
+    assert_eq!(one[0], want[0], "the best row is in the best list");
+
+    // A vector blob not the size the lists imply is corrupt, not short.
+    let short = MemoryStore::new();
+    short
+        .put(&fde_clusters::vectors_key(&seg), vec![0u8; 8].into())
+        .await
+        .unwrap();
+    assert!(
+        clusters
+            .search_vector_at(&short, &seg, 0, &q, 1, 10)
+            .await
+            .is_err()
+    );
+    // And a field's `base` shifts where its vectors are read.
+    let mut padded = vec![0u8; 64];
+    padded.extend(store.get(&fde_clusters::vectors_key(&seg)).await.unwrap());
+    let shifted = MemoryStore::new();
+    shifted
+        .put(&fde_clusters::vectors_key(&seg), padded.into())
+        .await
+        .unwrap();
+    let at = clusters
+        .search_vector_at(&shifted, &seg, 64, &q, 1 << 20, 10)
+        .await
+        .unwrap();
+    assert_eq!(at, want);
+}
+
+#[test]
+fn a_dense_field_never_shares_a_name_with_a_multi_vector_one() {
+    assert_eq!(fde_clusters::dense_name("tag"), "\0dense\0tag");
+    assert_ne!(fde_clusters::dense_name("tag"), "tag");
+    assert!(fde_clusters::dense_name("tag").starts_with('\0'));
 }

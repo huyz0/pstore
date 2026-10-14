@@ -111,6 +111,7 @@ async fn the_api_searches_a_named_field() {
     // that is not the field's, and a field of several vectors.
     for (body, why) in [
         (json!({"vector": q, "field": "tag$fde"}), "$fde"),
+        (json!({"vector": q, "field": "no\u{0}pe"}), "NUL"),
         (json!({"vector": q, "field": "nope"}), "unknown_field"),
         (json!({"vector": [1.0, 2.0], "field": "tag"}), "dimension"),
         (json!({"vector": q, "field": "late"}), "multi"),

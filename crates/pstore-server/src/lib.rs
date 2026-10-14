@@ -3045,6 +3045,11 @@ const MAX_PROBES: usize = 1024;
 
 /// A named field's name, or why it cannot be one (M61): `vector` is the dense field's.
 fn named_field(name: &str) -> Result<String, ApiError> {
+    if name.contains('\0') {
+        return Err(ApiError::bad_request(
+            "a named vector field's name may not contain a NUL byte: it is reserved",
+        ));
+    }
     if name.ends_with(pstore_format::fde::FIELD_SUFFIX) {
         return Err(ApiError::bad_request(format!(
             "a named vector field's name may not end `{}`: that suffix holds the encoding the \

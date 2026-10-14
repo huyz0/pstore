@@ -1553,9 +1553,12 @@ async fn open<S: BlobStore>(
             None => Ok(std::collections::HashSet::new()),
         }
     };
-    let wants_fde = prefetch
-        .iter()
-        .any(|p| matches!(p, Prefetch::MultiFde { .. }));
+    // M83: a dense leg over a named field reads that field's clusters when the segment has them.
+    let wants_fde = prefetch.iter().any(|p| match p {
+        Prefetch::MultiFde { .. } => true,
+        Prefetch::Dense { field, tune, .. } => field != pstore_format::DEFAULT_FIELD && !tune.exact,
+        _ => false,
+    });
     let fde_fut = maybe(
         store,
         (wants_fde && target.fde_clusters).then(|| pstore_index::fde_clusters::key(key)),
@@ -1732,15 +1735,6 @@ async fn leg<S: BlobStore>(
             // Found through the API in M7c.
             // ⚠️ A field of several vectors a row is MaxSim's (M61): searched as dense it would
             // read another field's codes, and its offset table as vectors.
-            if opened
-                .segment
-                .field_layout(field)
-                .is_some_and(|f| f.per_row == 0)
-            {
-                return Err(QueryError::Unimplemented(
-                    "a dense leg over a field of several vectors a document: search it with `multi`",
-                ));
-            }
             // M77: a named field is scanned exactly, over its own vectors. `search_field` would
             // search `vector`'s codes and centroids and answer with another field's rows.
             if *field != pstore_format::DEFAULT_FIELD {
@@ -1757,7 +1751,36 @@ async fn leg<S: BlobStore>(
                     }
                     .into());
                 }
+                // M83: the best `p` lists of the field's clusters, scored exactly, when the
+                // segment clustered it and the caller did not ask for the exact scan.
+                if !tune.exact
+                    && let Some(raw) = &opened.fde
+                {
+                    let set = pstore_index::fde_clusters::FdeSet::decode(raw)
+                        .ok_or(FormatError::Corrupt("damaged cluster sidecar"))?;
+                    let name = pstore_index::fde_clusters::dense_name(field);
+                    if let Some((c, base)) = set.field(&name) {
+                        let hits = c
+                            .search_vector_at(store, key, base, query, tune.p, *limit)
+                            .await?;
+                        return Ok(hits
+                            .into_iter()
+                            .map(|(row, score)| Hit {
+                                segment,
+                                row,
+                                score,
+                            })
+                            .collect());
+                    }
+                }
                 let rows = opened.segment.field_vectors(store, key, field).await?;
+                // ⚠️ A field some documents lack is stored with an offset table, as a field of
+                // several vectors is: a row of none is skipped, a row of several is `multi`'s.
+                if rows.iter().any(|d| d.len() > 1) {
+                    return Err(QueryError::Unimplemented(
+                        "a dense leg over a field of several vectors a document: search it with `multi`",
+                    ));
+                }
                 let mut scored: Vec<(usize, f32)> = rows
                     .iter()
                     .enumerate()

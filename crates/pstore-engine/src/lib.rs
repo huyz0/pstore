@@ -53,6 +53,41 @@ const MAX_COMMIT_ATTEMPTS: u32 = 24;
 /// not contention any retry fixes.
 const MAX_REFUSED_NAMES: u32 = 16;
 
+/// Every named dense field of one vector a document that **every** row of the segment carries,
+/// with its vectors in the segment's row order (M83). A field some row lacks is left out: its
+/// missing rows would be zero vectors, which score 0 and outrank real negative scores, so such
+/// a field keeps the exact scan. Named by [`pstore_index::fde_clusters::dense_name`].
+fn dense_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)> {
+    let mut seen = std::collections::HashSet::new();
+    let primary: Vec<usize> = order.iter().copied().filter(|i| seen.insert(*i)).collect();
+    let names: std::collections::BTreeSet<&str> = docs
+        .iter()
+        .flat_map(|d| d.vectors.keys())
+        .map(String::as_str)
+        .filter(|k| *k != pstore_format::DEFAULT_FIELD)
+        .filter(|k| !k.ends_with(pstore_format::fde::FIELD_SUFFIX))
+        .collect();
+    names
+        .into_iter()
+        .filter_map(|field| {
+            let rows: Option<Vec<Vec<f32>>> = primary
+                .iter()
+                .map(|i| match docs.get(*i).and_then(|d| d.vectors.get(field)) {
+                    Some(pstore_format::VectorField::Dense(v)) if v.len() == 1 => {
+                        v.first().cloned()
+                    }
+                    _ => None,
+                })
+                .collect();
+            let rows = rows?;
+            let dim = rows.first()?.len();
+            rows.iter()
+                .all(|r| r.len() == dim)
+                .then(|| (pstore_index::fde_clusters::dense_name(field), rows))
+        })
+        .collect()
+}
+
 /// Every multi-vector field the segment's documents carry the encoding of, and the encodings in
 /// the segment's row order (M71.2, M74). Empty when there is none.
 fn fde_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)> {
@@ -2142,7 +2177,9 @@ impl<S: BlobStore> Engine<S> {
         // M71.2: the multi-vector encoding clustered, when the segment is big enough to have
         // more than one list. `built.order` repeats a replicated row, so the segment's own rows
         // are each document once, in first-appearance order.
-        let fields = fde_rows(docs, &built.order);
+        let mut fields = fde_rows(docs, &built.order);
+        // M83: and the named dense fields, in the same set.
+        fields.extend(dense_rows(docs, &built.order));
         if !fields.is_empty() {
             let (set, vectors) = pstore_index::fde_clusters::FdeSet::build(
                 &fields,
@@ -2466,6 +2503,14 @@ impl<S: BlobStore> Engine<S> {
                      encoding the engine derives",
                     d.id,
                     pstore_format::fde::FIELD_SUFFIX
+                )));
+            }
+            // M83: a NUL begins the name a dense field's clusters carry in the set, so no
+            // field may contain one.
+            if let Some(name) = d.vectors.keys().find(|k| k.contains('\0')) {
+                return Err(EngineError::Format(format!(
+                    "document {}: vector field {name:?} contains a NUL byte, which is reserved",
+                    d.id
                 )));
             }
             for field in d.vectors.values_mut() {
