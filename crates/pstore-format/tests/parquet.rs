@@ -73,7 +73,6 @@ async fn locate_finds_the_real_files_vectors() {
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
     for (file, why) in [
-        ("brotli.parquet", "compressed with codec"),
         ("dict.parquet", "dictionary"),
         ("optional.parquet", "REQUIRED"),
         ("list.parquet", "repetition levels"),
@@ -485,10 +484,10 @@ async fn locate_refuses_each_shape_it_cannot_read() {
     refused(&with(&|s| s.column_type = 1), "FIXED_LEN_BYTE_ARRAY").await;
     refused(&with(&|s| s.repetition = 1), "REQUIRED").await;
     refused(&with(&|s| s.repetition = 2), "REQUIRED").await;
-    refused(&with(&|s| s.chunks[0].codec = 4), "compressed with codec").await;
+    refused(&with(&|s| s.chunks[0].codec = 3), "compressed with codec").await;
     refused(
-        &with(&|s| s.chunks[0].codec = 7),
-        "only snappy, gzip and zstd",
+        &with(&|s| s.chunks[0].codec = 5),
+        "only snappy, gzip, brotli, lz4_raw and zstd",
     )
     .await;
     refused(
@@ -742,20 +741,15 @@ async fn gzip_and_zstd_files_read_back_every_row() {
         check_every_row(file, "multipage.vectors.f32", 2600, found.extents.len()).await;
     }
     check_every_row("zstd.parquet", "good.vectors.f32", 300, 3).await;
+    check_every_row("brotli.parquet", "good.vectors.f32", 300, 3).await;
 }
 
 #[tokio::test]
-async fn brotli_and_other_codecs_are_refused_by_name() {
-    let (store, key) = put("brotli.parquet").await;
-    let err = locate(&store, &key, "embedding").await.unwrap_err();
-    assert!(
-        err.to_string().contains("only snappy, gzip and zstd"),
-        "{err}"
-    );
-    for codec in [4, 5, 7] {
+async fn lzo_and_hadoop_lz4_are_refused_by_name() {
+    for codec in [3, 5] {
         let mut s = spec(4, vec![chunk(4, &[5])]);
         s.chunks[0].codec = codec;
-        refused(&s, "only snappy, gzip and zstd").await;
+        refused(&s, "only snappy, gzip, brotli, lz4_raw and zstd").await;
     }
 }
 
@@ -804,6 +798,31 @@ async fn a_page_that_lies_about_its_size_cannot_balloon() {
     };
     lying(ok_gz, 2, 4).await.unwrap();
     lying(zstd::stream::encode_all(&[0u8; 32][..], 1).unwrap(), 6, 4)
+        .await
+        .unwrap();
+    let br = {
+        let mut out = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 1, 22);
+            w.write_all(&zeros).unwrap();
+        }
+        out
+    };
+    let lz = lz4_flex::block::compress(&zeros);
+    assert!(br.len() < 1 << 20 && lz.len() < 1 << 20);
+    assert!(matches!(
+        lying(br.clone(), 4, 4).await,
+        Err(ExternalError::Damaged)
+    ));
+    assert!(matches!(lying(lz, 7, 4).await, Err(ExternalError::Damaged)));
+    // Told the truth, they read.
+    let mut ok_br = Vec::new();
+    {
+        let mut w = brotli::CompressorWriter::new(&mut ok_br, 4096, 1, 22);
+        w.write_all(&[0u8; 32]).unwrap();
+    }
+    lying(ok_br, 4, 4).await.unwrap();
+    lying(lz4_flex::block::compress(&[0u8; 32]), 7, 4)
         .await
         .unwrap();
     // A codec number the extent cannot have.

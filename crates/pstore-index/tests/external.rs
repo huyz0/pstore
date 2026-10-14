@@ -491,7 +491,13 @@ async fn search_is_search_where_allowing_all() {
 
 #[tokio::test]
 async fn an_index_over_each_codec_finds_the_exact_neighbours() {
-    for file in ["multipage-snappy", "multipage-gzip", "multipage-zstd"] {
+    for file in [
+        "multipage-snappy",
+        "multipage-gzip",
+        "multipage-zstd",
+        "multipage-brotli",
+        "multipage-lz4raw",
+    ] {
         over_codec(file).await;
     }
 }

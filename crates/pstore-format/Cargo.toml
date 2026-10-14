@@ -19,6 +19,8 @@ bytes        = "1"
 thiserror    = "2"
 snap         = "1"
 zstd         = { version = "0.13", default-features = false }
+brotli-decompressor = "5"
+lz4_flex     = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
 flate2       = { version = "1", default-features = false, features = ["rust_backend"] }
 # M14: the Snowball stemmers for an index's declared language, and NFKD for ASCII folding.
 rust-stemmers         = "1.2"
@@ -29,3 +31,6 @@ regex-syntax          = { version = "0.8", default-features = false, features = 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Test-only: compressors, to build pages that lie about their size.
+brotli = { version = "8", default-features = false, features = ["std"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "std"] }

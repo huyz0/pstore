@@ -11,7 +11,7 @@ Commands: `cargo test -p pstore-format --test parquet`: 15 tests; `cargo test -p
 1. `gzip_and_zstd_files_read_back_every_row`: `multipage-gzip.parquet` and
    `multipage-zstd.parquet` (2,600 rows, several pages) locate with codec 2 and 6 on every extent
    and every row equals the generator's floats; `zstd.parquet` (3 row groups) likewise.
-2. `brotli_and_other_codecs_are_refused_by_name`: `brotli.parquet` and synthetic codecs 4, 5 and 7
+2. `lzo_and_hadoop_lz4_are_refused_by_name` (named `brotli_and_other_codecs_are_refused_by_name` when M76 shipped; renamed by M79, which made brotli readable): `brotli.parquet` and synthetic codecs 4, 5 and 7
    are refused naming "only snappy, gzip and zstd".
 3. `a_page_that_lies_about_its_size_cannot_balloon`: a 64 MB page of zeros, gzip- and zstd-coded
    (under 1 MB on disk), in an extent claiming 32 bytes, is `Damaged`; the same codecs told the

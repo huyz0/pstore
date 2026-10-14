@@ -39,3 +39,6 @@ pq.write_table(t,out+'zstd.parquet',compression='ZSTD',use_dictionary=False,writ
 pq.write_table(t2,out+'multipage-zstd.parquet',compression='ZSTD',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
 pq.write_table(t2,out+'multipage-gzip.parquet',compression='GZIP',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
 pq.write_table(t,out+'brotli.parquet',compression='BROTLI',use_dictionary=False,write_statistics=False,row_group_size=100)
+# M79: brotli and lz4 (pyarrow writes both its LZ4 spellings as LZ4_RAW, codec 7)
+pq.write_table(t2,out+'multipage-brotli.parquet',compression='BROTLI',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+pq.write_table(t2,out+'multipage-lz4raw.parquet',compression='LZ4_RAW',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')

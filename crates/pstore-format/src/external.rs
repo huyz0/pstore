@@ -51,8 +51,13 @@ pub struct Extent {
 pub const CODEC_SNAPPY: u8 = 1;
 /// Parquet's codec number for gzip.
 pub const CODEC_GZIP: u8 = 2;
+/// Parquet's codec number for brotli.
+pub const CODEC_BROTLI: u8 = 4;
 /// Parquet's codec number for zstd.
 pub const CODEC_ZSTD: u8 = 6;
+/// Parquet's codec number for `LZ4_RAW`: one lz4 block. (The deprecated Hadoop-framed `LZ4`, 5,
+/// is not read.)
+pub const CODEC_LZ4_RAW: u8 = 7;
 
 /// A compressed page's bytes, exactly `expected` of them or an error (M76). The output is bounded
 /// by `expected + 1` while decoding, so a page that lies about its size cannot balloon memory.
@@ -74,6 +79,17 @@ fn decompress(codec: u8, comp: &[u8], expected: usize) -> Result<Vec<u8>, Extern
                 .take(cap)
                 .read_to_end(&mut out)
                 .map_err(|_| ExternalError::Damaged)?;
+        }
+        CODEC_BROTLI => {
+            brotli_decompressor::Decompressor::new(comp, 4096)
+                .take(cap)
+                .read_to_end(&mut out)
+                .map_err(|_| ExternalError::Damaged)?;
+        }
+        // The block decoder allocates `expected` and refuses to write past it.
+        CODEC_LZ4_RAW => {
+            out =
+                lz4_flex::block::decompress(comp, expected).map_err(|_| ExternalError::Damaged)?;
         }
         CODEC_ZSTD => {
             zstd::stream::read::Decoder::new(comp)

@@ -401,10 +401,10 @@ pub async fn locate<S: BlobStore>(
             .ok_or_else(|| ParquetError::Unsupported(format!("a row group lacks {column:?}")))?;
         let codec: u8 = match m.codec {
             Some(CODEC_NONE) => 0,
-            Some(c @ (1 | 2 | 6)) => u8::try_from(c).map_err(|_| bad("codec"))?,
+            Some(c @ (1 | 2 | 4 | 6 | 7)) => u8::try_from(c).map_err(|_| bad("codec"))?,
             other => {
                 return unsupported(format!(
-                    "the column is compressed with codec {}, and only snappy, gzip and zstd are read in place",
+                    "the column is compressed with codec {}, and only snappy, gzip, brotli, lz4_raw and zstd are read in place",
                     other.map_or_else(|| "?".to_owned(), |c| c.to_string())
                 ));
             }
