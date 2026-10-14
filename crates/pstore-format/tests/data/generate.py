@@ -56,3 +56,14 @@ open(out+'dictionary.vectors.f32','wb').write(dvecs.tobytes())
 pq.write_table(td,out+'dictionary.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')
 pq.write_table(td,out+'dictionary-snappy.parquet',compression='SNAPPY',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')
 pq.write_table(td,out+'dictionary-v2.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='2.0')
+# M84: OPTIONAL (nullable) columns that hold no nulls, and one that does
+tn=pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(v2)})  # default schema: nullable
+for name,kw in [('optional-multipage.parquet',dict(compression='NONE',data_page_version='1.0')),
+                ('optional-v2.parquet',dict(compression='NONE',data_page_version='2.0')),
+                ('optional-v2-zstd.parquet',dict(compression='ZSTD',data_page_version='2.0')),
+                ('optional-snappy.parquet',dict(compression='SNAPPY',data_page_version='1.0'))]:
+    pq.write_table(tn,out+name,use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,**kw)
+holes=[None if i%10==3 else v2[i].tobytes() for i in range(M)]
+pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':pa.array(holes,type=pa.binary(D*4))}),out+'optional-nulls.parquet',compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+# M84: an optional, dictionary-encoded column (refused: its index pages carry levels)
+pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(dvecs)}),out+'optional-dictionary.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')

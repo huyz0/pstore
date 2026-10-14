@@ -500,6 +500,10 @@ async fn an_index_over_each_codec_finds_the_exact_neighbours() {
         "multipage-v2",
         "multipage-v2-snappy",
         "multipage-v2-zstd",
+        // M84: nullable columns that hold no nulls.
+        "optional-multipage",
+        "optional-v2",
+        "optional-v2-zstd",
     ] {
         over_codec(file).await;
     }

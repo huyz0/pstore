@@ -72,10 +72,7 @@ async fn locate_finds_the_real_files_vectors() {
 
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
-    for (file, why) in [
-        ("optional.parquet", "REQUIRED"),
-        ("list.parquet", "repetition levels"),
-    ] {
+    for (file, why) in [("list.parquet", "repetition levels")] {
         let (store, key) = put(file).await;
         let err = locate(&store, &key, "embedding").await.unwrap_err();
         assert!(matches!(err, ParquetError::Unsupported(_)), "{file}: {err}");
@@ -511,8 +508,10 @@ async fn locate_refuses_each_shape_it_cannot_read() {
     refused(&with(&|s| s.type_length = 0), "whole number").await;
     refused(&with(&|s| s.type_length = -4), "whole number").await;
     refused(&with(&|s| s.column_type = 1), "FIXED_LEN_BYTE_ARRAY").await;
-    refused(&with(&|s| s.repetition = 1), "REQUIRED").await;
-    refused(&with(&|s| s.repetition = 2), "REQUIRED").await;
+    // OPTIONAL (1) pages are checked for levels, which these synthetic pages do not have;
+    // REPEATED (2) is never read.
+    refused(&with(&|s| s.repetition = 1), "definition levels").await;
+    refused(&with(&|s| s.repetition = 2), "REPEATED").await;
     refused(&with(&|s| s.chunks[0].codec = 3), "compressed with codec").await;
     refused(
         &with(&|s| s.chunks[0].codec = 5),
@@ -1291,4 +1290,125 @@ async fn an_index_page_is_checked_against_its_sizes() {
     s.chunks[0].num_values = 5;
     s.chunks[0].group_rows = 5;
     refused(&s, "overshoot").await;
+}
+
+// ---- M84: OPTIONAL columns that hold no nulls -------------------------------------------------
+
+#[tokio::test]
+async fn optional_files_without_nulls_read_back_every_row() {
+    for (file, codec) in [
+        ("optional.parquet", 0u8),
+        ("optional-multipage.parquet", 0),
+        ("optional-v2.parquet", 0),
+        ("optional-v2-zstd.parquet", 6),
+    ] {
+        let (store, key) = put(file).await;
+        let found = locate(&store, &key, "embedding").await.unwrap();
+        // The levels are stepped over: no extent starts where its page's body does.
+        assert!(
+            found
+                .extents
+                .iter()
+                .all(|e| e.codec == 0 || e.codec == codec),
+            "{file}"
+        );
+        if file == "optional.parquet" {
+            check_every_row(file, "good.vectors.f32", 300, 3).await;
+        } else {
+            check_every_row(file, "multipage.vectors.f32", 2600, found.extents.len()).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_optional_column_that_cannot_be_read_in_place_is_refused_by_name() {
+    for (file, why) in [
+        ("optional-nulls.parquet", "holds nulls"),
+        (
+            "optional-snappy.parquet",
+            "levels are inside the compressed body",
+        ),
+        ("optional-dictionary.parquet", "dictionary-encoded optional"),
+    ] {
+        let (store, key) = put(file).await;
+        let err = locate(&store, &key, "embedding").await.unwrap_err();
+        assert!(err.to_string().contains(why), "{file}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn damaged_definition_levels_are_refused() {
+    let (store, key) = put("optional-multipage.parquet").await;
+    let found = locate(&store, &key, "embedding").await.unwrap();
+    let first = found.extents[0];
+    let raw = bytes("optional-multipage.parquet");
+    // v1: [length: u32][levels][values]. The levels end where the values begin.
+    let at = first.offset as usize;
+    let rle_value = at - 1;
+    assert_eq!(raw[rle_value], 1, "a run of 'present'");
+    let with = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = raw.clone();
+        f(&mut b);
+        b
+    };
+    let len_at = {
+        // The 4-byte length sits `4 + L` bytes before the values; L = 3 for one short run.
+        let l = u32::from_le_bytes(raw[at - 4 - 3..at - 3].try_into().unwrap());
+        assert_eq!(l, 3, "one run: header (2 bytes) and its value");
+        at - 7
+    };
+    // The levels may run exactly to the end of the page (leaving no values: a different
+    // refusal), but not one byte past it.
+    let page = 4 + 3 + first.rows as usize * 32;
+    let to_end = with(&|b| {
+        b[len_at..len_at + 4].copy_from_slice(&((page - 4) as u32).to_le_bytes());
+    });
+    store.put(&key, to_end.into()).await.unwrap();
+    let err = locate(&store, &key, "embedding")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("run past their page"), "{err}");
+    let beyond = with(&|b| {
+        b[len_at..len_at + 4].copy_from_slice(&((page - 3) as u32).to_le_bytes());
+    });
+    store.put(&key, beyond.into()).await.unwrap();
+    let err = locate(&store, &key, "embedding")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("run past their page"), "{err}");
+    for (what, damaged, why) in [
+        ("a null", with(&|b| b[rle_value] = 0), "holds nulls"),
+        (
+            "a longer level run than the page",
+            with(&|b| b[len_at + 3] = 0xFF),
+            "run past their page",
+        ),
+        ("no levels", with(&|b| b[len_at] = 0), "run past their page"),
+    ] {
+        store.put(&key, damaged.into()).await.unwrap();
+        let err = locate(&store, &key, "embedding").await.unwrap_err();
+        assert!(err.to_string().contains(why), "{what}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn an_optional_page_is_bounded_before_its_levels_are_read() {
+    let optional = |values: i64| {
+        let mut s = spec(4, vec![chunk(4, &[3])]);
+        s.repetition = 1;
+        s.chunks[0].pages[0].values = values;
+        s.chunks[0].num_values = values;
+        s.chunks[0].group_rows = values;
+        s
+    };
+    // A page of no values runs nowhere (the chunk holds values in a later page).
+    let mut empty = spec(4, vec![chunk(4, &[0, 3])]);
+    empty.repetition = 1;
+    refused(&empty, "runs past its chunk").await;
+    // Values that decode to more than 256 MiB are refused before any level is read; exactly
+    // 256 MiB (2^24 four-wide vectors) is not, and goes on to its levels.
+    refused(&optional((1 << 24) + 1), "too many values").await;
+    refused(&optional(1 << 24), "definition levels").await;
 }
