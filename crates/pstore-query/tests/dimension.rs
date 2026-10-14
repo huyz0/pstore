@@ -40,6 +40,7 @@ async fn a_query_vector_of_the_wrong_dimension_is_refused_by_the_dense_leg() {
         deleted: None,
         sparse_dict: true,
         text_dict: true,
+        fde_clusters: false,
         shadowed: false,
         segment: key.clone(),
     };

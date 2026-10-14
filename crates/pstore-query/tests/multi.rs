@@ -69,6 +69,7 @@ async fn segment(store: &MemoryStore, name: &str, rows: std::ops::Range<usize>) 
         deleted: None,
         sparse_dict: false,
         text_dict: false,
+        fde_clusters: false,
         shadowed: false,
         segment: key,
     }
@@ -315,6 +316,7 @@ async fn a_segment_without_the_encoding_answers_nothing() {
                 deleted: None,
                 sparse_dict: false,
                 text_dict: false,
+                fde_clusters: false,
                 shadowed: false,
                 segment: key,
             }
@@ -382,6 +384,7 @@ async fn fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced() {
         deleted: None,
         sparse_dict: false,
         text_dict: false,
+        fde_clusters: false,
         shadowed: false,
         segment: key,
     };

@@ -41,9 +41,24 @@ rerank as before.
   by dot, deduplicates a replicated row, and returns the top `limit` as `(row, score)`, ties by
   row.
 
-**Not covered here (M71.2):** the engine writing the sidecar at seal and compaction, GC deleting
-it, the query coordinator preferring it, and a size threshold below which a segment stays a
-flat scan.
+## M71.2 — the engine and query path
+
+- **HEAD** records `fde` as bit 2 of a segment's dictionary byte (`Dicts.fde`), beside sparse
+  and text, so a query asks for the sidecar only when HEAD says it exists (no known-404 read,
+  M27/M32's lesson). ⚠️ A build from before this reads byte 4-7 as a corrupt HEAD.
+- **Seal** (the one builder a fold and a compaction share) writes `.fdec` and `.fdev` when the
+  segment's documents carry the encoding of **exactly one** multi-vector field and clustering
+  yields more than one list (the default list size is 4,000 rows). Rows are the segment's own
+  rows: each document once, in the order it first appears in the clustered row order.
+- **GC** reaps both keys with the segment's other sidecars; **replication** copies them.
+- **Query**: `Target.fde_clusters` (from HEAD) makes the open round fetch `.fdec` beside the
+  footer and the other sidecars. The `fde` leg uses it when it names the leg's field, reading a
+  third of the lists (at least two; provisional); otherwise, and for a segment without it, the
+  flat scan. A sidecar that does not decode, or a `.fdev` of the wrong size, is an error.
+
+**Still not covered:** more than one multi-vector field per segment clustered (the second stays
+a flat scan); a configurable probe count; the in-memory fresh segment (unfolded rows are scanned
+flat, as they are small); the server's response and docs surface for it.
 
 ## Acceptance criteria
 
@@ -57,5 +72,12 @@ flat scan.
    control (a sidecar built from another corpus) falls below it.
 4. `clustered_search_reads_a_fraction`: bytes moved of `.fdev` are **under half** of probing every
    list at that setting (measured with the accounted store).
-5. **Gates:** `./scripts/gates.sh` passes; the mutation sweep of the new module misses 0, or
-   each miss is killed by a named test.
+5. `a_big_segment_clusters_its_encoding_and_a_query_uses_it` (engine, M71.2): 9,000 documents
+   fold into one segment whose HEAD ref has `fde` and whose `.fdec` names the field with more
+   than one list; an `fde` query with exact rerank scores within 5% of the exact leg's mean over
+   its top 10; a `.fdev` of the wrong size is an error, not a flat scan; a compaction reseals
+   with its own clusters and GC reaps the buried segment's.
+6. `the_dicts_section_round_trips_and_refuses_malformed_input` (HEAD): bit 2 round-trips alone
+   and with sparse and text; 8 is refused.
+7. **Gates:** `./scripts/gates.sh` passes; the mutation sweep of the new module and of the
+   changed lines misses 0, or each miss is killed by a named test.

@@ -1624,6 +1624,7 @@ async fn a_replica_records_its_sources_dictionaries() {
         let want = pstore_engine::Dicts {
             sparse: keys.contains(&format!("{}.sdict", r.key)),
             text: keys.contains(&format!("{}.tdict", r.key)),
+            fde: keys.contains(&format!("{}.fdec", r.key)),
         };
         assert_eq!(r.dicts, Some(want), "{}", r.key);
     }

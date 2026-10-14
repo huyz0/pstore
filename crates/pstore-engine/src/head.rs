@@ -34,23 +34,28 @@ pub struct Dicts {
     pub sparse: bool,
     /// A term dictionary (`.tdict`).
     pub text: bool,
+    /// Multi-vector encoding clusters (`.fdec`, `.fdev`; M71.2).
+    pub fde: bool,
 }
 
 impl Dicts {
-    /// HEAD's byte for a ref: bit 0 sparse, bit 1 text, `0xFF` unknown.
+    /// HEAD's byte for a ref: bit 0 sparse, bit 1 text, bit 2 fde, `0xFF` unknown.
     fn byte(d: Option<Self>) -> u8 {
         // A sum, not `|`: the bits are disjoint, so `|` and `^` agree and a sweep cannot tell
         // them apart (M32's sweep found it); every mutation of this one changes a byte or
         // panics.
-        d.map_or(0xFF, |d| u8::from(d.sparse) + 2 * u8::from(d.text))
+        d.map_or(0xFF, |d| {
+            u8::from(d.sparse) + 2 * u8::from(d.text) + 4 * u8::from(d.fde)
+        })
     }
 
     fn of(b: u8) -> Result<Option<Self>, EngineError> {
         match b {
             0xFF => Ok(None),
-            0..=3 => Ok(Some(Self {
+            0..=7 => Ok(Some(Self {
                 sparse: b & 1 != 0,
                 text: b & 2 != 0,
+                fde: b & 4 != 0,
             })),
             _ => Err(EngineError::CorruptHead),
         }
@@ -1178,6 +1183,7 @@ mod tests {
                     dicts: Some(Dicts {
                         sparse: false,
                         text: true,
+                        fde: false,
                     }),
                     len: None,
                 },
@@ -1229,13 +1235,30 @@ mod tests {
             b
         };
         assert_eq!(Head::decode(&section("a", &[2, 0xFF]))?, h);
+        // M71.2: bit 2 is the multi-vector clusters, and the three bits are independent.
+        for (flag, want) in [
+            (4u8, (false, false, true)),
+            (5, (true, false, true)),
+            (6, (false, true, true)),
+            (7, (true, true, true)),
+        ] {
+            let d = Head::decode(&section("a", &[flag, 0xFF]))?;
+            let got = d
+                .indexes
+                .get("a")
+                .and_then(|r| r.first())
+                .and_then(|r| r.dicts)
+                .ok_or(EngineError::CorruptHead)?;
+            assert_eq!((got.sparse, got.text, got.fde), want, "flag {flag}");
+            assert_eq!(d.encode(), section("a", &[flag, 0xFF]));
+        }
         for (why, bad) in [
             ("a count that disagrees", section("a", &[2])),
             // More flags than segments: without the count check, the extra byte is left over
             // and the section reads as valid.
             ("a count above the segments'", section("a", &[2, 0xFF, 0])),
             ("an index HEAD does not name", section("b", &[2, 0xFF])),
-            ("a flag byte out of range", section("a", &[7, 0xFF])),
+            ("a flag byte out of range", section("a", &[8, 0xFF])),
         ] {
             assert!(
                 matches!(Head::decode(&bad), Err(EngineError::CorruptHead)),

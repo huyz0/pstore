@@ -84,6 +84,7 @@ async fn run(store: &MemoryStore, seg: &Key, cen: &Key, field: &str) -> Result<u
         deleted: None,
         sparse_dict: true,
         text_dict: true,
+        fde_clusters: false,
         shadowed: false,
     }];
     query(

@@ -26,6 +26,7 @@ pub fn vectors_key(segment: &Key) -> Key {
 /// Centroids of a segment's encoded rows, and the rows of each list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FdeClusters {
+    field: String,
     centroids: Vec<Vec<f32>>,
     lists: Vec<Vec<u32>>,
     rows: u32,
@@ -39,7 +40,7 @@ impl FdeClusters {
     /// Clusters the encoded rows, one `Vec<f32>` a row in segment order, and lays them out in
     /// list order: the second value is the `.fdev` blob.
     #[must_use]
-    pub fn build(rows: &[Vec<f32>], params: Params) -> (Self, Vec<u8>) {
+    pub fn build(field: &str, rows: &[Vec<f32>], params: Params) -> (Self, Vec<u8>) {
         let c = Clustering::build(rows, params);
         let mut blob = Vec::new();
         for list in c.lists() {
@@ -50,6 +51,7 @@ impl FdeClusters {
             }
         }
         let me = Self {
+            field: field.to_owned(),
             centroids: c.centroids().to_vec(),
             lists: c
                 .lists()
@@ -76,6 +78,12 @@ impl FdeClusters {
         Ok(())
     }
 
+    /// The multi-vector field these lists cluster the encoding of.
+    #[must_use]
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
     /// Lists in the sidecar.
     #[must_use]
     pub fn lists(&self) -> usize {
@@ -89,6 +97,8 @@ impl FdeClusters {
         let mut b = Vec::new();
         b.extend(MAGIC);
         b.extend(self.rows.to_le_bytes());
+        b.extend((self.field.len() as u32).to_le_bytes());
+        b.extend(self.field.as_bytes());
         b.extend((self.centroids.len() as u32).to_le_bytes());
         b.extend((dim as u32).to_le_bytes());
         for c in &self.centroids {
@@ -120,6 +130,8 @@ impl FdeClusters {
             return None;
         }
         let rows = u32_of(take(4)?)?;
+        let flen = u32_of(take(4)?)? as usize;
+        let field = String::from_utf8(take(flen)?.to_vec()).ok()?;
         let n = u32_of(take(4)?)? as usize;
         let dim = u32_of(take(4)?)? as usize;
         // ⚠️ No `with_capacity(n)`: `n` is read from the blob, and a damaged one would ask for
@@ -147,6 +159,7 @@ impl FdeClusters {
             lists.push(l);
         }
         (at == raw.len()).then_some(Self {
+            field,
             centroids,
             lists,
             rows,

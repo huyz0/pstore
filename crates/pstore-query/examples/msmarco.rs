@@ -140,6 +140,7 @@ async fn main() {
             deleted: None,
             sparse_dict: true,
             text_dict: true,
+            fde_clusters: false,
             shadowed: false,
             segment: key,
         });

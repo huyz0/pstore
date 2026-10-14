@@ -126,6 +126,8 @@ pub struct Target {
     pub sparse_dict: bool,
     /// See `sparse_dict`.
     pub text_dict: bool,
+    /// Whether HEAD says it has multi-vector encoding clusters (M71.2): `false` asks for nothing.
+    pub fde_clusters: bool,
     /// Whether the query's shadowed ids hide rows here. `false` for the fresh segment, whose
     /// rows ARE the newest versions.
     pub shadowed: bool,
@@ -137,6 +139,8 @@ struct Opened {
     centroids: Option<bytes::Bytes>,
     dictionary: Option<bytes::Bytes>,
     terms: Option<bytes::Bytes>,
+    /// Its multi-vector encoding clusters (M71.2), when the target has them and a leg wants them.
+    fde: Option<bytes::Bytes>,
     /// Rows its delete vector excludes; empty when it has none.
     deleted: std::collections::HashSet<usize>,
 }
@@ -256,7 +260,7 @@ impl OpenPart {
             .iter()
             .map(|o| {
                 held_bytes(
-                    [&o.centroids, &o.dictionary, &o.terms]
+                    [&o.centroids, &o.dictionary, &o.terms, &o.fde]
                         .iter()
                         .map(|b| b.as_ref().map_or(0, bytes::Bytes::len))
                         .sum::<usize>(),
@@ -522,6 +526,7 @@ async fn candidates<S: BlobStore + Clone>(
             centroids: o.centroids.clone(),
             dictionary: o.dictionary.clone(),
             terms: o.terms.clone(),
+            fde: o.fde.clone(),
             deleted: std::collections::HashSet::new(),
         });
         for &(j, r) in legs.iter().filter(|(j, _)| runs(i, *j)) {
@@ -1534,18 +1539,28 @@ async fn open<S: BlobStore>(
             None => Ok(std::collections::HashSet::new()),
         }
     };
-    let (segment, cen, dict, terms, deleted) = futures_util::future::join5(
-        Segment::open_at(store, key, target.segment_len),
-        maybe(store, centroids.clone().filter(|_| wants_dense)),
-        maybe(
-            store,
-            (wants_sparse && target.sparse_dict).then(|| pstore_format::sparse::dict_key(key)),
+    let wants_fde = prefetch
+        .iter()
+        .any(|p| matches!(p, Prefetch::MultiFde { .. }));
+    let fde_fut = maybe(
+        store,
+        (wants_fde && target.fde_clusters).then(|| pstore_index::fde_clusters::key(key)),
+    );
+    let ((segment, cen, dict, terms, deleted), fde) = futures_util::future::join(
+        futures_util::future::join5(
+            Segment::open_at(store, key, target.segment_len),
+            maybe(store, centroids.clone().filter(|_| wants_dense)),
+            maybe(
+                store,
+                (wants_sparse && target.sparse_dict).then(|| pstore_format::sparse::dict_key(key)),
+            ),
+            maybe(
+                store,
+                (wants_text && target.text_dict).then(|| pstore_format::text::dict_key(key)),
+            ),
+            dv,
         ),
-        maybe(
-            store,
-            (wants_text && target.text_dict).then(|| pstore_format::text::dict_key(key)),
-        ),
-        dv,
+        fde_fut,
     )
     .await;
     Ok(Opened {
@@ -1553,6 +1568,7 @@ async fn open<S: BlobStore>(
         centroids: cen,
         dictionary: dict,
         terms,
+        fde,
         deleted: deleted?,
     })
 }
@@ -1811,17 +1827,35 @@ async fn leg<S: BlobStore>(
                 .into());
             }
             let encoded = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, query);
-            // ⚠️ One ranged read: the encodings only, 2 KB a row, in the leg round.
-            let rows = opened.segment.field_vectors(store, key, &derived).await?;
-            let mut scored: Vec<(usize, f32)> = rows
-                .iter()
-                .enumerate()
-                .filter_map(|(row, d)| {
-                    d.first()
-                        .map(|e| (row, e.iter().zip(&encoded).map(|(a, b)| a * b).sum::<f32>()))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // M71.2: clustered when the segment has clusters for THIS field; the flat scan
+            // otherwise. A sidecar that does not decode is an error, not a silent flat scan.
+            let clusters = match &opened.fde {
+                Some(raw) => Some(
+                    pstore_index::fde_clusters::FdeClusters::decode(raw)
+                        .ok_or(FormatError::Corrupt("damaged multi-vector cluster sidecar"))?,
+                )
+                .filter(|c| c.field() == *field),
+                None => None,
+            };
+            let mut scored: Vec<(usize, f32)> = if let Some(c) = clusters {
+                // ⚠️ Provisional: a third of the lists, at least two.
+                let want = rerank.map_or(*limit, |w| w.max(*limit));
+                c.search(store, key, query, c.lists().div_ceil(3).max(2), want)
+                    .await?
+            } else {
+                // ⚠️ One ranged read: the encodings only, 2 KB a row, in the leg round.
+                let rows = opened.segment.field_vectors(store, key, &derived).await?;
+                let mut flat: Vec<(usize, f32)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, d)| {
+                        d.first()
+                            .map(|e| (row, e.iter().zip(&encoded).map(|(a, b)| a * b).sum::<f32>()))
+                    })
+                    .collect();
+                flat.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                flat
+            };
             if let Some(window) = rerank {
                 scored.truncate((*window).max(*limit));
                 let wanted: Vec<usize> = scored.iter().map(|(r, _)| *r).collect();

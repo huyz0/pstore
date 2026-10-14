@@ -53,6 +53,39 @@ const MAX_COMMIT_ATTEMPTS: u32 = 24;
 /// not contention any retry fixes.
 const MAX_REFUSED_NAMES: u32 = 16;
 
+/// The one multi-vector field a segment's documents carry the encoding of, and the encodings in
+/// the segment's row order (M71.2). `None` when there is none, or more than one: the sidecar is
+/// per segment, so a second field stays a flat scan.
+fn fde_rows(docs: &[Document], order: &[usize]) -> Option<(String, Vec<Vec<f32>>)> {
+    let mut names = docs
+        .iter()
+        .flat_map(|d| d.vectors.keys())
+        .filter_map(|k| k.strip_suffix(pstore_format::fde::FIELD_SUFFIX));
+    let field = names.next()?.to_owned();
+    if names.any(|n| n != field) {
+        return None;
+    }
+    let derived = pstore_format::fde::field_name(&field);
+    let mut seen = std::collections::HashSet::new();
+    let primary: Vec<usize> = order.iter().copied().filter(|i| seen.insert(*i)).collect();
+    let dim = docs.iter().find_map(|d| match d.vectors.get(&derived) {
+        Some(pstore_format::VectorField::Dense(v)) => v.first().map(Vec::len),
+        _ => None,
+    })?;
+    let rows = primary
+        .iter()
+        .map(
+            |i| match docs.get(*i).and_then(|d| d.vectors.get(&derived)) {
+                Some(pstore_format::VectorField::Dense(v)) => {
+                    v.first().cloned().unwrap_or_else(|| vec![0.0; dim])
+                }
+                _ => vec![0.0; dim],
+            },
+        )
+        .collect();
+    Some((field, rows))
+}
+
 /// A segment's sidecar: how its name derives from the segment's, and its bytes (M23).
 type Sidecar = (fn(&Key) -> Key, bytes::Bytes);
 
@@ -2104,6 +2137,27 @@ impl<S: BlobStore> Engine<S> {
                 pstore_index::vec_index::centroid_key,
                 bytes::Bytes::from(c.encode()),
             ));
+        }
+        // M71.2: the multi-vector encoding clustered, when the segment is big enough to have
+        // more than one list. `built.order` repeats a replicated row, so the segment's own rows
+        // are each document once, in first-appearance order.
+        if let Some((field, rows)) = fde_rows(docs, &built.order) {
+            let (clusters, vectors) = pstore_index::fde_clusters::FdeClusters::build(
+                &field,
+                &rows,
+                pstore_index::cluster::Params::default(),
+            );
+            if clusters.lists() > 1 {
+                sidecars.push((
+                    pstore_index::fde_clusters::key,
+                    bytes::Bytes::from(clusters.encode()),
+                ));
+                sidecars.push((
+                    pstore_index::fde_clusters::vectors_key,
+                    bytes::Bytes::from(vectors),
+                ));
+                dicts.fde = true;
+            }
         }
         // ⚠️ **The segment claims its name FIRST** (M23), and every sidecar is created under it
         // before HEAD names the segment, so a reader still never opens one whose sidecar is
@@ -4402,6 +4456,9 @@ impl<S: BlobStore> Engine<S> {
                     // And the centroid table (code review, M19): every segment above the
                     // exact-scan threshold has one, and GC reaped none of them.
                     batch.push(pstore_index::vec_index::centroid_key(k));
+                    // M71.2: the multi-vector encoding's clusters.
+                    batch.push(pstore_index::fde_clusters::key(k));
+                    batch.push(pstore_index::fde_clusters::vectors_key(k));
                 }
             }
 
@@ -5067,6 +5124,7 @@ impl<S: BlobStore> Engine<S> {
             // M32: from what its own build wrote.
             sparse_dict: has_sparse_dict,
             text_dict: has_text_dict,
+            fde_clusters: false,
             segment: key,
             deleted: None,
             shadowed: false,
@@ -6550,6 +6608,7 @@ fn segment_targets(
                 // M32: asked for unless HEAD says the segment has none.
                 sparse_dict: r.dicts.is_none_or(|d| d.sparse),
                 text_dict: r.dicts.is_none_or(|d| d.text),
+                fde_clusters: r.dicts.is_some_and(|d| d.fde),
                 deleted: deletes
                     .get(&head::dv_ref(index, &r.key))
                     .map(|(key, _)| Key::new(key.clone())),
@@ -6797,6 +6856,7 @@ mod split_tests {
                 deleted: None,
                 sparse_dict: false,
                 text_dict: false,
+                fde_clusters: false,
                 shadowed: false,
             })
             .collect();

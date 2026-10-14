@@ -39,6 +39,7 @@ async fn put(store: &MemoryStore, name: &str, docs: Vec<Document>, shadowed: boo
         deleted: None,
         sparse_dict: false,
         text_dict: false,
+        fde_clusters: false,
         shadowed,
         segment: key,
     }

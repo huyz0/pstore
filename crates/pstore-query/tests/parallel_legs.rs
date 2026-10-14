@@ -175,6 +175,7 @@ async fn segments(store: &MemoryStore) -> Vec<Target> {
             deleted: None,
             sparse_dict: false,
             text_dict: false,
+            fde_clusters: false,
             shadowed: false,
             segment: key,
         });

@@ -43,6 +43,7 @@ fn one(segment: &Key, centroids: &Key) -> [Target; 1] {
         deleted: None,
         sparse_dict: true,
         text_dict: true,
+        fde_clusters: false,
         shadowed: false,
     }]
 }

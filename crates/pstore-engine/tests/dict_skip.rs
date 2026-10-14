@@ -328,6 +328,7 @@ async fn recorded_match_the_store(s: &Counting, e: &Engine<Counting>, why: &str)
         let want = Dicts {
             sparse: has(".sdict").await,
             text: has(".tdict").await,
+            fde: has(".fdec").await,
         };
         assert_eq!(r.dicts, Some(want), "{why}: {}", r.key);
     }

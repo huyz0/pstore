@@ -88,8 +88,9 @@ fn key() -> Key {
 #[test]
 fn sidecar_round_trips_and_refuses_damage() {
     let rows = encoded(&corpus(5)[..300]);
-    let (c, _) = FdeClusters::build(&rows, small());
+    let (c, _) = FdeClusters::build("late", &rows, small());
     assert!(c.lists() > 1);
+    assert_eq!(c.field(), "late");
     let b = c.encode();
     assert_eq!(FdeClusters::decode(&b).unwrap(), c);
     assert!(FdeClusters::decode(&[]).is_none());
@@ -113,19 +114,19 @@ fn sidecar_round_trips_and_refuses_damage() {
     );
     // More lists than the bytes can hold.
     let mut many = b.clone();
-    many[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    many[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(FdeClusters::decode(&many).is_none());
     // A dimension too large for the bytes.
     let mut wide = b.clone();
-    wide[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    wide[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(FdeClusters::decode(&wide).is_none());
 }
 
 #[test]
 fn build_is_deterministic_and_covers_every_row() {
     let rows = encoded(&corpus(5)[..400]);
-    let (a, blob) = FdeClusters::build(&rows, small());
-    let (again, blob2) = FdeClusters::build(&rows, small());
+    let (a, blob) = FdeClusters::build("late", &rows, small());
+    let (again, blob2) = FdeClusters::build("late", &rows, small());
     assert_eq!((a.encode(), blob.clone()), (again.encode(), blob2));
     let decoded = FdeClusters::decode(&a.encode()).unwrap();
     assert_eq!(decoded, a);
@@ -135,7 +136,7 @@ fn build_is_deterministic_and_covers_every_row() {
         let _ = r;
     }
     let raw = a.encode();
-    let mut at = 16 + a.lists() * rows[0].len() * 4;
+    let mut at = 24 + a.lists() * rows[0].len() * 4;
     for _ in 0..a.lists() {
         let n = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
         at += 4;
@@ -157,7 +158,7 @@ fn build_is_deterministic_and_covers_every_row() {
     assert!(entries > 0);
     assert_eq!(blob.len() % (rows[0].len() * 4), 0);
     let first = u32::from_le_bytes(
-        raw[16 + a.lists() * rows[0].len() * 4 + 4..][..4]
+        raw[24 + a.lists() * rows[0].len() * 4 + 4..][..4]
             .try_into()
             .unwrap(),
     ) as usize;
@@ -177,13 +178,13 @@ fn overlap(a: &[(usize, f32)], b: &[(usize, f32)]) -> f64 {
 async fn clustered_search_finds_what_the_flat_scan_finds() {
     let docs = corpus(11);
     let store = MemoryStore::new();
-    let (sidecar, blob) = FdeClusters::build(&encoded(&docs), small());
+    let (sidecar, blob) = FdeClusters::build("late", &encoded(&docs), small());
     sidecar.put(&store, &key(), blob).await.unwrap();
     let opened = FdeClusters::open(&store, &key()).await.unwrap();
     assert_eq!(opened, sidecar);
 
     let other_store = MemoryStore::new();
-    let (other, other_blob) = FdeClusters::build(&encoded(&corpus(99)), small());
+    let (other, other_blob) = FdeClusters::build("late", &encoded(&corpus(99)), small());
     other.put(&other_store, &key(), other_blob).await.unwrap();
     let (mut got, mut control, mut n) = (0.0, 0.0, 0.0);
     for q in queries(11) {
@@ -233,7 +234,7 @@ async fn clustered_search_reads_a_fraction() {
         async move {
             let acct = Accounted::new(MemoryStore::new());
             let store = acct.as_tenant(TenantId(1));
-            let (sidecar, blob) = FdeClusters::build(&encoded(&docs), small());
+            let (sidecar, blob) = FdeClusters::build("late", &encoded(&docs), small());
             sidecar.put(&store, &key(), blob).await.unwrap();
             acct.record_ranges();
             sidecar.search(&store, &key(), q, probes, 10).await.unwrap();

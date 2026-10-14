@@ -61,6 +61,7 @@ async fn put<S: BlobStore>(store: &S, name: &str, docs: &[Document]) -> Target {
         deleted: None,
         sparse_dict: true,
         text_dict: true,
+        fde_clusters: false,
         shadowed: false,
         segment: key,
     }

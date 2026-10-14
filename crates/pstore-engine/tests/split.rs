@@ -1027,6 +1027,7 @@ async fn a_share_sums_only_what_its_legs_and_head_ask_for() {
                         deleted: None,
                         sparse_dict: false,
                         text_dict,
+                        fde_clusters: false,
                         shadowed: false,
                     },
                 )

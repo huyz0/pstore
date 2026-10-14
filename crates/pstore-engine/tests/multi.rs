@@ -11,7 +11,7 @@
 //! M61: a named field of several vectors a document holds one width an index. No schema
 //! records it, so two processes' rows -- each past its own door -- first meet in the fold.
 
-use pstore_blob::{Accounted, MemoryStore};
+use pstore_blob::{Accounted, BlobStore, MemoryStore};
 use pstore_engine::Engine;
 use pstore_format::{Document, VectorField};
 use pstore_query::{Fusion, Prefetch};
@@ -156,5 +156,141 @@ async fn a_named_field_holding_no_vectors_derives_no_encoding() {
     assert!(
         rows.iter()
             .all(|d| d.vectors.keys().all(|k| !k.ends_with("$fde")))
+    );
+}
+
+/// Documents of two vectors near one of twelve topics, so a clustering has lists to find.
+fn topical(i: usize) -> Document {
+    let topic = i % 12;
+    let mut s = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut r = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s % 2000) as f32 / 1000.0 - 1.0
+    };
+    let base = |t: usize, d: usize| ((t * 7 + d * 3) % 11) as f32 - 5.0;
+    let v = |r: &mut dyn FnMut() -> f32| -> Vec<f32> {
+        (0..4).map(|d| base(topic, d) + 0.3 * r()).collect()
+    };
+    let mut doc = Document::new(format!("d{i:05}"), vec![1.0, 0.5, 0.25, 0.125]);
+    doc.vectors.insert(
+        "late".to_owned(),
+        VectorField::Dense(vec![v(&mut r), v(&mut r)]),
+    );
+    doc
+}
+
+/// M71.2: a fold big enough to cluster writes the sidecars, HEAD records them, a query uses
+/// them and finds what the flat scan finds, and compaction and GC keep them in step.
+#[tokio::test]
+async fn a_big_segment_clusters_its_encoding_and_a_query_uses_it() {
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let docs: Vec<Document> = (0..9_000).map(topical).collect();
+    e.write("docs", docs).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    let head = e.head_for_test().await;
+    let refs: Vec<_> = head.indexes.get("docs").unwrap().clone();
+    assert_eq!(refs.len(), 1);
+    assert!(refs[0].dicts.unwrap().fde, "HEAD records the clusters");
+    let seg = pstore_blob::Key::new(refs[0].key.clone());
+    let sidecar = pstore_index::fde_clusters::FdeClusters::open(&*store, &seg)
+        .await
+        .unwrap();
+    assert_eq!(sidecar.field(), "late");
+    assert!(sidecar.lists() > 1);
+
+    let q = vec![vec![-2.0, 1.0, 4.0, 0.0], vec![3.0, -1.0, 0.0, 2.0]];
+    let fde = Prefetch::MultiFde {
+        field: "late".to_owned(),
+        query: q.clone(),
+        limit: 10,
+        rerank: Some(100),
+    };
+    let exact = Prefetch::Multi {
+        field: "late".to_owned(),
+        query: q,
+        limit: 10,
+    };
+    let want = e
+        .query("docs", &[exact], Fusion::default(), 10)
+        .await
+        .unwrap();
+    let got = e
+        .query("docs", std::slice::from_ref(&fde), Fusion::default(), 10)
+        .await
+        .unwrap();
+    // ~750 documents a topic are near-ties, so the ids of the top 10 are arbitrary among them;
+    // the scores are not. The clustered, reranked answer scores as the exact one does.
+    let mean = |a: &pstore_engine::Answer| {
+        a.hits.iter().map(|h| h.score).sum::<f32>() / a.hits.len() as f32
+    };
+    assert_eq!(got.hits.len(), 10);
+    assert!(
+        mean(&got) >= 0.95 * mean(&want),
+        "{} vs {}",
+        mean(&got),
+        mean(&want)
+    );
+
+    // Without the sidecar the same query takes the flat scan and answers the same.
+    store
+        .delete_batch(&[pstore_index::fde_clusters::vectors_key(&seg)])
+        .await
+        .unwrap();
+    assert!(
+        e.query("docs", std::slice::from_ref(&fde), Fusion::default(), 10)
+            .await
+            .is_err(),
+        "HEAD says it exists: a missing vectors blob is an error, not a silent flat scan"
+    );
+
+    // Compaction reseals it with its own sidecars (the vectors blob restored first, so the
+    // inputs can be read), and GC reaps the old segment's.
+    store
+        .put(
+            &pstore_index::fde_clusters::vectors_key(&seg),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap();
+    e.write("docs", (9_000..9_050).map(topical).collect())
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    assert!(e.compact("docs").await.unwrap().is_some());
+    let after = e.head_for_test().await;
+    let merged = after.indexes.get("docs").unwrap();
+    assert_eq!(merged.len(), 1, "compaction merged the segments");
+    assert!(
+        merged[0].dicts.unwrap().fde,
+        "the merged segment has clusters"
+    );
+    assert_ne!(merged[0].key, refs[0].key);
+    let fresh = pstore_blob::Key::new(merged[0].key.clone());
+    assert!(
+        store
+            .get(&pstore_index::fde_clusters::key(&fresh))
+            .await
+            .is_ok()
+    );
+    e.gc(0).await.unwrap();
+    assert!(
+        store
+            .get(&pstore_index::fde_clusters::key(&seg))
+            .await
+            .is_err(),
+        "GC reaps the buried segment's clusters"
+    );
+    assert!(
+        store
+            .get(&pstore_index::fde_clusters::key(&fresh))
+            .await
+            .is_ok()
     );
 }

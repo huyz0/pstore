@@ -24,11 +24,13 @@ const MAX_STALLS: u32 = 24;
 
 /// The sidecars a segment may have, each derived from its key and each optional -- by the
 /// same functions that write them and that GC derives them with, so the three never drift.
-fn sidecars(segment: &Key) -> [Key; 3] {
+fn sidecars(segment: &Key) -> [Key; 5] {
     [
         pstore_index::vec_index::centroid_key(segment),
         pstore_format::sparse::dict_key(segment),
         pstore_format::text::dict_key(segment),
+        pstore_index::fde_clusters::key(segment),
+        pstore_index::fde_clusters::vectors_key(segment),
     ]
 }
 
