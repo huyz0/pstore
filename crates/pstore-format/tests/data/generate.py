@@ -35,3 +35,7 @@ f=pq.ParquetFile(out+'multipage.parquet'); print(f.metadata.row_group(0).column(
 # M75: compressed pages
 pq.write_table(t2,out+'multipage-snappy.parquet',compression='SNAPPY',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
 pq.write_table(t,out+'zstd.parquet',compression='ZSTD',use_dictionary=False,write_statistics=False,row_group_size=100)
+# M76: more codecs
+pq.write_table(t2,out+'multipage-zstd.parquet',compression='ZSTD',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+pq.write_table(t2,out+'multipage-gzip.parquet',compression='GZIP',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+pq.write_table(t,out+'brotli.parquet',compression='BROTLI',use_dictionary=False,write_statistics=False,row_group_size=100)

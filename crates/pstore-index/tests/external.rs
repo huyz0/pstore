@@ -490,7 +490,13 @@ async fn search_is_search_where_allowing_all() {
 }
 
 #[tokio::test]
-async fn an_index_over_a_snappy_file_finds_the_exact_neighbours() {
+async fn an_index_over_each_codec_finds_the_exact_neighbours() {
+    for file in ["multipage-snappy", "multipage-gzip", "multipage-zstd"] {
+        over_codec(file).await;
+    }
+}
+
+async fn over_codec(name: &str) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
     let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
         .unwrap()
@@ -502,8 +508,8 @@ async fn an_index_over_a_snappy_file_finds_the_exact_neighbours() {
         })
         .collect();
     let store = MemoryStore::new();
-    let key = Key::new("lake/ms.parquet");
-    let file = std::fs::read(format!("{dir}multipage-snappy.parquet")).unwrap();
+    let key = Key::new(format!("lake/{name}.parquet"));
+    let file = std::fs::read(format!("{dir}{name}.parquet")).unwrap();
     store.put(&key, file.clone().into()).await.unwrap();
     let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
         .await

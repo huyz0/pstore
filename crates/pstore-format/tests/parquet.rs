@@ -73,7 +73,7 @@ async fn locate_finds_the_real_files_vectors() {
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
     for (file, why) in [
-        ("zstd.parquet", "compressed with codec"),
+        ("brotli.parquet", "compressed with codec"),
         ("dict.parquet", "dictionary"),
         ("optional.parquet", "REQUIRED"),
         ("list.parquet", "repetition levels"),
@@ -154,18 +154,21 @@ async fn extents_address_rows() {
                 rows: 3,
                 offset: 100,
                 compressed: 0,
+                codec: 0,
             },
             Extent {
                 first_row: 3,
                 rows: 1,
                 offset: 200,
                 compressed: 0,
+                codec: 0,
             },
             Extent {
                 first_row: 4,
                 rows: 5,
                 offset: 300,
                 compressed: 0,
+                codec: 0,
             },
         ],
     )
@@ -182,6 +185,7 @@ async fn extents_address_rows() {
         |extents: Vec<Extent>, len: u64| ExternalColumn::from_extents("k", 2, len, None, extents);
     let e = |first_row, rows, offset| Extent {
         compressed: 0,
+        codec: 0,
         first_row,
         rows,
         offset,
@@ -481,8 +485,12 @@ async fn locate_refuses_each_shape_it_cannot_read() {
     refused(&with(&|s| s.column_type = 1), "FIXED_LEN_BYTE_ARRAY").await;
     refused(&with(&|s| s.repetition = 1), "REQUIRED").await;
     refused(&with(&|s| s.repetition = 2), "REQUIRED").await;
-    refused(&with(&|s| s.chunks[0].codec = 6), "compressed with codec").await;
-    refused(&with(&|s| s.chunks[0].codec = 2), "only snappy").await;
+    refused(&with(&|s| s.chunks[0].codec = 4), "compressed with codec").await;
+    refused(
+        &with(&|s| s.chunks[0].codec = 7),
+        "only snappy, gzip and zstd",
+    )
+    .await;
     refused(
         &with(&|s| s.chunks[0].dictionary_offset = true),
         "dictionary",
@@ -700,6 +708,7 @@ fn a_compressed_extent_is_bounded_by_its_compressed_size() {
         rows: 1000,
         offset: 10,
         compressed,
+        codec: u8::from(compressed > 0),
     };
     // 1,000 rows of 2 floats would be 8,000 raw bytes, but the page is 50 on disk.
     assert!(ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).is_ok());
@@ -710,4 +719,127 @@ fn a_compressed_extent_is_bounded_by_its_compressed_size() {
     );
     let col = ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).unwrap();
     assert!(col.row_range(3).is_none());
+}
+
+// ---- M76: gzip and zstd ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn gzip_and_zstd_files_read_back_every_row() {
+    for (file, codec) in [
+        ("multipage-gzip.parquet", 2u8),
+        ("multipage-zstd.parquet", 6),
+    ] {
+        let (store, key) = put(file).await;
+        let found = locate(&store, &key, "embedding").await.unwrap();
+        assert!(found.extents.len() > 1, "{file}");
+        assert!(
+            found
+                .extents
+                .iter()
+                .all(|e| e.codec == codec && e.compressed > 0),
+            "{file}"
+        );
+        check_every_row(file, "multipage.vectors.f32", 2600, found.extents.len()).await;
+    }
+    check_every_row("zstd.parquet", "good.vectors.f32", 300, 3).await;
+}
+
+#[tokio::test]
+async fn brotli_and_other_codecs_are_refused_by_name() {
+    let (store, key) = put("brotli.parquet").await;
+    let err = locate(&store, &key, "embedding").await.unwrap_err();
+    assert!(
+        err.to_string().contains("only snappy, gzip and zstd"),
+        "{err}"
+    );
+    for codec in [4, 5, 7] {
+        let mut s = spec(4, vec![chunk(4, &[5])]);
+        s.chunks[0].codec = codec;
+        refused(&s, "only snappy, gzip and zstd").await;
+    }
+}
+
+/// A column of one compressed page whose extent claims `rows` rows, over `page` bytes.
+async fn lying(page: Vec<u8>, codec: u8, rows: u64) -> Result<(), ExternalError> {
+    let store = MemoryStore::new();
+    let key = Key::new("lake/lie.bin");
+    store.put(&key, page.clone().into()).await.unwrap();
+    let col = ExternalColumn::from_extents(
+        "lake/lie.bin",
+        2,
+        page.len() as u64,
+        store.get_tag(&key).await.unwrap(),
+        vec![Extent {
+            first_row: 0,
+            rows,
+            offset: 0,
+            compressed: page.len() as u64,
+            codec,
+        }],
+    )
+    .unwrap();
+    col.read_rows(&store, &[0]).await.map(|_| ())
+}
+
+#[tokio::test]
+async fn a_page_that_lies_about_its_size_cannot_balloon() {
+    use std::io::Write;
+    let zeros = vec![0u8; 64 << 20];
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&zeros).unwrap();
+    let gz = gz.finish().unwrap();
+    let zs = zstd::stream::encode_all(&zeros[..], 1).unwrap();
+    assert!(
+        gz.len() < 1 << 20 && zs.len() < 1 << 20,
+        "the lies are tiny on disk"
+    );
+    // The extent claims 4 rows of 2 floats = 32 bytes; the page would inflate to 64 MB.
+    assert!(matches!(lying(gz, 2, 4).await, Err(ExternalError::Damaged)));
+    assert!(matches!(lying(zs, 6, 4).await, Err(ExternalError::Damaged)));
+    // The same pages told the truth are fine.
+    let ok_gz = {
+        let mut g = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        g.write_all(&[0u8; 32]).unwrap();
+        g.finish().unwrap()
+    };
+    lying(ok_gz, 2, 4).await.unwrap();
+    lying(zstd::stream::encode_all(&[0u8; 32][..], 1).unwrap(), 6, 4)
+        .await
+        .unwrap();
+    // A codec number the extent cannot have.
+    assert!(matches!(
+        lying(vec![1, 2, 3], 9, 4).await,
+        Err(ExternalError::Damaged)
+    ));
+}
+
+#[tokio::test]
+async fn a_damaged_page_is_an_error_per_codec() {
+    for (file, codec) in [
+        ("multipage-gzip.parquet", 2u8),
+        ("multipage-zstd.parquet", 6),
+    ] {
+        let (store, key) = put(file).await;
+        let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+            .await
+            .unwrap();
+        let e = col.extents[0];
+        assert_eq!(e.codec, codec);
+        let mut bad = bytes(file);
+        let at = e.offset as usize;
+        for b in &mut bad[at..at + 64] {
+            *b = 0xA5;
+        }
+        store.put(&key, bad.into()).await.unwrap();
+        let damaged = ExternalColumn::pin_parquet(&store, &key, "embedding")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                damaged.read_rows(&store, &[e.first_row as usize]).await,
+                Err(ExternalError::Damaged)
+            ),
+            "{file}"
+        );
+    }
 }

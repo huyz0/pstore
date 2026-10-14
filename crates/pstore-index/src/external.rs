@@ -11,7 +11,7 @@ use pstore_blob::{BlobError, BlobStore, Key};
 use pstore_format::external::{Extent, ExternalColumn, ExternalError};
 use pstore_types::CasTag;
 
-const MAGIC: &[u8; 4] = b"PXI3";
+const MAGIC: &[u8; 4] = b"PXI4";
 
 /// Why an external index could not be built, opened or searched.
 #[derive(Debug)]
@@ -139,6 +139,7 @@ impl ExternalIndex {
             for n in [e.first_row, e.rows, e.offset, e.compressed] {
                 b.extend(n.to_le_bytes());
             }
+            b.push(e.codec);
         }
         b.extend(&self.codes);
         b
@@ -194,6 +195,11 @@ impl ExternalIndex {
                 rows: r.u64().ok_or(bad("truncated"))?,
                 offset: r.u64().ok_or(bad("truncated"))?,
                 compressed: r.u64().ok_or(bad("truncated"))?,
+                codec: *r
+                    .take(1)
+                    .ok_or(bad("truncated"))?
+                    .first()
+                    .ok_or(bad("truncated"))?,
             });
         }
         let quantizer = Quantizer::new(dims as usize);

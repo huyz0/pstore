@@ -42,6 +42,53 @@ pub struct Extent {
     /// 0 for a raw run. Otherwise the run is one snappy-compressed page of this many bytes at
     /// `offset` (M75): its rows have no per-row range.
     pub compressed: u64,
+    /// How a compressed page is coded (M76): [`CODEC_SNAPPY`], [`CODEC_GZIP`] or [`CODEC_ZSTD`],
+    /// Parquet's codec numbers. 0 for a raw run.
+    pub codec: u8,
+}
+
+/// Parquet's codec number for snappy.
+pub const CODEC_SNAPPY: u8 = 1;
+/// Parquet's codec number for gzip.
+pub const CODEC_GZIP: u8 = 2;
+/// Parquet's codec number for zstd.
+pub const CODEC_ZSTD: u8 = 6;
+
+/// A compressed page's bytes, exactly `expected` of them or an error (M76). The output is bounded
+/// by `expected + 1` while decoding, so a page that lies about its size cannot balloon memory.
+fn decompress(codec: u8, comp: &[u8], expected: usize) -> Result<Vec<u8>, ExternalError> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let cap = u64::try_from(expected).map_err(|_| ExternalError::Damaged)? + 1;
+    match codec {
+        CODEC_SNAPPY => {
+            if snap::raw::decompress_len(comp).map_err(|_| ExternalError::Damaged)? != expected {
+                return Err(ExternalError::Damaged);
+            }
+            out = snap::raw::Decoder::new()
+                .decompress_vec(comp)
+                .map_err(|_| ExternalError::Damaged)?;
+        }
+        CODEC_GZIP => {
+            flate2::read::GzDecoder::new(comp)
+                .take(cap)
+                .read_to_end(&mut out)
+                .map_err(|_| ExternalError::Damaged)?;
+        }
+        CODEC_ZSTD => {
+            zstd::stream::read::Decoder::new(comp)
+                .map_err(|_| ExternalError::Damaged)?
+                .take(cap)
+                .read_to_end(&mut out)
+                .map_err(|_| ExternalError::Damaged)?;
+        }
+        _ => return Err(ExternalError::Damaged),
+    }
+    if out.len() == expected {
+        Ok(out)
+    } else {
+        Err(ExternalError::Damaged)
+    }
 }
 
 /// A column of fixed-width `f32` vectors inside an external object.
@@ -276,13 +323,12 @@ impl ExternalColumn {
         }
         for (i, e) in page_at {
             let comp = bufs.next().ok_or(ExternalError::Damaged)?;
-            let page = snap::raw::Decoder::new()
-                .decompress_vec(&comp)
-                .map_err(|_| ExternalError::Damaged)?;
             let width = usize::try_from(self.width()).map_err(|_| ExternalError::Damaged)?;
-            if u64::try_from(page.len()).ok() != e.rows.checked_mul(self.width()) {
-                return Err(ExternalError::Damaged);
-            }
+            let expected = usize::try_from(e.rows)
+                .ok()
+                .and_then(|n| n.checked_mul(width))
+                .ok_or(ExternalError::Damaged)?;
+            let page = decompress(e.codec, &comp, expected)?;
             for r in pages.get(&i).into_iter().flatten() {
                 let at = usize::try_from(*r as u64 - e.first_row)
                     .map_err(|_| ExternalError::Damaged)?

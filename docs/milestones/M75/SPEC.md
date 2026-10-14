@@ -33,7 +33,7 @@ are candidates share one read.
    page's compressed bytes once; rows on two pages move two pages and no others.
 4. `a_damaged_snappy_page_is_an_error`: a page whose bytes are corrupted, or whose decompressed
    length is not `values × width`, is an error, never wrong floats.
-5. `an_index_over_a_snappy_file_finds_the_exact_neighbours` (`pstore-index`): build, reopen and
+5. `an_index_over_each_codec_finds_the_exact_neighbours` (`pstore-index`): build, reopen and
    search `multipage-snappy.parquet` at a full window equals the exact cosine top 10.
 6. **Gates:** `./scripts/gates.sh` passes; the mutation sweep of the new code misses 0, or each
    miss is killed by a named test.

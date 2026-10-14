@@ -25,7 +25,7 @@ Commands: `cargo test -p pstore-format --test parquet`: 11 tests; `cargo test -p
    `a_compressed_extent_is_bounded_by_its_compressed_size`: a compressed size of 0, a decompressed
    size 4 over or under, and a page longer than its chunk are refused; a compressed extent is
    bounded by its compressed bytes, to the byte.
-5. `an_index_over_a_snappy_file_finds_the_exact_neighbours`: build, reopen (blob byte-identical)
+5. `an_index_over_each_codec_finds_the_exact_neighbours` (renamed by M76, which added gzip and zstd to it; the snappy file is its first case): build, reopen (blob byte-identical)
    and search `multipage-snappy.parquet`; at a full window the top 10 for three queries equals the
    exact cosine; a changed object is refused.
 6. **Gates:** green by the pre-commit hook on this commit. **Mutation** (`cargo mutants`,

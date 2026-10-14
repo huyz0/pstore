@@ -330,7 +330,6 @@ fn page_header(b: &[u8]) -> Option<(i64, i64, i64, i64, usize)> {
 
 const TYPE_FLBA: i64 = 7;
 const CODEC_NONE: i64 = 0;
-const CODEC_SNAPPY: i64 = 1;
 const ENC_PLAIN: i64 = 0;
 const ENC_RLE: i64 = 3;
 const REQUIRED: i64 = 0;
@@ -400,16 +399,17 @@ pub async fn locate<S: BlobStore>(
         let (m, rows) = group
             .as_ref()
             .ok_or_else(|| ParquetError::Unsupported(format!("a row group lacks {column:?}")))?;
-        let snappy = match m.codec {
-            Some(CODEC_NONE) => false,
-            Some(CODEC_SNAPPY) => true,
+        let codec: u8 = match m.codec {
+            Some(CODEC_NONE) => 0,
+            Some(c @ (1 | 2 | 6)) => u8::try_from(c).map_err(|_| bad("codec"))?,
             other => {
                 return unsupported(format!(
-                    "the column is compressed with codec {}, and only snappy is read in place",
+                    "the column is compressed with codec {}, and only snappy, gzip and zstd are read in place",
                     other.map_or_else(|| "?".to_owned(), |c| c.to_string())
                 ));
             }
         };
+        let snappy = codec != 0;
         if m.dictionary_page_offset.is_some() {
             return unsupported("the column has a dictionary page");
         }
@@ -462,6 +462,7 @@ pub async fn locate<S: BlobStore>(
                 rows: values,
                 offset: body,
                 compressed: if snappy { on_disk } else { 0 },
+                codec,
             });
             got += values;
             at = body + on_disk;
