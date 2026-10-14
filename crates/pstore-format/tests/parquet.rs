@@ -284,6 +284,8 @@ struct Page {
     encoding: i64,
     kind: i64,
     body: usize,
+    /// A v2 header's `(nulls, definition length, repetition length, is_compressed)`.
+    v2: Option<(i64, i64, i64, bool)>,
 }
 
 /// One column chunk, as its metadata claims.
@@ -318,6 +320,7 @@ fn page(dims: usize, values: i64) -> Page {
         encoding: 0,
         kind: 0,
         body: bytes as usize,
+        v2: None,
     }
 }
 
@@ -359,14 +362,28 @@ fn build(s: &Spec) -> Vec<u8> {
             h.i32(&mut l, 1, p.kind);
             h.i32(&mut l, 2, p.uncompressed);
             h.i32(&mut l, 3, p.compressed);
-            h.field(&mut l, 5, 12);
-            let mut d = 0;
-            h.i32(&mut d, 1, p.values);
-            h.i32(&mut d, 2, p.encoding);
-            h.i32(&mut d, 3, 3);
-            h.i32(&mut d, 4, 3);
-            h.stop();
-            h.stop();
+            if let Some((nulls, dl, rl, comp)) = p.v2 {
+                h.field(&mut l, 8, 12);
+                let mut d = 0;
+                h.i32(&mut d, 1, p.values);
+                h.i32(&mut d, 2, nulls);
+                h.i32(&mut d, 3, p.values);
+                h.i32(&mut d, 4, p.encoding);
+                h.i32(&mut d, 5, dl);
+                h.i32(&mut d, 6, rl);
+                h.field(&mut d, 7, if comp { 1 } else { 2 });
+                h.stop();
+                h.stop();
+            } else {
+                h.field(&mut l, 5, 12);
+                let mut d = 0;
+                h.i32(&mut d, 1, p.values);
+                h.i32(&mut d, 2, p.encoding);
+                h.i32(&mut d, 3, 3);
+                h.i32(&mut d, 4, 3);
+                h.stop();
+                h.stop();
+            }
             file.extend(&h.0);
             file.extend(std::iter::repeat_n(0x5A, p.body));
         }
@@ -861,4 +878,87 @@ async fn a_damaged_page_is_an_error_per_codec() {
             "{file}"
         );
     }
+}
+
+// ---- M80: v2 data pages ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn v2_files_read_back_every_row() {
+    // pyarrow compresses a v2 page only when that shrinks it (`is_compressed` is false
+    // otherwise), and random floats barely shrink under snappy: so the snappy file holds raw
+    // pages and the zstd file compressed ones. The reader must serve both from one codec.
+    for (file, any_compressed) in [
+        ("multipage-v2.parquet", false),
+        ("multipage-v2-snappy.parquet", false),
+        ("multipage-v2-zstd.parquet", true),
+    ] {
+        let (store, key) = put(file).await;
+        let found = locate(&store, &key, "embedding").await.unwrap();
+        assert!(found.extents.len() > 1, "{file}");
+        // A page is raw (codec 0, no compressed size) or compressed (both set), never half.
+        assert!(
+            found
+                .extents
+                .iter()
+                .all(|e| (e.codec == 0) == (e.compressed == 0)),
+            "{file}: {:?}",
+            found.extents
+        );
+        assert_eq!(
+            found.extents.iter().any(|e| e.compressed > 0),
+            any_compressed,
+            "{file}"
+        );
+        check_every_row(file, "multipage.vectors.f32", 2600, found.extents.len()).await;
+    }
+}
+
+#[tokio::test]
+async fn a_v2_page_is_checked_against_its_claims() {
+    // A v2 page of a REQUIRED flat column: no nulls, no levels, raw or compressed.
+    let v2 = |nulls, dl, rl, comp| {
+        let mut s = spec(4, vec![chunk(4, &[5])]);
+        s.chunks[0].pages[0].kind = 3;
+        s.chunks[0].pages[0].v2 = Some((nulls, dl, rl, comp));
+        s
+    };
+    let ok = run(&v2(0, 0, 0, true)).await.unwrap();
+    assert_eq!(
+        (ok.extents[0].rows, ok.extents[0].codec),
+        (5, 0),
+        "codec 0 chunk: raw"
+    );
+    for (what, s) in [
+        ("nulls", v2(1, 0, 0, true)),
+        ("a definition level", v2(0, 2, 0, true)),
+        ("a repetition level", v2(0, 0, 2, true)),
+    ] {
+        refused(&s, "levels or nulls").await;
+        let _ = what;
+    }
+    // A snappy chunk whose v2 page says it is not compressed reads as raw bytes.
+    let mut raw = v2(0, 0, 0, false);
+    raw.chunks[0].codec = 1;
+    let found = run(&raw).await.unwrap();
+    assert_eq!(
+        (found.extents[0].codec, found.extents[0].compressed),
+        (0, 0)
+    );
+    // The same chunk with a compressed page reads as snappy, sized by its on-disk bytes.
+    let mut comp = v2(0, 0, 0, true);
+    comp.chunks[0].codec = 1;
+    comp.chunks[0].pages[0].compressed = 30;
+    comp.chunks[0].pages[0].body = 30;
+    let found = run(&comp).await.unwrap();
+    assert_eq!(
+        (found.extents[0].codec, found.extents[0].compressed),
+        (1, 30)
+    );
+    // A v2 header on a v1 page type, and a v1 header on a v2 page type, are neither.
+    let mut mismatched = v2(0, 0, 0, true);
+    mismatched.chunks[0].pages[0].kind = 0;
+    refused(&mismatched, "page header").await;
+    let mut other = spec(4, vec![chunk(4, &[5])]);
+    other.chunks[0].pages[0].kind = 3;
+    refused(&other, "page header").await;
 }

@@ -497,6 +497,9 @@ async fn an_index_over_each_codec_finds_the_exact_neighbours() {
         "multipage-zstd",
         "multipage-brotli",
         "multipage-lz4raw",
+        "multipage-v2",
+        "multipage-v2-snappy",
+        "multipage-v2-zstd",
     ] {
         over_codec(file).await;
     }
@@ -520,7 +523,7 @@ async fn over_codec(name: &str) {
     let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
         .await
         .unwrap();
-    assert!(col.extents.iter().all(|e| e.compressed > 0));
+    assert!(col.extents.len() > 1, "{name}");
     let built = ExternalIndex::build(&store, &codes_key(), col, 700)
         .await
         .unwrap();

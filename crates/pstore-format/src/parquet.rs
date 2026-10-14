@@ -300,10 +300,36 @@ fn footer(b: &[u8], column: &[u8]) -> Option<Footer> {
     Some(Footer { schema, groups })
 }
 
-/// A data page header: `(values, compressed size, uncompressed size, encoding, header length)`.
-fn page_header(b: &[u8]) -> Option<(i64, i64, i64, i64, usize)> {
+/// A data page's header.
+struct PageHeader {
+    values: i64,
+    /// On-disk size of the page body.
+    compressed: i64,
+    /// Size of the body once decompressed.
+    uncompressed: i64,
+    encoding: i64,
+    /// Bytes the header itself takes.
+    header_len: usize,
+    /// A v2 page's own claims (M80); `None` for a v1 page.
+    v2: Option<V2>,
+}
+
+/// What a v2 data page header says beyond a v1's.
+struct V2 {
+    nulls: i64,
+    definition_len: i64,
+    repetition_len: i64,
+    /// Whether the values (not the levels) are compressed with the column's codec.
+    is_compressed: bool,
+}
+
+const PAGE_V1: i64 = 0;
+const PAGE_V2: i64 = 3;
+
+fn page_header(b: &[u8]) -> Option<PageHeader> {
     let mut t = Thrift::new(b);
     let (mut kind, mut un, mut co, mut values, mut enc) = (None, 0, 0, 0, None);
+    let mut v2 = None;
     let mut last = 0;
     while let Some((id, ty)) = t.field(last)? {
         last = id;
@@ -322,10 +348,46 @@ fn page_header(b: &[u8]) -> Option<(i64, i64, i64, i64, usize)> {
                     }
                 }
             }
+            (8, 12) => {
+                // DataPageHeaderV2: values, nulls, rows, encoding, def len, rep len, compressed.
+                let (mut nulls, mut dl, mut rl, mut comp) = (0, 0, 0, true);
+                let mut l = 0;
+                while let Some((did, dty)) = t.field(l)? {
+                    l = did;
+                    match (did, dty) {
+                        (1, 5) => values = t.zigzag()?,
+                        (2, 5) => nulls = t.zigzag()?,
+                        (4, 5) => enc = Some(t.zigzag()?),
+                        (5, 5) => dl = t.zigzag()?,
+                        (6, 5) => rl = t.zigzag()?,
+                        // `true` is the default; only a `false` changes it.
+                        (7, 2) => comp = false,
+                        _ => t.skip(dty)?,
+                    }
+                }
+                v2 = Some(V2 {
+                    nulls,
+                    definition_len: dl,
+                    repetition_len: rl,
+                    is_compressed: comp,
+                });
+            }
             _ => t.skip(ty)?,
         }
     }
-    (kind == Some(0)).then_some((values, co, un, enc?, t.position()))
+    let ok = match kind? {
+        PAGE_V1 => v2.is_none(),
+        PAGE_V2 => v2.is_some(),
+        _ => false,
+    };
+    ok.then_some(PageHeader {
+        values,
+        compressed: co,
+        uncompressed: un,
+        encoding: enc?,
+        header_len: t.position(),
+        v2,
+    })
 }
 
 const TYPE_FLBA: i64 = 7;
@@ -409,7 +471,6 @@ pub async fn locate<S: BlobStore>(
                 ));
             }
         };
-        let snappy = codec != 0;
         if m.dictionary_page_offset.is_some() {
             return unsupported("the column has a dictionary page");
         }
@@ -436,7 +497,26 @@ pub async fn locate<S: BlobStore>(
             }
             let window = HEADER_WINDOW.min(end - at);
             let head = store.get_range(key, at..at + window).await?;
-            let (values, co, un, enc, hlen) = page_header(&head).ok_or(bad("page header"))?;
+            let h = page_header(&head).ok_or(bad("page header"))?;
+            let (values, co, un, enc, hlen) = (
+                h.values,
+                h.compressed,
+                h.uncompressed,
+                h.encoding,
+                h.header_len,
+            );
+            // M80: a v2 page's levels sit outside the compressed values. A REQUIRED flat column
+            // has none, and anything else is not a plain run of vectors.
+            let mut page_codec = codec;
+            if let Some(v) = &h.v2 {
+                if v.nulls != 0 || v.definition_len != 0 || v.repetition_len != 0 {
+                    return unsupported("a v2 data page carries levels or nulls");
+                }
+                if !v.is_compressed {
+                    page_codec = 0;
+                }
+            }
+            let snappy = page_codec != 0;
             if enc != ENC_PLAIN {
                 return unsupported("a data page is not PLAIN-encoded");
             }
@@ -462,7 +542,7 @@ pub async fn locate<S: BlobStore>(
                 rows: values,
                 offset: body,
                 compressed: if snappy { on_disk } else { 0 },
-                codec,
+                codec: page_codec,
             });
             got += values;
             at = body + on_disk;
