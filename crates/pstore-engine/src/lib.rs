@@ -6750,6 +6750,7 @@ fn scored_by(
                 query,
                 limit,
                 rerank,
+                probes,
             } => Ok(pstore_query::Prefetch::MultiFde {
                 field: field.clone(),
                 query: query
@@ -6759,6 +6760,7 @@ fn scored_by(
                     .ok_or_else(|| EngineError::Unmeasurable("the query".to_owned()))?,
                 limit: *limit,
                 rerank: *rerank,
+                probes: *probes,
             }),
             other => Ok(other.clone()),
         })

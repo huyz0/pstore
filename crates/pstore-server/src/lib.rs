@@ -2928,12 +2928,14 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
             },
         };
         let rerank = multi_rerank(m, fde, limit, req.filters.is_some())?;
+        let probes = multi_probes(m, fde)?;
         if fde {
             legs.push(pstore_query::Prefetch::MultiFde {
                 field,
                 query,
                 limit,
                 rerank,
+                probes,
             });
         } else {
             legs.push(pstore_query::Prefetch::Multi {
@@ -3024,6 +3026,25 @@ fn multi_rerank(
     };
     Ok(Some(window))
 }
+
+/// The clustered lists an `fde` multi leg reads, or `None` for the default (M72).
+fn multi_probes(m: &types::MultiIn, fde: bool) -> Result<Option<usize>, ApiError> {
+    let Some(v) = m.probes.as_ref() else {
+        return Ok(None);
+    };
+    let bad = |why: &str| ApiError::bad_request(format!("multi: {why}"));
+    if !fde {
+        return Err(bad("probes needs mode \"fde\""));
+    }
+    v.as_u64()
+        .and_then(|p| usize::try_from(p).ok())
+        .filter(|p| (1..=MAX_PROBES).contains(p))
+        .map(Some)
+        .ok_or_else(|| bad(&format!("probes is a whole number from 1 to {MAX_PROBES}")))
+}
+
+/// Lists an `fde` leg may be told to read (M72).
+const MAX_PROBES: usize = 1024;
 
 /// A named field's name, or why it cannot be one (M61): `vector` is the dense field's.
 fn named_field(name: &str) -> Result<String, ApiError> {

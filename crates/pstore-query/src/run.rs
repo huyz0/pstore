@@ -60,6 +60,8 @@ pub enum Prefetch {
         limit: usize,
         /// The candidates re-scored exactly, or `None` for the encoding's own scores.
         rerank: Option<usize>,
+        /// Lists of the clustered encoding to read (M72); `None` is the default.
+        probes: Option<usize>,
     },
     /// BM25 over the segment's text field.
     ///
@@ -1264,6 +1266,8 @@ enum Runnable<'a> {
         query: &'a [Vec<f32>],
         limit: usize,
         rerank: Option<usize>,
+        /// Lists of the clustered encoding to read (M72); `None` is the default.
+        probes: Option<usize>,
     },
 }
 
@@ -1314,11 +1318,13 @@ impl Runnable<'_> {
                 query,
                 limit,
                 rerank,
+                probes,
             } => Prefetch::MultiFde {
                 field: field.to_owned(),
                 query: query.to_vec(),
                 limit,
                 rerank,
+                probes,
             },
         }
     }
@@ -1372,11 +1378,13 @@ impl Runnable<'_> {
                 query,
                 limit,
                 rerank,
+                probes,
             } => Self::MultiFde {
                 field,
                 query,
                 limit: limit + extra,
                 rerank,
+                probes,
             },
             Self::Dense {
                 field,
@@ -1424,12 +1432,14 @@ impl Runnable<'_> {
                 field,
                 query,
                 rerank,
+                probes,
                 ..
             } => Self::MultiFde {
                 field,
                 query,
                 limit: rows,
                 rerank,
+                probes,
             },
             Self::Dense {
                 field, query, tune, ..
@@ -1500,11 +1510,13 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 query,
                 limit,
                 rerank,
+                probes,
             } => Ok(Self::MultiFde {
                 field,
                 query,
                 limit: *limit,
                 rerank: *rerank,
+                probes: *probes,
             }),
             Prefetch::Trigram { .. } => Err(QueryError::Unimplemented("trigram")),
         }
@@ -1805,6 +1817,7 @@ async fn leg<S: BlobStore>(
             query,
             limit,
             rerank,
+            probes,
         } => {
             // A segment written before M67 has no encoding and answers nothing, as a segment
             // without the field does for `multi`.
@@ -1840,8 +1853,14 @@ async fn leg<S: BlobStore>(
             let mut scored: Vec<(usize, f32)> = if let Some(c) = clusters {
                 // ⚠️ Provisional: a third of the lists, at least two.
                 let want = rerank.map_or(*limit, |w| w.max(*limit));
-                c.search(store, key, query, c.lists().div_ceil(3).max(2), want)
-                    .await?
+                c.search(
+                    store,
+                    key,
+                    query,
+                    probes.unwrap_or_else(|| c.lists().div_ceil(3).max(2)),
+                    want,
+                )
+                .await?
             } else {
                 // ⚠️ One ranged read: the encodings only, 2 KB a row, in the leg round.
                 let rows = opened.segment.field_vectors(store, key, &derived).await?;

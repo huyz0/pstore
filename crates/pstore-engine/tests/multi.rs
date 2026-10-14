@@ -144,6 +144,7 @@ async fn a_named_field_holding_no_vectors_derives_no_encoding() {
         query: vec![vec![1.0, 0.0, 0.0]],
         limit: 10,
         rerank: None,
+        probes: None,
     };
     let answer = e
         .query("docs", &[fde], Fusion::default(), 10)
@@ -210,6 +211,7 @@ async fn a_big_segment_clusters_its_encoding_and_a_query_uses_it() {
         query: q.clone(),
         limit: 10,
         rerank: Some(100),
+        probes: None,
     };
     let exact = Prefetch::Multi {
         field: "late".to_owned(),

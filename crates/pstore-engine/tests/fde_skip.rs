@@ -169,6 +169,7 @@ async fn the_clusters_are_asked_for_only_by_an_fde_leg_of_a_flagged_segment() {
         query: vec![vec![-2.0, 1.0, 4.0, 0.0]],
         limit: 5,
         rerank: None,
+        probes: None,
     };
     let dense = Prefetch::Dense {
         field: pstore_format::DEFAULT_FIELD.to_owned(),
@@ -205,4 +206,48 @@ async fn the_clusters_are_asked_for_only_by_an_fde_leg_of_a_flagged_segment() {
         (0, 0),
         "a segment HEAD does not flag is never asked: no known-404 read"
     );
+}
+
+/// Bytes of `.fdev` a query over `big` moves at `probes`.
+async fn fdev_bytes(probes: Option<usize>) -> (u64, f32) {
+    let acct = Arc::new(pstore_blob::Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("big", (0..9_000).map(topical).collect())
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let leg = Prefetch::MultiFde {
+        field: "late".to_owned(),
+        query: vec![vec![-2.0, 1.0, 4.0, 0.0]],
+        limit: 10,
+        rerank: None,
+        probes,
+    };
+    acct.record_ranges();
+    let a = e.query("big", &[leg], Fusion::default(), 10).await.unwrap();
+    let moved: u64 = acct
+        .ranges()
+        .iter()
+        .filter(|(k, _)| k.as_str().ends_with(".fdev"))
+        .map(|(_, r)| r.end - r.start)
+        .sum();
+    (
+        moved,
+        a.hits.iter().map(|h| h.score).sum::<f32>() / a.hits.len() as f32,
+    )
+}
+
+#[tokio::test]
+async fn more_probes_read_more_and_all_of_them_read_everything() {
+    let (one, one_score) = fdev_bytes(Some(1)).await;
+    let (default, default_score) = fdev_bytes(None).await;
+    let (all, all_score) = fdev_bytes(Some(1024)).await;
+    eprintln!("1: {one} default: {default} all: {all}");
+    assert!(
+        one > 0 && one < default && default < all,
+        "{one} {default} {all}"
+    );
+    assert!(all_score >= default_score && default_score >= one_score * 0.999);
 }

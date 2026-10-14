@@ -205,6 +205,9 @@ pub struct MultiIn {
     /// The candidates a rerank re-scores a segment (M67).
     #[serde(default)]
     pub rerank_window: Option<serde_json::Value>,
+    /// With `mode: "fde"`, the clustered lists read a segment that has them (M72).
+    #[serde(default)]
+    pub probes: Option<serde_json::Value>,
 }
 
 fn some_vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {

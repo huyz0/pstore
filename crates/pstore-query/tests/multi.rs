@@ -329,6 +329,7 @@ async fn a_segment_without_the_encoding_answers_nothing() {
         query: q.clone(),
         limit: 100,
         rerank,
+        probes: None,
     };
     let rows_with_vectors = (0..20).filter(|r| !late(*r).is_empty()).count();
     for (target, fde_rows) in [(&with, rows_with_vectors), (&without, 0)] {
@@ -394,6 +395,7 @@ async fn fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced() {
         query: q.clone(),
         limit,
         rerank: None,
+        probes: None,
     };
     let encoded = pstore_format::fde::encode_query(&pstore_format::fde::DEFAULT, &q);
     let hits = query(

@@ -307,6 +307,17 @@ async fn fde_options_are_refused_at_the_door() {
         let why = refused(&api, &body).await;
         assert!(why.contains(name), "{body} -> {why}");
     }
+    // M72: `probes` is a whole number from 1 to 1024, and only beside the `fde` mode.
+    for bad in [json!(0), json!(1025), json!(2.5), json!("3"), json!(-1)] {
+        let why = refused(&api, &fde(1, 2, 5, json!({"probes": bad.clone()}))).await;
+        assert!(why.contains("probes"), "{bad} -> {why}");
+    }
+    let mut exact_probes = exact(1, 2, 5);
+    exact_probes["multi"]["probes"] = json!(2);
+    assert!(refused(&api, &exact_probes).await.contains("probes"));
+    for ok in [1, 1024] {
+        query(&api, &fde(1, 2, 5, json!({"probes": ok}))).await;
+    }
     // `rerank` without the `fde` mode, and rerank beside a filter.
     let mut exact_rerank = exact(1, 2, 5);
     exact_rerank["multi"]["rerank"] = json!("exact");
