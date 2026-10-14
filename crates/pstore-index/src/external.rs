@@ -8,10 +8,10 @@
 
 use crate::rabitq::{QuantError, Quantizer};
 use pstore_blob::{BlobError, BlobStore, Key};
-use pstore_format::external::{Extent, ExternalColumn, ExternalError};
+use pstore_format::external::{DictRef, Extent, ExternalColumn, ExternalError};
 use pstore_types::CasTag;
 
-const MAGIC: &[u8; 4] = b"PXI4";
+const MAGIC: &[u8; 4] = b"PXI5";
 
 /// Why an external index could not be built, opened or searched.
 #[derive(Debug)]
@@ -140,6 +140,17 @@ impl ExternalIndex {
                 b.extend(n.to_le_bytes());
             }
             b.push(e.codec);
+            b.extend(e.plain_len.to_le_bytes());
+            match e.dict {
+                None => b.push(0),
+                Some(d) => {
+                    b.push(1);
+                    b.extend(d.offset.to_le_bytes());
+                    b.extend(d.compressed.to_le_bytes());
+                    b.extend(d.count.to_le_bytes());
+                    b.push(d.codec);
+                }
+            }
         }
         b.extend(&self.codes);
         b
@@ -200,6 +211,21 @@ impl ExternalIndex {
                     .ok_or(bad("truncated"))?
                     .first()
                     .ok_or(bad("truncated"))?,
+                plain_len: r.u64().ok_or(bad("truncated"))?,
+                dict: match r.take(1).ok_or(bad("truncated"))?.first() {
+                    Some(0) => None,
+                    Some(1) => Some(DictRef {
+                        offset: r.u64().ok_or(bad("truncated"))?,
+                        compressed: r.u64().ok_or(bad("truncated"))?,
+                        count: r.u32().ok_or(bad("truncated"))?,
+                        codec: *r
+                            .take(1)
+                            .ok_or(bad("truncated"))?
+                            .first()
+                            .ok_or(bad("truncated"))?,
+                    }),
+                    _ => return Err(bad("bad dictionary flag")),
+                },
             });
         }
         let quantizer = Quantizer::new(dims as usize);

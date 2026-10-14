@@ -503,11 +503,19 @@ async fn an_index_over_each_codec_finds_the_exact_neighbours() {
     ] {
         over_codec(file).await;
     }
+    // M81: dictionary-encoded, plain / snappy / v2 (40 distinct vectors over 2,600 rows).
+    for file in ["dictionary", "dictionary-snappy", "dictionary-v2"] {
+        over_file(file, "dictionary.vectors.f32").await;
+    }
 }
 
 async fn over_codec(name: &str) {
+    over_file(name, "multipage.vectors.f32").await;
+}
+
+async fn over_file(name: &str, vectors: &str) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
-    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}{vectors}"))
         .unwrap()
         .chunks_exact(32)
         .map(|r| {

@@ -46,3 +46,13 @@ pq.write_table(t2,out+'multipage-lz4raw.parquet',compression='LZ4_RAW',use_dicti
 pq.write_table(t2,out+'multipage-v2.parquet',compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='2.0')
 pq.write_table(t2,out+'multipage-v2-snappy.parquet',compression='SNAPPY',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='2.0')
 pq.write_table(t2,out+'multipage-v2-zstd.parquet',compression='ZSTD',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='2.0')
+# M81: dictionary-encoded vectors (low cardinality, so the writer keeps its dictionary)
+K=40
+dv=rng.standard_normal((K,D)).astype('<f4')
+pick=rng.integers(0,K,size=M)
+dvecs=dv[pick]
+td=pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(dvecs)},schema=schema)
+open(out+'dictionary.vectors.f32','wb').write(dvecs.tobytes())
+pq.write_table(td,out+'dictionary.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')
+pq.write_table(td,out+'dictionary-snappy.parquet',compression='SNAPPY',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')
+pq.write_table(td,out+'dictionary-v2.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='2.0')

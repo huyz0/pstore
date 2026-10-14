@@ -45,6 +45,26 @@ pub struct Extent {
     /// How a compressed page is coded (M76): [`CODEC_SNAPPY`], [`CODEC_GZIP`] or [`CODEC_ZSTD`],
     /// Parquet's codec numbers. 0 for a raw run.
     pub codec: u8,
+    /// A dictionary-encoded page's decoded body size, once decompressed (M81): its indices, not
+    /// vectors. 0 for a page of plain vectors.
+    pub plain_len: u64,
+    /// The dictionary this page's indices point into (M81), if it is dictionary-encoded. Such a
+    /// page has `compressed > 0` whatever its codec: its rows are reached through the page.
+    pub dict: Option<DictRef>,
+}
+
+/// Where a chunk's dictionary page is (M81): a plain run of `count` distinct vectors, compressed
+/// with the chunk's codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DictRef {
+    /// The byte offset of the dictionary page's body.
+    pub offset: u64,
+    /// Its on-disk length.
+    pub compressed: u64,
+    /// Distinct vectors in it.
+    pub count: u32,
+    /// How it is coded: 0, or a `CODEC_*`.
+    pub codec: u8,
 }
 
 /// Parquet's codec number for snappy.
@@ -58,6 +78,69 @@ pub const CODEC_ZSTD: u8 = 6;
 /// Parquet's codec number for `LZ4_RAW`: one lz4 block. (The deprecated Hadoop-framed `LZ4`, 5,
 /// is not read.)
 pub const CODEC_LZ4_RAW: u8 = 7;
+
+/// The `n` indices of a dictionary-encoded page body (M81): one byte of bit width, then Parquet's
+/// RLE / bit-packed hybrid. `None` unless the body holds exactly `n` of them, every one below
+/// `count`. ⚠️ A run of zero values would not advance, so it is refused rather than looped on.
+fn decode_indices(buf: &[u8], n: usize, count: u32) -> Option<Vec<u32>> {
+    let width = usize::from(*buf.first()?);
+    if width > 32 {
+        return None;
+    }
+    let mut at = 1usize;
+    let mut out: Vec<u32> = Vec::with_capacity(n.min(1 << 20));
+    while out.len() < n {
+        // The run header: a varint whose low bit says bit-packed (1) or repeated (0).
+        let (mut header, mut shift) = (0u64, 0u32);
+        loop {
+            let b = *buf.get(at)?;
+            at += 1;
+            header |= u64::from(b & 0x7F).checked_shl(shift)?;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+        let units = usize::try_from(header >> 1).ok().filter(|u| *u > 0)?;
+        if header & 1 == 1 {
+            // `units` groups of eight values, `width` bits each, least significant bit first.
+            let bytes = units.checked_mul(width)?;
+            let packed = buf.get(at..at.checked_add(bytes)?)?;
+            at += bytes;
+            for k in 0..units.checked_mul(8)? {
+                if out.len() == n {
+                    break;
+                }
+                let mut v = 0u64;
+                for bit in 0..width {
+                    let pos = k * width + bit;
+                    if packed.get(pos / 8)? >> (pos % 8) & 1 == 1 {
+                        v |= 1 << bit;
+                    }
+                }
+                out.push(u32::try_from(v).ok()?);
+            }
+        } else {
+            // One value, repeated `units` times, in `ceil(width / 8)` little-endian bytes.
+            let vb = width.div_ceil(8);
+            let raw = buf.get(at..at.checked_add(vb)?)?;
+            at += vb;
+            // The value's bytes, little-endian, in the low end of eight.
+            let mut le = [0u8; 8];
+            for (to, from) in le.iter_mut().zip(raw) {
+                *to = *from;
+            }
+            let v = u32::try_from(u64::from_le_bytes(le)).ok()?;
+            for _ in 0..units.min(n - out.len()) {
+                out.push(v);
+            }
+        }
+    }
+    out.iter().all(|i| *i < count).then_some(out)
+}
 
 /// A compressed page's bytes, exactly `expected` of them or an error (M76). The output is bounded
 /// by `expected + 1` while decoding, so a page that lies about its size cannot balloon memory.
@@ -258,6 +341,20 @@ impl ExternalColumn {
             if e.rows == 0 {
                 return Err(ExternalError::Shape("a run holds no rows"));
             }
+            if let Some(d) = e.dict {
+                let dict_end = d
+                    .offset
+                    .checked_add(d.compressed)
+                    .ok_or(ExternalError::Shape("offsets overflow"))?;
+                if d.count == 0 || dict_end > len {
+                    return Err(ExternalError::Shape(
+                        "a dictionary is empty or past the object",
+                    ));
+                }
+                if e.compressed == 0 {
+                    return Err(ExternalError::Shape("a dictionary page has no body"));
+                }
+            }
             if e.first_row != next {
                 return Err(ExternalError::Shape("runs are not contiguous from row 0"));
             }
@@ -326,6 +423,14 @@ impl ExternalColumn {
                 .iter()
                 .map(|(_, e)| e.offset..e.offset + e.compressed),
         );
+        // The dictionaries those pages point into, each once (M81).
+        let dict_at: Vec<DictRef> = page_at
+            .iter()
+            .filter_map(|(_, e)| e.dict.map(|d| (d.offset, d)))
+            .collect::<std::collections::BTreeMap<u64, DictRef>>()
+            .into_values()
+            .collect();
+        ranges.extend(dict_at.iter().map(|d| d.offset..d.offset + d.compressed));
         let mut bufs = store.get_ranges(&key, &ranges).await?.into_iter();
         let mut out = BTreeMap::new();
         let floats = |raw: &[u8]| -> Vec<f32> {
@@ -337,9 +442,50 @@ impl ExternalColumn {
             let raw = bufs.next().ok_or(ExternalError::Damaged)?;
             out.insert(*row, floats(&raw));
         }
-        for (i, e) in page_at {
-            let comp = bufs.next().ok_or(ExternalError::Damaged)?;
-            let width = usize::try_from(self.width()).map_err(|_| ExternalError::Damaged)?;
+        // `bufs` yields the pages first and the dictionaries after, as `ranges` was built.
+        let page_bufs: Vec<_> = (0..page_at.len()).filter_map(|_| bufs.next()).collect();
+        let width = usize::try_from(self.width()).map_err(|_| ExternalError::Damaged)?;
+        let mut dicts: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for d in &dict_at {
+            let raw = bufs.next().ok_or(ExternalError::Damaged)?;
+            let want = usize::try_from(d.count)
+                .ok()
+                .and_then(|n| n.checked_mul(width))
+                .ok_or(ExternalError::Damaged)?;
+            let bytes = if d.codec == 0 {
+                raw.to_vec()
+            } else {
+                decompress(d.codec, &raw, want)?
+            };
+            if bytes.len() != want {
+                return Err(ExternalError::Damaged);
+            }
+            dicts.insert(d.offset, bytes);
+        }
+        for ((i, e), comp) in page_at.into_iter().zip(page_bufs) {
+            if let Some(d) = e.dict {
+                let body = if e.codec == 0 {
+                    comp.to_vec()
+                } else {
+                    decompress(e.codec, &comp, usize::try_from(e.plain_len).unwrap_or(0))?
+                };
+                if u64::try_from(body.len()).ok() != Some(e.plain_len) {
+                    return Err(ExternalError::Damaged);
+                }
+                let n = usize::try_from(e.rows).map_err(|_| ExternalError::Damaged)?;
+                let indices = decode_indices(&body, n, d.count).ok_or(ExternalError::Damaged)?;
+                let table = dicts.get(&d.offset).ok_or(ExternalError::Damaged)?;
+                for r in pages.get(&i).into_iter().flatten() {
+                    let k = usize::try_from(*r as u64 - e.first_row)
+                        .map_err(|_| ExternalError::Damaged)?;
+                    let at = usize::try_from(*indices.get(k).ok_or(ExternalError::Damaged)?)
+                        .map_err(|_| ExternalError::Damaged)?
+                        * width;
+                    let raw = table.get(at..at + width).ok_or(ExternalError::Damaged)?;
+                    out.insert(*r, floats(raw));
+                }
+                continue;
+            }
             let expected = usize::try_from(e.rows)
                 .ok()
                 .and_then(|n| n.checked_mul(width))
@@ -354,5 +500,194 @@ impl ExternalColumn {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::decode_indices;
+
+    /// An RLE run: `n` copies of `v`, `width` bits (so `ceil(width / 8)` bytes).
+    fn rle(n: u64, v: u32, width: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut h = n << 1;
+        loop {
+            let byte = (h & 0x7F) as u8;
+            h >>= 7;
+            if h == 0 {
+                b.push(byte);
+                break;
+            }
+            b.push(byte | 0x80);
+        }
+        b.extend(&v.to_le_bytes()[..width.div_ceil(8)]);
+        b
+    }
+
+    /// A bit-packed run of `groups` x 8 values, least significant bit first.
+    fn packed(values: &[u32], width: usize) -> Vec<u8> {
+        assert_eq!(values.len() % 8, 0);
+        let mut b = vec![(((values.len() / 8) << 1) | 1) as u8];
+        let mut bits = vec![0u8; values.len() * width / 8];
+        for (k, v) in values.iter().enumerate() {
+            for bit in 0..width {
+                if v >> bit & 1 == 1 {
+                    let pos = k * width + bit;
+                    bits[pos / 8] |= 1 << (pos % 8);
+                }
+            }
+        }
+        b.extend(bits);
+        b
+    }
+
+    #[test]
+    fn rle_and_bit_packed_runs_decode_and_mix() {
+        // Three bits wide: 5 x 7, then eight packed values, then 3 x 2.
+        let vals = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mut body = vec![3u8];
+        body.extend(rle(5, 7, 3));
+        body.extend(packed(&vals, 3));
+        body.extend(rle(3, 2, 3));
+        let got = decode_indices(&body, 16, 8).unwrap();
+        assert_eq!(got, [7, 7, 7, 7, 7, 0, 1, 2, 3, 4, 5, 6, 7, 2, 2, 2]);
+        // Fewer wanted than a run holds: the run is cut, not overrun.
+        assert_eq!(decode_indices(&body, 3, 8).unwrap(), [7, 7, 7]);
+        assert_eq!(decode_indices(&body, 7, 8).unwrap(), [7, 7, 7, 7, 7, 0, 1]);
+        // A run cut by `n` after earlier values: 8 packed, then 2 of 5 repeats.
+        let mut tail = vec![3u8];
+        tail.extend(packed(&vals, 3));
+        tail.extend(rle(5, 6, 3));
+        assert_eq!(
+            decode_indices(&tail, 10, 8).unwrap(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 6, 6]
+        );
+        // Wide values: a 17-bit packed run and a 3-byte RLE value.
+        let wide: Vec<u32> = (0..8).map(|i| 100_000 + i).collect();
+        let mut b = vec![17u8];
+        b.extend(packed(&wide, 17));
+        b.extend(rle(2, 99_999, 17));
+        assert_eq!(
+            decode_indices(&b, 10, 200_000).unwrap()[..9],
+            [
+                100_000, 100_001, 100_002, 100_003, 100_004, 100_005, 100_006, 100_007, 99_999
+            ]
+        );
+        // A multi-byte run header (200 repeats) and width 0 (everything is index 0).
+        let mut long = vec![2u8];
+        long.extend(rle(200, 3, 2));
+        assert_eq!(decode_indices(&long, 200, 4).unwrap(), vec![3; 200]);
+        let mut zero = vec![0u8];
+        zero.extend(rle(4, 0, 0));
+        assert_eq!(decode_indices(&zero, 4, 1).unwrap(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_body_that_is_not_n_indices_below_count_is_refused() {
+        let mut ok = vec![3u8];
+        ok.extend(rle(5, 7, 3));
+        assert!(decode_indices(&ok, 5, 8).is_some());
+        assert!(
+            decode_indices(&ok, 5, 7).is_none(),
+            "an index equal to the count"
+        );
+        assert!(
+            decode_indices(&ok, 6, 8).is_none(),
+            "fewer indices than rows"
+        );
+        assert!(decode_indices(&[], 1, 8).is_none(), "no width byte");
+        assert!(decode_indices(&[33], 1, 8).is_none(), "a width over 32");
+        // 32 is the widest; 33 and 40 would otherwise decode a valid-looking run.
+        let mut w32 = vec![32u8];
+        w32.extend(rle(2, 5, 32));
+        assert_eq!(decode_indices(&w32, 2, 8).unwrap(), [5, 5]);
+        for w in [33usize, 40] {
+            // An RLE run of two, its value in `ceil(w / 8)` bytes.
+            let mut wide = vec![w as u8, 4];
+            wide.extend(std::iter::repeat_n(5u8, w.div_ceil(8)));
+            assert!(decode_indices(&wide, 2, 8).is_none(), "width {w}");
+        }
+        assert!(decode_indices(&[3], 1, 8).is_none(), "no run");
+        assert!(
+            decode_indices(&[3, 0], 1, 8).is_none(),
+            "a run of nothing does not loop"
+        );
+        // A zero-length run is refused even when a good run follows it.
+        assert!(
+            decode_indices(&[3, 0, 0, 2, 5], 1, 8).is_none(),
+            "a zero run"
+        );
+        assert_eq!(
+            decode_indices(&[3, 2, 5], 1, 8).unwrap(),
+            [5],
+            "a nonzero run"
+        );
+        // A run header may take six bytes (a padded 2) but not seven.
+        assert_eq!(
+            decode_indices(&[3, 0x82, 0x80, 0x80, 0x80, 0x80, 0x00, 5], 1, 8).unwrap(),
+            [5]
+        );
+        assert!(
+            decode_indices(&[3, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 5], 1, 8).is_none(),
+            "a seven-byte header"
+        );
+        // A run longer than the rows wanted is cut: 2^28 repeats, three wanted.
+        let mut huge = vec![3u8];
+        huge.extend(rle(1 << 28, 1, 3));
+        assert_eq!(decode_indices(&huge, 3, 8).unwrap(), [1, 1, 1]);
+        // A zero-length run is refused even when a good run follows it.
+        assert!(
+            decode_indices(&[3, 0, 0, 2, 5], 1, 8).is_none(),
+            "a zero run"
+        );
+        assert_eq!(
+            decode_indices(&[3, 2, 5], 1, 8).unwrap(),
+            [5],
+            "a nonzero run"
+        );
+        // A run header may take six bytes (a padded 2) but not seven.
+        assert_eq!(
+            decode_indices(&[3, 0x82, 0x80, 0x80, 0x80, 0x80, 0x00, 5], 1, 8).unwrap(),
+            [5]
+        );
+        assert!(
+            decode_indices(&[3, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 5], 1, 8).is_none(),
+            "a seven-byte header"
+        );
+        // A run longer than the rows wanted is cut: 2^28 repeats, three wanted.
+        let mut huge = vec![3u8];
+        huge.extend(rle(1 << 28, 1, 3));
+        assert_eq!(decode_indices(&huge, 3, 8).unwrap(), [1, 1, 1]);
+        assert!(
+            decode_indices(&[3, 1], 1, 8).is_none(),
+            "a packed run of nothing"
+        );
+        assert!(
+            decode_indices(&[3, 0x81], 1, 8).is_none(),
+            "a header that never ends"
+        );
+        assert!(
+            decode_indices(&[3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 1, 8).is_none(),
+            "a header too long to be a run"
+        );
+        let mut cut = vec![3u8];
+        cut.extend(packed(&[1; 8], 3));
+        cut.pop();
+        assert!(
+            decode_indices(&cut, 8, 8).is_none(),
+            "a packed run cut short"
+        );
+        let mut short_rle = vec![3u8];
+        short_rle.extend(&rle(5, 7, 3)[..1]);
+        assert!(
+            decode_indices(&short_rle, 5, 8).is_none(),
+            "an RLE value cut short"
+        );
     }
 }

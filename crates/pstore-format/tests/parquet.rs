@@ -73,7 +73,6 @@ async fn locate_finds_the_real_files_vectors() {
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
     for (file, why) in [
-        ("dict.parquet", "dictionary"),
         ("optional.parquet", "REQUIRED"),
         ("list.parquet", "repetition levels"),
     ] {
@@ -154,6 +153,8 @@ async fn extents_address_rows() {
                 offset: 100,
                 compressed: 0,
                 codec: 0,
+                plain_len: 0,
+                dict: None,
             },
             Extent {
                 first_row: 3,
@@ -161,6 +162,8 @@ async fn extents_address_rows() {
                 offset: 200,
                 compressed: 0,
                 codec: 0,
+                plain_len: 0,
+                dict: None,
             },
             Extent {
                 first_row: 4,
@@ -168,6 +171,8 @@ async fn extents_address_rows() {
                 offset: 300,
                 compressed: 0,
                 codec: 0,
+                plain_len: 0,
+                dict: None,
             },
         ],
     )
@@ -185,6 +190,8 @@ async fn extents_address_rows() {
     let e = |first_row, rows, offset| Extent {
         compressed: 0,
         codec: 0,
+        plain_len: 0,
+        dict: None,
         first_row,
         rows,
         offset,
@@ -297,6 +304,8 @@ struct Chunk {
     codec: i64,
     encodings: Vec<i64>,
     dictionary_offset: bool,
+    /// Records a dictionary page offset of 0, as some writers do for "none".
+    dictionary_zero: bool,
     chunk_type: i64,
     group_rows: i64,
 }
@@ -334,6 +343,7 @@ fn chunk(dims: usize, rows: &[i64]) -> Chunk {
         codec: 0,
         encodings: vec![0, 3],
         dictionary_offset: false,
+        dictionary_zero: false,
         chunk_type: 7,
         group_rows: n,
     }
@@ -429,6 +439,8 @@ fn build(s: &Spec) -> Vec<u8> {
         f.i64(&mut m, 9, start);
         if c.dictionary_offset {
             f.i64(&mut m, 11, start);
+        } else if c.dictionary_zero {
+            f.i64(&mut m, 11, 0);
         }
         f.stop();
         if s.extra_struct_field {
@@ -509,13 +521,28 @@ async fn locate_refuses_each_shape_it_cannot_read() {
     .await;
     refused(
         &with(&|s| s.chunks[0].dictionary_offset = true),
-        "dictionary",
+        "dictionary page out of place",
     )
     .await;
+    // An offset of 0 means no dictionary: the chunk reads as any other.
+    run(&with(&|s| s.chunks[0].dictionary_zero = true))
+        .await
+        .unwrap();
     refused(&with(&|s| s.chunks[0].encodings = vec![0, 5]), "PLAIN").await;
-    refused(&with(&|s| s.chunks[0].encodings = vec![8]), "PLAIN").await;
+    refused(&with(&|s| s.chunks[0].encodings = vec![9]), "PLAIN").await;
     refused(&with(&|s| s.chunks[0].chunk_type = 1), "disagrees").await;
-    refused(&with(&|s| s.chunks[0].pages[0].encoding = 2), "PLAIN").await;
+    refused(&with(&|s| s.chunks[0].pages[0].encoding = 5), "PLAIN").await;
+    // Indices into a dictionary the chunk never declared.
+    refused(
+        &with(&|s| s.chunks[0].pages[0].encoding = 2),
+        "before any dictionary",
+    )
+    .await;
+    refused(
+        &with(&|s| s.chunks[0].pages[0].encoding = 8),
+        "before any dictionary",
+    )
+    .await;
     // A page that is compressed, or carries levels, is not `values × width` bytes.
     refused(&with(&|s| s.chunks[0].pages[0].compressed -= 4), "levels").await;
     refused(&with(&|s| s.chunks[0].pages[0].uncompressed += 4), "levels").await;
@@ -527,8 +554,12 @@ async fn locate_refuses_each_shape_it_cannot_read() {
         "levels",
     )
     .await;
-    // A dictionary page where a data page should be.
-    refused(&with(&|s| s.chunks[0].pages[0].kind = 2), "page header").await;
+    // A dictionary page the chunk never declared, and a page type that is neither.
+    refused(
+        &with(&|s| s.chunks[0].pages[0].kind = 2),
+        "dictionary page out of place",
+    )
+    .await;
     refused(&with(&|s| s.chunks[0].pages[0].kind = 3), "page header").await;
     // Counts that disagree.
     refused(&with(&|s| s.chunks[0].group_rows = 6), "one a row").await;
@@ -725,6 +756,8 @@ fn a_compressed_extent_is_bounded_by_its_compressed_size() {
         offset: 10,
         compressed,
         codec: u8::from(compressed > 0),
+        plain_len: 0,
+        dict: None,
     };
     // 1,000 rows of 2 floats would be 8,000 raw bytes, but the page is 50 on disk.
     assert!(ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).is_ok());
@@ -759,6 +792,8 @@ async fn gzip_and_zstd_files_read_back_every_row() {
     }
     check_every_row("zstd.parquet", "good.vectors.f32", 300, 3).await;
     check_every_row("brotli.parquet", "good.vectors.f32", 300, 3).await;
+    // M81: `dict.parquet` is dictionary-encoded (100 distinct vectors a row group).
+    check_every_row("dict.parquet", "good.vectors.f32", 300, 3).await;
 }
 
 #[tokio::test]
@@ -786,6 +821,8 @@ async fn lying(page: Vec<u8>, codec: u8, rows: u64) -> Result<(), ExternalError>
             offset: 0,
             compressed: page.len() as u64,
             codec,
+            plain_len: 0,
+            dict: None,
         }],
     )
     .unwrap();
@@ -961,4 +998,297 @@ async fn a_v2_page_is_checked_against_its_claims() {
     let mut other = spec(4, vec![chunk(4, &[5])]);
     other.chunks[0].pages[0].kind = 3;
     refused(&other, "page header").await;
+}
+
+// ---- M81: dictionary-encoded pages ----------------------------------------------------------
+
+#[tokio::test]
+async fn dictionary_files_read_back_every_row() {
+    for file in [
+        "dictionary.parquet",
+        "dictionary-snappy.parquet",
+        "dictionary-v2.parquet",
+    ] {
+        let (store, key) = put(file).await;
+        let found = locate(&store, &key, "embedding").await.unwrap();
+        assert!(found.extents.len() > 1, "{file}: several index pages");
+        assert!(found.extents.iter().all(|e| e.dict.is_some()), "{file}");
+        // One dictionary a chunk: every page points at the same one.
+        let first = found.extents[0].dict;
+        assert!(found.extents.iter().all(|e| e.dict == first), "{file}");
+        assert_eq!(first.unwrap().count, 40, "{file}: 40 distinct vectors");
+        check_every_row(file, "dictionary.vectors.f32", 2600, found.extents.len()).await;
+    }
+    // The snappy file's pages (and its dictionary) are compressed.
+    let (store, key) = put("dictionary-snappy.parquet").await;
+    let found = locate(&store, &key, "embedding").await.unwrap();
+    assert!(found.extents.iter().all(|e| e.codec == 1));
+    assert_eq!(found.extents[0].dict.unwrap().codec, 1);
+}
+
+#[tokio::test]
+async fn a_dictionary_is_read_once_for_all_its_candidates() {
+    use pstore_blob::Accounted;
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(pstore_types::TenantId(1));
+    let key = Key::new("lake/dict.parquet");
+    store
+        .put(&key, bytes("dictionary.parquet").into())
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let (a, b) = (col.extents[0], col.extents[1]);
+    let d = a.dict.unwrap();
+    let moved = |rows: Vec<usize>| {
+        let (acct, store, col, key) = (&acct, &store, &col, &key);
+        async move {
+            acct.record_ranges();
+            let got = col.read_rows(store, &rows).await.unwrap();
+            assert_eq!(got.len(), rows.len());
+            acct.bytes_in(key, 0..col.len)
+        }
+    };
+    let r0 = a.first_row as usize;
+    // Two rows of one page: that page and the dictionary, each once (plus at most the header the
+    // coalescer bridges between the dictionary page and the first index page).
+    let one = moved(vec![r0, r0 + 1]).await;
+    let want_one = a.compressed + d.compressed;
+    assert!(
+        (want_one..=want_one + 64).contains(&one),
+        "{one} vs {want_one}"
+    );
+    // Rows on two pages: both pages and still one dictionary (the coalescer may bridge the
+    // page header between neighbours).
+    let two = moved(vec![r0, b.first_row as usize]).await;
+    let want = a.compressed + b.compressed + d.compressed;
+    assert!((want..=want + 64).contains(&two), "{two} vs {want}");
+}
+
+#[tokio::test]
+async fn a_damaged_dictionary_page_is_an_error() {
+    let (store, key) = put("dictionary.parquet").await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let e = col.extents[0];
+    // The index page scribbled: a run that is not `rows` indices, or one past the dictionary.
+    let mut bad = bytes("dictionary.parquet");
+    let at = e.offset as usize;
+    for b in &mut bad[at..at + 16] {
+        *b = 0xFF;
+    }
+    store.put(&key, bad.into()).await.unwrap();
+    let damaged = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert!(matches!(
+        damaged.read_rows(&store, &[e.first_row as usize]).await,
+        Err(ExternalError::Damaged)
+    ));
+    // A dictionary that claims more vectors than its bytes hold.
+    let (store, key) = put("dictionary.parquet").await;
+    let mut lying = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    for x in &mut lying.extents {
+        x.dict.as_mut().unwrap().count += 1;
+    }
+    assert!(matches!(
+        lying.read_rows(&store, &[0]).await,
+        Err(ExternalError::Damaged)
+    ));
+    // Extents that point a dictionary outside the object, or nowhere, are not a column.
+    let ok = col.extents[0];
+    let mk = |dict: pstore_format::external::DictRef| {
+        ExternalColumn::from_extents(
+            "k",
+            8,
+            col.len,
+            None,
+            vec![Extent {
+                dict: Some(dict),
+                ..ok
+            }],
+        )
+    };
+    let d = ok.dict.unwrap();
+    assert!(mk(d).is_ok());
+    // A dictionary that ends exactly at the object's end is inside it; one byte more is not.
+    let last = pstore_format::external::DictRef {
+        offset: col.len - d.compressed,
+        ..d
+    };
+    assert!(mk(last).is_ok());
+    assert!(
+        mk(pstore_format::external::DictRef {
+            offset: last.offset + 1,
+            ..last
+        })
+        .is_err()
+    );
+    assert!(mk(pstore_format::external::DictRef { count: 0, ..d }).is_err());
+    assert!(
+        mk(pstore_format::external::DictRef {
+            offset: col.len,
+            ..d
+        })
+        .is_err()
+    );
+    assert!(
+        mk(pstore_format::external::DictRef {
+            offset: u64::MAX,
+            ..d
+        })
+        .is_err(),
+        "overflow"
+    );
+    let no_body = Extent {
+        compressed: 0,
+        dict: Some(d),
+        ..ok
+    };
+    assert!(ExternalColumn::from_extents("k", 8, col.len, None, vec![no_body]).is_err());
+}
+
+/// A chunk with a dictionary of `count` four-wide vectors, then index pages of `rows` rows each
+/// (6 bytes of indices apiece).
+fn dict_spec(count: i64, rows: &[i64]) -> Spec {
+    let bytes = count * 16;
+    let mut pages = vec![Page {
+        values: count,
+        compressed: bytes,
+        uncompressed: bytes,
+        encoding: 0,
+        kind: 2,
+        body: bytes as usize,
+        v2: None,
+    }];
+    for r in rows {
+        pages.push(Page {
+            values: *r,
+            compressed: 6,
+            uncompressed: 6,
+            encoding: 8,
+            kind: 0,
+            body: 6,
+            v2: None,
+        });
+    }
+    let n = rows.iter().sum();
+    spec(
+        4,
+        vec![Chunk {
+            pages,
+            num_values: n,
+            total_compressed: None,
+            codec: 0,
+            encodings: vec![0, 3, 8],
+            dictionary_offset: true,
+            dictionary_zero: false,
+            chunk_type: 7,
+            group_rows: n,
+        }],
+    )
+}
+
+#[tokio::test]
+async fn a_dictionary_chunk_is_checked_page_by_page() {
+    let ok = run(&dict_spec(5, &[3, 4])).await.unwrap();
+    assert_eq!(ok.extents.len(), 2);
+    let d = ok.extents[0].dict.unwrap();
+    assert_eq!((d.count, d.codec, d.compressed), (5, 0, 80));
+    assert!(
+        ok.extents
+            .iter()
+            .all(|e| e.dict == Some(d) && e.plain_len == 6)
+    );
+    // PLAIN_DICTIONARY (2) names the dictionary page's encoding as well as PLAIN (0).
+    let mut s = dict_spec(5, &[3]);
+    s.chunks[0].pages[0].encoding = 2;
+    run(&s).await.unwrap();
+    s.chunks[0].pages[0].encoding = 5;
+    refused(&s, "dictionary page is not PLAIN").await;
+    // An empty dictionary, and one whose size is not count x width.
+    refused(&dict_spec(0, &[3]), "dictionary size").await;
+    let mut s = dict_spec(5, &[3]);
+    s.chunks[0].pages[0].uncompressed = 79;
+    refused(&s, "not a plain run").await;
+    s.chunks[0].pages[0].uncompressed = 80;
+    s.chunks[0].pages[0].compressed = 79;
+    refused(&s, "not a plain run").await;
+    // Compressed: the on-disk size is free but must exist.
+    let mut s = dict_spec(5, &[3]);
+    s.chunks[0].codec = 1;
+    s.chunks[0].pages[0].compressed = 20;
+    s.chunks[0].pages[0].body = 20;
+    let found = run(&s).await.unwrap();
+    assert_eq!(found.extents[0].dict.unwrap().compressed, 20);
+    s.chunks[0].pages[0].compressed = 0;
+    s.chunks[0].pages[0].body = 0;
+    refused(&s, "not a plain run").await;
+    // A dictionary bigger than any page may decode to is refused before it is read: 2^24 vectors
+    // of 16 bytes is exactly 256 MiB (allowed, so it is only the chunk that is too short), one
+    // more is not.
+    let mut s = dict_spec(1 << 24, &[3]);
+    s.chunks[0].codec = 1;
+    s.chunks[0].pages[0].compressed = 20;
+    s.chunks[0].pages[0].body = 20;
+    run(&s).await.unwrap();
+    let mut s = dict_spec((1 << 24) + 1, &[3]);
+    s.chunks[0].codec = 1;
+    s.chunks[0].pages[0].compressed = 20;
+    s.chunks[0].pages[0].body = 20;
+    refused(&s, "not a plain run").await;
+    // A dictionary that runs past its chunk, or fills it with no index page after.
+    let mut s = dict_spec(5, &[3]);
+    s.chunks[0].total_compressed = Some(70);
+    refused(&s, "runs past its chunk").await;
+    let mut s = dict_spec(5, &[]);
+    s.chunks[0].num_values = 3;
+    s.chunks[0].group_rows = 3;
+    refused(&s, "pages end before").await;
+    // Two dictionaries, and one that does not come first.
+    let mut s = dict_spec(5, &[3]);
+    let again = s.chunks[0].pages[0].clone();
+    s.chunks[0].pages.insert(1, again);
+    refused(&s, "dictionary page out of place").await;
+}
+
+#[tokio::test]
+async fn an_index_page_is_checked_against_its_sizes() {
+    let with = |f: &dyn Fn(&mut Page)| {
+        let mut s = dict_spec(5, &[3]);
+        f(&mut s.chunks[0].pages[1]);
+        s
+    };
+    run(&with(&|_| {})).await.unwrap();
+    refused(&with(&|p| p.uncompressed = 0), "impossible size").await;
+    refused(&with(&|p| p.compressed = 0), "impossible size").await;
+    // Raw, the body is its own size; PLAIN_DICTIONARY (2) is an index page too.
+    refused(&with(&|p| p.compressed = 5), "impossible size").await;
+    run(&with(&|p| p.encoding = 2)).await.unwrap();
+    // Compressed, it may shrink; and it may decode to 256 MiB but not a byte more.
+    let squeezed = |un: i64| {
+        let mut s = dict_spec(5, &[3]);
+        s.chunks[0].codec = 1;
+        s.chunks[0].pages[0].compressed = 20;
+        s.chunks[0].pages[0].body = 20;
+        s.chunks[0].pages[1].uncompressed = un;
+        s
+    };
+    assert_eq!(run(&squeezed(900)).await.unwrap().extents[0].plain_len, 900);
+    run(&squeezed(256 << 20)).await.unwrap();
+    refused(&squeezed((256 << 20) + 1), "impossible size").await;
+    // An index page of no rows, and a body that runs past the chunk.
+    refused(&dict_spec(5, &[0, 3]), "runs past its chunk").await;
+    let mut s = dict_spec(5, &[3]);
+    s.chunks[0].total_compressed = Some(85);
+    refused(&s, "runs past its chunk").await;
+    // More rows than the chunk holds.
+    let mut s = dict_spec(5, &[3, 4]);
+    s.chunks[0].num_values = 5;
+    s.chunks[0].group_rows = 5;
+    refused(&s, "overshoot").await;
 }

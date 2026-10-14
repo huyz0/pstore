@@ -6,7 +6,7 @@
 //! decompress, a dictionary a lookup, and a nullable or repeated one level decoding -- none is a
 //! computable range, and silently reading one as floats would return noise.
 
-use crate::external::Extent;
+use crate::external::{DictRef, Extent};
 use pstore_blob::{BlobError, BlobStore, Key};
 
 /// Why a Parquet column could not be located.
@@ -302,6 +302,8 @@ fn footer(b: &[u8], column: &[u8]) -> Option<Footer> {
 
 /// A data page's header.
 struct PageHeader {
+    /// 0 a v1 data page, 2 a dictionary page, 3 a v2 data page.
+    kind: i64,
     values: i64,
     /// On-disk size of the page body.
     compressed: i64,
@@ -324,6 +326,7 @@ struct V2 {
 }
 
 const PAGE_V1: i64 = 0;
+const PAGE_DICT: i64 = 2;
 const PAGE_V2: i64 = 3;
 
 fn page_header(b: &[u8]) -> Option<PageHeader> {
@@ -338,6 +341,18 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
             (2, 5) => un = t.zigzag()?,
             (3, 5) => co = t.zigzag()?,
             (5, 12) => {
+                let mut l = 0;
+                while let Some((did, dty)) = t.field(l)? {
+                    l = did;
+                    match (did, dty) {
+                        (1, 5) => values = t.zigzag()?,
+                        (2, 5) => enc = Some(t.zigzag()?),
+                        _ => t.skip(dty)?,
+                    }
+                }
+            }
+            (7, 12) => {
+                // DictionaryPageHeader: values, encoding, is_sorted.
                 let mut l = 0;
                 while let Some((did, dty)) = t.field(l)? {
                     l = did;
@@ -375,12 +390,14 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
             _ => t.skip(ty)?,
         }
     }
-    let ok = match kind? {
-        PAGE_V1 => v2.is_none(),
+    let kind = kind?;
+    let ok = match kind {
+        PAGE_V1 | PAGE_DICT => v2.is_none(),
         PAGE_V2 => v2.is_some(),
         _ => false,
     };
     ok.then_some(PageHeader {
+        kind,
         values,
         compressed: co,
         uncompressed: un,
@@ -393,7 +410,12 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
 const TYPE_FLBA: i64 = 7;
 const CODEC_NONE: i64 = 0;
 const ENC_PLAIN: i64 = 0;
+const ENC_PLAIN_DICTIONARY: i64 = 2;
 const ENC_RLE: i64 = 3;
+const ENC_RLE_DICTIONARY: i64 = 8;
+/// The most a dictionary or an index page may claim to decode to (a lie is refused before any
+/// allocation).
+const MAX_PAGE_BYTES: i64 = 256 << 20;
 const REQUIRED: i64 = 0;
 /// Bytes read for a page header: far more than one holds.
 const HEADER_WINDOW: u64 = 256;
@@ -471,17 +493,24 @@ pub async fn locate<S: BlobStore>(
                 ));
             }
         };
-        if m.dictionary_page_offset.is_some() {
-            return unsupported("the column has a dictionary page");
-        }
-        if m.encodings.iter().any(|e| *e != ENC_PLAIN && *e != ENC_RLE) {
-            return unsupported("the column is not PLAIN-encoded");
+        if m.encodings
+            .iter()
+            .any(|e| ![ENC_PLAIN, ENC_RLE, ENC_PLAIN_DICTIONARY, ENC_RLE_DICTIONARY].contains(e))
+        {
+            return unsupported("the column uses an encoding other than PLAIN or a dictionary");
         }
         if m.ty != Some(TYPE_FLBA) {
             return unsupported("a chunk's type disagrees with the schema");
         }
-        let start = u64::try_from(m.data_page_offset.ok_or(bad("no data page offset"))?)
+        let data_start = u64::try_from(m.data_page_offset.ok_or(bad("no data page offset"))?)
             .map_err(|_| bad("negative offset"))?;
+        // M81: a chunk with a dictionary begins at its dictionary page; some writers record 0.
+        let dict_start = m
+            .dictionary_page_offset
+            .filter(|d| *d > 0)
+            .map(|d| u64::try_from(d).map_err(|_| bad("negative offset")))
+            .transpose()?;
+        let start = dict_start.unwrap_or(data_start);
         let end = start
             .checked_add(u64::try_from(m.total_compressed).map_err(|_| bad("negative size"))?)
             .filter(|e| *e <= len)
@@ -491,6 +520,7 @@ pub async fn locate<S: BlobStore>(
             return unsupported("a row group's values are not one a row");
         }
         let (mut at, mut got) = (start, 0u64);
+        let mut dict: Option<DictRef> = None;
         while got < want {
             if at >= end {
                 return Err(bad("pages end before the chunk's values"));
@@ -517,10 +547,76 @@ pub async fn locate<S: BlobStore>(
                 }
             }
             let snappy = page_codec != 0;
+            // A chunk that declares a dictionary page begins with one.
+            if dict_start == Some(at) && h.kind != PAGE_DICT {
+                return Err(bad("a dictionary page out of place"));
+            }
+            if h.kind == PAGE_DICT {
+                // M81: the chunk's dictionary page, first and once; plain vectors.
+                if dict_start != Some(at) || dict.is_some() {
+                    return Err(bad("a dictionary page out of place"));
+                }
+                if enc != ENC_PLAIN && enc != ENC_PLAIN_DICTIONARY {
+                    return unsupported("a dictionary page is not PLAIN");
+                }
+                let count = u32::try_from(values)
+                    .ok()
+                    .filter(|c| *c > 0)
+                    .ok_or(bad("dictionary size"))?;
+                let plain = i64::from(count) * width;
+                let sized = un == plain
+                    && plain <= MAX_PAGE_BYTES
+                    && if codec == 0 { co == un } else { co > 0 };
+                if !sized {
+                    return unsupported("a dictionary page is not a plain run of vectors");
+                }
+                let on_disk = u64::try_from(co).map_err(|_| bad("page size"))?;
+                let body = at + hlen as u64;
+                if body.checked_add(on_disk).is_none_or(|e| e > end) {
+                    return Err(bad("a page runs past its chunk"));
+                }
+                dict = Some(DictRef {
+                    offset: body,
+                    compressed: on_disk,
+                    count,
+                    codec,
+                });
+                at = body + on_disk;
+                continue;
+            }
+            let values = u64::try_from(values).map_err(|_| bad("page values"))?;
+            if got + values > want {
+                return Err(bad("pages overshoot the chunk's values"));
+            }
+            if enc == ENC_PLAIN_DICTIONARY || enc == ENC_RLE_DICTIONARY {
+                // M81: indices into the dictionary, reached by decoding the page.
+                let Some(d) = dict else {
+                    return Err(bad("a dictionary-encoded page before any dictionary"));
+                };
+                if un <= 0 || un > MAX_PAGE_BYTES || co <= 0 || (page_codec == 0 && co != un) {
+                    return unsupported("an index page has an impossible size");
+                }
+                let on_disk = u64::try_from(co).map_err(|_| bad("page size"))?;
+                let body = at + hlen as u64;
+                if values == 0 || body.checked_add(on_disk).is_none_or(|e| e > end) {
+                    return Err(bad("a page runs past its chunk"));
+                }
+                extents.push(Extent {
+                    first_row: first_row + got,
+                    rows: values,
+                    offset: body,
+                    compressed: on_disk,
+                    codec: page_codec,
+                    plain_len: u64::try_from(un).map_err(|_| bad("page size"))?,
+                    dict: Some(d),
+                });
+                got += values;
+                at = body + on_disk;
+                continue;
+            }
             if enc != ENC_PLAIN {
                 return unsupported("a data page is not PLAIN-encoded");
             }
-            let values = u64::try_from(values).map_err(|_| bad("page values"))?;
             let plain = values * u64::from(dims) * 4;
             // A raw page is exactly its values; a snappy page decompresses to exactly them.
             // Either way a size that disagrees means levels or another layout.
@@ -543,6 +639,8 @@ pub async fn locate<S: BlobStore>(
                 offset: body,
                 compressed: if snappy { on_disk } else { 0 },
                 codec: page_codec,
+                plain_len: 0,
+                dict: None,
             });
             got += values;
             at = body + on_disk;
