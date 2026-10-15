@@ -504,6 +504,10 @@ async fn an_index_over_each_codec_finds_the_exact_neighbours() {
         "optional-multipage",
         "optional-v2",
         "optional-v2-zstd",
+        // M91: lists of floats.
+        "list-v1",
+        "list-v2",
+        "list-groups",
     ] {
         over_codec(file).await;
     }

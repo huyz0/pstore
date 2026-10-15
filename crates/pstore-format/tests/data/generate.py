@@ -70,3 +70,29 @@ pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(dvecs)
 # M88: the same nulls in v2 pages, raw and zstd
 for name,codec in [('optional-nulls-v2.parquet','NONE'),('optional-nulls-v2-zstd.parquet','ZSTD')]:
     pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':pa.array(holes,type=pa.binary(D*4))}),out+name,compression=codec,use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='2.0')
+# M91: list<float> vector columns (the multipage vectors as lists of 8 floats)
+def lists(rows, typ=pa.float32(), nullable_items=True):
+    return pa.array([list(map(float, r)) for r in rows], type=pa.list_(pa.field('element', typ, nullable=nullable_items)))
+def wl(name, arr, **kw):
+    t=pa.table({'id':np.arange(len(arr),dtype='int64'),'embedding':arr})
+    base=dict(compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024)
+    base.update(kw)
+    pq.write_table(t,out+name,**base)
+wl('list-v1.parquet',lists(v2),data_page_version='1.0')
+wl('list-v2.parquet',lists(v2),data_page_version='2.0')
+wl('list-required.parquet',lists(v2,nullable_items=False),data_page_version='1.0')
+wl('list-groups.parquet',lists(v2),data_page_version='1.0',row_group_size=1000)
+wl('list-snappy.parquet',lists(v2),data_page_version='1.0',compression='SNAPPY')
+wl('list-double.parquet',lists(v2,pa.float64()),data_page_version='1.0')
+ragged=[list(map(float,r))[:(3 if i%5==0 else 8)] for i,r in enumerate(v2)]
+dims=[list(map(float,r))[:(8 if i<1000 else 3)] for i,r in enumerate(v2)]
+wl('list-dims.parquet',pa.array(dims,type=pa.list_(pa.float32())),data_page_version='1.0',row_group_size=1000)
+wl('list-ragged.parquet',pa.array(ragged,type=pa.list_(pa.float32())),data_page_version='1.0')
+holes_l=[None if i%10==3 else list(map(float,r)) for i,r in enumerate(v2)]
+wl('list-null-list.parquet',pa.array(holes_l,type=pa.list_(pa.float32())),data_page_version='1.0')
+holes_i=[[None if (i%10==3 and j==2) else float(x) for j,x in enumerate(r)] for i,r in enumerate(v2)]
+wl('list-null-item.parquet',pa.array(holes_i,type=pa.list_(pa.float32())),data_page_version='1.0')
+wl('list-nested.parquet',pa.array([[list(map(float,r))] for r in v2],type=pa.list_(pa.list_(pa.float32()))),data_page_version='1.0')
+# M91: the list first in the schema (so its index is not 2), and a struct of two floats
+pq.write_table(pa.table({'embedding':lists(v2),'id':np.arange(M,dtype='int64')}),out+'list-first.parquet',compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
+wl('list-struct.parquet',pa.StructArray.from_arrays([pa.array(v2[:,0]),pa.array(v2[:,1])],names=['a','b']),data_page_version='1.0')

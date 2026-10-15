@@ -72,12 +72,7 @@ async fn locate_finds_the_real_files_vectors() {
 
 #[tokio::test]
 async fn locate_refuses_what_cannot_be_reached() {
-    for (file, why) in [("list.parquet", "repetition levels")] {
-        let (store, key) = put(file).await;
-        let err = locate(&store, &key, "embedding").await.unwrap_err();
-        assert!(matches!(err, ParquetError::Unsupported(_)), "{file}: {err}");
-        assert!(err.to_string().contains(why), "{file}: {err}");
-    }
+    // (`list.parquet`, once refused here for its repetition levels, is read since M91.)
     let (store, key) = put("good.parquet").await;
     let err = locate(&store, &key, "nope").await.unwrap_err();
     assert!(err.to_string().contains("no column"), "{err}");
@@ -1665,4 +1660,72 @@ async fn any_one_object_changing_is_noticed() {
             "{name}"
         );
     }
+}
+
+// ---- M91: list<float> columns ------------------------------------------------------------------
+
+#[tokio::test]
+async fn lists_of_floats_read_back_every_row() {
+    for file in [
+        "list-v1.parquet",
+        "list-v2.parquet",
+        "list-required.parquet",
+        "list-groups.parquet",
+        "list-first.parquet",
+    ] {
+        let (store, key) = put(file).await;
+        let found = locate(&store, &key, "embedding").await.unwrap();
+        assert_eq!((found.dims, found.rows), (8, 2600), "{file}");
+        assert!(found.extents.len() > 1, "{file}: several pages");
+        // The levels are stepped over: extents are contiguous floats only.
+        assert!(
+            found
+                .extents
+                .iter()
+                .all(|e| e.codec == 0 && e.compressed == 0)
+        );
+        check_every_row(file, "multipage.vectors.f32", 2600, found.extents.len()).await;
+    }
+    // Three row groups of 1,000, 1,000 and 600 rows each start where the last ended.
+    let (store, key) = put("list-groups.parquet").await;
+    let found = locate(&store, &key, "embedding").await.unwrap();
+    assert_eq!(found.extents.iter().map(|e| e.rows).sum::<u64>(), 2600);
+    assert!(
+        found
+            .extents
+            .windows(2)
+            .all(|w| w[0].first_row + w[0].rows == w[1].first_row)
+    );
+    // `list.parquet`, once refused as nested, is a column of 300 lists of eight.
+    check_every_row("list.parquet", "good.vectors.f32", 300, 3).await;
+}
+
+#[tokio::test]
+async fn a_list_column_that_cannot_be_read_in_place_is_refused_by_name() {
+    for (file, why) in [
+        ("list-snappy.parquet", "compressed"),
+        ("list-double.parquet", "float32"),
+        ("list-ragged.parquet", "one length"),
+        ("list-dims.parquet", "same length"),
+        ("list-null-list.parquet", "null lists or null items"),
+        ("list-null-item.parquet", "null lists or null items"),
+        ("list-nested.parquet", "nested deeper"),
+        ("list-struct.parquet", "not a list of values"),
+    ] {
+        let (store, key) = put(file).await;
+        let err = locate(&store, &key, "embedding").await.unwrap_err();
+        assert!(err.to_string().contains(why), "{file}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn a_column_after_a_list_is_found_past_the_whole_list() {
+    // `list-first.parquet` puts the list ahead of `id`: skipping it takes its three schema
+    // elements, so `id` is found, and is refused for what it is rather than as missing.
+    let (store, key) = put("list-first.parquet").await;
+    let err = locate(&store, &key, "id").await.unwrap_err();
+    assert!(
+        err.to_string().contains("not FIXED_LEN_BYTE_ARRAY"),
+        "{err}"
+    );
 }

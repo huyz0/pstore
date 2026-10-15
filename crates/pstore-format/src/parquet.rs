@@ -6,6 +6,8 @@
 //! decompress, a dictionary a lookup, and a nullable or repeated one level decoding -- none is a
 //! computable range, and silently reading one as floats would return noise.
 
+mod list;
+
 use crate::external::{DictRef, Extent};
 use pstore_blob::{BlobError, BlobStore, Key};
 
@@ -236,8 +238,44 @@ fn chunk_meta(t: &mut Thrift<'_>) -> Option<ChunkMeta> {
     Some(m)
 }
 
+/// The flat schema index of the top-level element named `name`, and the number of elements in
+/// its subtree (itself included).
+fn top_level(schema: &[Leaf], name: &[u8]) -> Option<(usize, usize)> {
+    fn subtree(schema: &[Leaf], at: usize) -> Option<usize> {
+        let mut size = 1usize;
+        for _ in 0..schema.get(at)?.children {
+            size = size.checked_add(subtree(schema, at.checked_add(size)?)?)?;
+        }
+        Some(size)
+    }
+    let mut at = 1usize;
+    while let Some(e) = schema.get(at) {
+        let size = subtree(schema, at).filter(|s| *s != 0)?;
+        if e.name == name {
+            return Some((at, size));
+        }
+        at = at.checked_add(size)?;
+    }
+    None
+}
+
+/// The path of names from the top-level column `column` down through single children to its
+/// leaf (just `[column]` for a flat column): what a chunk's `path_in_schema` is.
+fn leaf_path(schema: &[Leaf], column: &[u8]) -> Vec<Vec<u8>> {
+    let mut path = vec![column.to_vec()];
+    if let Some((mut at, _)) = top_level(schema, column) {
+        while schema.get(at).is_some_and(|e| e.children == 1) {
+            at = at.saturating_add(1);
+            if let Some(e) = schema.get(at) {
+                path.push(e.name.clone());
+            }
+        }
+    }
+    path
+}
+
 /// A column chunk's metadata for each row group, for the one column wanted.
-fn row_groups(t: &mut Thrift<'_>, column: &[u8]) -> Option<Vec<Option<(ChunkMeta, i64)>>> {
+fn row_groups(t: &mut Thrift<'_>, column: &[Vec<u8>]) -> Option<Vec<Option<(ChunkMeta, i64)>>> {
     let (_, n) = t.list()?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -261,8 +299,7 @@ fn row_groups(t: &mut Thrift<'_>, column: &[u8]) -> Option<Vec<Option<(ChunkMeta
                             }
                         }
                         if let Some(m) = meta
-                            && m.path.len() == 1
-                            && m.path.first().is_some_and(|p| p == column)
+                            && m.path == column
                         {
                             found = Some(m);
                         }
@@ -296,7 +333,7 @@ fn footer(b: &[u8], column: &[u8]) -> Option<Footer> {
                     schema.push(schema_element(&mut t)?);
                 }
             }
-            (4, 9) => groups = row_groups(&mut t, column)?,
+            (4, 9) => groups = row_groups(&mut t, &leaf_path(&schema, column))?,
             _ => t.skip(ty)?,
         }
     }
@@ -573,15 +610,13 @@ pub async fn locate<S: BlobStore>(
     let raw = store.get_range(key, len - 8 - size..len - 8).await?;
     let f = footer(&raw, column.as_bytes()).ok_or(bad("footer metadata is damaged"))?;
 
-    // The leaf: a direct child of the root with this name, and nothing nested.
-    let leaf = f
-        .schema
-        .iter()
-        .skip(1)
-        .find(|e| e.name == column.as_bytes())
+    // The column: a top-level element of the root with this name.
+    let (top, size) = top_level(&f.schema, column.as_bytes())
         .ok_or_else(|| ParquetError::Unsupported(format!("no column named {column:?}")))?;
+    let leaf = f.schema.get(top).ok_or(bad("schema"))?;
     if leaf.children > 0 {
-        return unsupported("the column is a group (nested or a list): it has repetition levels");
+        // M91: a list of floats. Anything else nested is refused inside.
+        return list::locate_list(store, key, len, &f, column, top, size).await;
     }
     if leaf.ty != Some(TYPE_FLBA) {
         return unsupported("the column is not FIXED_LEN_BYTE_ARRAY");
