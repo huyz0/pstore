@@ -97,6 +97,26 @@ impl FdeClusters {
         self.lists.len()
     }
 
+    /// The rows list `i` holds (0 for a list that does not exist).
+    #[must_use]
+    pub fn list_len(&self, i: usize) -> usize {
+        self.lists.get(i).map_or(0, Vec::len)
+    }
+
+    /// The lists in the order a query `q` (in the clustered space) would probe them: best
+    /// centroid first, ties by list number.
+    #[must_use]
+    pub fn probe_order(&self, q: &[f32]) -> Vec<usize> {
+        let mut order: Vec<(usize, f32)> = self
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, dot(q, c)))
+            .collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        order.into_iter().map(|(i, _)| i).collect()
+    }
+
     /// The sidecar's bytes.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -237,13 +257,7 @@ impl FdeClusters {
     ) -> Result<Vec<(usize, f32)>, FormatError> {
         let dim = self.centroids.first().map_or(0, Vec::len);
         let width = (dim * 4) as u64;
-        let mut order: Vec<(usize, f32)> = self
-            .centroids
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, dot(q, c)))
-            .collect();
-        order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let order = self.probe_order(q);
         // Where each list starts, in rows of `.fdev`.
         let mut starts = Vec::with_capacity(self.lists.len());
         let mut at = 0u64;
@@ -251,7 +265,7 @@ impl FdeClusters {
             starts.push(at);
             at += l.len() as u64;
         }
-        let chosen: Vec<usize> = order.iter().take(probes.max(1)).map(|(i, _)| *i).collect();
+        let chosen: Vec<usize> = order.iter().take(probes.max(1)).copied().collect();
         let ranges: Vec<std::ops::Range<u64>> = chosen
             .iter()
             .filter_map(|i| {

@@ -1465,6 +1465,8 @@ dependencies = [
  "bytes",
  "futures-util",
  "object_store",
+ "pstore-format",
+ "pstore-index",
  "pstore-testkit",
  "pstore-types",
  "thiserror",

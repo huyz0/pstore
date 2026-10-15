@@ -21,6 +21,9 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
+# The M85 measurement example clusters real vectors; a dev-dependency cycle cargo allows.
+pstore-index = { path = "../pstore-index" }
+pstore-format = { path = "../pstore-format" }
 pstore-types = { path = "../pstore-types" }
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
@@ -41,4 +44,8 @@ compat = [
 
 [[example]]
 name = "probe"
+required-features = ["compat"]
+
+[[example]]
+name = "coalesce_s3"
 required-features = ["compat"]

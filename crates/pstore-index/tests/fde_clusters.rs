@@ -392,3 +392,29 @@ fn a_dense_field_never_shares_a_name_with_a_multi_vector_one() {
     assert_ne!(fde_clusters::dense_name("tag"), "tag");
     assert!(fde_clusters::dense_name("tag").starts_with('\0'));
 }
+
+#[test]
+fn the_probe_order_is_the_order_the_search_reads_in() {
+    let mut s = 85u64;
+    let rows: Vec<Vec<f32>> = (0..9_000)
+        .map(|i| {
+            let topic = (i % 12) as f32;
+            (0..4)
+                .map(|d| topic * (d as f32 + 1.0) + rnd(&mut s))
+                .collect()
+        })
+        .collect();
+    let (c, _) = FdeClusters::build("x", &rows, Params::default());
+    let q = [3.0f32, 6.0, 9.0, 12.0];
+    let order = c.probe_order(&q);
+    // Every list once, and the best centroid first.
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..c.lists()).collect::<Vec<_>>());
+    let total: usize = (0..c.lists()).map(|i| c.list_len(i)).sum();
+    assert!(total >= rows.len(), "lists hold every row (replicas aside)");
+    assert_eq!(c.list_len(c.lists()), 0, "no such list");
+    // A query on the opposite side of the centroids reverses which is best.
+    let far = [-3.0f32, -6.0, -9.0, -12.0];
+    assert_ne!(c.probe_order(&far).first(), order.first());
+}
