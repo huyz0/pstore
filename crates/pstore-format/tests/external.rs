@@ -49,6 +49,7 @@ fn column(len: u64, rows: u64) -> ExternalColumn {
         len,
         tag: None,
         extents: Vec::new(),
+        more: Vec::new(),
     }
 }
 

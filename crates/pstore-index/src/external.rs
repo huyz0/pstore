@@ -8,10 +8,10 @@
 
 use crate::rabitq::{QuantError, Quantizer};
 use pstore_blob::{BlobError, BlobStore, Key};
-use pstore_format::external::{DictRef, Extent, ExternalColumn, ExternalError};
+use pstore_format::external::{DictRef, Extent, ExternalColumn, ExternalError, ObjectRef};
 use pstore_types::CasTag;
 
-const MAGIC: &[u8; 4] = b"PXI5";
+const MAGIC: &[u8; 4] = b"PXI6";
 
 /// Why an external index could not be built, opened or searched.
 #[derive(Debug)]
@@ -132,14 +132,7 @@ impl ExternalIndex {
         for n in [c.base, c.stride, c.len] {
             b.extend(n.to_le_bytes());
         }
-        match &c.tag {
-            None => b.push(0),
-            Some(t) => {
-                b.push(1);
-                b.extend((t.as_str().len() as u32).to_le_bytes());
-                b.extend(t.as_str().as_bytes());
-            }
-        }
+        put_tag(&mut b, c.tag.as_ref());
         b.extend((c.extents.len() as u32).to_le_bytes());
         for e in &c.extents {
             for n in [e.first_row, e.rows, e.offset, e.compressed] {
@@ -157,6 +150,15 @@ impl ExternalIndex {
                     b.push(d.codec);
                 }
             }
+            b.extend(e.object.to_le_bytes());
+        }
+        // M87: the further objects a dataset of several data files spans.
+        b.extend((c.more.len() as u32).to_le_bytes());
+        for o in &c.more {
+            b.extend((o.key.len() as u32).to_le_bytes());
+            b.extend(o.key.as_bytes());
+            b.extend(o.len.to_le_bytes());
+            put_tag(&mut b, o.tag.as_ref());
         }
         b.extend(&self.codes);
         b
@@ -232,7 +234,27 @@ impl ExternalIndex {
                     }),
                     _ => return Err(bad("bad dictionary flag")),
                 },
+                object: r.u32().ok_or(bad("truncated"))?,
             });
+        }
+        let n_more = r.u32().ok_or(bad("truncated"))? as usize;
+        let mut more = Vec::new();
+        for _ in 0..n_more {
+            let klen = r.u32().ok_or(bad("truncated"))? as usize;
+            let key = String::from_utf8(r.take(klen).ok_or(bad("truncated"))?.to_vec())
+                .map_err(|_| bad("key is not text"))?;
+            let len = r.u64().ok_or(bad("truncated"))?;
+            let tag = match r.take(1).ok_or(bad("truncated"))?.first() {
+                Some(0) => None,
+                Some(1) => {
+                    let n = r.u32().ok_or(bad("truncated"))? as usize;
+                    let t = String::from_utf8(r.take(n).ok_or(bad("truncated"))?.to_vec())
+                        .map_err(|_| bad("tag is not text"))?;
+                    Some(CasTag::new(t))
+                }
+                _ => return Err(bad("bad tag flag")),
+            };
+            more.push(ObjectRef { key, len, tag });
         }
         let quantizer = Quantizer::new(dims as usize);
         let want = usize::try_from(rows)
@@ -244,8 +266,14 @@ impl ExternalIndex {
             return Err(bad("codes are not rows × code length"));
         }
         if !extents.is_empty() {
-            ExternalColumn::from_runs(&key, dims, len, tag.clone(), rows, extents.clone())
-                .map_err(|_| bad("the runs do not fit the object"))?;
+            let mut objects = vec![ObjectRef {
+                key: key.clone(),
+                len,
+                tag: tag.clone(),
+            }];
+            objects.extend(more.iter().cloned());
+            ExternalColumn::from_objects(objects, dims, rows, extents.clone())
+                .map_err(|_| bad("the runs do not fit the objects"))?;
         }
         Ok(Self {
             column: ExternalColumn {
@@ -257,6 +285,7 @@ impl ExternalIndex {
                 len,
                 tag,
                 extents,
+                more,
             },
             quantizer,
             codes: codes.to_vec(),
@@ -340,6 +369,18 @@ impl ExternalIndex {
         exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         exact.truncate(k);
         Ok(exact)
+    }
+}
+
+/// A CAS tag as a presence byte and, when present, a length-prefixed string.
+fn put_tag(b: &mut Vec<u8>, tag: Option<&CasTag>) {
+    match tag {
+        None => b.push(0),
+        Some(t) => {
+            b.push(1);
+            b.extend((t.as_str().len() as u32).to_le_bytes());
+            b.extend(t.as_str().as_bytes());
+        }
     }
 }
 

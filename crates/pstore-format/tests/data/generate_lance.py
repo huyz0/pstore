@@ -34,3 +34,30 @@ ds = lance.write_dataset(table(v[:300]), out + 'deleted', data_storage_version='
 ds.delete('id < 10')
 # a newer file format
 lance.write_dataset(table(v[:300]), out + 'v21', data_storage_version='2.1')
+
+# M87: Arrow IPC files in the shapes a deletion file could take (and mostly is not), read by the
+# hand-written reader's tests.
+import pyarrow.ipc as ipc
+arrow = out + 'arrow/'
+os.makedirs(arrow, exist_ok=True)
+rows = [8, 5, 3, 1, 2, 4, 6, 7, 0, 9]
+def write(name, table, **kw):
+    with ipc.new_file(arrow + name, table.schema, options=ipc.IpcWriteOptions(**kw)) as w:
+        for b in table.to_batches(): w.write_batch(b)
+u32 = pa.table({'row_id': pa.array(rows, type=pa.uint32())})
+write('plain.arrow', u32)
+write('zstd.arrow', u32, compression='zstd')
+write('lz4.arrow', u32, compression='lz4')
+write('empty.arrow', pa.table({'row_id': pa.array([], type=pa.uint32())}))
+write('u64.arrow', pa.table({'row_id': pa.array(rows, type=pa.uint64())}))
+write('two_columns.arrow', pa.table({'row_id': pa.array(rows, type=pa.uint32()), 'x': pa.array(rows, type=pa.uint32())}))
+write('nulls.arrow', pa.table({'row_id': pa.array([1, None, 3], type=pa.uint32())}))
+with ipc.new_file(arrow + 'two_batches.arrow', u32.schema) as w:
+    w.write_batch(pa.record_batch([pa.array([1, 2], type=pa.uint32())], schema=u32.schema))
+    w.write_batch(pa.record_batch([pa.array([3, 4], type=pa.uint32())], schema=u32.schema))
+with ipc.new_stream(arrow + 'stream.arrow', u32.schema) as w:
+    w.write_table(u32)
+# (appended after the above) the shapes that differ from a deletion file in exactly one count
+write('sparse.arrow', pa.table({'row_id': pa.array([1, 2, 5], type=pa.uint32())}))
+write('string.arrow', pa.table({'row_id': pa.array(['a', 'b', 'c'], type=pa.string())}))
+write('null_and_u32.arrow', pa.table({'n': pa.nulls(3), 'row_id': pa.array([1, 2, 3], type=pa.uint32())}))

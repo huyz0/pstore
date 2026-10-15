@@ -698,3 +698,132 @@ async fn an_index_over_a_column_with_nulls_finds_the_exact_neighbours() {
     assert!(got.iter().all(|g| g.0 % 2 == 1 && !is_null(g.0)));
     assert_eq!(got.len(), 10);
 }
+
+/// A Lance fixture dataset in a store, and its newest manifest (V2 naming counts down, so the
+/// smallest name is the newest).
+async fn lance_dataset(name: &str) -> (MemoryStore, Key) {
+    let root = format!(
+        "{}/../pstore-format/tests/data/lance/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let store = MemoryStore::new();
+    let mut manifest: Option<(String, Key)> = None;
+    let mut stack = vec![std::path::PathBuf::from(&root)];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+            let key = Key::new(format!("lake/{name}/{rel}"));
+            store
+                .put(&key, std::fs::read(&p).unwrap().into())
+                .await
+                .unwrap();
+            if rel.ends_with(".manifest") && manifest.as_ref().is_none_or(|(r, _)| rel < *r) {
+                manifest = Some((rel, key));
+            }
+        }
+    }
+    (store, manifest.unwrap().1)
+}
+
+fn lance_vectors() -> Vec<Vec<f32>> {
+    std::fs::read(format!(
+        "{}/../pstore-format/tests/data/lance/vectors.f32",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+    .chunks_exact(32)
+    .map(|r| {
+        r.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    })
+    .collect()
+}
+
+/// M87: a dataset of three data files is one column, and its index finds the exact neighbours
+/// across them.
+#[tokio::test]
+async fn an_index_over_a_multi_fragment_dataset_finds_the_exact_neighbours() {
+    let (store, manifest) = lance_dataset("many").await;
+    let all = lance_vectors();
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    assert_eq!(col.more.len(), 2);
+    let last = Key::new(col.more.last().unwrap().key.clone());
+    let index = check_index(&store, col, &all).await;
+    // The blob carries the other data files: reopened, a changed one is noticed.
+    let mut raw = store
+        .get_range(&last, 0..store.head(&last).await.unwrap())
+        .await
+        .unwrap()
+        .to_vec();
+    raw[4] ^= 0xFF;
+    store.put(&last, raw.into()).await.unwrap();
+    assert!(index.search(&store, &all[0], 3, 50).await.is_err());
+}
+
+/// M87: deleted rows keep their numbers and are never returned.
+#[tokio::test]
+async fn an_index_over_a_dataset_with_deletions_never_returns_a_deleted_row() {
+    let (store, manifest) = lance_dataset("deleted").await;
+    let all = lance_vectors();
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    assert_eq!(col.rows, 300);
+    let built = ExternalIndex::build(&store, &codes_key(), col, 100)
+        .await
+        .unwrap();
+    let index = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    assert_eq!(built.to_bytes(), index.to_bytes());
+    for qi in [0usize, 5, 150, 299] {
+        let q = &all[qi];
+        let mut exact: Vec<(usize, f64)> = (10..300).map(|i| (i, cosine(q, &all[i]))).collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let got = index.search(&store, q, 10, 300).await.unwrap();
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        assert_eq!(
+            got.iter().map(|g| g.0).collect::<Vec<_>>(),
+            want,
+            "query {qi}"
+        );
+    }
+}
+
+/// M87: further objects without a CAS tag survive the codes blob too.
+#[tokio::test]
+async fn objects_without_a_tag_round_trip_through_the_blob() {
+    let (store, manifest) = lance_dataset("many").await;
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col.clone(), 500)
+        .await
+        .unwrap();
+    for tags in [
+        (true, true, true),
+        (false, false, false),
+        (true, false, true),
+        (false, true, false),
+    ] {
+        let mut c = col.clone();
+        if !tags.0 {
+            c.tag = None;
+        }
+        for (o, keep) in c.more.iter_mut().zip([tags.1, tags.2]) {
+            if !keep {
+                o.tag = None;
+            }
+        }
+        let with = index.clone().with_column(c.clone());
+        let back = ExternalIndex::from_bytes(&with.to_bytes()).unwrap();
+        assert_eq!(back.to_bytes(), with.to_bytes(), "{tags:?}");
+        assert_eq!(back.extent_count(), with.extent_count());
+    }
+}

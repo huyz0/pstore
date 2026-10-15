@@ -421,9 +421,6 @@ const ENC_RLE_DICTIONARY: i64 = 8;
 const MAX_PAGE_BYTES: i64 = 256 << 20;
 const REQUIRED: i64 = 0;
 const OPTIONAL: i64 = 1;
-/// The most extents one column may be located into (M88): a hostile null pattern otherwise
-/// makes the located column as large as the file.
-const MAX_EXTENTS: usize = 1 << 22;
 /// Bytes read for a page header: far more than one holds.
 const HEADER_WINDOW: u64 = 256;
 
@@ -434,11 +431,6 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, ParquetError> {
 /// The most runs of present rows one page may split into (M88). A page of alternating null and
 /// present rows is the worst case, and each run becomes an extent.
 const MAX_RUNS_PER_PAGE: usize = 1 << 20;
-
-/// Whether a column of `n` extents is within [`MAX_EXTENTS`].
-fn within_extent_cap(n: usize) -> bool {
-    n <= MAX_EXTENTS
-}
 
 /// A run of present rows: `(first row of the page, rows)`.
 type Run = (u64, u64);
@@ -748,6 +740,7 @@ pub async fn locate<S: BlobStore>(
                     codec: page_codec,
                     plain_len: u64::try_from(un).map_err(|_| bad("page size"))?,
                     dict: Some(d),
+                    object: 0,
                 });
                 got += values;
                 at = body + on_disk;
@@ -809,10 +802,11 @@ pub async fn locate<S: BlobStore>(
                     codec: page_codec,
                     plain_len: 0,
                     dict: None,
+                    object: 0,
                 });
                 rank += run_len;
             }
-            if !within_extent_cap(extents.len()) {
+            if !crate::external::within_extent_cap(extents.len()) {
                 return unsupported("the column splits into too many runs");
             }
             got += values;
@@ -955,13 +949,6 @@ mod tests {
         }
         levels.extend(std::iter::repeat_n(0b0101_0101u8, groups as usize));
         levels
-    }
-
-    #[test]
-    fn the_extent_cap_is_exact() {
-        assert!(within_extent_cap(0));
-        assert!(within_extent_cap(MAX_EXTENTS));
-        assert!(!within_extent_cap(MAX_EXTENTS + 1));
     }
 
     #[test]

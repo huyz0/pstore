@@ -104,8 +104,6 @@ async fn a_lance_dataset_reads_back_every_row() {
 
 #[tokio::test]
 async fn a_column_that_cannot_be_read_in_place_is_refused_by_name() {
-    refused("many", "3 fragments").await;
-    refused("deleted", "deleted rows").await;
     refused("nullable", "null-free float32").await;
     refused("v21", "format 2.1").await;
     // A column the dataset does not have, and one that is not a vector.
@@ -583,4 +581,193 @@ async fn a_changed_data_file_is_noticed() {
         col.read_rows(&store, &[0]).await,
         Err(ExternalError::Changed)
     ));
+}
+
+// ---- M87: several data files, and deleted rows ------------------------------------------------
+
+#[tokio::test]
+async fn a_multi_fragment_dataset_reads_back_every_row() {
+    let (store, manifest) = dataset("many").await;
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    assert_eq!(
+        (col.dims, col.rows, col.more.len()),
+        (8, 2600, 2),
+        "three data files"
+    );
+    // The runs name all three objects, in row order.
+    let objects: Vec<u32> = col.extents.iter().map(|e| e.object).collect();
+    assert_eq!(objects.first(), Some(&0));
+    assert!(objects.windows(2).all(|w| w[0] <= w[1]));
+    assert_eq!(objects.last(), Some(&2));
+    let want = floats();
+    let all: Vec<usize> = (0..2600).collect();
+    let got = col.read_rows(&store, &all).await.unwrap();
+    assert_eq!(got.len(), 2600);
+    for (r, v) in &got {
+        assert_eq!(v.as_slice(), &want[r * 8..r * 8 + 8], "row {r}");
+    }
+    // A read across two data files asks each once, and nothing else.
+    let rows = [10usize, 1_500, 2_599];
+    let some = col.read_rows(&store, &rows).await.unwrap();
+    assert_eq!(some.len(), 3);
+}
+
+#[tokio::test]
+async fn a_deleted_row_is_never_returned() {
+    let (store, manifest) = dataset("deleted").await;
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    // Ids 0..9 were deleted from 300 rows: they keep their numbers and have no vector.
+    assert_eq!(col.rows, 300);
+    for r in 0..10 {
+        assert!(!col.is_present(r), "row {r} is deleted");
+        assert!(matches!(
+            col.read_rows(&store, &[r, 100]).await,
+            Err(ExternalError::Absent(x)) if x == r
+        ));
+    }
+    let want = floats();
+    let present: Vec<usize> = (10..300).collect();
+    let got = col.read_rows(&store, &present).await.unwrap();
+    assert_eq!(got.len(), 290);
+    for (r, v) in &got {
+        assert_eq!(v.as_slice(), &want[r * 8..r * 8 + 8], "row {r}");
+    }
+}
+
+#[tokio::test]
+async fn a_changed_fragment_is_noticed() {
+    let (store, manifest) = dataset("many").await;
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    // Replace the last data file; a read that touches only the first still notices.
+    let last = Key::new(col.more.last().unwrap().key.clone());
+    let mut raw = store
+        .get_range(&last, 0..store.head(&last).await.unwrap())
+        .await
+        .unwrap()
+        .to_vec();
+    raw[0] ^= 0xFF;
+    store.put(&last, raw.into()).await.unwrap();
+    assert!(matches!(
+        col.read_rows(&store, &[0]).await,
+        Err(ExternalError::Changed)
+    ));
+}
+
+#[tokio::test]
+async fn a_deletion_file_that_lies_is_refused() {
+    let (store, manifest) = dataset("deleted").await;
+    let dir = format!("{DIR}deleted/_deletions");
+    let name = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let key = Key::new(format!(
+        "lake/deleted/_deletions/{}",
+        name.to_str().unwrap()
+    ));
+    let good = std::fs::read(format!("{dir}/{}", name.to_str().unwrap())).unwrap();
+    let with = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = good.clone();
+        f(&mut b);
+        b
+    };
+    for (what, bad) in [
+        ("truncated", good[..good.len() / 2].to_vec()),
+        ("empty", Vec::new()),
+        ("not arrow", with(&|b| b[0] = b'X')),
+        (
+            "no trailing magic",
+            with(&|b| *b.last_mut().unwrap() = b'X'),
+        ),
+        (
+            "a footer length past the file",
+            with(&|b| {
+                let n = b.len();
+                b[n - 10..n - 6].copy_from_slice(&u32::MAX.to_le_bytes());
+            }),
+        ),
+    ] {
+        store.put(&key, bad.into()).await.unwrap();
+        let err = locate(&store, &manifest, "emb")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deletion file"), "{what}: {err}");
+    }
+    // The real one still works, put back.
+    store.put(&key, good.into()).await.unwrap();
+    locate(&store, &manifest, "emb").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deletion_count_that_disagrees_or_a_file_too_large_is_refused() {
+    let (store, manifest) = dataset("deleted").await;
+    let raw = store
+        .get_range(&manifest, 0..store.head(&manifest).await.unwrap())
+        .await
+        .unwrap()
+        .to_vec();
+    // The manifest says "10 rows deleted" (field 4 of the deletion file, then the fragment's
+    // 300 physical rows); the file lists 10.
+    let pattern = [0x20u8, 0x0A, 0x20, 0xAC, 0x02];
+    // The last occurrence: the manifest proper follows an earlier section of the file.
+    let at = raw
+        .windows(pattern.len())
+        .rposition(|w| w == pattern)
+        .expect("the deletion count");
+    let with_count = |n: u8| {
+        let mut b = raw.clone();
+        b[at + 1] = n;
+        b
+    };
+    for (count, ok) in [(10u8, true), (0, true), (9, false), (11, false)] {
+        store
+            .put(&manifest, with_count(count).into())
+            .await
+            .unwrap();
+        let got = locate(&store, &manifest, "emb").await;
+        assert_eq!(got.is_ok(), ok, "count {count}: {:?}", got.err());
+        if !ok {
+            assert!(got.unwrap_err().to_string().contains("different number"));
+        }
+    }
+    // A deletion file past 64 MiB is refused unread; exactly 64 MiB is read, and is not Arrow.
+    store.put(&manifest, raw.into()).await.unwrap();
+    let dir = format!("{DIR}deleted/_deletions");
+    let name = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let key = Key::new(format!(
+        "lake/deleted/_deletions/{}",
+        name.to_str().unwrap()
+    ));
+    store
+        .put(&key, vec![0u8; (64 << 20) + 1].into())
+        .await
+        .unwrap();
+    let err = locate(&store, &manifest, "emb")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too large"), "{err}");
+    store.put(&key, vec![0u8; 64 << 20].into()).await.unwrap();
+    let err = locate(&store, &manifest, "emb")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("deletion file") && !err.contains("too large"),
+        "{err}"
+    );
 }

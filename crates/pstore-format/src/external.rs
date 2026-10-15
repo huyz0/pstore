@@ -36,6 +36,15 @@ pub enum ExternalError {
     Lance(#[from] crate::lance::LanceError),
 }
 
+/// The most extents one column may be located into (M88, M87): a hostile null or deletion
+/// pattern otherwise makes the located column as large as the file.
+pub(crate) const MAX_EXTENTS: usize = 1 << 22;
+
+/// Whether a column of `n` extents is within [`MAX_EXTENTS`].
+pub(crate) fn within_extent_cap(n: usize) -> bool {
+    n <= MAX_EXTENTS
+}
+
 /// A run of contiguous vectors: rows `first_row..first_row + rows`, the first at `offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
@@ -57,6 +66,20 @@ pub struct Extent {
     /// The dictionary this page's indices point into (M81), if it is dictionary-encoded. Such a
     /// page has `compressed > 0` whatever its codec: its rows are reached through the page.
     pub dict: Option<DictRef>,
+    /// Which object the run lives in (M87): 0 is the column's own, `n` the `n`th of
+    /// [`ExternalColumn::more`]. A Parquet column is always 0.
+    pub object: u32,
+}
+
+/// A further object a column spans (M87): a Lance dataset keeps its rows in several data files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    /// The object's key.
+    pub key: String,
+    /// Its length when pinned.
+    pub len: u64,
+    /// Its CAS tag when pinned, if the store has one.
+    pub tag: Option<CasTag>,
 }
 
 /// Where a chunk's dictionary page is (M81): a plain run of `count` distinct vectors, compressed
@@ -217,6 +240,9 @@ pub struct ExternalColumn {
     /// the single run `base`, `stride`, `rows`; otherwise `base` and `stride` are unused and the
     /// vectors in a run are `dims * 4` bytes apart.
     pub extents: Vec<Extent>,
+    /// Objects beyond the first that extents may name (M87), numbered from 1. Empty for all but
+    /// a Lance dataset of several data files.
+    pub more: Vec<ObjectRef>,
 }
 
 impl ExternalColumn {
@@ -255,6 +281,11 @@ impl ExternalColumn {
     /// Where row `row`'s vector is, or `None` past the column or in a compressed page.
     #[must_use]
     pub fn row_range(&self, row: usize) -> Option<Range<u64>> {
+        self.row_location(row).map(|(_, range)| range)
+    }
+
+    /// [`Self::row_range`], and which object the range is in (M87).
+    fn row_location(&self, row: usize) -> Option<(u32, Range<u64>)> {
         let row = u64::try_from(row).ok().filter(|r| *r < self.rows)?;
         if !self.extents.is_empty() {
             let i = self
@@ -268,10 +299,10 @@ impl ExternalColumn {
             let start = e
                 .offset
                 .checked_add((row - e.first_row).checked_mul(self.width())?)?;
-            return Some(start..start.checked_add(self.width())?);
+            return Some((e.object, start..start.checked_add(self.width())?));
         }
         let start = self.base.checked_add(row.checked_mul(self.stride)?)?;
-        Some(start..start.checked_add(self.width())?)
+        Some((0, start..start.checked_add(self.width())?))
     }
 
     /// Records the object's length and tag, refusing a column that cannot fit in it.
@@ -298,6 +329,7 @@ impl ExternalColumn {
             len,
             tag,
             extents: Vec::new(),
+            more: Vec::new(),
         };
         if dims == 0 {
             return Err(ExternalError::Shape("zero dimensions"));
@@ -344,7 +376,8 @@ impl ExternalColumn {
     }
 
     /// Pins the float32 fixed-size-list column `column` of the Lance dataset whose manifest is at
-    /// `manifest` (M82): the column of its one data file, bound to that file's key.
+    /// `manifest` (M82, M87): the column across its data files, with the rows a deletion file
+    /// removes left out of every answer.
     ///
     /// # Errors
     /// [`ExternalError::Lance`] for a dataset or column that cannot be read in place; a store
@@ -354,18 +387,24 @@ impl ExternalColumn {
         manifest: &Key,
         column: &str,
     ) -> Result<Self, ExternalError> {
-        let (key, found) = crate::lance::locate(store, manifest, column).await?;
-        let tag = store.get_tag(&key).await?;
-        if store.head(&key).await? != found.len {
-            return Err(ExternalError::Changed);
+        let found = crate::lance::locate(store, manifest, column).await?;
+        let mut objects = Vec::with_capacity(found.objects.len());
+        for (key, len) in &found.objects {
+            let tag = store.get_tag(key).await?;
+            if store.head(key).await? != *len {
+                return Err(ExternalError::Changed);
+            }
+            objects.push(ObjectRef {
+                key: key.as_str().to_owned(),
+                len: *len,
+                tag,
+            });
         }
-        Self::from_runs(
-            key.as_str(),
-            found.dims,
-            found.len,
-            tag,
-            found.rows,
-            found.extents,
+        Self::from_objects(
+            objects,
+            found.located.dims,
+            found.located.rows,
+            found.located.extents,
         )
     }
 
@@ -406,6 +445,32 @@ impl ExternalColumn {
         rows: u64,
         extents: Vec<Extent>,
     ) -> Result<Self, ExternalError> {
+        let one = ObjectRef {
+            key: key.to_owned(),
+            len,
+            tag,
+        };
+        Self::from_objects(vec![one], dims, rows, extents)
+    }
+
+    /// [`Self::from_runs`] over several objects (M87): `objects[0]` is the column's own and the
+    /// rest are [`Self::more`]; each extent's `object` indexes the list. Runs are ordered by row
+    /// across objects. A run with a dictionary must be in object 0.
+    ///
+    /// # Errors
+    /// As [`Self::from_runs`], and [`ExternalError::Shape`] for no objects or an extent naming an
+    /// object that is not in the list.
+    pub fn from_objects(
+        objects: Vec<ObjectRef>,
+        dims: u32,
+        rows: u64,
+        extents: Vec<Extent>,
+    ) -> Result<Self, ExternalError> {
+        let mut objects = objects.into_iter();
+        let first = objects
+            .next()
+            .ok_or(ExternalError::Shape("a column has no object"))?;
+        let more: Vec<ObjectRef> = objects.collect();
         if dims == 0 {
             return Err(ExternalError::Shape("zero dimensions"));
         }
@@ -422,7 +487,23 @@ impl ExternalColumn {
             if e.rows == 0 {
                 return Err(ExternalError::Shape("a run holds no rows"));
             }
+            let len = match usize::try_from(e.object).ok() {
+                Some(0) => first.len,
+                Some(n) => more.get(n - 1).map(|o| o.len).ok_or(ExternalError::Shape(
+                    "a run names an object the column lacks",
+                ))?,
+                None => {
+                    return Err(ExternalError::Shape(
+                        "a run names an object the column lacks",
+                    ));
+                }
+            };
             if let Some(d) = e.dict {
+                if e.object != 0 {
+                    return Err(ExternalError::Shape(
+                        "a dictionary page is in the first object",
+                    ));
+                }
                 let dict_end = d
                     .offset
                     .checked_add(d.compressed)
@@ -454,15 +535,57 @@ impl ExternalColumn {
             return Err(ExternalError::Shape("no runs"));
         }
         Ok(Self {
-            key: key.to_owned(),
+            key: first.key,
             base: 0,
             dims,
             stride: width,
             rows,
-            len,
-            tag,
+            len: first.len,
+            tag: first.tag,
             extents,
+            more,
         })
+    }
+
+    /// The ranges, each in the object it names, in the order given (M87): one request set an
+    /// object, run together.
+    async fn fetch<S: BlobStore>(
+        &self,
+        store: &S,
+        ranges: &[(u32, Range<u64>)],
+    ) -> Result<Vec<bytes::Bytes>, ExternalError> {
+        let mut by_object: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (i, (object, _)) in ranges.iter().enumerate() {
+            by_object.entry(*object).or_default().push(i);
+        }
+        let reads = by_object.into_iter().map(|(object, at)| async move {
+            let key = match usize::try_from(object).ok() {
+                Some(0) => self.key.clone(),
+                Some(n) => self
+                    .more
+                    .get(n - 1)
+                    .map(|o| o.key.clone())
+                    .ok_or(ExternalError::Damaged)?,
+                None => return Err(ExternalError::Damaged),
+            };
+            let wanted: Vec<Range<u64>> = at
+                .iter()
+                .filter_map(|i| ranges.get(*i).map(|r| r.1.clone()))
+                .collect();
+            let got = store.get_ranges(&Key::new(key), &wanted).await?;
+            Ok::<_, ExternalError>((at, got))
+        });
+        let mut out: Vec<Option<bytes::Bytes>> = vec![None; ranges.len()];
+        for (at, got) in futures_util::future::try_join_all(reads).await? {
+            for (i, b) in at.into_iter().zip(got) {
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = Some(b);
+                }
+            }
+        }
+        out.into_iter()
+            .map(|b| b.ok_or(ExternalError::Damaged))
+            .collect()
     }
 
     /// The named rows' vectors, read by ranged read. Duplicates and rows past the column are
@@ -493,6 +616,12 @@ impl ExternalColumn {
         if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
             return Err(ExternalError::Changed);
         }
+        for o in &self.more {
+            let k = Key::new(o.key.clone());
+            if store.head(&k).await? != o.len || store.get_tag(&k).await? != o.tag {
+                return Err(ExternalError::Changed);
+            }
+        }
         // Raw rows by their own range; a compressed row by its whole page, once.
         let mut raw_rows: Vec<usize> = Vec::new();
         let mut pages: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -502,8 +631,11 @@ impl ExternalColumn {
                 None => raw_rows.push(r),
             }
         }
-        let mut ranges: Vec<Range<u64>> =
-            raw_rows.iter().filter_map(|r| self.row_range(*r)).collect();
+        // Every range with the object it is in; the answer comes back in this order.
+        let mut ranges: Vec<(u32, Range<u64>)> = raw_rows
+            .iter()
+            .filter_map(|r| self.row_location(*r))
+            .collect();
         let page_at: Vec<(usize, &Extent)> = pages
             .keys()
             .filter_map(|i| self.extents.get(*i).map(|e| (*i, e)))
@@ -511,7 +643,7 @@ impl ExternalColumn {
         ranges.extend(
             page_at
                 .iter()
-                .map(|(_, e)| e.offset..e.offset + e.compressed),
+                .map(|(_, e)| (e.object, e.offset..e.offset + e.compressed)),
         );
         // The dictionaries those pages point into, each once (M81).
         let dict_at: Vec<DictRef> = page_at
@@ -520,8 +652,12 @@ impl ExternalColumn {
             .collect::<std::collections::BTreeMap<u64, DictRef>>()
             .into_values()
             .collect();
-        ranges.extend(dict_at.iter().map(|d| d.offset..d.offset + d.compressed));
-        let mut bufs = store.get_ranges(&key, &ranges).await?.into_iter();
+        ranges.extend(
+            dict_at
+                .iter()
+                .map(|d| (0, d.offset..d.offset + d.compressed)),
+        );
+        let mut bufs = self.fetch(store, &ranges).await?.into_iter();
         let mut out = BTreeMap::new();
         let floats = |raw: &[u8]| -> Vec<f32> {
             raw.chunks_exact(4)
@@ -779,5 +915,17 @@ mod tests {
             decode_indices(&short_rle, 5, 8).is_none(),
             "an RLE value cut short"
         );
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::{MAX_EXTENTS, within_extent_cap};
+
+    #[test]
+    fn the_extent_cap_is_exact() {
+        assert!(within_extent_cap(0));
+        assert!(within_extent_cap(MAX_EXTENTS));
+        assert!(!within_extent_cap(MAX_EXTENTS + 1));
     }
 }

@@ -152,6 +152,7 @@ async fn extents_address_rows() {
                 codec: 0,
                 plain_len: 0,
                 dict: None,
+                object: 0,
             },
             Extent {
                 first_row: 3,
@@ -161,6 +162,7 @@ async fn extents_address_rows() {
                 codec: 0,
                 plain_len: 0,
                 dict: None,
+                object: 0,
             },
             Extent {
                 first_row: 4,
@@ -170,6 +172,7 @@ async fn extents_address_rows() {
                 codec: 0,
                 plain_len: 0,
                 dict: None,
+                object: 0,
             },
         ],
     )
@@ -189,6 +192,7 @@ async fn extents_address_rows() {
         codec: 0,
         plain_len: 0,
         dict: None,
+        object: 0,
         first_row,
         rows,
         offset,
@@ -757,6 +761,7 @@ fn a_compressed_extent_is_bounded_by_its_compressed_size() {
         codec: u8::from(compressed > 0),
         plain_len: 0,
         dict: None,
+        object: 0,
     };
     // 1,000 rows of 2 floats would be 8,000 raw bytes, but the page is 50 on disk.
     assert!(ExternalColumn::from_extents("k", 2, 60, None, vec![e(50)]).is_ok());
@@ -822,6 +827,7 @@ async fn lying(page: Vec<u8>, codec: u8, rows: u64) -> Result<(), ExternalError>
             codec,
             plain_len: 0,
             dict: None,
+            object: 0,
         }],
     )
     .unwrap();
@@ -1108,6 +1114,7 @@ async fn a_damaged_dictionary_page_is_an_error() {
             None,
             vec![Extent {
                 dict: Some(dict),
+                object: 0,
                 ..ok
             }],
         )
@@ -1146,6 +1153,7 @@ async fn a_damaged_dictionary_page_is_an_error() {
     let no_body = Extent {
         compressed: 0,
         dict: Some(d),
+        object: 0,
         ..ok
     };
     assert!(ExternalColumn::from_extents("k", 8, col.len, None, vec![no_body]).is_err());
@@ -1486,6 +1494,7 @@ async fn runs_with_gaps_are_checked() {
         codec: 0,
         plain_len: 0,
         dict: None,
+        object: 0,
     };
     let build = |rows: u64, extents: Vec<Extent>| {
         ExternalColumn::from_runs("k", 2, 1_000, None, rows, extents)
@@ -1518,6 +1527,7 @@ async fn runs_with_gaps_are_checked() {
         len: 100,
         tag: None,
         extents: vec![],
+        more: vec![],
     };
     assert!(strided.is_present(3) && !strided.is_present(4));
     // `from_extents` still insists on contiguous runs from row 0.
@@ -1528,4 +1538,131 @@ async fn runs_with_gaps_are_checked() {
     assert!(
         ExternalColumn::from_extents("k", 2, 1_000, None, vec![ok(0, 2, 0), ok(2, 2, 50)]).is_ok()
     );
+}
+
+// ---- M87: a column over several objects -----------------------------------------------------
+
+#[tokio::test]
+async fn a_column_over_several_objects_is_checked() {
+    let obj = |key: &str, len| pstore_format::external::ObjectRef {
+        key: key.to_owned(),
+        len,
+        tag: None,
+    };
+    let run = |first_row, rows, offset, object| Extent {
+        first_row,
+        rows,
+        offset,
+        compressed: 0,
+        codec: 0,
+        plain_len: 0,
+        dict: None,
+        object,
+    };
+    let build = |objects: Vec<_>, extents: Vec<Extent>| {
+        ExternalColumn::from_objects(objects, 2, 6, extents)
+    };
+    // Three objects of 100, 200 and 300 bytes (8 bytes a row of two floats).
+    let objects = || vec![obj("a", 100), obj("b", 200), obj("c", 300)];
+    let ok = build(
+        objects(),
+        vec![run(0, 2, 0, 0), run(2, 2, 100, 1), run(4, 2, 200, 2)],
+    )
+    .unwrap();
+    assert_eq!((ok.key.as_str(), ok.len, ok.more.len()), ("a", 100, 2));
+    // Each row's range is in its own object.
+    assert_eq!(ok.row_range(3), Some(108..116));
+    // A run past its own object's end, though inside another's, is refused.
+    assert!(build(objects(), vec![run(0, 2, 90, 0)]).is_err());
+    assert!(build(objects(), vec![run(0, 2, 90, 1)]).is_ok());
+    assert!(build(objects(), vec![run(0, 2, 195, 1)]).is_err());
+    // A run naming an object the column lacks, and a column with none.
+    assert!(build(objects(), vec![run(0, 2, 0, 3)]).is_err());
+    assert!(build(vec![], vec![run(0, 2, 0, 0)]).is_err());
+    // A dictionary page is in the first object only.
+    let dict = pstore_format::external::DictRef {
+        offset: 0,
+        compressed: 8,
+        count: 1,
+        codec: 0,
+    };
+    let page = |object| Extent {
+        compressed: 8,
+        dict: Some(dict),
+        object,
+        ..run(0, 2, 8, 0)
+    };
+    assert!(build(objects(), vec![page(0)]).is_ok());
+    assert!(build(objects(), vec![page(1)]).is_err());
+}
+
+/// Three objects of four rows of two floats (`base + row` in both), as one column of twelve.
+async fn three_objects() -> (MemoryStore, ExternalColumn) {
+    let store = MemoryStore::new();
+    let mut objects = Vec::new();
+    for (name, base) in [("a", 0.0f32), ("b", 100.0), ("c", 200.0)] {
+        let key = Key::new(format!("lake/{name}"));
+        let mut raw = Vec::new();
+        for r in 0..4 {
+            raw.extend((base + r as f32).to_le_bytes());
+            raw.extend((base + r as f32).to_le_bytes());
+        }
+        store.put(&key, raw.into()).await.unwrap();
+        objects.push(pstore_format::external::ObjectRef {
+            key: key.as_str().to_owned(),
+            len: 32,
+            tag: store.get_tag(&key).await.unwrap(),
+        });
+    }
+    let run = |first_row, object| Extent {
+        first_row,
+        rows: 4,
+        offset: 0,
+        compressed: 0,
+        codec: 0,
+        plain_len: 0,
+        dict: None,
+        object,
+    };
+    let col = ExternalColumn::from_objects(objects, 2, 12, vec![run(0, 0), run(4, 1), run(8, 2)])
+        .unwrap();
+    (store, col)
+}
+
+#[tokio::test]
+async fn reads_across_objects_come_back_in_the_rows_asked() {
+    let (store, col) = three_objects().await;
+    // Asked out of order and across all three, answered by row.
+    let got = col.read_rows(&store, &[9, 1, 5, 11, 0, 6]).await.unwrap();
+    let want: Vec<(usize, f32)> = vec![
+        (0, 0.0),
+        (1, 1.0),
+        (5, 101.0),
+        (6, 102.0),
+        (9, 201.0),
+        (11, 203.0),
+    ];
+    assert_eq!(got.len(), want.len());
+    for (row, x) in want {
+        assert_eq!(got[&row], [x, x], "row {row}");
+    }
+}
+
+#[tokio::test]
+async fn any_one_object_changing_is_noticed() {
+    // Whichever rows are asked for, a change to any of the three is `Changed`.
+    for name in ["a", "b", "c"] {
+        let (store, col) = three_objects().await;
+        let key = Key::new(format!("lake/{name}"));
+        let mut raw = store.get_range(&key, 0..32).await.unwrap().to_vec();
+        raw[0] ^= 1;
+        store.put(&key, raw.into()).await.unwrap();
+        assert!(
+            matches!(
+                col.read_rows(&store, &[0]).await,
+                Err(ExternalError::Changed)
+            ),
+            "{name}"
+        );
+    }
 }
