@@ -67,3 +67,6 @@ holes=[None if i%10==3 else v2[i].tobytes() for i in range(M)]
 pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':pa.array(holes,type=pa.binary(D*4))}),out+'optional-nulls.parquet',compression='NONE',use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='1.0')
 # M84: an optional, dictionary-encoded column (refused: its index pages carry levels)
 pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':flba(dvecs)}),out+'optional-dictionary.parquet',compression='NONE',use_dictionary=True,write_statistics=False,row_group_size=M,data_page_size=600,data_page_version='1.0')
+# M88: the same nulls in v2 pages, raw and zstd
+for name,codec in [('optional-nulls-v2.parquet','NONE'),('optional-nulls-v2-zstd.parquet','ZSTD')]:
+    pq.write_table(pa.table({'id':np.arange(M,dtype='int64'),'embedding':pa.array(holes,type=pa.binary(D*4))}),out+name,compression=codec,use_dictionary=False,write_statistics=False,row_group_size=M,data_page_size=1024,data_page_version='2.0')

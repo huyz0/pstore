@@ -92,9 +92,15 @@ impl ExternalIndex {
         let mut at = 0;
         while at < rows {
             let end = (at + chunk).min(rows);
-            let wanted: Vec<usize> = (at..end).collect();
+            let wanted: Vec<usize> = (at..end).filter(|r| column.is_present(*r)).collect();
             let got = column.read_rows(store, &wanted).await?;
             for row in at..end {
+                // M88: a row the source holds no vector for keeps its slot, with a zero code
+                // nothing reads (`search` skips it), so a code's position is still its row.
+                if !column.is_present(row) {
+                    codes.extend(std::iter::repeat_n(0u8, quantizer.code_len()));
+                    continue;
+                }
                 let v = got
                     .get(&row)
                     .ok_or(ExternalIndexError::Corrupt("a row was not returned"))?;
@@ -238,12 +244,8 @@ impl ExternalIndex {
             return Err(bad("codes are not rows × code length"));
         }
         if !extents.is_empty() {
-            let checked =
-                ExternalColumn::from_extents(&key, dims, len, tag.clone(), extents.clone())
-                    .map_err(|_| bad("the runs do not fit the object"))?;
-            if checked.rows != rows {
-                return Err(bad("the runs hold a different number of rows"));
-            }
+            ExternalColumn::from_runs(&key, dims, len, tag.clone(), rows, extents.clone())
+                .map_err(|_| bad("the runs do not fit the object"))?;
         }
         Ok(Self {
             column: ExternalColumn {
@@ -316,7 +318,8 @@ impl ExternalIndex {
             .chunks_exact(step)
             .enumerate()
             .filter_map(|(row, raw)| {
-                if !allow(row) {
+                // A null row (M88) has a slot and no vector.
+                if !allow(row) || !self.column.is_present(row) {
                     return None;
                 }
                 let code = self.quantizer.read_code(raw)?;

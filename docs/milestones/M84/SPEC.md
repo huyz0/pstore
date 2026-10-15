@@ -32,7 +32,7 @@ all "present", and stepped over: each extent starts after them.
    the compressed body.
 3. `damaged_definition_levels_are_refused`: a level byte flipped to null, a length prefix that
    runs past the page, and a zero length are each refused by name.
-4. `levels_that_say_present_are_checked_exactly` (unit): RLE and bit-packed runs, mixed runs, a
+4. `levels_give_the_runs_of_present_rows_exactly` (unit; named `levels_that_say_present_are_checked_exactly` when M84 shipped): RLE and bit-packed runs, mixed runs, a
    two-byte run header, bits of padding that are not read, a null inside the values, a run of
    nothing, a header that never ends, trailing bytes and truncation.
 5. `locate_refuses_each_shape_it_cannot_read`: `REPEATED` is refused; an `OPTIONAL` schema over

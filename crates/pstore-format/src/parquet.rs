@@ -30,8 +30,11 @@ pub struct Located {
     pub len: u64,
     /// Components in a vector.
     pub dims: u32,
-    /// One run of contiguous vectors a data page, covering rows `0..` without a gap.
+    /// One run of contiguous vectors a data page (or, with nulls, a run of present rows of one),
+    /// in row order. Rows between runs hold no vector (M88).
     pub extents: Vec<Extent>,
+    /// Rows the column has, nulls included.
+    pub rows: u64,
 }
 
 /// A Thrift compact-protocol reader over a byte slice.
@@ -418,6 +421,9 @@ const ENC_RLE_DICTIONARY: i64 = 8;
 const MAX_PAGE_BYTES: i64 = 256 << 20;
 const REQUIRED: i64 = 0;
 const OPTIONAL: i64 = 1;
+/// The most extents one column may be located into (M88): a hostile null pattern otherwise
+/// makes the located column as large as the file.
+const MAX_EXTENTS: usize = 1 << 22;
 /// Bytes read for a page header: far more than one holds.
 const HEADER_WINDOW: u64 = 256;
 
@@ -425,13 +431,24 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, ParquetError> {
     Err(ParquetError::Unsupported(why.into()))
 }
 
-/// The bytes of definition levels ahead of an OPTIONAL page's values, after reading them and
-/// finding that every value is present (M84).
+/// The most runs of present rows one page may split into (M88). A page of alternating null and
+/// present rows is the worst case, and each run becomes an extent.
+const MAX_RUNS_PER_PAGE: usize = 1 << 20;
+
+/// Whether a column of `n` extents is within [`MAX_EXTENTS`].
+fn within_extent_cap(n: usize) -> bool {
+    n <= MAX_EXTENTS
+}
+
+/// A run of present rows: `(first row of the page, rows)`.
+type Run = (u64, u64);
+
+/// Reads an OPTIONAL page's definition levels (M84, M88).
 ///
-/// A v1 page carries them inside its body behind a 4-byte length, so only an uncompressed one can
-/// be read in place; a v2 page's sit outside the compressed values, whose header says how long
-/// they are. Anything but "all present" is refused: a null would make a row number no longer a
-/// position.
+/// Returns the bytes of levels ahead of the values and the runs of rows that hold a value.
+/// A v1 page carries the levels inside its body behind a 4-byte length, so only an uncompressed
+/// one can be read in place; a v2 page's sit outside the compressed values, whose header says how
+/// long they are.
 async fn present<S: BlobStore>(
     store: &S,
     key: &Key,
@@ -440,7 +457,7 @@ async fn present<S: BlobStore>(
     values: u64,
     v2: Option<&V2>,
     codec: u8,
-) -> Result<u64, ParquetError> {
+) -> Result<(u64, Vec<Run>), ParquetError> {
     let bad = ParquetError::Malformed;
     let (start, len) = if let Some(v) = v2 {
         (
@@ -465,67 +482,76 @@ async fn present<S: BlobStore>(
         return Err(bad("definition levels run past their page"));
     }
     let raw = store.get_range(key, start..start + len).await?;
-    if !all_present(&raw, values) {
-        return unsupported("an optional column holds nulls");
-    }
-    Ok(if v2.is_some() { len } else { len + 4 })
+    let runs = present_runs(&raw, values).ok_or(bad("definition levels are damaged"))?;
+    Ok((if v2.is_some() { len } else { len + 4 }, runs))
 }
 
-/// Whether `levels` (Parquet's RLE / bit-packed hybrid at bit width 1, no length prefix) say
-/// "present" (1) for exactly `n` values and nothing follows. Nothing is allocated for the values.
-fn all_present(levels: &[u8], n: u64) -> bool {
+/// The runs of rows `levels` (Parquet's RLE / bit-packed hybrid at bit width 1, no length
+/// prefix) say are present (1), for exactly `n` values with nothing after; `None` if the levels
+/// are malformed or split into more than [`MAX_RUNS_PER_PAGE`] runs. Adjacent present runs are
+/// one run. Nothing is allocated per value.
+fn present_runs(levels: &[u8], n: u64) -> Option<Vec<Run>> {
     let (mut at, mut seen) = (0usize, 0u64);
+    let mut runs: Vec<Run> = Vec::new();
+    // Appends `count` rows from row `seen`, present or not.
+    let mut push = |present: bool, seen: u64, count: u64| -> Option<()> {
+        if !present || count == 0 {
+            return Some(());
+        }
+        match runs.last_mut() {
+            Some((start, len)) if *start + *len == seen => *len += count,
+            _ => {
+                if runs.len() >= MAX_RUNS_PER_PAGE {
+                    return None;
+                }
+                runs.push((seen, count));
+            }
+        }
+        Some(())
+    };
     while seen < n {
         let (mut header, mut shift) = (0u64, 0u32);
         loop {
-            let Some(b) = levels.get(at) else {
-                return false;
-            };
+            let b = levels.get(at)?;
             at += 1;
-            let Some(part) = u64::from(b & 0x7F).checked_shl(shift) else {
-                return false;
-            };
-            header |= part;
+            header |= u64::from(b & 0x7F).checked_shl(shift)?;
             if b & 0x80 == 0 {
                 break;
             }
             shift += 7;
             if shift > 35 {
-                return false;
+                return None;
             }
         }
         let units = header >> 1;
         if units == 0 {
-            return false;
+            return None;
         }
         if header & 1 == 1 {
             // `units` groups of eight bits; the bits past `n` are padding and may be anything.
-            let bytes = units;
-            let Some(packed) = usize::try_from(bytes)
+            let packed = usize::try_from(units)
                 .ok()
-                .and_then(|b| levels.get(at..at.checked_add(b)?))
-            else {
-                return false;
-            };
+                .and_then(|b| levels.get(at..at.checked_add(b)?))?;
             at += packed.len();
             let take = (units * 8).min(n - seen);
             for k in 0..take {
-                let byte = packed.get(usize::try_from(k / 8).unwrap_or(usize::MAX));
-                if byte.is_none_or(|b| b >> (k % 8) & 1 != 1) {
-                    return false;
-                }
+                let byte = packed.get(usize::try_from(k / 8).ok()?)?;
+                push(byte >> (k % 8) & 1 == 1, seen + k, 1)?;
             }
             seen += take;
         } else {
-            // One value, repeated: a single byte at width 1, and it must be "present".
-            if levels.get(at) != Some(&1) {
-                return false;
+            // One value, repeated: a single byte at width 1, "present" (1) or "null" (0).
+            let value = *levels.get(at)?;
+            if value > 1 {
+                return None;
             }
             at += 1;
-            seen = seen.saturating_add(units).min(n);
+            let take = units.min(n - seen);
+            push(value == 1, seen, take)?;
+            seen += take;
         }
     }
-    at == levels.len()
+    (at == levels.len()).then_some(runs)
 }
 
 /// Locates `column`'s vectors in the Parquet object at `key`.
@@ -644,7 +670,10 @@ pub async fn locate<S: BlobStore>(
             // has none, and anything else is not a plain run of vectors.
             let mut page_codec = codec;
             if let Some(v) = &h.v2 {
-                if v.nulls != 0 || v.repetition_len != 0 || (!optional && v.definition_len != 0) {
+                if (!optional && v.nulls != 0)
+                    || v.repetition_len != 0
+                    || (!optional && v.definition_len != 0)
+                {
                     return unsupported("a v2 data page carries levels or nulls");
                 }
                 if !v.is_compressed {
@@ -727,23 +756,34 @@ pub async fn locate<S: BlobStore>(
             if enc != ENC_PLAIN {
                 return unsupported("a data page is not PLAIN-encoded");
             }
-            let plain = values * u64::from(dims) * 4;
+            let width = u64::from(dims) * 4;
             let on_disk = u64::try_from(co).map_err(|_| bad("page size"))?;
             let body = at + hlen as u64;
-            // M84: the bytes of definition levels ahead of the values, once checked to say every
-            // value is present. A REQUIRED page has none.
-            let lead = if optional {
+            // M84, M88: an OPTIONAL page's definition levels, read once: the bytes they take and
+            // the runs of rows that hold a value. A REQUIRED page has none and one run.
+            let (lead, runs) = if optional {
                 // The levels are read, so the page must be inside its chunk first.
                 if values == 0 || body.checked_add(on_disk).is_none_or(|e| e > end) {
                     return Err(bad("a page runs past its chunk"));
                 }
-                if plain > MAX_PAGE_BYTES as u64 {
+                if values.saturating_mul(width) > MAX_PAGE_BYTES as u64 {
                     return unsupported("an optional page claims too many values");
                 }
                 present(store, key, body, on_disk, values, h.v2.as_ref(), page_codec).await?
             } else {
-                0
+                (0, vec![(0, values)])
             };
+            let held: u64 = runs.iter().map(|r| r.1).sum();
+            if let Some(v) = &h.v2
+                && optional
+                && u64::try_from(v.nulls).ok() != Some(values - held)
+            {
+                return Err(bad("a v2 page's null count disagrees with its levels"));
+            }
+            if held < values && snappy {
+                return unsupported("a compressed page holds nulls: its values cannot be ranked");
+            }
+            let plain = held * width;
             // A raw page is exactly its levels and values; a compressed page's values
             // decompress to exactly them. Either way a size that disagrees means another layout.
             let (co_values, un_values) = (co - lead as i64, un - lead as i64);
@@ -758,15 +798,23 @@ pub async fn locate<S: BlobStore>(
             if values == 0 || body.checked_add(on_disk).is_none_or(|e| e > end) {
                 return Err(bad("a page runs past its chunk"));
             }
-            extents.push(Extent {
-                first_row: first_row + got,
-                rows: values,
-                offset: body + lead,
-                compressed: if snappy { on_disk - lead } else { 0 },
-                codec: page_codec,
-                plain_len: 0,
-                dict: None,
-            });
+            // One extent a run of present rows; the rows between are nulls, with no vector.
+            let mut rank = 0u64;
+            for (run_start, run_len) in &runs {
+                extents.push(Extent {
+                    first_row: first_row + got + run_start,
+                    rows: *run_len,
+                    offset: body + lead + rank * width,
+                    compressed: if snappy { on_disk - lead } else { 0 },
+                    codec: page_codec,
+                    plain_len: 0,
+                    dict: None,
+                });
+                rank += run_len;
+            }
+            if !within_extent_cap(extents.len()) {
+                return unsupported("the column splits into too many runs");
+            }
             got += values;
             at = body + on_disk;
         }
@@ -775,7 +823,12 @@ pub async fn locate<S: BlobStore>(
         }
         first_row += want;
     }
-    Ok(Located { len, dims, extents })
+    Ok(Located {
+        len,
+        dims,
+        extents,
+        rows: first_row,
+    })
 }
 
 #[cfg(test)]
@@ -787,39 +840,140 @@ mod tests {
     use super::*;
 
     #[test]
-    fn levels_that_say_present_are_checked_exactly() {
-        // RLE: n x 1, the run header is `n << 1`.
-        assert!(all_present(&[10 << 1, 1], 10));
-        assert!(all_present(&[0x90, 0x03, 1], 200), "a two-byte header");
-        // A run longer than the values wanted still counts (the run is cut), but not one of 0s.
-        assert!(all_present(&[50 << 1, 1], 10));
-        assert!(!all_present(&[10 << 1, 0], 10), "a run of null");
-        assert!(!all_present(&[0, 1], 10), "a run of nothing");
-        // Two runs, the second null.
-        assert!(!all_present(&[4 << 1, 1, 6 << 1, 0], 10));
-        assert!(all_present(&[4 << 1, 1, 6 << 1, 1], 10));
-        // Bit-packed: one group of eight bits (header 1 << 1 | 1), 0xFF; bits past n are padding.
-        assert!(all_present(&[3, 0xFF], 8));
-        assert!(all_present(&[3, 0b0001_1111], 5), "padding is not read");
-        assert!(!all_present(&[3, 0b0001_0111], 5), "a null bit inside n");
-        assert!(!all_present(&[3, 0xFF], 9), "ran out of values");
-        // Mixed, then trailing bytes refused, truncation refused.
-        assert!(all_present(&[3, 0xFF, 2 << 1, 1], 10));
+    fn levels_give_the_runs_of_present_rows_exactly() {
+        // RLE: n x 1, the run header is `n << 1`; one run of everything.
+        assert_eq!(present_runs(&[10 << 1, 1], 10), Some(vec![(0, 10)]));
+        assert_eq!(
+            present_runs(&[0x90, 0x03, 1], 200),
+            Some(vec![(0, 200)]),
+            "a two-byte header"
+        );
+        // A run longer than the values wanted is cut; a run of nulls is no run.
+        assert_eq!(present_runs(&[50 << 1, 1], 10), Some(vec![(0, 10)]));
+        assert_eq!(present_runs(&[10 << 1, 0], 10), Some(vec![]));
+        assert_eq!(present_runs(&[0, 1], 10), None, "a run of nothing");
+        assert_eq!(
+            present_runs(&[10 << 1, 2], 10),
+            None,
+            "a level that is neither"
+        );
+        // A run longer than what is left of the page is cut at the page's end, wherever it begins.
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 50 << 1, 1], 10),
+            Some(vec![(0, 10)])
+        );
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 50 << 1, 0], 10),
+            Some(vec![(0, 4)])
+        );
+        assert_eq!(
+            present_runs(&[4 << 1, 0, 50 << 1, 1], 10),
+            Some(vec![(4, 6)])
+        );
+        // Nulls split runs; adjacent present runs join.
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 2 << 1, 0, 4 << 1, 1], 10),
+            Some(vec![(0, 4), (6, 4)])
+        );
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 6 << 1, 1], 10),
+            Some(vec![(0, 10)]),
+            "two present runs in a row are one"
+        );
+        assert_eq!(
+            present_runs(&[4 << 1, 0, 6 << 1, 1], 10),
+            Some(vec![(4, 6)]),
+            "a leading null run"
+        );
+        // Bit-packed: one group of eight bits (header 1 << 1 | 1), least significant bit first;
+        // bits past `n` are padding and are not read.
+        assert_eq!(present_runs(&[3, 0xFF], 8), Some(vec![(0, 8)]));
+        assert_eq!(
+            present_runs(&[3, 0b0001_1111], 5),
+            Some(vec![(0, 5)]),
+            "padding"
+        );
+        assert_eq!(
+            present_runs(&[3, 0b0001_0111], 5),
+            Some(vec![(0, 3), (4, 1)]),
+            "a null bit inside n"
+        );
+        assert_eq!(present_runs(&[3, 0xFF], 9), None, "ran out of values");
         // A packed run cut by `n` after earlier values: only the bits inside `n` are read.
-        assert!(all_present(&[4 << 1, 1, 3, 0b0000_0011], 6));
-        assert!(!all_present(&[4 << 1, 1, 3, 0b0000_0001], 6));
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 3, 0b0000_0011], 6),
+            Some(vec![(0, 6)])
+        );
+        assert_eq!(
+            present_runs(&[4 << 1, 1, 3, 0b0000_0001], 6),
+            Some(vec![(0, 5)])
+        );
         // A run header may take six bytes (padded) but not seven.
-        assert!(all_present(&[0x94, 0x80, 0x80, 0x80, 0x80, 0x00, 1], 10));
-        assert!(!all_present(
-            &[0x94, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 1],
-            10
-        ));
-        assert!(!all_present(&[10 << 1, 1, 9], 10), "bytes after the values");
-        assert!(!all_present(&[], 1));
-        assert!(!all_present(&[10 << 1], 10), "a run without its value");
-        assert!(!all_present(&[0x80], 1), "a header that never ends");
-        assert!(!all_present(&[0xFF; 8], 1), "a header too long");
-        assert!(!all_present(&[3], 8), "a packed run without its bytes");
+        assert_eq!(
+            present_runs(&[0x94, 0x80, 0x80, 0x80, 0x80, 0x00, 1], 10),
+            Some(vec![(0, 10)])
+        );
+        assert_eq!(
+            present_runs(&[0x94, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 1], 10),
+            None
+        );
+        // Mixed, then trailing bytes refused, truncation refused.
+        assert_eq!(present_runs(&[3, 0xFF, 2 << 1, 1], 10), Some(vec![(0, 10)]));
+        assert_eq!(
+            present_runs(&[10 << 1, 1, 9], 10),
+            None,
+            "bytes after the values"
+        );
+        assert_eq!(present_runs(&[], 1), None);
+        assert_eq!(
+            present_runs(&[10 << 1], 10),
+            None,
+            "a run without its value"
+        );
+        assert_eq!(present_runs(&[0x80], 1), None, "a header that never ends");
+        assert_eq!(present_runs(&[0xFF; 8], 1), None, "a header too long");
+        assert_eq!(
+            present_runs(&[3], 8),
+            None,
+            "a packed run without its bytes"
+        );
+    }
+
+    /// `n` alternating present / null rows as one bit-packed run.
+    fn alternating(n: u64) -> Vec<u8> {
+        let groups = n / 8;
+        let mut levels = vec![];
+        let mut header = groups << 1 | 1;
+        loop {
+            let b = (header & 0x7F) as u8;
+            header >>= 7;
+            if header == 0 {
+                levels.push(b);
+                break;
+            }
+            levels.push(b | 0x80);
+        }
+        levels.extend(std::iter::repeat_n(0b0101_0101u8, groups as usize));
+        levels
+    }
+
+    #[test]
+    fn the_extent_cap_is_exact() {
+        assert!(within_extent_cap(0));
+        assert!(within_extent_cap(MAX_EXTENTS));
+        assert!(!within_extent_cap(MAX_EXTENTS + 1));
+    }
+
+    #[test]
+    fn a_page_of_alternating_rows_is_refused_past_the_run_cap() {
+        // One run per present row: the cap itself is allowed, one more is not.
+        let at_cap = 2 * MAX_RUNS_PER_PAGE as u64;
+        assert_eq!(
+            present_runs(&alternating(at_cap), at_cap).map(|r| r.len()),
+            Some(MAX_RUNS_PER_PAGE)
+        );
+        let past = at_cap + 16;
+        assert_eq!(present_runs(&alternating(past), past), None);
     }
 
     #[test]

@@ -1323,7 +1323,6 @@ async fn optional_files_without_nulls_read_back_every_row() {
 #[tokio::test]
 async fn an_optional_column_that_cannot_be_read_in_place_is_refused_by_name() {
     for (file, why) in [
-        ("optional-nulls.parquet", "holds nulls"),
         (
             "optional-snappy.parquet",
             "levels are inside the compressed body",
@@ -1379,7 +1378,7 @@ async fn damaged_definition_levels_are_refused() {
         .to_string();
     assert!(err.contains("run past their page"), "{err}");
     for (what, damaged, why) in [
-        ("a null", with(&|b| b[rle_value] = 0), "holds nulls"),
+        ("a null", with(&|b| b[rle_value] = 0), "carries levels"),
         (
             "a longer level run than the page",
             with(&|b| b[len_at + 3] = 0xFF),
@@ -1411,4 +1410,122 @@ async fn an_optional_page_is_bounded_before_its_levels_are_read() {
     // 256 MiB (2^24 four-wide vectors) is not, and goes on to its levels.
     refused(&optional((1 << 24) + 1), "too many values").await;
     refused(&optional(1 << 24), "definition levels").await;
+}
+
+// ---- M88: columns that hold nulls ------------------------------------------------------------
+
+/// `optional-nulls.parquet`: 2,600 rows whose every row `i` with `i % 10 == 3` is null.
+fn is_null(i: usize) -> bool {
+    i % 10 == 3
+}
+
+#[tokio::test]
+async fn a_column_with_nulls_reads_back_every_present_row() {
+    let (store, key) = put("optional-nulls.parquet").await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert_eq!((col.dims, col.rows), (8, 2600));
+    let want = floats("multipage.vectors.f32");
+    for i in 0..2600 {
+        assert_eq!(col.is_present(i), !is_null(i), "row {i}");
+        assert_eq!(col.row_range(i).is_some(), !is_null(i), "range of row {i}");
+    }
+    assert!(!col.is_present(2600), "past the column");
+    let present: Vec<usize> = (0..2600).filter(|i| !is_null(*i)).collect();
+    let got = col.read_rows(&store, &present).await.unwrap();
+    assert_eq!(got.len(), present.len());
+    for (r, v) in &got {
+        assert_eq!(v.as_slice(), &want[r * 8..r * 8 + 8], "row {r}");
+    }
+    // A null row has a number and no vector: asking for it is an error, not zeros.
+    for null in [3usize, 13, 2593] {
+        assert!(matches!(
+            col.read_rows(&store, &[0, null]).await,
+            Err(ExternalError::Absent(r)) if r == null
+        ));
+    }
+    // Runs end where a null begins and the next starts after it.
+    let mut ends = col
+        .extents
+        .windows(2)
+        .filter(|w| w[0].first_row + w[0].rows != w[1].first_row);
+    assert!(ends.next().is_some(), "gaps exist");
+}
+
+#[tokio::test]
+async fn v2_pages_with_nulls_agree_with_their_headers() {
+    // Raw v2 pages with nulls read exactly like v1's; their header null counts match the levels.
+    let (store, key) = put("optional-nulls-v2.parquet").await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let want = floats("multipage.vectors.f32");
+    let present: Vec<usize> = (0..2600).filter(|i| !is_null(*i)).collect();
+    let got = col.read_rows(&store, &present).await.unwrap();
+    for (r, v) in &got {
+        assert_eq!(v.as_slice(), &want[r * 8..r * 8 + 8], "row {r}");
+    }
+    assert!((0..2600).all(|i| col.is_present(i) != is_null(i)));
+    // A compressed page with nulls cannot be ranked: refused by name.
+    let (store, key) = put("optional-nulls-v2-zstd.parquet").await;
+    let err = locate(&store, &key, "embedding").await.unwrap_err();
+    assert!(
+        err.to_string().contains("compressed page holds nulls"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn runs_with_gaps_are_checked() {
+    let ok = |first_row, rows, offset| Extent {
+        first_row,
+        rows,
+        offset,
+        compressed: 0,
+        codec: 0,
+        plain_len: 0,
+        dict: None,
+    };
+    let build = |rows: u64, extents: Vec<Extent>| {
+        ExternalColumn::from_runs("k", 2, 1_000, None, rows, extents)
+    };
+    // Gaps between and after runs are nulls.
+    let col = build(10, vec![ok(1, 2, 0), ok(5, 3, 100)]).unwrap();
+    assert_eq!(col.rows, 10);
+    let present: Vec<bool> = (0..11).map(|r| col.is_present(r)).collect();
+    assert_eq!(
+        present,
+        [
+            false, true, true, false, false, true, true, true, false, false, false
+        ]
+    );
+    assert_eq!(col.row_range(2), Some(8..16));
+    assert_eq!(col.row_range(3), None, "a gap has no range");
+    assert_eq!(col.row_range(7), Some(116..124));
+    // Out of order, overlapping, past the column, empty.
+    assert!(build(10, vec![ok(5, 2, 0), ok(1, 2, 100)]).is_err());
+    assert!(build(10, vec![ok(1, 4, 0), ok(4, 2, 100)]).is_err());
+    assert!(build(6, vec![ok(5, 2, 0)]).is_err());
+    assert!(build(10, vec![]).is_err());
+    // A column with no runs at all (a strided one) has rows 0..rows and nothing past.
+    let strided = ExternalColumn {
+        key: "k".to_owned(),
+        base: 0,
+        dims: 2,
+        stride: 8,
+        rows: 4,
+        len: 100,
+        tag: None,
+        extents: vec![],
+    };
+    assert!(strided.is_present(3) && !strided.is_present(4));
+    // `from_extents` still insists on contiguous runs from row 0.
+    assert!(ExternalColumn::from_extents("k", 2, 1_000, None, vec![ok(1, 2, 0)]).is_err());
+    assert!(
+        ExternalColumn::from_extents("k", 2, 1_000, None, vec![ok(0, 2, 0), ok(3, 2, 50)]).is_err()
+    );
+    assert!(
+        ExternalColumn::from_extents("k", 2, 1_000, None, vec![ok(0, 2, 0), ok(2, 2, 50)]).is_ok()
+    );
 }

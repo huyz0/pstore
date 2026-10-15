@@ -373,7 +373,12 @@ async fn locate_file<S: BlobStore>(
     if extents.is_empty() || first_row != rows {
         return Err(bad("the pages do not hold the fragment's rows"));
     }
-    Ok(Located { len, dims, extents })
+    Ok(Located {
+        len,
+        dims,
+        extents,
+        rows: first_row,
+    })
 }
 
 /// Accepts only `FixedSizeList(dims) -> Nullable(NoNull) -> Flat(32 bits)`, the encoding of a

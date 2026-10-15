@@ -28,6 +28,9 @@ pub enum ExternalError {
     /// A Parquet file or column that cannot be read in place.
     #[error("{0}")]
     Parquet(#[from] crate::parquet::ParquetError),
+    /// A row the source holds no vector for (M88: a null). It has a number and no vector.
+    #[error("row {0} holds no vector")]
+    Absent(usize),
     /// A Lance dataset or column that cannot be read in place (M82).
     #[error("{0}")]
     Lance(#[from] crate::lance::LanceError),
@@ -232,6 +235,23 @@ impl ExternalColumn {
         self.extents.get(i).filter(|e| e.compressed > 0).map(|_| i)
     }
 
+    /// Whether row `row` holds a vector: false past the column and, for a column read from a
+    /// source with nulls (M88), in a gap between runs.
+    #[must_use]
+    pub fn is_present(&self, row: usize) -> bool {
+        let Some(row) = u64::try_from(row).ok().filter(|r| *r < self.rows) else {
+            return false;
+        };
+        if self.extents.is_empty() {
+            return true;
+        }
+        self.extents
+            .partition_point(|e| e.first_row <= row)
+            .checked_sub(1)
+            .and_then(|i| self.extents.get(i))
+            .is_some_and(|e| row < e.first_row + e.rows)
+    }
+
     /// Where row `row`'s vector is, or `None` past the column or in a compressed page.
     #[must_use]
     pub fn row_range(&self, row: usize) -> Option<Range<u64>> {
@@ -242,7 +262,7 @@ impl ExternalColumn {
                 .partition_point(|e| e.first_row <= row)
                 .checked_sub(1)?;
             let e = self.extents.get(i)?;
-            if e.compressed > 0 {
+            if e.compressed > 0 || row >= e.first_row + e.rows {
                 return None;
             }
             let start = e
@@ -313,7 +333,14 @@ impl ExternalColumn {
         if store.head(key).await? != found.len {
             return Err(ExternalError::Changed);
         }
-        Self::from_extents(key.as_str(), found.dims, found.len, tag, found.extents)
+        Self::from_runs(
+            key.as_str(),
+            found.dims,
+            found.len,
+            tag,
+            found.rows,
+            found.extents,
+        )
     }
 
     /// Pins the float32 fixed-size-list column `column` of the Lance dataset whose manifest is at
@@ -332,7 +359,14 @@ impl ExternalColumn {
         if store.head(&key).await? != found.len {
             return Err(ExternalError::Changed);
         }
-        Self::from_extents(key.as_str(), found.dims, found.len, tag, found.extents)
+        Self::from_runs(
+            key.as_str(),
+            found.dims,
+            found.len,
+            tag,
+            found.rows,
+            found.extents,
+        )
     }
 
     /// A column of `extents`, checked: non-empty, no zero-row run, rows contiguous from 0,
@@ -345,6 +379,31 @@ impl ExternalColumn {
         dims: u32,
         len: u64,
         tag: Option<CasTag>,
+        extents: Vec<Extent>,
+    ) -> Result<Self, ExternalError> {
+        let mut next = 0u64;
+        for e in &extents {
+            if e.first_row != next {
+                return Err(ExternalError::Shape("runs are not contiguous from row 0"));
+            }
+            next = next.saturating_add(e.rows);
+        }
+        Self::from_runs(key, dims, len, tag, next, extents)
+    }
+
+    /// [`Self::from_extents`], where the runs may leave **gaps**: rows the source holds no vector
+    /// for (M88, nulls). The runs must be in order and not overlap, and the column is `rows` long
+    /// (a trailing gap counts).
+    ///
+    /// # Errors
+    /// [`ExternalError::Shape`] for zero dims, no runs, a zero-row run, runs out of order or
+    /// overlapping, a run past `rows` or past the object, or an overflow.
+    pub fn from_runs(
+        key: &str,
+        dims: u32,
+        len: u64,
+        tag: Option<CasTag>,
+        rows: u64,
         extents: Vec<Extent>,
     ) -> Result<Self, ExternalError> {
         if dims == 0 {
@@ -377,13 +436,19 @@ impl ExternalColumn {
                     return Err(ExternalError::Shape("a dictionary page has no body"));
                 }
             }
-            if e.first_row != next {
-                return Err(ExternalError::Shape("runs are not contiguous from row 0"));
+            if e.first_row < next {
+                return Err(ExternalError::Shape("runs overlap or are out of order"));
             }
             if end > len {
                 return Err(ExternalError::Shape("a run ends past the object"));
             }
-            next += e.rows;
+            next = e
+                .first_row
+                .checked_add(e.rows)
+                .ok_or(ExternalError::Shape("offsets overflow"))?;
+        }
+        if next > rows {
+            return Err(ExternalError::Shape("a run ends past the column"));
         }
         if extents.is_empty() {
             return Err(ExternalError::Shape("no runs"));
@@ -393,7 +458,7 @@ impl ExternalColumn {
             base: 0,
             dims,
             stride: width,
-            rows: next,
+            rows,
             len,
             tag,
             extents,
@@ -420,6 +485,9 @@ impl ExternalColumn {
         wanted.dedup();
         if wanted.is_empty() {
             return Ok(BTreeMap::new());
+        }
+        if let Some(r) = wanted.iter().find(|r| !self.is_present(**r)) {
+            return Err(ExternalError::Absent(*r));
         }
         let key = Key::new(self.key.clone());
         if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {

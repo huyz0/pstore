@@ -631,3 +631,70 @@ async fn an_index_over_a_lance_dataset_finds_the_exact_neighbours() {
     store.put(&data_key, other.into()).await.unwrap();
     assert!(index.search(&store, &all[0], 3, 50).await.is_err());
 }
+
+/// M88: a column with nulls (every row `i` with `i % 10 == 3`) keeps its row numbers, and no
+/// search ever returns a null row.
+#[tokio::test]
+async fn an_index_over_a_column_with_nulls_finds_the_exact_neighbours() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/nulls.parquet");
+    store
+        .put(
+            &key,
+            std::fs::read(format!("{dir}optional-nulls.parquet"))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    assert_eq!(col.rows, 2600);
+    let built = ExternalIndex::build(&store, &codes_key(), col, 700)
+        .await
+        .unwrap();
+    let index = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    assert_eq!(
+        built.to_bytes(),
+        index.to_bytes(),
+        "the gaps survive the blob"
+    );
+    let is_null = |i: usize| i % 10 == 3;
+    for qi in [0usize, 1_500, 2_599, 3, 2_593] {
+        // A query that is itself a null row's vector still never returns that row.
+        let q = &all[qi];
+        let mut exact: Vec<(usize, f64)> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !is_null(*i))
+            .map(|(i, v)| (i, cosine(q, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let got = index.search(&store, q, 10, 2_600).await.unwrap();
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        assert_eq!(
+            got.iter().map(|g| g.0).collect::<Vec<_>>(),
+            want,
+            "query {qi}"
+        );
+        assert!(got.iter().all(|g| !is_null(g.0)));
+    }
+    // And with a filter, which must not resurrect a null.
+    let got = index
+        .search_where(&store, &all[1], 10, 2_600, &|r| r % 2 == 1)
+        .await
+        .unwrap();
+    assert!(got.iter().all(|g| g.0 % 2 == 1 && !is_null(g.0)));
+    assert_eq!(got.len(), 10);
+}

@@ -16,7 +16,7 @@ Commands: `cargo test -p pstore-format --test parquet`: 26 tests; `cargo test -p
 3. `damaged_definition_levels_are_refused`: a level byte flipped to null, a length that runs one
    byte past the page, a huge one and a zero one are refused by name; levels running exactly to
    the page's end are not refused for running past it.
-4. `levels_that_say_present_are_checked_exactly`: the cases in the spec, including the six-byte
+4. `levels_give_the_runs_of_present_rows_exactly` (renamed by M88, which turned the all-present check into present runs): the cases in the spec, including the six-byte
    run header and a packed run cut by `n`.
 5. `locate_refuses_each_shape_it_cannot_read` and
    `an_optional_page_is_bounded_before_its_levels_are_read`: `REPEATED` is refused; an OPTIONAL
@@ -33,5 +33,5 @@ Commands: `cargo test -p pstore-format --test parquet`: 26 tests; `cargo test -p
    rewritten, and tests added for the rest. Final sweep: **110 mutants, 109 caught, 1 unviable,
    0 missed.** ⚠️ `cargo deny check advisories` still fails on `paste` (via `foyer`), as before.
 
-**Not covered:** nulls (a row with no vector); dictionary-encoded or compressed-v1 optional
+**Not covered:** nulls (a row with no vector; read by [M88](../M88/SPEC.md), which replaced this milestone's "holds nulls" refusal); dictionary-encoded or compressed-v1 optional
 columns; nested columns; maximum definition levels above 1.
