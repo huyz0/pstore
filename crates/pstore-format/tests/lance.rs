@@ -105,7 +105,6 @@ async fn a_lance_dataset_reads_back_every_row() {
 #[tokio::test]
 async fn a_column_that_cannot_be_read_in_place_is_refused_by_name() {
     refused("nullable", "null-free float32").await;
-    refused("v21", "format 2.1").await;
     // A column the dataset does not have, and one that is not a vector.
     let (store, manifest) = dataset("one").await;
     for (col, why) in [
@@ -503,7 +502,8 @@ async fn a_manifest_or_file_that_is_not_lance_is_refused() {
     .await;
     rejected(&with(&|s| s.footer_version = (0, 2)), "own version").await;
     rejected(&with(&|s| s.footer_version = (1, 3)), "own version").await;
-    rejected(&with(&|s| s.file_version = (2, 1)), "format 2.1").await;
+    // 2.1 is read (M90), but this builder writes a 2.0 footer under it.
+    rejected(&with(&|s| s.file_version = (2, 1)), "own version").await;
     rejected(&with(&|s| s.file_version = (0, 3)), "format 0.3").await;
     rejected(&with(&|s| s.file_version = (3, 0)), "format 3.0").await;
     rejected(

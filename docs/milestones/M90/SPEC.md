@@ -1,6 +1,6 @@
-# M90 — Lance 2.1 vector columns (PLANNED; step 1 done, finding below)
+# M90 — Lance 2.1 vector columns
 
-**Serves:** backlog row 73's last piece. **Status: planned.** No owner decision is needed.
+**Serves:** backlog row 73's last piece. **Status: built.** No owner decision was needed.
 
 ## What is known, and what is not
 
@@ -22,27 +22,52 @@ sit after further chunk boundaries (9,600 bytes of vectors plus 24 of framing). 
 buffer is presumably the chunk index. So a vector page is **chunked** (128 values a chunk, each
 chunk led by a header), and a row's byte range needs the chunk index decoded, not a stride.
 
-## Revised plan
+## Finding (step 2: 130 shapes, one writer)
 
-Step 2 stands only if the chunk header and index layouts can be pinned from more than one real
-file (this repo has one and the format's reference is not in it). Until then Lance 2.1 stays
-refused by name, which is the honest answer for a format read from a single sample.
+The first finding was read from one file and so was not enough. This milestone wrote 40-odd
+datasets with pylance 13 across rows 1 to 200,000 and dimensions 1 to 16,384, and read every
+vector's position back from the bytes. Two layouts hold a null-free `FixedSizeList<float32>`:
 
-## Plan
+- **`FullZip`** (rows of 256 bytes or more, dimensions 64 and up): one buffer, the rows back to
+  back with no framing. The layout's `bits_per_value` is `dims × 32`.
+- **`MiniBlock`** (smaller rows): two buffers. The first is a `u16` a chunk, `words << 4 |
+  log2(values)`, where `words` is the chunk's rows padded to 8 bytes, in 8-byte words, and the
+  log is 0 for a last chunk that is not full. The second is the chunks, each an **8-byte
+  header** (two `u16`s and padding) and its rows padded to 8 bytes. **Every chunk's offset is
+  arithmetic over the first buffer**, so one 2-byte-a-chunk read at build time pins them all; a
+  query reads nothing new. (The writer cuts chunks at about 4,096 bytes, rounded up to a power of
+  two of rows; that is a heuristic the reader does not rely on.)
+- Nulls change the layout (a `layers` of 3, two buffers, repetition and definition
+  compression): refused.
 
-1. Write a throwaway dumper over the `v21` fixture's page table to see the real protobuf (as M82
-   did for 2.0, which found three facts the documentation did not give).
-2. If the vector column is a plain contiguous run: read it as M82 does, with a `2.1` arm in the
-   version check and the new page-encoding check; any other layout (`MiniBlock`, compressed
-   `FullZip`, nullable) stays refused by name.
-3. If it is not (for example vectors are bit-packed or chunked), say so in this spec and stop:
-   an honest "Lance 2.1 vector columns cannot be read in place" is a result.
+## What is read, and refused
+
+Read: a page layout whose protobuf is exactly the shape above, `FixedSizeList(dims)` over a flat
+32-bit value with no buffer compression, a `layers` of `[1]`, and chunk sizes that account for the
+page's rows and its buffer to the byte. Refused, by name: anything else in a layout, a chunk that
+declares no size, a chunk of no rows, sizes that disagree with the page, a buffer past the file.
+`locate` accepts manifest version 2.1 with a 2.1 footer (2.1, where 2.0 is 0.3); each version's
+files must match their own footer.
+
+⚠️ **A behaviour change recorded here, not a weakened test:** `v21` was refused as "format 2.1"
+by `a_column_that_cannot_be_read_in_place_is_refused_by_name`, and the synthetic file-version
+case asserted the same. The first is now a reading test; the second asserts the footer check.
 
 ## Acceptance criteria
 
-1. The `v21` fixture's page table is dumped and recorded in this spec (the finding).
-2. If readable: `a_lance_2_1_dataset_reads_back_every_row` (the fixture, every row equal to the
-   generator's floats) and `a_2_1_page_of_another_layout_is_refused_by_name`.
-3. **Gates:** `./scripts/gates.sh`; the mutation sweep of the changed lines misses 0.
+1. `a_lance_2_1_dataset_reads_back_every_row`: real datasets of 1, 129, 256, 2,600 rows of 3 or 8
+   floats (`MiniBlock`, one chunk, a padded chunk, an exact fit, 21 chunks) and 300 rows of 100
+   (`FullZip`) read back every row exactly.
+2. `a_2_1_column_with_nulls_is_refused_by_name`.
+3. `a_damaged_chunk_index_is_refused_by_name`,
+   `a_page_whose_chunks_do_not_fill_its_buffer_is_refused`,
+   `a_layout_that_is_not_a_plain_null_free_run_is_refused_by_name` and
+   `a_full_zip_page_must_be_exactly_its_rows`: byte-patched copies of the real files, each
+   refused with its reason.
+4. **Gates:** `./scripts/gates.sh`; the mutation sweep of the changed lines misses 0.
 
-**Size:** M if readable, S if not.
+**Not covered:** nullable columns; compressed values; `list<float>`-style (variable) vectors;
+a page of more than 65,535 chunk-bytes of header fields (a writer's `has_large_chunk`); other
+writers than pylance 13.
+
+**Size:** M.

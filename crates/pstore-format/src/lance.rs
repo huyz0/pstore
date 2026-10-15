@@ -40,6 +40,8 @@ const MAX_MANIFEST: u64 = 8 << 20;
 /// The most column-metadata bytes read.
 const MAX_COLUMN_META: u64 = 8 << 20;
 const MAGIC: &[u8; 4] = b"LANC";
+mod v21;
+
 const ENCODING_URL: &[u8] = b"/lance.encodings.ArrayEncoding";
 
 /// One protobuf field's value. Fixed-width values are skipped, as nothing here reads one.
@@ -311,9 +313,9 @@ pub async fn locate<S: BlobStore>(
         let Some((path, col, major, minor, size)) = file else {
             return unsupported("a fragment has no data file holding the column");
         };
-        if (major, minor) != (2, 0) {
+        if (major, minor) != (2, 0) && (major, minor) != (2, 1) {
             return unsupported(format!(
-                "the data file is format {major}.{minor}, and only 2.0 is read in place"
+                "the data file is format {major}.{minor}, and only 2.0 and 2.1 are read in place"
             ));
         }
         let path = std::str::from_utf8(&path).map_err(|_| bad("data file path"))?;
@@ -328,6 +330,7 @@ pub async fn locate<S: BlobStore>(
             dims,
             rows,
             size,
+            minor == 1,
         )
         .await?;
         // The rows a deletion file removes stay in the numbering and leave the answer: gaps,
@@ -582,6 +585,7 @@ async fn locate_file<S: BlobStore>(
     dims: u32,
     rows: u64,
     declared_size: u64,
+    v21: bool,
 ) -> Result<Located, LanceError> {
     let bad = LanceError::Malformed;
     let len = store.head(key).await?;
@@ -608,8 +612,9 @@ async fn locate_file<S: BlobStore>(
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
         .map(u32::from_le_bytes)
         .ok_or(bad("footer"))?;
-    if (u16_at(32), u16_at(34)) != (Some(0), Some(3)) {
-        return unsupported("the data file's own version is not 0.3 (Lance 2.0)");
+    let footer = if v21 { (2, 1) } else { (0, 3) };
+    if (u16_at(32), u16_at(34)) != (Some(footer.0), Some(footer.1)) {
+        return unsupported("the data file's own version is not the one the manifest names");
     }
     if u32::try_from(col).map_or(true, |c| c >= n_cols) {
         return Err(bad("the column is past the file's columns"));
@@ -644,27 +649,40 @@ async fn locate_file<S: BlobStore>(
             packed(&page, 2).ok_or(bad("page sizes"))?,
         );
         let n = number(&page, 3);
-        encoding_is_plain_floats(&page, dims)?;
-        let ([offset], [bytes_len]) = (offsets.as_slice(), sizes.as_slice()) else {
-            return unsupported("a page has more than one buffer");
+        let pieces = if v21 {
+            if n == 0 {
+                return Err(bad("a page holds no rows"));
+            }
+            v21::pieces(store, key, &page, dims, n, len).await?
+        } else {
+            encoding_is_plain_floats(&page, dims)?;
+            let ([offset], [bytes_len]) = (offsets.as_slice(), sizes.as_slice()) else {
+                return unsupported("a page has more than one buffer");
+            };
+            if n == 0 || n.checked_mul(width) != Some(*bytes_len) {
+                return Err(bad("a page's size is not rows x dims x 4"));
+            }
+            if offset.checked_add(*bytes_len).is_none_or(|e| e > len) {
+                return Err(bad("a page runs past the file"));
+            }
+            vec![v21::Piece {
+                rows: n,
+                offset: *offset,
+            }]
         };
-        if n == 0 || n.checked_mul(width) != Some(*bytes_len) {
-            return Err(bad("a page's size is not rows x dims x 4"));
+        for piece in pieces {
+            extents.push(Extent {
+                first_row,
+                rows: piece.rows,
+                offset: piece.offset,
+                compressed: 0,
+                codec: 0,
+                plain_len: 0,
+                dict: None,
+                object: 0,
+            });
+            first_row += piece.rows;
         }
-        if offset.checked_add(*bytes_len).is_none_or(|e| e > len) {
-            return Err(bad("a page runs past the file"));
-        }
-        extents.push(Extent {
-            first_row,
-            rows: n,
-            offset: *offset,
-            compressed: 0,
-            codec: 0,
-            plain_len: 0,
-            dict: None,
-            object: 0,
-        });
-        first_row += n;
     }
     if extents.is_empty() || first_row != rows {
         return Err(bad("the pages do not hold the fragment's rows"));
