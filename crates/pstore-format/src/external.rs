@@ -408,6 +408,21 @@ impl ExternalColumn {
         )
     }
 
+    /// [`Self::pin_lance`] at the version `dataset`'s `_versions/latest_version_hint.json` names
+    /// (M89): `dataset` is the key prefix holding `_versions/` and `data/`. See
+    /// [`crate::lance::latest_manifest`] for what a hint does and does not promise.
+    ///
+    /// # Errors
+    /// As [`Self::pin_lance`], and for a hint that is missing or names no manifest.
+    pub async fn pin_lance_latest<S: BlobStore>(
+        store: &S,
+        dataset: &str,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let manifest = crate::lance::latest_manifest(store, dataset).await?;
+        Self::pin_lance(store, &manifest, column).await
+    }
+
     /// A column of `extents`, checked: non-empty, no zero-row run, rows contiguous from 0,
     /// every run inside the object.
     ///

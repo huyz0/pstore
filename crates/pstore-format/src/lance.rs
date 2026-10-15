@@ -127,6 +127,61 @@ fn number(fs: &[(u64, Wire<'_>)], field: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// The manifest of the version a dataset's `_versions/latest_version_hint.json` names (M89).
+///
+/// ⚠️ **A hint, not the truth**: Lance itself treats the file as an optimisation and lists
+/// `_versions/` to be sure, and a LIST is forbidden on a read path here. So this is the newest
+/// version *the hint names*, which a writer that has not refreshed it can leave one behind; a
+/// version older than that is still a consistent snapshot. A hint naming a manifest that is gone
+/// (garbage-collected) is an error, never a fallback.
+///
+/// # Errors
+/// [`LanceError::Malformed`] for a hint that is not `{"version": N}` or names no manifest; a
+/// store failure (including a missing hint).
+pub async fn latest_manifest<S: BlobStore>(store: &S, dataset: &str) -> Result<Key, LanceError> {
+    let bad = LanceError::Malformed;
+    let dir = dataset.trim_end_matches('/');
+    let hint = Key::new(if dir.is_empty() {
+        "_versions/latest_version_hint.json".to_owned()
+    } else {
+        format!("{dir}/_versions/latest_version_hint.json")
+    });
+    let len = store.head(&hint).await?;
+    if len == 0 || len > MAX_HINT {
+        return Err(bad("the version hint is empty or too large"));
+    }
+    let raw = store.get_range(&hint, 0..len).await?;
+    let text = std::str::from_utf8(&raw).map_err(|_| bad("the version hint is not text"))?;
+    let version = parse_version(text).ok_or(bad("the version hint is not {\"version\": N}"))?;
+    // V2 naming counts down from the largest u64 so a listing sorts newest first.
+    let name = u64::MAX - version;
+    let manifest = Key::new(if dir.is_empty() {
+        format!("_versions/{name}.manifest")
+    } else {
+        format!("{dir}/_versions/{name}.manifest")
+    });
+    store.head(&manifest).await?;
+    Ok(manifest)
+}
+
+/// The most hint bytes read.
+const MAX_HINT: u64 = 1024;
+
+/// `N` of exactly `{"version": N}` (whitespace allowed), where `N` is a positive integer.
+fn parse_version(text: &str) -> Option<u64> {
+    let inner = text.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    let rest = inner
+        .strip_prefix("\"version\"")?
+        .trim_start()
+        .strip_prefix(':')?;
+    let digits = rest.trim();
+    // `parse` accepts a leading `+`; only digits are a version here. (An empty run fails to parse.)
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().filter(|v| *v > 0)
+}
+
 /// The data file a dataset's column lives in, and its pages.
 ///
 /// `manifest` is the key of a `_versions/<n>.manifest` object; the data file is resolved as

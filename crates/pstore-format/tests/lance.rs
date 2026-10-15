@@ -771,3 +771,93 @@ async fn a_deletion_count_that_disagrees_or_a_file_too_large_is_refused() {
         "{err}"
     );
 }
+
+// ---- M89: the version a dataset's hint names -------------------------------------------------
+
+#[tokio::test]
+async fn the_hint_names_the_newest_version() {
+    // `deleted` has two versions (the second deletes ten rows); `many` has one.
+    let (store, newest) = dataset("deleted").await;
+    let got = pstore_format::lance::latest_manifest(&store, "lake/deleted")
+        .await
+        .unwrap();
+    assert_eq!(got, newest);
+    assert!(got.as_str().ends_with("18446744073709551613.manifest"));
+    let col = ExternalColumn::pin_lance_latest(&store, "lake/deleted", "emb")
+        .await
+        .unwrap();
+    assert!(!col.is_present(0), "the newest version has the deletions");
+    let (store, one) = dataset("many").await;
+    assert_eq!(
+        pstore_format::lance::latest_manifest(&store, "lake/many/")
+            .await
+            .unwrap(),
+        one,
+        "a trailing slash is fine"
+    );
+}
+
+#[tokio::test]
+async fn a_hint_that_lies_is_refused_never_guessed_around() {
+    let (store, _) = dataset("deleted").await;
+    let hint = Key::new("lake/deleted/_versions/latest_version_hint.json");
+    for (what, body, why) in [
+        ("not json", "version 2", "not {"),
+        ("no version", "{}", "not {"),
+        ("zero", "{\"version\":0}", "not {"),
+        ("negative", "{\"version\":-1}", "not {"),
+        ("a float", "{\"version\":2.0}", "not {"),
+        ("a string", "{\"version\":\"2\"}", "not {"),
+        ("extra keys", "{\"version\":2,\"x\":1}", "not {"),
+        ("a plus sign", "{\"version\":+2}", "not {"),
+        ("no number", "{\"version\":}", "not {"),
+        ("empty", "", "empty"),
+        ("not utf-8", "\u{0}", "not {"),
+    ] {
+        store
+            .put(&hint, body.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+        let err = pstore_format::lance::latest_manifest(&store, "lake/deleted")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(why), "{what}: {err}");
+    }
+    // Whitespace is fine; a version that has no manifest is an error from the store.
+    store
+        .put(&hint, b" { \"version\" : 2 } \n".to_vec().into())
+        .await
+        .unwrap();
+    pstore_format::lance::latest_manifest(&store, "lake/deleted")
+        .await
+        .unwrap();
+    store
+        .put(&hint, b"{\"version\":99}".to_vec().into())
+        .await
+        .unwrap();
+    assert!(
+        pstore_format::lance::latest_manifest(&store, "lake/deleted")
+            .await
+            .is_err()
+    );
+    // Exactly 1 KiB is read (it is the same hint, padded); one byte more is refused unread.
+    let mut padded = b"{\"version\":2}".to_vec();
+    padded.resize(1024, b' ');
+    store.put(&hint, padded.into()).await.unwrap();
+    pstore_format::lance::latest_manifest(&store, "lake/deleted")
+        .await
+        .unwrap();
+    // A hint over 1 KiB is refused unread; no hint at all is an error.
+    store.put(&hint, vec![b' '; 1025].into()).await.unwrap();
+    let err = pstore_format::lance::latest_manifest(&store, "lake/deleted")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too large"), "{err}");
+    assert!(
+        pstore_format::lance::latest_manifest(&store, "lake/nope")
+            .await
+            .is_err()
+    );
+}
