@@ -278,7 +278,7 @@ impl<S: BlobStore + 'static> Api<S> {
     }
 
     /// Where `source` is read from, for `tenant`, billed to `tenant`.
-    fn source_store(&self, tenant: TenantId, store: &str) -> Option<Arc<dyn BlobStore>> {
+    pub(crate) fn source_store(&self, tenant: TenantId, store: &str) -> Option<Arc<dyn BlobStore>> {
         if store.is_empty() {
             return Some(Arc::new(self.store.as_tenant(tenant)));
         }

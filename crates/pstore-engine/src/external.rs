@@ -6,7 +6,7 @@
 //! the rows it ranks. **Off by default**: nothing is read from a customer's bucket unless the
 //! deployment calls [`Engine::with_external_sources`] with the prefixes it allows.
 
-use crate::head::{self, ExternalKind, ExternalRef};
+use crate::head::{self, ExternalKind, ExternalRef, ReplicaSource};
 use crate::{Engine, EngineError, MAX_COMMIT_ATTEMPTS, backoff, nonce_for, valid_name};
 use pstore_blob::{BlobError, BlobStore, Key};
 use pstore_format::external::{ExternalColumn, ExternalError};
@@ -127,7 +127,7 @@ impl<S: BlobStore> Engine<S> {
                 "{index:?} is not a valid index name"
             )));
         }
-        let mut at = head::read(&*self.store, self.tenant).await?;
+        let at = head::read(&*self.store, self.tenant).await?;
         name_free(&at.head, index)?;
         let src = Key::new(source);
         let col = match kind {
@@ -152,6 +152,19 @@ impl<S: BlobStore> Engine<S> {
             rows,
             source_len,
         };
+        self.commit_external(at, index, entry, &codes).await
+    }
+
+    /// Commits `entry` as external index `index` on top of `at`, retrying a lost or contended
+    /// commit and burying `codes` -- already written, and named by nothing -- if it gives up
+    /// (M86; M92 shares it).
+    async fn commit_external(
+        &self,
+        mut at: head::HeadAt,
+        index: &str,
+        entry: ExternalRef,
+        codes: &Key,
+    ) -> Result<Epoch, EngineError> {
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
@@ -183,6 +196,57 @@ impl<S: BlobStore> Engine<S> {
         }
         self.bury_abandoned(&[codes.as_str().to_owned()]).await;
         Err(EngineError::Lost)
+    }
+
+    /// Copies the external index `source` names, read from `from`, to the new name `dest` of
+    /// this tenant (M92): its codes blob is moved to a key of this tenant's own and HEAD names
+    /// it. Nothing is rebuilt, and the customer's object is neither read nor written.
+    ///
+    /// ⚠️ The registration's `source` must be under **this** engine's allowed prefixes: a
+    /// deployment that has not allowed the customer's bucket does not read it because another
+    /// did. And a copy from another store reads the customer's object of the same key in *its
+    /// own* store, so what it finds there is the codes' pin to answer (`Source` for none,
+    /// `Changed` for another), never a stale answer.
+    ///
+    /// # Errors
+    /// [`ExternalRefusal::Off`] / [`ExternalRefusal::Prefix`] before the codes are read;
+    /// [`ExternalRefusal::NotFound`] for a source with no such external index;
+    /// [`ExternalRefusal::Exists`]; [`ExternalRefusal::Source`] for a codes blob that is not one;
+    /// a store failure.
+    pub async fn copy_external<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+    ) -> Result<Epoch, EngineError> {
+        self.external_enabled()?;
+        for n in [dest, source.index.as_str()] {
+            if !valid_name(n) {
+                return Err(EngineError::Refused(format!(
+                    "{n:?} is not a valid index name"
+                )));
+            }
+        }
+        let there = head::read(from, source.tenant).await?;
+        let entry = there
+            .head
+            .externals
+            .get(&source.index)
+            .ok_or_else(|| ExternalRefusal::NotFound(source.index.clone()))?
+            .clone();
+        self.external_allowed(&entry.source)?;
+        let at = head::read(&*self.store, self.tenant).await?;
+        name_free(&at.head, dest)?;
+        let raw = from.get(&Key::new(entry.codes.clone())).await?;
+        // Whatever is moved is a codes blob: a damaged one is refused here, not at a query.
+        ExternalIndex::from_bytes(&raw).map_err(|e| from_index(&e))?;
+        let codes = self.codes_key(at.head.epoch.next(), dest);
+        self.store.put(&codes, raw).await?;
+        let entry = ExternalRef {
+            codes: codes.as_str().to_owned(),
+            ..entry
+        };
+        self.commit_external(at, dest, entry, &codes).await
     }
 
     /// The `k` rows of external index `index` nearest `query`, as `(row, exact cosine)` (M86):

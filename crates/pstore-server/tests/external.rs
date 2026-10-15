@@ -41,11 +41,21 @@ async fn api(prefixes: Option<&[&str]>) -> (A, Accounted<MemoryStore>) {
 }
 
 async fn send(api: &A, method: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
+    send_as(api, "86", method, uri, body).await
+}
+
+async fn send_as(
+    api: &A,
+    tenant: &str,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
-        .header("x-pstore-tenant", "86")
+        .header("x-pstore-tenant", tenant)
         .body(Body::from(body.to_string()))
         .unwrap();
     let res = Arc::clone(api).router().oneshot(req).await.unwrap();
@@ -209,6 +219,115 @@ async fn each_refusal_has_its_status_and_code() {
     assert_eq!(
         (s, code(&b)),
         (StatusCode::CONFLICT, "external_source_changed"),
+        "{b}"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_answers_as_its_source_does_and_outlives_it() {
+    let (api, _) = api(Some(&["lake/"])).await;
+    assert_eq!(
+        send(&api, "PUT", "/v1/indexes/x/external", &register())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let q = json!({"vector": row0(), "k": 5});
+    let (_, want) = send(&api, "POST", "/v1/indexes/x/external/query", &q).await;
+
+    // In the caller's tenant, then from another tenant's index (the same bucket).
+    let (s, b) = send(
+        &api,
+        "PUT",
+        "/v1/indexes/y/external/copy",
+        &json!({"index": "x"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["epoch"].as_u64().unwrap() > 0);
+    let (s, got) = send(&api, "POST", "/v1/indexes/y/external/query", &q).await;
+    assert_eq!(s, StatusCode::OK, "{got}");
+    assert_eq!(got["hits"], want["hits"]);
+    let (s, b) = send_as(
+        &api,
+        "87",
+        "PUT",
+        "/v1/indexes/z/external/copy",
+        &json!({"index": "x", "tenant": "86", "store": ""}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, got) = send_as(&api, "87", "POST", "/v1/indexes/z/external/query", &q).await;
+    assert_eq!(got["hits"], want["hits"]);
+
+    // The source dropped, the copy answers.
+    assert_eq!(
+        send(&api, "DELETE", "/v1/indexes/x/external", &json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (s, got) = send(&api, "POST", "/v1/indexes/y/external/query", &q).await;
+    assert_eq!(s, StatusCode::OK, "{got}");
+    assert_eq!(got["hits"], want["hits"]);
+}
+
+#[tokio::test]
+async fn each_copy_refusal_has_its_status_and_code() {
+    let (api, _) = api(Some(&["lake/"])).await;
+    let copy = |body: Value| {
+        let api = Arc::clone(&api);
+        async move { send(&api, "PUT", "/v1/indexes/y/external/copy", &body).await }
+    };
+    let (s, b) = copy(json!({"index": "x"})).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, "external_index_not_found"),
+        "{b}"
+    );
+    assert_eq!(
+        send(&api, "PUT", "/v1/indexes/x/external", &register())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (s, b) = copy(json!({"index": "x", "store": "eu"})).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_REQUEST, "bad_request"),
+        "{b}"
+    );
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("PSTORE_SOURCES"),
+        "{b}"
+    );
+    for body in [
+        json!({"index": "x", "tenant": "abc"}),
+        json!({"tenant": "86"}),
+        json!({"index": "x", "colour": "red"}),
+    ] {
+        let (s, b) = copy(body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    }
+    assert_eq!(copy(json!({"index": "x"})).await.0, StatusCode::OK);
+    let (s, b) = copy(json!({"index": "x"})).await;
+    assert_eq!((s, code(&b)), (StatusCode::CONFLICT, "index_exists"), "{b}");
+
+    // A deployment that has not allowed external sources copies nothing.
+    let (off, _) = self::api(None).await;
+    let (s, b) = send(
+        &off,
+        "PUT",
+        "/v1/indexes/y/external/copy",
+        &json!({"index": "x"}),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, "external_sources_off"),
         "{b}"
     );
 }

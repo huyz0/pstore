@@ -40,7 +40,8 @@ Change the default only on the owner's word.
   is what a tenant's query costs the customer's bucket.
 - **⚠️ Replication does not carry the registration** (the delta above says it copies it; it
   does not). A replica store has neither the customer's object nor the codes blob, and copying
-  the codes needs a design this milestone did not make. Recorded as backlog row 79.
+  the codes needs a design this milestone did not make. Recorded as backlog row 79, built as a
+  one-shot copy by [M92](../M92/SPEC.md).
 
 ## Acceptance criteria
 

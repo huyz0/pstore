@@ -334,8 +334,14 @@ the codes are reaped by GC after its window, and the customer's file is never to
   carry the file's length and CAS tag from when it was pinned.
 - A name is one namespace with indexes: registering one that an index or replication holds is
   `409 index_exists`.
-- ⚠️ **Replication does not carry it.** A replica copies segments; an external registration names
-  a customer's object and codes in this bucket, neither of which a replica's store has.
+- **Replication does not carry it, but a copy does** ([M92](milestones/M92/SPEC.md)):
+  `PUT /v1/indexes/{dest}/external/copy` with `{"index": "x", "tenant": "71", "store": "eu"}`
+  (the source named as a replication's is) moves the codes under a key of the caller's own and
+  commits them. Nothing is rebuilt and the customer's object is not read. A registration never
+  changes once made, so a copy is a snapshot; follow a re-registration with a new copy.
+  ⚠️ The copying deployment must itself allow the registration's `source` prefix, and a copy from
+  another store reads the customer's object of the same key **in its own store**: none there is a
+  query refusal, a different one is `external_source_changed`, never a stale answer.
 - ⚠️ **No auth**: the tenant is whatever the header says, so any tenant may point at any source
   under an allowed prefix (see `auth` below). Allow only prefixes whose every tenant may read
   them.

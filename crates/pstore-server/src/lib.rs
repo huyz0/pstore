@@ -574,6 +574,11 @@ impl<S: BlobStore + 'static> Api<S> {
                 "/v1/indexes/{index}/external/query",
                 post(external::query::<S>),
             )
+            // M92: a copy of another external index, codes moved and nothing rebuilt.
+            .route(
+                "/v1/indexes/{index}/external/copy",
+                put(external::copy::<S>),
+            )
             .route(
                 "/v1/indexes/{index}/quarantine",
                 get(export_quarantine::<S>).delete(discard_quarantine::<S>),

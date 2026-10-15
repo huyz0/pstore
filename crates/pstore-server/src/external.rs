@@ -11,7 +11,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use pstore_blob::BlobStore;
-use pstore_engine::ExternalKind;
+use pstore_engine::{ExternalKind, ReplicaSource};
+use pstore_types::TenantId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -46,6 +47,16 @@ struct QueryBody {
     vector: Vec<f32>,
     k: Option<usize>,
     window: Option<usize>,
+}
+
+/// `PUT /v1/indexes/{dest}/external/copy` (M92): the external index to copy, named as a
+/// replication names its source.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyBody {
+    index: String,
+    tenant: Option<String>,
+    store: Option<String>,
 }
 
 /// A registration's or a drop's answer: the epoch that committed, and what it cost.
@@ -133,6 +144,41 @@ pub(crate) async fn query<S: BlobStore + 'static>(
         meta: WarmMeta {
             cost: api.spend(tenant).since(before),
         },
+    }))
+}
+
+pub(crate) async fn copy<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<axum::Json<Committed>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let req: CopyBody = body(&raw)?;
+    let source_tenant = match req.tenant {
+        None => tenant,
+        Some(t) => TenantId(
+            t.parse::<u128>()
+                .map_err(|_| ApiError::bad_request(format!("tenant {t:?} is not a tenant id")))?,
+        ),
+    };
+    let store = req.store.unwrap_or_default();
+    let Some(from) = api.source_store(tenant, &store) else {
+        return Err(ApiError::bad_request(format!(
+            "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"
+        )));
+    };
+    let source = ReplicaSource {
+        store,
+        tenant: source_tenant,
+        index: req.index,
+    };
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let epoch = engine.copy_external(&dest, source, &*from).await?;
+    Ok(axum::Json(Committed {
+        epoch: epoch.0,
+        cost: api.spend(tenant).since(before),
     }))
 }
 

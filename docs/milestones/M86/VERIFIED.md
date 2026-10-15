@@ -53,5 +53,5 @@ Commands: `cargo test -p pstore-engine --test external_index` (5 tests), `--test
 
 **Not covered:** a real bucket; the cost of a registration build (it reads the whole column once
 and writes the codes) against a customer's request budget; per-tenant allowlists; replication of
-a registration (backlog row 79); an engine built before `allow_external_sources` keeps what it was
+a registration (backlog row 79, [M92](../M92/VERIFIED.md)); an engine built before `allow_external_sources` keeps what it was
 built with.
