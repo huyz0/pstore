@@ -2,13 +2,16 @@
 //! bundles, and the memtable that makes a write visible before it is folded.
 
 mod bundle;
+mod external;
 mod head;
 pub mod lanes;
 mod replica;
 
 pub use bundle::Entry;
+pub use external::ExternalRefusal;
 pub use head::{
-    Dicts, Head, HeadAt, IndexSchema, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
+    Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, Metric, ReplicaSource,
+    Replication, SegmentRef, TimeTravel,
 };
 pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
 
@@ -293,6 +296,9 @@ pub enum EngineError {
     /// its status.
     #[error("{0}")]
     Replica(ReplicaRefusal),
+    /// An external index request was refused (M86), by name.
+    #[error("{0}")]
+    External(ExternalRefusal),
     /// The blob store could not serve it.
     #[error("blob error: {0}")]
     Blob(String),
@@ -1623,6 +1629,8 @@ pub struct Engine<S> {
     /// write no postings. The merged segment would carry every row and no text index, with
     /// nothing reporting an error. `compact` takes the name from its inputs instead.
     text_field: String,
+    /// The prefixes of customers' objects this engine may read (M86). `None` is off, the default.
+    external_prefixes: Option<Vec<String>>,
 }
 
 /// A bundle write whose outcome is unknown (M17): its sequence, and every attempt at it --
@@ -1745,6 +1753,7 @@ impl<S: BlobStore> Engine<S> {
                 ..pstore_index::cluster::Params::default()
             },
             text_field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
+            external_prefixes: None,
         }
     }
 

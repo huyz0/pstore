@@ -246,6 +246,9 @@ pub struct Head {
     /// object's key and its row count. Live to every burial and to GC until an operator
     /// discards it or its index is dropped. ⚠️ A trailing section after `replications`.
     pub quarantine: BTreeMap<String, Vec<(String, u32)>>,
+    /// Each external index (M86), by name. ⚠️ The last trailing section, after the segment
+    /// lengths: absent means none.
+    pub externals: BTreeMap<String, ExternalRef>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -284,6 +287,33 @@ pub struct Replication {
     pub applied: Option<(u64, u64)>,
     /// Rows written to the replica that a fold dropped (they slipped past a stale door).
     pub rejected: u64,
+}
+
+/// What an external index's source object is (M86).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalKind {
+    /// A Parquet file's `list<float>`/`FixedSizeList<float>` column.
+    Parquet,
+    /// A Lance dataset's vector column; `source` is the dataset's directory.
+    Lance,
+}
+
+/// One external index (M86): a customer's column, and the codes pstore built over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalRef {
+    /// How to read `source`.
+    pub kind: ExternalKind,
+    /// The customer's object (Parquet) or dataset directory (Lance).
+    pub source: String,
+    /// The column in it.
+    pub column: String,
+    /// The codes blob pstore wrote: pstore's own key, derived, not discovered.
+    pub codes: String,
+    /// Rows the column held when pinned.
+    pub rows: u64,
+    /// The source's length when pinned. (Its CAS tag is in the codes blob, which is where a
+    /// search compares it.)
+    pub source_len: u64,
 }
 
 /// FNV-1a 64: stable across builds and machines, which `std`'s hasher is not (M22).
@@ -482,7 +512,9 @@ impl Head {
         // one is -- otherwise the later count would be read as the earlier one's.
         // M32: the dictionaries are the last section, written whenever any ref's are known.
         // M45: the lengths follow the dictionaries, and force them, by the same rule.
-        let lens = self.indexes.values().flatten().any(|r| r.len.is_some());
+        // M86: the externals are last, and force the lengths (and so the dictionaries).
+        let ext = !self.externals.is_empty();
+        let lens = ext || self.indexes.values().flatten().any(|r| r.len.is_some());
         let dicts = lens || self.indexes.values().flatten().any(|r| r.dicts.is_some());
         let more = !self.replications.is_empty() || !self.quarantine.is_empty() || dicts;
         if !fts.is_empty() || !trigram.is_empty() || !self.branched.is_empty() || more {
@@ -558,6 +590,21 @@ impl Head {
                 for r in refs {
                     put_varint(&mut out, r.len.unwrap_or(0));
                 }
+            }
+        }
+        if ext {
+            out.extend_from_slice(&(self.externals.len() as u32).to_le_bytes());
+            for (name, e) in &self.externals {
+                put_str(&mut out, name);
+                out.push(match e.kind {
+                    ExternalKind::Parquet => 0,
+                    ExternalKind::Lance => 1,
+                });
+                put_str(&mut out, &e.source);
+                put_str(&mut out, &e.column);
+                put_str(&mut out, &e.codes);
+                out.extend_from_slice(&e.rows.to_le_bytes());
+                out.extend_from_slice(&e.source_len.to_le_bytes());
             }
         }
         out
@@ -821,6 +868,27 @@ impl Head {
             for r in refs.iter_mut() {
                 r.len = Some(c.varint()?).filter(|l| *l != 0);
             }
+        }
+        // ⚠️ M86: end of buffer here is "no external indexes".
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let kind = match c.u8()? {
+                0 => ExternalKind::Parquet,
+                1 => ExternalKind::Lance,
+                _ => return Err(EngineError::CorruptHead),
+            };
+            let e = ExternalRef {
+                kind,
+                source: c.string()?,
+                column: c.string()?,
+                codes: c.string()?,
+                rows: c.u64()?,
+                source_len: c.u64()?,
+            };
+            h.externals.insert(name, e);
         }
         Ok(h)
     }
@@ -1423,6 +1491,83 @@ mod tests {
         let back = Head::decode(&both.encode())?;
         assert_eq!(back.quarantine, h.quarantine);
         assert_eq!(back.replications, both.replications);
+        Ok(())
+    }
+
+    fn external(kind: ExternalKind, n: u64) -> ExternalRef {
+        ExternalRef {
+            kind,
+            source: format!("lake/ds{n}.parquet"),
+            column: format!("emb{n}"),
+            codes: format!("0046/tnt/70/ext/a/{n}.codes"),
+            rows: 1000 + n,
+            source_len: 123_456 + n,
+        }
+    }
+
+    #[test]
+    fn head_with_externals_round_trips_and_an_old_head_decodes() -> Result<(), EngineError> {
+        // M86: an old HEAD has none, and decodes as none.
+        let old = Head::decode(&sample().encode())?;
+        assert!(old.externals.is_empty());
+        // Externals alone: every earlier optional count is written as 0 before them.
+        let mut h = Head {
+            epoch: pstore_types::Epoch(9),
+            ..Head::default()
+        };
+        h.externals
+            .insert("a".to_owned(), external(ExternalKind::Parquet, 1));
+        h.externals
+            .insert("b".to_owned(), external(ExternalKind::Lance, 2));
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back.externals, h.externals);
+        assert!(back.replications.is_empty() && back.quarantine.is_empty());
+        // Beside everything else, segment lengths and dictionaries included.
+        let mut all = sample();
+        all.externals = h.externals.clone();
+        let back = Head::decode(&all.encode())?;
+        assert_eq!(back.externals, h.externals);
+        assert_eq!(back.replications, all.replications);
+        assert_eq!(back.indexes, all.indexes);
+        // An empty set changes no byte of what was written before.
+        assert_eq!(
+            hex(&Head {
+                externals: BTreeMap::new(),
+                ..sample()
+            }
+            .encode()),
+            hex(&sample().encode())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_damaged_externals_section_is_a_corrupt_head() -> Result<(), EngineError> {
+        let mut h = Head::default();
+        h.externals
+            .insert("a".to_owned(), external(ExternalKind::Lance, 1));
+        let full = h.encode();
+        // Cut anywhere inside the section: never a valid HEAD with the registration missing.
+        let start = Head::default().encode().len();
+        for cut in start + 1..full.len() {
+            let r = Head::decode(full.get(..cut).ok_or(EngineError::CorruptHead)?);
+            assert!(
+                r.map_or(true, |h| h.externals.is_empty()),
+                "cut at {cut} of {}",
+                full.len()
+            );
+        }
+        // A kind that is neither Parquet nor Lance.
+        let mut bad = full.clone();
+        let src = b"lake/ds1.parquet";
+        let at = bad
+            .windows(src.len())
+            .position(|w| w == src)
+            .ok_or(EngineError::CorruptHead)?;
+        // The byte before the source's 4-byte length is the kind.
+        assert_eq!(bad.get(at - 4).copied(), Some(src.len() as u8));
+        *bad.get_mut(at - 5).ok_or(EngineError::CorruptHead)? = 9;
+        assert!(matches!(Head::decode(&bad), Err(EngineError::CorruptHead)));
         Ok(())
     }
 

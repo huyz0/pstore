@@ -171,6 +171,9 @@ async fn run<S: BlobStore + 'static>(
     }
     api.configure_replication(config.replication.unwrap_or_default(), sources);
     api.recheck_lanes_within(config.lane_recheck);
+    if let Some(prefixes) = config.external_sources.clone() {
+        api.allow_external_sources(prefixes);
+    }
     let listener = match tokio::net::TcpListener::bind(&config.bind).await {
         Ok(l) => l,
         Err(e) => {

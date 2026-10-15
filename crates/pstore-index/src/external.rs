@@ -334,7 +334,7 @@ impl ExternalIndex {
         query: &[f32],
         k: usize,
         window: usize,
-        allow: &dyn Fn(usize) -> bool,
+        allow: &(dyn Fn(usize) -> bool + Sync),
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
         if query.len() != self.column.dims as usize {
             return Err(ExternalIndexError::Vector("wrong width"));

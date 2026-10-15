@@ -31,6 +31,7 @@ use types::Schema as SchemaOut;
 
 mod boost;
 mod diversify;
+mod external;
 mod facets;
 mod highlight;
 mod peers;
@@ -144,6 +145,9 @@ pub struct Api<S> {
     /// Index parameters every engine is built with, when set (M54's tests cluster small
     /// segments with them).
     index_params: Mutex<Option<pstore_index::cluster::Params>>,
+    /// The prefixes of customers' objects tenants may register as external indexes (M86), or
+    /// `None` for off, the default. Read when a tenant's engine is built.
+    external_prefixes: Mutex<Option<Vec<String>>>,
 }
 
 /// One tenant's engine in the registry (M26).
@@ -320,6 +324,7 @@ impl<S: BlobStore + 'static> Api<S> {
             parts_served: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
+            external_prefixes: Mutex::new(None),
         }))
     }
 
@@ -560,6 +565,15 @@ impl<S: BlobStore + 'static> Api<S> {
             // M54: one share of another server's query.
             .route("/v1/internal/part", post(peers::serve_part::<S>))
             .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
+            // M86: an external index, over the customer's own object.
+            .route(
+                "/v1/indexes/{index}/external",
+                put(external::register::<S>).delete(external::drop_index::<S>),
+            )
+            .route(
+                "/v1/indexes/{index}/external/query",
+                post(external::query::<S>),
+            )
             .route(
                 "/v1/indexes/{index}/quarantine",
                 get(export_quarantine::<S>).delete(discard_quarantine::<S>),
@@ -601,6 +615,11 @@ impl<S: BlobStore + 'static> Api<S> {
             .index_params
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let external = self
+            .external_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut engines = self.engines.lock().await;
         let slot = engines.entry(tenant).or_insert_with(|| {
             let engine = Engine::new(
@@ -613,6 +632,10 @@ impl<S: BlobStore + 'static> Api<S> {
             );
             let engine = match params {
                 Some(p) => engine.with_index_params(p),
+                None => engine,
+            };
+            let engine = match &external {
+                Some(prefixes) => engine.with_external_sources(prefixes.clone()),
                 None => engine,
             };
             Slot {
@@ -726,6 +749,16 @@ impl<S: BlobStore + 'static> Api<S> {
             tenant,
             filters: req.filters.clone(),
         })
+    }
+
+    /// Allows tenants to register external indexes over their own objects under `prefixes`
+    /// (M86, `PSTORE_EXTERNAL_SOURCES=allow`). Off until called, and meant to be called once at
+    /// startup: an engine already built keeps what it was built with.
+    pub fn allow_external_sources(&self, prefixes: Vec<String>) {
+        *self
+            .external_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefixes);
     }
 
     /// Caps the registry at `cap` engines, `0` for unbounded (M26, `PSTORE_ENGINES`): past it,
@@ -1000,6 +1033,19 @@ impl From<EngineError> for ApiError {
                     R::Active(_) => (StatusCode::CONFLICT, "replication_active"),
                     R::NoHistory(_) => (StatusCode::CONFLICT, "replica_no_history"),
                     R::Invalid(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+                };
+                Self::new(status, code, r.to_string())
+            }
+            // M86: each external-index refusal by its own name.
+            EngineError::External(r) => {
+                use pstore_engine::ExternalRefusal as R;
+                let (status, code) = match &r {
+                    R::Off => (StatusCode::FORBIDDEN, "external_sources_off"),
+                    R::Prefix(_) => (StatusCode::FORBIDDEN, "external_source_not_allowed"),
+                    R::Exists(_) => (StatusCode::CONFLICT, "index_exists"),
+                    R::NotFound(_) => (StatusCode::NOT_FOUND, "external_index_not_found"),
+                    R::Changed => (StatusCode::CONFLICT, "external_source_changed"),
+                    R::Source(_) => (StatusCode::BAD_REQUEST, "external_source_unreadable"),
                 };
                 Self::new(status, code, r.to_string())
             }
@@ -3732,6 +3778,10 @@ pub struct Config {
     pub peers: Option<PeerConfig>,
     /// Or a SWIM membership to take them from, `PSTORE_PEER_GOSSIP_*` (M56).
     pub gossip: Option<GossipConfig>,
+    /// The prefixes of customers' objects tenants may register external indexes over (M86),
+    /// or `None` -- the default -- for no external index at all. From
+    /// `PSTORE_EXTERNAL_SOURCES=allow` and `PSTORE_EXTERNAL_PREFIXES`.
+    pub external_sources: Option<Vec<String>>,
 }
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
@@ -3929,6 +3979,13 @@ pub enum ConfigError {
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
+    /// A `PSTORE_EXTERNAL_SOURCES` that is neither `allow` nor `off` (M86).
+    #[error("PSTORE_EXTERNAL_SOURCES={0} is refused: `allow` or `off`")]
+    ExternalSources(String),
+    /// `PSTORE_EXTERNAL_SOURCES=allow` with no prefix to allow (M86): the operator has not said
+    /// which buckets a tenant may point at.
+    #[error("PSTORE_EXTERNAL_SOURCES=allow needs PSTORE_EXTERNAL_PREFIXES, comma-separated")]
+    ExternalPrefixes,
 }
 
 impl Config {
@@ -3991,11 +4048,36 @@ impl Config {
             gossip: GossipConfig::from_vars(&get)?,
             replication: replication_policy(&get)?,
             sources: source_configs(&get)?,
+            external_sources: external_sources(&get)?,
             engines: match get("PSTORE_ENGINES") {
                 None => 10_000,
                 Some(v) => v.parse().map_err(|_| ConfigError::Engines(v))?,
             },
         })
+    }
+}
+
+/// The prefixes external indexes may be registered under (M86): unset and `off` are none, `allow`
+/// needs the prefixes, and anything else is refused by name.
+fn external_sources(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    match get("PSTORE_EXTERNAL_SOURCES").as_deref() {
+        None | Some("off") => Ok(None),
+        Some("allow") => {
+            let prefixes: Vec<String> = get("PSTORE_EXTERNAL_PREFIXES")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if prefixes.is_empty() {
+                return Err(ConfigError::ExternalPrefixes);
+            }
+            Ok(Some(prefixes))
+        }
+        Some(other) => Err(ConfigError::ExternalSources(other.to_owned())),
     }
 }
 

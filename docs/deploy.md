@@ -317,6 +317,29 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
 A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
 HMAC keys. It is only ever read.
 
+## An index over a customer's own file
+
+A tenant can index a column of a Parquet file or Lance dataset it already keeps in a bucket,
+without pstore storing the vectors ([M86](milestones/M86/SPEC.md); the readers are M69-M91).
+`PUT /v1/indexes/{name}/external` with `{"kind": "parquet" | "lance", "source": "lake/vecs.parquet",
+"column": "embedding"}` pins the column, builds the codes (RaBitQ-style, far smaller than the vectors, under pstore's own key) and commits them to HEAD. `POST …/external/query` with
+`{"vector": [...], "k": 10, "window": 40}` ranks by the codes and reads the `window` best rows from
+the customer's object (at most 10 000), answering the exact cosine. `DELETE …/external` drops it:
+the codes are reaped by GC after its window, and the customer's file is never touched.
+
+- ⚠️ **Off by default**, and it is the deployment's decision, not the tenant's: see
+  `PSTORE_EXTERNAL_SOURCES` and `PSTORE_EXTERNAL_PREFIXES` below. Off, a request is `403` and makes
+  no request to the store.
+- **A changed file is an error** (`409 external_source_changed`), never a stale answer: the codes
+  carry the file's length and CAS tag from when it was pinned.
+- A name is one namespace with indexes: registering one that an index or replication holds is
+  `409 index_exists`.
+- ⚠️ **Replication does not carry it.** A replica copies segments; an external registration names
+  a customer's object and codes in this bucket, neither of which a replica's store has.
+- ⚠️ **No auth**: the tenant is whatever the header says, so any tenant may point at any source
+  under an allowed prefix (see `auth` below). Allow only prefixes whose every tenant may read
+  them.
+
 ## The engine registry
 
 A server keeps one engine per tenant it has served. Since M26, `PSTORE_ENGINES` caps them: 10 000
@@ -429,6 +452,8 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_SOURCE_<NAME>_ENDPOINT` / `_BUCKET` | — | Required for each name. |
 | `PSTORE_SOURCE_<NAME>_ACCESS_KEY` / `_SECRET_KEY` | the provider's credential chain | Both or neither; half a pair is refused. |
 | `PSTORE_SOURCE_<NAME>_REGION` | `us-east-1` | |
+| `PSTORE_EXTERNAL_SOURCES` | off | `allow` lets a tenant register an index over a column of its own Parquet file or Lance dataset ([M86](milestones/M86/SPEC.md)); `off` or unset refuses every such request with `403 external_sources_off`, before any request to the store. Anything else is refused at startup. ⚠️ Whatever credential this server's store uses reads the customer's object, so name only buckets that credential should be able to read. |
+| `PSTORE_EXTERNAL_PREFIXES` | — | **Required** with `PSTORE_EXTERNAL_SOURCES=allow`: comma-separated key prefixes a tenant's `source` must start with (`lake/,exports/2026/`). A source outside them, or containing `..`, is `403 external_source_not_allowed`. |
 | `PSTORE_PEERS` | — | Every server's base URL, comma-separated, this one included (M54, above). |
 | `PSTORE_PEER_SELF` | — | This server's URL, as it appears in `PSTORE_PEERS`. Both or neither. |
 | `PSTORE_PEER_TIMEOUT_MS` | `2000` | How long a peer has to answer a share before this server runs it itself. |

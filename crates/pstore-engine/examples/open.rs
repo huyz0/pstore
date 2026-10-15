@@ -202,6 +202,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 branched: Default::default(),
                 replications: Default::default(),
                 quarantine: Default::default(),
+                externals: Default::default(),
             };
             store
                 .put(
