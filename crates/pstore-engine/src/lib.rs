@@ -5469,7 +5469,7 @@ impl<S: BlobStore> Engine<S> {
         &self,
         part: &Part,
     ) -> Result<(pstore_query::OpenPart, pstore_index::text::Stats), pstore_query::QueryError> {
-        pstore_query::open_part(&*self.store, &part.targets, &part.legs, &part.terms).await
+        pstore_query::open_part(&self.store, &part.targets, &part.legs, &part.terms).await
     }
 
     /// Phase 2 (M55): every leg over `held`, scored against `stats`, the sum over every segment

@@ -300,16 +300,16 @@ mod held_tests {
 ///
 /// # Errors
 /// As [`query`], and a term dictionary that should be there and is not.
-pub async fn open_part<S: BlobStore>(
+pub async fn open_part<S: BlobStore + Clone>(
     store: &S,
     targets: &[(usize, Target)],
     legs: &[(usize, Prefetch)],
     terms: &[String],
 ) -> Result<(OpenPart, Stats), QueryError> {
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
-    let opened =
-        futures_util::future::try_join_all(targets.iter().map(|(_, t)| open(store, t, &prefetch)))
-            .await?;
+    let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
+        .join()
+        .await?;
     let wants_text = legs.iter().any(|(_, p)| matches!(p, Prefetch::Text { .. }));
     let mut parts = Vec::new();
     for ((_, t), o) in targets.iter().zip(&opened) {
@@ -464,9 +464,9 @@ pub async fn part<S: BlobStore + Clone>(
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
-    let opened =
-        futures_util::future::try_join_all(targets.iter().map(|(_, t)| open(store, t, &prefetch)))
-            .await?;
+    let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
+        .join()
+        .await?;
     let held = OpenPart {
         targets: targets.to_vec(),
         legs: legs.to_vec(),
@@ -519,7 +519,7 @@ async fn candidates<S: BlobStore + Clone>(
     // 2,000 rows. A task owns what it reads: the store's handle, the segment's footer and
     // sidecars, the leg rebuilt owned, and the query's statistics, shared -- never copied a
     // task: the coordinator's hold its whole vocabulary.
-    let mut tasks = Tasks(Vec::new());
+    let mut tasks: Tasks<LegHits> = Tasks(Vec::new());
     for &(i, t, o) in items {
         // One copy a segment, shared by its legs (code review), without the delete vector: a
         // leg never reads it, and deleted rows are dropped below, from `items`.
@@ -554,21 +554,25 @@ async fn candidates<S: BlobStore + Clone>(
     let legs_fut = tasks.join();
     // ⚠️ A mask only for a segment some leg runs over here (M54): a segment whose vector legs
     // run elsewhere is masked there.
-    let masks_fut = futures_util::future::try_join_all(items.iter().map(|&(i, t, o)| async move {
-        match filter {
-            Some(f) if legs.iter().any(|(j, _)| runs(i, *j)) => {
-                mask(store, &t.segment, &o.segment, f)
-                    .await
-                    .map(|m| (i, Some(m)))
+    let mut mask_tasks: Tasks<(usize, Mask)> = Tasks(Vec::new());
+    if let Some(f) = filter {
+        for &(i, t, o) in items {
+            if legs.iter().any(|(j, _)| runs(i, *j)) {
+                let (store, key, segment, f) = (
+                    store.clone(),
+                    t.segment.clone(),
+                    o.segment.clone(),
+                    f.clone(),
+                );
+                mask_tasks.0.push(tokio::spawn(async move {
+                    mask(&store, &key, &segment, &f).await.map(|m| (i, m))
+                }));
             }
-            _ => Ok((i, None)),
         }
-    }));
+    }
+    let masks_fut = mask_tasks.join();
     let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
-    let masks: std::collections::BTreeMap<usize, Mask> = masks
-        .into_iter()
-        .filter_map(|(i, m)| m.map(|m| (i, m)))
-        .collect();
+    let masks: std::collections::BTreeMap<usize, Mask> = masks.into_iter().collect();
     let by_ordinal: std::collections::BTreeMap<usize, (&Target, &Opened)> =
         items.iter().map(|&(i, t, o)| (i, (t, o))).collect();
     Ok(per_segment
@@ -678,16 +682,23 @@ async fn run<S: BlobStore + Clone>(
         .filter(|(_, p)| splittable(p))
         .cloned()
         .collect();
-    let opening = futures_util::future::try_join_all(targets.iter().enumerate().map(|(i, t)| {
-        let wanted: &[Prefetch] = if all_remote.contains(&i) {
-            &[]
-        } else if vector_remote.contains(&i) {
-            text_legs.as_slice()
-        } else {
-            prefetch
-        };
-        open(store, t, wanted)
-    }));
+    let prefetch_all: Arc<[Prefetch]> = prefetch.into();
+    let prefetch_text: Arc<[Prefetch]> = text_legs.as_slice().into();
+    let prefetch_none: Arc<[Prefetch]> = Arc::from(Vec::new());
+    let opening = open_tasks(
+        store,
+        targets.iter().enumerate().map(|(i, t)| {
+            let wanted = if all_remote.contains(&i) {
+                &prefetch_none
+            } else if vector_remote.contains(&i) {
+                &prefetch_text
+            } else {
+                &prefetch_all
+            };
+            (t.clone(), Arc::clone(wanted))
+        }),
+    )
+    .join();
     let (mut phase_ones, mut scans): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
     let mut phased_targets = Vec::new();
     for (t, stats, scan) in phased {
@@ -762,10 +773,9 @@ async fn run<S: BlobStore + Clone>(
                 ),
             }
         }
-        let opened_here = futures_util::future::try_join_all(
-            scan_here.iter().map(|(_, t)| open(store, t, prefetch)),
-        )
-        .await?;
+        let opened_here = open_all(store, scan_here.iter().map(|(_, t)| t), prefetch)
+            .join()
+            .await?;
         stats = Stats::merge(std::iter::once(stats).chain(summed_parts).chain(
             opened_here.iter().filter_map(|o| {
                 let raw = o.terms.as_ref()?;
@@ -1602,21 +1612,21 @@ async fn maybe<S: BlobStore>(store: &S, key: Option<Key>) -> Option<bytes::Bytes
         .ok()
 }
 
-/// A query's leg tasks (M59), aborted if the query is dropped before they finish -- by a
+/// A query's tasks (M59, M93), aborted if the query is dropped before they finish -- by a
 /// client hanging up, or a peer's timeout -- so none reads and scores for nobody.
-struct Tasks(Vec<tokio::task::JoinHandle<LegHits>>);
+struct Tasks<T>(Vec<tokio::task::JoinHandle<Result<T, QueryError>>>);
 
-/// One `(segment, leg)` pair's candidates, or why there are none.
-type LegHits = Result<(usize, usize, Vec<Hit>), QueryError>;
+/// One `(segment, leg)` pair's candidates.
+type LegHits = (usize, usize, Vec<Hit>);
 
-impl Tasks {
+impl<T> Tasks<T> {
     /// Every task's result, in the order the tasks were made, as `try_join_all` returned the
     /// futures they replaced. Waited on as they finish (code review), so the first error to
-    /// arrive is the query's and aborts the rest, as `try_join_all`'s did. A leg's panic is
+    /// arrive is the query's and aborts the rest, as `try_join_all`'s did. A task's panic is
     /// resumed here, as an inline one would have been.
-    async fn join(mut self) -> Result<Vec<(usize, usize, Vec<Hit>)>, QueryError> {
+    async fn join(mut self) -> Result<Vec<T>, QueryError> {
         use futures_util::StreamExt as _;
-        let mut slots: Vec<Option<(usize, usize, Vec<Hit>)>> = Vec::new();
+        let mut slots: Vec<Option<T>> = Vec::new();
         slots.resize_with(self.0.len(), || None);
         let mut pending: futures_util::stream::FuturesUnordered<_> = self
             .0
@@ -1630,7 +1640,7 @@ impl Tasks {
                 Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
                 // Only `Drop` aborts, and it cannot run while this waits; a runtime shutting
                 // down under the query is the one other way, and is an error.
-                Err(_) => return Err(QueryError::Unimplemented("a leg cancelled")),
+                Err(_) => return Err(QueryError::Unimplemented("a task cancelled")),
             };
             if let Some(slot) = slots.get_mut(k) {
                 *slot = Some(done);
@@ -1641,12 +1651,45 @@ impl Tasks {
     }
 }
 
-impl Drop for Tasks {
+impl<T> Drop for Tasks<T> {
     fn drop(&mut self) {
         for task in &self.0 {
             task.abort();
         }
     }
+}
+
+/// Each target opened on a task of its own (M93): the footer's decoding, and the sidecars',
+/// ran in the query's task, one future after another, while the runtime's other workers sat
+/// idle. A task owns what it reads: the store's handle, its target, and the legs, shared.
+/// Spawned here, so the opens are under way before the caller awaits any of them.
+fn open_tasks<S: BlobStore + Clone>(
+    store: &S,
+    jobs: impl IntoIterator<Item = (Target, Arc<[Prefetch]>)>,
+) -> Tasks<Opened> {
+    Tasks(
+        jobs.into_iter()
+            .map(|(target, prefetch)| {
+                let store = store.clone();
+                tokio::spawn(async move { open(&store, &target, &prefetch).await })
+            })
+            .collect(),
+    )
+}
+
+/// [`open_tasks`] for targets that all want the same legs.
+fn open_all<'a, S: BlobStore + Clone>(
+    store: &S,
+    targets: impl IntoIterator<Item = &'a Target>,
+    prefetch: &[Prefetch],
+) -> Tasks<Opened> {
+    let prefetch: Arc<[Prefetch]> = prefetch.into();
+    open_tasks(
+        store,
+        targets
+            .into_iter()
+            .map(|t| (t.clone(), Arc::clone(&prefetch))),
+    )
 }
 
 /// `MaxSim(q, d) = Σᵢ maxⱼ ⟨qᵢ, dⱼ⟩` (M61), in a fixed order -- i, then j, each dot over the
