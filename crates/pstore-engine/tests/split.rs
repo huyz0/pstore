@@ -81,6 +81,8 @@ struct Three {
     given: Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>>,
     /// Which phase fails, if any: 1 or 2.
     fails: u8,
+    /// Targets that a one-exchange share was handed with a clustered multi-vector sidecar (M94).
+    clustered: Arc<AtomicU64>,
 }
 
 impl Three {
@@ -99,6 +101,7 @@ impl Three {
             most_rows: Arc::default(),
             given: Arc::default(),
             fails: 0,
+            clustered: Arc::default(),
         }
     }
 }
@@ -118,8 +121,13 @@ impl Peers for Three {
         let engine = Arc::clone(&self.engines[server]);
         let filter = self.filter.clone();
         let parts = Arc::clone(&self.parts);
+        let clustered = Arc::clone(&self.clustered);
         Box::pin(async move {
             parts.fetch_add(1, Ordering::SeqCst);
+            clustered.fetch_add(
+                part.targets.iter().filter(|(_, t)| t.fde_clusters).count() as u64,
+                Ordering::SeqCst,
+            );
             engine
                 .part(&part, filter.as_ref())
                 .await
@@ -1257,4 +1265,152 @@ async fn a_split_named_dense_query_ranks_that_field() {
         .map(|(i, _)| Some(format!("d{i:05}")))
         .collect();
     assert_eq!(split.ids, want);
+}
+
+/// A document of the default `doc`, and a field `late` of two vectors near one of twelve
+/// topics, so a clustering has lists to find (M94).
+fn mdoc(i: u32) -> Document {
+    let topic = (i % 12) as usize;
+    let mut s = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut r = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s % 2000) as f32 / 1000.0 - 1.0
+    };
+    let base = |t: usize, d: usize| ((t * 7 + d * 3) % 11) as f32 - 5.0;
+    let mut v = || -> Vec<f32> { (0..4).map(|d| base(topic, d) + 0.3 * r()).collect() };
+    let mut d = doc(i);
+    d.vectors
+        .insert("late".to_owned(), VectorField::Dense(vec![v(), v()]));
+    d
+}
+
+fn multi() -> Prefetch {
+    Prefetch::Multi {
+        field: "late".to_owned(),
+        query: vec![vec![-2.0, 1.0, 4.0, 0.0], vec![1.0, 1.0, -3.0, 2.0]],
+        limit: 10,
+    }
+}
+
+fn fde(rerank: Option<usize>, probes: Option<usize>) -> Prefetch {
+    Prefetch::MultiFde {
+        field: "late".to_owned(),
+        query: vec![vec![-2.0, 1.0, 4.0, 0.0]],
+        limit: 10,
+        rerank,
+        probes,
+    }
+}
+
+async fn mfilled(store: &Arc<MemoryStore>, segments: u32, rows: u32) -> Engine<MemoryStore> {
+    let coordinator = engine(store, 1);
+    for k in 0..segments {
+        coordinator
+            .write("idx", (k * rows..k * rows + rows).map(mdoc).collect())
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    coordinator
+}
+
+fn trio(store: &Arc<MemoryStore>) -> Three {
+    Three::new(
+        vec![
+            Arc::new(engine(store, 10)),
+            Arc::new(engine(store, 11)),
+            Arc::new(engine(store, 12)),
+        ],
+        None,
+    )
+}
+
+async fn split_equals_unsplit(
+    coordinator: &Engine<MemoryStore>,
+    peers: &Three,
+    legs: &[Prefetch],
+    fusion: Fusion,
+) -> String {
+    let split = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            None,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            Some(peers),
+        )
+        .await
+        .unwrap();
+    let whole = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            None,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!whole.hits.is_empty(), "the control answer is empty");
+    assert_eq!(exactly(&split), exactly(&whole));
+    exactly(&split)
+}
+
+#[tokio::test]
+async fn a_split_multi_query_equals_the_unsplit_one() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = mfilled(&store, 4, 25).await;
+    let dense_leg = dense(pstore_format::DEFAULT_FIELD, vec![0.3, 0.9, -0.2, 1.0]);
+    let cases: Vec<Vec<Prefetch>> = vec![
+        vec![multi()],
+        vec![fde(None, None)],
+        vec![fde(Some(20), None)],
+        vec![fde(Some(20), Some(2))],
+        vec![multi(), dense_leg.clone()],
+        vec![fde(Some(5), None), dense_leg],
+    ];
+    for legs in cases {
+        let peers = trio(&store);
+        split_equals_unsplit(&coordinator, &peers, &legs, Fusion::default()).await;
+        assert!(
+            peers.parts.load(Ordering::SeqCst) > 0,
+            "{legs:?} was not split"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_split_multi_with_text_equals_the_unsplit_one() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = mfilled(&store, 4, 25).await;
+    for legs in [vec![multi(), text()], vec![fde(Some(20), None), text()]] {
+        let peers = trio(&store);
+        split_equals_unsplit(&coordinator, &peers, &legs, Fusion::default()).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0 && peers.scans.load(Ordering::SeqCst) > 0,
+            "{legs:?} was not split in two phases"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_split_clustered_fde_query_equals_the_unsplit_one() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = mfilled(&store, 2, 4_500).await;
+    let peers = trio(&store);
+    for legs in [vec![fde(None, None)], vec![fde(Some(30), Some(2))]] {
+        split_equals_unsplit(&coordinator, &peers, &legs, Fusion::default()).await;
+    }
+    assert!(peers.parts.load(Ordering::SeqCst) > 0, "it was split");
+    assert!(
+        peers.clustered.load(Ordering::SeqCst) > 0,
+        "the segments carry a clustered sidecar and the part says so"
+    );
 }

@@ -762,6 +762,22 @@ enum WireLeg {
         query: Vec<(u32, u32)>,
         limit: usize,
     },
+    /// M94: MaxSim over a field of several vectors a document.
+    Multi {
+        j: usize,
+        field: String,
+        query: Vec<Vec<u32>>,
+        limit: usize,
+    },
+    /// M94: a `Multi` leg's candidates from the fixed-dimensional encoding.
+    MultiFde {
+        j: usize,
+        field: String,
+        query: Vec<Vec<u32>>,
+        limit: usize,
+        rerank: Option<usize>,
+        probes: Option<usize>,
+    },
     /// M55, phased parts only.
     Text {
         j: usize,
@@ -780,6 +796,11 @@ struct WireTarget {
     deleted: Option<String>,
     sparse_dict: bool,
     text_dict: bool,
+    /// M94: whether the segment has the clustered multi-vector sidecar. A peer that did not
+    /// know would scan the flat encoding where the coordinator reads the clusters, and the two
+    /// would answer differently. Absent from an older coordinator's part: `false`.
+    #[serde(default)]
+    fde_clusters: bool,
     shadowed: bool,
 }
 
@@ -790,6 +811,20 @@ type WireShare = (usize, usize, Vec<(usize, u32)>);
 #[derive(Debug, Serialize, Deserialize)]
 struct WireHits {
     hits: Vec<WireShare>,
+}
+
+/// A multi-vector query's floats as their bits.
+fn bits_of(query: &[Vec<f32>]) -> Vec<Vec<u32>> {
+    query
+        .iter()
+        .map(|v| v.iter().map(|x| x.to_bits()).collect())
+        .collect()
+}
+
+fn floats_of(bits: Vec<Vec<u32>>) -> Vec<Vec<f32>> {
+    bits.into_iter()
+        .map(|v| v.into_iter().map(f32::from_bits).collect())
+        .collect()
 }
 
 fn rerank_name(r: pstore_index::vec_index::Rerank) -> &'static str {
@@ -871,8 +906,31 @@ impl WirePart {
                         query: query.clone(),
                         limit: *limit,
                     }),
+                    Prefetch::Multi {
+                        field,
+                        query,
+                        limit,
+                    } => Some(WireLeg::Multi {
+                        j: *j,
+                        field: field.clone(),
+                        query: bits_of(query),
+                        limit: *limit,
+                    }),
+                    Prefetch::MultiFde {
+                        field,
+                        query,
+                        limit,
+                        rerank,
+                        probes,
+                    } => Some(WireLeg::MultiFde {
+                        j: *j,
+                        field: field.clone(),
+                        query: bits_of(query),
+                        limit: *limit,
+                        rerank: *rerank,
+                        probes: *probes,
+                    }),
                     Prefetch::Trigram { .. } => None,
-                    Prefetch::Multi { .. } | Prefetch::MultiFde { .. } => None,
                 })
                 .collect(),
             targets: part
@@ -886,6 +944,7 @@ impl WirePart {
                     deleted: t.deleted.as_ref().map(|k| k.as_str().to_owned()),
                     sparse_dict: t.sparse_dict,
                     text_dict: t.text_dict,
+                    fde_clusters: t.fde_clusters,
                     shadowed: t.shadowed,
                 })
                 .collect(),
@@ -961,7 +1020,11 @@ fn guard(tenant: TenantId, wire: &WirePart) -> Result<(), ApiError> {
     let mut named = std::collections::BTreeSet::new();
     for leg in &wire.legs {
         let j = match leg {
-            WireLeg::Dense { j, .. } | WireLeg::Sparse { j, .. } | WireLeg::Text { j, .. } => *j,
+            WireLeg::Dense { j, .. }
+            | WireLeg::Sparse { j, .. }
+            | WireLeg::Multi { j, .. }
+            | WireLeg::MultiFde { j, .. }
+            | WireLeg::Text { j, .. } => *j,
         };
         if j >= pstore_query::MAX_LEGS || !named.insert(j) {
             return Err(refuse(format!(
@@ -1042,6 +1105,36 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
                     limit,
                 },
             )),
+            WireLeg::Multi {
+                j,
+                field,
+                query,
+                limit,
+            } => Ok((
+                j,
+                Prefetch::Multi {
+                    field,
+                    query: floats_of(query),
+                    limit,
+                },
+            )),
+            WireLeg::MultiFde {
+                j,
+                field,
+                query,
+                limit,
+                rerank,
+                probes,
+            } => Ok((
+                j,
+                Prefetch::MultiFde {
+                    field,
+                    query: floats_of(query),
+                    limit,
+                    rerank,
+                    probes,
+                },
+            )),
             WireLeg::Text {
                 j,
                 field,
@@ -1072,7 +1165,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
                     deleted: t.deleted.map(Key::new),
                     sparse_dict: t.sparse_dict,
                     text_dict: t.text_dict,
-                    fde_clusters: false,
+                    fde_clusters: t.fde_clusters,
                     shadowed: t.shadowed,
                     segment,
                 },
@@ -1439,6 +1532,34 @@ mod tests {
                         limit: 4,
                     },
                 ),
+                (
+                    4,
+                    Prefetch::Multi {
+                        field: "late".to_owned(),
+                        query: vec![vec![0.1, -0.0], vec![1.0 / 3.0, f32::MIN_POSITIVE]],
+                        limit: 6,
+                    },
+                ),
+                (
+                    6,
+                    Prefetch::MultiFde {
+                        field: "late".to_owned(),
+                        query: vec![vec![-0.0, 1.0 / 3.0]],
+                        limit: 8,
+                        rerank: Some(20),
+                        probes: None,
+                    },
+                ),
+                (
+                    7,
+                    Prefetch::MultiFde {
+                        field: "late".to_owned(),
+                        query: vec![vec![0.5, 0.25]],
+                        limit: 2,
+                        rerank: None,
+                        probes: Some(3),
+                    },
+                ),
             ],
             targets: vec![(
                 3,
@@ -1448,7 +1569,7 @@ mod tests {
                     deleted: Some(Key::new(format!("{}.1-2.dv", segment.as_str()))),
                     sparse_dict: false,
                     text_dict: true,
-                    fde_clusters: false,
+                    fde_clusters: true,
                     shadowed: true,
                     segment,
                 },
@@ -1543,6 +1664,57 @@ mod tests {
     }
 
     #[test]
+    fn a_leg_number_is_named_once_across_every_kind() {
+        // M94: the multi-vector variants join the same rule as the others.
+        let part = Part {
+            index: "docs".to_owned(),
+            fts: pstore_format::text::FullText::default(),
+            legs: vec![
+                (
+                    1,
+                    Prefetch::Multi {
+                        field: "late".to_owned(),
+                        query: vec![vec![1.0]],
+                        limit: 1,
+                    },
+                ),
+                (
+                    1,
+                    Prefetch::MultiFde {
+                        field: "late".to_owned(),
+                        query: vec![vec![1.0]],
+                        limit: 1,
+                        rerank: None,
+                        probes: None,
+                    },
+                ),
+            ],
+            targets: Vec::new(),
+            shadow: 0,
+            terms: Vec::new(),
+            sum: None,
+        };
+        let wire = WirePart::of(&part, None);
+        assert_eq!(wire.legs.len(), 2);
+        assert!(guard(TenantId(7), &wire).is_err());
+        let mut one = part;
+        one.legs.truncate(1);
+        guard(TenantId(7), &WirePart::of(&one, None)).unwrap();
+        one.legs[0].0 = pstore_query::MAX_LEGS;
+        assert!(guard(TenantId(7), &WirePart::of(&one, None)).is_err());
+    }
+
+    #[test]
+    fn an_older_coordinators_target_has_no_clusters() {
+        let raw = serde_json::json!({
+            "i": 0, "segment": "s.seg", "segment_len": null, "centroids": false,
+            "deleted": null, "sparse_dict": false, "text_dict": false, "shadowed": false
+        });
+        let t: WireTarget = serde_json::from_value(raw).unwrap();
+        assert!(!t.fde_clusters);
+    }
+
+    #[test]
     fn a_part_is_bounded_at_its_limits_exactly() {
         let target = |i: usize| WireTarget {
             i,
@@ -1552,6 +1724,7 @@ mod tests {
             deleted: None,
             sparse_dict: false,
             text_dict: false,
+            fde_clusters: false,
             shadowed: false,
         };
         let leg = |j: usize| WireLeg::Sparse {

@@ -239,10 +239,18 @@ pub enum Share<'a> {
 
 /// Whether a leg may run on another server in one exchange (M54): dense and sparse score
 /// each row by itself, so their hits over two segments compare wherever they were computed.
-/// A text leg scores against statistics summed over every segment, so it needs two (M55).
+/// So do the multi-vector legs (M94): MaxSim, and the encoding's dot product, are each a
+/// function of the query and one row. A text leg scores against statistics summed over every
+/// segment, so it needs two (M55).
 #[must_use]
 pub fn splittable(p: &Prefetch) -> bool {
-    matches!(p, Prefetch::Dense { .. } | Prefetch::Sparse { .. })
+    matches!(
+        p,
+        Prefetch::Dense { .. }
+            | Prefetch::Sparse { .. }
+            | Prefetch::Multi { .. }
+            | Prefetch::MultiFde { .. }
+    )
 }
 
 /// One share's segments, opened for its legs and held between a split query's two phases

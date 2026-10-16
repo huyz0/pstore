@@ -156,7 +156,9 @@ RRF; `sum` and `max` refuse it.
   field of one vector a document by an exact scan of that field (M77), or -- when the segment is big enough to have
   clusters and every row carries the field -- by the best `p` lists of its clusters (M83); a
   field of several vectors is `multi`'s.
-- **Not split** across peers (backlog row 64).
+- Split across peers like a dense leg (M94). ⚠️ Roll peers before coordinators when upgrading:
+  a peer that predates M94 cannot decode the leg, and each such share costs a failed part and
+  runs on the coordinator, with the same answer.
 - **A segment's export or compaction reads each named field in a round of its own.** Queries
   never do.
 
@@ -183,8 +185,8 @@ dimensions is 16 times fewer bytes.
 - A field name ending `$fde` is refused, and no read returns the derived field. The encoding's
   parameters are fixed (4 repetitions of 8 buckets of 16 dimensions): changing them would
   invalidate every stored encoding.
-- It is a flat scan of the encodings, not an index (backlog row 65), and not split across
-  peers (row 64).
+- It is a flat scan of the encodings, not an index (backlog row 65), and splits across peers
+  as `multi` does (M94).
 
 ## Boosting a ranking
 

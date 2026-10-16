@@ -152,7 +152,7 @@ order, smallest and most certain first:
 | # | Task | From | Size |
 |---|---|---|---|
 | 63 | **Multi-vector candidates from quantized codes.** A `multi` leg reads every float of its field in every segment: exact, and 51 KB a document at 100 vectors of 128 dimensions. Per-vector 1-bit codes (as RaBitQ is for `vector`) would let a query read codes, pick candidates, and score only those exactly -- a format change. **Delivered by [M67](M67/SPEC.md) with a different mechanism** (a fixed-dimensional encoding, no format change); a per-vector code is still open if the encoding's recall is not enough. | [M61](M61/SPEC.md) | L |
-| 64 | **Split a `multi` leg across peers.** The part protocol carries no `multi` leg, so `shares` refuses every query holding one, and it runs on the server asked. | [M61](M61/SPEC.md) | S |
+| ~~64~~ | ~~**Split a `multi` leg across peers.** The part protocol carries no `multi` leg, so `shares` refuses every query holding one, and it runs on the server asked.~~ **CLOSED by [M94](M94/SPEC.md).** | [M61](M61/SPEC.md) | S |
 | 65 | **Dense search over a named field, and a width an index for every field.** (A dense query over a named field is [M77](M77/SPEC.md), delivered as an exact scan, and it already splits across servers: [M78](M78/SPEC.md). The approximate index per field is [M83](M83/SPEC.md): clusters in M71's sidecar pair.) A dense leg over a named field would have searched `vector`'s clustering (`VecIndex::search_field`); the API refused it. And no schema records a named field's width, so two widths folded apart are refused at query time, and their compaction fails, rather than refused at the door. | [M61](M61/SPEC.md) | M |
 
 ## Opened by M54

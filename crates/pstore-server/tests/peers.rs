@@ -550,6 +550,46 @@ async fn a_failed_peer_costs_rounds_not_answers() {
 }
 
 #[tokio::test]
+async fn a_failed_peer_costs_rounds_not_answers_for_a_multi_leg() {
+    // M94: the share of a `multi` or `multi_fde` leg that fails is run here, alone, beside a
+    // dense leg, and beside a text leg (two phases).
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let (store, servers, alone) = cluster(std::slice::from_ref(&dead)).await;
+    let mut all = urls(&servers);
+    all.push(dead);
+    let late = |i: usize| {
+        let mut d = doc(i);
+        let x = i as f32;
+        d["vectors"] = json!({"late": [[x.sin(), 1.0], [x.cos(), -1.0]]});
+        d
+    };
+    fill_with(&store, &servers[0].api, &all, 8, late).await;
+    servers[1].view.failing.store(true, Ordering::SeqCst);
+    let multi = json!({"field": "late", "vectors": [[0.5, 0.25]]});
+    let fde = json!({"field": "late", "vectors": [[0.5, 0.25]], "mode": "fde"});
+    for q in [
+        json!({"multi": multi, "top_k": 10}),
+        json!({"multi": fde, "top_k": 10}),
+        json!({"multi": multi, "vector": Q, "top_k": 10}),
+        json!({"multi": fde, "text": "word2", "top_k": 10}),
+    ] {
+        let (_, want) = query(&alone.api, &q).await;
+        let before = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(s, 200, "{q}: {got}");
+        assert_eq!(got["results"], want["results"], "{q}");
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            before + 2,
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_peer_of_another_protocol_is_refused_and_run_here() {
     // A peer that answers every part with the version refusal.
     let fake = axum::Router::new().route(
@@ -773,9 +813,9 @@ async fn a_split_boosted_query_answers_as_one_server_does() {
 }
 
 #[tokio::test]
-async fn a_multi_query_is_not_split() {
-    // M61: the part protocol carries no `multi` leg, so a share would answer without it. The
-    // whole query runs on the server asked, alone or beside a leg that would split.
+async fn a_multi_query_is_split() {
+    // M94 (row 64): a `multi` leg crosses the part protocol, alone or beside a leg that
+    // splits, and the answer is the one server's.
     let (store, servers, alone) = cluster(&[]).await;
     let late = |i: usize| {
         let mut d = doc(i);
@@ -790,7 +830,7 @@ async fn a_multi_query_is_not_split() {
         json!({"multi": multi, "top_k": 10}),
         json!({"multi": multi, "text": "word2", "top_k": 10}),
         json!({"multi": multi, "vector": Q, "top_k": 10}),
-        // M67: the encoding's leg is not split either, beside a leg that would be.
+        // M67: the encoding's leg splits too.
         json!({"multi": fde, "top_k": 10}),
         json!({"multi": fde, "text": "word2", "top_k": 10}),
         json!({"multi": fde, "vector": Q, "top_k": 10}),
@@ -803,10 +843,9 @@ async fn a_multi_query_is_not_split() {
             let (s, got) = query(&server.api, &q).await;
             assert_eq!(s, 200, "{q} at {i}: {got}");
             assert_eq!(answer(&got), answer(&want), "{q} at {i}");
-            assert_eq!(
-                metric(&server.api, "pstore_peer_parts_sent").await,
-                sent,
-                "{q} at {i} was split"
+            assert!(
+                metric(&server.api, "pstore_peer_parts_sent").await > sent,
+                "{q} at {i} was not split"
             );
         }
     }

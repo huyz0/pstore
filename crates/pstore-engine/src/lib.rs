@@ -6559,16 +6559,6 @@ fn shares(
     top_k: usize,
     cap: usize,
 ) -> Vec<pstore_query::Elsewhere<'static>> {
-    // ⚠️ A `multi` leg is not split (M61): the part protocol carries no such leg, so a share
-    // would answer without it. The whole query runs here (backlog row 64).
-    if prefetch.iter().any(|p| {
-        matches!(
-            p,
-            pstore_query::Prefetch::Multi { .. } | pstore_query::Prefetch::MultiFde { .. }
-        )
-    }) {
-        return Vec::new();
-    }
     let text: Vec<&String> = prefetch
         .iter()
         .filter_map(|p| match p {

@@ -10,7 +10,7 @@ Commands:
 - `cargo test -p pstore-query --test multi`
 - `cargo test -p pstore-engine --test multi`
 - `cargo test -p pstore-server --test multi`
-- `cargo test -p pstore-server --test peers a_multi_query_is_not_split`
+- `cargo test -p pstore-server --test peers a_multi_query_is_split`
 - `cargo test -p pstore-blob -p pstore-format -p pstore-query -p pstore-engine -p pstore-server -p pstore-index`: every test passes.
 
 1. **MaxSim is MaxSim.** `multi_scores_by_maxsim`: two segments, rows of 0 to 4 vectors. The
@@ -72,7 +72,7 @@ Commands:
      overlap it: it counts a round only when a request starts with nothing in flight. That
      is the mirror of M59's caveat, and every depth test that runs a single segment as well
      keeps it honest.
-7. **Not split.** `a_multi_query_is_not_split`, in `crates/pstore-server/tests/peers.rs`:
+7. **Not split.** ⚠️ **Superseded by [M94](../M94/SPEC.md)**, which split the leg and inverted this test as `a_multi_query_is_split`. As of M61 it read: `a_multi_query_is_not_split`, in `crates/pstore-server/tests/peers.rs`:
    `multi` alone, with text and with dense send no part on any of the three peered servers,
    and answer as the unpeered one. Seen red with `shares` not refusing `multi`.
 8. **Gates.**
