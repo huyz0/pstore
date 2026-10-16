@@ -8,7 +8,7 @@
 
 mod list;
 
-use crate::external::{DictRef, Extent};
+use crate::external::{AttrKind, DictRef, Extent};
 use pstore_blob::{BlobError, BlobStore, Key};
 
 /// Why a Parquet column could not be located.
@@ -177,6 +177,36 @@ struct Leaf {
     repetition: Option<i64>,
     name: Vec<u8>,
     children: i64,
+    /// The legacy converted type, if the writer set one (M95).
+    converted: Option<i64>,
+    /// The logical type, if set: `Some(true)` for a signed integer (which a physical value is),
+    /// `Some(false)` for any other (unsigned, decimal, date, time, timestamp, string ...).
+    logical: Option<bool>,
+}
+
+/// A `LogicalType` union: whether it is a signed `INTEGER` and nothing else.
+fn logical_is_signed_int(t: &mut Thrift<'_>) -> Option<bool> {
+    let mut signed = false;
+    let mut last = 0;
+    while let Some((id, ty)) = t.field(last)? {
+        last = id;
+        if id == 10 && ty == 12 {
+            let (mut inner, mut is_signed) = (0, false);
+            while let Some((iid, ity)) = t.field(inner)? {
+                inner = iid;
+                match (iid, ity) {
+                    (2, 1) => is_signed = true,
+                    (2, 2) => is_signed = false,
+                    _ => t.skip(ity)?,
+                }
+            }
+            signed = is_signed;
+        } else {
+            t.skip(ty)?;
+            signed = false;
+        }
+    }
+    Some(signed)
 }
 
 fn schema_element(t: &mut Thrift<'_>) -> Option<Leaf> {
@@ -190,6 +220,8 @@ fn schema_element(t: &mut Thrift<'_>) -> Option<Leaf> {
             (3, 5) => e.repetition = Some(t.zigzag()?),
             (4, 8) => e.name = t.binary()?.to_vec(),
             (5, 5) => e.children = t.zigzag()?,
+            (6, 5) => e.converted = Some(t.zigzag()?),
+            (10, 12) => e.logical = Some(logical_is_signed_int(t)?),
             _ => t.skip(ty)?,
         }
     }
@@ -447,7 +479,25 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
     })
 }
 
+const CONVERTED_INT_8: i64 = 15;
+const CONVERTED_INT_64: i64 = 18;
+const TYPE_INT32: i64 = 1;
+const TYPE_INT64: i64 = 2;
+const TYPE_FLOAT: i64 = 4;
+const TYPE_DOUBLE: i64 = 5;
 const TYPE_FLBA: i64 = 7;
+
+/// The name of a physical type a scalar attribute cannot be, for a refusal.
+fn type_name(ty: Option<i64>) -> &'static str {
+    match ty {
+        Some(0) => "BOOLEAN",
+        Some(3) => "INT96",
+        Some(6) => "BYTE_ARRAY",
+        Some(7) => "FIXED_LEN_BYTE_ARRAY",
+        _ => "of an unknown type",
+    }
+}
+
 const CODEC_NONE: i64 = 0;
 const ENC_PLAIN: i64 = 0;
 const ENC_PLAIN_DICTIONARY: i64 = 2;
@@ -593,6 +643,35 @@ pub async fn locate<S: BlobStore>(
     key: &Key,
     column: &str,
 ) -> Result<Located, ParquetError> {
+    locate_flat(store, key, column, false)
+        .await
+        .map(|(found, _)| found)
+}
+
+/// Locates the scalar `INT32`, `INT64`, `FLOAT` or `DOUBLE` column `column` (M95): a value is a
+/// "vector" of one or two `f32` lanes, found by the machinery a vector column is, so compression,
+/// dictionaries, v2 pages and nulls are read as they are for one.
+///
+/// # Errors
+/// As [`locate`]; a column of another type is refused naming it.
+pub async fn locate_scalar<S: BlobStore>(
+    store: &S,
+    key: &Key,
+    column: &str,
+) -> Result<(Located, AttrKind), ParquetError> {
+    let (found, kind) = locate_flat(store, key, column, true).await?;
+    Ok((
+        found,
+        kind.ok_or(ParquetError::Malformed("a scalar column has no kind"))?,
+    ))
+}
+
+async fn locate_flat<S: BlobStore>(
+    store: &S,
+    key: &Key,
+    column: &str,
+    scalar: bool,
+) -> Result<(Located, Option<AttrKind>), ParquetError> {
     let bad = ParquetError::Malformed;
     let len = store.head(key).await?;
     let tail = store.get_suffix(key, 8).await?;
@@ -615,24 +694,63 @@ pub async fn locate<S: BlobStore>(
         .ok_or_else(|| ParquetError::Unsupported(format!("no column named {column:?}")))?;
     let leaf = f.schema.get(top).ok_or(bad("schema"))?;
     if leaf.children > 0 {
+        if scalar {
+            return unsupported("the column is nested, not a scalar");
+        }
         // M91: a list of floats. Anything else nested is refused inside.
-        return list::locate_list(store, key, len, &f, column, top, size).await;
+        return list::locate_list(store, key, len, &f, column, top, size)
+            .await
+            .map(|found| (found, None));
     }
-    if leaf.ty != Some(TYPE_FLBA) {
-        return unsupported("the column is not FIXED_LEN_BYTE_ARRAY");
+    // M95: a scalar is read as a vector of `width / 4` lanes; `ty` is the type every chunk must
+    // agree on.
+    let (ty, kind) = if scalar {
+        match leaf.ty {
+            Some(TYPE_INT32) => (TYPE_INT32, Some(AttrKind::Int32)),
+            Some(TYPE_INT64) => (TYPE_INT64, Some(AttrKind::Int64)),
+            Some(TYPE_FLOAT) => (TYPE_FLOAT, Some(AttrKind::Float)),
+            Some(TYPE_DOUBLE) => (TYPE_DOUBLE, Some(AttrKind::Double)),
+            other => {
+                return unsupported(format!(
+                    "the column is {}, not INT32, INT64, FLOAT or DOUBLE",
+                    type_name(other)
+                ));
+            }
+        }
+    } else {
+        if leaf.ty != Some(TYPE_FLBA) {
+            return unsupported("the column is not FIXED_LEN_BYTE_ARRAY");
+        }
+        (TYPE_FLBA, None)
+    };
+    // A physical value is the value only when no logical type reinterprets it: unsigned, decimal,
+    // date, time and timestamp columns are refused, never read as signed numbers.
+    let signed_plain = leaf
+        .converted
+        .is_none_or(|c| (CONVERTED_INT_8..=CONVERTED_INT_64).contains(&c))
+        && leaf.logical != Some(false);
+    if scalar && !signed_plain {
+        return unsupported(
+            "the column has a logical type (unsigned, decimal, date, time or timestamp) its physical value does not carry",
+        );
     }
+
     // M84: an OPTIONAL flat column carries a definition level a value; it is read in place only
     // when every level of every page is "present" (checked page by page below).
     if leaf.repetition != Some(REQUIRED) && leaf.repetition != Some(OPTIONAL) {
         return unsupported("the column is REPEATED: it carries repetition levels");
     }
     let optional = leaf.repetition == Some(OPTIONAL);
-    let width = leaf
-        .type_length
-        .filter(|w| *w > 0 && w % 4 == 0)
-        .ok_or_else(|| {
-            ParquetError::Unsupported("the type length is not a whole number of f32".into())
-        })?;
+    let width = match kind {
+        Some(AttrKind::Int32 | AttrKind::Float) => 4,
+        Some(AttrKind::Int64 | AttrKind::Double) => 8,
+        None => leaf
+            .type_length
+            .filter(|w| *w > 0 && w % 4 == 0)
+            .ok_or_else(|| {
+                ParquetError::Unsupported("the type length is not a whole number of f32".into())
+            })?,
+    };
     let dims = u32::try_from(width / 4).map_err(|_| bad("too many dimensions"))?;
 
     let mut extents = Vec::new();
@@ -657,7 +775,7 @@ pub async fn locate<S: BlobStore>(
         {
             return unsupported("the column uses an encoding other than PLAIN or a dictionary");
         }
-        if m.ty != Some(TYPE_FLBA) {
+        if m.ty != Some(ty) {
             return unsupported("a chunk's type disagrees with the schema");
         }
         let data_start = u64::try_from(m.data_page_offset.ok_or(bad("no data page offset"))?)
@@ -852,12 +970,15 @@ pub async fn locate<S: BlobStore>(
         }
         first_row += want;
     }
-    Ok(Located {
-        len,
-        dims,
-        extents,
-        rows: first_row,
-    })
+    Ok((
+        Located {
+            len,
+            dims,
+            extents,
+            rows: first_row,
+        },
+        kind,
+    ))
 }
 
 #[cfg(test)]
@@ -1049,6 +1170,24 @@ mod tests {
         let mut t = Thrift::new(&sib);
         assert_eq!(t.skip(9), Some(()));
         assert_eq!(t.position(), sib.len());
+    }
+
+    #[test]
+    fn a_logical_type_is_signed_only_as_an_integer_with_is_signed() {
+        let signed = |b: &[u8]| logical_is_signed_int(&mut Thrift::new(b));
+        // INTEGER (union field 10): bitWidth 8, isSigned true / false.
+        assert_eq!(signed(&[0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]), Some(true));
+        assert_eq!(signed(&[0xAC, 0x13, 0x08, 0x12, 0x00, 0x00]), Some(false));
+        // Another member (field 5, a struct) that happens to hold a true bool 2 is not an integer.
+        assert_eq!(signed(&[0x5C, 0x21, 0x00, 0x00]), Some(false));
+    }
+
+    #[test]
+    fn a_converted_type_is_read_from_the_schema_element() {
+        // Field 6 (delta 6, type 5): zigzag(15) = 30, INT_8.
+        let b = [0x65, 0x1E, 0x00];
+        let leaf = schema_element(&mut Thrift::new(&b)).unwrap();
+        assert_eq!(leaf.converted, Some(15));
     }
 
     #[test]

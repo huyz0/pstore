@@ -8,7 +8,9 @@
 
 use crate::rabitq::{QuantError, Quantizer};
 use pstore_blob::{BlobError, BlobStore, Key};
-use pstore_format::external::{DictRef, Extent, ExternalColumn, ExternalError, ObjectRef};
+use pstore_format::external::{
+    AttrValue, DictRef, Extent, ExternalAttribute, ExternalColumn, ExternalError, ObjectRef,
+};
 use pstore_types::CasTag;
 
 const MAGIC: &[u8; 4] = b"PXI6";
@@ -321,6 +323,44 @@ impl ExternalIndex {
         window: usize,
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
         self.search_where(store, query, k, window, &|_| true).await
+    }
+
+    /// [`Self::search_where`], over the rows whose value in `attr` -- a scalar column of **this
+    /// index's own object** (M95) -- `keep` admits; `keep` sees `None` for a null. The column is
+    /// read once, in full, before any code is scored.
+    ///
+    /// # Errors
+    /// As [`Self::search`]; [`ExternalIndexError::Corrupt`] for an attribute in another object or
+    /// of another row count, before any vector is read.
+    pub async fn search_attr<S: BlobStore>(
+        &self,
+        store: &S,
+        query: &[f32],
+        k: usize,
+        window: usize,
+        attr: &ExternalAttribute,
+        keep: &(dyn Fn(Option<&AttrValue>) -> bool + Sync),
+    ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
+        if attr.column.key != self.column.key {
+            return Err(ExternalIndexError::Corrupt(
+                "the attribute is in another object than the vectors",
+            ));
+        }
+        if attr.column.rows != self.column.rows {
+            return Err(ExternalIndexError::Corrupt(
+                "the attribute has another number of rows than the vectors",
+            ));
+        }
+        let mask: Vec<bool> = attr
+            .read_all(store)
+            .await?
+            .iter()
+            .map(|v| keep(v.as_ref()))
+            .collect();
+        self.search_where(store, query, k, window, &|row| {
+            mask.get(row).copied().unwrap_or(false)
+        })
+        .await
     }
 
     /// [`Self::search`], over only the rows `allow` admits (M73): the others are never scored,

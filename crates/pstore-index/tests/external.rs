@@ -831,3 +831,227 @@ async fn objects_without_a_tag_round_trip_through_the_blob() {
         assert_eq!(back.extent_count(), with.extent_count());
     }
 }
+
+// ---- M95: the attribute is a column of the same Parquet object ---------------------------------
+
+use pstore_format::external::{AttrValue, ExternalAttribute};
+
+fn id_of(v: Option<&AttrValue>) -> Option<i64> {
+    match v {
+        Some(AttrValue::Int(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_filter_on_the_files_own_column_equals_the_exact_filtered_cosine() {
+    let (store, index, all) = parquet_index().await;
+    let key = Key::new("lake/multipage.parquet");
+    let attr = ExternalAttribute::pin_parquet(&store, &key, "id")
+        .await
+        .unwrap();
+    let keep = |v: Option<&AttrValue>| id_of(v).is_some_and(|i| i % 7 == 3);
+    let q = &all[1_000];
+    let mut exact: Vec<(usize, f64)> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 7 == 3)
+        .map(|(i, v)| (i, cosine(q, v)))
+        .collect();
+    exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+    let full = index
+        .search_attr(&store, q, 10, 2_600, &attr, &keep)
+        .await
+        .unwrap();
+    assert_eq!(full.iter().map(|g| g.0).collect::<Vec<_>>(), want);
+    assert!(full.iter().all(|g| g.0 % 7 == 3));
+    // The same rows as the caller-supplied predicate of M73 admits.
+    let by_hand = index
+        .search_where(&store, q, 10, 2_600, &|r| r % 7 == 3)
+        .await
+        .unwrap();
+    assert_eq!(full, by_hand);
+    // A window of 20 would hold about 3 survivors if filtered after; pruned first, it holds 20.
+    let small = index
+        .search_attr(&store, q, 10, 20, &attr, &keep)
+        .await
+        .unwrap();
+    assert_eq!(small.len(), 10);
+    assert!(small.iter().all(|g| g.0 % 7 == 3));
+}
+
+#[tokio::test]
+async fn an_attribute_of_another_object_or_length_is_refused() {
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(TenantId(1));
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let put = |name: &'static str, file: &'static str| {
+        let store = store.clone();
+        async move {
+            let key = Key::new(format!("lake/{name}"));
+            let raw = std::fs::read(format!("{dir}{file}")).unwrap();
+            store.put(&key, raw.into()).await.unwrap();
+            key
+        }
+    };
+    let key = put("multipage.parquet", "multipage.parquet").await;
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 700)
+        .await
+        .unwrap();
+    // Another object (a copy of the very same file), pinned honestly.
+    let other = put("elsewhere.parquet", "multipage.parquet").await;
+    let attr = ExternalAttribute::pin_parquet(&store, &other, "id")
+        .await
+        .unwrap();
+    // The right object name and a column of another length: 300 rows named as the 2,600.
+    let short = put("short.parquet", "good.parquet").await;
+    let mut wrong_len = ExternalAttribute::pin_parquet(&store, &short, "id")
+        .await
+        .unwrap();
+    wrong_len.column.key = "lake/multipage.parquet".to_owned();
+    acct.record_ranges();
+    let err = index
+        .search_attr(&store, &[1.0; 8], 10, 100, &attr, &|_| true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("another object"), "{err}");
+    let err = index
+        .search_attr(&store, &[1.0; 8], 10, 100, &wrong_len, &|_| true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rows"), "{err}");
+    // Neither refusal moved a byte of any of the objects.
+    for k in [&key, &other, &short] {
+        assert_eq!(acct.bytes_in(k, 0..u64::MAX), 0, "{k:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_attribute_that_admits_nothing_reads_no_vector() {
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(TenantId(1));
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let key = Key::new("lake/multipage.parquet");
+    store
+        .put(
+            &key,
+            std::fs::read(format!("{dir}multipage.parquet"))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let attr = ExternalAttribute::pin_parquet(&store, &key, "id")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col.clone(), 700)
+        .await
+        .unwrap();
+    // The bytes the vectors occupy: the attribute's pages are elsewhere in the same file.
+    let first = col.extents.iter().map(|e| e.offset).min().unwrap();
+    let last = col
+        .extents
+        .iter()
+        .map(|e| e.offset + e.rows * 32)
+        .max()
+        .unwrap();
+    acct.record_ranges();
+    let got = index
+        .search_attr(&store, &[1.0; 8], 10, 100, &attr, &|_| false)
+        .await
+        .unwrap();
+    assert!(got.is_empty());
+    assert_eq!(acct.bytes_in(&key, first..last), 0);
+    // The attribute itself was read: its pages are in the file, outside the vectors'.
+    assert!(acct.bytes_in(&key, 0..col.len) > 0);
+}
+
+#[tokio::test]
+async fn a_null_attribute_reaches_keep_as_none() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}good.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/vectors-attrs.parquet");
+    store
+        .put(
+            &key,
+            std::fs::read(format!("{dir}vectors-attrs.parquet"))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 100)
+        .await
+        .unwrap();
+    let grp = ExternalAttribute::pin_parquet(&store, &key, "grp")
+        .await
+        .unwrap();
+    let score = ExternalAttribute::pin_parquet(&store, &key, "score")
+        .await
+        .unwrap();
+    let null = |r: usize| r % 7 == 3;
+    let exact = |keep: &dyn Fn(usize) -> bool| -> Vec<usize> {
+        let q = &all[10];
+        let mut e: Vec<(usize, f64)> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(i, v)| (i, cosine(q, v)))
+            .collect();
+        e.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        e.iter().take(10).map(|x| x.0).collect()
+    };
+    let rows = |hits: Vec<(usize, f32)>| hits.into_iter().map(|h| h.0).collect::<Vec<_>>();
+    // Only the nulls.
+    let got = index
+        .search_attr(&store, &all[10], 10, 300, &grp, &|v| v.is_none())
+        .await
+        .unwrap();
+    assert_eq!(rows(got), exact(&null));
+    // Everything but the nulls, and the value is the file's.
+    let got = index
+        .search_attr(
+            &store,
+            &all[10],
+            10,
+            300,
+            &grp,
+            &|v| matches!(v, Some(AttrValue::Int(g)) if *g == 2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows(got), exact(&|r| !null(r) && r % 5 == 2));
+    // A float attribute is compared as the number it is.
+    let got = index
+        .search_attr(&store, &all[10], 10, 300, &score, &|v| {
+            v.is_some_and(|v| v.as_f64() >= 29.0)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows(got), exact(&|r| r >= 290));
+    // Null is not admitted by a predicate that wants a value.
+    let got = index
+        .search_attr(&store, &all[10], 10, 300, &grp, &|v| v.is_some())
+        .await
+        .unwrap();
+    assert_eq!(rows(got), exact(&|r| !null(r)));
+}

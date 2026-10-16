@@ -1729,3 +1729,237 @@ async fn a_column_after_a_list_is_found_past_the_whole_list() {
         "{err}"
     );
 }
+
+// ---- M95: a scalar attribute column, read by the machinery a vector column is ----------------
+
+use pstore_format::external::{AttrKind, AttrValue, ExternalAttribute};
+use pstore_format::parquet::locate_scalar;
+
+fn id_column(rows: usize) -> Vec<Option<AttrValue>> {
+    (0..rows)
+        .map(|r| Some(AttrValue::Int(i64::try_from(r).unwrap())))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_scalar_column_is_located_and_read_back() {
+    for (file, rows) in [("good.parquet", 300), ("multipage.parquet", 2600)] {
+        let (store, key) = put(file).await;
+        let (found, kind) = locate_scalar(&store, &key, "id").await.unwrap();
+        assert_eq!((kind, found.rows, found.dims), (AttrKind::Int64, rows, 2));
+        let attr = ExternalAttribute::pin_parquet(&store, &key, "id")
+            .await
+            .unwrap();
+        assert_eq!(attr.kind, AttrKind::Int64);
+        assert_eq!(attr.column.rows, rows);
+        assert_eq!(
+            attr.read_all(&store).await.unwrap(),
+            id_column(rows as usize),
+            "{file}"
+        );
+    }
+    // multipage.parquet's id column is spread over several pages.
+    let (store, key) = put("multipage.parquet").await;
+    let (found, _) = locate_scalar(&store, &key, "id").await.unwrap();
+    assert!(found.extents.len() > 1);
+}
+
+#[tokio::test]
+async fn a_scalar_column_is_read_in_every_encoding() {
+    // The two files whose levels or indices a compressed or dictionary page hides are refused
+    // for `id` exactly as for `embedding` (M84).
+    let refused = ["optional-snappy.parquet", "optional-dictionary.parquet"];
+    let mut read = 0;
+    let mut names: Vec<String> = std::fs::read_dir(DIR)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| {
+            n.ends_with(".parquet")
+                && !["list", "scalars", "int96", "vectors-attrs"]
+                    .iter()
+                    .any(|p| n.starts_with(p))
+        })
+        .collect();
+    names.sort();
+    for file in names {
+        let (store, key) = put(&file).await;
+        let attr = ExternalAttribute::pin_parquet(&store, &key, "id").await;
+        if refused.contains(&file.as_str()) {
+            assert!(attr.is_err(), "{file} should be refused");
+            continue;
+        }
+        let attr = attr.expect(&file);
+        let got = attr.read_all(&store).await.unwrap();
+        assert!(
+            got.len() == 300 || got.len() == 2600,
+            "{file}: {}",
+            got.len()
+        );
+        assert_eq!(got, id_column(got.len()), "{file}");
+        read += 1;
+    }
+    // 26 flat fixtures: every codec, dictionary and v2 file is among the 24 read.
+    assert_eq!(read, 24);
+}
+
+#[test]
+fn a_scalar_column_of_each_kind_decodes() {
+    let i32s = [-5i32, 0, i32::MIN, i32::MAX];
+    for v in i32s {
+        assert_eq!(
+            AttrKind::Int32.decode(&v.to_le_bytes()),
+            Some(AttrValue::Int(i64::from(v)))
+        );
+    }
+    for v in [i64::MIN, -1, 0, 1, i64::MAX, 0x7fc0_0000_0000_0001] {
+        assert_eq!(
+            AttrKind::Int64.decode(&v.to_le_bytes()),
+            Some(AttrValue::Int(v))
+        );
+    }
+    // A FLOAT is widened exactly.
+    assert_eq!(
+        AttrKind::Float.decode(&0.1f32.to_le_bytes()),
+        Some(AttrValue::Float(f64::from(0.1f32)))
+    );
+    // A DOUBLE is the file's bits: a subnormal and -0.0 included.
+    for v in [f64::MIN_POSITIVE / 4.0, -0.0, 1.0 / 3.0, f64::MAX] {
+        let got = AttrKind::Double.decode(&v.to_le_bytes()).unwrap();
+        assert!(matches!(got, AttrValue::Float(g) if g.to_bits() == v.to_bits()));
+    }
+    // The wrong number of bytes is no value.
+    assert_eq!(AttrKind::Int32.decode(&[0; 8]), None);
+    assert_eq!(AttrKind::Int64.decode(&[0; 4]), None);
+    assert_eq!(AttrKind::Float.decode(&[]), None);
+    assert_eq!(AttrKind::Double.decode(&[0; 4]), None);
+    assert_eq!(AttrKind::Int32.width(), 4);
+    assert_eq!(AttrKind::Float.width(), 4);
+    assert_eq!(AttrKind::Int64.width(), 8);
+    assert_eq!(AttrKind::Double.width(), 8);
+    // A value compares as the number it is.
+    assert_eq!(AttrValue::Int(3).as_f64().to_bits(), 3.0f64.to_bits());
+    assert_eq!(AttrValue::Float(2.5).as_f64().to_bits(), 2.5f64.to_bits());
+}
+
+#[tokio::test]
+async fn a_non_scalar_column_is_refused_with_its_type() {
+    let (store, key) = put("good.parquet").await;
+    let err = locate_scalar(&store, &key, "embedding").await.unwrap_err();
+    assert!(err.to_string().contains("FIXED_LEN_BYTE_ARRAY"), "{err}");
+    let err = locate_scalar(&store, &key, "nope").await.unwrap_err();
+    assert!(err.to_string().contains("no column"), "{err}");
+    let (store, key) = put("list.parquet").await;
+    let err = locate_scalar(&store, &key, "embedding").await.unwrap_err();
+    assert!(err.to_string().contains("nested"), "{err}");
+    // `locate` of the scalar column still says what it always did.
+    let (store, key) = put("multipage.parquet").await;
+    let err = locate(&store, &key, "id").await.unwrap_err();
+    assert!(err.to_string().contains("FIXED_LEN_BYTE_ARRAY"), "{err}");
+}
+
+fn col(name: &str, r: usize) -> Option<AttrValue> {
+    let r64 = r as i64;
+    let null = r % 7 == 3;
+    match name {
+        "i32" => Some(AttrValue::Int(r64 * 1000 - 150_000)),
+        "i64" => Some(AttrValue::Int(r64 * 4_000_000_000 - 5_000_000_000)),
+        "f32" => Some(AttrValue::Float(f64::from(r as f32 * 0.25 - 10.0))),
+        "f64" => Some(AttrValue::Float(r as f64 / 3.0)),
+        "i64n" => (!null).then_some(AttrValue::Int(r64 * 10)),
+        "i32n" => (!null).then_some(AttrValue::Int(r64 - 100)),
+        "f64n" => (!null).then_some(AttrValue::Float(r as f64 / 4.0)),
+        "i8" => Some(AttrValue::Int(r64 % 100 - 50)),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn scalar_columns_of_each_type_read_back_with_their_nulls() {
+    let (store, key) = put("scalars.parquet").await;
+    for name in ["i32", "i64", "f32", "f64", "i64n", "i32n", "f64n", "i8"] {
+        let attr = ExternalAttribute::pin_parquet(&store, &key, name)
+            .await
+            .expect(name);
+        let got = attr.read_all(&store).await.unwrap();
+        let want: Vec<_> = (0..300).map(|r| col(name, r)).collect();
+        assert_eq!(got, want, "{name}");
+        // A column with nulls is many runs, with a gap between each.
+        assert_eq!(
+            attr.column.extents.len() > 1,
+            name.ends_with('n'),
+            "{name}: {} runs",
+            attr.column.extents.len()
+        );
+    }
+    // The columns with nulls have some, and the others have none.
+    let n = ExternalAttribute::pin_parquet(&store, &key, "i64n")
+        .await
+        .unwrap();
+    let got = n.read_all(&store).await.unwrap();
+    assert_eq!(got.iter().filter(|v| v.is_none()).count(), 43);
+    assert!(got[3].is_none() && got[4].is_some());
+}
+
+#[tokio::test]
+async fn a_logical_type_its_physical_value_does_not_carry_is_refused() {
+    let (store, key) = put("scalars.parquet").await;
+    for name in ["u32", "u64", "date", "ts_ns", "ts_ms", "dec"] {
+        let err = ExternalAttribute::pin_parquet(&store, &key, name)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("logical type"), "{name}: {err}");
+    }
+    for (name, ty) in [("flag", "BOOLEAN"), ("name", "BYTE_ARRAY")] {
+        let err = ExternalAttribute::pin_parquet(&store, &key, name)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(ty), "{name}: {err}");
+    }
+    let (store, key) = put("int96.parquet").await;
+    let err = ExternalAttribute::pin_parquet(&store, &key, "ts96")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("INT96"), "{err}");
+}
+
+#[tokio::test]
+async fn nulls_that_cannot_be_read_in_place_are_refused_by_name() {
+    // v1 pages compress their levels with the values (M84).
+    let (store, key) = put("scalars-zstd.parquet").await;
+    let err = ExternalAttribute::pin_parquet(&store, &key, "i64n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("levels are inside"), "{err}");
+    // A v2 compressed page that holds nulls: its values cannot be ranked (M84).
+    let (store, key) = put("scalars-v2-zstd.parquet").await;
+    let err = ExternalAttribute::pin_parquet(&store, &key, "i64n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("holds nulls"), "{err}");
+    // Without nulls the same file reads.
+    let attr = ExternalAttribute::pin_parquet(&store, &key, "i64")
+        .await
+        .unwrap();
+    assert_eq!(
+        attr.read_all(&store).await.unwrap(),
+        (0..300).map(|r| col("i64", r)).collect::<Vec<_>>()
+    );
+    // A column of nothing but nulls has no value to read.
+    let (store, key) = put("scalars.parquet").await;
+    assert!(
+        ExternalAttribute::pin_parquet(&store, &key, "allnull")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_column_claiming_too_many_rows_is_not_read() {
+    let (store, key) = put("scalars.parquet").await;
+    let mut attr = ExternalAttribute::pin_parquet(&store, &key, "i64")
+        .await
+        .unwrap();
+    attr.column.rows = pstore_format::external::MAX_ATTRIBUTE_ROWS + 1;
+    let err = attr.read_all(&store).await.unwrap_err();
+    assert!(err.to_string().contains("too many rows"), "{err}");
+}

@@ -219,6 +219,138 @@ fn decompress(codec: u8, comp: &[u8], expected: usize) -> Result<Vec<u8>, Extern
     }
 }
 
+/// The physical type of a scalar attribute column (M95).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrKind {
+    /// Parquet `INT32`.
+    Int32,
+    /// Parquet `INT64`.
+    Int64,
+    /// Parquet `FLOAT`.
+    Float,
+    /// Parquet `DOUBLE`.
+    Double,
+}
+
+/// One value of a scalar attribute column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttrValue {
+    /// An `INT32` or `INT64`.
+    Int(i64),
+    /// A `FLOAT` (widened exactly) or `DOUBLE`.
+    Float(f64),
+}
+
+impl AttrValue {
+    /// The value as a number to compare, an `i64` rounded to the nearest `f64` above 2^53.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, reason = "a comparison, named in the doc")]
+    pub fn as_f64(&self) -> f64 {
+        match *self {
+            Self::Int(v) => v as f64,
+            Self::Float(v) => v,
+        }
+    }
+}
+
+/// A column of more than [`MAX_ATTRIBUTE_ROWS`] rows is not read whole.
+fn check_attribute_rows(rows: u64) -> Result<(), ExternalError> {
+    if rows > MAX_ATTRIBUTE_ROWS {
+        return Err(ExternalError::Shape(
+            "too many rows to read as an attribute",
+        ));
+    }
+    Ok(())
+}
+
+impl AttrKind {
+    /// Bytes a value occupies.
+    #[must_use]
+    pub fn width(self) -> usize {
+        match self {
+            Self::Int32 | Self::Float => 4,
+            Self::Int64 | Self::Double => 8,
+        }
+    }
+
+    /// The value `raw` (little-endian, exactly [`Self::width`] bytes) holds, if it is that long.
+    #[must_use]
+    pub fn decode(self, raw: &[u8]) -> Option<AttrValue> {
+        Some(match self {
+            Self::Int32 => AttrValue::Int(i64::from(i32::from_le_bytes(raw.try_into().ok()?))),
+            Self::Int64 => AttrValue::Int(i64::from_le_bytes(raw.try_into().ok()?)),
+            Self::Float => AttrValue::Float(f64::from(f32::from_le_bytes(raw.try_into().ok()?))),
+            Self::Double => AttrValue::Float(f64::from_le_bytes(raw.try_into().ok()?)),
+        })
+    }
+}
+
+/// The most rows [`ExternalAttribute::read_all`] reads: it holds the whole column and a mask of
+/// it in memory, so a column claiming more (a damaged page can claim any count) is refused.
+pub const MAX_ATTRIBUTE_ROWS: u64 = 1 << 27;
+
+/// A scalar column of a Parquet object (M95), read through the same extents a vector column is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAttribute {
+    /// The column's runs, as a vector column of `kind.width() / 4` lanes.
+    pub column: ExternalColumn,
+    /// What a value is.
+    pub kind: AttrKind,
+}
+
+impl ExternalAttribute {
+    /// Pins the scalar column `column` of the Parquet object at `key`.
+    ///
+    /// # Errors
+    /// [`ExternalError::Parquet`] for a file or column that cannot be read in place, or is not
+    /// `INT32`, `INT64`, `FLOAT` or `DOUBLE`; a store failure.
+    pub async fn pin_parquet<S: BlobStore>(
+        store: &S,
+        key: &Key,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let (found, kind) = crate::parquet::locate_scalar(store, key, column).await?;
+        let tag = store.get_tag(key).await?;
+        if store.head(key).await? != found.len {
+            return Err(ExternalError::Changed);
+        }
+        let column = ExternalColumn::from_runs(
+            key.as_str(),
+            found.dims,
+            found.len,
+            tag,
+            found.rows,
+            found.extents,
+        )?;
+        Ok(Self { column, kind })
+    }
+
+    /// Every row's value, `None` for a null: one ranged read of the column's pages.
+    ///
+    /// # Errors
+    /// [`ExternalError::Changed`] if the object moved since the pin; [`ExternalError::Damaged`]
+    /// for a page that does not hold its rows; a store failure.
+    pub async fn read_all<S: BlobStore>(
+        &self,
+        store: &S,
+    ) -> Result<Vec<Option<AttrValue>>, ExternalError> {
+        check_attribute_rows(self.column.rows)?;
+        let rows = usize::try_from(self.column.rows).map_err(|_| ExternalError::Damaged)?;
+        let present: Vec<usize> = (0..rows).filter(|r| self.column.is_present(*r)).collect();
+        let mut got = self.column.read_rows_bytes(store, &present).await?;
+        (0..rows)
+            .map(|r| match got.remove(&r) {
+                None => Ok(None),
+                Some(raw) => self
+                    .kind
+                    .decode(&raw)
+                    .map(Some)
+                    .ok_or(ExternalError::Damaged),
+            })
+            .collect()
+    }
+}
+
 /// A column of fixed-width `f32` vectors inside an external object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalColumn {
@@ -614,6 +746,30 @@ impl ExternalColumn {
         store: &S,
         rows: &[usize],
     ) -> Result<BTreeMap<usize, Vec<f32>>, ExternalError> {
+        Ok(self
+            .read_rows_bytes(store, rows)
+            .await?
+            .into_iter()
+            .map(|(row, raw)| {
+                let lanes = raw
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                    .collect();
+                (row, lanes)
+            })
+            .collect())
+    }
+
+    /// [`Self::read_rows`], as the bytes the object holds a row as (M95): a scalar attribute is
+    /// decoded from them, not from `f32` lanes whose bit patterns a float could disturb.
+    ///
+    /// # Errors
+    /// As [`Self::read_rows`].
+    pub async fn read_rows_bytes<S: BlobStore>(
+        &self,
+        store: &S,
+        rows: &[usize],
+    ) -> Result<BTreeMap<usize, Vec<u8>>, ExternalError> {
         let mut wanted: Vec<usize> = rows
             .iter()
             .copied()
@@ -674,14 +830,9 @@ impl ExternalColumn {
         );
         let mut bufs = self.fetch(store, &ranges).await?.into_iter();
         let mut out = BTreeMap::new();
-        let floats = |raw: &[u8]| -> Vec<f32> {
-            raw.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                .collect()
-        };
         for row in &raw_rows {
             let raw = bufs.next().ok_or(ExternalError::Damaged)?;
-            out.insert(*row, floats(&raw));
+            out.insert(*row, raw.to_vec());
         }
         // `bufs` yields the pages first and the dictionaries after, as `ranges` was built.
         let page_bufs: Vec<_> = (0..page_at.len()).filter_map(|_| bufs.next()).collect();
@@ -723,7 +874,7 @@ impl ExternalColumn {
                         .map_err(|_| ExternalError::Damaged)?
                         * width;
                     let raw = table.get(at..at + width).ok_or(ExternalError::Damaged)?;
-                    out.insert(*r, floats(raw));
+                    out.insert(*r, raw.to_vec());
                 }
                 continue;
             }
@@ -737,7 +888,7 @@ impl ExternalColumn {
                     .map_err(|_| ExternalError::Damaged)?
                     * width;
                 let raw = page.get(at..at + width).ok_or(ExternalError::Damaged)?;
-                out.insert(*r, floats(raw));
+                out.insert(*r, raw.to_vec());
             }
         }
         Ok(out)
@@ -752,7 +903,15 @@ impl ExternalColumn {
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
-    use super::decode_indices;
+    use super::{MAX_ATTRIBUTE_ROWS, check_attribute_rows, decode_indices};
+
+    #[test]
+    fn the_attribute_row_cap_is_inclusive() {
+        assert!(check_attribute_rows(0).is_ok());
+        assert!(check_attribute_rows(MAX_ATTRIBUTE_ROWS - 1).is_ok());
+        assert!(check_attribute_rows(MAX_ATTRIBUTE_ROWS).is_ok());
+        assert!(check_attribute_rows(MAX_ATTRIBUTE_ROWS + 1).is_err());
+    }
 
     /// An RLE run: `n` copies of `v`, `width` bits (so `ceil(width / 8)` bytes).
     fn rle(n: u64, v: u32, width: usize) -> Vec<u8> {
