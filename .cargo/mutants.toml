@@ -56,8 +56,9 @@ exclude_re = [
     # column, so an edit that moves it makes it reappear as MISSED. (M8k)
     'pstore-index/src/rabitq\.rs:293:23: replace \* with / in Quantizer::rotate',
     # The rescale search keeps the first prefix with the best cosine; `>=` keeps the last. They
-    # differ only between two prefixes with the SAME cosine, so the code chosen is as good either
-    # way, and `exq_search_beats_a_fixed_scale` pins the cosine, which is all a tie decides.
+    # differ only between two prefixes with the SAME cosine: the same cosine, not the same code
+    # (the planes and `||y||` differ), so not strictly equivalent, but no better or worse a code
+    # by the measure the search maximises, which `exq_search_beats_a_fixed_scale` pins.
     # Named by line and column, as above. (M97)
     'pstore-index/src/exq\.rs:166:18: replace > with >= in ExQuantizer::encode_residual',
     # The binary16 conversions assemble sign, exponent and significand with `|`, and the three

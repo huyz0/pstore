@@ -261,3 +261,23 @@ fn a_vector_on_its_centroid_estimates_the_centroid() {
     let q = base.prepare(&[1.0; 8]).unwrap();
     assert_eq!(exq.estimate_residual(&one, &extra, &q, 0.75), 0.75);
 }
+
+#[test]
+fn a_residual_too_small_to_normalise_estimates_the_centroid() {
+    // A residual whose squares underflow in f32 has `||o - c|| = 0` but is not zero, so it is
+    // coded unnormalised (M8k) and its cosine is tiny but NOT zero: the guard in
+    // `estimate_residual` does not fire, and the zero norm must still give `<c, q>`, not the
+    // NaN or infinity a reordered `norm * (acc / (||y|| cos))` gives (M97 review).
+    let base = Quantizer::new(8);
+    let exq = ExQuantizer::new(&base, 4).unwrap();
+    let c = [0.0f32; 8];
+    let v = [1e-40f32, -1e-40, 2e-40, 0.0, 1e-40, 0.0, -3e-40, 1e-40];
+    let one = base.encode_residual(&v, &c).unwrap();
+    let extra = exq.encode_residual(&v, &c).unwrap();
+    assert_eq!(one.residual_norm(), 0.0);
+    assert!(extra.cosine() > 0.0, "{}", extra.cosine());
+    let q = base
+        .prepare(&[1.0, -2.0, 3.0, 0.5, 1.0, 1.0, -1.0, 2.0])
+        .unwrap();
+    assert_eq!(exq.estimate_residual(&one, &extra, &q, 0.75), 0.75);
+}

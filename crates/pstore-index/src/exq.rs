@@ -221,7 +221,10 @@ impl ExQuantizer {
     ) -> f32 {
         // No direction to estimate: a vector on its centroid, as the 1-bit code returns. A
         // zero residual is the only way `encode_residual` gives a zero cosine, so this one
-        // test is both (and a `residual_norm() == 0.0` beside it was unkillable, M97).
+        // test covers it (a `residual_norm() == 0.0` beside it was unkillable, M97). The
+        // converse fails: a residual whose squares underflow has norm 0 and a tiny nonzero
+        // cosine, and the norm multiplying FIRST below is what keeps that `<c, q>` (pinned by
+        // `a_residual_too_small_to_normalise_estimates_the_centroid`).
         if extra.cosine == 0.0 {
             return centroid_dot;
         }
@@ -249,10 +252,11 @@ impl ExQuantizer {
 
 /// `(||y||, <ȳ, o'>)` for magnitudes `m` against the rotated residual `r`.
 ///
-/// ⚠️ `r` is a **unit** vector or zero, as `rotated_residual` gives it: the rotation is
-/// orthonormal, so `||o'||` is not divided by, as the search in `encode_residual` does not.
-/// A `* ||o'||²` here was unkillable, and a search and a cosine that disagree about it would
-/// pick a code by one measure and report it by another (M97).
+/// ⚠️ `r` is a **unit** vector or zero, as `rotated_residual` gives it, or tiny and
+/// unnormalised for a residual whose squares underflow (its cosine is still nonzero). The
+/// rotation is orthonormal, so `||o'||` is not divided by, as the search in
+/// `encode_residual` does not. A `* ||o'||²` here was unkillable, and a search and a cosine
+/// that disagree about it would pick a code by one measure and report it by another (M97).
 fn cosine(r: &[f32], m: &[u32]) -> (f32, f32) {
     let mut num = 0.0f64;
     let mut y2 = 0.0f64;
@@ -261,7 +265,7 @@ fn cosine(r: &[f32], m: &[u32]) -> (f32, f32) {
         num += f64::from(x.abs()) * y;
         y2 += y * y;
     }
-    // `y2 >= D / 4 > 0`, so no branch: a zero residual has `num = 0` and so cosine 0, which
+    // `y2 >= padded / 4 > 0`, so no branch: a zero residual has `num = 0` and so cosine 0, which
     // `estimate_residual` reads as "no direction".
     let cos = num / y2.sqrt();
     (y2.sqrt() as f32, cos as f32)

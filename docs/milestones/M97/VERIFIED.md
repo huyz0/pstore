@@ -119,26 +119,42 @@ unchanged: clustered `fast` is 0.9810 at p=8 and uniform is 0.5150.
      - `./scripts/recall.sh --prism` was rerun after the changes, and its output is identical
        to the block above.
    - `./scripts/gates.sh`: every gate PASS, on the tree as committed.
-   - ⚠️ **`./scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95`: FAIL on
-     regions, and it was already failing before M97.**
-     - Measured here: lines 96.47% and regions **94.52%** (2,922 of 53,275 missed).
-     - CI's `coverage` job on the base commit, `63f9779`, which changed only docs: lines
-       96.45% and regions **94.49%** (2,918 of 52,913).
-     - So M97 raises both. Its own files, by regions: `exq.rs` 97.37%, `ladder.rs` 100%,
+   - **`./scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95`: PASS**, after a
+     follow-up commit that restores the region floor. As first committed, M97 failed it.
+     - At `991c86a`, measured here: lines 96.47% and regions **94.52%** (2,922 of 53,275
+       missed). CI's `coverage` job on the base, `63f9779`, read 94.49%, so the floor was
+       already red before M97. M97's own files: `exq.rs` 97.37%, `ladder.rs` 100%,
        `rabitq.rs` 97.53%, `search.rs` 96.48%.
-     - Reaching 95% again needs about 260 more covered regions in crates M97 does not touch,
-       for example `pstore-query/src/condition.rs` at 86.21%. That is its own task. The floor
-       was not moved.
-     - The local run used the default features, while CI uses `--all-features`.
+     - The follow-up adds tests and no shipping code. Each was seen red against an injected
+       defect before it counted. The tests cover the external index's decoder (every
+       truncation of a blob with every section), the HEAD decoder (every cut of a HEAD with
+       every section: 14 decodable, one per optional section, seen red at 15 against a read
+       that defaulted), condition, disk-cache key, Lance v2.1 compression, analyzer and
+       full-text line refusals, the jobs queue's config, a lost registration, Azure offline
+       build, sketch declarations, reserved names, strong reads of a past epoch, and a
+       multi-vector query of another width, on both the exact and the FDE path.
+     - Measured on the tree as committed, `--all-features` as CI runs it: exit 0, lines
+       96.85% and regions **95.08%** (2,652 of 53,946 missed). With the default features:
+       exit 0, the same 95.08% and 2,652 missed.
+     - No threshold was moved.
    - **Review:**
-     - One reviewer round on the full staged diff found one major finding and one minor.
-       - Major: this ledger was untracked while staged docs linked to it. It is in this
-         commit.
-       - Minor: a test comment said "about 2%" where the measured bias is −0.0048. It was
-         corrected.
-     - The changes since then are the mutation-driven ones listed above. They were not given
-       a reviewer of their own, because `review.sh` puts this tag past its two-round budget.
-       The re-sweep and the unchanged `--prism` output are their evidence.
+     - Round 1 on the full staged diff found one major finding and one minor.
+       - Major: this ledger was untracked while staged docs linked to it. Fixed in `991c86a`.
+       - Minor: a test comment said "about 2%" where the measured bias is −0.0048. Corrected.
+     - A later round, on the mutation-driven changes made after round 1, found no blocking or
+       major finding, and three minors, each addressed:
+       - A residual whose squares underflow has norm 0 and a nonzero cosine, so the
+         `cosine == 0` guard does not catch it. It is safe only because the estimate
+         multiplies by the norm first. That is now stated in `estimate_residual` and pinned
+         by `a_residual_too_small_to_normalise_estimates_the_centroid`, which was seen red
+         (NaN) with the product reordered.
+       - The `>` → `>=` exclusion in `.cargo/mutants.toml` said the two prefixes give "the
+         same code". They give the same cosine, not the same code. The comment now says
+         so, and that the mutant is not strictly equivalent.
+       - A comment said `y2 >= D / 4` where it is `padded / 4`. Corrected.
+     - The coverage tests were reviewed as their own change, in one round on the
+       full staged diff: pass, with no blocking or major finding and three minors, which land
+       as they are and are listed in that commit's message.
 
 **Not covered**, as the spec states: a segment section, an index option, an engine path or any
 API. Real embedding families (OQ-39) are not covered either. A B above 4 was not measured. At 384d
