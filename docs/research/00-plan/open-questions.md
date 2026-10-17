@@ -69,6 +69,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
 | OQ-100 | Does class→region segregation reach the ~1.03 DLWA the FDP paper reports, without FDP hardware? | `07/disk-space-management` |
 | OQ-103 | Behaviour when the cache device fails outright mid-flight — must be identical to bypass mode, and the node must not die. Verify. | `07/disk-space-management` |
+| OQ-170 | Can a narrower rerank tier (extended RaBitQ, 2–4 bits a dimension) replace int8 at its recall? The int8 records are **84%** of the bytes a `fast` query moves, and of the resident working set: a 4-bit tier is 0.59× the bytes a probed row, 2-bit 0.38×. Measured by [M97](../../milestones/M97/SPEC.md) criterion 1 against an sq4 control. | `06/prism-comparison` |
 
 ## Tier 3 — tuning and refinement
 
@@ -99,7 +100,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-36` exact-scan threshold ·
 `OQ-37` centroid hierarchy above 1M centroids ·
 `OQ-38` boundary augmentation factor by dimension ·
-`OQ-40` oversample factor per rerank rung ·
+`OQ-40` oversample factor per rerank rung — **candidate answer: none, size the survivors by the error bound** ([M97](../../milestones/M97/SPEC.md) criterion 3) ·
 `OQ-41` 1-bit quantization at 3072d / Matryoshka ·
 `OQ-42` opt-in PQ for customers who benchmark it better ·
 ~~`OQ-44`~~ **closed** — do not hoist it: the pruning it feeds skips **0 bytes** at every query width and `top_k` measured ([C-15](../06-indexing/full-text-search.md)) ·
@@ -109,6 +110,9 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-49` `p_effective` explosion on anti-correlated filters ·
 `OQ-52` drift thresholds for re-clustering ·
 `OQ-53` centroid hierarchy crossover ·
+`OQ-171` does an int8 centroid table rank probes as `f32` does at every `p` we use? a quarter of the hottest object ([M97](../../milestones/M97/SPEC.md) criterion 4) ·
+`OQ-172` SOAR secondary assignment against boundary replication, once a replicated row is written once (item 14) ·
+`OQ-173` is 1-bit scoring ever compute-bound on our hardware, so that a fastscan layout would pay (H-1)? ·
 `OQ-55` RAM:NVMe ratio and instance selection ·
 `OQ-56` class-aware admission vs S3-FIFO/W-TinyLFU (see also OQ-101) ·
 ~~`OQ-57`~~ **closed** — warm classes 1–4 only; bulk warming exceeds the endurance budget ·

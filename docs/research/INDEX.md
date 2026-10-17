@@ -1,7 +1,7 @@
 # pstore Research Index
 
 Master index of all research. **Read this first; it is the map.**
-Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q48`) are
+Every doc states which research question(s) it answers. Question IDs (`Q1`…`Q49`) are
 defined in [`00-plan/research-plan.md`](00-plan/research-plan.md).
 
 **Project:** `pstore` — masterless, object-storage-native search engine (vector + BM25 +
@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 57 documents, 48 research questions answered, 169 open
+**Status: research phase complete.** 58 documents, 49 research questions answered, 173 open
 questions logged. Workspace scaffold live: `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`,
 `crates/pstore-types`. Dev scaffold in [`dev/`](../../dev/README.md). Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
@@ -51,8 +51,8 @@ If you read nothing else:
 ## 00 — Plan
 | Doc | Answers | Status |
 |---|---|---|
-| [research-plan.md](00-plan/research-plan.md) | — | The plan: 48 questions, 9 phases, method. |
-| [open-questions.md](00-plan/open-questions.md) | D36 | **169 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
+| [research-plan.md](00-plan/research-plan.md) | — | The plan: 49 questions, 9 phases, method. |
+| [open-questions.md](00-plan/open-questions.md) | D36 | **173 open questions, risk-ranked.** Tier 1 is what could invalidate the architecture. |
 
 ## 01 — Prior art
 | Doc | Answers | One-line finding |
@@ -105,6 +105,7 @@ If you read nothing else:
 | **[modalities-and-sequencing.md](06-indexing/modalities-and-sequencing.md)** | Q39 | Dense, sparse, and BM25 are one structure: postings with a generic impact payload. Build the general data model (named plural vectors, optional sections, `prefetch[]`+`fusion`) in v1; ship one retriever at a time. **Sparse before BM25** — it's exact, so it's far cheaper. |
 | [filtering.md](06-indexing/filtering.md) | Q22 | Graph indexes collapse under selective filters (islands/dead ends). Clustered indexes compose with pre-filtering. **Our round-trip choice hands us the better filtering architecture for free.** |
 | [incremental-maintenance.md](06-indexing/incremental-maintenance.md) | Q23 | LIRE/SPFresh touches only boundary vectors: 1% of DRAM, <10% of cores vs. global rebuild. ~~the design's biggest open risk (OQ-51)~~ **✅ C-4: measured, it holds — 3.4× less work than a rebuild at 0.4 points of recall. The trigger condition is the whole claim: dirtying on insert collapses the saving from 21× to 1.36×.** |
+| [prism-comparison.md](06-indexing/prism-comparison.md) | Q49 | PRISM (pg_vectorsearch) is our design in Postgres: lists, 1-bit RaBitQ, boundary replication, rerank. **Its memory win over HNSW is ours already.** Three details transfer, and M97 measures them: a narrower rerank tier (int8 is 84% of a `fast` query's bytes), bound-sized survivors (OQ-40), and an int8 centroid table. fastscan, a centroid tree and SOAR do not, yet. |
 
 ## 07 — Caching
 | Doc | Answers | Status |
