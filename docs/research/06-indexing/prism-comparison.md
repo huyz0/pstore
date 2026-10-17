@@ -2,8 +2,9 @@
 
 **Answers:** Q49 — does PRISM, Tiger Data's PostgreSQL vector index, carry an idea that cuts
 our memory, our bytes per query or our CPU without losing recall?
-**Status:** Complete (v1). The three ideas worth taking are specified as
-[M97](../../milestones/M97/SPEC.md); the numbers here are the corpus's, not PRISM's.
+**Status:** Complete (v2). The three ideas that looked worth taking were specified as
+[M97](../../milestones/M97/SPEC.md) and **measured short of their rules** (see
+[Measured](#measured-m97-2026-10-17)). The numbers here are the corpus's, not PRISM's.
 
 ## What PRISM is
 
@@ -48,9 +49,12 @@ details, and the deciding difference between the two systems decides which detai
 > PRISM does *after* the estimate costs it CPU and memory, and costs us **bytes we already
 > chose to move** — or depth we are not allowed.
 
-## The three ideas that transfer (specified as M97)
+## The three ideas that looked transferable (specified as M97)
 
 ### 1. The rerank tier sets our bytes, not the 1-bit tier — and it could be narrower
+
+> ⚠️ **Measured by M97: not at 384d.** A 4-bit tier gives 0.856 against int8's 0.981 on the
+> clustered corpus; see [Measured](#measured-m97-2026-10-17). The banner wins over this section.
 
 `rerank: fast` fetches the int8 record of **every probed row** beside its 1-bit code, in one
 call (`vec_index.rs`; C-3). At 384d a probed row moves 72 bytes of 1-bit code and 392 bytes of
@@ -86,6 +90,9 @@ written at build time and a customer who wants the last 0.5 point of recall can 
 
 ### 2. The error bound can size the survivor set; a constant does today
 
+> ⚠️ **Measured by M97: it keeps recall and keeps more rows**, 500 and 1,024 against 320; see
+> [Measured](#measured-m97-2026-10-17).
+
 `Query::default()` records that oversample 8 gives 0.801 recall@10 and 32 gives 0.981, and
 OQ-40 asks for the factor per rung. PRISM's answer is not a factor: **keep every candidate
 whose upper bound reaches the `k`-th best lower bound.** `Quantizer::error_bound` exists and
@@ -104,6 +111,9 @@ A survivor set sized by the bound rather than by a constant is a test of the fir
 
 ### 3. The centroid table can be stored at int8
 
+> ⚠️ **Measured by M97: no recall lost at any p**, but the probe overlap at clustered p=4 is
+> 0.9875, under the rule's 0.99; see [Measured](#measured-m97-2026-10-17).
+
 The centroid object is `f32` (`vec_index.rs`), sized at about 768 MB in production
 (`vector-index-survey.md`), and it is the one object that must stay resident (D-9). At int8
 it is a quarter of that. PRISM goes further (1-bit plus an exact re-sort), and **the exact
@@ -111,6 +121,60 @@ re-sort is the part we cannot copy**: re-reading `f32` centroids after choosing 
 data-dependent fetch. An int8 table needs no re-sort if its probe order matches `f32`'s,
 and the only other consumer, the residual estimate's `<c, q>`, adds the same error to every
 row of a list — a ranking shift between lists, measured rather than argued.
+
+## Measured (M97, 2026-10-17)
+
+`./scripts/recall.sh --prism`, **provisional**: a Linux cloud container, synthetic corpora, 384d,
+k=10, p=8 and over=32 unless stated. Hit counts are out of 1,000 (100 queries × 10). Each decision
+rule was written in the spec before the harness existed.
+[VERIFIED.md](../../milestones/M97/VERIFIED.md) has the full output.
+
+**1. The rerank tier: no narrower tier holds int8's recall.**
+
+| Tier | Bytes a probed row | Clustered 20,000 (100 lists) | Uniform 10,000 (50 lists) | MB/query clustered |
+|---|---|---|---|---|
+| int8 (control) | 464 | **0.9810** (981) | 0.5150 (515) | 0.841 |
+| exq B=4 | 272 (0.59×) | 0.8560 (856) | 0.5110 (511) | 0.493 |
+| sq4 (unrotated) | 272 (0.59×) | 0.6990 (699) | 0.5040 (504) | 0.493 |
+| exq B=2 | 144 (0.31×) | 0.5540 (554) | 0.4110 (411) | 0.261 |
+
+⚠️ **The clustered corpus decides it, and it is the one the module docs warned about.** Rows in one
+list differ by about the third decimal place of `<o, q>`, and 4 bits on the residual does not
+resolve that where 8 bits on the row does. The rotation and the rescale search are
+worth having: exq beats the simple 4-bit code by **15.7 points** at the same bytes. But they do
+not make up for four bits. On uniform data, where neighbours are far apart, B=4 is within 0.004.
+OQ-170 is **answered no** at 384d.
+
+⚠️ A wider exq does not rescue the bytes. At 384d the padding to 512 coordinates costs B=6 a
+400-byte record, 0.86× int8, so the saving is gone before recall is measured (not measured).
+
+**2. Bound-sized survivors keep recall, and keep more rows than the constant.**
+
+| Survivors (exact rerank) | Clustered recall | Mean survivors | Uniform recall | Mean survivors |
+|---|---|---|---|---|
+| over=32 (today) | 0.9990 (999) | 320 | 0.5150 (515) | 320 |
+| bound, cap 1,024 | 1.0000 (1000) | **499.8** | 0.5170 (517) | **1,024** (every query at the cap) |
+
+C-3's prediction holds: the 1-bit error is wider than the gaps it must separate, so every
+interval overlaps the k-th lower bound. PRISM's "drops 80–95%" is a claim about lists whose
+members differ by more than ours do. The recall half of the rule passes on both corpora. The
+survivor half fails on both. OQ-40 stays open: the bound cannot replace the constant at 1 bit.
+The bound itself is sound: `the_residual_bound_holds_and_is_tight` measures 6 breaches in 40,000
+pairs.
+
+**3. An int8 centroid table loses no recall, and misses the overlap rule at one point.**
+
+| p | Clustered f32 / int8 recall | Overlap | Uniform f32 / int8 recall | Overlap |
+|---|---|---|---|---|
+| 4 | 0.9800 / 0.9800 | **395/400 = 0.9875** | 0.3020 / 0.3050 | 396/400 = 0.9900 |
+| 8 | 0.9810 / 0.9810 | 794/800 = 0.9925 | 0.5150 / 0.5170 | 795/800 = 0.9938 |
+| 16 | 0.9810 / 0.9810 | 1592/1600 = 0.9950 | 0.7380 / 0.7390 | 1592/1600 = 0.9950 |
+
+The table is a quarter of the size: 39,200 bytes against 153,600 for 100 lists. Recall is equal
+or higher in every cell. But the rule asked for an overlap of at least 0.99 everywhere, and
+clustered p=4 has 0.9875, five lists in 400. **The rule says not yet**, and the ledger may not
+move it. What the number says is that the differing lists cost no recall here. A rule led by
+recall, or real embeddings, is what would close OQ-171.
 
 ## Not taken, and why
 
@@ -124,8 +188,11 @@ row of a list — a ranking shift between lists, measured rather than argued.
 ## Open questions raised
 
 - OQ-170 — Can a narrower rerank tier (extended RaBitQ, 2–4 bits) replace int8 at its recall?
-- OQ-40 — Optimal oversample per rung — **now with a candidate answer: no constant at all**.
-- OQ-171 — Does an int8 centroid table rank probes as `f32` does, at every `p` we use?
+  **Answered no (M97)**: 0.856 against 0.981 on the clustered corpus.
+- OQ-40 — Optimal oversample per rung. **The bound is not the answer (M97)**: 500 and 1,024
+  survivors against 320.
+- OQ-171 — Does an int8 centroid table rank probes as `f32` does, at every `p` we use? **Recall yes,
+  overlap 0.9875 at clustered p=4 (M97)**: open under the rule as written.
 - OQ-172 — SOAR against boundary replication, once a replicated row is written once.
 - OQ-173 — Is 1-bit scoring ever compute-bound on our hardware, so that fastscan would pay?
 

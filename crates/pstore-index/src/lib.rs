@@ -4,6 +4,7 @@
 //! candidate sets, so it can be tested without a store and reused by whatever fetches.
 
 pub mod cluster;
+pub mod exq;
 pub mod external;
 pub mod fde_clusters;
 pub mod ladder;

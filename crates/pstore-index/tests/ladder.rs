@@ -272,3 +272,43 @@ fn a_range_too_narrow_for_a_step_codes_like_a_constant_vector() {
     sq8::write_to(&sq8::encode(&[0.0, 0.0]), &mut want);
     assert_eq!(got, want);
 }
+
+#[test]
+fn bounded_rung_keeps_every_overlapping_interval() {
+    // k = 2: the second-largest lower bound is 0.625 (row 1's). Row 2's upper bound touches
+    // it exactly and is kept -- it could still be in the top 2 -- and row 3's falls a hair
+    // short and is dropped. Dyadic values, so the sums are exact and "touches" means equal.
+    let l = Ladder::new(2, 32);
+    let kept = l.rung0_bounded(
+        [
+            (3, 0.5, 0.124),
+            (0, 1.0, 0.125),
+            (2, 0.5, 0.125),
+            (1, 0.75, 0.125),
+            (4, 0.25, 0.25),
+        ],
+        1_024,
+    );
+    assert_eq!(
+        kept,
+        vec![(0, 1.0), (1, 0.75), (2, 0.5)],
+        "best first, by the estimate; every interval reaching the k-th lower bound kept"
+    );
+    // Fewer candidates than k: there is no k-th lower bound, and all of them are kept.
+    assert_eq!(
+        Ladder::new(10, 32).rung0_bounded([(5, 0.1, 0.0), (6, 0.2, 0.0)], 1_024),
+        vec![(6, 0.2), (5, 0.1)]
+    );
+}
+
+#[test]
+fn bounded_rung_respects_its_cap() {
+    // Bounds wide enough to keep everything: the cap is all that limits the set, and what
+    // it keeps is the best by estimate, not the first seen.
+    let l = Ladder::new(3, 32);
+    let kept = l.rung0_bounded((0..100).map(|i| (i, i as f32, 1_000.0)), 7);
+    assert_eq!(
+        kept.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        (93..100).rev().collect::<Vec<_>>()
+    );
+}

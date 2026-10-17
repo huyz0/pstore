@@ -18,6 +18,7 @@
 )]
 
 use pstore_index::cluster::{Clustering, Params};
+use pstore_index::exq::{ExCode, ExQuantizer};
 use pstore_index::ladder::Ladder;
 use pstore_index::rabitq::{Code, Quantizer};
 use pstore_index::search;
@@ -175,6 +176,348 @@ enum Rerank {
     Exact,
 }
 
+/// sq4: per-vector 4-bit scalar quantization, **unrotated** -- `sq8` at 15 steps.
+///
+/// Harness-only, M97 criterion 1's simple control: if it holds int8's recall at the bytes
+/// of a 4-bit extended RaBitQ record, the simpler code wins and `exq` is not needed.
+struct Sq4 {
+    codes: Vec<u8>,
+    offset: f32,
+    step: f32,
+}
+
+impl Sq4 {
+    fn encode(v: &[f32]) -> Self {
+        let lo = v.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let step = (hi - lo).max(0.0) / 15.0;
+        let codes = v
+            .iter()
+            .map(|x| {
+                if step > 0.0 {
+                    ((x - lo) / step).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                }
+            })
+            .collect();
+        Self {
+            codes,
+            offset: lo,
+            step,
+        }
+    }
+
+    fn estimate(&self, q: &[f32]) -> f32 {
+        let (mut sum_q, mut acc) = (0.0f32, 0.0f32);
+        for (b, x) in self.codes.iter().zip(q) {
+            sum_q += *x;
+            acc += f32::from(*b) * *x;
+        }
+        self.offset * sum_q + self.step * acc
+    }
+
+    /// Two codes a byte, then offset and step.
+    fn record_len(dim: usize) -> usize {
+        dim.div_ceil(2) + 8
+    }
+}
+
+/// The candidate rerank tiers `--prism` compares (M97 criterion 1).
+#[derive(Clone, Copy)]
+enum Tier {
+    Int8,
+    Exq4,
+    Exq2,
+    Sq4,
+}
+
+/// Everything `--prism` adds to an index: the narrower tiers and the int8 centroid table.
+struct Prism {
+    b4: ExQuantizer,
+    b2: ExQuantizer,
+    x4: Vec<ExCode>,
+    x2: Vec<ExCode>,
+    sq4: Vec<Sq4>,
+    table: Vec<sq8::Code>,
+}
+
+impl Prism {
+    fn build(c: &Corpus, idx: &Index) -> Self {
+        let b4 = ExQuantizer::new(&idx.quantizer, 4).unwrap();
+        let b2 = ExQuantizer::new(&idx.quantizer, 2).unwrap();
+        let cen = idx.clustering.centroids();
+        let code = |x: &ExQuantizer| -> Vec<ExCode> {
+            c.vectors
+                .iter()
+                .zip(&idx.codes)
+                .map(|(v, (_, home))| x.encode_residual(v, &cen[*home]).unwrap())
+                .collect()
+        };
+        Self {
+            x4: code(&b4),
+            x2: code(&b2),
+            b4,
+            b2,
+            sq4: c.vectors.iter().map(|v| Sq4::encode(v)).collect(),
+            table: cen.iter().map(|v| sq8::encode(v)).collect(),
+        }
+    }
+
+    /// Bytes a probed row's rerank record moves, beside its 1-bit code.
+    fn tier_bytes(&self, tier: Tier, dim: usize) -> usize {
+        match tier {
+            Tier::Int8 => sq8::record_len(dim),
+            Tier::Exq4 => self.b4.record_len(),
+            Tier::Exq2 => self.b2.record_len(),
+            Tier::Sq4 => Sq4::record_len(dim),
+        }
+    }
+}
+
+/// How a `--prism` query ends.
+#[derive(Clone, Copy)]
+enum Finish {
+    /// Rung 1 at a tier: 3 round trips.
+    Rerank(Tier),
+    /// Exact `f32` over rung 0's survivors: 4 round trips.
+    Exact,
+}
+
+/// One `--prism` configuration's totals over a corpus's queries.
+struct Outcome {
+    hits: usize,
+    total: usize,
+    cands: f64,
+    survivors: f64,
+    /// Probed lists the `f32` table also chose, and lists probed: counts, so the 0.99 rule
+    /// is decided by integers rather than by a mean's rounding.
+    overlap: (usize, usize),
+}
+
+impl Outcome {
+    fn recall(&self) -> f64 {
+        self.hits as f64 / self.total as f64
+    }
+}
+
+/// A query through rung 0 and `finish`, with the probe table and survivor rule chosen.
+///
+/// ⚠️ A sibling of `measure`, not a change to it: the gate run's numbers are compared across
+/// milestones, so its code path stays as it was (M97 delta item 5).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a harness sweep: every argument is an axis of the table it prints"
+)]
+fn prism_measure(
+    c: &Corpus,
+    idx: &Index,
+    px: &Prism,
+    p: usize,
+    over: usize,
+    finish: Finish,
+    sq8_table: bool,
+    bounded: bool,
+) -> Outcome {
+    let k = 10;
+    let l = Ladder::new(k, over);
+    let mut out = Outcome {
+        hits: 0,
+        total: 0,
+        cands: 0.0,
+        survivors: 0.0,
+        overlap: (0, 0),
+    };
+    for (qi, q) in c.queries.iter().enumerate() {
+        let exact_lists = search::probe(&idx.clustering, q, p);
+        let (lists, dots): (Vec<usize>, Vec<f32>) = if sq8_table {
+            let chosen = search::probe_sq8(&px.table, q, p);
+            let lists: Vec<usize> = chosen.iter().map(|(i, _)| *i).collect();
+            // Every list's `<c, q>` from the int8 table: a replicated row's home list need
+            // not be one of the probed ones.
+            let dots = px.table.iter().map(|t| sq8::estimate(t, q)).collect();
+            (lists, dots)
+        } else {
+            let dots = idx
+                .clustering
+                .centroids()
+                .iter()
+                .map(|cen| cen.iter().zip(q).map(|(a, b)| a * b).sum())
+                .collect();
+            (exact_lists.clone(), dots)
+        };
+        out.overlap.0 += lists.iter().filter(|i| exact_lists.contains(i)).count();
+        out.overlap.1 += exact_lists.len();
+        let cand = search::candidates(&idx.clustering, &lists);
+        out.cands += cand.len() as f64;
+        let prepared = idx.quantizer.prepare(q).unwrap();
+        let qnorm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let est = |r: usize| {
+            let (code, home) = &idx.codes[r];
+            idx.quantizer
+                .estimate_residual(code, &prepared, dots[*home])
+        };
+        let scored = if bounded {
+            l.rung0_bounded(
+                cand.iter().map(|r| {
+                    let b = idx.quantizer.residual_error_bound(&idx.codes[*r].0, qnorm);
+                    (*r, est(*r), b)
+                }),
+                1_024,
+            )
+        } else {
+            l.rung0(cand.iter().map(|r| (*r, est(*r))))
+        };
+        out.survivors += scored.len() as f64;
+        let refined: Vec<(usize, f32)> = match finish {
+            Finish::Rerank(tier) => {
+                let score = |r: usize| {
+                    let (code, home) = &idx.codes[r];
+                    match tier {
+                        Tier::Int8 => sq8::estimate(&idx.eights[r], q),
+                        Tier::Exq4 => {
+                            px.b4
+                                .estimate_residual(code, &px.x4[r], &prepared, dots[*home])
+                        }
+                        Tier::Exq2 => {
+                            px.b2
+                                .estimate_residual(code, &px.x2[r], &prepared, dots[*home])
+                        }
+                        Tier::Sq4 => px.sq4[r].estimate(q),
+                    }
+                };
+                l.rung1(&scored, score).into_iter().take(k).collect()
+            }
+            Finish::Exact => l.rung2(&scored, |r| c.dot(r, q)),
+        };
+        out.total += k;
+        out.hits += c.truth[qi]
+            .iter()
+            .filter(|i| refined.iter().any(|(j, _)| j == *i))
+            .count();
+    }
+    let n = c.queries.len() as f64;
+    out.cands /= n;
+    out.survivors /= n;
+    out
+}
+
+/// `--prism`: M97's three tables, on both corpora.
+fn prism(params: Params) {
+    let dim = 384;
+    for c in [
+        Corpus::clustered(20_000, dim, 40, 1),
+        Corpus::uniform(10_000, dim, 2),
+    ] {
+        let idx = build(&c, params);
+        let px = Prism::build(&c, &idx);
+        let lists = idx.clustering.lists().len();
+        let code = idx.quantizer.code_len();
+        println!(
+            "# {} x {dim}d {} corpus, {lists} lists, k=10 (provisional: container, synthetic)",
+            c.vectors.len(),
+            c.name
+        );
+
+        // Criterion 1: the rerank tier, at p=8, over=32.
+        println!(
+            "## rerank tier, p=8 over=32: recall@10 under rung 1, bytes beside the 1-bit code"
+        );
+        println!(
+            "{:>6} {:>10} {:>9} {:>9} {:>9} {:>9}",
+            "tier", "recall@10", "hits", "B/row", "MB/query", "x int8"
+        );
+        let base_mb = {
+            let o = prism_measure(
+                &c,
+                &idx,
+                &px,
+                8,
+                32,
+                Finish::Rerank(Tier::Int8),
+                false,
+                false,
+            );
+            o.cands * (code + px.tier_bytes(Tier::Int8, dim)) as f64 / 1e6
+        };
+        for (name, tier) in [
+            ("int8", Tier::Int8),
+            ("exq4", Tier::Exq4),
+            ("exq2", Tier::Exq2),
+            ("sq4", Tier::Sq4),
+        ] {
+            let o = prism_measure(&c, &idx, &px, 8, 32, Finish::Rerank(tier), false, false);
+            let row = code + px.tier_bytes(tier, dim);
+            let mb = o.cands * row as f64 / 1e6;
+            println!(
+                "{name:>6} {:>10.4} {:>9} {row:>9} {mb:>9.3} {:>9.3}",
+                o.recall(),
+                format!("{}/{}", o.hits, o.total),
+                mb / base_mb
+            );
+        }
+
+        // Criterion 3: the survivor set, sized by a constant or by the bound.
+        println!("## survivors, p=8: recall@10 under exact, and the fourth round's f32 bytes");
+        println!(
+            "{:>14} {:>10} {:>9} {:>10} {:>9}",
+            "rule", "recall@10", "hits", "survivors", "MB rt4"
+        );
+        for (name, bounded) in [("over=32", false), ("bound cap=1024", true)] {
+            let o = prism_measure(&c, &idx, &px, 8, 32, Finish::Exact, false, bounded);
+            println!(
+                "{name:>14} {:>10.4} {:>9} {:>10.1} {:>9.3}",
+                o.recall(),
+                format!("{}/{}", o.hits, o.total),
+                o.survivors,
+                o.survivors * (dim * 4) as f64 / 1e6
+            );
+        }
+
+        // Criterion 4: the centroid table at int8.
+        println!(
+            "## centroid table: f32 {} B, int8 {} B; recall@10 under fast (int8 rung 1), over=32",
+            lists * dim * 4,
+            lists * sq8::record_len(dim)
+        );
+        println!(
+            "{:>4} {:>10} {:>9} {:>10} {:>9} {:>8} {:>9}",
+            "p", "f32", "hits", "int8", "hits", "overlap", "lists"
+        );
+        for p in [4usize, 8, 16] {
+            let f = prism_measure(
+                &c,
+                &idx,
+                &px,
+                p,
+                32,
+                Finish::Rerank(Tier::Int8),
+                false,
+                false,
+            );
+            let e = prism_measure(
+                &c,
+                &idx,
+                &px,
+                p,
+                32,
+                Finish::Rerank(Tier::Int8),
+                true,
+                false,
+            );
+            println!(
+                "{p:>4} {:>10.4} {:>9} {:>10.4} {:>9} {:>8.4} {:>9}",
+                f.recall(),
+                format!("{}/{}", f.hits, f.total),
+                e.recall(),
+                format!("{}/{}", e.hits, e.total),
+                e.overlap.0 as f64 / e.overlap.1 as f64,
+                format!("{}/{}", e.overlap.0, e.overlap.1)
+            );
+        }
+    }
+}
+
 /// recall@k, and the mean number of candidates rung 0 scored.
 fn measure(
     c: &Corpus,
@@ -303,6 +646,14 @@ fn main() {
                 }
             }
         }
+        return;
+    }
+
+    // M97: three ideas from PRISM, measured before any is shipped (`docs/milestones/M97`).
+    //
+    //   cargo run --release -p pstore-index --example recall -- --prism
+    if std::env::args().any(|a| a == "--prism") {
+        prism(params);
         return;
     }
 

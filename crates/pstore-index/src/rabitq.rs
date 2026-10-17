@@ -155,7 +155,7 @@ impl Code {
 
 /// A query, rotated once and ready to score against many codes.
 #[derive(Debug, Clone)]
-pub struct Query(Vec<f32>);
+pub struct Query(pub(crate) Vec<f32>);
 
 /// A dimension's quantizer. Holds no data-derived state — that is the point.
 #[derive(Debug, Clone)]
@@ -170,7 +170,7 @@ pub struct Quantizer {
     rotate: bool,
     dim: usize,
     /// Padded to a power of two, which the Walsh–Hadamard transform requires.
-    padded: usize,
+    pub(crate) padded: usize,
     /// One sign flip per padded coordinate, derived from the dimension alone.
     flips: Vec<f32>,
 }
@@ -280,7 +280,7 @@ impl Quantizer {
     /// Orthogonal up to the `1/sqrt(padded)` scaling applied at the end, so inner products
     /// are preserved — which is what lets the estimate be compared against the original
     /// vectors' inner product at all.
-    fn rotate(&self, v: &[f32]) -> Vec<f32> {
+    pub(crate) fn rotate(&self, v: &[f32]) -> Vec<f32> {
         if !self.rotate {
             let mut a = vec![0.0f32; self.padded];
             for (slot, x) in a.iter_mut().zip(v) {
@@ -319,6 +319,21 @@ impl Quantizer {
     /// because everything in one posting list is similar and the shared component is all
     /// the 1-bit code can see.
     pub fn encode_residual(&self, v: &[f32], centroid: &[f32]) -> Result<Code, QuantError> {
+        let (unit, norm) = self.unit_residual(v, centroid)?;
+        let mut code = self.encode_unit(&unit)?;
+        code.residual_norm = norm;
+        Ok(code)
+    }
+
+    /// `v`'s unit residual from `centroid`, and the residual's norm.
+    ///
+    /// ⚠️ The one place it is taken: `exq` codes magnitudes beside this code's signs, and a
+    /// second copy of the arithmetic is a second place for the two to disagree (M97).
+    pub(crate) fn unit_residual(
+        &self,
+        v: &[f32],
+        centroid: &[f32],
+    ) -> Result<(Vec<f32>, f32), QuantError> {
         self.check(v)?;
         let residual: Vec<f32> = v
             .iter()
@@ -334,9 +349,7 @@ impl Quantizer {
         } else {
             residual
         };
-        let mut code = self.encode_unit(&unit)?;
-        code.residual_norm = norm;
-        Ok(code)
+        Ok((unit, norm))
     }
 
     /// Encodes a **unit** vector, with no centroid.
@@ -435,6 +448,19 @@ impl Quantizer {
     #[doc(hidden)]
     pub fn estimate_unnormalized_for_test(&self, code: &Code, query: &Query) -> f32 {
         self.raw(code, &query.0)
+    }
+
+    /// The bound on [`Self::estimate_residual`]'s error, for a query of norm `query_norm`.
+    ///
+    /// The estimate is `<c, q> + ||o - c|| · <x, q>`, and [`Self::error_bound`] bounds the
+    /// second factor for a **unit** `q`. Both scale linearly: by the residual norm, and by
+    /// the query's norm.
+    ///
+    /// ⚠️ `query_norm` is an argument, not an assumption. [`Self::prepare`] does not
+    /// normalize, and the engine passes the caller's query as it came.
+    #[must_use]
+    pub fn residual_error_bound(&self, code: &Code, query_norm: f32) -> f32 {
+        code.residual_norm * query_norm * self.error_bound(code)
     }
 
     /// The error bound for this code, at [`BOUND_EPSILON`].

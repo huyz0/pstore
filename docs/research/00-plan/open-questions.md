@@ -69,7 +69,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
 | OQ-100 | Does class→region segregation reach the ~1.03 DLWA the FDP paper reports, without FDP hardware? | `07/disk-space-management` |
 | OQ-103 | Behaviour when the cache device fails outright mid-flight — must be identical to bypass mode, and the node must not die. Verify. | `07/disk-space-management` |
-| OQ-170 | Can a narrower rerank tier (extended RaBitQ, 2–4 bits a dimension) replace int8 at its recall? The int8 records are **84%** of the bytes a `fast` query moves, and of the resident working set: a 4-bit tier is 0.59× the bytes a probed row, 2-bit 0.31× (extra bits beside the 1-bit code, over the padded dimension). Measured by [M97](../../milestones/M97/SPEC.md) criterion 1 against an sq4 control. | `06/prism-comparison` |
+| ~~OQ-170~~ | Can a narrower rerank tier (extended RaBitQ, 2–4 bits a dimension) replace int8 at its recall? **ANSWERED no by [M97](../../milestones/M97/VERIFIED.md), at 384d on synthetic data:** at p=8, over=32, a 4-bit tier (0.59× the bytes a probed row) reaches recall@10 **0.856** against int8's **0.981** on the clustered corpus. It holds on uniform (0.511 against 0.515), and the sq4 control does worse at the same bytes (0.699). Within one list, rows differ by less than 4 bits of the residual can resolve. | `06/prism-comparison` |
 
 ## Tier 3 — tuning and refinement
 
@@ -100,7 +100,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-36` exact-scan threshold ·
 `OQ-37` centroid hierarchy above 1M centroids ·
 `OQ-38` boundary augmentation factor by dimension ·
-`OQ-40` oversample factor per rerank rung — **candidate answer: none, size the survivors by the error bound** ([M97](../../milestones/M97/SPEC.md) criterion 3) ·
+`OQ-40` oversample factor per rerank rung — **the error bound does not replace the constant** ([M97](../../milestones/M97/VERIFIED.md) criterion 3): it keeps recall (`exact` 1.000 and 0.517 against 0.999 and 0.515), but it keeps **500** survivors on clustered and hits the cap of **1,024** on uniform, against 320. Still open for a constant per rung ·
 `OQ-41` 1-bit quantization at 3072d / Matryoshka ·
 `OQ-42` opt-in PQ for customers who benchmark it better ·
 ~~`OQ-44`~~ **closed** — do not hoist it: the pruning it feeds skips **0 bytes** at every query width and `top_k` measured ([C-15](../06-indexing/full-text-search.md)) ·
@@ -110,7 +110,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-49` `p_effective` explosion on anti-correlated filters ·
 `OQ-52` drift thresholds for re-clustering ·
 `OQ-53` centroid hierarchy crossover ·
-`OQ-171` does an int8 centroid table rank probes as `f32` does at every `p` we use? a quarter of the hottest object ([M97](../../milestones/M97/SPEC.md) criterion 4) ·
+`OQ-171` does an int8 centroid table rank probes as `f32` does at every `p` we use? a quarter of the hottest object. **Not yes by M97's rule** ([criterion 4](../../milestones/M97/VERIFIED.md)): recall@10 is equal or higher at every p on both corpora, but the overlap at clustered p=4 is **395/400 = 0.9875**, under the 0.99 the rule set. Open until a recall-led rule, or real embeddings, decide ·
 `OQ-172` SOAR secondary assignment against boundary replication, once a replicated row is written once (item 14) ·
 `OQ-173` is 1-bit scoring ever compute-bound on our hardware, so that a fastscan layout would pay (H-1)? ·
 `OQ-55` RAM:NVMe ratio and instance selection ·

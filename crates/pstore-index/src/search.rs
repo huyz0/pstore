@@ -8,6 +8,7 @@
 //! is the one thing the architecture forbids.
 
 use crate::cluster::Clustering;
+use crate::sq8;
 
 /// Which lists a query should read.
 ///
@@ -82,4 +83,30 @@ pub fn candidates(clustering: &Clustering, lists: &[usize]) -> Vec<usize> {
 
 fn dist2(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+/// [`probe`] over a centroid table stored as `sq8` records, with each probed list's
+/// `<c, q>` for the residual estimate (M97, OQ-171).
+///
+/// Ranks by `||c||² - 2<c, q>`, which is `dist2(q, c) - ||q||²`: the same order as
+/// [`probe`]'s, from a quarter of the bytes. `||c||²` comes from the **decoded** record, so
+/// the order is that of the vectors the table holds, not of vectors it no longer has.
+///
+/// ⚠️ No re-sort against `f32` centroids. PRISM re-ranks its compressed centroids exactly;
+/// here that would be a fetch chosen by the first ranking, a data-dependent chain (D-34).
+#[must_use]
+pub fn probe_sq8(table: &[sq8::Code], query: &[f32], p: usize) -> Vec<(usize, f32)> {
+    let mut d: Vec<(usize, f32, f32)> = table
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let norm2: f32 = sq8::decode(c).iter().map(|x| x * x).sum();
+            let cq = sq8::estimate(c, query);
+            (i, norm2 - 2.0 * cq, cq)
+        })
+        .collect();
+    // Ties by index, as `probe`'s are.
+    d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    d.truncate(p.max(1));
+    d.into_iter().map(|(i, _, cq)| (i, cq)).collect()
 }

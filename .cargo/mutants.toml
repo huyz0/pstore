@@ -55,6 +55,11 @@ exclude_re = [
     # rotation without its flips is still orthogonal, which recall cannot see. Named by line and
     # column, so an edit that moves it makes it reappear as MISSED. (M8k)
     'pstore-index/src/rabitq\.rs:293:23: replace \* with / in Quantizer::rotate',
+    # The rescale search keeps the first prefix with the best cosine; `>=` keeps the last. They
+    # differ only between two prefixes with the SAME cosine, so the code chosen is as good either
+    # way, and `exq_search_beats_a_fixed_scale` pins the cosine, which is all a tie decides.
+    # Named by line and column, as above. (M97)
+    'pstore-index/src/exq\.rs:166:18: replace > with >= in ExQuantizer::encode_residual',
     # The binary16 conversions assemble sign, exponent and significand with `|`, and the three
     # occupy disjoint bits on every path that reaches them, so `^` is the same value. No test
     # can witness that -- an equivalent mutant has no failing input -- so none backs it; what

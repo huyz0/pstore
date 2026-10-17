@@ -22,7 +22,11 @@
 //!    is not a tradeoff, it is a defect. The bound is a guarantee we intend to state, so it
 //!    is measured here rather than cited.
 
+use pstore_index::cluster::Params;
 use pstore_index::rabitq::{BOUND_EPSILON, Quantizer};
+use pstore_index::search;
+
+mod common;
 
 const DIM: usize = 384;
 const SEED: u64 = 0x5EED;
@@ -489,4 +493,62 @@ fn the_error_bound_is_epsilon_times_the_misalignment_over_the_remaining_dimensio
     let code = q.encode(&[1.0, 0.0, 0.0, 0.0]).unwrap();
     assert_eq!(code.alignment(), 0.5);
     assert_eq!(q.error_bound(&code), BOUND_EPSILON);
+}
+
+#[test]
+fn the_residual_bound_holds_and_is_tight() {
+    // ⚠️ The bound a search would use (M97, criterion 2): on `estimate_residual`, which is
+    // `<c, q> + ||o - c|| * unit estimate`, so the unit bound scales by the residual norm AND
+    // by the query's norm -- `prepare` does not normalize, and the engine passes raw queries.
+    //
+    // Two halves, because a bound can be right by being useless: it must hold (breaches at
+    // most 2e-3 of the pairs, delta 1e-3 two-sided with slack for a fixture this small), and
+    // half of it must NOT hold often (at least 10x that), or a bound with a factor missing
+    // that makes it larger -- a residual norm under 1 dropped -- would pass the first half.
+    let c = common::Corpus::clustered(2_000, DIM, 20, 5);
+    let idx = c.build(Params {
+        target_list_size: 100,
+        ..Params::default()
+    });
+    let q = &c.quantizer;
+    let rate = |scale: f32, frac: f32| {
+        let (mut breaches, mut total) = (0usize, 0usize);
+        for unit in c.queries.iter().take(50) {
+            // Probed with the unit query: L2 order is not scale-invariant, and the same
+            // pairs are what makes the two rates comparable.
+            let lists = search::probe(&idx.clustering, unit, 8);
+            let query: Vec<f32> = unit.iter().map(|x| x * scale).collect();
+            let prepared = q.prepare(&query).unwrap();
+            let norm = dot(&query, &query).sqrt();
+            for r in search::candidates(&idx.clustering, &lists) {
+                let (code, home) = &idx.codes[r];
+                let cd = dot(&idx.clustering.centroids()[*home], &query);
+                let err = (q.estimate_residual(code, &prepared, cd) - c.dot(r, &query)).abs();
+                total += 1;
+                if err > frac * q.residual_error_bound(code, norm) {
+                    breaches += 1;
+                }
+            }
+        }
+        (breaches, total)
+    };
+    let (full, total) = rate(1.0, 1.0);
+    let (half, _) = rate(1.0, 0.5);
+    assert!(
+        full as f64 <= 2e-3 * total as f64,
+        "the residual bound was breached {full} times in {total} pairs"
+    );
+    assert!(
+        half as f64 >= 10.0 * 2e-3 * total as f64,
+        "half the residual bound was breached only {half} times in {total} pairs: the bound \
+         is loose by more than 2x, so a factor is missing"
+    );
+    // Unit queries cannot see a dropped query norm. The same queries at 3x their length
+    // must breach at the same rate, which they do only if the bound scales with them.
+    let (tripled, _) = rate(3.0, 0.5);
+    assert!(
+        tripled.abs_diff(half) * 20 <= half,
+        "at 3x the query length half the bound was breached {tripled} times, against \
+         {half} for unit queries"
+    );
 }
