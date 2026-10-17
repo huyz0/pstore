@@ -1055,3 +1055,253 @@ async fn a_null_attribute_reaches_keep_as_none() {
         .unwrap();
     assert_eq!(rows(got), exact(&|r| !null(r)));
 }
+
+// ---- M96: clustered codes ----
+
+const LISTS: usize = 40;
+
+async fn clustered(store: &MemoryStore, vs: &[Vec<f32>]) -> ExternalIndex {
+    store.put(&data_key(), file(vs).into()).await.unwrap();
+    let col = column(store, vs.len()).await;
+    ExternalIndex::build_clustered(store, &codes_key(), col, 1_024, LISTS)
+        .await
+        .unwrap()
+}
+
+fn queries(vs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let mut s = 99;
+    (0..20)
+        .map(|_| {
+            vs[(rnd(&mut s).abs() * 19_000.0) as usize]
+                .iter()
+                .map(|x| x + 0.3 * rnd(&mut s))
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_clustered_blob_round_trips_and_refuses_damage() {
+    let vs = vectors(5, ROWS);
+    let store = MemoryStore::new();
+    let built = clustered(&store, &vs).await;
+    let nlist = built.cluster_count();
+    assert!(nlist > 1 && nlist <= LISTS, "{nlist}");
+    let flat = {
+        let col = column(&store, ROWS).await;
+        ExternalIndex::build(&store, &Key::new("t/ext/flat"), col, 1_024)
+            .await
+            .unwrap()
+    };
+    let blob = built.to_bytes();
+    assert_eq!(
+        blob.len(),
+        flat.to_bytes().len() + 4 + nlist * DIMS * 4 + ROWS * 4
+    );
+    let opened = ExternalIndex::open(&store, &codes_key()).await.unwrap();
+    assert_eq!(opened.to_bytes(), blob);
+    let q = &queries(&vs)[0];
+    assert_eq!(
+        opened.search_probes(&store, q, 10, 200, 3).await.unwrap(),
+        built.search_probes(&store, q, 10, 200, 3).await.unwrap()
+    );
+    // Every row sits in exactly one list: all the lists together are every row, once.
+    assert_eq!(
+        opened.probed_rows(q, nlist).unwrap(),
+        (0..ROWS).collect::<Vec<_>>()
+    );
+    // An unknown magic is refused even when the rest parses as a clustered blob.
+    let mut alien = blob.clone();
+    alien[..4].copy_from_slice(b"PXI9");
+    assert!(ExternalIndex::from_bytes(&alien).is_err());
+    // Damage: a list id out of range, a truncated section, a trailing byte.
+    let mut bad = blob.clone();
+    let n = bad.len();
+    bad[n - 4..].copy_from_slice(&(nlist as u32).to_le_bytes());
+    assert!(ExternalIndex::from_bytes(&bad).is_err());
+    assert!(ExternalIndex::from_bytes(&blob[..n - 1]).is_err());
+    // A hostile list count: zero, and one the blob cannot hold.
+    let at = n - (4 + nlist * DIMS * 4 + ROWS * 4);
+    for hostile in [0u32, u32::MAX, nlist as u32 + 1] {
+        let mut h = blob.clone();
+        h[at..at + 4].copy_from_slice(&hostile.to_le_bytes());
+        assert!(ExternalIndex::from_bytes(&h).is_err(), "nlist {hostile}");
+    }
+    let mut long = blob.clone();
+    long.push(0);
+    assert!(ExternalIndex::from_bytes(&long).is_err());
+    // A flat blob still opens, has no clusters, and answers as it did.
+    let reopened = ExternalIndex::from_bytes(&flat.to_bytes()).unwrap();
+    assert_eq!(reopened.cluster_count(), 0);
+    assert_eq!(
+        reopened.search(&store, q, 10, 200).await.unwrap(),
+        flat.search(&store, q, 10, 200).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn probing_every_list_is_the_flat_search() {
+    let vs = vectors(5, ROWS);
+    let store = MemoryStore::new();
+    let index = clustered(&store, &vs).await;
+    let nlist = index.cluster_count();
+    for q in queries(&vs) {
+        let flat = index.search(&store, &q, 10, 200).await.unwrap();
+        assert_eq!(
+            index
+                .search_probes(&store, &q, 10, 200, nlist)
+                .await
+                .unwrap(),
+            flat
+        );
+        assert_eq!(
+            index
+                .search_probes(&store, &q, 10, 200, nlist + 5)
+                .await
+                .unwrap(),
+            flat
+        );
+    }
+}
+
+async fn recall_at(
+    index: &ExternalIndex,
+    store: &MemoryStore,
+    vs: &[Vec<f32>],
+    probes: usize,
+) -> f64 {
+    let mut hit = 0usize;
+    for q in queries(vs) {
+        let mut exact: Vec<(usize, f64)> = vs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, cosine(&q, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let got = index
+            .search_probes(store, &q, 10, 200, probes)
+            .await
+            .unwrap();
+        hit += exact[..10]
+            .iter()
+            .filter(|e| got.iter().any(|g| g.0 == e.0))
+            .count();
+    }
+    hit as f64 / 200.0
+}
+
+#[tokio::test]
+async fn a_few_probes_find_the_neighbours_and_score_a_fraction_of_the_rows() {
+    const FLOOR: f64 = 0.9;
+    let vs = vectors(5, ROWS);
+    let store = MemoryStore::new();
+    let index = clustered(&store, &vs).await;
+    let four = recall_at(&index, &store, &vs, 4).await;
+    let one = recall_at(&index, &store, &vs, 1).await;
+    eprintln!("recall probes=4 {four} probes=1 {one}");
+    assert!(four >= FLOOR, "recall {four}");
+    assert!(one <= four, "{one} > {four}");
+    for q in queries(&vs) {
+        let scored = index.probed_rows(&q, 4).unwrap().len();
+        assert!(
+            scored > 0 && scored * 4 <= ROWS,
+            "scored {scored} of {ROWS}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_filter_composes_with_the_probes() {
+    let vs = vectors(5, ROWS);
+    let store = MemoryStore::new();
+    let index = clustered(&store, &vs).await;
+    let nlist = index.cluster_count();
+    for q in queries(&vs).iter().take(5) {
+        let got = index
+            .search_where_probes(&store, q, 10, 200, &|r| r % 3 == 1, 4)
+            .await
+            .unwrap();
+        assert!(!got.is_empty() && got.iter().all(|g| g.0 % 3 == 1));
+        assert_eq!(
+            index
+                .search_where_probes(&store, q, 10, 200, &|r| r % 3 == 1, nlist)
+                .await
+                .unwrap(),
+            index
+                .search_where(&store, q, 10, 200, &|r| r % 3 == 1)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn probes_of_zero_and_an_unclustered_index_are_refused() {
+    let vs = vectors(5, 2_000);
+    let store = MemoryStore::new();
+    let index = clustered(&store, &vs).await;
+    let q = &vs[3];
+    assert!(index.search_probes(&store, q, 10, 100, 0).await.is_err());
+    let col = column(&store, 2_000).await;
+    let flat = ExternalIndex::build(&store, &Key::new("t/ext/flat"), col, 512)
+        .await
+        .unwrap();
+    assert!(flat.search_probes(&store, q, 10, 100, 2).await.is_err());
+    let col = column(&store, 2_000).await;
+    assert!(
+        ExternalIndex::build_clustered(&store, &codes_key(), col, 512, 0)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_column_with_nulls_is_clustered() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let store = MemoryStore::new();
+    let key = Key::new("lake/nulls.parquet");
+    store
+        .put(
+            &key,
+            std::fs::read(format!("{dir}optional-nulls.parquet"))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build_clustered(&store, &codes_key(), col, 700, 8)
+        .await
+        .unwrap();
+    let nlist = index.cluster_count();
+    let is_null = |i: usize| i % 10 == 3;
+    let vecs: Vec<Vec<f32>> = std::fs::read(format!("{dir}multipage.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    for qi in [0usize, 1_500, 3] {
+        let q = &vecs[qi];
+        let flat = index.search(&store, q, 10, 2_600).await.unwrap();
+        let probed = index
+            .search_probes(&store, q, 10, 2_600, nlist)
+            .await
+            .unwrap();
+        assert_eq!(probed, flat);
+        let few = index.search_probes(&store, q, 10, 2_600, 2).await.unwrap();
+        assert!(few.iter().all(|g| !is_null(g.0)));
+        assert!(
+            !index
+                .probed_rows(q, nlist)
+                .unwrap()
+                .iter()
+                .any(|r| is_null(*r))
+        );
+    }
+}

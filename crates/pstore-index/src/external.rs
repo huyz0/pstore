@@ -14,6 +14,10 @@ use pstore_format::external::{
 use pstore_types::CasTag;
 
 const MAGIC: &[u8; 4] = b"PXI6";
+/// A blob with the cluster section after its codes (M96).
+const MAGIC_CLUSTERED: &[u8; 4] = b"PXI7";
+/// Rows read to find the centroids of a clustered build.
+pub const CLUSTER_SAMPLE: usize = 8_192;
 
 /// Why an external index could not be built, opened or searched.
 #[derive(Debug)]
@@ -66,6 +70,61 @@ pub struct ExternalIndex {
     quantizer: Quantizer,
     /// `rows` codes back to back, each `quantizer.code_len()` bytes.
     codes: Vec<u8>,
+    /// The rows grouped by nearest centroid, if the build clustered them (M96).
+    clusters: Option<Clusters>,
+}
+
+/// Centroids and each row's list (M96). Codes stay in row order; this only says which rows a
+/// probe scores.
+#[derive(Debug, Clone)]
+struct Clusters {
+    /// `nlist × dims` floats, a centroid after another.
+    centroids: Vec<f32>,
+    /// The list of each row (`rows` entries; a null row's is 0 and never read).
+    assign: Vec<u32>,
+    /// Each list's rows, ascending: derived from `assign`.
+    lists: Vec<Vec<u32>>,
+}
+
+impl Clusters {
+    fn new(centroids: Vec<f32>, assign: Vec<u32>, nlist: usize) -> Option<Self> {
+        let mut lists = vec![Vec::new(); nlist];
+        for (row, list) in assign.iter().enumerate() {
+            lists
+                .get_mut(*list as usize)?
+                .push(u32::try_from(row).ok()?);
+        }
+        Some(Self {
+            centroids,
+            assign,
+            lists,
+        })
+    }
+
+    /// The `probes` lists whose centroids are nearest the unit vector `q`, nearest first.
+    fn nearest(&self, q: &[f32], probes: usize) -> Vec<usize> {
+        let dims = q.len();
+        let mut dist: Vec<(usize, f32)> = self
+            .centroids
+            .chunks_exact(dims)
+            .enumerate()
+            .map(|(i, c)| (i, sq_dist(c, q)))
+            .collect();
+        dist.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        dist.into_iter().take(probes).map(|(i, _)| i).collect()
+    }
+}
+
+/// At most about `cap` of the present rows of `0..rows`, evenly strided over the **present**
+/// ones (so nulls that fall on the stride cannot empty the sample).
+fn sample_rows(rows: usize, cap: usize, present: impl Fn(usize) -> bool) -> Vec<usize> {
+    let all: Vec<usize> = (0..rows).filter(|r| present(*r)).collect();
+    let step = all.len().div_ceil(cap.max(1)).max(1);
+    all.into_iter().step_by(step).collect()
+}
+
+fn sq_dist(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 fn unit(v: &[f32]) -> Option<Vec<f32>> {
@@ -85,12 +144,65 @@ impl ExternalIndex {
         column: ExternalColumn,
         chunk: usize,
     ) -> Result<Self, ExternalIndexError> {
+        Self::build_with(store, codes_key, column, chunk, None).await
+    }
+
+    /// [`Self::build`], and the rows grouped into about `lists` lists by nearest centroid
+    /// (M96), so [`Self::search_probes`] scores only some of them. The centroids are found
+    /// from a strided sample of at most [`CLUSTER_SAMPLE`] rows.
+    ///
+    /// # Errors
+    /// As [`Self::build`]; `lists` of 0; a column with no present row.
+    pub async fn build_clustered<S: BlobStore>(
+        store: &S,
+        codes_key: &Key,
+        column: ExternalColumn,
+        chunk: usize,
+        lists: usize,
+    ) -> Result<Self, ExternalIndexError> {
+        if lists == 0 {
+            return Err(ExternalIndexError::Corrupt("lists is zero"));
+        }
+        let rows = usize::try_from(column.rows)
+            .map_err(|_| ExternalIndexError::Corrupt("too many rows"))?;
+        let wanted = sample_rows(rows, CLUSTER_SAMPLE, |r| column.is_present(r));
+        if wanted.is_empty() {
+            return Err(ExternalIndexError::Corrupt("no row to cluster"));
+        }
+        let mut sample = Vec::with_capacity(wanted.len());
+        for part in wanted.chunks(chunk.max(1)) {
+            let got = column.read_rows(store, part).await?;
+            for row in part {
+                let v = got
+                    .get(row)
+                    .ok_or(ExternalIndexError::Corrupt("a row was not returned"))?;
+                sample.push(unit(v).ok_or(ExternalIndexError::Vector("a row has no direction"))?);
+            }
+        }
+        let params = crate::cluster::Params {
+            target_list_size: sample.len().div_ceil(lists).max(1),
+            replicas: 0,
+            boundary: 0.0,
+            ..crate::cluster::Params::default()
+        };
+        let found = crate::cluster::Clustering::build(&sample, params);
+        Self::build_with(store, codes_key, column, chunk, Some(found.centroids())).await
+    }
+
+    async fn build_with<S: BlobStore>(
+        store: &S,
+        codes_key: &Key,
+        column: ExternalColumn,
+        chunk: usize,
+        centroids: Option<&[Vec<f32>]>,
+    ) -> Result<Self, ExternalIndexError> {
         let dims = column.dims as usize;
         let quantizer = Quantizer::new(dims);
         let rows = usize::try_from(column.rows)
             .map_err(|_| ExternalIndexError::Corrupt("too many rows"))?;
         let chunk = chunk.max(1);
         let mut codes = Vec::with_capacity(rows.saturating_mul(quantizer.code_len()));
+        let mut assign: Vec<u32> = Vec::new();
         let mut at = 0;
         while at < rows {
             let end = (at + chunk).min(rows);
@@ -101,6 +213,9 @@ impl ExternalIndex {
                 // nothing reads (`search` skips it), so a code's position is still its row.
                 if !column.is_present(row) {
                     codes.extend(std::iter::repeat_n(0u8, quantizer.code_len()));
+                    if centroids.is_some() {
+                        assign.push(0);
+                    }
                     continue;
                 }
                 let v = got
@@ -108,13 +223,30 @@ impl ExternalIndex {
                     .ok_or(ExternalIndexError::Corrupt("a row was not returned"))?;
                 let u = unit(v).ok_or(ExternalIndexError::Vector("a row has no direction"))?;
                 quantizer.encode(&u)?.write_to(&mut codes);
+                if let Some(cs) = centroids {
+                    let nearest = cs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (i, sq_dist(c, &u)))
+                        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+                        .map_or(0, |(i, _)| i);
+                    assign.push(u32::try_from(nearest).unwrap_or(0));
+                }
             }
             at = end;
         }
+        let clusters = match centroids {
+            Some(cs) => Some(
+                Clusters::new(cs.iter().flatten().copied().collect(), assign, cs.len())
+                    .ok_or(ExternalIndexError::Corrupt("a list id is out of range"))?,
+            ),
+            None => None,
+        };
         let index = Self {
             column,
             quantizer,
             codes,
+            clusters,
         };
         store.put(codes_key, index.to_bytes().into()).await?;
         Ok(index)
@@ -126,7 +258,11 @@ impl ExternalIndex {
     pub fn to_bytes(&self) -> Vec<u8> {
         let c = &self.column;
         let mut b = Vec::with_capacity(96 + self.codes.len());
-        b.extend(MAGIC);
+        b.extend(if self.clusters.is_some() {
+            MAGIC_CLUSTERED
+        } else {
+            MAGIC
+        });
         b.extend(c.dims.to_le_bytes());
         b.extend(c.rows.to_le_bytes());
         b.extend((c.key.len() as u32).to_le_bytes());
@@ -163,6 +299,15 @@ impl ExternalIndex {
             put_tag(&mut b, o.tag.as_ref());
         }
         b.extend(&self.codes);
+        if let Some(cl) = &self.clusters {
+            b.extend((cl.lists.len() as u32).to_le_bytes());
+            for x in &cl.centroids {
+                b.extend(x.to_le_bytes());
+            }
+            for l in &cl.assign {
+                b.extend(l.to_le_bytes());
+            }
+        }
         b
     }
 
@@ -187,9 +332,11 @@ impl ExternalIndex {
     pub fn from_bytes(raw: &[u8]) -> Result<Self, ExternalIndexError> {
         let bad = ExternalIndexError::Corrupt;
         let mut r = Reader(raw);
-        if r.take(4).ok_or(bad("truncated"))? != MAGIC {
-            return Err(bad("not an external index"));
-        }
+        let clustered = match r.take(4).ok_or(bad("truncated"))? {
+            m if m == MAGIC => false,
+            m if m == MAGIC_CLUSTERED => true,
+            _ => return Err(bad("not an external index")),
+        };
         let dims = r.u32().ok_or(bad("truncated"))?;
         let rows = r.u64().ok_or(bad("truncated"))?;
         let klen = r.u32().ok_or(bad("truncated"))? as usize;
@@ -263,10 +410,42 @@ impl ExternalIndex {
             .ok()
             .and_then(|n| n.checked_mul(quantizer.code_len()))
             .ok_or(bad("rows overflow"))?;
-        let codes = r.rest();
-        if dims == 0 || codes.len() != want {
+        let rest = r.rest();
+        let (codes, tail) = rest
+            .split_at_checked(want)
+            .ok_or(bad("codes are not rows × code length"))?;
+        if dims == 0 {
             return Err(bad("codes are not rows × code length"));
         }
+        let clusters = if clustered {
+            let mut t = Reader(tail);
+            let nlist = t.u32().ok_or(bad("truncated"))? as usize;
+            let nrows = rows as usize;
+            let cfloats = nlist
+                .checked_mul(dims as usize)
+                .ok_or(bad("clusters overflow"))?;
+            let cbytes = t
+                .take(cfloats.checked_mul(4).ok_or(bad("clusters overflow"))?)
+                .ok_or(bad("truncated"))?;
+            let abytes = t
+                .take(nrows.checked_mul(4).ok_or(bad("clusters overflow"))?)
+                .ok_or(bad("truncated"))?;
+            if !t.rest().is_empty() || nlist == 0 {
+                return Err(bad("the cluster section is not nlist × dims + rows"));
+            }
+            let f = |c: &[u8]| c.try_into().map_or(0, u32::from_le_bytes);
+            let centroids = cbytes
+                .chunks_exact(4)
+                .map(|c| f32::from_bits(f(c)))
+                .collect();
+            let assign = abytes.chunks_exact(4).map(f).collect();
+            Some(Clusters::new(centroids, assign, nlist).ok_or(bad("a list id is out of range"))?)
+        } else {
+            if !tail.is_empty() {
+                return Err(bad("codes are not rows × code length"));
+            }
+            None
+        };
         if !extents.is_empty() {
             let mut objects = vec![ObjectRef {
                 key: key.clone(),
@@ -291,7 +470,49 @@ impl ExternalIndex {
             },
             quantizer,
             codes: codes.to_vec(),
+            clusters,
         })
+    }
+
+    /// Lists the build clustered the rows into: 0 for a flat index.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cluster_count(&self) -> usize {
+        self.clusters.as_ref().map_or(0, |c| c.lists.len())
+    }
+
+    /// The rows -- vectors present -- of the `probes` lists nearest `query`, ascending: what a
+    /// probing search scores.
+    ///
+    /// # Errors
+    /// A zero or wrong-width query, `probes` of 0, or an index with no clusters.
+    #[doc(hidden)]
+    pub fn probed_rows(
+        &self,
+        query: &[f32],
+        probes: usize,
+    ) -> Result<Vec<usize>, ExternalIndexError> {
+        let cl = self
+            .clusters
+            .as_ref()
+            .ok_or(ExternalIndexError::Corrupt("the index has no clusters"))?;
+        if probes == 0 {
+            return Err(ExternalIndexError::Corrupt("probes is zero"));
+        }
+        if query.len() != self.column.dims as usize {
+            return Err(ExternalIndexError::Vector("wrong width"));
+        }
+        let q = unit(query).ok_or(ExternalIndexError::Vector("the query has no direction"))?;
+        let mut rows: Vec<usize> = cl
+            .nearest(&q, probes)
+            .into_iter()
+            .filter_map(|l| cl.lists.get(l))
+            .flatten()
+            .map(|r| *r as usize)
+            .filter(|r| self.column.is_present(*r))
+            .collect();
+        rows.sort_unstable();
+        Ok(rows)
     }
 
     /// Runs the pinned column is made of: 0 for a single run.
@@ -376,25 +597,86 @@ impl ExternalIndex {
         window: usize,
         allow: &(dyn Fn(usize) -> bool + Sync),
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
+        self.search_inner(store, query, k, window, allow, None)
+            .await
+    }
+
+    /// [`Self::search`], scoring only the rows of the `probes` lists nearest the query (M96).
+    /// `probes` of at least [`Self::cluster_count`] scores every row, as `search` does.
+    ///
+    /// # Errors
+    /// As [`Self::search`]; `probes` of 0; an index built without clusters.
+    pub async fn search_probes<S: BlobStore>(
+        &self,
+        store: &S,
+        query: &[f32],
+        k: usize,
+        window: usize,
+        probes: usize,
+    ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
+        self.search_inner(store, query, k, window, &|_| true, Some(probes))
+            .await
+    }
+
+    /// [`Self::search_where`] and [`Self::search_probes`] together.
+    ///
+    /// # Errors
+    /// As [`Self::search_probes`].
+    pub async fn search_where_probes<S: BlobStore>(
+        &self,
+        store: &S,
+        query: &[f32],
+        k: usize,
+        window: usize,
+        allow: &(dyn Fn(usize) -> bool + Sync),
+        probes: usize,
+    ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
+        self.search_inner(store, query, k, window, allow, Some(probes))
+            .await
+    }
+
+    async fn search_inner<S: BlobStore>(
+        &self,
+        store: &S,
+        query: &[f32],
+        k: usize,
+        window: usize,
+        allow: &(dyn Fn(usize) -> bool + Sync),
+        probes: Option<usize>,
+    ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
         if query.len() != self.column.dims as usize {
             return Err(ExternalIndexError::Vector("wrong width"));
         }
         let q = unit(query).ok_or(ExternalIndexError::Vector("the query has no direction"))?;
         let prepared = self.quantizer.prepare(&q)?;
         let step = self.quantizer.code_len();
-        let mut scored: Vec<(usize, f32)> = self
-            .codes
-            .chunks_exact(step)
-            .enumerate()
-            .filter_map(|(row, raw)| {
-                // A null row (M88) has a slot and no vector.
-                if !allow(row) || !self.column.is_present(row) {
-                    return None;
+        let score = |row: usize| -> Option<(usize, f32)> {
+            // A null row (M88) has a slot and no vector.
+            if !allow(row) || !self.column.is_present(row) {
+                return None;
+            }
+            let raw = self.codes.get(row * step..(row + 1) * step)?;
+            let code = self.quantizer.read_code(raw)?;
+            Some((row, self.quantizer.estimate_prepared(&code, &prepared)))
+        };
+        let mut scored: Vec<(usize, f32)> = match probes {
+            None => (0..self.codes.len() / step).filter_map(score).collect(),
+            Some(p) => {
+                let cl = self
+                    .clusters
+                    .as_ref()
+                    .ok_or(ExternalIndexError::Corrupt("the index has no clusters"))?;
+                if p == 0 {
+                    return Err(ExternalIndexError::Corrupt("probes is zero"));
                 }
-                let code = self.quantizer.read_code(raw)?;
-                Some((row, self.quantizer.estimate_prepared(&code, &prepared)))
-            })
-            .collect();
+                cl.nearest(&q, p)
+                    .into_iter()
+                    .filter_map(|l| cl.lists.get(l))
+                    .flatten()
+                    .filter_map(|r| score(*r as usize))
+                    .collect()
+            }
+        };
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored.truncate(window.max(k));
         let rows: Vec<usize> = scored.iter().map(|(r, _)| *r).collect();
@@ -440,5 +722,30 @@ impl<'a> Reader<'a> {
     }
     fn rest(&mut self) -> &'a [u8] {
         std::mem::take(&mut self.0)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::sample_rows;
+
+    #[test]
+    fn nulls_on_the_stride_cannot_empty_the_sample() {
+        // 20,000 rows, every third a null, a cap that strides by 3 over the rows.
+        let got = sample_rows(20_000, 8_192, |r| r % 3 != 0);
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|r| r % 3 != 0));
+        assert!(got.len() <= 8_192 && got.len() > 4_096, "{}", got.len());
+        // Every present row when they fit; none past the end; ascending.
+        assert_eq!(
+            sample_rows(10, 100, |r| r != 4),
+            [0, 1, 2, 3, 5, 6, 7, 8, 9]
+        );
+        assert!(sample_rows(10, 100, |_| false).is_empty());
+        assert!(got.is_sorted());
     }
 }

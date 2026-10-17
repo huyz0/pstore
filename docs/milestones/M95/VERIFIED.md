@@ -42,6 +42,8 @@ Commands:
        `logical_is_signed_int`; the fallback skips a bool, which consumes nothing, and
        `is_signed` is already false.
      - Re-sweep: 73 mutants, 64 caught, 8 unviable, 1 missed (the equivalent one above).
+     - Final sweep over the whole milestone diff, after the clippy edit to the tests: 82 mutants,
+       73 caught, 8 unviable, 1 missed (the same equivalent one).
 
 **Code review:** two majors fixed (a logical type the physical value does not carry was read
 as signed; a null row's path to `keep` was untested), plus minors. Review rounds stayed within budget.
