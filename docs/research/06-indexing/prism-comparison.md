@@ -73,8 +73,13 @@ not assumed:
 | Rerank tier (384d) | Bytes a probed row | vs. int8 today |
 |---|---|---|
 | int8 (`Sq8`) | 72 + 392 = 464 | 1.00× |
-| 4-bit | 72 + 200 = 272 | 0.59× |
-| 2-bit | 72 + 104 = 176 | 0.38× |
+| 4-bit (3 extra bits) | 72 + 200 = 272 | 0.59× |
+| 2-bit (1 extra bit) | 72 + 72 = 144 | 0.31× |
+
+⚠️ **Extra bits beside the 1-bit code, over the *padded* dimension.** An extended-RaBitQ code's
+sign bit is the 1-bit code's bit, so only `B − 1` bits a coordinate are new. The rotation codes
+`next_power_of_two(D)` coordinates (512 at 384d; `rabitq.rs`). A standalone `B·D/8` record would
+be both wrong and dearer: the first draft of M97 priced it so, and its review caught it.
 
 If a 4-bit tier holds int8's recall, it is offered **as an index option**, because the width is
 written at build time and a customer who wants the last 0.5 point of recall can keep int8.

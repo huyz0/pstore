@@ -69,7 +69,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 | OQ-99 | Optimal cache-max fraction of the device (64% is derived from CacheLib/DLWA data, not from our access-size distribution) | `07/disk-space-management` |
 | OQ-100 | Does class→region segregation reach the ~1.03 DLWA the FDP paper reports, without FDP hardware? | `07/disk-space-management` |
 | OQ-103 | Behaviour when the cache device fails outright mid-flight — must be identical to bypass mode, and the node must not die. Verify. | `07/disk-space-management` |
-| OQ-170 | Can a narrower rerank tier (extended RaBitQ, 2–4 bits a dimension) replace int8 at its recall? The int8 records are **84%** of the bytes a `fast` query moves, and of the resident working set: a 4-bit tier is 0.59× the bytes a probed row, 2-bit 0.38×. Measured by [M97](../../milestones/M97/SPEC.md) criterion 1 against an sq4 control. | `06/prism-comparison` |
+| OQ-170 | Can a narrower rerank tier (extended RaBitQ, 2–4 bits a dimension) replace int8 at its recall? The int8 records are **84%** of the bytes a `fast` query moves, and of the resident working set: a 4-bit tier is 0.59× the bytes a probed row, 2-bit 0.31× (extra bits beside the 1-bit code, over the padded dimension). Measured by [M97](../../milestones/M97/SPEC.md) criterion 1 against an sq4 control. | `06/prism-comparison` |
 
 ## Tier 3 — tuning and refinement
 
