@@ -626,3 +626,47 @@ async fn keys_carry_the_published_partition_prefix() {
         assert_eq!(reg.shard_key(shard).as_str(), want);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn open_refuses_a_bad_config_and_retries_a_lost_create() {
+    use pstore_blob::{BlobStore, Key};
+    use pstore_jobs::MAX_ATTEMPTS;
+    let store = Counting::new();
+    let opened = |name: &'static str, shards: u16| {
+        let s = store.clone();
+        async move { Register::open(Arc::new(s), name, shards).await }
+    };
+    // A shard count of 0 hashes every id into no shard; refused before anything is written.
+    let r = opened("zero", 0).await;
+    assert!(matches!(r, Err(JobsError::Corrupt(_))), "{:?}", r.err());
+    assert_eq!(store.cas(), 0);
+
+    // A stored CONFIG that does not decode, or says 0, is refused rather than replaced:
+    // its count was fixed at first use, and every shard key depends on it.
+    let config = Key::new(format!("{:04x}/jobs/cfg/CONFIG", fnv1a(b"cfg") & 0xffff));
+    assert_eq!(opened("cfg", 4).await.unwrap().shards(), 4);
+    for bad in [&b"not json"[..], br#"{"shards":0}"#] {
+        store
+            .inner
+            .put(&config, bytes::Bytes::from_static(bad))
+            .await
+            .unwrap();
+        let r = opened("cfg", 4).await;
+        assert!(matches!(r, Err(JobsError::Corrupt(_))), "{:?}", r.err());
+    }
+
+    // A create that loses its race once is retried, and the count it then writes is used.
+    let base = store.cas();
+    store.contend_at(&[base]);
+    assert_eq!(opened("raced", 3).await.unwrap().shards(), 3);
+    assert_eq!(store.cas() - base, 2);
+
+    // One that loses every time gives up after its attempts.
+    store
+        .lose_all
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let base = store.cas();
+    let r = opened("never", 3).await;
+    assert!(matches!(r, Err(JobsError::Contended)), "{:?}", r.err());
+    assert_eq!(store.cas() - base, u64::from(MAX_ATTEMPTS));
+}

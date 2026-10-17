@@ -368,3 +368,48 @@ async fn a_glob_class_never_prunes_a_match() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_declaration_that_cannot_mean_anything_is_refused_by_name() {
+    // A schema is fixed when its index is created (M15.2, M30), so a declaration that would
+    // be ignored or misread must be a 400 naming it, not an index built some other way.
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    let doc = json!({"id": "1", "vector": [1.0, 0.0], "attributes": {"s": "x"}});
+    let docs = || json!([doc.clone()]);
+    for (body, why) in [
+        (
+            json!({"schema": {"s": {"type": "string", "regex": true, "sketch": 1}}, "documents": docs()}),
+            "unknown key \"sketch\"",
+        ),
+        (
+            json!({"schema": {"s": {"type": "int", "regex": true}}, "documents": docs()}),
+            "a regex attribute's type is string",
+        ),
+        (
+            json!({"schema": {"s": {"type": "string", "regex": true}}, "patch_rows": [{"id": "1", "attributes": {}}]}),
+            "regex is declared and the write has no documents",
+        ),
+        (
+            json!({"schema": {"title": {"full_text_search": true}}, "documents": docs()}),
+            "full_text_search is on the text field",
+        ),
+        (
+            json!({"schema": {"text": {"type": "int", "full_text_search": true}}, "documents": docs()}),
+            "the text field's type is string",
+        ),
+        (
+            json!({"schema": {"text": {"full_text_search": true}}, "patch_rows": [{"id": "1", "attributes": {}}]}),
+            "full_text_search is declared and the write has no documents",
+        ),
+        (
+            json!({"patch_rows": [{"id": "1", "attributes": [1]}]}),
+            "attributes is an object",
+        ),
+    ] {
+        let (s, b) = put(a, body.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body} was accepted: {b}");
+        let msg = b["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(why), "{body}: {msg:?} does not name {why:?}");
+    }
+}

@@ -191,3 +191,27 @@ async fn writes_folds_queries_and_reads_as_of_against_azurite() {
     // so each opens by `head` then range (M46).
     assert_eq!(ranked(&r, Some(at)).await, before, "as_of differs");
 }
+
+#[test]
+fn the_azure_store_builds_offline_and_names_its_account() {
+    // Not ignored: building a client reaches no network, so what `main` does with the
+    // configuration is checked here and not only against Azurite.
+    use pstore_server::AzureConfig;
+    let with = |key: Option<&str>, endpoint: Option<&str>| AzureConfig {
+        account: "acct".to_owned(),
+        key: key.map(str::to_owned),
+        container: "pstore".to_owned(),
+        endpoint: endpoint.map(str::to_owned),
+    };
+    for c in [
+        with(None, None),
+        with(Some("a2V5"), None),
+        with(Some("a2V5"), Some("http://127.0.0.1:10000/acct")),
+    ] {
+        let store = azure_store(&c, Profile::Conforming).unwrap();
+        assert_eq!(store.capabilities().backend, "azure(acct)", "{c:?}");
+    }
+    // A key that is not base64 is the client's refusal to build, reported rather than
+    // discovered on the first request.
+    assert!(azure_store(&with(Some("not base64!"), None), Profile::Conforming).is_err());
+}

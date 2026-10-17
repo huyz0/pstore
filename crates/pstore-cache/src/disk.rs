@@ -274,6 +274,11 @@ impl foyer::Code for Id {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "assertions in tests are the reporting mechanism"
+    )]
     use super::Id;
     use std::hash::BuildHasher as _;
 
@@ -287,5 +292,38 @@ mod tests {
         assert_eq!(hash(Id::Range(key(), 4096, 8192)), 0x9c77_4f0d_9145_8c19);
         assert_eq!(hash(Id::Whole(key())), 0xc2ed_b142_b10c_2a82);
         assert_eq!(hash(Id::Suffix(key(), 65536)), 0x881b_2410_f45f_4894);
+    }
+
+    /// A recovered disk entry is found by decoding its key, so every shape must round-trip,
+    /// `estimated_size` must be the encoding's length (foyer budgets by it), and a short,
+    /// mistagged or non-UTF-8 key must be refused rather than read as some other entry.
+    #[test]
+    fn every_shape_round_trips_and_a_bad_key_is_refused() {
+        use foyer::Code as _;
+        let key = || "tnt/1/seg/a.seg".to_owned();
+        for id in [
+            Id::Range(key(), 4096, 8192),
+            Id::Whole(key()),
+            Id::Suffix(key(), 65536),
+        ] {
+            let mut wire = Vec::new();
+            id.encode(&mut wire).unwrap();
+            assert_eq!(wire.len(), id.estimated_size(), "{id:?}");
+            assert_eq!(Id::decode(&mut wire.as_slice()).unwrap(), id);
+            for cut in 0..wire.len() {
+                assert!(
+                    Id::decode(&mut &wire[..cut]).is_err(),
+                    "{id:?} cut at {cut}"
+                );
+            }
+        }
+        let mut wire = Vec::new();
+        Id::Whole(key()).encode(&mut wire).unwrap();
+        wire[0] = 3;
+        let refused = Id::decode(&mut wire.as_slice()).unwrap_err().to_string();
+        assert!(refused.contains("unknown cache id tag 3"), "{refused}");
+        wire[0] = 1;
+        wire[9] = 0xff;
+        assert!(Id::decode(&mut wire.as_slice()).is_err(), "non-UTF-8 key");
     }
 }

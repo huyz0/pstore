@@ -617,3 +617,42 @@ async fn a_multi_query_keeps_the_depth() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_multi_query_of_another_width_is_refused_by_a_folded_segment() {
+    // Every row folded, so the width the query meets is the segment's, not one held at the
+    // door: the client's error, never an empty answer or a `500`.
+    let store = MemoryStore::new();
+    let api = api(&store);
+    let (s, b) = put(
+        &api,
+        "docs",
+        &json!({"durability": "durable", "documents": [
+            {"id": "a", "vector": [1.0, 2.0], "vectors": {"late": [[1.0, 2.0, 3.0]]}}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(&api).await;
+    // Exact maxsim and the FDE scan check the width each on its own path.
+    for mode in ["exact", "fde"] {
+        let (s, b) = query(
+            &api,
+            "docs",
+            &json!({"multi": {"field": "late", "mode": mode,
+                "vectors": [[1.0, 0.0, 0.0], [1.0, 0.0]]}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{mode}: {b}");
+        assert_eq!(b["error"]["code"], "schema_conflict", "{mode}: {b}");
+        // The same query at the segment's width answers.
+        let (s, b) = query(
+            &api,
+            "docs",
+            &json!({"multi": {"field": "late", "mode": mode,
+                "vectors": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{mode}: {b}");
+        assert_eq!(ids(&b), ["a"], "{mode}: {b}");
+    }
+}

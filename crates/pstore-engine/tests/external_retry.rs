@@ -11,7 +11,7 @@
 //! `Contended` -- not `Lost` -- after exactly the attempts every commit loop here makes.
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
-use pstore_engine::{Engine, EngineError, ExternalKind};
+use pstore_engine::{Engine, EngineError, ExternalKind, ExternalRefusal};
 use pstore_types::{LaneId, TenantId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
@@ -26,6 +26,8 @@ struct Contend {
     inner: MemoryStore,
     left: AtomicU32,
     refused: AtomicU32,
+    /// A rival's HEAD, landed by the next HEAD commit in place of ours, which then loses.
+    rival: std::sync::Mutex<Option<bytes::Bytes>>,
 }
 
 impl Contend {
@@ -34,6 +36,7 @@ impl Contend {
             inner: MemoryStore::new(),
             left: times.into(),
             refused: 0.into(),
+            rival: std::sync::Mutex::default(),
         })
     }
 }
@@ -92,6 +95,13 @@ impl BlobStore for Contend {
         {
             self.refused.fetch_add(1, SeqCst);
             return Err(pstore_blob::CasError::Contended);
+        }
+        let rival = self.rival.lock().unwrap().take();
+        if key.as_str().ends_with("/HEAD")
+            && let Some(theirs) = rival
+        {
+            self.inner.put(key, theirs).await.unwrap();
+            return Err(pstore_blob::CasError::Lost);
         }
         self.inner.put_conditional(key, body, pre).await
     }
@@ -165,4 +175,76 @@ async fn a_drop_that_keeps_contending_reports_contention_after_every_attempt() {
     assert_eq!(store.refused.load(SeqCst), ATTEMPTS);
     store.left.store(0, SeqCst);
     assert!(e.head_for_test().await.externals.contains_key("x"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_registration_that_loses_to_a_rival_of_the_same_name_is_refused() {
+    // Two registrations of one name race: the one that loses re-reads HEAD, finds the name
+    // taken, and refuses rather than retrying over the rival's index.
+    let (store, e) = engine(0).await;
+    register(&e).await.unwrap();
+    let rivals = format!("{:?}", e.head_for_test().await.externals["x"]);
+    let keys = store.inner.list_unrestricted(&Key::new("")).await.unwrap();
+    let head = keys
+        .into_iter()
+        .find(|k| k.as_str().ends_with("/HEAD"))
+        .unwrap();
+    // Taken back out, so the next registration sees the name free, builds, and commits.
+    let theirs = store.inner.get(&head).await.unwrap();
+    store
+        .inner
+        .delete_batch(std::slice::from_ref(&head))
+        .await
+        .unwrap();
+    *store.rival.lock().unwrap() = Some(theirs.clone());
+
+    let fresh = Engine::new(Arc::clone(&store), T, LaneId(1))
+        .with_external_sources(vec!["lake/".to_owned()]);
+    let err = register(&fresh).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::External(ExternalRefusal::Exists(ref n)) if n == "x"),
+        "{err:?}"
+    );
+    // The rival's index stands, and nothing else was registered.
+    let h = fresh.head_for_test().await;
+    assert_eq!(format!("{:?}", h.externals["x"]), rivals);
+    assert_eq!(h.externals.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_registration_that_loses_to_an_unrelated_commit_retries_and_lands() {
+    let (store, e) = engine(0).await;
+    // Any HEAD that names nothing new: the rival changed something else.
+    let a = Engine::new(Arc::clone(&store), T, LaneId(2))
+        .with_external_sources(vec!["lake/".to_owned()]);
+    a.register_external("y", ExternalKind::Parquet, "lake/good.parquet", "embedding")
+        .await
+        .unwrap();
+    let keys = store.inner.list_unrestricted(&Key::new("")).await.unwrap();
+    let head = keys
+        .into_iter()
+        .find(|k| k.as_str().ends_with("/HEAD"))
+        .unwrap();
+    *store.rival.lock().unwrap() = Some(store.inner.get(&head).await.unwrap());
+    register(&e).await.unwrap();
+    let h = e.head_for_test().await;
+    assert!(h.externals.contains_key("x") && h.externals.contains_key("y"));
+}
+
+#[tokio::test]
+async fn an_invalid_name_is_refused_before_anything_is_read() {
+    let (_, e) = engine(0).await;
+    let err = e
+        .register_external(
+            "not/a name",
+            ExternalKind::Parquet,
+            "lake/good.parquet",
+            "embedding",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Refused(ref m) if m.contains("not a valid index name")),
+        "{err:?}"
+    );
 }

@@ -219,3 +219,68 @@ fn chunks_of(
     }
     Ok(pieces)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::plain_floats;
+
+    /// A length-delimited protobuf field. Every body here is under 128 bytes.
+    fn msg(field: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![field << 3 | 2, u8::try_from(body.len()).unwrap_or(0)];
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn varint(field: u8, v: u8) -> Vec<u8> {
+        vec![field << 3, v]
+    }
+
+    /// `FixedSizeList(dims) -> Flat(bits)`, the compression a plain float32 page carries.
+    fn compression(dims: u8, bits: u8) -> Vec<u8> {
+        let flat = varint(1, bits);
+        let items = msg(1, &flat);
+        let fsl = [varint(1, dims), msg(2, &items)].concat();
+        msg(11, &fsl)
+    }
+
+    /// Only plain float32s of the declared width are read as rows: anything else in the
+    /// compression would be decoded as floats it is not, and answer queries wrongly.
+    #[test]
+    fn only_a_flat_32_bit_list_of_the_declared_width_is_plain() {
+        assert!(plain_floats(&compression(4, 32), 4));
+        let flat = varint(1, 32);
+        let fsl = |items: &[u8]| msg(11, &[varint(1, 4), msg(2, items)].concat());
+        for (what, bad) in [
+            ("another width", compression(8, 32)),
+            ("64-bit values", compression(4, 64)),
+            ("malformed", vec![11 << 3 | 2, 5]),
+            ("another encoding", msg(12, &[])),
+            (
+                "a second encoding",
+                [compression(4, 32), msg(12, &[])].concat(),
+            ),
+            ("a malformed list", msg(11, &[1 << 3])),
+            ("a list with no items", msg(11, &varint(1, 4))),
+            (
+                "a list with more",
+                msg(
+                    11,
+                    &[varint(1, 4), msg(2, &msg(1, &flat)), varint(3, 1)].concat(),
+                ),
+            ),
+            ("malformed items", fsl(&[1 << 3 | 2, 9])),
+            (
+                "items with more",
+                fsl(&[msg(1, &flat), varint(2, 1)].concat()),
+            ),
+            ("items not flat", fsl(&msg(2, &flat))),
+            ("a malformed flat", fsl(&msg(1, &[1 << 3]))),
+            (
+                "a flat with more",
+                fsl(&msg(1, &[flat.clone(), varint(2, 1)].concat())),
+            ),
+        ] {
+            assert!(!plain_floats(&bad, 4), "{what}");
+        }
+    }
+}

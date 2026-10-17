@@ -726,12 +726,211 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "assertions in tests are the reporting mechanism"
-)]
 mod tests {
-    use super::sample_rows;
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "assertions in tests are the reporting mechanism"
+    )]
+    use super::{ExternalIndex, ExternalIndexError, MAGIC, MAGIC_CLUSTERED, sample_rows};
+    use crate::rabitq::{QuantError, Quantizer};
+
+    const DIMS: u32 = 8;
+    const ROWS: u64 = 2;
+
+    /// A codes blob written by hand: `ROWS` rows of `DIMS`, no tag, `extents` as given, then
+    /// `codes` bytes of codes and `tail`.
+    fn blob(
+        magic: &[u8; 4],
+        dims: u32,
+        tag: &[u8],
+        extents: &[&[u8]],
+        codes: usize,
+        tail: &[u8],
+    ) -> Vec<u8> {
+        let mut b = magic.to_vec();
+        b.extend(dims.to_le_bytes());
+        b.extend(ROWS.to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.push(b'k');
+        for n in [0u64, 32, 64] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend(tag);
+        b.extend((extents.len() as u32).to_le_bytes());
+        for e in extents {
+            b.extend(*e);
+        }
+        b.extend(0u32.to_le_bytes());
+        b.extend(vec![0u8; codes]);
+        b.extend(tail);
+        b
+    }
+
+    /// One extent, its dictionary flag `dict` followed by nothing.
+    fn extent(dict: u8) -> Vec<u8> {
+        let mut e = Vec::new();
+        for n in [0u64, ROWS, 0, 64] {
+            e.extend(n.to_le_bytes());
+        }
+        e.push(0);
+        e.extend(64u64.to_le_bytes());
+        e.push(dict);
+        e.extend(0u32.to_le_bytes());
+        e
+    }
+
+    fn refusal(raw: &[u8]) -> &'static str {
+        match ExternalIndex::from_bytes(raw) {
+            Err(ExternalIndexError::Corrupt(why)) => why,
+            other => panic!("not refused as corrupt: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_damaged_codes_blob_is_refused_by_name() {
+        let code = Quantizer::new(DIMS as usize).code_len() * ROWS as usize;
+        // The control: the same bytes, well formed, open.
+        let good = ExternalIndex::from_bytes(&blob(MAGIC, DIMS, &[0], &[], code, &[])).unwrap();
+        assert_eq!(good.cluster_count(), 0);
+        let tagged = blob(MAGIC, DIMS, &[1, 1, 0, 0, 0, b't'], &[], code, &[]);
+        assert!(ExternalIndex::from_bytes(&tagged).is_ok());
+
+        assert_eq!(
+            refusal(&blob(MAGIC, DIMS, &[2], &[], code, &[])),
+            "bad tag flag"
+        );
+        assert_eq!(
+            refusal(&blob(MAGIC, DIMS, &[0], &[&extent(2)], code, &[])),
+            "bad dictionary flag"
+        );
+        let short = "codes are not rows × code length";
+        assert_eq!(refusal(&blob(MAGIC, DIMS, &[0], &[], code - 1, &[])), short);
+        assert_eq!(refusal(&blob(MAGIC, DIMS, &[0], &[], code, &[0])), short);
+        assert_eq!(refusal(&blob(MAGIC, 0, &[0], &[], 0, &[])), short);
+        // No rows and no width: zero codes is the right length, and still not an index.
+        let mut empty = blob(MAGIC, 0, &[0], &[], 0, &[]);
+        empty[8..16].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(refusal(&empty), short);
+        assert_eq!(refusal(b"PXI5"), "not an external index");
+    }
+
+    /// Every section a codes blob can carry: a tag, a run with a dictionary and one without,
+    /// a further object with a tag, codes, and the cluster section. `object` is the object the
+    /// second run names.
+    fn full(object: u32) -> Vec<u8> {
+        let tag = [1, 1, 0, 0, 0, b't'];
+        let run = |first: u64, dict: bool, object: u32| {
+            let mut e = Vec::new();
+            for n in [first, 1, 0, 64] {
+                e.extend(n.to_le_bytes());
+            }
+            e.push(0);
+            e.extend(64u64.to_le_bytes());
+            if dict {
+                e.push(1);
+                e.extend(0u64.to_le_bytes());
+                e.extend(8u64.to_le_bytes());
+                e.extend(1u32.to_le_bytes());
+                e.push(0);
+            } else {
+                e.push(0);
+            }
+            e.extend(object.to_le_bytes());
+            e
+        };
+        let mut b = MAGIC_CLUSTERED.to_vec();
+        b.extend(DIMS.to_le_bytes());
+        b.extend(ROWS.to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.push(b'k');
+        for n in [0u64, 32, 64] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend(tag);
+        b.extend(2u32.to_le_bytes());
+        b.extend(run(0, true, 0));
+        b.extend(run(1, false, object));
+        b.extend(1u32.to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.push(b'm');
+        b.extend(64u64.to_le_bytes());
+        b.extend(tag);
+        b.extend(vec![
+            0u8;
+            Quantizer::new(DIMS as usize).code_len() * ROWS as usize
+        ]);
+        b.extend(1u32.to_le_bytes());
+        for i in 0..DIMS {
+            b.extend(if i == 0 { 1f32 } else { 0f32 }.to_le_bytes());
+        }
+        for _ in 0..ROWS {
+            b.extend(0u32.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn every_truncation_of_a_full_codes_blob_is_refused() {
+        let raw = full(1);
+        let ix = ExternalIndex::from_bytes(&raw).unwrap();
+        assert_eq!((ix.cluster_count(), ix.extent_count()), (1, 2));
+        // The blob reads back as the bytes it was read from.
+        assert_eq!(ix.to_bytes(), raw);
+        for n in 0..raw.len() {
+            assert!(
+                ExternalIndex::from_bytes(&raw[..n]).is_err(),
+                "a blob cut to {n} of {} bytes was read",
+                raw.len()
+            );
+        }
+        assert_eq!(refusal(&full(2)), "the runs do not fit the objects");
+        // A list id past the lists, and a cluster section with no list.
+        let mut far = raw.clone();
+        let at = far.len() - 4;
+        far[at..].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(refusal(&far), "a list id is out of range");
+        let mut more = raw;
+        more.push(0);
+        assert_eq!(
+            refusal(&more),
+            "the cluster section is not nlist × dims + rows"
+        );
+    }
+
+    #[test]
+    fn probing_refuses_no_probes_and_a_query_of_another_width() {
+        let code = Quantizer::new(DIMS as usize).code_len() * ROWS as usize;
+        // One list, its centroid on the first axis, both rows in it.
+        let mut tail = 1u32.to_le_bytes().to_vec();
+        for i in 0..DIMS {
+            tail.extend(if i == 0 { 1f32 } else { 0f32 }.to_le_bytes());
+        }
+        for _ in 0..ROWS {
+            tail.extend(0u32.to_le_bytes());
+        }
+        let ix = ExternalIndex::from_bytes(&blob(MAGIC_CLUSTERED, DIMS, &[0], &[], code, &tail))
+            .unwrap();
+        let q = [1f32, 0., 0., 0., 0., 0., 0., 0.];
+        assert_eq!(ix.probed_rows(&q, 1).unwrap(), [0, 1]);
+        assert!(matches!(
+            ix.probed_rows(&q, 0),
+            Err(ExternalIndexError::Corrupt("probes is zero"))
+        ));
+        assert!(matches!(
+            ix.probed_rows(&q[..7], 1),
+            Err(ExternalIndexError::Vector("wrong width"))
+        ));
+        let quant = QuantError::Dimension {
+            expected: 8,
+            got: 7,
+        };
+        assert!(matches!(
+            ExternalIndexError::from(quant),
+            ExternalIndexError::Vector("wrong width")
+        ));
+    }
 
     #[test]
     fn nulls_on_the_stride_cannot_empty_the_sample() {

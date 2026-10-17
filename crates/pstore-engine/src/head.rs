@@ -1571,6 +1571,83 @@ mod tests {
         Ok(())
     }
 
+    /// A HEAD with every section written: every optional one non-empty, every schema field
+    /// off its default.
+    fn every_section() -> Head {
+        let mut h = sample();
+        h.nonce = 0xfeed;
+        h.indexes = with_lens([Some(5), Some(300)]).indexes;
+        h.watermarks.insert(1, 9);
+        let schema = IndexSchema {
+            dims: 4,
+            text_field: "body".to_owned(),
+            metric: Metric::CosineDistance,
+            fts: pstore_format::text::FullText {
+                k1: 1.5,
+                b: 0.25,
+                ..Default::default()
+            },
+            trigram: vec!["title".to_owned(), "url".to_owned()],
+        };
+        h.schemas.insert("a".to_owned(), schema.clone());
+        h.schema_rejects.insert("a".to_owned(), 3);
+        h.reaped_before = 6;
+        h.graveyard
+            .insert(5, vec!["k/0.seg".to_owned(), "k/0.seg.dv".to_owned()]);
+        h.deletes
+            .insert("k/1.seg".to_owned(), ("k/1.seg.dv".to_owned(), 2));
+        h.dropped.push(("gone".to_owned(), 4, schema));
+        h.quarantine
+            .insert("a".to_owned(), vec![("k/1.q".to_owned(), 1)]);
+        h.externals
+            .insert("x".to_owned(), external(ExternalKind::Lance, 1));
+        h
+    }
+
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "every cut is below the length it is taken from"
+    )]
+    fn a_head_of_every_section_is_refused_cut_anywhere_but_a_section_boundary()
+    -> Result<(), EngineError> {
+        let h = every_section();
+        let bytes = h.encode();
+        assert_eq!(Head::decode(&bytes)?, h);
+        let decodable: Vec<usize> = (0..bytes.len())
+            .filter(|cut| Head::decode(&bytes[..*cut]).is_ok())
+            .collect();
+        // One decodable cut per optional section -- the fourteen `at_end` checks `decode`
+        // makes -- and none inside a section: a `?` that read short as a default would add
+        // one. (`a_truncated_head_is_refused_at_every_length_but_a_section_boundary` pins the
+        // same for a HEAD whose later sections are empty.)
+        assert_eq!(decodable.len(), 14, "{decodable:?} of {}", bytes.len());
+        for cut in &decodable {
+            assert_ne!(
+                Head::decode(&bytes[..*cut])?,
+                h,
+                "a cut at {cut} read as the whole"
+            );
+        }
+        // The first is where every HEAD before M7d ended: its segments are whole (their
+        // dictionaries and lengths are later sections), and the schemas absent.
+        let old = Head::decode(&bytes[..decodable[0]])?;
+        let segs = |h: &Head| -> Vec<(String, u32)> {
+            h.indexes
+                .values()
+                .flatten()
+                .map(|r| (r.key.clone(), r.rows))
+                .collect()
+        };
+        assert_eq!(segs(&old), segs(&h));
+        assert_eq!(
+            (&old.watermarks, &old.graveyard),
+            (&h.watermarks, &h.graveyard)
+        );
+        assert!(old.schemas.is_empty() && old.externals.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn a_suffixed_name_parses_as_its_base() {
         // M23: a refused name takes `_{n:x}` before its extension, and every parser reads the

@@ -371,6 +371,49 @@ mod tests {
     }
 
     #[test]
+    fn every_truncation_and_every_unknown_tag_is_none() {
+        // A condition crosses a process boundary (M13), so a short one must be refused and not
+        // read as the predicate its prefix spells: each field is read with `?`, and a reader
+        // that padded a short read would decode a cut-off `Cmp` as a comparison with zero.
+        let a = || "a".to_owned();
+        let mut shapes = match every_shape() {
+            Predicate::And(ps) => ps,
+            _ => unreachable!(),
+        };
+        shapes.push(Predicate::GeoRadius(a(), 1.5, -2.5, 300.0));
+        shapes.push(Predicate::GeoBox(a(), -1.0, -2.0, 3.0, 4.0));
+        shapes.push(Predicate::Cmp(
+            a(),
+            Op::Eq,
+            Value::Array(vec![Value::Int(1)]),
+        ));
+        for p in shapes {
+            let good = encode(&p);
+            assert_eq!(decode(&good), Some(p.clone()), "{good}");
+            for cut in (2..good.len()).step_by(2) {
+                assert_eq!(decode(&good[..cut]), None, "{p:?} cut at byte {}", cut / 2);
+            }
+        }
+        // An unknown tag at every place one is read: the predicate, a value, an operator, a
+        // pattern kind, a token operator, an analyzer.
+        let s1 = "0100000061";
+        for bad in [
+            "0c".to_owned(),
+            format!("00{s1}0006"),
+            format!("00{s1}05"),
+            format!("08{s1}03"),
+            format!("07{s1}03"),
+            format!("07{s1}000000000002"),
+            // A regex `Pattern::new` refuses: `(`.
+            format!("08{s1}020100000028"),
+            // An analyzer that does not decode.
+            format!("07{s1}0000000000010100000078"),
+        ] {
+            assert_eq!(decode(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn anything_else_is_none() {
         let good = encode(&every_shape());
         for bad in [
