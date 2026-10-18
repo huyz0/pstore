@@ -834,7 +834,7 @@ async fn objects_without_a_tag_round_trip_through_the_blob() {
 
 // ---- M95: the attribute is a column of the same Parquet object ---------------------------------
 
-use pstore_format::external::{AttrValue, ExternalAttribute};
+use pstore_format::external::{AttrSource, AttrValue, ExternalAttribute};
 
 fn id_of(v: Option<&AttrValue>) -> Option<i64> {
     match v {
@@ -912,7 +912,10 @@ async fn an_attribute_of_another_object_or_length_is_refused() {
     let mut wrong_len = ExternalAttribute::pin_parquet(&store, &short, "id")
         .await
         .unwrap();
-    wrong_len.column.key = "lake/multipage.parquet".to_owned();
+    let AttrSource::Fixed(column) = &mut wrong_len.source else {
+        unreachable!()
+    };
+    column.key = "lake/multipage.parquet".to_owned();
     acct.record_ranges();
     let err = index
         .search_attr(&store, &[1.0; 8], 10, 100, &attr, &|_| true)
@@ -1350,4 +1353,62 @@ async fn a_filter_on_a_timestamp_column_equals_the_exact_filtered_cosine() {
         .await
         .unwrap();
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), want);
+}
+
+#[tokio::test]
+async fn a_filter_on_a_string_column_equals_the_exact_filtered_cosine() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}good.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/vectors-labels.parquet");
+    let raw = std::fs::read(format!("{dir}vectors-labels.parquet")).unwrap();
+    store.put(&key, raw.into()).await.unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 100)
+        .await
+        .unwrap();
+    let q = &all[10];
+    // `label` is "odd" on odd rows and null every 7th; `flag` is set on every third row.
+    let odd = |i: usize| i % 2 == 1 && i % 7 != 3;
+    let third = |i: usize| i.is_multiple_of(3);
+    let label = ExternalAttribute::pin_parquet(&store, &key, "label")
+        .await
+        .unwrap();
+    let flag = ExternalAttribute::pin_parquet(&store, &key, "flag")
+        .await
+        .unwrap();
+    let keep_odd = |v: Option<&AttrValue>| matches!(v, Some(AttrValue::Str(s)) if s == "odd");
+    let keep_flag = |v: Option<&AttrValue>| matches!(v, Some(AttrValue::Bool(true)));
+    for (attr, keep, rows) in [
+        (
+            &label,
+            &keep_odd as &(dyn Fn(Option<&AttrValue>) -> bool + Sync),
+            &odd as &dyn Fn(usize) -> bool,
+        ),
+        (&flag, &keep_flag, &third),
+    ] {
+        let mut exact: Vec<(usize, f64)> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| rows(*i))
+            .map(|(i, v)| (i, cosine(q, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        let got = index
+            .search_attr(&store, q, 10, 300, attr, keep)
+            .await
+            .unwrap();
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), want);
+    }
 }

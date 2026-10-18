@@ -6,9 +6,12 @@
 //! decompress, a dictionary a lookup, and a nullable or repeated one level decoding -- none is a
 //! computable range, and silently reading one as floats would return noise.
 
+mod chunks;
 mod list;
 
-use crate::external::{AttrKind, DictRef, Extent};
+pub(crate) use chunks::decode_chunks;
+
+use crate::external::{AttrChunk, AttrKind, DictRef, Extent};
 use pstore_blob::{BlobError, BlobStore, Key};
 
 /// Why a Parquet column could not be located.
@@ -194,14 +197,18 @@ enum TimeUnit {
 /// The members of a `LogicalType` union an attribute can be read as (M99).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Logical {
-    Integer { signed: bool },
+    Integer {
+        signed: bool,
+    },
     Date,
     Timestamp(TimeUnit),
+    /// `STRING` (M100): a `BYTE_ARRAY` of UTF-8.
+    String,
     Other,
 }
 
-/// A `LogicalType` union (M99): `INTEGER` (field 10), `DATE` (6) and `TIMESTAMP` (8) by what
-/// they hold; every other member is [`Logical::Other`].
+/// A `LogicalType` union (M99): `INTEGER` (field 10), `DATE` (6), `TIMESTAMP` (8) and `STRING`
+/// (1, M100) by what they hold; every other member is [`Logical::Other`].
 fn logical_type(t: &mut Thrift<'_>) -> Option<Logical> {
     let mut found = Logical::Other;
     let mut last = 0;
@@ -214,6 +221,10 @@ fn logical_type(t: &mut Thrift<'_>) -> Option<Logical> {
                 Logical::Date
             }
             (8, 12) => timestamp(t)?,
+            (1, 12) => {
+                t.skip_struct()?;
+                Logical::String
+            }
             _ => {
                 t.skip(ty)?;
                 Logical::Other
@@ -272,6 +283,7 @@ fn from_converted(c: i64) -> Logical {
         CONVERTED_DATE => Logical::Date,
         CONVERTED_TIMESTAMP_MILLIS => Logical::Timestamp(TimeUnit::Millis),
         CONVERTED_TIMESTAMP_MICROS => Logical::Timestamp(TimeUnit::Micros),
+        CONVERTED_UTF8 => Logical::String,
         _ => Logical::Other,
     }
 }
@@ -285,13 +297,26 @@ fn scalar_kind(
     logical: Option<Logical>,
 ) -> Result<AttrKind, String> {
     use AttrKind as K;
-    let Some(physical @ (TYPE_INT32 | TYPE_INT64 | TYPE_FLOAT | TYPE_DOUBLE)) = ty else {
+    let logical = logical.or_else(|| converted.map(from_converted));
+    // M100: a boolean, and a string, which is a BYTE_ARRAY that says it is one.
+    match (ty, logical) {
+        (Some(TYPE_BOOLEAN), None) => return Ok(K::Bool),
+        (Some(TYPE_BYTE_ARRAY), Some(Logical::String)) => return Ok(K::Str),
+        (Some(TYPE_BYTE_ARRAY), _) => {
+            return Err(
+                "the column is binary: a BYTE_ARRAY with no STRING logical type is bytes, not text"
+                    .to_owned(),
+            );
+        }
+        _ => {}
+    }
+    let Some(physical @ (TYPE_BOOLEAN | TYPE_INT32 | TYPE_INT64 | TYPE_FLOAT | TYPE_DOUBLE)) = ty
+    else {
         return Err(format!(
-            "the column is {}, not INT32, INT64, FLOAT or DOUBLE",
+            "the column is {}, not a number, a BOOLEAN or a string",
             type_name(ty)
         ));
     };
-    let logical = logical.or_else(|| converted.map(from_converted));
     let int = |signed| Some(Logical::Integer { signed });
     match (physical, logical) {
         (TYPE_INT32, None) => Ok(K::Int32),
@@ -307,7 +332,7 @@ fn scalar_kind(
         (TYPE_FLOAT, None) => Ok(K::Float),
         (TYPE_DOUBLE, None) => Ok(K::Double),
         _ => Err(format!(
-            "the column has a logical type its {} value does not carry: only integers, dates and timestamps are read",
+            "the column has a logical type its {} value does not carry: only integers, dates, timestamps and strings are read",
             type_name(ty)
         )),
     }
@@ -583,6 +608,7 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
     })
 }
 
+const CONVERTED_UTF8: i64 = 0;
 const CONVERTED_DATE: i64 = 6;
 const CONVERTED_TIMESTAMP_MILLIS: i64 = 9;
 const CONVERTED_TIMESTAMP_MICROS: i64 = 10;
@@ -590,22 +616,24 @@ const CONVERTED_UINT_8: i64 = 11;
 const CONVERTED_UINT_64: i64 = 14;
 const CONVERTED_INT_8: i64 = 15;
 const CONVERTED_INT_64: i64 = 18;
+const TYPE_BOOLEAN: i64 = 0;
 const TYPE_INT32: i64 = 1;
 const TYPE_INT64: i64 = 2;
 const TYPE_FLOAT: i64 = 4;
 const TYPE_DOUBLE: i64 = 5;
+const TYPE_BYTE_ARRAY: i64 = 6;
 const TYPE_FLBA: i64 = 7;
 
 /// The name of a physical type, for a refusal.
 fn type_name(ty: Option<i64>) -> &'static str {
     match ty {
-        Some(0) => "BOOLEAN",
+        Some(TYPE_BOOLEAN) => "BOOLEAN",
         Some(TYPE_INT32) => "INT32",
         Some(TYPE_INT64) => "INT64",
         Some(TYPE_FLOAT) => "FLOAT",
         Some(TYPE_DOUBLE) => "DOUBLE",
         Some(3) => "INT96",
-        Some(6) => "BYTE_ARRAY",
+        Some(TYPE_BYTE_ARRAY) => "BYTE_ARRAY",
         Some(7) => "FIXED_LEN_BYTE_ARRAY",
         _ => "of an unknown type",
     }
@@ -746,6 +774,64 @@ fn present_runs(levels: &[u8], n: u64) -> Option<Vec<Run>> {
     (at == levels.len()).then_some(runs)
 }
 
+/// The `n` values of `bytes`, Parquet's RLE / bit-packed hybrid at `width` bits with no length
+/// prefix (M100). `None` unless the stream is well-formed, holds `n` values with no byte left
+/// over, and every repeated value fits in `width` bits. A width of 0 is all zeros; one past 32
+/// is no stream. ⚠️ A run of zero values would not advance, so it is refused rather than looped
+/// on.
+pub(crate) fn hybrid(bytes: &[u8], n: usize, width: u32) -> Option<Vec<u32>> {
+    if width > 32 {
+        return None;
+    }
+    let w = usize::try_from(width).ok()?;
+    let (mut at, mut out) = (0usize, Vec::with_capacity(n.min(1 << 20)));
+    while out.len() < n {
+        let (mut header, mut shift) = (0u64, 0u32);
+        loop {
+            let b = bytes.get(at)?;
+            at += 1;
+            header |= u64::from(b & 0x7F).checked_shl(shift)?;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+        let units = usize::try_from(header >> 1).ok().filter(|u| *u > 0)?;
+        let left = n - out.len();
+        if header & 1 == 1 {
+            // `units` groups of eight values, `width` bits each, least significant bit first;
+            // the values past `n` are padding.
+            let len = units.checked_mul(w)?;
+            let packed = bytes.get(at..at.checked_add(len)?)?;
+            at += len;
+            for k in 0..units.checked_mul(8)?.min(left) {
+                let mut v = 0u64;
+                for bit in 0..w {
+                    let pos = k * w + bit;
+                    v |= u64::from(packed.get(pos / 8)? >> (pos % 8) & 1) << bit;
+                }
+                out.push(u32::try_from(v).ok()?);
+            }
+        } else {
+            // One value, repeated, in `ceil(width / 8)` little-endian bytes.
+            let len = w.div_ceil(8);
+            let raw = bytes.get(at..at.checked_add(len)?)?;
+            at += len;
+            let mut le = [0u8; 8];
+            le.get_mut(..len)?.copy_from_slice(raw);
+            let v = u64::from_le_bytes(le);
+            if v >> width != 0 {
+                return None;
+            }
+            out.extend(std::iter::repeat_n(u32::try_from(v).ok()?, units.min(left)));
+        }
+    }
+    (at == bytes.len()).then_some(out)
+}
+
 /// Locates `column`'s vectors in the Parquet object at `key`.
 ///
 /// # Errors
@@ -756,9 +842,31 @@ pub async fn locate<S: BlobStore>(
     key: &Key,
     column: &str,
 ) -> Result<Located, ParquetError> {
-    locate_flat(store, key, column, false)
-        .await
-        .map(|(found, _)| found)
+    match locate_flat(store, key, column, false).await?.0 {
+        Scalar::Fixed(found) => Ok(found),
+        Scalar::Chunks { .. } => Err(ParquetError::Malformed("a vector column has no width")),
+    }
+}
+
+/// Where a scalar column's values are (M100): computed ranges for a fixed-width kind, or each
+/// row group's column chunk, read whole, for a boolean or a string.
+pub(crate) enum Scalar {
+    Fixed(Located),
+    Chunks {
+        len: u64,
+        rows: u64,
+        chunks: Vec<AttrChunk>,
+    },
+}
+
+impl Scalar {
+    /// The object's length.
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Fixed(found) => found.len,
+            Self::Chunks { len, .. } => *len,
+        }
+    }
 }
 
 /// Locates the scalar `INT32`, `INT64`, `FLOAT` or `DOUBLE` column `column` (M95): a value is a
@@ -772,6 +880,24 @@ pub async fn locate_scalar<S: BlobStore>(
     key: &Key,
     column: &str,
 ) -> Result<(Located, AttrKind), ParquetError> {
+    match locate_attribute(store, key, column).await? {
+        (Scalar::Fixed(found), kind) => Ok((found, kind)),
+        (Scalar::Chunks { .. }, _) => unsupported(
+            "the column is a BOOLEAN or a string, which has no fixed width: pin it as an ExternalAttribute",
+        ),
+    }
+}
+
+/// Locates the scalar column `column` of any kind [`AttrKind`] names (M100): a boolean or a
+/// string from the footer alone, its pages judged when they are read.
+///
+/// # Errors
+/// As [`locate_scalar`].
+pub(crate) async fn locate_attribute<S: BlobStore>(
+    store: &S,
+    key: &Key,
+    column: &str,
+) -> Result<(Scalar, AttrKind), ParquetError> {
     let (found, kind) = locate_flat(store, key, column, true).await?;
     Ok((
         found,
@@ -784,7 +910,7 @@ async fn locate_flat<S: BlobStore>(
     key: &Key,
     column: &str,
     scalar: bool,
-) -> Result<(Located, Option<AttrKind>), ParquetError> {
+) -> Result<(Scalar, Option<AttrKind>), ParquetError> {
     let bad = ParquetError::Malformed;
     let len = store.head(key).await?;
     let tail = store.get_suffix(key, 8).await?;
@@ -813,7 +939,7 @@ async fn locate_flat<S: BlobStore>(
         // M91: a list of floats. Anything else nested is refused inside.
         return list::locate_list(store, key, len, &f, column, top, size)
             .await
-            .map(|found| (found, None));
+            .map(|found| (Scalar::Fixed(found), None));
     }
     // M95: a scalar is read as a vector of `width / 4` lanes; `ty` is the type every chunk must
     // agree on.
@@ -834,8 +960,13 @@ async fn locate_flat<S: BlobStore>(
         return unsupported("the column is REPEATED: it carries repetition levels");
     }
     let optional = leaf.repetition == Some(OPTIONAL);
-    let width = match kind {
-        Some(kind) => kind.width() as i64,
+    let width = match kind.map(AttrKind::width) {
+        Some(Some(width)) => width as i64,
+        // M100: a kind that is not fixed-width is read by chunk; the footer is all the pin reads.
+        Some(None) => {
+            let (rows, chunks) = chunks::locate_chunks(len, &f, column, ty, optional)?;
+            return Ok((Scalar::Chunks { len, rows, chunks }, kind));
+        }
         None => leaf
             .type_length
             .filter(|w| *w > 0 && w % 4 == 0)
@@ -1063,12 +1194,12 @@ async fn locate_flat<S: BlobStore>(
         first_row += want;
     }
     Ok((
-        Located {
+        Scalar::Fixed(Located {
             len,
             dims,
             extents,
             rows: first_row,
-        },
+        }),
         kind,
     ))
 }
@@ -1076,10 +1207,107 @@ async fn locate_flat<S: BlobStore>(
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::indexing_slicing,
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
     use super::*;
+
+    /// An RLE run: `n` copies of `v` in `ceil(width / 8)` bytes, behind a varint header.
+    fn rle_run(n: u64, v: u32, width: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut h = n << 1;
+        loop {
+            let byte = (h & 0x7F) as u8;
+            h >>= 7;
+            if h == 0 {
+                b.push(byte);
+                break;
+            }
+            b.push(byte | 0x80);
+        }
+        b.extend(&v.to_le_bytes()[..width.div_ceil(8) as usize]);
+        b
+    }
+
+    /// A bit-packed run of `values` (a multiple of eight, under 512), least significant bit
+    /// first.
+    fn packed_run(values: &[u32], width: u32) -> Vec<u8> {
+        assert_eq!(values.len() % 8, 0);
+        let w = width as usize;
+        let mut b = vec![(((values.len() / 8) << 1) | 1) as u8];
+        let mut bits = vec![0u8; values.len() * w / 8];
+        for (k, v) in values.iter().enumerate() {
+            for bit in 0..w {
+                if u64::from(*v) >> bit & 1 == 1 {
+                    let pos = k * w + bit;
+                    bits[pos / 8] |= 1 << (pos % 8);
+                }
+            }
+        }
+        b.extend(bits);
+        b
+    }
+
+    #[test]
+    fn the_hybrid_decodes_every_width() {
+        for width in [0u32, 1, 3, 8, 17, 32] {
+            let top = if width == 0 {
+                0
+            } else {
+                u32::MAX >> (32 - width)
+            };
+            // Eight packed values reaching the width's top bit, then a run of the top value.
+            let vals: Vec<u32> = (0..8u32).map(|k| top.wrapping_sub(k) & top).collect();
+            let mut b = packed_run(&vals, width);
+            b.extend(rle_run(5, top, width));
+            let mut want = vals.clone();
+            want.extend([top; 5]);
+            assert_eq!(hybrid(&b, 13, width), Some(want), "width {width}");
+            // An RLE run alone, cut to `n`; a packed run's padding past `n` is not a value.
+            assert_eq!(
+                hybrid(&rle_run(3, top, width), 3, width),
+                Some(vec![top; 3]),
+                "width {width}"
+            );
+            assert_eq!(
+                hybrid(&packed_run(&vals, width), 6, width),
+                Some(vals[..6].to_vec()),
+                "width {width}"
+            );
+            // A run longer than `n` is cut to it.
+            assert_eq!(
+                hybrid(&rle_run(9, top, width), 4, width),
+                Some(vec![top; 4])
+            );
+            // Short by a byte, or a byte left over.
+            if width > 0 {
+                assert_eq!(hybrid(&b[..b.len() - 1], 13, width), None, "width {width}");
+            }
+            let mut more = b.clone();
+            more.push(0);
+            assert_eq!(hybrid(&more, 13, width), None, "width {width}");
+            // Too few values for `n`.
+            assert_eq!(hybrid(&b, 14, width), None, "width {width}");
+        }
+        // Width 3 by hand: 0b10_001_000 0b1_100_011_0 0b111_110_10: 0..=7 packed.
+        assert_eq!(
+            hybrid(&[0x03, 0x88, 0xC6, 0xFA], 8, 3),
+            Some((0..8).collect())
+        );
+        // A two-byte header: 200 copies of 1 at width 1.
+        assert_eq!(hybrid(&[0x90, 0x03, 1], 200, 1), Some(vec![1; 200]));
+        // A run of nothing never advances, and a width past 32 is no stream.
+        assert_eq!(hybrid(&[0, 1], 1, 1), None);
+        assert_eq!(hybrid(&[0x01, 0, 0, 0, 0], 8, 33), None);
+        assert_eq!(hybrid(&[], 0, 33), None);
+        // No values from no bytes.
+        assert_eq!(hybrid(&[], 0, 4), Some(vec![]));
+        // An RLE value wider than its width is refused.
+        assert_eq!(hybrid(&[2, 2], 1, 1), None);
+        assert_eq!(hybrid(&[2, 0xFF, 0xFF, 0x02], 1, 17), None);
+        assert_eq!(hybrid(&[2, 0xFF, 0xFF, 0x01], 1, 17), Some(vec![0x1_FFFF]));
+    }
 
     #[test]
     fn levels_give_the_runs_of_present_rows_exactly() {
@@ -1281,6 +1509,10 @@ mod tests {
         );
         // DATE (field 6): an empty struct.
         assert_eq!(decode(&[0x6C, 0x00, 0x00]), Some(Logical::Date));
+        // M100: STRING (field 1), an empty struct; ENUM (4) and JSON (12) are not strings.
+        assert_eq!(decode(&[0x1C, 0x00, 0x00]), Some(Logical::String));
+        assert_eq!(decode(&[0x4C, 0x00, 0x00]), Some(Logical::Other));
+        assert_eq!(decode(&[0xCC, 0x00, 0x00]), Some(Logical::Other));
         // TIMESTAMP (field 8): isAdjustedToUTC (1, a bool), then unit (2, a TimeUnit union).
         for (member, unit) in [
             (0x1C, TimeUnit::Millis),
@@ -1372,15 +1604,41 @@ mod tests {
         }
         // A physical type no attribute is, by name.
         for (ty, name) in [
-            (Some(0), "BOOLEAN"),
             (Some(3), "INT96"),
-            (Some(6), "BYTE_ARRAY"),
             (Some(7), "FIXED_LEN_BYTE_ARRAY"),
             (None, "unknown"),
         ] {
             let err = scalar_kind(ty, None, None).unwrap_err();
             assert!(err.contains(name), "{err}");
-            assert!(err.contains("not INT32, INT64, FLOAT or DOUBLE"), "{err}");
+            assert!(err.contains("not a number, a BOOLEAN or a string"), "{err}");
+        }
+        // M100: a BOOLEAN with no logical type, and a BYTE_ARRAY that says it is a string, by
+        // its logical type or its converted UTF8 (0).
+        let string = Some(Logical::String);
+        assert_eq!(scalar_kind(Some(0), None, None), Ok(K::Bool));
+        assert_eq!(scalar_kind(Some(6), None, string), Ok(K::Str));
+        assert_eq!(scalar_kind(Some(6), Some(0), None), Ok(K::Str));
+        assert_eq!(scalar_kind(Some(6), Some(0), string), Ok(K::Str));
+        // Any other BYTE_ARRAY is binary: no logical type, ENUM, JSON, a decimal, or a converted
+        // type that is not UTF8 under a logical one that is not STRING.
+        for (converted, logical) in [
+            (None, None),
+            (None, Some(Logical::Other)),
+            (Some(5), None),
+            (Some(0), Some(Logical::Other)),
+        ] {
+            let err = scalar_kind(Some(6), converted, logical).unwrap_err();
+            assert!(err.contains("binary"), "{err}");
+        }
+        // A STRING on another physical type, or a BOOLEAN with any logical type, is refused.
+        for (ty, logical, name) in [
+            (TYPE_INT32, string, "INT32"),
+            (TYPE_FLBA, string, "FIXED_LEN_BYTE_ARRAY"),
+            (0, string, "BOOLEAN"),
+            (0, Some(Logical::Other), "BOOLEAN"),
+        ] {
+            let err = scalar_kind(Some(ty), None, logical).unwrap_err();
+            assert!(err.contains(name), "{err}");
         }
     }
 

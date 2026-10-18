@@ -1732,8 +1732,16 @@ async fn a_column_after_a_list_is_found_past_the_whole_list() {
 
 // ---- M95: a scalar attribute column, read by the machinery a vector column is ----------------
 
-use pstore_format::external::{AttrKind, AttrValue, ExternalAttribute};
+use pstore_format::external::{AttrKind, AttrSource, AttrValue, ExternalAttribute};
 use pstore_format::parquet::locate_scalar;
+
+/// The fixed-width column an attribute of a fixed-width kind is read through.
+fn fixed(attr: &ExternalAttribute) -> &ExternalColumn {
+    let AttrSource::Fixed(column) = &attr.source else {
+        unreachable!("{:?} is not fixed-width", attr.kind)
+    };
+    column
+}
 
 fn id_column(rows: usize) -> Vec<Option<AttrValue>> {
     (0..rows)
@@ -1751,7 +1759,7 @@ async fn a_scalar_column_is_located_and_read_back() {
             .await
             .unwrap();
         assert_eq!(attr.kind, AttrKind::Int64);
-        assert_eq!(attr.column.rows, rows);
+        assert_eq!((fixed(&attr).rows, attr.rows()), (rows, rows));
         assert_eq!(
             attr.read_all(&store).await.unwrap(),
             id_column(rows as usize),
@@ -1775,9 +1783,17 @@ async fn a_scalar_column_is_read_in_every_encoding() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| {
             n.ends_with(".parquet")
-                && !["list", "scalars", "int96", "vectors-attrs", "vectors-ts"]
-                    .iter()
-                    .any(|p| n.starts_with(p))
+                && ![
+                    "list",
+                    "scalars",
+                    "int96",
+                    "vectors-attrs",
+                    "vectors-ts",
+                    "strings",
+                    "vectors-labels",
+                ]
+                .iter()
+                .any(|p| n.starts_with(p))
         })
         .collect();
     names.sort();
@@ -1832,10 +1848,19 @@ fn a_scalar_column_of_each_kind_decodes() {
     assert_eq!(AttrKind::Int64.decode(&[0; 4]), None);
     assert_eq!(AttrKind::Float.decode(&[]), None);
     assert_eq!(AttrKind::Double.decode(&[0; 4]), None);
-    assert_eq!(AttrKind::Int32.width(), 4);
-    assert_eq!(AttrKind::Float.width(), 4);
-    assert_eq!(AttrKind::Int64.width(), 8);
-    assert_eq!(AttrKind::Double.width(), 8);
+    assert_eq!(AttrKind::Int32.width(), Some(4));
+    assert_eq!(AttrKind::Float.width(), Some(4));
+    assert_eq!(AttrKind::Int64.width(), Some(8));
+    assert_eq!(AttrKind::Double.width(), Some(8));
+    // M100: a boolean and a string have no width, and no bytes are one.
+    for kind in [AttrKind::Bool, AttrKind::Str] {
+        assert_eq!(kind.width(), None, "{kind:?}");
+        assert_eq!(kind.decode(&[1]), None, "{kind:?}");
+        assert_eq!(kind.decode(&[0; 4]), None, "{kind:?}");
+    }
+    assert_eq!(AttrValue::Bool(true).as_f64().to_bits(), 1.0f64.to_bits());
+    assert_eq!(AttrValue::Bool(false).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(AttrValue::Str("1".to_owned()).as_f64().is_nan());
     // A value compares as the number it is.
     assert_eq!(AttrValue::Int(3).as_f64().to_bits(), 3.0f64.to_bits());
     assert_eq!(AttrValue::Float(2.5).as_f64().to_bits(), 2.5f64.to_bits());
@@ -1860,7 +1885,7 @@ fn an_unsigned_or_temporal_kind_decodes() {
         (AttrKind::TimestampMicros, 8),
         (AttrKind::TimestampNanos, 8),
     ] {
-        assert_eq!(kind.width(), width, "{kind:?}");
+        assert_eq!(kind.width(), Some(width), "{kind:?}");
         assert_eq!(kind.decode(&[0; 6]), None, "{kind:?}");
     }
     // A u32 above i32::MAX is never sign-extended; a u64 above i64::MAX is a `UInt`.
@@ -2047,10 +2072,10 @@ async fn scalar_columns_of_each_type_read_back_with_their_nulls() {
         assert_eq!(got, want, "{name}");
         // A column with nulls is many runs, with a gap between each.
         assert_eq!(
-            attr.column.extents.len() > 1,
+            fixed(&attr).extents.len() > 1,
             name.ends_with('n'),
             "{name}: {} runs",
-            attr.column.extents.len()
+            fixed(&attr).extents.len()
         );
     }
     // The columns with nulls have some, and the others have none.
@@ -2077,12 +2102,13 @@ async fn a_logical_type_its_physical_value_does_not_carry_is_refused() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("logical type"), "{err}");
-    for (name, ty) in [("flag", "BOOLEAN"), ("name", "BYTE_ARRAY")] {
-        let err = ExternalAttribute::pin_parquet(&store, &key, name)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains(ty), "{name}: {err}");
-    }
+    // M100: a BYTE_ARRAY that is not a string is bytes this crate cannot compare.
+    let (strings, skey) = put("strings-plain.parquet").await;
+    let err = ExternalAttribute::pin_parquet(&strings, &skey, "bin")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("binary"), "{err}");
+    assert!(err.to_string().contains("BYTE_ARRAY"), "{err}");
     let (store, key) = put("int96.parquet").await;
     let err = ExternalAttribute::pin_parquet(&store, &key, "ts96")
         .await
@@ -2127,7 +2153,199 @@ async fn a_column_claiming_too_many_rows_is_not_read() {
     let mut attr = ExternalAttribute::pin_parquet(&store, &key, "i64")
         .await
         .unwrap();
-    attr.column.rows = pstore_format::external::MAX_ATTRIBUTE_ROWS + 1;
+    let AttrSource::Fixed(column) = &mut attr.source else {
+        unreachable!()
+    };
+    column.rows = pstore_format::external::MAX_ATTRIBUTE_ROWS + 1;
     let err = attr.read_all(&store).await.unwrap_err();
     assert!(err.to_string().contains("too many rows"), "{err}");
+}
+
+// ---- M100: boolean and string attribute columns, read chunk by chunk ------------------------
+
+/// The value of `name` at row `r` in `generate_strings.py`'s fixtures.
+fn string_col(name: &str, r: usize) -> Option<AttrValue> {
+    let null = r % 7 == 3;
+    match name {
+        "name" => Some(AttrValue::Str(format!("s{r}"))),
+        "namen" => (!null).then(|| AttrValue::Str(format!("s{r}"))),
+        "flag" => Some(AttrValue::Bool(r % 2 == 1)),
+        "flagn" => (!null).then_some(AttrValue::Bool(r % 2 == 1)),
+        "long" => Some(AttrValue::Str(format!("{r:04}").repeat(75))),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn bool_and_string_columns_read_back_in_every_layout() {
+    for file in [
+        "strings-plain.parquet",
+        "strings-dict-snappy.parquet",
+        "strings-v2-zstd.parquet",
+    ] {
+        let (store, key) = put(file).await;
+        for name in ["name", "namen", "flag", "flagn", "long"] {
+            let attr = ExternalAttribute::pin_parquet(&store, &key, name)
+                .await
+                .expect(name);
+            let want_kind = if name.starts_with("flag") {
+                AttrKind::Bool
+            } else {
+                AttrKind::Str
+            };
+            assert_eq!(attr.kind, want_kind, "{file} {name}");
+            assert_eq!((attr.key(), attr.rows()), (key.as_str(), 300));
+            // One chunk a row group, each 100 rows, in order.
+            let AttrSource::Chunks(c) = &attr.source else {
+                unreachable!("{file} {name} is not read by chunk")
+            };
+            let firsts: Vec<_> = c.chunks.iter().map(|k| (k.first_row, k.rows)).collect();
+            assert_eq!(firsts, [(0, 100), (100, 100), (200, 100)], "{file} {name}");
+            assert!(
+                c.chunks.iter().all(|k| k.optional),
+                "pyarrow writes every column OPTIONAL"
+            );
+            let got = attr.read_all(&store).await.expect(name);
+            let want: Vec<_> = (0..300).map(|r| string_col(name, r)).collect();
+            assert_eq!(got, want, "{file} {name}");
+        }
+        // Nulls are where the generator put them, and nowhere else.
+        let attr = ExternalAttribute::pin_parquet(&store, &key, "namen")
+            .await
+            .unwrap();
+        let got = attr.read_all(&store).await.unwrap();
+        assert_eq!(got.iter().filter(|v| v.is_none()).count(), 43, "{file}");
+    }
+    // The dictionary fallback: each `long` chunk begins with a dictionary page, whose 4 KiB
+    // limit holds at most 13 of the chunk's 100 distinct 300-byte strings, so most of its rows
+    // were read from PLAIN pages after it (and all 100 read back above).
+    let (store, key) = put("strings-dict-snappy.parquet").await;
+    let long = ExternalAttribute::pin_parquet(&store, &key, "long")
+        .await
+        .unwrap();
+    let AttrSource::Chunks(c) = &long.source else {
+        unreachable!()
+    };
+    assert!(c.chunks.iter().all(|k| k.dictionary));
+    // The plain file has no dictionary at all.
+    let (store, key) = put("strings-plain.parquet").await;
+    let long = ExternalAttribute::pin_parquet(&store, &key, "long")
+        .await
+        .unwrap();
+    let AttrSource::Chunks(c) = &long.source else {
+        unreachable!()
+    };
+    assert!(c.chunks.iter().all(|k| !k.dictionary));
+    // M95's fixture's own boolean and string columns, PLAIN, zstd v1 and zstd v2.
+    for file in [
+        "scalars.parquet",
+        "scalars-zstd.parquet",
+        "scalars-v2-zstd.parquet",
+    ] {
+        let (store, key) = put(file).await;
+        let flag = ExternalAttribute::pin_parquet(&store, &key, "flag")
+            .await
+            .expect(file);
+        let want: Vec<_> = (0..300)
+            .map(|r| Some(AttrValue::Bool(r % 2 == 1)))
+            .collect();
+        assert_eq!(flag.read_all(&store).await.unwrap(), want, "{file}");
+        let name = ExternalAttribute::pin_parquet(&store, &key, "name")
+            .await
+            .expect(file);
+        let want: Vec<_> = (0..300)
+            .map(|r| Some(AttrValue::Str(format!("n{r}"))))
+            .collect();
+        assert_eq!(name.read_all(&store).await.unwrap(), want, "{file}");
+    }
+}
+
+/// `file`'s bytes with `edit` applied at the first occurrence of `pat` at or after `from`.
+fn edited(file: &str, from: usize, pat: &[u8], edit: impl FnOnce(&mut [u8])) -> Vec<u8> {
+    let mut b = bytes(file);
+    let at = from
+        + b[from..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .expect("the pattern is in the fixture");
+    edit(&mut b[at..]);
+    b
+}
+
+async fn read_edited(raw: Vec<u8>, name: &str) -> Result<Vec<Option<AttrValue>>, ExternalError> {
+    let store = MemoryStore::new();
+    let key = Key::new("lake/edited.parquet");
+    store.put(&key, raw.into()).await.unwrap();
+    // The footer is untouched, so the pin succeeds and the damage is met reading the page.
+    let attr = ExternalAttribute::pin_parquet(&store, &key, name)
+        .await
+        .unwrap();
+    attr.read_all(&store).await
+}
+
+#[tokio::test]
+async fn a_damaged_chunk_is_refused_not_misread() {
+    // `name`'s first value, PLAIN: a 4-byte length (2), then "s0".
+    let first = b"\x02\x00\x00\x00s0";
+    // A length running past its page.
+    let raw = edited("strings-plain.parquet", 0, first, |b| {
+        b[..4].copy_from_slice(&0xFFFFu32.to_le_bytes());
+    });
+    assert!(matches!(
+        read_edited(raw, "name").await,
+        Err(ExternalError::Damaged)
+    ));
+    // A string that is not UTF-8.
+    let raw = edited("strings-plain.parquet", 0, first, |b| b[4] = 0xFF);
+    assert!(matches!(
+        read_edited(raw, "name").await,
+        Err(ExternalError::Damaged)
+    ));
+    // The first index page of `name`'s first chunk: bit width 7, a bit-packed run of 13 groups,
+    // then indices 0, 1, ... Setting the first byte's low seven bits makes index 0 into 127, past
+    // the chunk's 100-entry dictionary. Snappy keeps the bytes as a literal, so the page still
+    // decompresses to its size.
+    let raw = edited("strings-dict-snappy.parquet", 0, &[7, 0x1B, 0x80], |b| {
+        b[2] = 0xFF;
+    });
+    assert!(matches!(
+        read_edited(raw, "name").await,
+        Err(ExternalError::Damaged)
+    ));
+    // An object changed after the pin: same length, other bytes.
+    let (store, key) = put("strings-plain.parquet").await;
+    let attr = ExternalAttribute::pin_parquet(&store, &key, "name")
+        .await
+        .unwrap();
+    let raw = edited("strings-plain.parquet", 0, first, |b| b[5] = b'9');
+    store.put(&key, raw.into()).await.unwrap();
+    assert!(matches!(
+        attr.read_all(&store).await,
+        Err(ExternalError::Changed)
+    ));
+}
+
+#[tokio::test]
+async fn a_column_whose_chunks_are_too_large_to_fetch_is_not_read() {
+    use pstore_format::external::MAX_ATTRIBUTE_BYTES;
+    let (store, key) = put("strings-plain.parquet").await;
+    let pinned = ExternalAttribute::pin_parquet(&store, &key, "name")
+        .await
+        .unwrap();
+    // A footer claiming chunks of `total` bytes in all: refused before any is fetched once
+    // the total passes the cap, and fetched (then refused otherwise) at the cap itself.
+    let claim = |total: u64| {
+        let mut attr = pinned.clone();
+        let AttrSource::Chunks(c) = &mut attr.source else {
+            unreachable!()
+        };
+        let rest: u64 = c.chunks[1..].iter().map(|c| c.len).sum();
+        c.chunks[0].len = total - rest;
+        attr
+    };
+    let cap = u64::try_from(MAX_ATTRIBUTE_BYTES).unwrap();
+    let err = claim(cap + 1).read_all(&store).await.unwrap_err();
+    assert!(matches!(err, ExternalError::Shape(_)), "{err}");
+    let err = claim(cap).read_all(&store).await.unwrap_err();
+    assert!(!matches!(err, ExternalError::Shape(_)), "{err}");
 }

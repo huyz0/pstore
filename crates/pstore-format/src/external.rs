@@ -173,7 +173,11 @@ fn decode_indices(buf: &[u8], n: usize, count: u32) -> Option<Vec<u32>> {
 
 /// A compressed page's bytes, exactly `expected` of them or an error (M76). The output is bounded
 /// by `expected + 1` while decoding, so a page that lies about its size cannot balloon memory.
-fn decompress(codec: u8, comp: &[u8], expected: usize) -> Result<Vec<u8>, ExternalError> {
+pub(crate) fn decompress(
+    codec: u8,
+    comp: &[u8],
+    expected: usize,
+) -> Result<Vec<u8>, ExternalError> {
     use std::io::Read;
     let mut out = Vec::new();
     let cap = u64::try_from(expected).map_err(|_| ExternalError::Damaged)? + 1;
@@ -242,10 +246,14 @@ pub enum AttrKind {
     TimestampMicros,
     /// A `TIMESTAMP` in nanoseconds on `INT64`.
     TimestampNanos,
+    /// Parquet `BOOLEAN` (M100): bit-packed, so read by chunk.
+    Bool,
+    /// A `BYTE_ARRAY` whose logical or converted type is a UTF-8 string (M100), read by chunk.
+    Str,
 }
 
 /// One value of a scalar attribute column.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttrValue {
     /// An `INT32` or `INT64`.
     Int(i64),
@@ -257,11 +265,16 @@ pub enum AttrValue {
     /// [`crate::Value::DateTime`] has. A timestamp the writer did not adjust to UTC is read as if
     /// it were, the value it stored; a nanosecond is rounded toward negative infinity.
     DateTime(i64),
+    /// A `BOOLEAN` (M100).
+    Bool(bool),
+    /// A UTF-8 string (M100), compared bytewise with no collation.
+    Str(String),
 }
 
 impl AttrValue {
     /// The value as a number to compare, an integer rounded to the nearest `f64` above 2^53 (a
-    /// date or timestamp is its microseconds).
+    /// date or timestamp is its microseconds, a boolean 0 or 1). A string is NaN, which compares
+    /// to nothing.
     #[must_use]
     #[allow(clippy::cast_precision_loss, reason = "a comparison, named in the doc")]
     pub fn as_f64(&self) -> f64 {
@@ -270,6 +283,8 @@ impl AttrValue {
             Self::Float(v) => v,
             Self::UInt(v) => v as f64,
             Self::DateTime(v) => v as f64,
+            Self::Bool(v) => f64::from(u8::from(v)),
+            Self::Str(_) => f64::NAN,
         }
     }
 }
@@ -285,22 +300,24 @@ fn check_attribute_rows(rows: u64) -> Result<(), ExternalError> {
 }
 
 impl AttrKind {
-    /// Bytes a value occupies.
+    /// Bytes a value occupies; `None` for a kind that is not fixed-width (M100).
     #[must_use]
-    pub fn width(self) -> usize {
+    pub fn width(self) -> Option<usize> {
         match self {
-            Self::Int32 | Self::Float | Self::UInt32 | Self::Date => 4,
+            Self::Int32 | Self::Float | Self::UInt32 | Self::Date => Some(4),
             Self::Int64
             | Self::Double
             | Self::UInt64
             | Self::TimestampMillis
             | Self::TimestampMicros
-            | Self::TimestampNanos => 8,
+            | Self::TimestampNanos => Some(8),
+            Self::Bool | Self::Str => None,
         }
     }
 
     /// The value `raw` (little-endian, exactly [`Self::width`] bytes) holds, if it is that long,
     /// and, for a date or a millisecond timestamp, if it is an instant `i64` microseconds hold.
+    /// `None` for a kind that is not fixed-width.
     #[must_use]
     pub fn decode(self, raw: &[u8]) -> Option<AttrValue> {
         Some(match self {
@@ -320,6 +337,7 @@ impl AttrKind {
             Self::TimestampNanos => {
                 AttrValue::DateTime(i64::from_le_bytes(raw.try_into().ok()?).div_euclid(1000))
             }
+            Self::Bool | Self::Str => return None,
         })
     }
 }
@@ -329,15 +347,65 @@ const DAY_US: i64 = 86_400_000_000;
 
 /// The most rows [`ExternalAttribute::read_all`] reads: it holds the whole column and a mask of
 /// it in memory, so a column claiming more (a damaged page can claim any count) is refused.
+/// Since M100 a value may hold a string, so the column it allows is about 4 GiB, not 2.
 pub const MAX_ATTRIBUTE_ROWS: u64 = 1 << 27;
 
-/// A scalar column of a Parquet object (M95), read through the same extents a vector column is.
+/// The most bytes of strings one [`ExternalAttribute::read_all`] holds (M100): a string is as
+/// long as its page says, so a column of them is bounded by bytes as well as by rows. The
+/// chunks of a boolean or string column, fetched whole, are bounded by it too.
+pub const MAX_ATTRIBUTE_BYTES: usize = 1 << 30;
+
+/// A scalar column of a Parquet object (M95).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAttribute {
-    /// The column's runs, as a vector column of `kind.width() / 4` lanes.
-    pub column: ExternalColumn,
     /// What a value is.
     pub kind: AttrKind,
+    /// Where its values are.
+    pub source: AttrSource,
+}
+
+/// Where an attribute's values are, by its kind (M100).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttrSource {
+    /// A fixed-width kind (M95, M99): the column's runs, as a vector column of `width / 4`
+    /// lanes, so row `r` is at a computed offset.
+    Fixed(ExternalColumn),
+    /// A kind that is not fixed-width: each row group's column chunk, read whole and decoded.
+    Chunks(AttrChunks),
+}
+
+/// The column chunks of a boolean or string attribute (M100).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttrChunks {
+    /// The object's key.
+    pub key: String,
+    /// The object's length when pinned.
+    pub len: u64,
+    /// The object's CAS tag when pinned, if the store has one.
+    pub tag: Option<CasTag>,
+    /// Rows in the column.
+    pub rows: u64,
+    /// One a row group, in row order.
+    pub chunks: Vec<AttrChunk>,
+}
+
+/// A row group's column chunk (M100): its pages are judged only when they are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttrChunk {
+    /// The first row the chunk holds.
+    pub first_row: u64,
+    /// Rows in it.
+    pub rows: u64,
+    /// The byte offset of its first page: the dictionary page, if it has one.
+    pub offset: u64,
+    /// Its on-disk length.
+    pub len: u64,
+    /// How its pages are coded: 0, or a `CODEC_*`.
+    pub codec: u8,
+    /// Whether the column is OPTIONAL, so a page carries a definition level a value.
+    pub optional: bool,
+    /// Whether the footer declared a dictionary page, which must then come first.
+    pub dictionary: bool,
 }
 
 impl ExternalAttribute {
@@ -345,41 +413,76 @@ impl ExternalAttribute {
     ///
     /// # Errors
     /// [`ExternalError::Parquet`] for a file or column that cannot be read in place, or is not
-    /// `INT32`, `INT64`, `FLOAT` or `DOUBLE`; a store failure.
+    /// a kind [`AttrKind`] names; a store failure.
     pub async fn pin_parquet<S: BlobStore>(
         store: &S,
         key: &Key,
         column: &str,
     ) -> Result<Self, ExternalError> {
-        let (found, kind) = crate::parquet::locate_scalar(store, key, column).await?;
+        let (found, kind) = crate::parquet::locate_attribute(store, key, column).await?;
         let tag = store.get_tag(key).await?;
-        if store.head(key).await? != found.len {
+        if store.head(key).await? != found.len() {
             return Err(ExternalError::Changed);
         }
-        let column = ExternalColumn::from_runs(
-            key.as_str(),
-            found.dims,
-            found.len,
-            tag,
-            found.rows,
-            found.extents,
-        )?;
-        Ok(Self { column, kind })
+        let source = match found {
+            crate::parquet::Scalar::Fixed(found) => AttrSource::Fixed(ExternalColumn::from_runs(
+                key.as_str(),
+                found.dims,
+                found.len,
+                tag,
+                found.rows,
+                found.extents,
+            )?),
+            crate::parquet::Scalar::Chunks { len, rows, chunks } => {
+                AttrSource::Chunks(AttrChunks {
+                    key: key.as_str().to_owned(),
+                    len,
+                    tag,
+                    rows,
+                    chunks,
+                })
+            }
+        };
+        Ok(Self { kind, source })
     }
 
-    /// Every row's value, `None` for a null: one ranged read of the column's pages.
+    /// The object's key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match &self.source {
+            AttrSource::Fixed(c) => &c.key,
+            AttrSource::Chunks(c) => &c.key,
+        }
+    }
+
+    /// Rows in the column.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        match &self.source {
+            AttrSource::Fixed(c) => c.rows,
+            AttrSource::Chunks(c) => c.rows,
+        }
+    }
+
+    /// Every row's value, `None` for a null: one ranged read of the column's pages, or of its
+    /// chunks, in one round.
     ///
     /// # Errors
     /// [`ExternalError::Changed`] if the object moved since the pin; [`ExternalError::Damaged`]
-    /// for a page that does not hold its rows; a store failure.
+    /// for a page that does not hold its rows; [`ExternalError::Shape`] for a column too large
+    /// to hold; a store failure.
     pub async fn read_all<S: BlobStore>(
         &self,
         store: &S,
     ) -> Result<Vec<Option<AttrValue>>, ExternalError> {
-        check_attribute_rows(self.column.rows)?;
-        let rows = usize::try_from(self.column.rows).map_err(|_| ExternalError::Damaged)?;
-        let present: Vec<usize> = (0..rows).filter(|r| self.column.is_present(*r)).collect();
-        let mut got = self.column.read_rows_bytes(store, &present).await?;
+        check_attribute_rows(self.rows())?;
+        let column = match &self.source {
+            AttrSource::Fixed(column) => column,
+            AttrSource::Chunks(c) => return c.read_all(store, self.kind).await,
+        };
+        let rows = usize::try_from(column.rows).map_err(|_| ExternalError::Damaged)?;
+        let present: Vec<usize> = (0..rows).filter(|r| column.is_present(*r)).collect();
+        let mut got = column.read_rows_bytes(store, &present).await?;
         (0..rows)
             .map(|r| match got.remove(&r) {
                 None => Ok(None),
@@ -390,6 +493,39 @@ impl ExternalAttribute {
                     .ok_or(ExternalError::Damaged),
             })
             .collect()
+    }
+}
+
+impl AttrChunks {
+    /// Every row's value: each chunk read whole, all in one round, and decoded.
+    async fn read_all<S: BlobStore>(
+        &self,
+        store: &S,
+        kind: AttrKind,
+    ) -> Result<Vec<Option<AttrValue>>, ExternalError> {
+        // The chunks are fetched whole before a page is judged, so what the footer claims for
+        // them is bounded before any request: more than the strings may hold is refused.
+        let fetched = self
+            .chunks
+            .iter()
+            .try_fold(0u64, |sum, c| sum.checked_add(c.len));
+        let fetched = fetched.and_then(|n| usize::try_from(n).ok());
+        if fetched.is_none_or(|n| n > MAX_ATTRIBUTE_BYTES) {
+            return Err(ExternalError::Shape(
+                "the column's chunks are too large to fetch",
+            ));
+        }
+        let key = Key::new(self.key.clone());
+        if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
+            return Err(ExternalError::Changed);
+        }
+        let ranges: Vec<Range<u64>> = self
+            .chunks
+            .iter()
+            .map(|c| c.offset..c.offset.saturating_add(c.len))
+            .collect();
+        let raw = store.get_ranges(&key, &ranges).await?;
+        crate::parquet::decode_chunks(&self.chunks, &raw, kind, self.rows, MAX_ATTRIBUTE_BYTES)
     }
 }
 

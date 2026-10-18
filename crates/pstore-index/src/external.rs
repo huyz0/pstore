@@ -562,12 +562,12 @@ impl ExternalIndex {
         attr: &ExternalAttribute,
         keep: &(dyn Fn(Option<&AttrValue>) -> bool + Sync),
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
-        if attr.column.key != self.column.key {
+        if attr.key() != self.column.key {
             return Err(ExternalIndexError::Corrupt(
                 "the attribute is in another object than the vectors",
             ));
         }
-        if attr.column.rows != self.column.rows {
+        if attr.rows() != self.column.rows {
             return Err(ExternalIndexError::Corrupt(
                 "the attribute has another number of rows than the vectors",
             ));
