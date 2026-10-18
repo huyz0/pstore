@@ -406,4 +406,68 @@ mod tests {
             Err(ExternalError::Damaged)
         ));
     }
+
+    /// Each fixture's first chunk of each M100 column, its bytes, and its kind.
+    async fn fixture_chunks() -> Vec<(AttrChunk, Vec<u8>, AttrKind)> {
+        use pstore_blob::{BlobStore, Key, MemoryStore};
+        let mut out = Vec::new();
+        for file in [
+            "strings-plain",
+            "strings-dict-snappy",
+            "strings-v2-zstd",
+            "vectors-labels",
+        ] {
+            let path = format!("{}/tests/data/{file}.parquet", env!("CARGO_MANIFEST_DIR"));
+            let raw = std::fs::read(path).unwrap();
+            let (store, key) = (MemoryStore::new(), Key::new("lake/f.parquet"));
+            store.put(&key, raw.clone().into()).await.unwrap();
+            for column in ["name", "namen", "flag", "flagn", "long", "label"] {
+                let Ok((super::super::Scalar::Chunks { chunks, .. }, kind)) =
+                    super::super::locate_attribute(&store, &key, column).await
+                else {
+                    continue;
+                };
+                let c = chunks[0];
+                let at = usize::try_from(c.offset).unwrap();
+                let bytes = raw[at..at + usize::try_from(c.len).unwrap()].to_vec();
+                out.push((AttrChunk { first_row: 0, ..c }, bytes, kind));
+            }
+        }
+        out
+    }
+
+    fn decode(b: &[u8], chunk: &AttrChunk, kind: AttrKind) -> Result<usize, ExternalError> {
+        let (mut budget, mut out) = (MAX_PAGE_BYTES as usize, Vec::new());
+        decode_chunk(b, chunk, kind, &mut budget, &mut out).map(|()| out.len())
+    }
+
+    #[tokio::test]
+    async fn every_cut_or_flipped_byte_of_a_real_chunk_is_refused_or_holds_its_rows() {
+        let chunks = fixture_chunks().await;
+        assert!(chunks.len() >= 14, "{} chunks", chunks.len());
+        for (chunk, b, kind) in &chunks {
+            let rows = usize::try_from(chunk.rows).unwrap();
+            assert_eq!(decode(b, chunk, *kind).unwrap(), rows);
+            // A chunk cut short cannot hold its last page, wherever it is cut.
+            for cut in 0..b.len() {
+                assert!(
+                    matches!(decode(&b[..cut], chunk, *kind), Err(ExternalError::Damaged)),
+                    "{kind:?} cut at {cut} of {}",
+                    b.len()
+                );
+            }
+            // A flipped byte is refused as damage or too large, or still gives every row:
+            // never a panic, a short column or another error.
+            for at in 0..b.len() {
+                let mut e = b.clone();
+                e[at] ^= 0xA5;
+                let got = decode(&e, chunk, *kind);
+                assert!(
+                    matches!(got, Err(ExternalError::Damaged | ExternalError::Shape(_)))
+                        || got.as_ref().is_ok_and(|n| *n == rows),
+                    "{kind:?} flipped at {at}: {got:?}"
+                );
+            }
+        }
+    }
 }
