@@ -2580,6 +2580,11 @@ async fn index_summary<S: BlobStore + 'static>(
             text_field: sc.text_field,
             full_text_search: fts_json(&sc.fts),
             regex: sc.trigram,
+            vectors: sc
+                .fields
+                .into_iter()
+                .map(|(n, w)| (n, w.saturating_sub(sc.metric.extra() as u32)))
+                .collect(),
         }),
         rejected_rows: s.rejected_rows,
         quarantined_rows: s.quarantined_rows,

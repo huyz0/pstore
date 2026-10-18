@@ -1207,15 +1207,23 @@ fn odd_width(widths: &mut BTreeMap<String, usize>, d: &Document) -> Option<(usiz
     None
 }
 
-/// Why `docs` cannot join `index` by a named field's width (M61): against the rows this
-/// process holds for it, then each other, in the width the client wrote.
+/// Why `docs` cannot join `index` by a named field's width (M61): against the widths its
+/// schema records (M98), then the rows this process holds for it, then each other, in the
+/// width the client wrote.
+///
+/// ⚠️ **The schema's first** (M98 review): a held row that disagrees with it is one the fold
+/// will set aside, and must not refuse a write the schema accepts (M35).
 fn field_width_conflict(
     index: &str,
+    known: &BTreeMap<String, u32>,
     held: &[&Document],
     docs: &[Document],
     metric: Metric,
 ) -> Option<EngineError> {
-    let mut widths = BTreeMap::new();
+    let mut widths: BTreeMap<String, usize> = known
+        .iter()
+        .map(|(n, w)| (n.clone(), *w as usize))
+        .collect();
     for d in held {
         // A held row that disagrees was accepted before this check could see it; it decides
         // nothing, and the fold quarantines it.
@@ -1914,6 +1922,7 @@ impl<S: BlobStore> Engine<S> {
                 .filter(|d| !is_rowless(d))
                 .find_map(trgm_of)
                 .unwrap_or_default(),
+            fields: Default::default(),
         }
     }
 
@@ -2027,6 +2036,24 @@ impl<S: BlobStore> Engine<S> {
                 expected: schema.client_dims().to_string(),
                 got: dims.saturating_sub(extra).to_string(),
             });
+        }
+        // M98: and each named field the schema records, at its width.
+        for (name, field) in &doc.vectors {
+            let pstore_format::VectorField::Dense(vs) = field else {
+                continue;
+            };
+            let Some(&want) = schema.fields.get(name) else {
+                continue;
+            };
+            if let Some(v) = vs.iter().find(|v| v.len() as u32 != want) {
+                let extra = metric.extra() as u32;
+                return Some(EngineError::SchemaConflict {
+                    index: index.to_owned(),
+                    what: "a named vector field's width",
+                    expected: want.saturating_sub(extra).to_string(),
+                    got: (v.len() as u32).saturating_sub(extra).to_string(),
+                });
+            }
         }
         if !schema.text_field.is_empty()
             && let Some(field) = self.text_of(doc)
@@ -2654,9 +2681,12 @@ impl<S: BlobStore> Engine<S> {
             .flatten()
             .chain(m.durable_rows(index))
             .collect();
-        let named = || field_width_conflict(index, &held, docs, metric);
+        let named =
+            |known: &BTreeMap<String, u32>| field_width_conflict(index, known, &held, docs, metric);
         if let Some(schema) = self.cached_schema(index) {
-            return self.batch_conflict(index, &schema, docs).or_else(named);
+            return self
+                .batch_conflict(index, &schema, docs)
+                .or_else(|| named(&schema.fields));
         }
         // ⚠️ **Falls back to the batch's own first row**, which closes the case a reviewer
         // spotted next to the one this ladder was built for: a brand-new index created by a
@@ -2720,7 +2750,7 @@ impl<S: BlobStore> Engine<S> {
                 got: odd.vector().len().saturating_sub(metric.extra()),
             });
         }
-        named()
+        named(&BTreeMap::new())
     }
 
     /// Deletes `ids` from `index` (M9c.2): buffered as tombstones, in the same ordered log as
@@ -3846,6 +3876,8 @@ impl<S: BlobStore> Engine<S> {
                 .collect();
             // M36: the text field each index was judged against, which the seal records.
             let mut judged: BTreeMap<String, String> = BTreeMap::new();
+            // M98: and each named field's width, which the seal records the same way.
+            let mut learned: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
             for (idx, docs) in &mut by_index {
                 let Some(schema) = at.head.schemas.get(idx).or_else(|| created.get(idx)) else {
                     continue;
@@ -3861,13 +3893,19 @@ impl<S: BlobStore> Engine<S> {
                 let (keep, mut out): (Vec<Document>, Vec<Document>) = std::mem::take(docs)
                     .into_iter()
                     .partition(|d| self.row_conflict(idx, schema, d).is_none());
-                // ⚠️ **And one width a named field** (M61), which no schema records: two
-                // processes' rows first meet here, each past its own door, and a segment of
-                // two widths cannot be sealed. The fold's first row of a field decides it.
-                let mut widths = BTreeMap::new();
+                // ⚠️ **And one width a named field** (M61): two processes' rows first meet
+                // here, each past its own door, and a segment of two widths cannot be sealed.
+                // The schema's width decides a field it records (M98, `row_conflict` above);
+                // the fold's first row of it decides any other, and is recorded below.
+                let mut widths: BTreeMap<String, usize> = schema
+                    .fields
+                    .iter()
+                    .map(|(n, w)| (n.clone(), *w as usize))
+                    .collect();
                 let (keep, odd): (Vec<Document>, Vec<Document>) = keep
                     .into_iter()
                     .partition(|d| odd_width(&mut widths, d).is_none());
+                learned.insert(idx.clone(), widths);
                 out.extend(odd);
                 *docs = keep;
                 if !out.is_empty() {
@@ -3960,10 +3998,13 @@ impl<S: BlobStore> Engine<S> {
                 // arrival order, is set aside and its id left untouched, so its version already
                 // folded stands: it costs that operation, never the fold, which the writer
                 // would refuse whole.
-                let mut widths = BTreeMap::new();
+                //
+                // M98: seeded with the reject pass's widths, the schema's among them.
+                let mut widths = learned.get(&idx).cloned().unwrap_or_default();
                 let (sealed, odd): (Vec<Document>, Vec<Document>) = sealed
                     .into_iter()
                     .partition(|d| odd_width(&mut widths, d).is_none());
+                learned.insert(idx.clone(), widths);
                 let odd_ids: std::collections::HashSet<&str> =
                     odd.iter().map(|d| d.id.as_str()).collect();
                 touched.insert(
@@ -4071,6 +4112,23 @@ impl<S: BlobStore> Engine<S> {
                         dicts: Some(dicts),
                         len: Some(len),
                     });
+            }
+            // ⚠️ **Each named field's width the fold judged by is recorded** (M98), whether or
+            // not anything is left to seal, as the text field is: a row quarantined against
+            // one width and an index recording none would let the next fold accept it.
+            // ⚠️ Added, never assigned (M98 review): the map is seeded with the schema's, and
+            // a recorded width neither changes nor goes.
+            for (idx, widths) in &learned {
+                if let Some(s) = next.schemas.get_mut(idx) {
+                    // A client's fields only: an encoding derived from one (M67) has the
+                    // width its parameters give it, and no client writes it.
+                    for (n, w) in widths
+                        .iter()
+                        .filter(|(n, _)| !n.ends_with(pstore_format::fde::FIELD_SUFFIX))
+                    {
+                        s.fields.entry(n.clone()).or_insert(*w as u32);
+                    }
+                }
             }
             // ⚠️ Advanced only for the spans actually folded. Advancing a lane past
             // bundles this attempt did not read would drop them permanently — and nothing

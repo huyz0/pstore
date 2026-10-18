@@ -173,6 +173,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
+            fields: Default::default(),
         },
     );
     h.schemas.insert(
@@ -183,6 +184,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
+            fields: Default::default(),
         },
     );
     h.schema_rejects.insert("alpha".to_owned(), 17);
@@ -243,6 +245,7 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
             metric: pstore_engine::Metric::DotProduct,
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
+            fields: Default::default(),
         },
     );
     h.reaped_before = 77;
@@ -295,6 +298,7 @@ fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
         metric,
         fts: pstore_format::text::FullText::default(),
         trigram: Vec::new(),
+        fields: Default::default(),
     };
     let mut h = populated();
     h.dropped.push((
@@ -340,6 +344,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             metric: pstore_engine::Metric::DotProduct,
             fts: FullText::default(),
             trigram: Vec::new(),
+            fields: Default::default(),
         },
     );
     h.dropped.push((
@@ -351,6 +356,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             metric: pstore_engine::Metric::DotProduct,
             fts: FullText::default(),
             trigram: Vec::new(),
+            fields: Default::default(),
         },
     ));
     let before = h.encode();
@@ -386,6 +392,7 @@ fn a_trigram_set_round_trips_with_and_without_full_text() {
         metric: pstore_engine::Metric::DotProduct,
         fts,
         trigram: trigram.iter().map(|s| (*s).to_owned()).collect(),
+        fields: Default::default(),
     };
     let stem = FullText {
         analyzer: pstore_format::text::Analyzer {
@@ -441,4 +448,64 @@ fn a_branched_set_round_trips_and_is_pruned_by_the_reap() {
     assert_eq!(h.branched.len(), 1, "a lower horizon never restores");
     h.record_reap(12);
     assert!(h.branched.is_empty());
+}
+
+#[test]
+fn named_field_widths_round_trip() {
+    // M98's trailing section follows M86's externals, and forces every section before it.
+    let schema = |fields: &[(&str, u32)]| pstore_engine::IndexSchema {
+        dims: 4,
+        text_field: "text".to_owned(),
+        metric: pstore_engine::Metric::DotProduct,
+        fts: pstore_format::text::FullText::default(),
+        trigram: Vec::new(),
+        fields: fields.iter().map(|(n, w)| ((*n).to_owned(), *w)).collect(),
+    };
+    let mut h = populated();
+    h.schemas
+        .insert("alpha".to_owned(), schema(&[("late", 3), ("other", 7)]));
+    h.schemas.insert("beta".to_owned(), schema(&[]));
+    h.dropped
+        .push(("gone".to_owned(), 9, schema(&[("late", 2)])));
+    let full = h.encode();
+    assert_eq!(Head::decode(&full).unwrap(), h);
+    // Without fields, nothing is written: the earlier encoding is a prefix, untouched.
+    let plain = {
+        let mut p = h.clone();
+        for s in p.schemas.values_mut() {
+            s.fields.clear();
+        }
+        for (_, _, s) in &mut p.dropped {
+            s.fields.clear();
+        }
+        p
+    };
+    let bytes = plain.encode();
+    assert!(full.starts_with(&bytes), "fields only append");
+    assert!(full.len() > bytes.len());
+    assert_eq!(Head::decode(&bytes).unwrap(), plain);
+    // An entry naming no schema is not a HEAD this wrote.
+    let at = full
+        .windows(5)
+        .rposition(|w| w == b"alpha")
+        .expect("the section names its schema");
+    let mut stray = full.clone();
+    stray[at + 4] = b'z';
+    assert!(Head::decode(&stray).is_err(), "names no schema");
+    // Nor one addressing a dropped schema past the last, or by an unknown kind: the byte
+    // before the section's first name length is its first entry's kind.
+    let first = at - 5;
+    for kind in [1u8, 2] {
+        let mut odd = full.clone();
+        odd[first] = kind;
+        assert!(Head::decode(&odd).is_err(), "kind {kind}");
+    }
+    // Nor is a width for `vector`, which `dims` holds, or for a derived encoding.
+    let mut v = plain.clone();
+    v.schemas
+        .insert("alpha".to_owned(), schema(&[("vector", 4)]));
+    assert!(Head::decode(&v.encode()).is_err(), "`vector` is dims");
+    v.schemas
+        .insert("alpha".to_owned(), schema(&[("late$fde", 512)]));
+    assert!(Head::decode(&v.encode()).is_err(), "derived");
 }

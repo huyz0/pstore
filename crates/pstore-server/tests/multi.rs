@@ -532,18 +532,19 @@ async fn a_named_fields_width_is_one_an_index() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "schema: {b}");
     assert_eq!(b["error"]["code"], "schema_conflict", "schema: {b}");
     fold(&api).await;
-    // ⚠️ With every row folded, the door holds nothing to compare: a new width is accepted
-    // (no request on the write path), and the query that meets both is refused, loudly.
+    // M98: with every row folded the door holds nothing to compare, and the schema records the
+    // width: refused, at no request, where M61 accepted it and refused the query instead.
     let (s, b) = put(&api, "docs", &write(vec![row("d", 4)])).await;
-    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "folded: {b}");
+    assert_eq!(b["error"]["code"], "schema_conflict", "folded: {b}");
     let (s, b) = query(
         &api,
         "docs",
-        &json!({"multi": {"field": "late", "vectors": [[1.0, 0.0, 0.0]]}}),
+        &json!({"multi": {"field": "late", "vectors": [[1.0, 0.0, 0.0]]}, "top_k": 10}),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
-    assert_eq!(b["error"]["code"], "schema_conflict", "{b}");
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b).len(), 2, "the index's rows unchanged: {b}");
     // Within one batch, on a new index: its first row decides.
     let (s, b) = put(&api, "new", &write(vec![row("a", 2), row("b", 5)])).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
@@ -557,6 +558,28 @@ async fn a_named_fields_width_is_one_an_index() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+}
+
+#[tokio::test]
+async fn a_named_fields_width_survives_a_restart() {
+    // M98: a process holding no row of the index reads the width from the schema HEAD records,
+    // and reports it in the client's width.
+    let store = MemoryStore::new();
+    let row = |id: &str, w: usize| json!({"id": id, "vector": [1.0, 2.0], "vectors": {"late": [vec![0.5; w]]}});
+    let write = |docs: Vec<Value>| json!({"durability": "durable", "distance_metric": "euclidean_squared", "documents": docs});
+    let first = api(&store);
+    let (s, b) = put(&first, "docs", &write(vec![row("a", 3)])).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(&first).await;
+    let api = api(&store);
+    let (s, b) = send(&api, "GET", "/v1/indexes/docs", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["schema"]["vectors"], json!({"late": 3}), "{b}");
+    let (s, b) = put(&api, "docs", &write(vec![row("b", 4)])).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "schema_conflict", "{b}");
+    let (s, b) = put(&api, "docs", &write(vec![row("b", 3)])).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
 }
 
 #[tokio::test]

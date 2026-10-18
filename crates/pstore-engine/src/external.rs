@@ -388,6 +388,7 @@ mod tests {
                 metric: Metric::DotProduct,
                 fts: pstore_format::text::FullText::default(),
                 trigram: Vec::new(),
+                fields: Default::default(),
             },
         );
         assert!(taken(&h));

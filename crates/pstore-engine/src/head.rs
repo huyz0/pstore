@@ -84,6 +84,9 @@ pub struct IndexSchema {
     pub fts: pstore_format::text::FullText,
     /// The attributes whose trigrams each segment sketches (M15.2), sorted; empty for none.
     pub trigram: Vec<String>,
+    /// The **stored** width of each named dense field the index's rows have carried (M98), as
+    /// `dims` is `vector`'s, which is never a key. Filled by the fold, never changed.
+    pub fields: BTreeMap<String, u32>,
 }
 
 impl IndexSchema {
@@ -512,8 +515,13 @@ impl Head {
         // one is -- otherwise the later count would be read as the earlier one's.
         // M32: the dictionaries are the last section, written whenever any ref's are known.
         // M45: the lengths follow the dictionaries, and force them, by the same rule.
-        // M86: the externals are last, and force the lengths (and so the dictionaries).
-        let ext = !self.externals.is_empty();
+        // M86: the externals follow, and force the lengths (and so the dictionaries).
+        // M98: the named fields' widths are last, and force the externals.
+        let widths: Vec<_> = all
+            .iter()
+            .filter(|(_, _, s, _)| !s.fields.is_empty())
+            .collect();
+        let ext = !widths.is_empty() || !self.externals.is_empty();
         let lens = ext || self.indexes.values().flatten().any(|r| r.len.is_some());
         let dicts = lens || self.indexes.values().flatten().any(|r| r.dicts.is_some());
         let more = !self.replications.is_empty() || !self.quarantine.is_empty() || dicts;
@@ -607,6 +615,17 @@ impl Head {
                 out.extend_from_slice(&e.source_len.to_le_bytes());
             }
         }
+        if !widths.is_empty() {
+            out.extend_from_slice(&(widths.len() as u32).to_le_bytes());
+            for (kind, at, s, name) in widths {
+                put_ref(&mut out, *kind, *at, *name);
+                out.extend_from_slice(&(s.fields.len() as u32).to_le_bytes());
+                for (field, width) in &s.fields {
+                    put_str(&mut out, field);
+                    out.extend_from_slice(&width.to_le_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -680,6 +699,7 @@ impl Head {
                     metric: Metric::DotProduct,
                     fts: pstore_format::text::FullText::default(),
                     trigram: Vec::new(),
+                    fields: Default::default(),
                 },
             );
         }
@@ -735,6 +755,7 @@ impl Head {
                     metric,
                     fts: pstore_format::text::FullText::default(),
                     trigram: Vec::new(),
+                    fields: Default::default(),
                 },
             ));
         }
@@ -889,6 +910,37 @@ impl Head {
                 source_len: c.u64()?,
             };
             h.externals.insert(name, e);
+        }
+        // ⚠️ M98: end of buffer here is "no named field's width known", which the next fold
+        // learns from its own rows.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let kind = c.u8()?;
+            let schema = match kind {
+                0 => {
+                    let name = c.string()?;
+                    h.schemas.get_mut(&name)
+                }
+                1 => {
+                    let at = c.u32()? as usize;
+                    h.dropped.get_mut(at).map(|(_, _, s)| s)
+                }
+                _ => None,
+            }
+            .ok_or(EngineError::CorruptHead)?;
+            for _ in 0..c.u32()? {
+                let field = c.string()?;
+                // `vector`'s width is `dims`, and a derived encoding's (M67) its parameters':
+                // a record of either is not a HEAD this wrote.
+                if field == pstore_format::DEFAULT_FIELD
+                    || field.ends_with(pstore_format::fde::FIELD_SUFFIX)
+                {
+                    return Err(EngineError::CorruptHead);
+                }
+                schema.fields.insert(field, c.u32()?);
+            }
         }
         Ok(h)
     }
@@ -1588,6 +1640,7 @@ mod tests {
                 ..Default::default()
             },
             trigram: vec!["title".to_owned(), "url".to_owned()],
+            fields: BTreeMap::from([("late".to_owned(), 5)]),
         };
         h.schemas.insert("a".to_owned(), schema.clone());
         h.schema_rejects.insert("a".to_owned(), 3);
@@ -1617,11 +1670,11 @@ mod tests {
         let decodable: Vec<usize> = (0..bytes.len())
             .filter(|cut| Head::decode(&bytes[..*cut]).is_ok())
             .collect();
-        // One decodable cut per optional section -- the fourteen `at_end` checks `decode`
+        // One decodable cut per optional section -- the fifteen `at_end` checks `decode`
         // makes -- and none inside a section: a `?` that read short as a default would add
         // one. (`a_truncated_head_is_refused_at_every_length_but_a_section_boundary` pins the
         // same for a HEAD whose later sections are empty.)
-        assert_eq!(decodable.len(), 14, "{decodable:?} of {}", bytes.len());
+        assert_eq!(decodable.len(), 15, "{decodable:?} of {}", bytes.len());
         for cut in &decodable {
             assert_ne!(
                 Head::decode(&bytes[..*cut])?,

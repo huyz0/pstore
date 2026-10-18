@@ -143,6 +143,13 @@ fn fingerprint(h: &Head, index: &str) -> Option<u64> {
             b.extend_from_slice(t.as_bytes());
             b.push(2);
         }
+        // M98: and each named field's width -- nothing when none is recorded, so a source
+        // folded before M98 keeps the fingerprint its replicas applied.
+        for (n, w) in &s.fields {
+            b.extend_from_slice(n.as_bytes());
+            b.push(3);
+            b.extend_from_slice(&w.to_le_bytes());
+        }
     }
     Some(fnv1a(&b))
 }
@@ -977,6 +984,39 @@ impl<S: BlobStore> Engine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_named_fields_width_is_part_of_the_fingerprint() {
+        // M98 review: a fold may record a width and change no segment (every row set aside),
+        // and a replica that compared equal would keep the schema without it.
+        let mut h = Head::default();
+        h.indexes.insert(
+            "i".to_owned(),
+            vec![head::SegmentRef {
+                key: "k/0.seg".to_owned(),
+                rows: 1,
+                dicts: None,
+                len: None,
+            }],
+        );
+        h.schemas
+            .insert("i".to_owned(), head::IndexSchema::default());
+        let before = fingerprint(&h, "i");
+        let mut w = h.clone();
+        if let Some(s) = w.schemas.get_mut("i") {
+            s.fields.insert("late".to_owned(), 3);
+        }
+        assert_ne!(fingerprint(&w, "i"), before);
+        if let Some(s) = w.schemas.get_mut("i") {
+            s.fields.insert("late".to_owned(), 4);
+        }
+        let four = fingerprint(&w, "i");
+        if let Some(s) = w.schemas.get_mut("i") {
+            s.fields.insert("late".to_owned(), 3);
+            s.fields.insert("other".to_owned(), 4);
+        }
+        assert_ne!(fingerprint(&w, "i"), four, "names and widths both count");
+    }
 
     #[test]
     fn a_suffixed_name_is_not_a_copy() {

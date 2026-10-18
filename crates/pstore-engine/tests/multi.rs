@@ -85,7 +85,19 @@ async fn a_patch_beside_a_new_width_never_stops_the_fold() {
     e.write("docs", vec![doc("a", 3)]).await.unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();
-    e.write("docs", vec![doc("x", 4)]).await.unwrap();
+    // M98: the schema records `late`'s width, so the door, the flush and the reject pass all
+    // refuse `x`. The second pass is reached by an index folded before that, which records
+    // none: a process started on it accepts `x` through its own door.
+    e.commit_head_for_test(|h| {
+        for s in h.schemas.values_mut() {
+            s.fields.clear();
+        }
+    })
+    .await
+    .unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(2));
+    other.write("docs", vec![doc("x", 4)]).await.unwrap();
+    other.flush().await.unwrap();
     let mut set = std::collections::BTreeMap::new();
     set.insert("tag".to_owned(), pstore_format::Value::Int(7));
     e.patch(
@@ -295,4 +307,181 @@ async fn a_big_segment_clusters_its_encoding_and_a_query_uses_it() {
             .await
             .is_ok()
     );
+}
+
+/// `doc`, with a second named field `other` of one vector at `width`.
+fn with_other(id: &str, late: usize, width: usize) -> Document {
+    let mut d = doc(id, late);
+    d.vectors.insert(
+        "other".to_owned(),
+        VectorField::Dense(vec![vec![0.75; width]]),
+    );
+    d
+}
+
+#[tokio::test]
+async fn the_fold_records_each_named_fields_width() {
+    // M98: in the schema, stored widths as `dims` is: euclidean adds a component.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let euclid = pstore_engine::Metric::EuclideanSquared;
+    e.write_as("docs", vec![doc("a", 3)], euclid).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let fields = |h: &pstore_engine::Head| h.schemas["docs"].fields.clone();
+    let h = e.head_for_test().await;
+    assert_eq!(
+        fields(&h),
+        std::collections::BTreeMap::from([("late".to_owned(), 4)])
+    );
+    // A later fold adds a field it first meets and leaves the one recorded.
+    e.write_as("docs", vec![with_other("b", 3, 2)], euclid)
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let h = e.head_for_test().await;
+    assert_eq!(
+        fields(&h),
+        std::collections::BTreeMap::from([("late".to_owned(), 4), ("other".to_owned(), 3)])
+    );
+    // And the door refuses another width of either, with nothing held: the schema says.
+    for d in [doc("c", 2), with_other("c", 3, 5)] {
+        let err = e.write_as("docs", vec![d], euclid).await.unwrap_err();
+        assert!(err.to_string().contains("named vector field"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn a_held_width_meets_the_recorded_one_in_the_fold() {
+    // M98: a row of another width past both checks -- the hooks build what two processes that
+    // never read HEAD could -- is judged by the schema, not by the fold's first row of it.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("docs", vec![doc("a", 3)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    // First in the fold, so a fold-local first row would have decided by it.
+    e.write_without_schema_check_for_test("docs", vec![doc("x", 4)])
+        .await;
+    e.write_without_schema_check_for_test("docs", vec![doc("y", 3)])
+        .await;
+    e.flush_without_schema_check_for_test().await.unwrap();
+    e.fold().await.unwrap();
+    let q = e.quarantine("docs").await.unwrap().unwrap();
+    let out: Vec<(String, Option<String>)> = q
+        .rows
+        .iter()
+        .map(|r| (r.document.id.clone(), r.reason.clone()))
+        .collect();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].0, "x");
+    assert!(
+        out[0]
+            .1
+            .as_deref()
+            .is_some_and(|r| r.contains("named vector field")),
+        "a reason: {out:?}"
+    );
+    // One width sealed, so the index compacts.
+    e.compact("docs").await.unwrap();
+    let rows = e.scan("docs", None).await.unwrap();
+    let ids: BTreeSet<String> = rows.iter().map(|d| d.id.clone()).collect();
+    assert_eq!(ids, BTreeSet::from(["a".to_owned(), "y".to_owned()]));
+}
+
+#[tokio::test]
+async fn a_fold_without_a_field_keeps_its_width() {
+    // M98 review: a fold whose rows carry no `late` records what it judged by, which is the
+    // schema's widths and its own: never fewer.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("docs", vec![doc("a", 3)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.write("docs", vec![Document::new("b", vec![0.5; 4])])
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let h = e.head_for_test().await;
+    assert_eq!(
+        h.schemas["docs"].fields,
+        std::collections::BTreeMap::from([("late".to_owned(), 3)])
+    );
+}
+
+#[tokio::test]
+async fn the_schema_outranks_a_held_width_at_the_door() {
+    // M98 review: a row this process buffered before the schema recorded `late` is one the
+    // fold will set aside; it must not refuse a write at the recorded width (M35).
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let a = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2));
+    a.write("docs", vec![doc("p", 5)]).await.unwrap();
+    b.write("docs", vec![doc("x", 3)]).await.unwrap();
+    b.flush().await.unwrap();
+    b.fold().await.unwrap();
+    a.write("docs", vec![doc("q", 3)]).await.unwrap();
+    let err = a.write("docs", vec![doc("r", 5)]).await.unwrap_err();
+    assert!(err.to_string().contains("named vector field"), "{err}");
+}
+
+#[tokio::test]
+async fn a_patch_meets_the_recorded_width() {
+    // M98: an index folded with two widths before M98 holds a row the schema's width now
+    // contradicts. A patch resolves it after the reject pass, so only the second pass, seeded
+    // with the schema's widths, sets it aside.
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("docs", vec![doc("a", 3)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.commit_head_for_test(|h| {
+        for s in h.schemas.values_mut() {
+            s.fields.clear();
+        }
+    })
+    .await
+    .unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(2));
+    other.write("docs", vec![doc("x", 4)]).await.unwrap();
+    other.flush().await.unwrap();
+    other.fold().await.unwrap();
+    assert_eq!(
+        e.head_for_test().await.schemas["docs"].fields,
+        std::collections::BTreeMap::from([("late".to_owned(), 4)])
+    );
+    let mut set = std::collections::BTreeMap::new();
+    set.insert("tag".to_owned(), pstore_format::Value::Int(7));
+    other
+        .patch(
+            "docs",
+            vec![pstore_engine::Patch {
+                id: "a".to_owned(),
+                set,
+                unset: Vec::new(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    other.flush().await.unwrap();
+    other.fold().await.unwrap();
+    let q = other.quarantine("docs").await.unwrap().unwrap();
+    let out: Vec<String> = q.rows.iter().map(|r| r.document.id.clone()).collect();
+    assert_eq!(out, ["a"]);
+    let a = other
+        .scan("docs", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == "a")
+        .unwrap();
+    assert!(!a.attrs.contains_key("tag"), "set aside: {:?}", a.attrs);
 }

@@ -457,6 +457,9 @@ pub struct Schema {
     pub full_text_search: serde_json::Value,
     /// The attributes whose trigrams are sketched (M15.2), sorted.
     pub regex: Vec<String>,
+    /// Each named dense field's width, as a client writes it (M98); absent when none is known.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vectors: std::collections::BTreeMap<String, u32>,
 }
 
 /// One index, as `GET /v1/indexes/{id}` reports it.

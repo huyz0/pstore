@@ -204,6 +204,7 @@ async fn the_metric_survives_a_head_round_trip() {
                 metric,
                 fts: pstore_format::text::FullText::default(),
                 trigram: Vec::new(),
+                fields: Default::default(),
             },
         );
     }
