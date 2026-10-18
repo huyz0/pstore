@@ -562,7 +562,7 @@ impl ExternalIndex {
         attr: &ExternalAttribute,
         keep: &(dyn Fn(Option<&AttrValue>) -> bool + Sync),
     ) -> Result<Vec<(usize, f32)>, ExternalIndexError> {
-        if attr.key() != self.column.key {
+        if attr.keys() != self.column.keys() {
             return Err(ExternalIndexError::Corrupt(
                 "the attribute is in another object than the vectors",
             ));

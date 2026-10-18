@@ -13,7 +13,7 @@
 //! The manifest and the page tables are untrusted bytes: the reader is bounded (depth, sizes,
 //! offsets checked against the object) and returns `None` for anything it does not understand.
 
-use crate::external::Extent;
+use crate::external::{AttrKind, Extent};
 use crate::parquet::Located;
 use pstore_blob::{BlobError, BlobStore, Key};
 
@@ -197,6 +197,92 @@ pub async fn locate<S: BlobStore>(
     manifest: &Key,
     column: &str,
 ) -> Result<Dataset, LanceError> {
+    Ok(locate_as(store, manifest, column, false).await?.0)
+}
+
+/// The scalar column `column` of a dataset (M101), as [`locate`] finds a vector column: its
+/// runs, and the kind its manifest's logical type names.
+///
+/// # Errors
+/// As [`locate`], and [`LanceError::Unsupported`] for a logical type [`AttrKind`] does not name,
+/// a column with nulls, or a bit-packed or compressed page.
+pub(crate) async fn locate_attribute<S: BlobStore>(
+    store: &S,
+    manifest: &Key,
+    column: &str,
+) -> Result<(Dataset, AttrKind), LanceError> {
+    let (found, kind) = locate_as(store, manifest, column, true).await?;
+    let kind = kind.ok_or(LanceError::Malformed("an attribute without its kind"))?;
+    Ok((found, kind))
+}
+
+/// What a page must hold: a float32 vector of `dims`, or one scalar of `bits` (M101).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    Vector(u32),
+    Scalar(u32),
+}
+
+impl Shape {
+    /// A row's bytes.
+    pub(crate) fn width(self) -> u64 {
+        match self {
+            Self::Vector(dims) => u64::from(dims) * 4,
+            Self::Scalar(bits) => u64::from(bits / 8),
+        }
+    }
+
+    /// A row's `f32` lanes, which is how a run addresses it.
+    fn dims(self) -> u32 {
+        match self {
+            Self::Vector(dims) => dims,
+            Self::Scalar(bits) => bits / 32,
+        }
+    }
+
+    /// Why a page's size does not hold its rows.
+    pub(crate) fn size_error(self) -> LanceError {
+        LanceError::Malformed(match self {
+            Self::Vector(_) => "a page's size is not rows x dims x 4",
+            Self::Scalar(_) => "a page's size is not rows x the value's width",
+        })
+    }
+}
+
+/// The kind of a scalar column with the manifest's logical type `logical` (M101), and its
+/// width in bits; anything else is refused with what it is.
+fn lance_kind(logical: &str) -> Result<(AttrKind, u32), LanceError> {
+    let timestamp = logical
+        .strip_prefix("timestamp:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(unit, _zone)| unit);
+    Ok(match (logical, timestamp) {
+        ("int32", _) => (AttrKind::Int32, 32),
+        ("int64", _) => (AttrKind::Int64, 64),
+        ("uint32", _) => (AttrKind::UInt32, 32),
+        ("uint64", _) => (AttrKind::UInt64, 64),
+        ("float", _) => (AttrKind::Float, 32),
+        ("double", _) => (AttrKind::Double, 64),
+        ("date32:day", _) => (AttrKind::Date, 32),
+        (_, Some("ms")) => (AttrKind::TimestampMillis, 64),
+        (_, Some("us")) => (AttrKind::TimestampMicros, 64),
+        (_, Some("ns")) => (AttrKind::TimestampNanos, 64),
+        _ => {
+            return unsupported(format!(
+                "the column is {logical:?}: only a 32- or 64-bit integer, a float, a double, a \
+                 date32 or a ms/us/ns timestamp is read as an attribute"
+            ));
+        }
+    })
+}
+
+/// [`locate`] of a vector column, or with `attribute` of a scalar one and its kind.
+async fn locate_as<S: BlobStore>(
+    store: &S,
+    manifest: &Key,
+    column: &str,
+    attribute: bool,
+) -> Result<(Dataset, Option<AttrKind>), LanceError> {
     let bad = LanceError::Malformed;
     let total = store.head(manifest).await?;
     if !(16..=MAX_MANIFEST).contains(&total) {
@@ -239,17 +325,23 @@ pub async fn locate<S: BlobStore>(
     let Some((field_id, logical)) = leaf else {
         return unsupported(format!("no top-level column named {column:?}"));
     };
-    let dims: u32 = std::str::from_utf8(&logical)
-        .ok()
-        .and_then(|s| s.strip_prefix("fixed_size_list:float:"))
-        .and_then(|d| d.parse().ok())
-        .filter(|d| *d > 0)
-        .ok_or_else(|| {
-            LanceError::Unsupported(format!(
-                "the column is {:?}, not a float32 fixed-size list",
-                String::from_utf8_lossy(&logical)
-            ))
-        })?;
+    let (shape, kind) = if attribute {
+        let (kind, bits) = lance_kind(&String::from_utf8_lossy(&logical))?;
+        (Shape::Scalar(bits), Some(kind))
+    } else {
+        let dims: u32 = std::str::from_utf8(&logical)
+            .ok()
+            .and_then(|s| s.strip_prefix("fixed_size_list:float:"))
+            .and_then(|d| d.parse().ok())
+            .filter(|d| *d > 0)
+            .ok_or_else(|| {
+                LanceError::Unsupported(format!(
+                    "the column is {:?}, not a float32 fixed-size list",
+                    String::from_utf8_lossy(&logical)
+                ))
+            })?;
+        (Shape::Vector(dims), None)
+    };
 
     // <dataset>/_versions/<n>.manifest  ->  <dataset>/data/<path>
     let key = manifest.as_str();
@@ -327,7 +419,7 @@ pub async fn locate<S: BlobStore>(
             store,
             &data,
             usize::try_from(col).map_err(|_| bad("column"))?,
-            dims,
+            shape,
             rows,
             size,
             minor == 1,
@@ -363,7 +455,7 @@ pub async fn locate<S: BlobStore>(
         };
         let object = u32::try_from(objects.len()).map_err(|_| bad("too many data files"))?;
         for e in located.extents {
-            for piece in without(&e, &deleted, u64::from(dims) * 4) {
+            for piece in without(&e, &deleted, shape.width()) {
                 extents.push(Extent {
                     first_row: base + piece.first_row,
                     object,
@@ -377,15 +469,16 @@ pub async fn locate<S: BlobStore>(
         objects.push((data, located.len));
         base += rows;
     }
-    Ok(Dataset {
+    let found = Dataset {
         objects,
         located: Located {
             len: 0,
-            dims,
+            dims: shape.dims(),
             extents,
             rows: base,
         },
-    })
+    };
+    Ok((found, kind))
 }
 
 /// A dataset's column, in place: its data files and the runs of rows (M87).
@@ -582,7 +675,7 @@ async fn locate_file<S: BlobStore>(
     store: &S,
     key: &Key,
     col: usize,
-    dims: u32,
+    shape: Shape,
     rows: u64,
     declared_size: u64,
     v21: bool,
@@ -637,7 +730,7 @@ async fn locate_file<S: BlobStore>(
     let meta = store.get_range(key, pos..pos + size).await?;
     let cm = fields(&meta).ok_or(bad("column metadata protobuf"))?;
 
-    let width = u64::from(dims) * 4;
+    let width = shape.width();
     let (mut extents, mut first_row) = (Vec::new(), 0u64);
     for (f, w) in &cm {
         let (2, Wire::Bytes(pb)) = (*f, w) else {
@@ -653,14 +746,14 @@ async fn locate_file<S: BlobStore>(
             if n == 0 {
                 return Err(bad("a page holds no rows"));
             }
-            v21::pieces(store, key, &page, dims, n, len).await?
+            v21::pieces(store, key, &page, shape, n, len).await?
         } else {
-            encoding_is_plain_floats(&page, dims)?;
+            encoding_is_plain(&page, shape)?;
             let ([offset], [bytes_len]) = (offsets.as_slice(), sizes.as_slice()) else {
                 return unsupported("a page has more than one buffer");
             };
             if n == 0 || n.checked_mul(width) != Some(*bytes_len) {
-                return Err(bad("a page's size is not rows x dims x 4"));
+                return Err(shape.size_error());
             }
             if offset.checked_add(*bytes_len).is_none_or(|e| e > len) {
                 return Err(bad("a page runs past the file"));
@@ -689,19 +782,24 @@ async fn locate_file<S: BlobStore>(
     }
     Ok(Located {
         len,
-        dims,
+        dims: shape.dims(),
         extents,
         rows: first_row,
     })
 }
 
-/// Accepts only `FixedSizeList(dims) -> Nullable(NoNull) -> Flat(32 bits)`, the encoding of a
-/// float32 vector column with no nulls; anything else is refused with what it is.
-fn encoding_is_plain_floats(page: &[(u64, Wire<'_>)], dims: u32) -> Result<(), LanceError> {
+/// Accepts only `Nullable(NoNull) -> FixedSizeList(dims) -> Nullable(NoNull) -> Flat(32 bits)`,
+/// the encoding of a float32 vector column with no nulls, or for a scalar `Nullable(NoNull) ->
+/// Flat(bits)` (M101); anything else is refused with what it is.
+fn encoding_is_plain(page: &[(u64, Wire<'_>)], shape: Shape) -> Result<(), LanceError> {
     let bad = LanceError::Malformed;
     let wrong = || {
         LanceError::Unsupported(
-            "a page is not a plain, null-free float32 fixed-size list".to_owned(),
+            match shape {
+                Shape::Vector(_) => "a page is not a plain, null-free float32 fixed-size list",
+                Shape::Scalar(_) => "a page is not a plain, null-free fixed-width value",
+            }
+            .to_owned(),
         )
     };
     // PageEncoding.direct(2) -> DirectEncoding.encoding(1) = Any { type_url, value }
@@ -714,28 +812,39 @@ fn encoding_is_plain_floats(page: &[(u64, Wire<'_>)], dims: u32) -> Result<(), L
         return Err(wrong());
     }
     // The column: ArrayEncoding.nullable(2) = { no_nulls(1) = { values(1) } }
-    let column = bytes(&any, 2)
+    let nullable = bytes(&any, 2)
         .and_then(fields)
         .and_then(|a| bytes(&a, 2).and_then(fields))
-        .and_then(|n| bytes(&n, 1).and_then(fields))
-        .and_then(|n| bytes(&n, 1).and_then(fields))
         .ok_or_else(wrong)?;
-    // values: ArrayEncoding.fixed_size_list(3) = { dimension(1), items(2) }
-    let fsl = bytes(&column, 3).and_then(fields).ok_or_else(wrong)?;
-    if number(&fsl, 1) != u64::from(dims) {
-        return Err(bad("a page's dimension disagrees with the manifest"));
+    if matches!(shape, Shape::Scalar(_)) && bytes(&nullable, 2).is_some() {
+        return unsupported("a page holds nulls: only a column with none is read as an attribute");
     }
-    // items: ArrayEncoding.nullable(2) = { no_nulls(1) = { values(1) } }
-    let values = bytes(&fsl, 2)
+    let column = bytes(&nullable, 1)
         .and_then(fields)
-        .and_then(|a| bytes(&a, 2).and_then(fields))
-        .and_then(|n| bytes(&n, 1).and_then(fields))
         .and_then(|n| bytes(&n, 1).and_then(fields))
         .ok_or_else(wrong)?;
-    // values: ArrayEncoding.flat(1) = { bits_per_value(1) = 32, buffer(2) = { index, type } }
+    let (values, bits) = match shape {
+        Shape::Vector(dims) => {
+            // values: ArrayEncoding.fixed_size_list(3) = { dimension(1), items(2) }
+            let fsl = bytes(&column, 3).and_then(fields).ok_or_else(wrong)?;
+            if number(&fsl, 1) != u64::from(dims) {
+                return Err(bad("a page's dimension disagrees with the manifest"));
+            }
+            // items: ArrayEncoding.nullable(2) = { no_nulls(1) = { values(1) } }
+            let items = bytes(&fsl, 2)
+                .and_then(fields)
+                .and_then(|a| bytes(&a, 2).and_then(fields))
+                .and_then(|n| bytes(&n, 1).and_then(fields))
+                .and_then(|n| bytes(&n, 1).and_then(fields))
+                .ok_or_else(wrong)?;
+            (items, 32)
+        }
+        Shape::Scalar(bits) => (column, bits),
+    };
+    // values: ArrayEncoding.flat(1) = { bits_per_value(1), buffer(2) = { index, type } }
     let flat = bytes(&values, 1).and_then(fields).ok_or_else(wrong)?;
     let buffer = bytes(&flat, 2).and_then(fields).ok_or_else(wrong)?;
-    if number(&flat, 1) != 32 || number(&buffer, 1) != 0 || number(&buffer, 2) != 0 {
+    if number(&flat, 1) != u64::from(bits) || number(&buffer, 1) != 0 || number(&buffer, 2) != 0 {
         return Err(wrong());
     }
     Ok(())
@@ -769,6 +878,48 @@ mod tests {
             .iter()
             .map(|e| (e.first_row, e.rows, e.offset))
             .collect()
+    }
+
+    #[test]
+    fn a_lance_logical_type_is_its_kind() {
+        let kind = |t: &str| lance_kind(t).ok();
+        for (t, want, bits) in [
+            ("int32", AttrKind::Int32, 32),
+            ("int64", AttrKind::Int64, 64),
+            ("uint32", AttrKind::UInt32, 32),
+            ("uint64", AttrKind::UInt64, 64),
+            ("float", AttrKind::Float, 32),
+            ("double", AttrKind::Double, 64),
+            ("date32:day", AttrKind::Date, 32),
+            ("timestamp:ms:-", AttrKind::TimestampMillis, 64),
+            ("timestamp:us:UTC", AttrKind::TimestampMicros, 64),
+            (
+                "timestamp:ns:America/New_York",
+                AttrKind::TimestampNanos,
+                64,
+            ),
+        ] {
+            assert_eq!(kind(t), Some((want, bits)), "{t}");
+        }
+        for t in [
+            "timestamp:s:-",
+            "timestamp:ms",
+            "date64:ms",
+            "int16",
+            "int8",
+            "bool",
+            "string",
+            "fixed_size_list:float:8",
+            "xint32",
+        ] {
+            let err = lance_kind(t).unwrap_err().to_string();
+            assert!(err.contains(&format!("{t:?}")), "{t}: {err}");
+        }
+        assert_eq!(Shape::Scalar(64).width(), 8);
+        assert_eq!(Shape::Scalar(32).dims(), 1);
+        assert_eq!(Shape::Scalar(64).dims(), 2);
+        assert_eq!(Shape::Vector(3).width(), 12);
+        assert_eq!(Shape::Vector(3).dims(), 3);
     }
 
     #[test]

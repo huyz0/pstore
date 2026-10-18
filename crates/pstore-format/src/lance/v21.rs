@@ -13,7 +13,7 @@
 //! item) is refused by name. The layout was read from files written by one library, across 130
 //! shapes of (rows, dimensions); see `docs/milestones/M90/SPEC.md`.
 
-use super::{LanceError, Wire, bytes, fields, packed};
+use super::{LanceError, Shape, Wire, bytes, fields, packed};
 use pstore_blob::{BlobStore, Key};
 
 const LAYOUT_URL: &[u8] = b"/lance.encodings21.PageLayout";
@@ -37,6 +37,44 @@ fn bad(why: &'static str) -> LanceError {
 
 fn refused<T>(why: &str) -> Result<T, LanceError> {
     Err(LanceError::Unsupported(why.to_owned()))
+}
+
+/// `Flat(bits)`, with no buffer compression, and nothing more (M101).
+fn plain_flat(compression: &[u8], bits: u32) -> bool {
+    let Some(fs) = fields(compression) else {
+        return false;
+    };
+    let [(1, Wire::Bytes(flat))] = fs.as_slice() else {
+        return false;
+    };
+    fields(flat)
+        .is_some_and(|f| matches!(f.as_slice(), [(1, Wire::Varint(b))] if *b == u64::from(bits)))
+}
+
+/// The value compression `shape` is stored with when nothing compresses it.
+fn plain(compression: &[u8], shape: Shape) -> bool {
+    match shape {
+        Shape::Vector(dims) => plain_floats(compression, dims),
+        Shape::Scalar(bits) => plain_flat(compression, bits),
+    }
+}
+
+/// Why a scalar's mini-block page is not read (M101), named more closely than a vector's: a
+/// layer other than an all-valid item holds nulls, and `InlineBitpacking` (field 5) is the
+/// compression pylance 13 gives most integer columns.
+fn scalar_refusal(layout: &[(u64, Wire<'_>)]) -> Option<&'static str> {
+    let nulls = layout
+        .iter()
+        .any(|(f, w)| *f == 6 && !matches!(w, Wire::Bytes(ALL_VALID_ITEM)));
+    if nulls {
+        return Some("a page holds nulls: only a column with none is read as an attribute");
+    }
+    let compression = layout.iter().find_map(|(f, w)| match (f, w) {
+        (3, Wire::Bytes(vc)) => fields(vc),
+        _ => None,
+    })?;
+    matches!(compression.as_slice(), [(5, _)])
+        .then_some("a page's values are bit-packed: only a plain fixed-width value is read")
 }
 
 /// `FixedSizeList(dims) -> Flat(32 bits)`, with no buffer compression, and nothing more.
@@ -80,13 +118,13 @@ fn layout<'a>(page: &[(u64, Wire<'a>)]) -> Result<Vec<(u64, Wire<'a>)>, LanceErr
         .ok_or(bad("page layout protobuf"))
 }
 
-/// The runs of rows of one 2.1 page of `n` rows of `dims` float32s, read from the page's
-/// protobuf `page` (and, for `MiniBlock`, its chunk index) in a file of `len` bytes.
+/// The runs of rows of one 2.1 page of `n` rows of `shape`, read from the page's protobuf
+/// `page` (and, for `MiniBlock`, its chunk index) in a file of `len` bytes.
 pub(super) async fn pieces<S: BlobStore>(
     store: &S,
     key: &Key,
     page: &[(u64, Wire<'_>)],
-    dims: u32,
+    shape: Shape,
     n: u64,
     len: u64,
 ) -> Result<Vec<Piece>, LanceError> {
@@ -102,7 +140,7 @@ pub(super) async fn pieces<S: BlobStore>(
     {
         return Err(bad("a page's buffers run past the file"));
     }
-    let row = u64::from(dims) * 4;
+    let row = shape.width();
     match layout(page)?.as_slice() {
         [(3, Wire::Bytes(full))] => {
             let fs = fields(full).ok_or(bad("page layout protobuf"))?;
@@ -116,14 +154,14 @@ pub(super) async fn pieces<S: BlobStore>(
             else {
                 return refused("a page's full-zip layout is not a null-free, uncompressed run");
             };
-            if *bits != row * 8 || *visible != n || *items != n || !plain_floats(vc, dims) {
+            if *bits != row * 8 || *visible != n || *items != n || !plain(vc, shape) {
                 return refused("a page's full-zip layout is not a null-free, uncompressed run");
             }
             let ([offset], [size]) = (offsets.as_slice(), sizes.as_slice()) else {
                 return refused("a full-zip page has more than one buffer");
             };
             if n.checked_mul(row) != Some(*size) {
-                return Err(bad("a page's size is not rows x dims x 4"));
+                return Err(shape.size_error());
             }
             Ok(vec![Piece {
                 rows: n,
@@ -132,6 +170,9 @@ pub(super) async fn pieces<S: BlobStore>(
         }
         [(1, Wire::Bytes(mini))] => {
             let fs = fields(mini).ok_or(bad("page layout protobuf"))?;
+            if let (Shape::Scalar(_), Some(why)) = (shape, scalar_refusal(&fs)) {
+                return refused(why);
+            }
             let [
                 (3, Wire::Bytes(vc)),
                 (6, Wire::Bytes(ALL_VALID_ITEM)),
@@ -141,7 +182,7 @@ pub(super) async fn pieces<S: BlobStore>(
             else {
                 return refused("a page's mini-block layout is not a null-free, uncompressed run");
             };
-            if *items != n || !plain_floats(vc, dims) {
+            if *items != n || !plain(vc, shape) {
                 return refused("a page's mini-block layout is not a null-free, uncompressed run");
             }
             let ([index_at, data_at], [index_len, data_len]) =

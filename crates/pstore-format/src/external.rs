@@ -446,12 +446,54 @@ impl ExternalAttribute {
         Ok(Self { kind, source })
     }
 
-    /// The object's key.
+    /// Pins the scalar column `column` of the Lance dataset whose manifest is at `manifest`
+    /// (M101), as [`ExternalColumn::pin_lance`] pins a vector column: a deleted row is `None`.
+    ///
+    /// # Errors
+    /// [`ExternalError::Lance`] for a dataset or column that cannot be read in place, or is not
+    /// a kind [`AttrKind`] names; a store failure.
+    pub async fn pin_lance<S: BlobStore>(
+        store: &S,
+        manifest: &Key,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let (found, kind) = crate::lance::locate_attribute(store, manifest, column).await?;
+        let column = ExternalColumn::from_dataset(store, found).await?;
+        Ok(Self {
+            kind,
+            source: AttrSource::Fixed(column),
+        })
+    }
+
+    /// [`Self::pin_lance`] at the version the dataset's hint names, as
+    /// [`ExternalColumn::pin_lance_latest`].
+    ///
+    /// # Errors
+    /// As [`Self::pin_lance`], and for a hint that is missing or names no manifest.
+    pub async fn pin_lance_latest<S: BlobStore>(
+        store: &S,
+        dataset: &str,
+        column: &str,
+    ) -> Result<Self, ExternalError> {
+        let manifest = crate::lance::latest_manifest(store, dataset).await?;
+        Self::pin_lance(store, &manifest, column).await
+    }
+
+    /// The object's key: the first, for a column of several.
     #[must_use]
     pub fn key(&self) -> &str {
         match &self.source {
             AttrSource::Fixed(c) => &c.key,
             AttrSource::Chunks(c) => &c.key,
+        }
+    }
+
+    /// Every object's key, in row order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<&str> {
+        match &self.source {
+            AttrSource::Fixed(c) => c.keys(),
+            AttrSource::Chunks(c) => vec![c.key.as_str()],
         }
     }
 
@@ -556,6 +598,14 @@ pub struct ExternalColumn {
 }
 
 impl ExternalColumn {
+    /// Every object's key, in the order extents number them (M101).
+    #[must_use]
+    pub fn keys(&self) -> Vec<&str> {
+        std::iter::once(self.key.as_str())
+            .chain(self.more.iter().map(|o| o.key.as_str()))
+            .collect()
+    }
+
     /// Bytes a vector occupies.
     fn width(&self) -> u64 {
         u64::from(self.dims) * 4
@@ -698,6 +748,15 @@ impl ExternalColumn {
         column: &str,
     ) -> Result<Self, ExternalError> {
         let found = crate::lance::locate(store, manifest, column).await?;
+        Self::from_dataset(store, found).await
+    }
+
+    /// The column a located dataset describes, each data file's length checked and its tag
+    /// recorded.
+    async fn from_dataset<S: BlobStore>(
+        store: &S,
+        found: crate::lance::Dataset,
+    ) -> Result<Self, ExternalError> {
         let mut objects = Vec::with_capacity(found.objects.len());
         for (key, len) in &found.objects {
             let tag = store.get_tag(key).await?;

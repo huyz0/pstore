@@ -706,8 +706,13 @@ async fn an_index_over_a_column_with_nulls_finds_the_exact_neighbours() {
 /// A Lance fixture dataset in a store, and its newest manifest (V2 naming counts down, so the
 /// smallest name is the newest).
 async fn lance_dataset(name: &str) -> (MemoryStore, Key) {
+    lance_dataset_in("lance", name).await
+}
+
+/// As [`lance_dataset`], from the fixture directory `dir`.
+async fn lance_dataset_in(dir: &str, name: &str) -> (MemoryStore, Key) {
     let root = format!(
-        "{}/../pstore-format/tests/data/lance/{name}",
+        "{}/../pstore-format/tests/data/{dir}/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
     let store = MemoryStore::new();
@@ -1411,4 +1416,52 @@ async fn a_filter_on_a_string_column_equals_the_exact_filtered_cosine() {
             .unwrap();
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), want);
     }
+}
+
+/// M101: a filter on a Lance dataset's own scalar column, across its data files and deletions.
+#[tokio::test]
+async fn a_filter_on_a_lance_column_equals_the_exact_filtered_cosine() {
+    let (store, manifest) = lance_dataset_in("lance-scalars", "many").await;
+    let all = lance_vectors();
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 100)
+        .await
+        .unwrap();
+    let attr = ExternalAttribute::pin_lance(&store, &manifest, "int64")
+        .await
+        .unwrap();
+    // `int64` is (r - 1500) << 40, so this keeps rows 900 and on; 1000 to 1009 are deleted.
+    let keep = |v: Option<&AttrValue>| matches!(v, Some(AttrValue::Int(x)) if *x >= -600 << 40);
+    let kept = |i: usize| i >= 900 && !(1000..1010).contains(&i);
+    for qi in [0usize, 1005, 2000] {
+        let q = &all[qi];
+        let mut exact: Vec<(usize, f64)> = (0..2600)
+            .filter(|i| kept(*i))
+            .map(|i| (i, cosine(q, &all[i])))
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+        let got = index
+            .search_attr(&store, q, 10, 2600, &attr, &keep)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|g| g.0).collect::<Vec<_>>(),
+            want,
+            "query {qi}"
+        );
+    }
+    // An attribute whose second data file is another object is refused before a vector moves.
+    let mut moved = attr.clone();
+    let AttrSource::Fixed(column) = &mut moved.source else {
+        unreachable!()
+    };
+    column.more[0].key.push('x');
+    let err = index
+        .search_attr(&store, &all[0], 10, 2600, &moved, &keep)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("another object"), "{err}");
 }

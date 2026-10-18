@@ -15,13 +15,20 @@
 //! pages) and each way a page table can lie.
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
-use pstore_format::external::{ExternalColumn, ExternalError};
+use pstore_format::external::{
+    AttrKind, AttrValue, ExternalAttribute, ExternalColumn, ExternalError,
+};
 use pstore_format::lance::{LanceError, locate};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/lance/");
 
 /// Every file of the dataset directory `name`, stored under `lake/<name>/...`.
 async fn dataset(name: &str) -> (MemoryStore, Key) {
+    dataset_in(DIR, name).await
+}
+
+/// As [`dataset`], from the directory `dir`.
+async fn dataset_in(dir: &str, name: &str) -> (MemoryStore, Key) {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
@@ -32,7 +39,7 @@ async fn dataset(name: &str) -> (MemoryStore, Key) {
             }
         }
     }
-    let root = std::path::PathBuf::from(format!("{DIR}{name}"));
+    let root = std::path::PathBuf::from(format!("{dir}{name}"));
     let mut files = Vec::new();
     walk(&root, &mut files);
     let store = MemoryStore::new();
@@ -860,4 +867,104 @@ async fn a_hint_that_lies_is_refused_never_guessed_around() {
             .await
             .is_err()
     );
+}
+
+// ---- M101: scalar attribute columns ---------------------------------------------------------
+
+const SCALARS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/lance-scalars/");
+
+/// What `generate_lance_scalars.py` writes in column `col` at row `r`.
+fn scalar(col: &str, r: i64) -> AttrValue {
+    const DAY: i64 = 86_400_000_000;
+    match col {
+        "i32" => AttrValue::Int(r * 3 - 1500),
+        "int64" => AttrValue::Int((r - 1500) << 40),
+        "f32" => AttrValue::Float(f64::from(r as f32 / 4.0)),
+        "f64" => AttrValue::Float(r as f64 / 8.0 - 100.0),
+        "u64" => AttrValue::UInt((1u64 << 63) + r as u64),
+        "date" => AttrValue::DateTime((r - 1500) * DAY),
+        "ts_ms" => AttrValue::DateTime((r * 1000 - 7) * 1000),
+        "ts_us" => AttrValue::DateTime(r - 5),
+        "ts_ns" => AttrValue::DateTime((r * 1001 - 2000).div_euclid(1000)),
+        _ => unreachable!("{col}"),
+    }
+}
+
+async fn read_scalar(name: &str, col: &str) -> (AttrKind, Vec<Option<AttrValue>>) {
+    let (store, manifest) = dataset_in(SCALARS, name).await;
+    let attr = ExternalAttribute::pin_lance(&store, &manifest, col)
+        .await
+        .unwrap_or_else(|e| panic!("{name}/{col}: {e}"));
+    assert_eq!(attr.rows(), 2600, "{name}/{col}");
+    (attr.kind, attr.read_all(&store).await.unwrap())
+}
+
+#[tokio::test]
+async fn lance_scalar_columns_read_back_in_every_layout() {
+    let kinds = [
+        ("i32", AttrKind::Int32),
+        ("int64", AttrKind::Int64),
+        ("f32", AttrKind::Float),
+        ("f64", AttrKind::Double),
+        ("u64", AttrKind::UInt64),
+        ("date", AttrKind::Date),
+        ("ts_ms", AttrKind::TimestampMillis),
+        ("ts_us", AttrKind::TimestampMicros),
+        ("ts_ns", AttrKind::TimestampNanos),
+    ];
+    let deleted = 1000..1010;
+    for name in ["one", "many", "v21"] {
+        for (col, kind) in kinds {
+            // pylance 13 bit-packs these in 2.1: criterion 2 refuses them.
+            if name == "v21" && !matches!(col, "int64" | "f32" | "f64" | "u64") {
+                continue;
+            }
+            let (got_kind, got) = read_scalar(name, col).await;
+            assert_eq!(got_kind, kind, "{name}/{col}");
+            for (r, v) in got.iter().enumerate() {
+                let want = (name != "many" || !deleted.contains(&r)).then(|| scalar(col, r as i64));
+                assert_eq!(v.as_ref(), want.as_ref(), "{name}/{col} row {r}");
+            }
+        }
+    }
+    // The pin also follows the dataset's hint (M89).
+    let (store, _) = dataset_in(SCALARS, "one").await;
+    let attr = ExternalAttribute::pin_lance_latest(&store, "lake/one", "f64")
+        .await
+        .unwrap();
+    assert_eq!(
+        attr.read_all(&store).await.unwrap()[3],
+        Some(scalar("f64", 3))
+    );
+}
+
+#[tokio::test]
+async fn a_lance_column_not_read_as_an_attribute_is_refused_by_name() {
+    for (name, col, why) in [
+        ("one", "b", "\"bool\""),
+        ("one", "s", "\"string\""),
+        ("one", "i16", "\"int16\""),
+        ("one", "ts_s", "\"timestamp:s:-\""),
+        ("one", "emb", "\"fixed_size_list:float:8\""),
+        ("one", "nope", "no top-level column"),
+        ("one", "i32n", "nulls"),
+        ("v21", "i32n", "nulls"),
+        ("v21", "i32", "bit-packed"),
+        ("v21", "ts_ms", "bit-packed"),
+    ] {
+        let (store, manifest) = dataset_in(SCALARS, name).await;
+        let err = ExternalAttribute::pin_lance(&store, &manifest, col)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(why),
+            "{name}/{col}: wanted {why:?}, got {err}"
+        );
+    }
+    // The vector reader reads the same datasets' vectors, as before.
+    for name in ["one", "many", "v21"] {
+        let (store, manifest) = dataset_in(SCALARS, name).await;
+        let col = ExternalColumn::pin_lance(&store, &manifest, "emb").await;
+        assert!(col.is_ok(), "{name}: {col:?}");
+    }
 }
