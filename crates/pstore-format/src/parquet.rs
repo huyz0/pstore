@@ -179,34 +179,138 @@ struct Leaf {
     children: i64,
     /// The legacy converted type, if the writer set one (M95).
     converted: Option<i64>,
-    /// The logical type, if set: `Some(true)` for a signed integer (which a physical value is),
-    /// `Some(false)` for any other (unsigned, decimal, date, time, timestamp, string ...).
-    logical: Option<bool>,
+    /// The logical type, if set (M99).
+    logical: Option<Logical>,
 }
 
-/// A `LogicalType` union: whether it is a signed `INTEGER` and nothing else.
-fn logical_is_signed_int(t: &mut Thrift<'_>) -> Option<bool> {
-    let mut signed = false;
+/// A `TIMESTAMP`'s unit (M99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeUnit {
+    Millis,
+    Micros,
+    Nanos,
+}
+
+/// The members of a `LogicalType` union an attribute can be read as (M99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Logical {
+    Integer { signed: bool },
+    Date,
+    Timestamp(TimeUnit),
+    Other,
+}
+
+/// A `LogicalType` union (M99): `INTEGER` (field 10), `DATE` (6) and `TIMESTAMP` (8) by what
+/// they hold; every other member is [`Logical::Other`].
+fn logical_type(t: &mut Thrift<'_>) -> Option<Logical> {
+    let mut found = Logical::Other;
     let mut last = 0;
     while let Some((id, ty)) = t.field(last)? {
         last = id;
-        if id == 10 && ty == 12 {
-            let (mut inner, mut is_signed) = (0, false);
-            while let Some((iid, ity)) = t.field(inner)? {
-                inner = iid;
-                match (iid, ity) {
-                    (2, 1) => is_signed = true,
-                    (2, 2) => is_signed = false,
-                    _ => t.skip(ity)?,
-                }
+        found = match (id, ty) {
+            (10, 12) => integer(t)?,
+            (6, 12) => {
+                t.skip_struct()?;
+                Logical::Date
             }
-            signed = is_signed;
-        } else {
-            t.skip(ty)?;
-            signed = false;
+            (8, 12) => timestamp(t)?,
+            _ => {
+                t.skip(ty)?;
+                Logical::Other
+            }
+        };
+    }
+    Some(found)
+}
+
+/// An `IntType`: `bitWidth` (1, unread: the physical type is what is read) and `isSigned` (2).
+/// Without `isSigned`, which is required, the sign is unknown and it is no integer.
+fn integer(t: &mut Thrift<'_>) -> Option<Logical> {
+    let (mut last, mut signed) = (0, None);
+    while let Some((id, ty)) = t.field(last)? {
+        last = id;
+        match (id, ty) {
+            (2, 1) => signed = Some(true),
+            (2, 2) => signed = Some(false),
+            _ => t.skip(ty)?,
         }
     }
-    Some(signed)
+    Some(signed.map_or(Logical::Other, |signed| Logical::Integer { signed }))
+}
+
+/// A `TimestampType`: `isAdjustedToUTC` (1, ignored) and `unit` (2), a `TimeUnit` union of
+/// `MILLIS` (1), `MICROS` (2) and `NANOS` (3). Without a unit it is no instant.
+fn timestamp(t: &mut Thrift<'_>) -> Option<Logical> {
+    let (mut last, mut unit) = (0, None);
+    while let Some((id, ty)) = t.field(last)? {
+        last = id;
+        if (id, ty) == (2, 12) {
+            let mut inner = 0;
+            unit = None;
+            while let Some((uid, uty)) = t.field(inner)? {
+                inner = uid;
+                unit = match (uid, uty) {
+                    (1, 12) => Some(TimeUnit::Millis),
+                    (2, 12) => Some(TimeUnit::Micros),
+                    (3, 12) => Some(TimeUnit::Nanos),
+                    _ => None,
+                };
+                t.skip(uty)?;
+            }
+        } else {
+            t.skip(ty)?;
+        }
+    }
+    Some(unit.map_or(Logical::Other, Logical::Timestamp))
+}
+
+/// The logical type a legacy converted type stands for, when no logical type is set.
+fn from_converted(c: i64) -> Logical {
+    match c {
+        CONVERTED_INT_8..=CONVERTED_INT_64 => Logical::Integer { signed: true },
+        CONVERTED_UINT_8..=CONVERTED_UINT_64 => Logical::Integer { signed: false },
+        CONVERTED_DATE => Logical::Date,
+        CONVERTED_TIMESTAMP_MILLIS => Logical::Timestamp(TimeUnit::Millis),
+        CONVERTED_TIMESTAMP_MICROS => Logical::Timestamp(TimeUnit::Micros),
+        _ => Logical::Other,
+    }
+}
+
+/// What a scalar attribute column is (M99): its physical type read as its logical type when one
+/// is set, else as its converted type. A physical value that is not the value (a decimal, a time
+/// of day, an interval ...), or a logical type on a physical type it cannot sit on, is refused.
+fn scalar_kind(
+    ty: Option<i64>,
+    converted: Option<i64>,
+    logical: Option<Logical>,
+) -> Result<AttrKind, String> {
+    use AttrKind as K;
+    let Some(physical @ (TYPE_INT32 | TYPE_INT64 | TYPE_FLOAT | TYPE_DOUBLE)) = ty else {
+        return Err(format!(
+            "the column is {}, not INT32, INT64, FLOAT or DOUBLE",
+            type_name(ty)
+        ));
+    };
+    let logical = logical.or_else(|| converted.map(from_converted));
+    let int = |signed| Some(Logical::Integer { signed });
+    match (physical, logical) {
+        (TYPE_INT32, None) => Ok(K::Int32),
+        (TYPE_INT32, l) if l == int(true) => Ok(K::Int32),
+        (TYPE_INT32, l) if l == int(false) => Ok(K::UInt32),
+        (TYPE_INT32, Some(Logical::Date)) => Ok(K::Date),
+        (TYPE_INT64, None) => Ok(K::Int64),
+        (TYPE_INT64, l) if l == int(true) => Ok(K::Int64),
+        (TYPE_INT64, l) if l == int(false) => Ok(K::UInt64),
+        (TYPE_INT64, Some(Logical::Timestamp(TimeUnit::Millis))) => Ok(K::TimestampMillis),
+        (TYPE_INT64, Some(Logical::Timestamp(TimeUnit::Micros))) => Ok(K::TimestampMicros),
+        (TYPE_INT64, Some(Logical::Timestamp(TimeUnit::Nanos))) => Ok(K::TimestampNanos),
+        (TYPE_FLOAT, None) => Ok(K::Float),
+        (TYPE_DOUBLE, None) => Ok(K::Double),
+        _ => Err(format!(
+            "the column has a logical type its {} value does not carry: only integers, dates and timestamps are read",
+            type_name(ty)
+        )),
+    }
 }
 
 fn schema_element(t: &mut Thrift<'_>) -> Option<Leaf> {
@@ -221,7 +325,7 @@ fn schema_element(t: &mut Thrift<'_>) -> Option<Leaf> {
             (4, 8) => e.name = t.binary()?.to_vec(),
             (5, 5) => e.children = t.zigzag()?,
             (6, 5) => e.converted = Some(t.zigzag()?),
-            (10, 12) => e.logical = Some(logical_is_signed_int(t)?),
+            (10, 12) => e.logical = Some(logical_type(t)?),
             _ => t.skip(ty)?,
         }
     }
@@ -479,6 +583,11 @@ fn page_header(b: &[u8]) -> Option<PageHeader> {
     })
 }
 
+const CONVERTED_DATE: i64 = 6;
+const CONVERTED_TIMESTAMP_MILLIS: i64 = 9;
+const CONVERTED_TIMESTAMP_MICROS: i64 = 10;
+const CONVERTED_UINT_8: i64 = 11;
+const CONVERTED_UINT_64: i64 = 14;
 const CONVERTED_INT_8: i64 = 15;
 const CONVERTED_INT_64: i64 = 18;
 const TYPE_INT32: i64 = 1;
@@ -487,10 +596,14 @@ const TYPE_FLOAT: i64 = 4;
 const TYPE_DOUBLE: i64 = 5;
 const TYPE_FLBA: i64 = 7;
 
-/// The name of a physical type a scalar attribute cannot be, for a refusal.
+/// The name of a physical type, for a refusal.
 fn type_name(ty: Option<i64>) -> &'static str {
     match ty {
         Some(0) => "BOOLEAN",
+        Some(TYPE_INT32) => "INT32",
+        Some(TYPE_INT64) => "INT64",
+        Some(TYPE_FLOAT) => "FLOAT",
+        Some(TYPE_DOUBLE) => "DOUBLE",
         Some(3) => "INT96",
         Some(6) => "BYTE_ARRAY",
         Some(7) => "FIXED_LEN_BYTE_ARRAY",
@@ -705,35 +818,15 @@ async fn locate_flat<S: BlobStore>(
     // M95: a scalar is read as a vector of `width / 4` lanes; `ty` is the type every chunk must
     // agree on.
     let (ty, kind) = if scalar {
-        match leaf.ty {
-            Some(TYPE_INT32) => (TYPE_INT32, Some(AttrKind::Int32)),
-            Some(TYPE_INT64) => (TYPE_INT64, Some(AttrKind::Int64)),
-            Some(TYPE_FLOAT) => (TYPE_FLOAT, Some(AttrKind::Float)),
-            Some(TYPE_DOUBLE) => (TYPE_DOUBLE, Some(AttrKind::Double)),
-            other => {
-                return unsupported(format!(
-                    "the column is {}, not INT32, INT64, FLOAT or DOUBLE",
-                    type_name(other)
-                ));
-            }
-        }
+        let kind = scalar_kind(leaf.ty, leaf.converted, leaf.logical)
+            .map_err(ParquetError::Unsupported)?;
+        (leaf.ty.ok_or(bad("schema"))?, Some(kind))
     } else {
         if leaf.ty != Some(TYPE_FLBA) {
             return unsupported("the column is not FIXED_LEN_BYTE_ARRAY");
         }
         (TYPE_FLBA, None)
     };
-    // A physical value is the value only when no logical type reinterprets it: unsigned, decimal,
-    // date, time and timestamp columns are refused, never read as signed numbers.
-    let signed_plain = leaf
-        .converted
-        .is_none_or(|c| (CONVERTED_INT_8..=CONVERTED_INT_64).contains(&c))
-        && leaf.logical != Some(false);
-    if scalar && !signed_plain {
-        return unsupported(
-            "the column has a logical type (unsigned, decimal, date, time or timestamp) its physical value does not carry",
-        );
-    }
 
     // M84: an OPTIONAL flat column carries a definition level a value; it is read in place only
     // when every level of every page is "present" (checked page by page below).
@@ -742,8 +835,7 @@ async fn locate_flat<S: BlobStore>(
     }
     let optional = leaf.repetition == Some(OPTIONAL);
     let width = match kind {
-        Some(AttrKind::Int32 | AttrKind::Float) => 4,
-        Some(AttrKind::Int64 | AttrKind::Double) => 8,
+        Some(kind) => kind.width() as i64,
         None => leaf
             .type_length
             .filter(|w| *w > 0 && w % 4 == 0)
@@ -1173,13 +1265,123 @@ mod tests {
     }
 
     #[test]
-    fn a_logical_type_is_signed_only_as_an_integer_with_is_signed() {
-        let signed = |b: &[u8]| logical_is_signed_int(&mut Thrift::new(b));
+    fn a_logical_type_union_decodes_each_member() {
+        let decode = |b: &[u8]| logical_type(&mut Thrift::new(b));
+        let ts = |u| Some(Logical::Timestamp(u));
         // INTEGER (union field 10): bitWidth 8, isSigned true / false.
-        assert_eq!(signed(&[0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]), Some(true));
-        assert_eq!(signed(&[0xAC, 0x13, 0x08, 0x12, 0x00, 0x00]), Some(false));
+        let int = |signed| Some(Logical::Integer { signed });
+        assert_eq!(decode(&[0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]), int(true));
+        assert_eq!(decode(&[0xAC, 0x13, 0x08, 0x12, 0x00, 0x00]), int(false));
         // Another member (field 5, a struct) that happens to hold a true bool 2 is not an integer.
-        assert_eq!(signed(&[0x5C, 0x21, 0x00, 0x00]), Some(false));
+        assert_eq!(decode(&[0x5C, 0x21, 0x00, 0x00]), Some(Logical::Other));
+        // An INTEGER without its required isSigned says nothing of its sign: no integer.
+        assert_eq!(
+            decode(&[0xAC, 0x13, 0x08, 0x00, 0x00]),
+            Some(Logical::Other)
+        );
+        // DATE (field 6): an empty struct.
+        assert_eq!(decode(&[0x6C, 0x00, 0x00]), Some(Logical::Date));
+        // TIMESTAMP (field 8): isAdjustedToUTC (1, a bool), then unit (2, a TimeUnit union).
+        for (member, unit) in [
+            (0x1C, TimeUnit::Millis),
+            (0x2C, TimeUnit::Micros),
+            (0x3C, TimeUnit::Nanos),
+        ] {
+            let b = [0x8C, 0x11, 0x1C, member, 0x00, 0x00, 0x00, 0x00];
+            assert_eq!(decode(&b), ts(unit), "{unit:?}");
+            // The unit first, and the UTC flag (false) after it by its long form.
+            let b = [0x8C, 0x2C, member, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00];
+            assert_eq!(decode(&b), ts(unit), "{unit:?} reordered");
+        }
+        // A TIMESTAMP without a unit, or with one no writer defines, is no instant.
+        assert_eq!(decode(&[0x8C, 0x11, 0x00, 0x00]), Some(Logical::Other));
+        let b = [0x8C, 0x1C, 0x4C, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(decode(&b), Some(Logical::Other));
+        // A damaged union is no type at all.
+        assert_eq!(decode(&[0x8C, 0x1C]), None);
+        assert_eq!(decode(&[0xAC, 0x13]), None);
+    }
+
+    #[test]
+    fn scalar_kind_is_the_table() {
+        use AttrKind as K;
+        let signed = Some(Logical::Integer { signed: true });
+        let unsigned = Some(Logical::Integer { signed: false });
+        let ts = |u| Some(Logical::Timestamp(u));
+        let date = Some(Logical::Date);
+        // (physical, converted, logical) -> kind.
+        let read = [
+            (TYPE_INT32, None, None, K::Int32),
+            (TYPE_INT32, None, signed, K::Int32),
+            (TYPE_INT64, None, None, K::Int64),
+            (TYPE_INT64, None, signed, K::Int64),
+            (TYPE_FLOAT, None, None, K::Float),
+            (TYPE_DOUBLE, None, None, K::Double),
+            (TYPE_INT32, None, unsigned, K::UInt32),
+            (TYPE_INT64, None, unsigned, K::UInt64),
+            (TYPE_INT32, None, date, K::Date),
+            (TYPE_INT64, None, ts(TimeUnit::Millis), K::TimestampMillis),
+            (TYPE_INT64, None, ts(TimeUnit::Micros), K::TimestampMicros),
+            (TYPE_INT64, None, ts(TimeUnit::Nanos), K::TimestampNanos),
+            // By the converted type alone: INT_8..INT_64, UINT_8..UINT_64, DATE, TIMESTAMP_*.
+            (TYPE_INT32, Some(15), None, K::Int32),
+            (TYPE_INT32, Some(16), None, K::Int32),
+            (TYPE_INT32, Some(17), None, K::Int32),
+            (TYPE_INT64, Some(18), None, K::Int64),
+            (TYPE_INT32, Some(11), None, K::UInt32),
+            (TYPE_INT32, Some(12), None, K::UInt32),
+            (TYPE_INT32, Some(13), None, K::UInt32),
+            (TYPE_INT64, Some(14), None, K::UInt64),
+            // An unsigned integer on INT64 is a u64, whatever width the writer claimed.
+            (TYPE_INT64, Some(13), None, K::UInt64),
+            (TYPE_INT32, Some(6), None, K::Date),
+            (TYPE_INT64, Some(9), None, K::TimestampMillis),
+            (TYPE_INT64, Some(10), None, K::TimestampMicros),
+            // The logical type wins over a converted one that contradicts it.
+            (TYPE_INT32, Some(11), signed, K::Int32),
+            (TYPE_INT64, Some(9), ts(TimeUnit::Nanos), K::TimestampNanos),
+            (TYPE_INT64, Some(5), unsigned, K::UInt64),
+        ];
+        for (ty, converted, logical, kind) in read {
+            assert_eq!(
+                scalar_kind(Some(ty), converted, logical),
+                Ok(kind),
+                "{ty} {converted:?} {logical:?}"
+            );
+        }
+        // A logical type on a physical type it cannot sit on, or one that reinterprets the
+        // value beyond a number or an instant, is refused naming the physical type.
+        let refused = [
+            (TYPE_INT64, None, date, "INT64"),
+            (TYPE_INT32, None, ts(TimeUnit::Micros), "INT32"),
+            (TYPE_FLOAT, None, unsigned, "FLOAT"),
+            (TYPE_DOUBLE, None, signed, "DOUBLE"),
+            (TYPE_INT32, Some(7), None, "INT32"), // TIME_MILLIS
+            (TYPE_INT64, Some(8), None, "INT64"), // TIME_MICROS
+            (TYPE_INT32, Some(5), None, "INT32"), // DECIMAL
+            (TYPE_INT64, Some(6), None, "INT64"), // DATE on INT64
+            (TYPE_INT32, Some(9), None, "INT32"), // TIMESTAMP_MILLIS on INT32
+            (TYPE_INT64, None, Some(Logical::Other), "INT64"),
+            (TYPE_INT32, Some(15), Some(Logical::Other), "INT32"),
+            (TYPE_FLOAT, Some(15), None, "FLOAT"),
+        ];
+        for (ty, converted, logical, name) in refused {
+            let err = scalar_kind(Some(ty), converted, logical).unwrap_err();
+            assert!(err.contains("logical type"), "{err}");
+            assert!(err.contains(name), "{err}");
+        }
+        // A physical type no attribute is, by name.
+        for (ty, name) in [
+            (Some(0), "BOOLEAN"),
+            (Some(3), "INT96"),
+            (Some(6), "BYTE_ARRAY"),
+            (Some(7), "FIXED_LEN_BYTE_ARRAY"),
+            (None, "unknown"),
+        ] {
+            let err = scalar_kind(ty, None, None).unwrap_err();
+            assert!(err.contains(name), "{err}");
+            assert!(err.contains("not INT32, INT64, FLOAT or DOUBLE"), "{err}");
+        }
     }
 
     #[test]

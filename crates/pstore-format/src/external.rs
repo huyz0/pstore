@@ -230,6 +230,18 @@ pub enum AttrKind {
     Float,
     /// Parquet `DOUBLE`.
     Double,
+    /// An unsigned integer of up to 32 bits on `INT32` (M99).
+    UInt32,
+    /// An unsigned 64-bit integer on `INT64`.
+    UInt64,
+    /// A `DATE` on `INT32`: days since the epoch.
+    Date,
+    /// A `TIMESTAMP` in milliseconds on `INT64`.
+    TimestampMillis,
+    /// A `TIMESTAMP` in microseconds on `INT64`.
+    TimestampMicros,
+    /// A `TIMESTAMP` in nanoseconds on `INT64`.
+    TimestampNanos,
 }
 
 /// One value of a scalar attribute column.
@@ -239,16 +251,25 @@ pub enum AttrValue {
     Int(i64),
     /// A `FLOAT` (widened exactly) or `DOUBLE`.
     Float(f64),
+    /// An unsigned 64-bit integer (M99).
+    UInt(u64),
+    /// A date or timestamp, in microseconds since the Unix epoch: the unit
+    /// [`crate::Value::DateTime`] has. A timestamp the writer did not adjust to UTC is read as if
+    /// it were, the value it stored; a nanosecond is rounded toward negative infinity.
+    DateTime(i64),
 }
 
 impl AttrValue {
-    /// The value as a number to compare, an `i64` rounded to the nearest `f64` above 2^53.
+    /// The value as a number to compare, an integer rounded to the nearest `f64` above 2^53 (a
+    /// date or timestamp is its microseconds).
     #[must_use]
     #[allow(clippy::cast_precision_loss, reason = "a comparison, named in the doc")]
     pub fn as_f64(&self) -> f64 {
         match *self {
             Self::Int(v) => v as f64,
             Self::Float(v) => v,
+            Self::UInt(v) => v as f64,
+            Self::DateTime(v) => v as f64,
         }
     }
 }
@@ -268,12 +289,18 @@ impl AttrKind {
     #[must_use]
     pub fn width(self) -> usize {
         match self {
-            Self::Int32 | Self::Float => 4,
-            Self::Int64 | Self::Double => 8,
+            Self::Int32 | Self::Float | Self::UInt32 | Self::Date => 4,
+            Self::Int64
+            | Self::Double
+            | Self::UInt64
+            | Self::TimestampMillis
+            | Self::TimestampMicros
+            | Self::TimestampNanos => 8,
         }
     }
 
-    /// The value `raw` (little-endian, exactly [`Self::width`] bytes) holds, if it is that long.
+    /// The value `raw` (little-endian, exactly [`Self::width`] bytes) holds, if it is that long,
+    /// and, for a date or a millisecond timestamp, if it is an instant `i64` microseconds hold.
     #[must_use]
     pub fn decode(self, raw: &[u8]) -> Option<AttrValue> {
         Some(match self {
@@ -281,9 +308,24 @@ impl AttrKind {
             Self::Int64 => AttrValue::Int(i64::from_le_bytes(raw.try_into().ok()?)),
             Self::Float => AttrValue::Float(f64::from(f32::from_le_bytes(raw.try_into().ok()?))),
             Self::Double => AttrValue::Float(f64::from_le_bytes(raw.try_into().ok()?)),
+            Self::UInt32 => AttrValue::Int(i64::from(u32::from_le_bytes(raw.try_into().ok()?))),
+            Self::UInt64 => AttrValue::UInt(u64::from_le_bytes(raw.try_into().ok()?)),
+            Self::Date => AttrValue::DateTime(
+                i64::from(i32::from_le_bytes(raw.try_into().ok()?)).checked_mul(DAY_US)?,
+            ),
+            Self::TimestampMillis => {
+                AttrValue::DateTime(i64::from_le_bytes(raw.try_into().ok()?).checked_mul(1000)?)
+            }
+            Self::TimestampMicros => AttrValue::DateTime(i64::from_le_bytes(raw.try_into().ok()?)),
+            Self::TimestampNanos => {
+                AttrValue::DateTime(i64::from_le_bytes(raw.try_into().ok()?).div_euclid(1000))
+            }
         })
     }
 }
+
+/// Microseconds in a day.
+const DAY_US: i64 = 86_400_000_000;
 
 /// The most rows [`ExternalAttribute::read_all`] reads: it holds the whole column and a mask of
 /// it in memory, so a column claiming more (a damaged page can claim any count) is refused.

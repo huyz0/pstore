@@ -43,3 +43,20 @@ emb = pa.array([row.tobytes() for row in vecs], type=pa.binary(D * 4))
 grp = pa.array([None if nulls[i] else int(i % 5) for i in range(N)], type=pa.int32())
 pq.write_table(pa.table({'embedding': emb, 'grp': grp, 'score': pa.array(r / 10.0)}), out + 'vectors-attrs.parquet',
                compression='NONE', use_dictionary=False, write_statistics=False, row_group_size=N, data_page_size=512, data_page_version='1.0')
+# M99: unsigned, date and timestamp columns beyond scalars.parquet's
+def masked_ty(vals, ty):
+    return pa.array([None if nulls[i] else vals[i] for i in range(N)], type=ty)
+typed = {
+    'u8': pa.array((r % 256).astype('uint8')),
+    'u16': pa.array((60000 + r).astype('uint16')),
+    'ts_us': pa.array((r * 1_000_003 - 50_000_000).astype('int64'), type=pa.timestamp('us', tz='UTC')),
+    'ts_ns_neg': pa.array((r * 7 - 1000).astype('int64'), type=pa.timestamp('ns')),
+    'daten': masked_ty([int(i) - 150 for i in r], pa.date32()),
+    'u64n': masked_ty([2**63 + int(i) for i in r], pa.uint64()),
+    'time': pa.array((r * 1000).astype('int32'), type=pa.time32('ms')),
+}
+pq.write_table(pa.table(typed), out + 'scalars-typed.parquet', compression='NONE', **{k: v for k, v in kw.items() if k != 'store_decimal_as_integer'})
+# a vector column beside a millisecond timestamp
+pq.write_table(pa.table({'embedding': emb, 'ts': pa.array((r * 1_000_000).astype('int64'), type=pa.timestamp('ms'))}),
+               out + 'vectors-ts.parquet', compression='NONE', use_dictionary=False, write_statistics=False,
+               row_group_size=N, data_page_size=512, data_page_version='1.0')

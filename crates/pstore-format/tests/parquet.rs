@@ -1775,7 +1775,7 @@ async fn a_scalar_column_is_read_in_every_encoding() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| {
             n.ends_with(".parquet")
-                && !["list", "scalars", "int96", "vectors-attrs"]
+                && !["list", "scalars", "int96", "vectors-attrs", "vectors-ts"]
                     .iter()
                     .any(|p| n.starts_with(p))
         })
@@ -1839,6 +1839,168 @@ fn a_scalar_column_of_each_kind_decodes() {
     // A value compares as the number it is.
     assert_eq!(AttrValue::Int(3).as_f64().to_bits(), 3.0f64.to_bits());
     assert_eq!(AttrValue::Float(2.5).as_f64().to_bits(), 2.5f64.to_bits());
+    assert_eq!(
+        AttrValue::UInt(1 << 63).as_f64().to_bits(),
+        2f64.powi(63).to_bits()
+    );
+    assert_eq!(
+        AttrValue::DateTime(-7).as_f64().to_bits(),
+        (-7.0f64).to_bits()
+    );
+}
+
+#[test]
+fn an_unsigned_or_temporal_kind_decodes() {
+    // M99: the width is the physical type's.
+    for (kind, width) in [
+        (AttrKind::UInt32, 4),
+        (AttrKind::Date, 4),
+        (AttrKind::UInt64, 8),
+        (AttrKind::TimestampMillis, 8),
+        (AttrKind::TimestampMicros, 8),
+        (AttrKind::TimestampNanos, 8),
+    ] {
+        assert_eq!(kind.width(), width, "{kind:?}");
+        assert_eq!(kind.decode(&[0; 6]), None, "{kind:?}");
+    }
+    // A u32 above i32::MAX is never sign-extended; a u64 above i64::MAX is a `UInt`.
+    let big = 3_000_000_000u32;
+    assert_eq!(
+        AttrKind::UInt32.decode(&big.to_le_bytes()),
+        Some(AttrValue::Int(3_000_000_000))
+    );
+    for v in [0u64, 1 << 63, u64::MAX] {
+        assert_eq!(
+            AttrKind::UInt64.decode(&v.to_le_bytes()),
+            Some(AttrValue::UInt(v))
+        );
+    }
+    // Every temporal kind is microseconds since the epoch.
+    let us = |kind: AttrKind, raw: &[u8]| kind.decode(raw);
+    assert_eq!(
+        us(AttrKind::Date, &(-2i32).to_le_bytes()),
+        Some(AttrValue::DateTime(-172_800_000_000))
+    );
+    assert_eq!(
+        us(AttrKind::TimestampMillis, &(-3i64).to_le_bytes()),
+        Some(AttrValue::DateTime(-3_000))
+    );
+    assert_eq!(
+        us(AttrKind::TimestampMicros, &i64::MIN.to_le_bytes()),
+        Some(AttrValue::DateTime(i64::MIN))
+    );
+    // Nanoseconds round toward negative infinity: -1 ns is in the microsecond before the epoch.
+    for (ns, want) in [(-1i64, -1), (-1000, -1), (-1001, -2), (999, 0), (1000, 1)] {
+        assert_eq!(
+            us(AttrKind::TimestampNanos, &ns.to_le_bytes()),
+            Some(AttrValue::DateTime(want)),
+            "{ns}"
+        );
+    }
+    // A product past i64 is no value, never a wrapped one.
+    assert_eq!(us(AttrKind::Date, &i32::MAX.to_le_bytes()), None);
+    assert_eq!(us(AttrKind::Date, &i32::MIN.to_le_bytes()), None);
+    let edge = i64::MAX / 1000;
+    assert_eq!(
+        us(AttrKind::TimestampMillis, &edge.to_le_bytes()),
+        Some(AttrValue::DateTime(edge * 1000))
+    );
+    assert_eq!(
+        us(AttrKind::TimestampMillis, &(edge + 1).to_le_bytes()),
+        None
+    );
+    assert_eq!(us(AttrKind::TimestampMillis, &i64::MIN.to_le_bytes()), None);
+}
+
+const DAY_US: i64 = 86_400_000_000;
+
+#[tokio::test]
+async fn unsigned_and_temporal_columns_read_back_exactly() {
+    let read = |file: &'static str, name: &'static str| async move {
+        let (store, key) = put(file).await;
+        let attr = ExternalAttribute::pin_parquet(&store, &key, name)
+            .await
+            .expect(name);
+        (attr.kind, attr.read_all(&store).await.unwrap())
+    };
+    let want = |f: &dyn Fn(i64) -> Option<AttrValue>| -> Vec<Option<AttrValue>> {
+        (0..300).map(f).collect()
+    };
+    let null = |r: i64| r % 7 == 3;
+    let cases: [(&str, &str, AttrKind, Vec<Option<AttrValue>>); 10] = [
+        (
+            "scalars.parquet",
+            "u32",
+            AttrKind::UInt32,
+            want(&|r| Some(AttrValue::Int(3_000_000_000 + r))),
+        ),
+        (
+            "scalars.parquet",
+            "u64",
+            AttrKind::UInt64,
+            want(&|r| Some(AttrValue::UInt((1 << 63) + r as u64))),
+        ),
+        (
+            "scalars.parquet",
+            "date",
+            AttrKind::Date,
+            want(&|r| Some(AttrValue::DateTime(r * DAY_US))),
+        ),
+        (
+            "scalars.parquet",
+            "ts_ms",
+            AttrKind::TimestampMillis,
+            want(&|r| Some(AttrValue::DateTime(r * 1000))),
+        ),
+        (
+            "scalars.parquet",
+            "ts_ns",
+            AttrKind::TimestampNanos,
+            want(&|r| Some(AttrValue::DateTime(r.div_euclid(1000)))),
+        ),
+        (
+            "scalars-typed.parquet",
+            "u8",
+            AttrKind::UInt32,
+            want(&|r| Some(AttrValue::Int(r % 256))),
+        ),
+        (
+            "scalars-typed.parquet",
+            "u16",
+            AttrKind::UInt32,
+            want(&|r| Some(AttrValue::Int(60_000 + r))),
+        ),
+        (
+            "scalars-typed.parquet",
+            "ts_us",
+            AttrKind::TimestampMicros,
+            want(&|r| Some(AttrValue::DateTime(r * 1_000_003 - 50_000_000))),
+        ),
+        (
+            "scalars-typed.parquet",
+            "ts_ns_neg",
+            AttrKind::TimestampNanos,
+            want(&|r| Some(AttrValue::DateTime((r * 7 - 1000).div_euclid(1000)))),
+        ),
+        (
+            "scalars-typed.parquet",
+            "daten",
+            AttrKind::Date,
+            want(&|r| (!null(r)).then_some(AttrValue::DateTime((r - 150) * DAY_US))),
+        ),
+    ];
+    for (file, name, kind, rows) in cases {
+        assert_eq!(read(file, name).await, (kind, rows), "{name}");
+    }
+    // Some of ts_ns_neg's values are before the epoch, and floor rather than truncate.
+    let (_, got) = read("scalars-typed.parquet", "ts_ns_neg").await;
+    assert_eq!(got[0], Some(AttrValue::DateTime(-1)));
+    let (kind, got) = read("scalars-typed.parquet", "u64n").await;
+    assert_eq!(kind, AttrKind::UInt64);
+    assert_eq!(
+        got,
+        want(&|r| (!null(r)).then_some(AttrValue::UInt((1 << 63) + r as u64)))
+    );
 }
 
 #[tokio::test]
@@ -1903,12 +2065,18 @@ async fn scalar_columns_of_each_type_read_back_with_their_nulls() {
 #[tokio::test]
 async fn a_logical_type_its_physical_value_does_not_carry_is_refused() {
     let (store, key) = put("scalars.parquet").await;
-    for name in ["u32", "u64", "date", "ts_ns", "ts_ms", "dec"] {
-        let err = ExternalAttribute::pin_parquet(&store, &key, name)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("logical type"), "{name}: {err}");
-    }
+    // M99 reads unsigned, date and timestamp columns; a decimal still needs its scale.
+    let err = ExternalAttribute::pin_parquet(&store, &key, "dec")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("logical type"), "{err}");
+    assert!(err.to_string().contains("INT32"), "{err}");
+    // A time of day is not an instant.
+    let (typed, tkey) = put("scalars-typed.parquet").await;
+    let err = ExternalAttribute::pin_parquet(&typed, &tkey, "time")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("logical type"), "{err}");
     for (name, ty) in [("flag", "BOOLEAN"), ("name", "BYTE_ARRAY")] {
         let err = ExternalAttribute::pin_parquet(&store, &key, name)
             .await

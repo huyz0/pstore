@@ -1305,3 +1305,49 @@ async fn a_column_with_nulls_is_clustered() {
         );
     }
 }
+
+// ---- M99: a timestamp attribute ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_filter_on_a_timestamp_column_equals_the_exact_filtered_cosine() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../pstore-format/tests/data/");
+    let all: Vec<Vec<f32>> = std::fs::read(format!("{dir}good.vectors.f32"))
+        .unwrap()
+        .chunks_exact(32)
+        .map(|r| {
+            r.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let key = Key::new("lake/vectors-ts.parquet");
+    let raw = std::fs::read(format!("{dir}vectors-ts.parquet")).unwrap();
+    store.put(&key, raw.into()).await.unwrap();
+    let col = ExternalColumn::pin_parquet(&store, &key, "embedding")
+        .await
+        .unwrap();
+    let index = ExternalIndex::build(&store, &codes_key(), col, 100)
+        .await
+        .unwrap();
+    let ts = ExternalAttribute::pin_parquet(&store, &key, "ts")
+        .await
+        .unwrap();
+    // `ts` is r x 10^6 ms: rows 150 to 299 are at or after 150,000,000,000 us.
+    let keep =
+        |v: Option<&AttrValue>| matches!(v, Some(AttrValue::DateTime(t)) if *t >= 150_000_000_000);
+    let q = &all[10];
+    let mut exact: Vec<(usize, f64)> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i >= 150)
+        .map(|(i, v)| (i, cosine(q, v)))
+        .collect();
+    exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let want: Vec<usize> = exact.iter().take(10).map(|e| e.0).collect();
+    let got = index
+        .search_attr(&store, q, 10, 300, &ts, &keep)
+        .await
+        .unwrap();
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), want);
+}
