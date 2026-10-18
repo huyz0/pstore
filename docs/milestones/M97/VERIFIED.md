@@ -116,15 +116,19 @@ unchanged: clustered `fast` is 0.9810 at p=8 and uniform is 0.5150.
        - `exq.rs`: 132 mutants, 128 caught, 3 unviable, and 1 missed, the excluded tie.
        - `rabitq.rs`, against the whole `pstore-index` suite: 20 mutants, 19 caught, 1
          unviable.
-     - Why the narrowing stands as the answer: every test in the narrowed set is also in
-       the workspace suite, so a mutant the narrowed set catches, the workspace catches
-       too. The narrowed sweep missed nothing outside the one exclusion. A workspace run
-       could therefore kill more mutants, but it could not add a miss.
-     - The script's own whole-workspace run was also started on M97's diff,
-       `MUTANTS_BASE=63f9779 ./scripts/mutants.sh`: 178 mutants, at about six minutes
-       each on this 4-core container. It was stopped at the session's two-hour limit
-       after 21, all in `exq.rs`: 20 caught, 1 unviable, 0 missed. It was not
-       completed, and those 21 are not a sweep of the rest.
+     - The narrowed sweeps drove the fixes above. The gate itself is answered by the
+       whole-workspace sweep below, not by the narrowing.
+     - **The script's own whole-workspace sweep of M97's diff, complete: 178 mutants, 164
+       caught, 14 unviable, 0 missed, 0 timed out.**
+       - Run as `MUTANTS_BASE=63f9779 ./scripts/mutants.sh --shard=k/12` for k = 0 to 11.
+         Each shard had to finish inside the session's two-hour limit. The first unsharded
+         attempt was stopped by that limit after 21 mutants.
+       - In 11 of the 12 shards, cargo-mutants 27.1.0 lost one mutant to an internal
+         error, `write message to log`, which stopped its second worker. The outcome was
+         then never recorded. Those 11 were re-run by exact name with `MUTANTS_JOBS=1`, in
+         the script's same diff mode: 11 caught.
+       - Each of the 178 names in the listing has exactly one recorded outcome.
+       - `.cargo/mutants.toml`'s one named exclusion is not among the 178.
      - `./scripts/recall.sh --prism` was rerun after the changes, and its output is identical
        to the block above.
    - `./scripts/gates.sh`: every gate PASS, on the tree as committed.
