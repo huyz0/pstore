@@ -95,6 +95,37 @@ JOBS=${MUTANTS_JOBS:-$(( by_mem < by_cpu ? by_mem : by_cpu ))}
 [[ "$JOBS" -gt 8 ]] && JOBS=8
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
+# ⚠️ **A sweep removes what it created, killed or not** (M103). cargo-mutants copies the whole
+# tree, build directory included, into `$TMPDIR/cargo-mutants-*.tmp` -- gigabytes a job -- and
+# a killed sweep left every copy behind. This script used to `exec` cargo-mutants, which
+# discards the EXIT trap, so its diff file leaked on every run too. On WSL2 that fills the
+# host drive for good: the virtual disk does not shrink when files are deleted.
+# So each run gets a directory of its own under the base, `TMPDIR` points into it, and the
+# cleanup removes exactly that directory. Nothing is removed by a glob: a sibling may be a
+# sweep still running, older or younger than this one, so leftovers are reported instead.
+base="${TMPDIR:-$(pick_tmpdir)}"
+for left in "$base"/pstore-mutants-run.* "$base"/cargo-mutants-*.tmp; do
+    if [[ -e "$left" ]]; then
+        echo "# ⚠️ left by another sweep, running or killed -- remove it when none is" \
+            "running: $left ($(du -sh "$left" 2>/dev/null | cut -f1))" >&2
+    fi
+done
+run=$(mktemp -d "$base/pstore-mutants-run.XXXXXX")
+child=""
+trap 'rm -rf "$run"' EXIT
+# A trap does not run while bash waits on a foreground child, so cargo-mutants runs in the
+# background and a signal is passed on to it: `kill <this script>` stops the sweep now.
+stop() {
+    if [[ -n "$child" ]]; then
+        kill -"$1" "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    exit "$2"
+}
+trap 'stop INT 130' INT
+trap 'stop TERM 143' TERM
+export TMPDIR="$run"
+
 args=()
 scope=()
 case "${1:-}" in
@@ -125,8 +156,7 @@ case "${1:-}" in
         # The merge base, so a stale main does not widen the diff to everything.
         base=$(git merge-base HEAD "${MUTANTS_BASE:-origin/main}" 2>/dev/null \
             || git merge-base HEAD main 2>/dev/null || echo HEAD~1)
-        diff=$(mktemp)
-        trap 'rm -f "$diff"' EXIT
+        diff="$run/in.diff"
         git diff "$base"...HEAD > "$diff"
         if [[ ! -s "$diff" ]]; then
             echo "no diff against $base -- nothing to mutate. Use --all for a full sweep." >&2
@@ -152,7 +182,6 @@ while IFS= read -r glob; do
 done <<< "$excludes"
 echo "# not mutated (entry points): $(printf '%s' "$excludes" | tr '\n' ' ')" >&2
 
-export TMPDIR="${TMPDIR:-$(pick_tmpdir)}"
 flags=$(linker_flags)
 [[ -n "$flags" ]] && export RUSTFLAGS="${RUSTFLAGS:-} $flags"
 
@@ -160,4 +189,9 @@ echo "# jobs=$JOBS cargo-build-jobs=$CARGO_BUILD_JOBS tmpdir=$TMPDIR linker=${fl
 # ⚠️ Headroom over the baseline, not a multiple of it. A genuinely hung mutant -- `put_varint`
 # with its loop condition flipped is one -- takes the full 300 s and is still caught; a
 # survivor finishes in the baseline's 20 s and is reported honestly as MISSED.
-exec cargo mutants -j "$JOBS" --minimum-test-timeout 300 --no-shuffle "${args[@]}" "$@"
+# Not `exec`, which would discard the cleanup trap above; and in the background, for `stop`.
+cargo mutants -j "$JOBS" --minimum-test-timeout 300 --no-shuffle "${args[@]}" "$@" &
+child=$!
+status=0
+wait "$child" || status=$?
+exit "$status"

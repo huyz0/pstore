@@ -177,6 +177,9 @@ jobs:
       # the `portable` job below is what catches what a grep cannot.
       - run: ./scripts/check-portable.sh
       - run: ./scripts/check-portable.sh --selftest
+      # M103: a mutation sweep removes its tree copies and its diff file, killed or not. Here
+      # and not in `gates.sh`, because `mutants.sh` is `portable: no`.
+      - run: ./scripts/selftest-mutants.sh
 
   # The whole local gate, on the three operating systems a contributor might run it on.
   # ⚠️ For seven milestones it ran on one: on Windows every Python gate failed (`python3` is
