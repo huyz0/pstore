@@ -61,7 +61,8 @@ pub struct Extent {
     /// Parquet's codec numbers. 0 for a raw run.
     pub codec: u8,
     /// A dictionary-encoded page's decoded body size, once decompressed (M81): its indices, not
-    /// vectors. 0 for a page of plain vectors.
+    /// vectors. 0 for a page of plain vectors. For [`CODEC_FASTLANES`] (M102), the chunk's values
+    /// before the run's first row instead.
     pub plain_len: u64,
     /// The dictionary this page's indices point into (M81), if it is dictionary-encoded. Such a
     /// page has `compressed > 0` whatever its codec: its rows are reached through the page.
@@ -107,6 +108,10 @@ pub const CODEC_ZSTD: u8 = 6;
 /// Parquet's codec number for `LZ4_RAW`: one lz4 block. (The deprecated Hadoop-framed `LZ4`, 5,
 /// is not read.)
 pub const CODEC_LZ4_RAW: u8 = 7;
+/// pstore's own number, not Parquet's, for one Lance 2.1 bit-packed mini-block chunk (M102): the
+/// run's `compressed` bytes at `offset` are the whole chunk, header included, holding 1,024
+/// values, and its `plain_len` is how many of them come before the run's first row.
+pub const CODEC_FASTLANES: u8 = 0x80;
 
 /// The `n` indices of a dictionary-encoded page body (M81): one byte of bit width, then Parquet's
 /// RLE / bit-packed hybrid. `None` unless the body holds exactly `n` of them, every one below
@@ -1115,16 +1120,25 @@ impl ExternalColumn {
                 }
                 continue;
             }
-            let expected = usize::try_from(e.rows)
-                .ok()
-                .and_then(|n| n.checked_mul(width))
-                .ok_or(ExternalError::Damaged)?;
-            let page = decompress(e.codec, &comp, expected)?;
+            let (page, skip) = if e.codec == CODEC_FASTLANES {
+                let page = crate::lance::fastlanes::unpack(&comp, width);
+                (page.ok_or(ExternalError::Damaged)?, e.plain_len)
+            } else {
+                let expected = usize::try_from(e.rows)
+                    .ok()
+                    .and_then(|n| n.checked_mul(width))
+                    .ok_or(ExternalError::Damaged)?;
+                (decompress(e.codec, &comp, expected)?, 0)
+            };
             for r in pages.get(&i).into_iter().flatten() {
-                let at = usize::try_from(*r as u64 - e.first_row)
-                    .map_err(|_| ExternalError::Damaged)?
-                    * width;
-                let raw = page.get(at..at + width).ok_or(ExternalError::Damaged)?;
+                let at = (*r as u64 - e.first_row)
+                    .checked_add(skip)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .and_then(|n| n.checked_mul(width))
+                    .ok_or(ExternalError::Damaged)?;
+                let raw = page
+                    .get(at..at.saturating_add(width))
+                    .ok_or(ExternalError::Damaged)?;
                 out.insert(*r, raw.to_vec());
             }
         }

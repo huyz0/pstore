@@ -16,7 +16,8 @@
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_format::external::{
-    AttrKind, AttrValue, ExternalAttribute, ExternalColumn, ExternalError,
+    AttrKind, AttrSource, AttrValue, CODEC_FASTLANES, ExternalAttribute, ExternalColumn,
+    ExternalError,
 };
 use pstore_format::lance::{LanceError, locate};
 
@@ -886,6 +887,7 @@ fn scalar(col: &str, r: i64) -> AttrValue {
         "ts_ms" => AttrValue::DateTime((r * 1000 - 7) * 1000),
         "ts_us" => AttrValue::DateTime(r - 5),
         "ts_ns" => AttrValue::DateTime((r * 1001 - 2000).div_euclid(1000)),
+        "small" => AttrValue::Int(r),
         _ => unreachable!("{col}"),
     }
 }
@@ -915,10 +917,6 @@ async fn lance_scalar_columns_read_back_in_every_layout() {
     let deleted = 1000..1010;
     for name in ["one", "many", "v21"] {
         for (col, kind) in kinds {
-            // pylance 13 bit-packs these in 2.1: criterion 2 refuses them.
-            if name == "v21" && !matches!(col, "int64" | "f32" | "f64" | "u64") {
-                continue;
-            }
             let (got_kind, got) = read_scalar(name, col).await;
             assert_eq!(got_kind, kind, "{name}/{col}");
             for (r, v) in got.iter().enumerate() {
@@ -949,8 +947,6 @@ async fn a_lance_column_not_read_as_an_attribute_is_refused_by_name() {
         ("one", "nope", "no top-level column"),
         ("one", "i32n", "nulls"),
         ("v21", "i32n", "nulls"),
-        ("v21", "i32", "bit-packed"),
-        ("v21", "ts_ms", "bit-packed"),
     ] {
         let (store, manifest) = dataset_in(SCALARS, name).await;
         let err = ExternalAttribute::pin_lance(&store, &manifest, col)
@@ -967,4 +963,106 @@ async fn a_lance_column_not_read_as_an_attribute_is_refused_by_name() {
         let col = ExternalColumn::pin_lance(&store, &manifest, "emb").await;
         assert!(col.is_ok(), "{name}: {col:?}");
     }
+}
+
+// ---- M102: Lance 2.1 bit-packed columns -----------------------------------------------------
+
+/// The columns pylance 13 bit-packs in 2.1, with their kinds.
+const PACKED: [(&str, AttrKind); 6] = [
+    ("i32", AttrKind::Int32),
+    ("date", AttrKind::Date),
+    ("ts_ms", AttrKind::TimestampMillis),
+    ("ts_us", AttrKind::TimestampMicros),
+    ("ts_ns", AttrKind::TimestampNanos),
+    ("small", AttrKind::Int32),
+];
+
+/// The rows `generate_lance_scalars.py` deletes from `v21-deleted`.
+fn deleted_from_v21(r: usize) -> bool {
+    (1000..1010).contains(&r) || [5, 1023, 1024, 1500, 2599].contains(&r)
+}
+
+#[tokio::test]
+async fn bit_packed_lance_columns_read_back() {
+    for name in ["v21", "v21-deleted"] {
+        for (col, kind) in PACKED {
+            let (store, manifest) = dataset_in(SCALARS, name).await;
+            let attr = ExternalAttribute::pin_lance(&store, &manifest, col)
+                .await
+                .unwrap_or_else(|e| panic!("{name}/{col}: {e}"));
+            let AttrSource::Fixed(column) = &attr.source else {
+                panic!("{name}/{col}: not a fixed-width source");
+            };
+            // The fixtures exercise packing: in `v21` every run is a whole chunk, and in
+            // `v21-deleted`, whose writer stored some fragments flat, a column mixes the two.
+            let packed = column
+                .extents
+                .iter()
+                .filter(|e| e.codec == CODEC_FASTLANES && e.compressed > 0)
+                .count();
+            let all = column.extents.len();
+            let want = if name == "v21" {
+                packed == all
+            } else {
+                packed > 0
+            };
+            assert!(want, "{name}/{col}: {packed} of {all} runs packed");
+            assert_eq!((attr.kind, attr.rows()), (kind, 2600), "{name}/{col}");
+            let got = attr.read_all(&store).await.unwrap();
+            for (r, v) in got.iter().enumerate() {
+                let gone = name == "v21-deleted" && deleted_from_v21(r);
+                let want = (!gone).then(|| scalar(col, r as i64));
+                assert_eq!(v.as_ref(), want.as_ref(), "{name}/{col} row {r}");
+            }
+        }
+    }
+}
+
+/// `v21`'s `small`, with the first chunk's bytes at `at` (from the chunk's start) set to `to`.
+async fn small_with(at: u64, to: u8) -> (MemoryStore, ExternalAttribute) {
+    let (store, manifest) = dataset_in(SCALARS, "v21").await;
+    let attr = ExternalAttribute::pin_lance(&store, &manifest, "small")
+        .await
+        .unwrap();
+    let AttrSource::Fixed(column) = &attr.source else {
+        panic!("not a fixed-width source");
+    };
+    let key = Key::new(column.key.clone());
+    let mut bytes = store.get(&key).await.unwrap().to_vec();
+    bytes[(column.extents[0].offset + at) as usize] = to;
+    store.put(&key, bytes.into()).await.unwrap();
+    let attr = ExternalAttribute::pin_lance(&store, &manifest, "small")
+        .await
+        .unwrap();
+    (store, attr)
+}
+
+#[tokio::test]
+async fn a_damaged_packed_chunk_is_refused_not_misread() {
+    // The chunk's header: a level byte, and a values length that disagrees with the chunk.
+    // Then its bit width, which the values are then not sized for: 33, past the value's, and 1.
+    for (at, to, why) in [
+        (0, 1, "levels"),
+        (2, 0, "values length"),
+        (8, 33, "33 bits"),
+        (8, 1, "a width"),
+    ] {
+        let (store, attr) = small_with(at, to).await;
+        let err = attr.read_all(&store).await.unwrap_err();
+        assert!(matches!(err, ExternalError::Damaged), "{why}: {err}");
+    }
+    // An object changed after the pin, to the same length.
+    let (store, manifest) = dataset_in(SCALARS, "v21").await;
+    let attr = ExternalAttribute::pin_lance(&store, &manifest, "small")
+        .await
+        .unwrap();
+    let AttrSource::Fixed(column) = &attr.source else {
+        panic!("not a fixed-width source");
+    };
+    let key = Key::new(column.key.clone());
+    let mut bytes = store.get(&key).await.unwrap().to_vec();
+    bytes[column.extents[0].offset as usize + 20] ^= 1;
+    store.put(&key, bytes.into()).await.unwrap();
+    let err = attr.read_all(&store).await.unwrap_err();
+    assert!(matches!(err, ExternalError::Changed), "{err}");
 }

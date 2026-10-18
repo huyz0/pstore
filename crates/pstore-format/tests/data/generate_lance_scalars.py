@@ -58,3 +58,7 @@ ds = lance.write_dataset(whole, out + 'many', data_storage_version='2.0', max_ro
 ds.delete('i32 >= 1500 AND i32 < 1530')
 # Lance 2.1: mini-block pages of several chunks
 lance.write_dataset(whole, out + 'v21', data_storage_version='2.1')
+# Lance 2.1 in several fragments, with rows deleted inside bit-packed chunks (M102)
+ds = lance.write_dataset(whole, out + 'v21-deleted', data_storage_version='2.1',
+                         max_rows_per_file=1000)
+ds.delete('(small >= 1000 AND small < 1010) OR small IN (5, 1023, 1024, 1500, 2599)')

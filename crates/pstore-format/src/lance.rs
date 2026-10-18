@@ -13,7 +13,7 @@
 //! The manifest and the page tables are untrusted bytes: the reader is bounded (depth, sizes,
 //! offsets checked against the object) and returns `None` for anything it does not understand.
 
-use crate::external::{AttrKind, Extent};
+use crate::external::{AttrKind, CODEC_FASTLANES, Extent};
 use crate::parquet::Located;
 use pstore_blob::{BlobError, BlobStore, Key};
 
@@ -40,6 +40,7 @@ const MAX_MANIFEST: u64 = 8 << 20;
 /// The most column-metadata bytes read.
 const MAX_COLUMN_META: u64 = 8 << 20;
 const MAGIC: &[u8; 4] = b"LANC";
+pub(crate) mod fastlanes;
 mod v21;
 
 const ENCODING_URL: &[u8] = b"/lance.encodings.ArrayEncoding";
@@ -518,12 +519,22 @@ fn without(extent: &Extent, deleted: &[u64], width: u64) -> Vec<Extent> {
     out
 }
 
-/// Rows `from..to` of `extent`.
+/// Rows `from..to` of `extent`. A bit-packed chunk (M102) is still read whole, so its rows are
+/// found by how many of the chunk's come before them.
 fn piece(extent: &Extent, from: u64, to: u64, width: u64) -> Extent {
+    let skip = from - extent.first_row;
+    if extent.compressed > 0 {
+        return Extent {
+            first_row: from,
+            rows: to - from,
+            plain_len: extent.plain_len + skip,
+            ..*extent
+        };
+    }
     Extent {
         first_row: from,
         rows: to - from,
-        offset: extent.offset + (from - extent.first_row) * width,
+        offset: extent.offset + skip * width,
         ..*extent
     }
 }
@@ -761,15 +772,18 @@ async fn locate_file<S: BlobStore>(
             vec![v21::Piece {
                 rows: n,
                 offset: *offset,
+                packed: 0,
             }]
         };
         for piece in pieces {
+            // A bit-packed chunk is read whole, as a compressed page is (M102).
+            let codec = if piece.packed > 0 { CODEC_FASTLANES } else { 0 };
             extents.push(Extent {
                 first_row,
                 rows: piece.rows,
                 offset: piece.offset,
-                compressed: 0,
-                codec: 0,
+                compressed: piece.packed,
+                codec,
                 plain_len: 0,
                 dict: None,
                 object: 0,
@@ -945,6 +959,30 @@ mod tests {
         assert_eq!(cut(&[1, 2, 10, 12, 30]), [(11, 1, 1016), (13, 7, 1048)]);
         // The object and the rest of the extent survive every piece.
         assert!(without(&e, &[14], 16).iter().all(|p| p.object == 3));
+    }
+
+    #[test]
+    fn deleted_rows_are_cut_out_of_a_bit_packed_chunk_by_its_skip() {
+        // A chunk of rows 10..20 read whole from byte 1000: a cut keeps the chunk and counts
+        // the chunk's rows before each piece.
+        let e = Extent {
+            compressed: 96,
+            codec: CODEC_FASTLANES,
+            ..extent(10, 10, 1000)
+        };
+        let cut = without(&e, &[10, 14], 4);
+        let got: Vec<_> = cut
+            .iter()
+            .map(|p| (p.first_row, p.rows, p.offset, p.plain_len))
+            .collect();
+        assert_eq!(got, [(11, 3, 1000, 1), (15, 5, 1000, 5)]);
+        assert!(
+            cut.iter()
+                .all(|p| p.compressed == 96 && p.codec == CODEC_FASTLANES)
+        );
+        // A cut of a piece already cut adds to its skip.
+        let again = without(&cut[1], &[16], 4);
+        assert_eq!(again[1].plain_len, 7);
     }
 
     /// The real deletion file the fixture generator wrote: ten rows of 300, zstd-compressed.
