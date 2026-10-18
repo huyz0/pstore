@@ -405,6 +405,238 @@ mod tests {
             decode_chunks(&[chunk], &[], AttrKind::Str, 3, 5),
             Err(ExternalError::Damaged)
         ));
+        // A chunk that does not begin where the rows before it end, even at its own length.
+        let late = AttrChunk {
+            first_row: 1,
+            ..chunk
+        };
+        assert!(matches!(
+            decode_chunks(&[late], std::slice::from_ref(&b), AttrKind::Str, 3, 5),
+            Err(ExternalError::Damaged)
+        ));
+    }
+
+    /// A footer of one row group of 3 rows, whose chunk of PLAIN strings is 50 bytes at 100.
+    fn one_group(dictionary_page_offset: Option<i64>) -> Footer {
+        let m = super::super::ChunkMeta {
+            ty: Some(super::super::TYPE_BYTE_ARRAY),
+            encodings: vec![ENC_PLAIN],
+            codec: Some(0),
+            num_values: 3,
+            data_page_offset: Some(100),
+            dictionary_page_offset,
+            total_compressed: 50,
+            ..Default::default()
+        };
+        Footer {
+            schema: Vec::new(),
+            groups: vec![Some((m, 3))],
+        }
+    }
+
+    /// A chunk lies inside its file, up to its last byte, and begins at its dictionary page
+    /// only when the footer records one at a real offset: some writers record 0 (M81).
+    #[test]
+    fn a_chunk_is_inside_the_file_and_begins_at_its_first_page() {
+        let locate = |len, dict| {
+            locate_chunks(
+                len,
+                &one_group(dict),
+                "s",
+                super::super::TYPE_BYTE_ARRAY,
+                false,
+            )
+        };
+        let (rows, chunks) = locate(150, None).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!((chunks[0].offset, chunks[0].len), (100, 50));
+        assert!(!chunks[0].dictionary);
+        assert!(locate(149, None).is_err(), "a chunk a byte past the file");
+        let (_, chunks) = locate(150, Some(0)).unwrap();
+        assert_eq!(chunks[0].offset, 100, "a dictionary offset of 0 is none");
+        assert!(!chunks[0].dictionary);
+        let (_, chunks) = locate(150, Some(90)).unwrap();
+        assert_eq!(chunks[0].offset, 90);
+        assert!(chunks[0].dictionary);
+    }
+
+    /// PLAIN strings, the body of a page.
+    fn strings(values: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for s in values {
+            body.extend(u32::try_from(s.len()).unwrap().to_le_bytes());
+            body.extend(s.as_bytes());
+        }
+        body
+    }
+
+    /// A REQUIRED chunk of `rows` rows, one v1 page of PLAIN strings for each of `pages`.
+    fn pages_chunk(pages: &[&[&str]], rows: u64) -> (AttrChunk, Vec<u8>) {
+        let mut b = Vec::new();
+        for page in pages {
+            let body = strings(page);
+            b.extend(page_v1(
+                u8::try_from(page.len()).unwrap(),
+                u8::try_from(body.len()).unwrap(),
+            ));
+            b.extend(body);
+        }
+        let chunk = AttrChunk {
+            first_row: 0,
+            rows,
+            offset: 0,
+            len: b.len() as u64,
+            codec: 0,
+            optional: false,
+            dictionary: false,
+        };
+        (chunk, b)
+    }
+
+    /// Each page holds at least one row and at most the rows its chunk has left.
+    #[test]
+    fn a_page_holds_between_one_row_and_the_rows_left() {
+        let read = |pages: &[&[&str]], rows| {
+            let (chunk, b) = pages_chunk(pages, rows);
+            decode(&b, &chunk, AttrKind::Str)
+        };
+        assert_eq!(read(&[&["a"], &["b"]], 2).unwrap(), 2);
+        assert_eq!(read(&[&["a"], &["b", "c"]], 3).unwrap(), 3);
+        // A page of no rows, though a good page follows it.
+        assert!(matches!(
+            read(&[&[], &["a"]], 1),
+            Err(ExternalError::Damaged)
+        ));
+        // A second page of more rows than are left.
+        assert!(matches!(
+            read(&[&["a"], &["b", "c"]], 2),
+            Err(ExternalError::Damaged)
+        ));
+        assert!(matches!(
+            read(&[&["a", "b"]], 1),
+            Err(ExternalError::Damaged)
+        ));
+    }
+
+    /// A v2 data page header of `n` PLAIN values with no nulls, `dl` and `rl` bytes of levels and
+    /// `len` bytes of body in all, its values uncompressed.
+    fn page_v2(n: u8, len: u8, dl: u8, rl: u8) -> Vec<u8> {
+        assert!(
+            n < 64 && len < 64 && dl < 64 && rl < 64,
+            "one-byte zigzag varints"
+        );
+        vec![
+            0x15,
+            0x06, // type: DATA_PAGE_V2
+            0x15,
+            len << 1, // uncompressed size
+            0x15,
+            len << 1, // compressed size
+            0x5C,     // field 8, a struct: DataPageHeaderV2
+            0x15,
+            n << 1, // num_values
+            0x15,
+            0x00, // num_nulls
+            0x15,
+            n << 1, // num_rows
+            0x15,
+            0x00, // encoding: PLAIN
+            0x15,
+            dl << 1, // definition levels byte length
+            0x15,
+            rl << 1, // repetition levels byte length
+            0x12,    // is_compressed: false
+            0x00,
+            0x00,
+        ]
+    }
+
+    /// A v2 page carries no repetition levels, and a REQUIRED column's no definition levels.
+    #[test]
+    fn a_v2_page_has_only_the_levels_its_column_has() {
+        let body = strings(&["ab", "c"]);
+        let len = u8::try_from(body.len()).unwrap();
+        let chunk = |b: &[u8], optional| AttrChunk {
+            first_row: 0,
+            rows: 2,
+            offset: 0,
+            len: b.len() as u64,
+            codec: 0,
+            optional,
+            dictionary: false,
+        };
+        let mut b = page_v2(2, len, 0, 0);
+        b.extend(&body);
+        assert_eq!(decode(&b, &chunk(&b, false), AttrKind::Str).unwrap(), 2);
+        // Repetition levels, of no length that would move the values.
+        let mut b = page_v2(2, len, 0, 1);
+        b.extend(&body);
+        for optional in [false, true] {
+            assert!(
+                matches!(
+                    decode(&b, &chunk(&b, optional), AttrKind::Str),
+                    Err(ExternalError::Damaged)
+                ),
+                "optional {optional}"
+            );
+        }
+        // Definition levels in a REQUIRED column: all-present ones, as an OPTIONAL one has.
+        let levels = [0x04, 0x01];
+        let mut b = page_v2(2, len + 2, 2, 0);
+        b.extend(levels);
+        b.extend(&body);
+        assert_eq!(decode(&b, &chunk(&b, true), AttrKind::Str).unwrap(), 2);
+        assert!(matches!(
+            decode(&b, &chunk(&b, false), AttrKind::Str),
+            Err(ExternalError::Damaged)
+        ));
+    }
+
+    /// `b` with one byte of its first page header changed so that the header parses with
+    /// `encoding` and every other field as it was, or `None` if no one byte does.
+    fn with_encoding(b: &[u8], encoding: i64) -> Option<Vec<u8>> {
+        let h = page_header(b).unwrap();
+        for at in 0..h.header_len {
+            for v in 0..=255u8 {
+                let mut e = b.to_vec();
+                e[at] = v;
+                if page_header(&e).is_some_and(|g| {
+                    g.encoding == encoding
+                        && (g.kind, g.values, g.compressed, g.uncompressed, g.header_len)
+                            == (h.kind, h.values, h.compressed, h.uncompressed, h.header_len)
+                }) {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+
+    /// A dictionary page is PLAIN, under either name Parquet has given it, and only a string
+    /// column has one.
+    #[tokio::test]
+    async fn a_dictionary_page_is_plain_strings() {
+        let chunks = fixture_chunks().await;
+        let (chunk, b, kind) = chunks
+            .iter()
+            .find(|(c, _, k)| c.dictionary && *k == AttrKind::Str)
+            .unwrap();
+        let rows = usize::try_from(chunk.rows).unwrap();
+        assert_eq!(page_header(b).unwrap().kind, PAGE_DICT);
+        for enc in [ENC_PLAIN, ENC_PLAIN_DICTIONARY] {
+            assert_eq!(
+                decode(&with_encoding(b, enc).unwrap(), chunk, *kind).unwrap(),
+                rows
+            );
+        }
+        assert!(matches!(
+            decode(&with_encoding(b, ENC_RLE).unwrap(), chunk, *kind),
+            Err(ExternalError::Damaged)
+        ));
+        assert!(matches!(
+            decode(b, chunk, AttrKind::Bool),
+            Err(ExternalError::Damaged)
+        ));
     }
 
     /// Each fixture's first chunk of each M100 column, its bytes, and its kind.

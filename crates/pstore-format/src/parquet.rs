@@ -1249,6 +1249,25 @@ mod tests {
         b
     }
 
+    /// Every physical type is named in a refusal by its own name.
+    #[test]
+    fn a_refusal_names_every_physical_type() {
+        for (ty, name) in [
+            (TYPE_BOOLEAN, "BOOLEAN"),
+            (TYPE_INT32, "INT32"),
+            (TYPE_INT64, "INT64"),
+            (3, "INT96"),
+            (TYPE_FLOAT, "FLOAT"),
+            (TYPE_DOUBLE, "DOUBLE"),
+            (TYPE_BYTE_ARRAY, "BYTE_ARRAY"),
+            (TYPE_FLBA, "FIXED_LEN_BYTE_ARRAY"),
+        ] {
+            assert_eq!(type_name(Some(ty)), name);
+        }
+        assert_eq!(type_name(Some(8)), "of an unknown type");
+        assert_eq!(type_name(None), "of an unknown type");
+    }
+
     #[test]
     fn the_hybrid_decodes_every_width() {
         for width in [0u32, 1, 3, 8, 17, 32] {
@@ -1303,6 +1322,22 @@ mod tests {
         assert_eq!(hybrid(&[], 0, 33), None);
         // No values from no bytes.
         assert_eq!(hybrid(&[], 0, 4), Some(vec![]));
+        // A run of nothing is refused even when a good run follows it.
+        assert_eq!(hybrid(&[0x02, 1], 1, 1), Some(vec![1]));
+        assert_eq!(hybrid(&[0, 0, 0x02, 1], 1, 1), None);
+        // A second run is cut to the values left: eight 1s, then a packed eight cut to two.
+        let mut want = vec![1; 8];
+        want.extend([1, 0]);
+        assert_eq!(hybrid(&[0x10, 1, 0x03, 0x01], 10, 1), Some(want));
+        // A run header may take six bytes (padded) but not seven, as a level run's may.
+        assert_eq!(
+            hybrid(&[0x83, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01], 8, 1),
+            Some(vec![1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            hybrid(&[0x83, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01], 8, 1),
+            None
+        );
         // An RLE value wider than its width is refused.
         assert_eq!(hybrid(&[2, 2], 1, 1), None);
         assert_eq!(hybrid(&[2, 0xFF, 0xFF, 0x02], 1, 17), None);

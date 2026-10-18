@@ -317,7 +317,7 @@ fn chunks_of(
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
-    use super::{Piece, bit_packed, chunks_of, fields, plain_floats, scalar_refusal};
+    use super::{Piece, bit_packed, chunks_of, fields, plain_flat, plain_floats, scalar_refusal};
 
     /// A length-delimited protobuf field. Every body here is under 128 bytes.
     fn msg(field: u8, body: &[u8]) -> Vec<u8> {
@@ -407,6 +407,28 @@ mod tests {
         assert!(why(&packing(16), 32).is_some_and(|w| w.contains("another width")));
         assert_eq!(why(&packing(32), 32), None);
         assert_eq!(why(&msg(1, &varint(1, 32)), 32), None);
+    }
+
+    /// A scalar is read flat only as `Flat(bits)` at its own width (M101): bit-packed values
+    /// read as flat ones would be other numbers.
+    #[test]
+    fn only_flat_at_the_values_width_is_a_plain_scalar() {
+        let flat = |bits| msg(1, &varint(1, bits));
+        assert!(plain_flat(&flat(32), 32));
+        assert!(plain_flat(&flat(64), 64));
+        for (what, bad) in [
+            ("another width", flat(64)),
+            ("bit-packed", packing(32)),
+            ("a second encoding", [flat(32), msg(12, &[])].concat()),
+            (
+                "a flat with more",
+                msg(1, &[varint(1, 32), varint(2, 1)].concat()),
+            ),
+            ("a malformed flat", msg(1, &[1 << 3])),
+            ("malformed", vec![1 << 3 | 2, 5]),
+        ] {
+            assert!(!plain_flat(&bad, 32), "{what}");
+        }
     }
 
     /// `(rows, offset, packed)` of each piece.
