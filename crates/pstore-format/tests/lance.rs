@@ -1007,6 +1007,10 @@ async fn bit_packed_lance_columns_read_back() {
                 packed > 0
             };
             assert!(want, "{name}/{col}: {packed} of {all} runs packed");
+            // A flat run stays a raw one: codec 0, as `Extent` documents it.
+            for e in column.extents.iter().filter(|e| e.compressed == 0) {
+                assert_eq!(e.codec, 0, "{name}/{col}: a flat run's codec");
+            }
             assert_eq!((attr.kind, attr.rows()), (kind, 2600), "{name}/{col}");
             let got = attr.read_all(&store).await.unwrap();
             for (r, v) in got.iter().enumerate() {
