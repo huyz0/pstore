@@ -71,6 +71,10 @@ so timings are a floor. `dev/README.md` has the reason.
    (`cargo test -p pstore-gossip --test protocol`). ⚠️ **Simulation only.** Splitting a real
    fleet needs network control this environment does not have on host networking; that is
    `NOT-RUN`, and the simulation exercises the real protocol rather than a model of it.
+   ⚠️ **Since run on a real fleet, by [M104](../M104/VERIFIED.md) criterion 3:** `iptables` on the
+   host loopback splits a host-network fleet after all. 20 nodes split for 90 s evict each other
+   and rejoin 1.1 s after the lift; with views below N, only the roster heal can rejoin them, and an
+   earlier hand run logged `HEAL dialled=10` on each side. A 1 s split evicts no one.
 9. **Coverage, mutation and gates.** `./scripts/coverage.sh --fail-under-regions 95` →
    **95.70%** region, 97.43% line. `cargo mutants -p pstore-gossip --timeout 60` →
    **87 caught, 15 missed = 85.3%**, against a floor of 80%; most survivors are in the

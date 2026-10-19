@@ -13,6 +13,7 @@
 #   scripts/cluster.sh traffic 30      gossip bytes/s/node over a 30s window (criterion 5)
 #   scripts/cluster.sh kill 5          kill 5 nodes, time detection
 #   scripts/cluster.sh starve n7 90    starve one accuser for 90s (OQ-12, criterion 4)
+#   scripts/cluster.sh partition 90    split the fleet in two for 90s, then time the heal (M104)
 #   scripts/cluster.sh down            containers AND the network -- see `down` for why
 #
 #   scripts/cluster-report.py 200      convergence and traffic, from the fleet's own logs
@@ -39,10 +40,14 @@ GOSSIP_PERIOD_MS=$(cat "$PERIOD_FILE" 2>/dev/null || echo 200)
 
 # One `docker logs` costs ~40ms of daemon time, so a serial sweep of 1,000 containers is 40
 # seconds — longer than the convergence it is trying to observe. Every sweep below fans out.
+# ⚠️ The last VIEW line, not the last line, and one value per node with 0 for one it cannot
+# read (M104). A `HEAL` line carries no `members=`, so reading the last line dropped every
+# node that had just healed -- and under a partition every node heals every 10 s, so
+# `converge` took its worst view over the nodes it happened to read.
 views() {
   docker ps -q --filter name=pstore-n |
-    xargs -P 32 -I{} sh -c 'docker logs --tail 1 {} 2>/dev/null' |
-    sed -n 's/.*members=\([0-9]*\).*/\1/p'
+    xargs -P 32 -I{} sh -c 'docker logs --tail 40 {} 2>/dev/null |
+      sed -n "s/^VIEW[A-Z]* .*members=\([0-9]*\).*/\1/p" | tail -1 | grep . || echo 0'
 }
 count_matching() { # $1 = grep pattern; prints how many containers have at least one match
   docker ps -q --filter name=pstore-n |
@@ -142,7 +147,7 @@ up)
       "$IMAGE" >/dev/null
   }
   export -f start_one
-  export IMAGE LOSS PERIOD_MS STORE_PORT OWNS_S POLL_MS GOSSIP AZ
+  export IMAGE LOSS PERIOD_MS STORE_PORT OWNS_S POLL_MS GOSSIP AZ gossip_auth
 
   # The first few in order and alone: the roster starts empty, so somebody has to create it
   # before a herd arrives to contend for it.
@@ -299,6 +304,83 @@ starve)
     echo "OQ-12: FAIL — a starved accuser evicted down to ${after} of $N"
     exit 1
   fi
+  ;;
+
+partition)
+  # M4c criterion 8 on real nodes: split the fleet, rejoin it, and time until every node is
+  # back to one member set. ⚠️ Host networking puts every node on the host's loopback at
+  # gossip port 7946+i, so two DROP rules between two port ranges split it without touching
+  # a node. That needs root in the host's network namespace, and nothing here asks for it.
+  H="${2:-90}"
+  # The comment match is load-bearing: the dropped count and the trap both key on it.
+  if [ "$(id -u)" -ne 0 ] || ! command -v iptables >/dev/null ||
+    ! iptables -m comment --help >/dev/null 2>&1; then
+    echo "partition: needs root, iptables and its comment match in the host network namespace" >&2
+    exit 2
+  fi
+  N=$(docker ps -q --filter name=pstore-n | wc -l)
+  # The ranges are counted from node numbers, so a fleet with a gap (after `kill`) would put
+  # its top nodes in neither half.
+  top=$(docker ps --format '{{.Names}}' --filter name=pstore-n | sed 's/^pstore-n//' | sort -n | tail -1)
+  if [ "$N" -lt 2 ] || [ "${top:-0}" != "$N" ]; then
+    echo "partition: needs running nodes numbered 1 to N with no gap, N >= 2 (have $N, top ${top:-none})" >&2
+    exit 2
+  fi
+  HALF=$((N / 2))
+  # PSTORE_SPLIT_PORT moves the ranges, and exists for the VACUOUS check: aimed at ports no
+  # node uses, the rules drop nothing and the run must say so rather than report a heal.
+  BASE="${PSTORE_SPLIT_PORT:-7946}"
+  A="$((BASE + 1)):$((BASE + HALF))"
+  B="$((BASE + HALF + 1)):$((BASE + N))"
+  # UDP only: gossip is UDP, and a TCP client sends from an ephemeral port no range matches.
+  rule() { # $1 = -I or -D
+    iptables -w "$1" INPUT -i lo -p udp --sport "$A" --dport "$B" -j DROP -m comment --comment pstore-split
+    iptables -w "$1" INPUT -i lo -p udp --sport "$B" --dport "$A" -j DROP -m comment --comment pstore-split
+  }
+  # ⚠️ A rule left behind splits every later run, and reads as a gossip bug. The trap lifts it
+  # on any exit; `lifted` keeps the normal path from deleting it twice.
+  lifted=0
+  trap '[ "$lifted" = 1 ] || rule -D 2>/dev/null || true' EXIT
+  rule -I
+  echo "split: nodes 1-$HALF (ports $A) from $((HALF + 1))-$N (ports $B) for ${H}s"
+  worst_hold=$N
+  best_hold=0
+  end=$(($(date +%s) + H))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    sleep 1
+    # An unread node prints 0; that is "not seen", never "evicted", so it is left out here.
+    v=$(views | grep -v '^0$' | sort -n)
+    w=$(echo "$v" | head -1)
+    b=$(echo "$v" | tail -1)
+    [ "${w:-0}" -lt "$worst_hold" ] && worst_hold=${w:-0}
+    [ "${b:-0}" -gt "$best_hold" ] && best_hold=${b:-0}
+  done
+  dropped=$(iptables -w -L INPUT -v -n -x | awk '/pstore-split/ {s += $1} END {print s + 0}')
+  w_end=$(views | sort -n | head -1)
+  echo "held: worst view $w_end at the lift, lowest $worst_hold, highest $best_hold, of $N; $dropped packets dropped"
+  rule -D
+  lifted=1
+  lifted_at=$(date +%s%3N)
+  if [ "$dropped" -eq 0 ]; then
+    echo "partition: VACUOUS -- the rules dropped nothing, so the fleet was never split"
+    exit 1
+  fi
+  if [ "$worst_hold" -lt "$N" ]; then
+    echo "evicted: yes -- gossip alone cannot rejoin the halves; the roster heal must"
+  else
+    echo "evicted: no -- no view fell below $N; gossip carried the split"
+  fi
+  for _ in $(seq 1 120); do
+    worst=$(views | sort -n | head -1)
+    if [ "${worst:-0}" -ge "$N" ]; then
+      ms=$(($(date +%s%3N) - lifted_at))
+      echo "healed: every node sees $N ${ms}ms after the lift = $((ms / GOSSIP_PERIOD_MS)) periods (provisional)"
+      exit 0
+    fi
+    sleep 0.2
+  done
+  echo "NOT healed; worst view was $worst of $N"
+  exit 1
   ;;
 
 down)

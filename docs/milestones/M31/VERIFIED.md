@@ -6,6 +6,10 @@ One line per acceptance criterion in [SPEC.md](SPEC.md). Gate: `scripts/check-ve
 number here is a latency. The fleet harness was not run: `scripts/cluster.sh` needs Docker,
 and this container has none (**NOT-RUN**).
 
+⚠️ **Since run, by [M104](../M104/VERIFIED.md) criterion 2:** on 20 nodes, every survivor heals
+every 10.07 s, at 8 distinct slots, with `OWNS` 5 s and `VIEW` 1 s apart. That run first had to
+fix `cluster.sh`, which since M53 had started only three nodes.
+
 Command: `cargo test -p pstore-node --test schedule --test policy`.
 
 ⚠️ **A test that fails to compile is not counted as red** (spec review M4). The tests were first
