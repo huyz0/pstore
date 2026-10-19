@@ -33,13 +33,17 @@
 //! Nodes own nothing and coordinate about nothing, so a tenant's true rate is its per-node
 //! rate times the nodes it reaches. This bounds the damage one node does, which is what a
 //! token bucket in a shared process can honestly claim. `usage` is likewise this node's view;
-//! summing across the fleet is the billing rollup's problem and it is not built.
+//! ~~summing across the fleet is the billing rollup's problem and it is not built~~ — summing
+//! it across the fleet is [`rollup`]'s, over the reports each node's [`Reporter`] writes
+//! (M109).
 
 mod bucket;
 mod metered;
+mod report;
 
 pub use bucket::{Bucket, Rate};
 pub use metered::Metered;
+pub use report::{Budget, INDEX_SHARDS, Month, ReportError, Reporter, Rollup, rollup};
 
 use pstore_blob::OpClass;
 use pstore_types::TenantId;
@@ -68,13 +72,61 @@ impl Quota {
     }
 }
 
-/// What one tenant has spent on this node, in the shape `Accounted` keeps it.
+/// What one tenant has spent on this node, in the shape `Accounted` keeps it, and the answers
+/// it was given.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     /// Requests per [`OpClass`], indexed by [`Usage::slot`].
     pub requests: [u64; 4],
     /// Bytes per [`OpClass`].
     pub bytes: [u64; 4],
+    /// API answers, every one of them (M109).
+    pub answered: u64,
+    /// API answers that spent the tenant's error budget.
+    pub failed: u64,
+}
+
+impl std::ops::Add for Usage {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        for (a, b) in out.requests.iter_mut().zip(o.requests) {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in out.bytes.iter_mut().zip(o.bytes) {
+            *a = a.saturating_add(b);
+        }
+        out.answered = out.answered.saturating_add(o.answered);
+        out.failed = out.failed.saturating_add(o.failed);
+        out
+    }
+}
+
+impl std::ops::Sub for Usage {
+    type Output = Self;
+    /// What was counted between `o` and `self`. Saturating: counters only grow, so a field
+    /// below its mark is a different meter, and zero is what it contributed.
+    fn sub(self, o: Self) -> Self {
+        let mut out = self;
+        for (a, b) in out.requests.iter_mut().zip(o.requests) {
+            *a = a.saturating_sub(b);
+        }
+        for (a, b) in out.bytes.iter_mut().zip(o.bytes) {
+            *a = a.saturating_sub(b);
+        }
+        out.answered = out.answered.saturating_sub(o.answered);
+        out.failed = out.failed.saturating_sub(o.failed);
+        out
+    }
+}
+
+/// How an API request was answered, as the error budget counts it (M109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Answered, including a refusal the tenant caused: a bad request, a quota refusal.
+    Ok,
+    /// A server-side failure. It spends the tenant's error budget.
+    Failed,
 }
 
 impl Usage {
@@ -210,6 +262,31 @@ impl Meter {
     #[must_use]
     pub fn usage(&self, tenant: TenantId) -> Usage {
         self.with(tenant, |t| t.usage)
+    }
+
+    /// Counts one API answer to the tenant (M109).
+    ///
+    /// ⚠️ **Which answers are `Failed` is the caller's call**, because only the server knows a
+    /// status code. A refusal the tenant caused is `Ok`: spending its budget on its own bad
+    /// requests would make the budget a measure of the tenant, not of the service.
+    pub fn answer(&self, tenant: TenantId, answer: Answer) {
+        self.with(tenant, |t| {
+            t.usage.answered = t.usage.answered.saturating_add(1);
+            if answer == Answer::Failed {
+                t.usage.failed = t.usage.failed.saturating_add(1);
+            }
+        });
+    }
+
+    /// Every tenant this node has seen, and its usage. For [`Reporter`].
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<TenantId, Usage> {
+        self.tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, t)| (*k, t.usage))
+            .collect()
     }
 
     /// The tenant's remaining request and byte balances, for a test or a `meta` field.

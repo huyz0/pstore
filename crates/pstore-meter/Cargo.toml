@@ -16,6 +16,7 @@ pstore-types = { path = "../pstore-types" }
 async-trait  = "0.1"
 bytes        = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+thiserror    = "2"
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }

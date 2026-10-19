@@ -40,6 +40,7 @@ Latency objectives are therefore `blocked` on M0b, each with the measurement it 
 | A document acknowledged durable and folded is never missing from a successful query | 0 missing | enforced | `an_acknowledged_document_is_never_missing_under_faults` |
 | The epoch sequence is linearizable under adversarial scheduling | 100+ writers | enforced | `every_acknowledged_document_survives_contention` |
 | A backend that cannot fence serves nothing | refused at the door | enforced | `a_backend_that_cannot_fence_is_refused_before_the_socket_is_bound` |
+| A tenant's monthly error budget is summed from every node that served it, a departed one included, in one read per index shard and per node | `64 + nodes` reads, 0 LIST | enforced | `a_publish_is_one_write_and_a_rollup_is_one_read_per_shard_and_per_node`, `a_node_that_left_is_still_counted` |
 
 ## Latency objectives — blocked
 
@@ -58,5 +59,5 @@ here would be a WSL2 number wearing a production label.
 
 | Objective | Status | Blocked on |
 |---|---|---|
-| Error budget per tenant per month | blocked | A fleet-wide rollup of `Meter::usage`, which does not exist |
+| Error budget per tenant per month: the **target** | blocked | ~~A fleet-wide rollup of `Meter::usage`, which does not exist~~ — built by [M109](../../milestones/M109/VERIFIED.md). Now blocked on a real fleet's failure rate, which is what a promise to a tenant needs, and on the server calling `Meter::answer`, which it does not yet |
 | Time to detect a dead node | blocked | M4b measured detection in **gossip periods**, which is a count and not a duration until a real fleet sets the period |
