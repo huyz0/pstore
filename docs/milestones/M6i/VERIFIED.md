@@ -46,10 +46,11 @@ applied to the shipped code, the test run, and the failure read.
    Requests are pinned by `an_open_costs_the_same_requests_however_many_indexes_a_tenant_has`,
    observed red by reading HEAD once per index entry.
 7. **Memory per idle index** — **13.6 bytes per index** of catalog, identical at both arms
-   (136,472,556 bytes over 10M indexes and 681,088,268 over 50M). ⚠️ The other half — what a
-   node holds for an index it is not serving — is **`NOT-RUN`**: it is zero by construction
-   because nodes own nothing, and neither harness instantiates a serving node. A zero asserted
-   by a harness with no node in it would be evidence of nothing.
+   (136,472,556 bytes over 10M indexes and 681,088,268 over 50M). The other half, what a
+   node holds for an index it is not serving, was `NOT-RUN` here because neither harness
+   instantiates a serving node. **Measured by [M106](../M106/VERIFIED.md)** on one: nothing
+   for an index of a tenant it does not serve, and the index's HEAD entry for an idle index of
+   one it does: 195 bytes, for an index of one segment.
 8. **`provisional`** — WSL2, a `MemoryStore`, one run; both harnesses print that line above
    their results. Request and byte counts are exact; wall clock is relative only.
    `./scripts/gates.sh` green. ⚠️ **How relative:** the run was repeated after an edit to the
