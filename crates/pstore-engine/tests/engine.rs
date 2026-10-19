@@ -209,7 +209,10 @@ async fn a_stale_committer_is_fenced() {
 
     // `b` still holds the pre-commit view. Its commit must be refused, not silently win.
     assert!(
-        b.commit_stale_for_test().await.is_err(),
+        matches!(
+            b.commit_stale_for_test().await,
+            Err(pstore_engine::EngineError::Lost)
+        ),
         "a stale tag must be fenced out"
     );
 }

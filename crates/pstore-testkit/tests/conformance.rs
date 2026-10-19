@@ -185,6 +185,22 @@ async fn the_suite_detects_a_backend_that_is_not_fenced() {
 }
 
 #[tokio::test]
+async fn the_suite_tells_a_multipart_tag_from_an_opaque_one() {
+    // OQ-6. A multipart ETag is still content-derived, so it fails exactly where a
+    // single-part one does. An SSE-KMS-style tag is unrelated to content, so it conforms:
+    // nothing in the suite reads a tag as anything but a token to hand back.
+    let r = conformance::run(
+        &MemoryStore::with_tag_style(TagStyle::Multipart { part_bytes: 4 }),
+        12,
+    )
+    .await;
+    let d: Vec<&str> = r.divergences().iter().map(|p| p.name).collect();
+    assert_eq!(d, ["aba_resistance"], "got {:?}", r.divergences());
+    let r = conformance::run(&MemoryStore::with_tag_style(TagStyle::Opaque), 13).await;
+    assert!(r.conforms(), "got {:?}", r.divergences());
+}
+
+#[tokio::test]
 async fn a_report_names_what_diverged() {
     let r = conformance::run(&MemoryStore::with_tag_style(TagStyle::ContentHash), 7).await;
     let d = r.divergences();

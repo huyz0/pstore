@@ -153,7 +153,10 @@ async fn a_writer_paused_past_many_commits_cannot_corrupt() {
     }
 
     assert!(
-        paused.commit_stale_for_test().await.is_err(),
+        matches!(
+            paused.commit_stale_for_test().await,
+            Err(pstore_engine::EngineError::Lost)
+        ),
         "a writer {WRITERS} commits behind was allowed to commit"
     );
 

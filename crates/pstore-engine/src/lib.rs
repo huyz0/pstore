@@ -6437,10 +6437,14 @@ impl<S: BlobStore> Engine<S> {
             head: Head::default(),
             tag: None,
         };
-        // ⚠️ The next head's contents are irrelevant: `commit` returns its epoch only on
-        // success, and every caller asserts refusal. An `epoch: Epoch(1)` here was an equivalent
-        // mutant -- deleting it changed nothing any test could see (M8g).
-        head::commit(&*self.store, self.tenant, &stale, &Head::default()).await
+        // ⚠️ Epoch 1, so the refusal comes from the CAS and never from `commit`'s epoch guard
+        // (M105). This was an equivalent mutant before the guard existed (M8g); now deleting it
+        // turns `Lost` into `Refused`, and the tests ask for `Lost`.
+        let next = Head {
+            epoch: Epoch(1),
+            ..Head::default()
+        };
+        head::commit(&*self.store, self.tenant, &stale, &next).await
     }
 }
 

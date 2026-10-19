@@ -153,6 +153,15 @@ Because ~5 CAS/s is the ceiling, we need contention *avoidance*, not just retry:
 | Hazard | Mitigation |
 |---|---|
 | **ABA** — tag reused for a different value | S3/Azure ETags are content-derived, so identical content ⇒ identical tag ⇒ CAS "succeeds" on a semantically different world. **Closed by:** HEAD always contains a strictly monotonic `epoch` and a random `commit_nonce`, so no two HEAD values are ever byte-identical. GCS generations are inherently monotonic and immune. |
+
+> ⚠️ **Corrected by [M105](../../milestones/M105/VERIFIED.md) (OQ-6).** The nonce was never random:
+> it is `nonce_for(epoch, lane)`, and it adds no uniqueness the epoch does not, since two HEADs at
+> one epoch cannot both land. What keeps HEADs byte-distinct, and so closes ABA on single-part
+> and multipart ETags alike, is the **strictly monotonic epoch**, which `head::commit` now refuses
+> to write without.
+
+| Hazard | Mitigation |
+|---|---|
 | **S3 409 Contended** ≠ lost | Distinguish 409 from 412. 409 means "couldn't evaluate"; retry without rebasing. Conflating them causes needless rebase storms. |
 | **Torn write** | Blob PUT is atomic; no partial visibility. Multipart completion is atomic at `CompleteMultipartUpload`. |
 | **Orphaned manifest objects** from lost CAS races | Unreferenced by any HEAD; reaped by GC using epoch-range scanning (derived keys, not LIST). |

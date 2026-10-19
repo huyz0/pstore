@@ -1228,6 +1228,17 @@ pub(crate) async fn commit<S: BlobStore>(
     next: &Head,
 ) -> Result<Epoch, EngineError> {
     crate::require_fencing(store)?;
+    // ⚠️ **The ABA guard is this check, not the nonce** (M105, OQ-6). A content-derived tag,
+    // single-part or multipart, repeats exactly when the bytes do, and the epoch is what keeps
+    // two HEADs from being byte-identical. Every caller advances it; this makes that a
+    // property of the one place they all pass through rather than of each of them.
+    // `Refused` although it is the engine's bug, not a client's: no caller reaches it.
+    if next.epoch <= at.head.epoch {
+        return Err(EngineError::Refused(format!(
+            "a HEAD at epoch {} does not advance on the {} it was read at",
+            next.epoch.0, at.head.epoch.0
+        )));
+    }
     let pre = match &at.tag {
         Some(t) => Precondition::Match(t.clone()),
         None => Precondition::NotExists,

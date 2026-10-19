@@ -23,6 +23,19 @@ pub enum TagStyle {
     /// changed and changed back. This is why the manifest carries a monotonic epoch and a
     /// nonce, and it is modelled here so that hazard is testable rather than argued about.
     ContentHash,
+    /// Content-derived per part, as an S3 ETag is for a multipart upload: a hash of the
+    /// parts' hashes, then `-N` for N parts. The body is split every `part_bytes` bytes.
+    ///
+    /// ⚠️ **ABA-prone**, as [`Self::ContentHash`] is: for a fixed split, equal content still
+    /// yields an equal tag. OQ-6 asked whether the `-N` form changes that; it does not.
+    Multipart {
+        /// Bytes per part. Real S3 parts are at least 5 MiB; a small part keeps a test small.
+        part_bytes: usize,
+    },
+    /// A fresh token per write that is unrelated to the content and is not a number, as an
+    /// SSE-KMS ETag is. Immune to ABA, like [`Self::Monotonic`], but nothing may read an
+    /// order or a value out of it: tags are opaque (design rule 3).
+    Opaque,
 }
 
 #[derive(Debug, Default)]
@@ -108,22 +121,45 @@ impl MemoryStore {
 
     fn next_tag(&self, st: &mut State, body: &Bytes) -> CasTag {
         match self.tag_style {
+            TagStyle::Multipart { part_bytes } => {
+                // S3 hashes each part, then the concatenated part hashes. An empty body is
+                // still one part.
+                let parts: Vec<&[u8]> = if body.is_empty() {
+                    vec![&[]]
+                } else {
+                    body.chunks(part_bytes.max(1)).collect()
+                };
+                let joined: Vec<u8> = parts.iter().flat_map(|p| fnv1a(p).to_le_bytes()).collect();
+                CasTag::new(format!("\"{:016x}-{}\"", fnv1a(&joined), parts.len()))
+            }
+            // The counter is the shared state's, so two clones of one store never hand out
+            // the same token.
+            TagStyle::Opaque => {
+                st.generation = st.generation.saturating_add(1);
+                CasTag::new(format!(
+                    "\"kms-{:016x}\"",
+                    fnv1a(&st.generation.to_le_bytes())
+                ))
+            }
             TagStyle::Monotonic => {
                 st.generation = st.generation.saturating_add(1);
                 CasTag::new(st.generation.to_string())
             }
             // FNV-1a. Not a real MD5, but it has the property under test: equal content
             // yields an equal tag.
-            TagStyle::ContentHash => {
-                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-                for b in body.iter() {
-                    h ^= u64::from(*b);
-                    h = h.wrapping_mul(0x1000_0000_01b3);
-                }
-                CasTag::new(format!("\"{h:016x}\""))
-            }
+            TagStyle::ContentHash => CasTag::new(format!("\"{:016x}\"", fnv1a(body))),
         }
     }
+}
+
+/// FNV-1a 64, standing in for MD5: equal input, equal output.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
 }
 
 #[async_trait::async_trait]

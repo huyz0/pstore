@@ -27,7 +27,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 |---|---|---|
 | OQ-2 | Break-even gap `G*` for range coalescing, per backend | `02/request-efficiency-patterns` |
 | OQ-3 | Real p50/p99/p999 TTFB per backend per object size | `02/cost-and-latency` |
-| OQ-6 | Does the ABA nonce fully close the hole under S3 multipart ETags? **Unblocked** — `pstore-fake-s3` can synthesize the `-N` and non-MD5 ETag forms, so this is testable without cloud access | `03/manifest-and-cas`, `09/blob-store-fakes` |
+| ~~OQ-6~~ | Does the ABA nonce fully close the hole under S3 multipart ETags? **ANSWERED for the engine ([M105](../../milestones/M105/VERIFIED.md)): yes, and the nonce is not what closes it.** A multipart ETag is still content-derived for a fixed split, so it is exactly as ABA-prone as a single-part one; an SSE-KMS-style tag is not. What closes the hole is that **no two HEADs are byte-identical**, because every HEAD write advances the epoch — now refused at `head::commit` if it does not. Pinned on `MemoryStore`'s `Multipart` and `Opaque` tag styles, under every one of which no HEAD's bytes or tag repeat. Nothing CAS'd is uploaded in parts today. **Open:** the `object_store` adapter's round trip of a quoted `-N` or `kms-` ETag, for want of `pstore-fake-s3` | `03/manifest-and-cas`, `09/blob-store-fakes` |
 | OQ-10 | Cap on unindexed WAL volume before backpressure | `03/consistency-model` |
 | OQ-12 | Does Lifeguard's false-positive suppression hold when nodes are CPU-pinned by SIMD work? Our workload is SWIM's pathological case. | `04/membership` |
 | OQ-16 | Quantify the cache dip after a 2× scale-out; is shadow warming worth its cost? | `04/routing-and-placement` |
