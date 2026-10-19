@@ -74,11 +74,15 @@ the failure read. Command: `cargo test -p pstore-catalog --test split`.
   writers than readers.
 - ⚠️ **Anything past 65,536 buckets.** That is the fifth hex digit in `{bucket:04x}` and a
   different key space.
-- **Shrinking**, and **automatic splitting**: nothing measures bucket occupancy and nothing
-  calls `split`.
+- **Shrinking**, and ~~**automatic splitting**: nothing measures bucket occupancy and nothing
+  calls `split`~~. **Measured and decided by [M108](../M108/VERIFIED.md)**: `split_if_due`
+  measures every run and splits past a threshold. Nothing calls it on a schedule yet, the same
+  maintenance loop `fold`, `reap` and `sweep` wait for.
 - ⚠️ **`split` is not atomic and not resumable.** A crash between the bucket writes and the
   root CAS leaves the new buckets written and the width unmoved — observably nothing, by
-  criterion 8 — and a re-run redoes the partitioning from the same source.
+  criterion 8 — and a re-run redoes the partitioning from the same source. ⚠️ **Corrected by
+  [M108](../M108/VERIFIED.md):** a re-run keeps the sibling heads and runs the crash left, since
+  they are created if absent and never overwritten. Nothing is lost: bucket `b` keeps every record.
 - ⚠️ **Two tests changed their asserted round-trip counts**, and neither was loosened to pass:
   `enumeration_is_two_rounds_deep` goes 2 → 3 and its cold path 3 → 4, and
   `enumeration_requests_do_not_scale_with_tenants` goes `width * 2` → `width * 2 + 1`. Both

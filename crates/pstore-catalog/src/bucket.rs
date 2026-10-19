@@ -237,8 +237,17 @@ pub(crate) async fn read_run<S: BlobStore>(
     bucket: u32,
     head: &BucketHead,
 ) -> Result<Vec<TenantRecord>, CatalogError> {
+    Ok(read_sized_run(store, bucket, head).await?.0)
+}
+
+/// A run's records and its size in bytes, which is what a bucket costs a fold (M108).
+async fn read_sized_run<S: BlobStore>(
+    store: &S,
+    bucket: u32,
+    head: &BucketHead,
+) -> Result<(Vec<TenantRecord>, u64), CatalogError> {
     let Some(key) = head.run(bucket) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     match store.get(&key).await {
         Ok(bytes) => {
@@ -247,7 +256,7 @@ pub(crate) async fn read_run<S: BlobStore>(
                 i: 0,
                 what: key.as_str(),
             };
-            decode_records(&mut c)
+            Ok((decode_records(&mut c)?, bytes.len() as u64))
         }
         Err(BlobError::NotFound(_)) => Err(CatalogError::MissingRun(bucket)),
         Err(e) => Err(e.into()),
@@ -653,19 +662,31 @@ async fn rewrite<S: BlobStore>(
 pub async fn split<S: BlobStore>(store: &S) -> Result<Width, CatalogError> {
     crate::require_fencing(store)?;
     let (root, tag) = read_root(store).await?;
-    let old = root.width.get();
-    // ⚠️ `Width::new` is the guard, and a `<= MAX_WIDTH` filter beside it was dead: a mutation
-    // sweep could not distinguish removing it from keeping it, because the constructor already
-    // refuses anything past the key format. Removed rather than tested — the same call M5f and
-    // M6e made on their own unreachable guards.
-    let Some(next) = old.checked_mul(2).and_then(Width::new) else {
-        return Err(CatalogError::BadWidth(old.saturating_mul(2)));
-    };
+    let next = doubled(root.width)?;
+    let buckets = read_buckets(store, root.width).await?;
+    split_from(store, root, tag, next, buckets).await
+}
 
-    // Every old bucket's pointer, then every run they name — the same two rounds a census
-    // costs, and for the same reason: the keys are derived, so width is a fan-out and not a
-    // depth.
-    let heads = futures_util::future::try_join_all(root.width.all().map(|b| async move {
+/// The width after `width`, or the refusal past the key format.
+///
+/// ⚠️ `Width::new` is the guard, and a `<= MAX_WIDTH` filter beside it was dead: a mutation
+/// sweep could not distinguish removing it from keeping it, because the constructor already
+/// refuses anything past the key format. Removed rather than tested — the same call M5f and
+/// M6e made on their own unreachable guards.
+fn doubled(width: Width) -> Result<Width, CatalogError> {
+    let old = width.get();
+    old.checked_mul(2)
+        .and_then(Width::new)
+        .ok_or(CatalogError::BadWidth(old.saturating_mul(2)))
+}
+
+/// One bucket as a census read it: its number, its pointer, its run, and the run's bytes.
+type Read = (u32, BucketHead, Vec<TenantRecord>, u64);
+
+/// Every bucket's pointer, then every run they name — the same two rounds an enumeration
+/// costs, and for the same reason: the keys are derived, so width is a fan-out and not a depth.
+async fn read_buckets<S: BlobStore>(store: &S, width: Width) -> Result<Vec<Read>, CatalogError> {
+    let heads = futures_util::future::try_join_all(width.all().map(|b| async move {
         let (head, _) = read_head(store, b).await?;
         Ok::<_, CatalogError>((b, head))
     }))
@@ -673,18 +694,32 @@ pub async fn split<S: BlobStore>(store: &S) -> Result<Width, CatalogError> {
     let runs = futures_util::future::try_join_all(
         heads
             .iter()
-            .map(|(b, head)| async move { read_run(store, *b, head).await }),
+            .map(|(b, head)| async move { read_sized_run(store, *b, head).await }),
     )
     .await?;
+    Ok(heads
+        .into_iter()
+        .zip(runs)
+        .map(|((b, head), (run, bytes))| (b, head, run, bytes))
+        .collect())
+}
 
-    for ((b, head), run) in heads.iter().zip(runs) {
+async fn split_from<S: BlobStore>(
+    store: &S,
+    root: Root,
+    tag: Option<CasTag>,
+    next: Width,
+    buckets: Vec<Read>,
+) -> Result<Width, CatalogError> {
+    let old = root.width.get();
+    for (b, head, run, _) in buckets {
         // ⚠️ Pending as well as the run: a record recorded and not yet folded is as much a
         // tenant as one in a run, and leaving it behind would strand it in a bucket the new
         // width never reads for that tenant.
         let moving: Vec<TenantRecord> = run
             .into_iter()
             .chain(head.pending.iter().cloned())
-            .filter(|r| keys::bucket_of(r.tenant, next) != *b)
+            .filter(|r| keys::bucket_of(r.tenant, next) != b)
             .collect();
         if moving.is_empty() {
             continue;
@@ -703,18 +738,32 @@ pub async fn split<S: BlobStore>(store: &S) -> Result<Width, CatalogError> {
             Err(CasError::Contended) => return Err(CatalogError::Contended(sibling, 1)),
             Err(CasError::Io(e)) => return Err(BlobError::Other(e).into()),
         }
-        let (_, sibling_tag) = read_head(store, sibling).await?;
+        // ⚠️ **Create-if-absent, never read first and never overwritten** (M108). A head
+        // already there was written by a concurrent split that moved these records, by an
+        // appender at the new width, or by a crashed attempt of this one. Overwriting it is
+        // how a second splitter that read the root before the first one flipped it wiped a
+        // tenant recorded at the new width: the lost root CAS afterwards undid nothing. A
+        // crashed attempt's run may be older than this one's, and that loses nothing either,
+        // because bucket `b` keeps every record and a census merges across buckets.
         let head = BucketHead {
             run_epoch: Epoch(1),
             digest,
             pending: Vec::new(),
             graveyard: Vec::new(),
         };
-        if !matches!(
-            write_head(store, sibling, &head, sibling_tag).await?,
-            Publish::Landed
-        ) {
-            return Err(CatalogError::Contended(sibling, 1));
+        // Losing the create is success, the way losing a run's create is. A 409 is not a lost
+        // create: nothing was written, and flipping now would publish a bucket with no head.
+        match store
+            .put_conditional(
+                &keys::head_key(sibling),
+                head.encode().into(),
+                Precondition::NotExists,
+            )
+            .await
+        {
+            Ok(_) | Err(CasError::Lost) => {}
+            Err(CasError::Contended) => return Err(CatalogError::Contended(sibling, 0)),
+            Err(CasError::Io(e)) => return Err(BlobError::Other(e).into()),
         }
     }
 
@@ -731,6 +780,99 @@ pub async fn split<S: BlobStore>(store: &S) -> Result<Width, CatalogError> {
     )
     .await?;
     Ok(next)
+}
+
+/// How full the catalog's buckets are, measured from one census (M108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occupancy {
+    /// The width the census read.
+    pub width: Width,
+    /// Each bucket's run in bytes, indexed by bucket. A bucket never folded is 0.
+    pub run_bytes: Vec<u64>,
+    /// The bucket whose run is largest, the lowest-numbered on a tie.
+    pub fullest: u32,
+    /// Its run's bytes.
+    pub fullest_bytes: u64,
+}
+
+impl Occupancy {
+    fn of(width: Width, buckets: &[Read]) -> Self {
+        let run_bytes: Vec<u64> = buckets.iter().map(|(_, _, _, n)| *n).collect();
+        let (fullest, fullest_bytes) =
+            buckets.iter().fold(
+                (0, 0),
+                |(fb, fn_), (b, _, _, n)| {
+                    if *n > fn_ { (*b, *n) } else { (fb, fn_) }
+                },
+            );
+        Self {
+            width,
+            run_bytes,
+            fullest,
+            fullest_bytes,
+        }
+    }
+}
+
+/// When the catalog splits (M108, OQ-8's threshold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitPolicy {
+    /// Split when the fullest bucket's run is larger than this.
+    pub max_run_bytes: u64,
+}
+
+impl Default for SplitPolicy {
+    /// 2 MiB: about twice the fullest bucket at the corpus's design point of 1M tenants of
+    /// ~10 KB at the default width. The design point does not split; twice it does.
+    fn default() -> Self {
+        Self {
+            max_run_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+/// What [`split_if_due`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitOutcome {
+    /// The fullest bucket is within the threshold. Nothing was written.
+    NotDue(Occupancy),
+    /// The fullest bucket was over the threshold, and the width doubled.
+    Split {
+        /// The width before.
+        from: Width,
+        /// The width now.
+        to: Width,
+    },
+    /// The fullest bucket is over the threshold and the width is already
+    /// [`crate::MAX_WIDTH`]. Nothing was written: the deployment is full.
+    AtFormat(Occupancy),
+}
+
+/// Splits the catalog if its fullest bucket is over `policy`'s threshold.
+///
+/// # Errors
+/// As [`split`]: if the store refuses, an object is malformed, or the root moved under it.
+pub async fn split_if_due<S: BlobStore>(
+    store: &S,
+    policy: &SplitPolicy,
+) -> Result<SplitOutcome, CatalogError> {
+    crate::require_fencing(store)?;
+    let (root, tag) = read_root(store).await?;
+    let buckets = read_buckets(store, root.width).await?;
+    let occupancy = Occupancy::of(root.width, &buckets);
+    if occupancy.fullest_bytes <= policy.max_run_bytes {
+        return Ok(SplitOutcome::NotDue(occupancy));
+    }
+    let Ok(next) = doubled(root.width) else {
+        return Ok(SplitOutcome::AtFormat(occupancy));
+    };
+    // The census it decided on is the census it splits from: a due split costs no second
+    // read round.
+    let to = split_from(store, root, tag, next, buckets).await?;
+    Ok(SplitOutcome::Split {
+        from: root.width,
+        to,
+    })
 }
 
 /// Drains a bucket's pending records into a new immutable run.

@@ -17,6 +17,7 @@ thiserror    = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 
 [dev-dependencies]
+async-trait    = "0.1"
 bytes          = "1"
 pstore-testkit = { path = "../pstore-testkit" }
 tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

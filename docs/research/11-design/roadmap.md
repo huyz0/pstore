@@ -292,8 +292,10 @@ it.~~ **Measured since [M6i](../../milestones/M6i/VERIFIED.md)**: 32,769 reads a
 tenants, the same as at 200,000. ⚠️ And ~~bucket splitting is unbuilt~~ — **it is built**:
 [M6g](../../milestones/M6g/VERIFIED.md) splits a bucket and
 [M6h](../../milestones/M6h/VERIFIED.md) re-partitions a catalog that has drifted, both of them
-after this line was written. OQ-8's remaining half is the **threshold** — what should trigger a
-split — not whether one can happen.
+after this line was written. ~~OQ-8's remaining half is the **threshold** — what should trigger a
+split — not whether one can happen.~~ **Decided by [M108](../../milestones/M108/VERIFIED.md)**:
+split when the fullest bucket's run passes `max_run_bytes`, default 2 MiB, about twice the
+fullest bucket at the design point. What a real fleet's record sizes are still needs one.
 
 #### M6b — Quotas and metering
 → [`docs/milestones/M6b/SPEC.md`](../../milestones/M6b/SPEC.md) ·
