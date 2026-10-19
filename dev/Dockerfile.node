@@ -11,8 +11,12 @@ RUN cargo build --release -p pstore-node
 # ⚠️ Distroless-ish runtime: 100 of these run at once, so the image's resident cost is
 # multiplied by 100. Measured, an idle container is ~1.4 MB of host memory; the binary's RSS
 # is what actually matters and is what M4b reports.
+# ⚠️ The CA bundle is COPIED from the build stage, not `apt-get install`ed: the build image
+# already carries Debian's `ca-certificates` for the same release, and an `apt-get` here made
+# the image unbuildable anywhere a Debian mirror is unreachable (M110) -- for a file that was
+# already one stage away. The node needs it: object_store's TLS verifies against the
+# platform's roots, which on Linux is this file.
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /src/target/release/pstore-node /usr/local/bin/pstore-node
 ENTRYPOINT ["/usr/local/bin/pstore-node"]
