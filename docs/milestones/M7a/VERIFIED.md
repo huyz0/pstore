@@ -154,9 +154,10 @@ checking less than it says.
 
 - **Real clouds.** M0b. Every profile says so in its own header, because a `Supported` from an
   emulator is a statement about plumbing (D-99) and nothing else.
-- **The `delete_batch` fix does not help GCS.** `object_store` 0.14.1 maps GCS's `delete_stream`
-  to one request per location — the JSON API it uses has no bulk delete — so GC's request rate
-  still scales with objects there. In the spec's RA budget, and unfixed.
+- ~~**The `delete_batch` fix does not help GCS.**~~ **DONE** by [M107](../M107/VERIFIED.md):
+  `ObjectStoreBackend::gcs` sends a batch of up to 100 deletes as one `POST
+  /batch/storage/v1`. `object_store` 0.14.1 maps GCS's `delete_stream` to one request per
+  location, and its JSON API has a bulk form after all, one it does not use.
 - ~~**`Engine::gc` builds an unbounded batch**~~ **DONE**, after this ledger: `gc` chunks at
   `max_batch_delete`, read from `Capabilities` rather than assumed, since S3 takes 1000 per
   request and Azure 256. `gc_never_exceeds_the_backends_delete_cap`,

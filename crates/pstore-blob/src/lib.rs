@@ -10,6 +10,8 @@ mod accounting;
 mod coalesce;
 mod congestion;
 mod faulty;
+#[cfg(feature = "gcs")]
+mod gcs_batch;
 mod memory;
 #[cfg(feature = "object_store")]
 mod object_store_backend;

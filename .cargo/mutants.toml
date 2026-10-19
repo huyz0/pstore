@@ -30,7 +30,12 @@ additional_cargo_test_args = ["--all-targets"]
 #
 # `object_store` and not `compat`: `compat` pulls the aws, gcp and azure clients into every
 # one of the N per-mutant builds, and those add nothing a mutant of ours can be caught by.
-additional_cargo_args = ["--features", "pstore-blob/object_store"]
+#
+# ⚠️ **And `gcs`, since M107**, which is the exception that rule names: GCS's batch delete is
+# our code behind that feature, so without it every mutant in `gcs_batch.rs` reads as MISSED
+# for the M7a reason. It costs the gcp client in each per-mutant build, and nothing narrower
+# compiles the code.
+additional_cargo_args = ["--features", "pstore-blob/object_store,pstore-blob/gcs"]
 
 # ⚠️ **Equivalent mutants, excluded by name -- each with its reason, and each premise tested.**
 # D-111's exclusion policy (engineering-standards.md): an exclusion says why and is reviewed

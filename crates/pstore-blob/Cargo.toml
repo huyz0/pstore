@@ -18,6 +18,9 @@ thiserror    = "2"
 tokio        = { version = "1", features = ["sync", "time", "rt"] }
 object_store = { version = "0.14.1", default-features = false, optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
+# M107: the request type of GCS's batch delete, which `object_store` takes but does not
+# re-export. Already in the lockfile, at the version `object_store` uses.
+http         = { version = "1", optional = true }
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
@@ -30,15 +33,20 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
 async-trait = "0.1"
 object_store = { version = "0.14.1", default-features = false }
+# M107: the emulator test seeds objects with a request `object_store` cannot send there.
+http = "1"
 
 [features]
 object_store = ["dep:object_store"]
+# M107: GCS's batch delete, one request for up to 100 objects. Not in `pstore-server`'s
+# features: GCS is not a server backend (the capability matrix), only a probe target.
+gcs = ["object_store", "object_store/gcp", "dep:http"]
 # ⚠️ The emulator-integration feature `dev/README.md` has always named and nothing has ever
 # provided. It pulls the three cloud clients in; `scripts/conformance.sh` is what runs them.
 compat = [
     "object_store",
     "object_store/aws",
-    "object_store/gcp",
+    "gcs",
     "object_store/azure",
 ]
 

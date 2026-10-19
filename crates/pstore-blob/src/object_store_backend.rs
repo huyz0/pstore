@@ -22,6 +22,9 @@ use std::sync::Arc;
 pub struct ObjectStoreBackend {
     inner: Arc<dyn ObjectStore>,
     caps: Capabilities,
+    /// GCS's batch endpoint (M107), which `delete_batch` uses in place of `delete_stream`.
+    #[cfg(feature = "gcs")]
+    batch: Option<Arc<crate::gcs_batch::GcsBatch>>,
 }
 
 impl ObjectStoreBackend {
@@ -32,7 +35,12 @@ impl ObjectStoreBackend {
     /// hope. See [`Self::unprobed`] for the pre-measurement value.
     #[must_use]
     pub fn new(inner: Arc<dyn ObjectStore>, caps: Capabilities) -> Self {
-        Self { inner, caps }
+        Self {
+            inner,
+            caps,
+            #[cfg(feature = "gcs")]
+            batch: None,
+        }
     }
 
     /// A profile for a backend the conformance suite has not run against yet.
@@ -71,6 +79,41 @@ impl ObjectStoreBackend {
                 ..caps
             },
         )
+    }
+
+    /// Wraps a GCS store (M107): `caps` with what GCS's batch endpoint does, whatever profile
+    /// it came from.
+    /// - Batches of 100, the API's cap, sent as **one** `POST {endpoint}/batch/storage/v1`
+    ///   through `client`, with the store's own credentials. `object_store` sends one
+    ///   `DELETE` per object, and `Accounted` bills one request for the lot.
+    /// - Deletes are billed.
+    ///
+    /// `endpoint` is the JSON API's root, `https://storage.googleapis.com` on GCS, since the
+    /// store does not say where it points.
+    #[cfg(feature = "gcs")]
+    #[must_use]
+    pub fn gcs(
+        store: object_store::gcp::GoogleCloudStorage,
+        client: object_store::client::HttpClient,
+        endpoint: &str,
+        bucket: &str,
+        caps: Capabilities,
+    ) -> Self {
+        let batch = crate::gcs_batch::GcsBatch {
+            client,
+            credentials: Arc::clone(store.credentials()),
+            endpoint: endpoint.to_owned(),
+            bucket: bucket.to_owned(),
+        };
+        Self {
+            inner: Arc::new(store),
+            caps: Capabilities {
+                max_batch_delete: crate::gcs_batch::MAX_BATCH,
+                delete_is_free: false,
+                ..caps
+            },
+            batch: Some(Arc::new(batch)),
+        }
     }
 
     fn path(key: &Key) -> Path {
@@ -246,6 +289,10 @@ impl crate::BlobStore for ObjectStoreBackend {
         if keys.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "gcs")]
+        if let Some(batch) = &self.batch {
+            return batch.delete(keys).await;
+        }
         let paths: Vec<Result<Path, object_store::Error>> =
             keys.iter().map(|k| Ok(Self::path(k))).collect();
         let stream = futures_util::stream::iter(paths).boxed();
@@ -305,6 +352,7 @@ pub(crate) fn map_cas_err(e: &object_store::Error) -> CasError {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::indexing_slicing,
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
@@ -341,6 +389,56 @@ mod tests {
         // Every other backend serves suffix reads.
         assert!(profile.suffix_read);
         assert!(crate::BlobStore::capabilities(&crate::MemoryStore::new()).suffix_read);
+    }
+
+    /// A GCS store that never leaves the process: building one makes no request.
+    #[cfg(feature = "gcs")]
+    fn gcs_over(gcs: &crate::gcs_batch::mock::Gcs, caps: Capabilities) -> ObjectStoreBackend {
+        let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+            .with_bucket_name("pstore")
+            .with_service_account_key(
+                r#"{"gcs_base_url": "http://gcs.invalid:1", "disable_oauth": true,
+                    "client_email": "", "private_key_id": "", "private_key": ""}"#,
+            )
+            .build()
+            .unwrap();
+        let client = object_store::client::HttpClient::new(gcs.clone());
+        ObjectStoreBackend::gcs(store, client, "http://gcs.invalid:1", "pstore", caps)
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn gcs_declares_batches_of_100_and_sends_each_as_one_request() {
+        use crate::BlobStore;
+        // `delete_is_free: true` and 1000 in, so both overrides are visible.
+        let profile = Capabilities {
+            cas: Support::Supported,
+            delete_is_free: true,
+            ..ObjectStoreBackend::unprobed("gcs")
+        };
+        let body = "--b\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n\r\n\
+                    --b\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 404 Not Found\r\n\r\n\r\n--b--";
+        let gcs = crate::gcs_batch::mock::Gcs::answering(200, "multipart/mixed; boundary=b", body);
+        let store = gcs_over(&gcs, profile);
+        let caps = store.capabilities();
+        assert_eq!(caps.max_batch_delete, 100);
+        assert!(!caps.delete_is_free);
+        assert_eq!(caps.cas, Support::Supported);
+
+        store.delete_batch(&[]).await.unwrap();
+        assert_eq!(gcs.sent().len(), 0, "an empty batch sent a request");
+        let over: Vec<Key> = (0..101).map(|i| Key::new(format!("k{i}"))).collect();
+        assert!(store.delete_batch(&over).await.is_err());
+        assert_eq!(gcs.sent().len(), 0, "an over-cap batch sent a request");
+
+        store
+            .delete_batch(&[Key::new("a/b"), Key::new("c")])
+            .await
+            .unwrap();
+        let sent = gcs.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "http://gcs.invalid:1/batch/storage/v1");
+        assert!(sent[0].4.contains("/o/a%2Fb HTTP/1.1"), "{}", sent[0].4);
     }
 
     #[test]
