@@ -917,9 +917,19 @@ async fn failed_shares_are_run_here_together() {
     // Code review: two failed shares run one after the other cost four more rounds. Run
     // together, two: HEAD, open, legs, the failed shares' open and legs, rows -- six rounds of
     // 400 ms (2.4 s), where one after the other is eight (3.2 s).
+    //
+    // M116: the dead peer accepts and closes, never a closed port. Windows retries a connect
+    // the port refused before reporting it, which costs this timed query a second or more;
+    // a connection closed at once fails in one loopback round trip on every OS.
     let dead = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                drop(c);
+            }
+        });
+        url
     };
     let (store, servers, _) = cluster(std::slice::from_ref(&dead)).await;
     let mut all = urls(&servers);
