@@ -151,6 +151,29 @@ fn an_identity_is_fresh_on_every_start() {
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
+#[test]
+fn identities_in_one_process_never_collide() {
+    // ⚠️ macOS's wall clock moves in microseconds: two calls in one tick read the same time,
+    // so the clock alone repeats an identity (M113). The call counter is what separates them.
+    let ids: Vec<String> = (0..10_000).map(|_| fresh_node_id()).collect();
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "an identity repeated in one process"
+    );
+    // Bits 64 to 95 are the counter's alone: the clock needs 61 bits, the process id sits at
+    // 96 and up. Hex digits 8..16 of the 32 hold those bits.
+    for w in ids.windows(2) {
+        let counter = |id: &str| id.get(8..16).map(str::to_owned);
+        assert_ne!(
+            w.first().and_then(|a| counter(a)),
+            w.get(1).and_then(|b| counter(b)),
+            "consecutive identities share the counter's bits"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_join_reads_the_roster_once_and_tolerates_an_empty_one() {
     let store = MemoryStore::new();

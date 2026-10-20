@@ -194,10 +194,19 @@ pub fn zone(raw: Option<&str>) -> Result<String, String> {
 /// ⚠️ Never derived from IP or hostname. A restarted node must look **cold** — it has no
 /// cache and owns nothing — and an identity that survives a restart tells the fleet
 /// otherwise.
+///
+/// ⚠️ The clock alone repeats: macOS's moves in microseconds, so two calls in one tick read
+/// the same time (M113). A call counter fills bits 64 to 95, which nothing else uses: the
+/// clock in nanoseconds needs 61 bits, and the process id sits at 96 and up.
 #[must_use]
 pub fn fresh_node_id() -> String {
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("{:032x}", t ^ (u128::from(std::process::id())) << 96)
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{:032x}",
+        t ^ (u128::from(n) << 64) ^ (u128::from(std::process::id()) << 96)
+    )
 }
