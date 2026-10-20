@@ -358,6 +358,10 @@ async fn the_largest_sealed_part_is_received() {
     let frame = seal::seal(keyed(&[7]).as_ref().unwrap(), &payload, &h);
     assert_eq!(frame.len(), 65_507);
     let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    // M114: sized as a member's is, or macOS refuses the frame here with "Message too long".
+    socket2::SockRef::from(&raw)
+        .set_send_buffer_size(swim::SEND_BUFFER)
+        .unwrap();
     raw.send_to(&frame, &addr).unwrap();
     // Waits for the `Part`'s own member by address: counting members would see the sender
     // learned too, and then each probed to death (code review).
@@ -372,6 +376,19 @@ async fn the_largest_sealed_part_is_received() {
     panic!(
         "the largest sealed datagram never arrived: {} refused",
         a.refused()
+    );
+}
+
+#[tokio::test]
+async fn a_member_socket_holds_the_largest_frame() {
+    // M114: macOS refuses a datagram larger than the socket's send buffer, and its default
+    // is 9,216 bytes, so a member that never sizes it drops every large frame at the sender.
+    let socket = swim::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let size = socket2::SockRef::from(&socket).send_buffer_size().unwrap();
+    assert!(
+        size >= swim::SEND_BUFFER,
+        "send buffer {size} is under {}",
+        swim::SEND_BUFFER
     );
 }
 

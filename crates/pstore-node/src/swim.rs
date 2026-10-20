@@ -221,6 +221,21 @@ fn now_micros() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
+/// The send buffer a member's socket asks for: four largest frames, so a round that sends to
+/// several peers does not refuse the next.
+pub const SEND_BUFFER: usize = 256 * 1024;
+
+/// Binds a member's socket, with a send buffer of at least `SEND_BUFFER`.
+///
+/// ⚠️ macOS refuses a UDP datagram larger than the socket's send buffer, and its default is
+/// 9,216 bytes (M114). `send_to`'s failure is ignored, so an unsized socket dropped every
+/// frame over that at the sender, silently. Linux's default of about 208 KiB hid it.
+pub async fn bind(listen: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(listen).await?;
+    socket2::SockRef::from(&socket).set_send_buffer_size(SEND_BUFFER)?;
+    Ok(socket)
+}
+
 /// Bind, and start probing, unauthenticated.
 pub async fn start(
     listen: &str,
@@ -245,7 +260,7 @@ pub async fn start_with(
     keys: Option<Keys>,
 ) -> Result<Member, Box<dyn std::error::Error>> {
     let listen: SocketAddr = listen.parse()?;
-    let socket = Arc::new(UdpSocket::bind(listen).await?);
+    let socket = Arc::new(bind(listen).await?);
 
     let me = derive_id(advertise).map_err(|()| "unusable advertise address")?;
     let mut cluster = Cluster::new(me, advertise.to_owned(), zone.to_owned());

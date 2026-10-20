@@ -18,6 +18,7 @@ pstore-types   = { path = "../pstore-types" }
 bytes          = "1"
 chitchat       = "0.13"
 ring           = "0.17"
+socket2        = "0.6"
 anyhow         = "1"
 async-trait    = "0.1"
 object_store   = { version = "0.14.1", features = ["aws"] }

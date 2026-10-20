@@ -1617,6 +1617,7 @@ dependencies = [
  "pstore-testkit",
  "pstore-types",
  "ring",
+ "socket2",
  "tokio",
 ]
 
