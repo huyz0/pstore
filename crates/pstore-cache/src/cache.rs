@@ -165,6 +165,17 @@ impl CacheCore {
         &self.state
     }
 
+    /// Waits for the disk tier's writes queued so far, and keeps it open.
+    ///
+    /// ⚠️ An insert the tier cannot queue is dropped, never an error: `foyer` refuses one once
+    /// 16 MiB wait to be written (M115). A caller that must not lose a burst waits between its
+    /// parts; `close` would do it too, but each reopen starts a fresh block and costs capacity.
+    pub async fn wait(&self) {
+        if let Some(d) = &self.disk {
+            d.wait().await;
+        }
+    }
+
     /// Flushes the disk tier's writes in flight, and closes it. A core is not used after.
     pub async fn close(&self) {
         if let Some(d) = &self.disk {

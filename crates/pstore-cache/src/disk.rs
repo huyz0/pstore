@@ -140,6 +140,13 @@ impl Tiers {
         self.of(class).insert(id.clone(), bytes.clone());
     }
 
+    /// Waits for the writes queued so far to reach the disk.
+    pub(crate) async fn wait(&self) {
+        for t in [&self.pinned, &self.meta, &self.bulk] {
+            t.storage().wait().await;
+        }
+    }
+
     /// Waits for the writes in flight, then closes each class.
     pub(crate) async fn close(&self) {
         for t in [&self.pinned, &self.meta, &self.bulk] {

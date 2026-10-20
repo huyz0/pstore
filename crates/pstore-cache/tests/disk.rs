@@ -198,6 +198,12 @@ async fn a_bulk_burst_leaves_meta_on_disk() {
         c.get_range_as(&key(i), 0..(BLOCK as u64 / 4 - 4096), Class::Bulk)
             .await
             .unwrap();
+        // M115: `foyer` drops an insert once 16 MiB are queued for the disk, as the tier
+        // means to, so a burst written faster than it flushes loses its newest entries -- the
+        // very ones read back below. Waiting every 4 MiB keeps the queue under that.
+        if i % 16 == 15 {
+            core.wait().await;
+        }
     }
     core.close().await;
     let core = open(&dir.0, "A").await;
@@ -236,6 +242,31 @@ fn files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn a_waited_write_is_on_disk_before_close() {
+    // M115: `wait` is what lets a test write more than `foyer` queues without dropping, so
+    // the entry is on disk once it returns, with the core still open.
+    let dir = Dir::new("wait");
+    let acct = store(1, 8192, 13).await;
+    let core = open(&dir.0, "A").await;
+    let want = over(&acct, &core)
+        .get_range(&key(0), 0..8192)
+        .await
+        .unwrap();
+    core.wait().await;
+    let found = files(&dir.0)
+        .iter()
+        .filter(|f| {
+            std::fs::read(f)
+                .unwrap()
+                .windows(want.len())
+                .any(|w| w == &want[..])
+        })
+        .count();
+    assert_eq!(found, 1, "the value was not on disk after wait");
+    core.close().await;
 }
 
 #[tokio::test]
