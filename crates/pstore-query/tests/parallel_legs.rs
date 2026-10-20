@@ -48,6 +48,9 @@ struct Legs {
     /// The most leg reads ever in flight at once.
     most: Arc<AtomicUsize>,
     reads: Arc<AtomicU64>,
+    /// How long the leg reads held their threads, summed, in nanoseconds: measured, never
+    /// the hold asked for, because a sleep may run long and never short (M117).
+    held: Arc<AtomicU64>,
 }
 
 /// Counts a read in flight until it is dropped, completed or not.
@@ -68,6 +71,7 @@ impl Legs {
             in_flight: Arc::default(),
             most: Arc::default(),
             reads: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -82,7 +86,12 @@ impl Legs {
             .insert(format!("{:?}", std::thread::current().id()));
         let how = *self.read.lock().unwrap();
         match how {
-            Read::Block(ms) => std::thread::sleep(Duration::from_millis(ms)),
+            Read::Block(ms) => {
+                let from = Instant::now();
+                std::thread::sleep(Duration::from_millis(ms));
+                let nanos = u64::try_from(from.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.held.fetch_add(nanos, Ordering::SeqCst);
+            }
             Read::Hang => std::future::pending::<()>().await,
         }
     }
@@ -207,6 +216,7 @@ async fn legs_are_scored_in_parallel() {
     *store.read.lock().unwrap() = Read::Block(25);
     store.threads.lock().unwrap().clear();
     store.most.store(0, Ordering::SeqCst);
+    store.held.store(0, Ordering::SeqCst);
     let started = Instant::now();
     let got = query(&store, &targets, &dense(), Fusion::default(), 10)
         .await
@@ -217,10 +227,15 @@ async fn legs_are_scored_in_parallel() {
     // task, a blocking read holds the only thread the query has, so the most is 1.
     let most = store.most.load(Ordering::SeqCst);
     assert!(most >= 2, "at most {most} leg read(s) ran at once");
-    let serial = Duration::from_millis(25 * reads);
+    // M117: serial is the holds as measured, not 25 ms times the reads. A sleep runs long on
+    // a loaded runner and never short, so the declared sum understates what one after the
+    // other costs: macOS took 397 ms against a declared 400. Run one after the other, the
+    // query takes at least the measured sum, so half of it still needs two reads at once.
+    let serial = Duration::from_nanos(store.held.load(Ordering::SeqCst));
+    let declared = Duration::from_millis(25 * reads);
     assert!(
         took < serial / 2,
-        "{reads} leg reads holding 25 ms each took {took:?}: serial is {serial:?}"
+        "{reads} leg reads took {took:?}: serial is {serial:?} as held ({declared:?} as asked)"
     );
     let threads = store.threads.lock().unwrap().len();
     assert!(threads >= 2, "the leg reads ran on {threads} thread(s)");
