@@ -3763,8 +3763,32 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<Folded, EngineError> {
         require_fencing(&*self.store)?;
         let mut interfere = interfere;
+        // What the first attempt read: each lane and its tail.
+        let mut named: Option<Vec<(LaneId, u64)>> = None;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
+            // ⚠️ **A fold that lost stops once a winner folded what it first read** (M111). A
+            // loser rebased onto everything left -- including what other lanes flushed while it
+            // worked -- so under steady writes it always found more, and a fold slower than its
+            // peers lost every attempt and returned `Lost` for rows already visible. A winner
+            // whose watermarks reach every tail the first attempt read has folded every bundle
+            // acknowledged before this call, which is what `Ok` promises -- and a check of only
+            // this process's own batches would not be: another lane's bundle can be past the
+            // winner's read and inside this one's (spec review M1). A drop needs a commit of its
+            // own, so it never stops here. `Contended` counts as a loss: the predicate is the
+            // same either way, and an unmoved HEAD never satisfies it.
+            if drop.is_none()
+                && let Some(named) = &named
+                && named
+                    .iter()
+                    .all(|(l, tail)| at.head.watermarks.get(&l.0).copied().unwrap_or(0) >= *tail)
+            {
+                // The winner may have created a schema; the door refuses against it (spec
+                // review M4).
+                self.remember_schemas(&at.head);
+                self.prune_to(&at.head);
+                return Ok(Folded::Nothing(at.head.epoch));
+            }
             let live = lanes::live(&*self.store, self.tenant).await?;
 
             // Each lane's unfolded span, discovered rather than remembered.
@@ -3777,6 +3801,7 @@ impl<S: BlobStore> Engine<S> {
                 }
             }))
             .await?;
+            named.get_or_insert_with(|| spans.iter().map(|(l, _, tail)| (*l, *tail)).collect());
 
             let keys: Vec<(LaneId, Key)> = spans
                 .iter()

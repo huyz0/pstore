@@ -591,24 +591,34 @@ async fn mine(w: &World, before: &BTreeSet<String>) -> Vec<String> {
 
 #[tokio::test]
 async fn a_fold_buries_what_its_discarded_attempts_created() {
-    // A lost CAS: another lane folds everything between A's seal and A's commit.
+    // A lost CAS: another process commits between A's seal and A's commit.
+    //
+    // ⚠️ **A compaction, not a fold** (M111). A retry commits only while no winner has folded
+    // what A's first attempt read: a fold that lost stops once one has. This used to be
+    // another lane folding everything and then a row flushed during A's fold, which A's retry
+    // folded -- since M111 that fold stops at the rebase, with nothing of its first read left,
+    // and buries at its next commit (the test below). A compaction commits without moving a
+    // watermark, so A's retry still has the bundle it read, and commits.
     let w = World::new();
+    for id in ["s0", "s1"] {
+        w.put("idx", &[id]).await;
+        w.w.fold().await.unwrap();
+    }
     w.put("idx", &["a"]).await;
     let other = engine(&Store::view(&w.inner), 2);
     let before: BTreeSet<String> = w.objects().await.into_keys().collect();
     let epochs = w.head().await.epoch.0;
     let got = w
         .paused(".seg", w.a.fold(), async {
-            other.write("idx", vec![doc("z", 9.0)]).await.unwrap();
-            other.flush().await.unwrap();
-            other.fold().await.unwrap();
-            // A row only A's retry can fold, so the retry commits.
-            w.put("idx", &["b"]).await;
+            assert!(
+                other.compact("idx").await.unwrap().is_some(),
+                "nothing compacted"
+            );
         })
         .await;
     got.unwrap();
     let head = w.head().await;
-    // Two commits, the other lane's and A's retry: no burial commit of its own.
+    // Two commits, the compaction and A's retry: no burial commit of its own.
     assert_eq!(head.epoch.0, epochs + 2);
     let live: BTreeSet<String> = head
         .indexes
@@ -630,7 +640,7 @@ async fn a_fold_buries_what_its_discarded_attempts_created() {
     for k in mine.iter().filter(|k| grave.contains(*k)) {
         assert!(w.bytes(k).await.is_none(), "{k} survived GC");
     }
-    assert_eq!(w.ids("idx").await, set(&["a", "b", "z"]));
+    assert_eq!(w.ids("idx").await, set(&["s0", "s1", "a"]));
 }
 
 #[tokio::test]
