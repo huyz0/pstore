@@ -61,7 +61,33 @@ pub(crate) struct Tiers {
     pinned: Tier,
     meta: Tier,
     bulk: Tier,
+    /// Last, so the classes are dropped before it is shut down.
+    _workers: Workers,
 }
+
+/// The runtime `foyer`'s flushers, reclaimers and file I/O run on, shut down with the tier.
+///
+/// ⚠️ **Not the caller's** (M118). foyer-storage 0.22.3 spawns a reclaim while it holds its
+/// block state lock, a runtime shutting down drops that task at once, and the task's drop
+/// takes the same lock again: a self-deadlock on the thread shutting the runtime down. On
+/// the caller's runtime that is the test's thread, or `main`'s, so a panic or an early
+/// return before `close` hung instead of failing. Here it is a worker nothing waits for.
+///
+/// ⚠️ **Shut down, never left to drop.** `foyer`'s flushers never exit, so a runtime held
+/// only by its tasks outlived its tier -- ten threads leaked per core opened -- and dropping
+/// a runtime inside another's async context panics.
+struct Workers(Option<tokio::runtime::Runtime>);
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// Two workers: they only queue. The file I/O runs on the runtime's blocking pool.
+const WORKERS: usize = 2;
 
 type Tier = foyer::HybridCache<Id, Bytes>;
 
@@ -98,15 +124,23 @@ impl Tiers {
             sync_dir(&root);
         }
         let (p, m, b) = crate::cache::shares(c.bytes);
-        let pinned = tier(&root.join("pinned"), p, c.block).await?;
-        let meta = match tier(&root.join("meta"), m, c.block).await {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .thread_name("pstore-cache")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cache runtime: {e}"))?;
+        let spawner = foyer::Spawner::from(rt.handle().clone());
+        let workers = Workers(Some(rt));
+        let pinned = tier(&root.join("pinned"), p, c.block, &spawner).await?;
+        let meta = match tier(&root.join("meta"), m, c.block, &spawner).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = pinned.close().await;
                 return Err(e);
             }
         };
-        let bulk = match tier(&root.join("bulk"), b, c.block).await {
+        let bulk = match tier(&root.join("bulk"), b, c.block, &spawner).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = pinned.close().await;
@@ -114,7 +148,12 @@ impl Tiers {
                 return Err(e);
             }
         };
-        Ok(Self { pinned, meta, bulk })
+        Ok(Self {
+            pinned,
+            meta,
+            bulk,
+            _workers: workers,
+        })
     }
 
     fn of(&self, class: Class) -> &Tier {
@@ -162,7 +201,12 @@ const CLASSES: [&str; 3] = ["pinned", "meta", "bulk"];
 /// filled under `/1` is emptied rather than left as entries no lookup can find.
 const FORMAT: &str = "pstore-cache/2";
 
-async fn tier(dir: &std::path::Path, bytes: usize, block: usize) -> Result<Tier, String> {
+async fn tier(
+    dir: &std::path::Path,
+    bytes: usize,
+    block: usize,
+    spawner: &foyer::Spawner,
+) -> Result<Tier, String> {
     let why = |e: &dyn std::fmt::Display| format!("{}: {e}", dir.display());
     // Whole blocks, and at least two: one being written, one to evict.
     let capacity = (bytes / block).max(2) * block;
@@ -178,6 +222,7 @@ async fn tier(dir: &std::path::Path, bytes: usize, block: usize) -> Result<Tier,
         .storage()
         .with_engine_config(foyer::BlockEngineConfig::new(device).with_block_size(block))
         .with_recover_mode(foyer::RecoverMode::Quiet)
+        .with_spawner(spawner.clone())
         .build()
         .await
         .map_err(|e| why(&e))
@@ -286,8 +331,50 @@ mod tests {
         clippy::indexing_slicing,
         reason = "assertions in tests are the reporting mechanism"
     )]
-    use super::Id;
+    use super::{Class, DiskConfig, Id, Tiers};
     use std::hash::BuildHasher as _;
+
+    /// A tier in a fresh directory under the system's temporary one.
+    async fn open(name: &str) -> (Tiers, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pstore-tiers-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = DiskConfig::new(&dir, 1, 8 << 20, "A").with_block(1 << 20);
+        (Tiers::open(&c).await.unwrap(), dir)
+    }
+
+    /// M118 criterion 1: a runtime shutting down drops `foyer`'s tasks on the thread doing it,
+    /// and `foyer` can deadlock there. So none of its tasks is on the caller's runtime.
+    #[tokio::test]
+    async fn foyer_runs_on_the_tiers_workers() {
+        let (t, dir) = open("workers").await;
+        for class in [&t.pinned, &t.meta, &t.bulk] {
+            let name = class
+                .storage()
+                .spawner()
+                .spawn(async { std::thread::current().name().map(str::to_owned) })
+                .await
+                .unwrap();
+            assert_eq!(name.as_deref(), Some("pstore-cache"));
+        }
+        t.close().await;
+        drop(t);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// M118 criterion 2: `foyer`'s flushers never exit, so a runtime left to its tasks outlives
+    /// the tier. Dropped, the tier's workers stop: a task spawned after never runs.
+    #[tokio::test]
+    async fn a_dropped_tier_stops_its_workers() {
+        let (t, dir) = open("stops").await;
+        let spawner = t.bulk.storage().spawner().clone();
+        t.close().await;
+        drop(t);
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(5), spawner.spawn(async {}))
+            .await
+            .unwrap();
+        assert!(ran.is_err(), "a task ran on a dropped tier's runtime");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// M28 criterion 6: `foyer` finds a recovered entry by this hash, so it is pinned to bytes
     /// this crate defines. Each literal is `XxHash64`, seed 0, of the `Id`'s 40-byte encoding,
@@ -332,5 +419,45 @@ mod tests {
         wire[0] = 1;
         wire[9] = 0xff;
         assert!(Id::decode(&mut wire.as_slice()).is_err(), "non-UTF-8 key");
+    }
+    /// Floods every class with eight times its share, waits `linger`, and returns with the
+    /// tier open: a reclaim in flight, and a flusher waiting for its block. Whether the
+    /// runtime, dropped then, returned within 20 s.
+    fn returns(round: usize, linger: std::time::Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // ⚠️ A thread of its own: a run that hangs is abandoned, not joined.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let dir = rt.block_on(async {
+                let (t, dir) = open(&format!("flood-{round}")).await;
+                let v = bytes::Bytes::from(vec![7u8; (1 << 18) - 4096]);
+                for i in 0..256 {
+                    for class in [Class::Pinned, Class::Meta, Class::Bulk] {
+                        t.insert(&Id::Range(format!("k{i}"), 0, i), &v, class);
+                    }
+                }
+                tokio::time::sleep(linger).await;
+                dir
+            });
+            drop(rt);
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok()
+    }
+
+    /// M118 criterion 3: a runtime dropped with the tier open returns. Before M118, 25 of 100
+    /// such drops hung, in `foyer`'s `on_reclaim_finish` waiting on its own lock.
+    #[test]
+    fn a_runtime_dropped_mid_flood_returns() {
+        let hung = (0..20).find(|&r| !returns(r, std::time::Duration::from_micros(r as u64 * 20)));
+        assert_eq!(
+            hung, None,
+            "a runtime dropped with the tier open never returned"
+        );
     }
 }
