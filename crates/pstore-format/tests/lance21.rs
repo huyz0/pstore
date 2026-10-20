@@ -35,7 +35,15 @@ async fn dataset(name: &str) -> (MemoryStore, Key) {
     let store = MemoryStore::new();
     let mut manifest = None;
     for f in files {
-        let rel = f.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+        // Joined with `/`: on Windows `to_str()` gives `\`, and a key is never a
+        // Windows path (M112).
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("/");
         let key = Key::new(format!("lake/{name}/{rel}"));
         store
             .put(&key, std::fs::read(&f).unwrap().into())

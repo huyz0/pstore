@@ -46,7 +46,15 @@ async fn lance(store: &impl BlobStore, name: &str) {
     let mut files = Vec::new();
     walk(&root, &mut files);
     for f in files {
-        let rel = f.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+        // Joined with `/`: on Windows `to_str()` gives `\`, and a key is never a
+        // Windows path (M112).
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("/");
         store
             .put(
                 &Key::new(format!("lake/{name}/{rel}")),

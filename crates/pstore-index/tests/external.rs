@@ -604,7 +604,15 @@ async fn an_index_over_a_lance_dataset_finds_the_exact_neighbours() {
                 stack.push(p);
                 continue;
             }
-            let rel = p.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+            // Joined with `/`: on Windows `to_str()` gives `\`, and a key is never a
+            // Windows path (M112).
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
             let key = Key::new(format!("lake/one/{rel}"));
             store
                 .put(&key, std::fs::read(&p).unwrap().into())
@@ -725,7 +733,15 @@ async fn lance_dataset_in(dir: &str, name: &str) -> (MemoryStore, Key) {
                 stack.push(p);
                 continue;
             }
-            let rel = p.strip_prefix(&root).unwrap().to_str().unwrap().to_owned();
+            // Joined with `/`: on Windows `to_str()` gives `\`, and a key is never a
+            // Windows path (M112).
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
             let key = Key::new(format!("lake/{name}/{rel}"));
             store
                 .put(&key, std::fs::read(&p).unwrap().into())
