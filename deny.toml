@@ -1,6 +1,14 @@
 # cargo-deny: advisories, licences, and dependency bans.
 [advisories]
 yanked = "deny"
+# ⚠️ **Ignored by the owner's decision (2026-10-20), not because it was fixed.** `paste` is
+# unmaintained (RUSTSEC-2024-0436): an advisory with no vulnerability and no safe version to
+# move to. It is a compile-time proc-macro that only `foyer-memory` pulls in, under
+# `pstore-cache`, so no `paste` code runs in a node. Remove this entry once foyer drops it --
+# `cargo deny` warns about an ignore that matches nothing, so the gate will say when.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable; compile-time only, via foyer-memory; owner accepted 2026-10-20" },
+]
 
 [licenses]
 # ⚠️ An allowance no crate uses is a FAILURE here, not a spare permission — `cargo deny`
