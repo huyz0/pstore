@@ -79,3 +79,5 @@ on a path that fails. No LIST.
 ## Tasks
 
 - **M120.1** — all of it, and the ledger.
+- **M120.2** — the review's minors: a multi-query told apart before any typed parse, the
+  part's dispatch pinned by the equivalence test, the corpus widened.

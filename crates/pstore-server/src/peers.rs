@@ -1224,7 +1224,29 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
                 .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?,
         ),
     };
-    let (protocol, phase) = match &raw {
+    let (protocol, phase) = heading(&raw)?;
+    match (protocol, phase.as_deref()) {
+        (Some(p), None) if p == u64::from(PROTOCOL) => serve_whole(&api, tenant, raw).await,
+        (Some(p), Some("open")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
+            serve_open(&api, tenant, raw).await
+        }
+        (Some(p), Some("scan")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
+            serve_scan(&api, tenant, raw).await
+        }
+        _ => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "protocol_mismatch",
+            format!(
+                "this server speaks part protocols {PROTOCOL}, and {PHASED} and {SUMMED} (open, \
+                 scan), not {protocol:?} {phase:?}"
+            ),
+        )),
+    }
+}
+
+/// A part's protocol and phase, read as the tree's `get`s read them.
+fn heading(raw: &Body<'_>) -> Result<(Option<u64>, Option<String>), ApiError> {
+    Ok(match raw {
         Body::Tree(raw) => (
             raw.get("protocol").and_then(serde_json::Value::as_u64),
             raw.get("phase")
@@ -1250,24 +1272,7 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
                     .map(str::to_owned),
             )
         }
-    };
-    match (protocol, phase.as_deref()) {
-        (Some(p), None) if p == u64::from(PROTOCOL) => serve_whole(&api, tenant, raw).await,
-        (Some(p), Some("open")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
-            serve_open(&api, tenant, raw).await
-        }
-        (Some(p), Some("scan")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
-            serve_scan(&api, tenant, raw).await
-        }
-        _ => Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "protocol_mismatch",
-            format!(
-                "this server speaks part protocols {PROTOCOL}, and {PHASED} and {SUMMED} (open, \
-                 scan), not {protocol:?} {phase:?}"
-            ),
-        )),
-    }
+    })
 }
 
 /// A part's body: plain, to parse once, or the tree the rest are judged by (M120).
@@ -1577,6 +1582,12 @@ mod tests {
             };
             let tree: serde_json::Value = serde_json::from_slice(&b).unwrap();
             let label = String::from_utf8_lossy(&b).into_owned();
+            // The dispatch, too, reads what the tree's `get`s read.
+            assert_eq!(
+                heading(&Body::Plain(&b)).map_err(|e| format!("{e:?}")),
+                heading(&Body::Tree(tree.clone())).map_err(|e| format!("{e:?}")),
+                "heading: {label}"
+            );
             assert_eq!(
                 shown(wire_of::<WireScan>(Body::Plain(&b)).map(|w| format!("{w:?}"))),
                 shown(wire_of::<WireScan>(Body::Tree(tree.clone())).map(|w| format!("{w:?}"))),

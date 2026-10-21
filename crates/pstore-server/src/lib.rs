@@ -1690,16 +1690,7 @@ async fn query_index<S: BlobStore + 'static>(
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
     let token = session_of(&headers, tenant)?;
-    // M120: one query, parsed once into its type where that is the tree's answer ([`body`]);
-    // a body naming `queries` is a multi-query, and goes the tree's way with every other.
-    let fast = body::typed::<QueryRequest>(&body)
-        .filter(|(shape, _)| {
-            shape
-                .keys
-                .as_ref()
-                .is_some_and(|k| !k.iter().any(|k| k == "queries"))
-        })
-        .map(|(_, req)| req);
+    let fast = fast_query(&body);
     let raw: serde_json::Value = if fast.is_some() {
         serde_json::Value::Null
     } else {
@@ -1790,6 +1781,16 @@ async fn query_index<S: BlobStore + 'static>(
         }),
         &session,
     ))
+}
+
+/// One query, parsed once into its type where that is the tree's answer (M120, [`body`]), or
+/// `None` for the tree to parse. A body naming `queries` is a multi-query, the tree's, and is
+/// told apart before any typed parse: its sub-queries are not parsed twice to be discarded.
+fn fast_query(raw: &[u8]) -> Option<QueryRequest> {
+    body::plain(raw)?
+        .keys
+        .filter(|k| !k.iter().any(|k| k == "queries"))?;
+    serde_json::from_slice(raw).ok()
 }
 
 /// The most queries one request may carry (M9g), turbopuffer's bound.
@@ -4628,8 +4629,18 @@ mod tests {
             r#"{"documents": [{"id": "a", "vector": [1]}], "documents": [{"id": "b", "vector": [2]}]}"#,
             r#"{"documents": [{"id": "a", "id": "b", "vector": [1]}]}"#,
             r#"{"documents": [{"id": "a", "vector": [1], "attributes": {"n": 1, "n": 2}}]}"#,
-            r#"{"documents": [{"id": "a", "vector": [1], "attributes": {"n": 1, "n": 2}}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1], "attributes": {"n": 1, "\u006e": 2}}]}"#,
             r#"{"documents": [{"id": "a", "vector": [1e999]}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [-0, 18446744073709551616, 1e-50], "attributes": {"z": -0, "big": 18446744073709551616, "neg": -9223372036854775809}}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1], "vectors": {"late": [[1, 2], "AACAPw=="]}}]}"#,
+            r#"{"text": ["a", "b"], "top_k": 5}"#,
+            r#"{"text": "a", "top_k": 5, "include_attributes": ["n", "s"]}"#,
+            r#"{"text": "a", "top_k": 5, "include_attributes": true}"#,
+            r#"{"multi": {"field": "late", "vectors": [[1, 2]]}, "top_k": 5}"#,
+            r#"{"multi": {"field": "late", "vectors": [[1, 2]], "nope": 1}, "top_k": 5}"#,
+            r#"{"vector": [-0, 1e-50], "top_k": 5, "as_of": null}"#,
+            r#"{"vector": [1], "top_k": 18446744073709551616}"#,
+            r#"{"vector": [1], "top_k": -1}"#,
             r#"{"documents": [], "x": 1e999}"#,
             r#"{"documents": [], "x": [1, {"y": -1e400}]}"#,
             r#"{"documents": [{"id": "a", "vector": [1, "a"]}]}"#,
@@ -4644,6 +4655,9 @@ mod tests {
             r#"{"queries": null}"#,
             r#"{"vector": [1], "top_k": 1, "nope": 1e999}"#,
             r#"{"protocol": 1, "phase": "open"}"#,
+            r#"{"protocol": null, "phase": null}"#,
+            r#"{"protocol": 2.0, "phase": 3}"#,
+            r#"{"protocol": -1, "phase": "scan"}"#,
             r#"[]"#,
             r#"[{"durability": "async"}]"#,
             r#""x""#,
@@ -4697,16 +4711,8 @@ mod tests {
             // A multi-query is not the single path's.
             raw.get("queries").is_none().then(|| parse_query(raw))
         }
-        fn fast_query(body: &[u8]) -> Option<Result<QueryRequest, ApiError>> {
-            let fast = body::typed::<QueryRequest>(body)
-                .filter(|(shape, _)| {
-                    shape
-                        .keys
-                        .as_ref()
-                        .is_some_and(|k| !k.iter().any(|k| k == "queries"))
-                })
-                .map(|(_, req)| req);
-            match fast {
+        fn either_query(body: &[u8]) -> Option<Result<QueryRequest, ApiError>> {
+            match fast_query(body) {
                 Some(req) => Some(checked_query(req)),
                 None => tree_query(body),
             }
@@ -4718,14 +4724,15 @@ mod tests {
         let mut fast_hits = 0;
         for b in bodies() {
             let label = String::from_utf8_lossy(&b).into_owned();
-            fast_hits += usize::from(body::typed::<WriteRequest>(&b).is_some());
+            fast_hits += usize::from(body::typed::<WriteRequest>(&b).is_some())
+                + usize::from(fast_query(&b).is_some());
             assert_eq!(
                 shown(parse_write(&b).map(|r| format!("{r:?}"))),
                 shown(tree_write(&b).map(|r| format!("{r:?}"))),
                 "write: {label}"
             );
             assert_eq!(
-                fast_query(&b).map(|r| shown(r.map(|q| format!("{q:?}")))),
+                either_query(&b).map(|r| shown(r.map(|q| format!("{q:?}")))),
                 tree_query(&b).map(|r| shown(r.map(|q| format!("{q:?}")))),
                 "query: {label}"
             );

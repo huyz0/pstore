@@ -10,8 +10,11 @@ with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`,
    passes: 2 rounds. **Red first** with the serial code restored: `left: 7, right: 2` and
    `a three-field scan took 4 rounds`.
 2. `the_fast_parse_is_the_tree_parse` and `the_fast_part_is_the_tree_part` pass: every body
-   of the corpus -- 32 shapes and every truncation of a valid write -- gets the tree's answer
-   from the write, query and part parsers, error text included, and the fast path is taken.
+   of the corpus -- 45 shapes and every truncation of a valid write -- gets the tree's answer
+   from the write, query and part parsers and the part's dispatch, error text included, and
+   the fast path is taken. M120.2 widened it at review: `-0`, integers past `u64` and `i64`,
+   untagged `text` and `include_attributes`, `multi` with and without an unknown field, a
+   `null` option, an escaped key repeated, and a protocol of each wrong type.
    **Red first** with the validation pass skipped: `query: {"documents": [{"id": "a",
    "vector": [1e999]}]}` was accepted where the tree said `number out of range`.
    ⚠️ **Drift from the test plan:** it named the duplicate-key check as the mutation. That
