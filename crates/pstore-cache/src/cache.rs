@@ -15,16 +15,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 ///
 /// ⚠️ `Hash` is written by hand, over the disk tier's encoding (M28): `foyer` files an entry
 /// under its hash, and a derived one is not promised stable across Rust releases.
+///
+/// ⚠️ The key is an `Arc<str>` (M120): a batched read names one object in every range, and a
+/// `String` an `Id` copied the key once a range, per call. One key is shared by all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Id {
     /// An exact byte range of an object.
-    Range(String, u64, u64),
+    Range(Arc<str>, u64, u64),
     /// A whole object the caller asserted is immutable.
-    Whole(String),
+    Whole(Arc<str>),
     /// The last *n* bytes. ⚠️ A separate shape on purpose: `get_suffix` exists because the
     /// caller does **not** know the object's length, so it cannot be expressed as a range
     /// without the `head` this design refuses to put on the read path.
-    Suffix(String, u64),
+    Suffix(Arc<str>, u64),
 }
 
 /// The state a cache keeps, shared by every [`Caching`] wrapped over it (M20).
@@ -353,7 +356,7 @@ impl<S: BlobStore> Caching<S> {
     /// entry was evicted, which a byte total cannot show.
     #[must_use]
     pub fn holds(&self, key: &Key, range: Range<u64>) -> bool {
-        let id = Id::Range(key.as_str().to_owned(), range.start, range.end);
+        let id = Id::Range(key.as_str().into(), range.start, range.end);
         self.core.as_ref().is_some_and(|c| {
             [&c.pinned, &c.meta, &c.bulk]
                 .iter()
@@ -463,7 +466,7 @@ impl<S: BlobStore> BlobStore for Caching<S> {
         let Some(core) = &self.core else {
             return self.inner.get_range_as(key, range, class).await;
         };
-        let id = Id::Range(key.as_str().to_owned(), range.start, range.end);
+        let id = Id::Range(key.as_str().into(), range.start, range.end);
         core.fetch_once(id, class, || {
             self.inner.get_range_as(key, range.clone(), class)
         })
@@ -486,7 +489,9 @@ impl<S: BlobStore> BlobStore for Caching<S> {
         let Some(core) = &self.core else {
             return self.inner.get_ranges_as(key, ranges, class).await;
         };
-        let id = |r: &Range<u64>| Id::Range(key.as_str().to_owned(), r.start, r.end);
+        // One key for every range, shared (M120).
+        let name: Arc<str> = key.as_str().into();
+        let id = |r: &Range<u64>| Id::Range(Arc::clone(&name), r.start, r.end);
         // Split hits from misses, keyed by what was ASKED for -- every range looked up at
         // once, since a disk lookup is a read of its own.
         let mut out: Vec<Option<Bytes>> = futures_util::future::join_all(ranges.iter().map(|r| {
@@ -543,7 +548,7 @@ impl<S: BlobStore> BlobStore for Caching<S> {
         let Some(core) = &self.core else {
             return self.inner.get_suffix_as(key, n, class).await;
         };
-        let id = Id::Suffix(key.as_str().to_owned(), n);
+        let id = Id::Suffix(key.as_str().into(), n);
         core.fetch_once(id, class, || self.inner.get_suffix_as(key, n, class))
             .await
     }
@@ -554,7 +559,7 @@ impl<S: BlobStore> BlobStore for Caching<S> {
         let Some(core) = &self.core else {
             return self.inner.get_immutable(key, class).await;
         };
-        let id = Id::Whole(key.as_str().to_owned());
+        let id = Id::Whole(key.as_str().into());
         core.fetch_once(id, class, || self.inner.get_immutable(key, class))
             .await
     }
@@ -615,7 +620,7 @@ mod tests {
                 panic!("recency is not O(log entries): past 20 s at step {i}");
             }
         };
-        let id = |i: usize| Id::Range(format!("k{i}"), 0, 1);
+        let id = |i: usize| Id::Range(format!("k{i}").into(), 0, 1);
         let one = Bytes::from_static(b"x");
         let mut s = State::default();
         for i in 0..N {

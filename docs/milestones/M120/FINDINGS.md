@@ -6,13 +6,15 @@ by the gate run on that commit; a row naming a test names one that passes, and t
 record the mutation each went red under first, where one was run. **Rejected** gives the reason. The bench digests
 ([M119](../M119/VERIFIED.md) criterion 2) held across every commit below.
 
-Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, and this
-ledger's correction after it. Each commit's gate run is the whole workspace's suite at that
+Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, M120.4
+`4bb3ef2` (this ledger's count), and M120.5 (engine 7's last sub-point, and the tests the
+appendix found missing). Each commit's gate run is the whole workspace's suite at that
 commit, so the last run covers every test named below at once.
 
 **The count.** The reviews numbered **47** findings: 10 index, 10 format, 9 query, 9 engine
-and cache, 9 server. **All 47 are fixed.** Two of them carried a sub-point that is rejected
-below (format 10, engine 7), with the reason. Three rows marked `—` are not among the 47: two
+and cache, 9 server. **All 47 are fixed**, every sub-point included but one: format 10's
+per-row key clone, which is rejected below with the reason -- the allocation is the
+document's own map key, not a copy of anything. Three rows marked `—` are not among the 47: two
 found later (the spikes, the projected mask) and fixed, and one the review itself declined.
 
 ## `pstore-index`
@@ -71,7 +73,7 @@ found later (the spikes, the projected mask) and fixed, and one the review itsel
 | 4 | a coalesced slice pins its whole fetch in the cache | Fixed, M119.2: admitted as a copy |
 | 5 | every write rescans every held row | Fixed, M119.2: only for a named field |
 | 6 | schemas cloned a query | Fixed, M119.2: compared first |
-| 7 | misses placed in O(misses × ranges); a lock a range; a key `String` a range | Fixed: by index in M119.2; one lock a batch in M120.3. **Rejected:** the key -- `HashMap<Id, _>` is looked up by an owned `Id`, and stable `std` has no borrowed-key lookup for a composite key |
+| 7 | misses placed in O(misses × ranges); a lock a range; a key `String` a range | Fixed: by index in M119.2; one lock a batch in M120.3; the key an `Arc<str>` shared by every range of a call in M120.5 (`the_disk_hash_is_the_encodings` pins the encoding unchanged) |
 | 8 | a tokio mutex for a synchronous section | Fixed, M119.2: `std`, poison recovered |
 | 9 | `scoped` allocates a `String` a byte | Fixed, M119.2 |
 
@@ -93,3 +95,54 @@ found later (the spikes, the projected mask) and fixed, and one the review itsel
 The two independent reviews' findings are in [M119's](../M119/VERIFIED.md) and
 [this milestone's](VERIFIED.md) ledgers: the first's two majors are M120's Deltas 1 and 2,
 its minors fixed in M119.2; the second's minors are M120.2.
+
+## Appendix — the tests over each row's path
+
+Each row's path is executed by these, among others; `=` marks a test that compares against
+brute force, a reference implementation or the code it replaced, so a wrong value on that
+path fails it. Found by a read-only sweep of the suite; each name resolves.
+
+| Row | Tests |
+|---|---|
+| index 1, 3 | `the_branchless_kernel_is_the_branchy_one` =, `every_rung_zero_score_is_the_rows_code_against_its_own_lists_centroid` =, `probing_every_list_is_the_flat_search` = |
+| index 2 | `the_table_in_place_is_the_decoded_one` =, `probing_every_list_reaches_every_candidate`, `a_corrupt_centroid_table_is_refused_not_guessed` |
+| index 4 | `top_k_matches_a_full_sort` =, `the_exact_rung_reproduces_brute_force_on_what_it_is_given` =, `sq8_probe_orders_and_scores_as_f32` = |
+| index 5 | `a_replicated_document_appears_once_in_a_top_k` =, `augmentation_lifts_recall_by_five_points_at_p_two` |
+| index 6 | `the_dense_accumulator_is_the_map` =, `bm25_matches_an_independent_implementation` =, `f32_impacts_rank_exactly_like_brute_force` = |
+| index 7 | `the_assignment_cost_is_the_squared_distance_to_the_assigned_centroid` =, `a_full_list_takes_no_more_rows`, `two_lists_are_enough_to_replicate_between` |
+| index 8, spikes | `a_centroid_is_the_mean_of_what_it_holds` =, `maintenance_is_deterministic`, `exq_residual_estimate_is_unbiased` |
+| index 9 | `every_int8_score_is_the_rows_own_int8_estimate` =, `a_ragged_dimension_does_not_shift_every_later_row` |
+| index 10 | `a_vector_query_scores_the_probed_lists_exactly` =, `clustered_search_finds_what_the_flat_scan_finds` = |
+| format 1 | `a_dictionary_of_terms_is_searchable_and_refuses_nonsense` =, `a_dictionary_from_another_format_or_an_unsorted_one_is_refused` |
+| format 2 | `the_draws_kept_are_the_draws_made` =, `the_encoding_is_frozen` = |
+| format 3 | `the_needle_is_the_strings` =, `a_trigram_sets_the_bits_fnv_1a_names` =, `a_fuzzy_match_at_distance_k_is_never_pruned` |
+| format 4, 5 | `pruning_does_not_change_the_answer` =, `a_segment_that_fits_keeps_its_zone_maps`, `mixed_ints_and_floats_prune_soundly_with_zone_maps` =, `a_segment_with_datetime_zones_prunes_soundly` = |
+| format 6 | `the_dictionary_carries_document_frequency` =, `bm25_matches_an_independent_implementation` = |
+| format 7 | `read_rows_returns_the_files_floats` =, `a_filter_on_the_files_own_column_equals_the_exact_filtered_cosine` = |
+| format 8 | `f32_impacts_rank_exactly_like_brute_force` =, `a_corrupt_dictionary_is_refused_not_guessed` |
+| format 9 | `a_row_asked_twice_comes_back_twice` =, `rows_at_returns_each_rows_id_and_attributes_in_one_round` = |
+| format 10 | `a_multi_field_scan_reads_its_fields_together` =, `a_scan_still_returns_whole_documents` = |
+| query 1, 2 | `global_statistics_change_the_ranking_across_segments` =, `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` |
+| query 3 | `rrf_is_the_reciprocal_rank_sum` =, `ties_break_on_the_pair_and_the_segment_comes_first` = |
+| query 4 | `multi_scores_by_maxsim` =, `fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced` = |
+| query 5, mask | `mixed_ints_and_floats_prune_soundly_with_zone_maps` =, `a_projection_keeps_exactly_what_it_names` =, `a_projection_refuses_what_the_full_decode_refuses` = |
+| query 6 | `four_segments_cost_one_open_round_and_one_leg_round`, `a_hybrid_query_opens_the_segment_once` -- the change shares a value it copied; it computes none |
+| query 7 | `the_selector_holds_at_most_its_cap_and_equals_a_sort_truncated` =, `rank_by_orders_integers_then_strings_then_absent` = |
+| query 8 | `it_holds_at_most_top_k_groups_and_keeps_the_smallest_exactly` =, `counts_and_sums_equal_brute_force` =, `groups_equal_brute_force` = |
+| query 9 | `a_multi_leg_is_widened_past_deleted_rows`, `text_and_sparse_legs_are_widened_past_deleted_rows_too`, `unfolded_deletes_and_upserts_hide_the_folded_rows` |
+| engine 1, 2 | `each_index_keeps_its_own_fresh_segment`, `a_query_on_one_index_is_not_served_another_indexs_fresh_rows` =, `a_cached_fresh_segment_is_rebuilt_when_the_text_field_is_filled` |
+| engine 3 | `a_hit_skips_head_and_says_how_stale_it_is` =, `a_hit_this_engine_has_pruned_past_is_read_fresh` |
+| engine 4 | `a_cached_range_owns_its_bytes` (M120.5, red with the slice admitted), `a_cached_range_equals_what_the_store_holds` = |
+| engine 5 | `the_schema_outranks_a_held_width_at_the_door`, `two_writers_widths_meet_in_the_fold` |
+| engine 6 | `the_write_door_uses_the_schema_the_process_has_read`, `the_schema_is_read_once_per_process` -- the change skips a copy of what is held; it computes none |
+| engine 7 | `a_repeated_range_within_one_call_fills_both_positions` =, `eviction_follows_a_model_lru` =, `the_disk_hash_is_the_encodings` = |
+| engine 8 | `concurrent_misses_issue_one_request`, `each_class_stays_within_its_quota`, `eviction_follows_a_model_lru` = -- a lock's kind, not a value |
+| engine 9 | `only_a_scoped_segment_key_unscopes` =, `a_branch_equals_its_source_and_then_diverges` |
+| server 1, 3 | `the_fast_parse_is_the_tree_parse` =, `a_multi_query_answers_each_as_it_would_alone` = |
+| server 2 | `the_fast_part_is_the_tree_part` = (red with the phase dropped, and with no fallback), `a_split_query_answers_exactly_as_one_server_does` = |
+| server 4 | `the_hand_written_vector_is_the_derived_one` =, `multi_vectors_are_refused_at_the_door` |
+| server 5 | `a_patch_merges_into_the_folded_row` =, `a_patch_by_filter_merges_into_exactly_what_it_admits` = |
+| server 6 | `the_api_searches_a_named_field`, `text_is_written_queried_and_fused_with_the_vector`, `multi_vector_documents_are_searched_by_maxsim` |
+| server 7 | `a_requested_or_backing_off_tenant_is_kept`, `the_least_recently_used_goes_first` |
+| server 8 | `the_deployment_opts_in_by_name_and_names_its_prefixes`, `an_allowed_source_is_registered_queried_and_dropped_by_name` |
+| server 9 | `the_metered_slices_are_the_stores_bytes` = (M120.5, red with a slice at the wrong offset), `the_meter_and_the_accountant_agree_on_a_coalesced_fan_out` |

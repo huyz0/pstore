@@ -667,3 +667,28 @@ async fn a_short_coalesced_fetch_is_an_error_not_a_panic() {
         .expect_err("a short coalesced fetch must be an error");
     assert!(err.to_string().contains("short of"), "{err}");
 }
+
+#[tokio::test]
+async fn the_metered_slices_are_the_stores_bytes() {
+    // M119 (server 9): a coalesced fan-out's ranges are slices of the fetch, not copies, and
+    // they are the bytes the store holds at each range -- not a neighbour's.
+    let f = Fixture::new(quota(rate(1e9, 1e9), rate(1e12, 1e12)), 1024).await;
+    // Every byte its own, so a slice at the wrong offset reads differently.
+    let k = Key::new("seg/patterned");
+    f.acc
+        .as_tenant(TenantId(999))
+        .put(
+            &k,
+            Bytes::from((0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>()),
+        )
+        .await
+        .unwrap();
+    let ranges: Vec<_> = (0..8u64).map(|i| i * 64 + i..i * 64 + i + 8).collect();
+    let got = f.store(A).get_ranges(&k, &ranges).await.unwrap();
+    let want = f.acc.as_tenant(A).get_ranges(&k, &ranges).await.unwrap();
+    assert_eq!(got, want);
+    for (r, b) in ranges.iter().zip(&got) {
+        let one = f.acc.as_tenant(A).get_range(&k, r.clone()).await.unwrap();
+        assert_eq!(*b, one, "range {r:?}");
+    }
+}

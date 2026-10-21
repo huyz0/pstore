@@ -969,3 +969,28 @@ async fn eviction_follows_a_model_lru() {
         assert_eq!(cache.resident_bytes(), model.len() * 64, "step {step}");
     }
 }
+
+#[tokio::test]
+async fn a_cached_range_owns_its_bytes() {
+    // M119 (engine 4): a range a coalesced fetch served is admitted as its own bytes. Cached
+    // as a slice, it kept the whole fetched span alive -- every byte between the ranges --
+    // while the quota counted only the range.
+    let (cache, _, key) = fixture(1 << 20).await;
+    let rs = vec![0..64, 128..192];
+    let cold = cache.get_ranges(&key, &rs).await.unwrap();
+    // The fixture coalesces, or this proves nothing: both came out of one buffer.
+    assert_eq!(
+        cold[1].as_ptr() as usize - cold[0].as_ptr() as usize,
+        128,
+        "the two ranges were not one fetch"
+    );
+    let warm = cache.get_ranges(&key, &rs).await.unwrap();
+    assert_eq!(warm, cold);
+    for (w, c) in warm.iter().zip(&cold) {
+        assert_ne!(
+            w.as_ptr(),
+            c.as_ptr(),
+            "the cache holds a slice of the fetch"
+        );
+    }
+}

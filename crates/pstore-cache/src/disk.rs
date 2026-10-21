@@ -301,9 +301,11 @@ impl foyer::Code for Id {
         })?;
         let mut key = vec![0u8; len];
         r.read_exact(&mut key).map_err(io)?;
-        let key = String::from_utf8(key).map_err(|e| {
-            foyer::Error::io_error(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+        let key: std::sync::Arc<str> = String::from_utf8(key)
+            .map_err(|e| {
+                foyer::Error::io_error(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?
+            .into();
         let (a, b) = (u64s(r)?, u64s(r)?);
         match tag[0] {
             0 => Ok(Id::Range(key, a, b)),
@@ -382,7 +384,7 @@ mod tests {
     #[test]
     fn the_disk_hash_is_the_encodings() {
         let hash = |id: Id| foyer::DefaultHasher::default().hash_one(id);
-        let key = || "tnt/1/seg/a.seg".to_owned();
+        let key = || std::sync::Arc::<str>::from("tnt/1/seg/a.seg");
         assert_eq!(hash(Id::Range(key(), 4096, 8192)), 0x9c77_4f0d_9145_8c19);
         assert_eq!(hash(Id::Whole(key())), 0xc2ed_b142_b10c_2a82);
         assert_eq!(hash(Id::Suffix(key(), 65536)), 0x881b_2410_f45f_4894);
@@ -394,7 +396,7 @@ mod tests {
     #[test]
     fn every_shape_round_trips_and_a_bad_key_is_refused() {
         use foyer::Code as _;
-        let key = || "tnt/1/seg/a.seg".to_owned();
+        let key = || std::sync::Arc::<str>::from("tnt/1/seg/a.seg");
         for id in [
             Id::Range(key(), 4096, 8192),
             Id::Whole(key()),
@@ -437,7 +439,7 @@ mod tests {
                 let v = bytes::Bytes::from(vec![7u8; (1 << 18) - 4096]);
                 for i in 0..256 {
                     for class in [Class::Pinned, Class::Meta, Class::Bulk] {
-                        t.insert(&Id::Range(format!("k{i}"), 0, i), &v, class);
+                        t.insert(&Id::Range(format!("k{i}").into(), 0, i), &v, class);
                     }
                 }
                 tokio::time::sleep(linger).await;

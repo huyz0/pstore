@@ -37,7 +37,12 @@ with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`,
 [FINDINGS.md](FINDINGS.md) lists every finding of M119's five reviews with its commit and
 evidence, or why it was rejected. M120.3's: `the_draws_kept_are_the_draws_made` and
 `a_row_asked_twice_comes_back_twice` pass, each **red first** -- the cache keyed without
-its seed, and every row moved out at its first mention.
+its seed, and every row moved out at its first mention. M120.5's:
+`a_cached_range_owns_its_bytes` and `the_metered_slices_are_the_stores_bytes` pass, each
+**red first** -- the fetch's slice admitted, and a slice cut at the wrong offset (which
+passed until the test read an object whose bytes differ from each other: the fixture's
+are all `7`). `the_fast_part_is_the_tree_part`, not run against a mutation at M120, was:
+red with the dispatch's phase dropped, and with a typed failure not falling back.
 
 ## M119's open findings
 

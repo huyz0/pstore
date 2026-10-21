@@ -84,3 +84,6 @@ on a path that fails. No LIST.
 - **M120.3** — the review's last sub-points, found reconciling every finding in
   [FINDINGS.md](FINDINGS.md): FDE planes kept a thread, `rows_at` moving rows out, a batch of
   cache misses admitted under one lock, patches moved out of the request.
+- **M120.4** — the ledgers say what landed, and count it.
+- **M120.5** — a cache key shared by every range of a call; tests for the two paths the
+  findings appendix found unexercised by value (a cached range's bytes, a metered slice's).
