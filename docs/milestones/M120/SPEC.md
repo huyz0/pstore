@@ -81,3 +81,6 @@ on a path that fails. No LIST.
 - **M120.1** — all of it, and the ledger.
 - **M120.2** — the review's minors: a multi-query told apart before any typed parse, the
   part's dispatch pinned by the equivalence test, the corpus widened.
+- **M120.3** — the review's last sub-points, found reconciling every finding in
+  [FINDINGS.md](FINDINGS.md): FDE planes kept a thread, `rows_at` moving rows out, a batch of
+  cache misses admitted under one lock, patches moved out of the request.

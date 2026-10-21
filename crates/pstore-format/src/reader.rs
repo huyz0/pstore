@@ -1121,7 +1121,23 @@ impl Segment {
                 }
             }
         }
-        Ok(rows.iter().map(|r| found.get(r).cloned()).collect())
+        // Moved out at each row's last mention, copied only for one asked more than once
+        // (M120).
+        let mut last: BTreeMap<usize, usize> = BTreeMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            last.insert(*r, i);
+        }
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                if last.get(r) == Some(&i) {
+                    found.remove(r)
+                } else {
+                    found.get(r).cloned()
+                }
+            })
+            .collect())
     }
 
     /// Exact k-nearest-neighbour search by squared L2, over the rows a filter selects.

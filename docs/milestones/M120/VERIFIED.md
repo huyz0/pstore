@@ -32,6 +32,13 @@ with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`,
    why the criterion is a median of alternating runs. NOT-RUN on macOS and Windows.
 6. `./scripts/gates.sh` passed, run by the pre-commit hook on this commit.
 
+## Every finding
+
+[FINDINGS.md](FINDINGS.md) lists every finding of M119's five reviews with its commit and
+evidence, or why it was rejected. M120.3's: `the_draws_kept_are_the_draws_made` and
+`a_row_asked_twice_comes_back_twice` pass, each **red first** -- the cache keyed without
+its seed, and every row moved out at its first mention.
+
 ## M119's open findings
 
 Every one is closed here: the two depth chains (Delta 1), the double parse of a write, a

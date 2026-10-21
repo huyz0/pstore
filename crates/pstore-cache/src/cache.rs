@@ -241,6 +241,24 @@ impl CacheCore {
         locked(arena).admit(id, bytes, quota);
     }
 
+    /// [`Self::admit`] for several, under one lock of the arena (M120): a batched read's misses
+    /// took the lock once each. The disk tier is written outside it, as `admit` writes it.
+    async fn admit_all(&self, items: Vec<(Id, Bytes)>, class: Class) {
+        if class == Class::Scan {
+            return;
+        }
+        if let Some(d) = &self.disk {
+            for (id, bytes) in &items {
+                d.insert(id, bytes, class);
+            }
+        }
+        let (arena, quota) = self.arena(class);
+        let mut state = locked(arena);
+        for (id, bytes) in items {
+            state.admit(id, bytes, quota);
+        }
+    }
+
     /// Fetch under singleflight: whoever arrives first fetches, the rest wait and then read
     /// the cache.
     ///
@@ -492,17 +510,19 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             // the cache, where it belongs. The cache decides *what* to fetch; the store
             // decides how few requests that takes.
             let fetched = self.inner.get_ranges_as(key, &missing, class).await?;
+            let mut admitted = Vec::with_capacity(missing.len());
             for ((i, r), bytes) in slots.into_iter().zip(&missing).zip(fetched) {
                 // ⚠️ **Admitted as its own bytes, not as a slice of the fetch** (M119). The
                 // store coalesces ranges up to a gap apart into one fetch, and a slice keeps
                 // that whole buffer alive: two 4 KiB ranges a mebibyte apart pinned the
                 // mebibyte while the quota counted 8 KiB. The caller still gets the slice.
-                core.admit(id(r), Bytes::copy_from_slice(&bytes), class)
-                    .await;
+                admitted.push((id(r), Bytes::copy_from_slice(&bytes)));
                 if let Some(slot) = out.get_mut(i) {
                     *slot = Some(bytes);
                 }
             }
+            // In fetch order, as one at a time admitted them, so eviction picks the same.
+            core.admit_all(admitted, class).await;
         }
 
         out.into_iter()

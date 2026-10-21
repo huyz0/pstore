@@ -173,3 +173,34 @@ async fn rows_at_returns_each_rows_id_and_attributes_in_one_round() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_row_asked_twice_comes_back_twice() {
+    // M120: each row moved out at its last mention and copied before it, so a request naming
+    // a row twice, or one no block holds, answers each position as asking it alone does.
+    let store = pstore_blob::MemoryStore::new();
+    let mut w = pstore_format::SegmentWriter::new(4);
+    for i in 0..20i64 {
+        let mut d = Document::new(format!("d{i:04}"), vec![i as f32]);
+        d.attrs.insert("n".to_owned(), pstore_format::Value::Int(i));
+        w.push(d);
+    }
+    let key = Key::new("0000/seg/twice");
+    store.put(&key, w.finish()).await.unwrap();
+    let seg = Segment::open(&store, &key).await.unwrap();
+    let asked = [8, 7, 8, 999, 7, 8, 0, 19];
+    let got = seg.rows_at(&store, &key, &asked).await.unwrap();
+    assert_eq!(got.len(), asked.len());
+    for (r, doc) in asked.iter().zip(&got) {
+        let alone = seg.rows_at(&store, &key, &[*r]).await.unwrap();
+        assert_eq!(
+            doc.as_ref().map(|d| &d.id),
+            alone[0].as_ref().map(|d| &d.id),
+            "row {r}"
+        );
+        assert_eq!(
+            doc.as_ref().map(|d| &d.attrs),
+            alone[0].as_ref().map(|d| &d.attrs)
+        );
+    }
+}

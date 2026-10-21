@@ -98,6 +98,49 @@ fn bucket(planes: &[Vec<f64>], v: &[f32]) -> usize {
         .fold(0, |b, (i, g)| b + (usize::from(dot(v, g) > 0.0) << i))
 }
 
+/// One repetition's random draws: its SimHash planes and its projection's signs, `d_proj`
+/// rows of `d`.
+struct Draws {
+    planes: Vec<Vec<f64>>,
+    negated: Vec<bool>,
+}
+
+/// Every repetition's draws for `p` over `d` dimensions.
+///
+/// ⚠️ **The last ones drawn, kept a thread** (M120): they depend on the parameters and the
+/// width alone, never on the data, and drawing them per document cost `k_sim × d` Box-Muller
+/// gaussians and `d_proj × d` hashes a repetition -- for the same numbers every time. One entry
+/// a thread, so it is bounded and takes no lock; a different width or seed draws afresh.
+fn draws(p: &Params, d: usize) -> std::rc::Rc<Vec<Draws>> {
+    type Key = (usize, usize, usize, u64, usize);
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(Key, std::rc::Rc<Vec<Draws>>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let key: Key = (p.reps, p.k_sim, p.d_proj, p.seed, d);
+    LAST.with(|last| {
+        if let Some((k, held)) = last.borrow().as_ref()
+            && *k == key
+        {
+            return std::rc::Rc::clone(held);
+        }
+        let drawn = std::rc::Rc::new(
+            (0..p.reps)
+                .map(|rep| Draws {
+                    planes: (0..p.k_sim)
+                        .map(|bit| (0..d).map(|i| gauss(p.seed, rep, bit, i)).collect())
+                        .collect(),
+                    negated: (0..p.d_proj)
+                        .flat_map(|j| (0..d).map(move |i| signed(1.0, p.seed, rep, j, i) < 0.0))
+                        .collect(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        *last.borrow_mut() = Some((key, std::rc::Rc::clone(&drawn)));
+        drawn
+    })
+}
+
 fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
     let Some(d) = vectors.first().map(Vec::len) else {
         return Vec::new();
@@ -105,16 +148,9 @@ fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
     let vectors: Vec<&Vec<f32>> = vectors.iter().filter(|v| v.len() == d).collect();
     let buckets = 1usize << p.k_sim;
     let mut out = Vec::new();
-    for rep in 0..p.reps {
-        let planes: Vec<Vec<f64>> = (0..p.k_sim)
-            .map(|bit| (0..d).map(|i| gauss(p.seed, rep, bit, i)).collect())
-            .collect();
-        let of: Vec<usize> = vectors.iter().map(|v| bucket(&planes, v)).collect();
-        // The projection's signs, once per repetition (M119): they depend on neither the
-        // bucket nor the data, and drawing them per bucket hashed `buckets` times as often.
-        let negated: Vec<bool> = (0..p.d_proj)
-            .flat_map(|j| (0..d).map(move |i| signed(1.0, p.seed, rep, j, i) < 0.0))
-            .collect();
+    let drawn = draws(p, d);
+    for Draws { planes, negated } in drawn.iter() {
+        let of: Vec<usize> = vectors.iter().map(|v| bucket(planes, v)).collect();
         for b in 0..buckets {
             let members: Vec<&&Vec<f32>> = vectors
                 .iter()
@@ -191,6 +227,63 @@ mod tests {
 
     /// The gaussians and signs the planes and projection are drawn from, to the last digit: a
     /// stored encoding depends on them, so a change here is a migration.
+    #[allow(
+        clippy::unwrap_used,
+        clippy::cast_precision_loss,
+        reason = "assertions in tests are the reporting mechanism"
+    )]
+    #[test]
+    fn the_draws_kept_are_the_draws_made() {
+        // M120: an encoding from the thread's kept draws is the one drawn afresh, however the
+        // parameters and widths alternate -- a stale entry would encode with another's planes.
+        let other = Params {
+            seed: DEFAULT.seed ^ 1,
+            ..DEFAULT
+        };
+        let set = |d: usize, k: u32| -> Vec<Vec<f32>> {
+            (0..5)
+                .map(|i| {
+                    (0..d)
+                        .map(|j| ((i * 7 + j) as f32 * 0.37 + k as f32).sin())
+                        .collect()
+                })
+                .collect()
+        };
+        let fresh = |p: &Params, v: &[Vec<f32>]| {
+            // Another thread has drawn nothing, so its first encoding draws afresh.
+            let (p, v) = (*p, v.to_vec());
+            std::thread::spawn(move || encode_doc(&p, &v))
+                .join()
+                .unwrap()
+        };
+        for (p, d) in [
+            (DEFAULT, 8),
+            (other, 8),
+            (DEFAULT, 3),
+            (DEFAULT, 8),
+            (other, 3),
+        ] {
+            let v = set(d, 1);
+            let kept = encode_doc(&p, &v);
+            assert_eq!(
+                kept.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                fresh(&p, &v)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                "seed {} width {d}",
+                p.seed
+            );
+            assert_eq!(encode_query(&p, &v), fresh_query(&p, &v));
+        }
+        fn fresh_query(p: &Params, v: &[Vec<f32>]) -> Vec<f32> {
+            let (p, v) = (*p, v.to_vec());
+            std::thread::spawn(move || encode_query(&p, &v))
+                .join()
+                .unwrap()
+        }
+    }
+
     #[test]
     fn gaussians_and_signs_are_frozen() {
         let g: Vec<f64> = (0..4).map(|i| gauss(DEFAULT.seed, 1, 2, i)).collect();

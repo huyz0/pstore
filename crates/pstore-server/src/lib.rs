@@ -1299,19 +1299,24 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
 
 /// A write's patches (M13), from `patch_rows` and `patch_columns`, in that order. Values are
 /// converted as a document's attributes are; `null` removes an attribute.
+///
+/// ⚠️ Takes both by value (M120): every attribute map and every column cell was copied out of
+/// the request, which nothing reads again.
 fn patches_of(
-    req: &WriteRequest,
+    patch_rows: Vec<serde_json::Value>,
+    patch_columns: Option<serde_json::Value>,
     dated: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<pstore_engine::Patch>, ApiError> {
     let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
-    for raw in &req.patch_rows {
+    for mut raw in patch_rows {
         let o = raw
-            .as_object()
+            .as_object_mut()
             .ok_or_else(|| ApiError::bad_request("a patch is {\"id\", \"attributes\"}"))?;
         let id = o
             .get("id")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ApiError::bad_request("a patch needs a string id"))?;
+            .ok_or_else(|| ApiError::bad_request("a patch needs a string id"))?
+            .to_owned();
         if let Some(k) = o.keys().find(|k| *k != "id" && *k != "attributes") {
             return Err(ApiError::bad_request(if k == "vector" {
                 format!("patch of {id}: a patch carries no vector; upsert the row to change it")
@@ -1319,44 +1324,45 @@ fn patches_of(
                 format!("patch of {id}: unknown field {k}")
             }));
         }
-        let attrs = match o.get("attributes") {
+        let attrs = match o.remove("attributes") {
             None => serde_json::Map::new(),
-            Some(serde_json::Value::Object(m)) => m.clone(),
+            Some(serde_json::Value::Object(m)) => m,
             Some(_) => {
                 return Err(ApiError::bad_request(format!(
                     "patch of {id}: attributes is an object"
                 )));
             }
         };
-        rows.push((id.to_owned(), attrs));
+        rows.push((id, attrs));
     }
-    if let Some(cols) = &req.patch_columns {
+    if let Some(mut cols) = patch_columns {
         let bad = |why: &str| ApiError::bad_request(format!("patch_columns: {why}"));
         let cols = cols
-            .as_object()
+            .as_object_mut()
             .ok_or_else(|| bad("an object of columns"))?;
-        let ids = cols
-            .get("id")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| bad("an `id` column is required"))?;
+        let ids = match cols.remove("id") {
+            Some(serde_json::Value::Array(ids)) => ids,
+            _ => return Err(bad("an `id` column is required")),
+        };
         let mut columns = Vec::new();
-        for (name, col) in cols.iter().filter(|(n, _)| *n != "id") {
+        for (name, col) in std::mem::take(cols) {
             if name == "vector" {
                 return Err(bad(
                     "a patch carries no vector; upsert the rows to change them",
                 ));
             }
-            let col = col
-                .as_array()
-                .filter(|c| c.len() == ids.len())
-                .ok_or_else(|| bad("every column must have one value per id"))?;
-            columns.push((name, col));
+            let col = match col {
+                serde_json::Value::Array(c) if c.len() == ids.len() => c,
+                _ => return Err(bad("every column must have one value per id")),
+            };
+            columns.push((name, col.into_iter()));
         }
-        for (i, id) in ids.iter().enumerate() {
+        for id in &ids {
             let id = id.as_str().ok_or_else(|| bad("ids are strings"))?;
+            // Each column's cells in id order, one a row, moved.
             let attrs = columns
-                .iter()
-                .filter_map(|(name, col)| col.get(i).map(|v| ((*name).clone(), v.clone())))
+                .iter_mut()
+                .filter_map(|(name, col)| col.next().map(|v| (name.clone(), v)))
                 .collect();
             rows.push((id.to_owned(), attrs));
         }
@@ -1470,7 +1476,11 @@ async fn write_documents<S: BlobStore + 'static>(
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
     };
-    let patches = patches_of(&req, &dated)?;
+    let patches = patches_of(
+        std::mem::take(&mut req.patch_rows),
+        req.patch_columns.take(),
+        &dated,
+    )?;
     let delete_by = req
         .delete_by_filter
         .as_ref()
