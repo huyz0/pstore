@@ -408,7 +408,7 @@ async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     let mut two = pstore_format::Document::new("d", vec![1.0]);
     for name in ["s1", "s2"] {
         two.vectors.insert(
-            name.to_owned(),
+            name.into(),
             pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
         );
     }
@@ -423,7 +423,7 @@ async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     // One sparse field is stored now, not refused — M5a.2.
     let mut one = pstore_format::Document::new("d2", vec![1.0]);
     one.vectors.insert(
-        "s1".to_owned(),
+        "s1".into(),
         pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
     );
     e.write("idx", vec![one]).await.unwrap();

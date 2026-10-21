@@ -137,7 +137,7 @@ async fn a_fresh_row_is_ranked_against_the_corpus_not_beside_it() {
     let mut mid = doc(289);
     mid.id = "fresh-mid".to_owned();
     mid.vectors.insert(
-        DEFAULT_FIELD.to_owned(),
+        DEFAULT_FIELD.into(),
         pstore_format::VectorField::Dense(vec![{
             let mut v = doc(289).vector().to_vec();
             v[0] = 2.895;

@@ -41,9 +41,8 @@ fn doc(i: usize, lacking: bool) -> Document {
         // And a field of two vectors a document, which is `multi`'s, never a dense field's.
         let w: Vec<f32> = v.iter().map(|x| -x).collect();
         d.vectors
-            .insert("pair".to_owned(), VectorField::Dense(vec![v.clone(), w]));
-        d.vectors
-            .insert("tag".to_owned(), VectorField::Dense(vec![v]));
+            .insert("pair".into(), VectorField::Dense(vec![v.clone(), w]));
+        d.vectors.insert("tag".into(), VectorField::Dense(vec![v]));
     }
     d
 }
@@ -230,7 +229,7 @@ async fn a_nul_in_a_field_name_is_refused() {
     let e = Engine::new(store, T, LaneId(1));
     let mut d = Document::new("a".to_owned(), vec![1.0]);
     d.vectors
-        .insert("a\0b".to_owned(), VectorField::Dense(vec![vec![1.0]]));
+        .insert("a\0b".into(), VectorField::Dense(vec![vec![1.0]]));
     let err = e.write("x", vec![d]).await.unwrap_err().to_string();
     assert!(err.contains("NUL"), "{err}");
 }

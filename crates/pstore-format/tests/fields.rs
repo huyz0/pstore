@@ -21,7 +21,7 @@ fn doc(i: usize, fields: &[(&str, Vec<Vec<f32>>)]) -> Document {
         id: format!("d{i}"),
         vectors: fields
             .iter()
-            .map(|(n, v)| ((*n).to_owned(), VectorField::Dense(v.clone())))
+            .map(|(n, v)| ((*n).into(), VectorField::Dense(v.clone())))
             .collect(),
         attrs: BTreeMap::new(),
     }
@@ -248,7 +248,7 @@ async fn eight_fields_still_open_in_one_round() {
             .collect();
         w.push(Document {
             id: format!("d{i}"),
-            vectors: fields.into_iter().collect(),
+            vectors: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             attrs: BTreeMap::new(),
         });
     }
@@ -284,7 +284,7 @@ async fn a_segment_too_wide_to_open_in_one_round_is_refused() {
             .collect();
         w.push(Document {
             id: format!("d{i}"),
-            vectors: fields.into_iter().collect(),
+            vectors: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             attrs: BTreeMap::new(),
         });
     }

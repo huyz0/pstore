@@ -80,7 +80,7 @@ fn sparse_corpus(rows: usize, vocab: u32, nnz: usize) -> Vec<Document> {
             Document {
                 id: format!("d{i:05}"),
                 vectors: std::collections::BTreeMap::from([(
-                    SPARSE_FIELD.to_owned(),
+                    SPARSE_FIELD.into(),
                     VectorField::Sparse(pairs),
                 )]),
                 attrs: std::collections::BTreeMap::new(),

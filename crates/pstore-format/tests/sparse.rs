@@ -26,7 +26,7 @@ fn doc(id: usize, pairs: Vec<(u32, f32)>) -> Document {
     Document {
         id: format!("d{id}"),
         vectors: BTreeMap::from([(
-            FIELD.to_owned(),
+            FIELD.into(),
             VectorField::Sparse(
                 pairs
                     .into_iter()
@@ -475,7 +475,7 @@ async fn a_sparse_field_does_not_displace_the_dense_one() {
     for i in 0..12 {
         let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0]);
         d.vectors.insert(
-            "aaa_sparse".to_owned(),
+            "aaa_sparse".into(),
             VectorField::Sparse(vec![(1, Impact::new(0.5))]),
         );
         docs.push(d);

@@ -14,7 +14,7 @@ fn doc(i: usize) -> Document {
     Document {
         id: format!("d{i}"),
         vectors: std::collections::BTreeMap::from([(
-            pstore_format::DEFAULT_FIELD.to_owned(),
+            pstore_format::DEFAULT_FIELD.into(),
             pstore_format::VectorField::dense(vec![0.0; 4]),
         )]),
         attrs: Default::default(),

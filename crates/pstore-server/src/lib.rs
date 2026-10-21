@@ -3465,7 +3465,7 @@ fn to_document(
             ApiError::bad_request(format!("document {id}: field `{name}`: {why}"))
         })?;
         doc.vectors
-            .insert(name, pstore_format::VectorField::Dense(vs));
+            .insert(name.into(), pstore_format::VectorField::Dense(vs));
     }
     if let Some(t) = text {
         // `attributes.text` and top-level `text` are one field spelled twice; which one

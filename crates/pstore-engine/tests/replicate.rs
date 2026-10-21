@@ -244,7 +244,7 @@ fn doc(id: &str, x: f32) -> Document {
         Value::Str(format!("the quick fox number {}", x as u32 % 5)),
     );
     d.vectors.insert(
-        "s".to_owned(),
+        "s".into(),
         VectorField::Sparse(vec![
             (3, Impact::new(0.5)),
             ((x as u32) % 7, Impact::new(0.25)),

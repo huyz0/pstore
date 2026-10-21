@@ -238,11 +238,11 @@ async fn field_rows_reads_only_the_named_rows() {
             .collect();
         want.push(vs.clone());
         if !vs.is_empty() {
-            d.vectors.insert("late".to_owned(), VectorField::Dense(vs));
+            d.vectors.insert("late".into(), VectorField::Dense(vs));
         }
         // A fixed-width single-vector field beside it.
         d.vectors.insert(
-            "one".to_owned(),
+            "one".into(),
             VectorField::Dense(vec![vec![i as f32, -(i as f32), 2.0]]),
         );
         w.push(d);
@@ -300,9 +300,9 @@ async fn field_rows_refuses_a_corrupt_table_and_skips_a_sparse_field() {
     for i in 0..40usize {
         let mut d = Document::new(format!("d{i:02}"), vec![i as f32, 1.0, 0.0, 0.5]);
         let vs: Vec<Vec<f32>> = (0..2 + i % 3).map(|j| vec![(i + j) as f32; 5]).collect();
-        d.vectors.insert("late".to_owned(), VectorField::Dense(vs));
+        d.vectors.insert("late".into(), VectorField::Dense(vs));
         d.vectors.insert(
-            "terms".to_owned(),
+            "terms".into(),
             VectorField::Sparse(vec![
                 (3, pstore_format::Impact::new(1.0)),
                 (9, pstore_format::Impact::new(2.0)),
@@ -518,9 +518,9 @@ async fn a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width() {
     for i in 0..3usize {
         let mut d = Document::new(format!("z{i}"), vec![1.0, 0.0, 0.0, 0.5]);
         d.vectors
-            .insert("flat".to_owned(), VectorField::Dense(vec![Vec::new()]));
+            .insert("flat".into(), VectorField::Dense(vec![Vec::new()]));
         d.vectors.insert(
-            "terms".to_owned(),
+            "terms".into(),
             VectorField::Sparse(vec![(1, pstore_format::Impact::new(1.0))]),
         );
         all.push(d.clone());

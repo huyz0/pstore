@@ -66,7 +66,7 @@ fn dense_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)
     let names: std::collections::BTreeSet<&str> = docs
         .iter()
         .flat_map(|d| d.vectors.keys())
-        .map(String::as_str)
+        .map(pstore_format::Field::as_str)
         .filter(|k| *k != pstore_format::DEFAULT_FIELD)
         .filter(|k| !k.ends_with(pstore_format::fde::FIELD_SUFFIX))
         .collect();
@@ -105,14 +105,16 @@ fn fde_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)> 
         .into_iter()
         .filter_map(|field| {
             let derived = pstore_format::fde::field_name(field);
-            let dim = docs.iter().find_map(|d| match d.vectors.get(&derived) {
-                Some(pstore_format::VectorField::Dense(v)) => v.first().map(Vec::len),
-                _ => None,
-            })?;
+            let dim = docs
+                .iter()
+                .find_map(|d| match d.vectors.get(derived.as_str()) {
+                    Some(pstore_format::VectorField::Dense(v)) => v.first().map(Vec::len),
+                    _ => None,
+                })?;
             let rows = primary
                 .iter()
                 .map(
-                    |i| match docs.get(*i).and_then(|d| d.vectors.get(&derived)) {
+                    |i| match docs.get(*i).and_then(|d| d.vectors.get(derived.as_str())) {
                         Some(pstore_format::VectorField::Dense(v)) => {
                             v.first().cloned().unwrap_or_else(|| vec![0.0; dim])
                         }
@@ -1189,6 +1191,7 @@ fn odd_width(widths: &mut BTreeMap<String, usize>, d: &Document) -> Option<(usiz
         let pstore_format::VectorField::Dense(vs) = field else {
             continue;
         };
+        let name = name.as_str();
         if name == pstore_format::DEFAULT_FIELD {
             continue;
         }
@@ -1196,7 +1199,7 @@ fn odd_width(widths: &mut BTreeMap<String, usize>, d: &Document) -> Option<(usiz
             let want = widths
                 .get(name)
                 .copied()
-                .or_else(|| seen.iter().find(|(n, _)| n == name).map(|(_, w)| *w));
+                .or_else(|| seen.iter().find(|(n, _)| *n == name).map(|(_, w)| *w));
             match want {
                 Some(w) if w != v.len() => return Some((w, v.len())),
                 Some(_) => {}
@@ -2086,7 +2089,7 @@ impl<S: BlobStore> Engine<S> {
             let pstore_format::VectorField::Dense(vs) = field else {
                 continue;
             };
-            let Some(&want) = schema.fields.get(name) else {
+            let Some(&want) = schema.fields.get(name.as_str()) else {
                 continue;
             };
             if let Some(v) = vs.iter().find(|v| v.len() as u32 != want) {
@@ -2618,7 +2621,11 @@ impl<S: BlobStore> Engine<S> {
                         _ => None,
                     })
                     .collect();
-            d.vectors.extend(derived);
+            d.vectors.extend(
+                derived
+                    .into_iter()
+                    .map(|(name, field)| (name.into(), field)),
+            );
             if metric != Metric::DotProduct {
                 d.attrs.insert(
                     METRIC_ATTR.to_owned(),

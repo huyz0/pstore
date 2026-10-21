@@ -33,7 +33,7 @@ fn doc(id: usize, pairs: &[(u32, f32)]) -> Document {
     Document {
         id: format!("d{id:05}"),
         vectors: BTreeMap::from([(
-            FIELD.to_owned(),
+            FIELD.into(),
             VectorField::Sparse(pairs.iter().map(|(d, w)| (*d, Impact::new(*w))).collect()),
         )]),
         attrs: BTreeMap::new(),
@@ -438,7 +438,7 @@ async fn a_dense_field_asked_for_sparsely_is_an_error() {
     let mut docs = corpus(50, 100, 3);
     for (i, d) in docs.iter_mut().enumerate() {
         d.vectors
-            .insert("dense".to_owned(), VectorField::dense(vec![i as f32, 1.0]));
+            .insert("dense".into(), VectorField::dense(vec![i as f32, 1.0]));
     }
     let store = MemoryStore::with_coalesce_gap(GAP);
     let key = put(&store, &docs, ImpactEncoding::U8).await;

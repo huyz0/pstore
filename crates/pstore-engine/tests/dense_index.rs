@@ -147,7 +147,7 @@ async fn a_hybrid_corpus_survives_the_reordering() {
         .map(|i| {
             let mut d = doc(i);
             d.vectors.insert(
-                "body_sparse".to_owned(),
+                "body_sparse".into(),
                 VectorField::Sparse(vec![(i as u32 % 17, Impact::new(0.9))]),
             );
             d.attrs.insert(
@@ -291,7 +291,7 @@ async fn an_over_wide_segment_is_refused_by_the_fold() {
         .map(|i| {
             let mut d = doc(i);
             d.vectors.insert(
-                "f".repeat(pstore_format::INDEX_BUDGET + 1),
+                "f".repeat(pstore_format::INDEX_BUDGET + 1).into(),
                 pstore_format::VectorField::dense(vec![1.0, i as f32]),
             );
             d

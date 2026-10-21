@@ -56,7 +56,7 @@ fn hybrid_doc(i: usize) -> Document {
     // ⚠️ The sparse field sorts BEFORE the dense one, which is the case that would have taken
     // the legacy section ids from the dense field and made this whole leg return nothing.
     d.vectors.insert(
-        SPARSE.to_owned(),
+        SPARSE.into(),
         VectorField::Sparse(vec![
             (i as u32 % 23, Impact::new(0.9)),
             (50 + (i as u32 % 7), Impact::new(0.4)),

@@ -20,10 +20,7 @@ use std::collections::BTreeMap;
 fn doc(i: usize, attr: &str, body: &str) -> Document {
     Document {
         id: format!("d{i}"),
-        vectors: BTreeMap::from([(
-            "v".to_owned(),
-            VectorField::Dense(vec![vec![i as f32, 1.0]]),
-        )]),
+        vectors: BTreeMap::from([("v".into(), VectorField::Dense(vec![vec![i as f32, 1.0]]))]),
         attrs: BTreeMap::from([(attr.to_owned(), Value::Str(body.to_owned()))]),
     }
 }
@@ -124,13 +121,10 @@ async fn three_meta_entries_still_resolve_to_their_own_bytes() {
             id: format!("d{i}"),
             vectors: BTreeMap::from([
                 (
-                    "alpha".to_owned(),
+                    "alpha".into(),
                     VectorField::Dense(vec![vec![i as f32, 1.0]]),
                 ),
-                (
-                    "beta".to_owned(),
-                    VectorField::Dense(vec![vec![2.0, i as f32]]),
-                ),
+                ("beta".into(), VectorField::Dense(vec![vec![2.0, i as f32]])),
             ]),
             attrs: BTreeMap::from([(
                 "body".to_owned(),

@@ -27,7 +27,7 @@ const FIELD: &str = "body_sparse";
 fn hybrid(i: usize) -> Document {
     let mut d = Document::new(format!("d{i:04}"), vec![i as f32, 1.0, 0.5]);
     d.vectors.insert(
-        FIELD.to_owned(),
+        FIELD.into(),
         VectorField::Sparse(vec![
             (i as u32 % 17, Impact::new(0.75)),
             (100 + (i as u32 % 3), Impact::new(0.25)),

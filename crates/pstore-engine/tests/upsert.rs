@@ -233,7 +233,7 @@ async fn best_three_deleted() -> Engine<MemoryStore> {
                 Value::Str(words.join(" ")),
             );
             d.vectors.insert(
-                "sparse".to_owned(),
+                "sparse".into(),
                 pstore_format::VectorField::Sparse(vec![(
                     1,
                     pstore_format::Impact::new(0.05 * (i + 1) as f32),

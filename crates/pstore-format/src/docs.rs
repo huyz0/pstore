@@ -208,7 +208,8 @@ pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
         let fields = d.u32()? as usize;
         let mut vectors = BTreeMap::new();
         for _ in 0..fields.min(1 << 12) {
-            let name = d.string()?;
+            // Borrowed, then shared: the default field allocates nothing (M120).
+            let name: crate::Field = d.str()?.into();
             let kind = d.u8()?;
             let count = d.u32()? as usize;
             let field = if kind == 0 {

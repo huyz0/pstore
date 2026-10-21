@@ -449,6 +449,134 @@ impl VectorField {
 /// knows about many fields, and it can only be if today's one field has a name.
 pub const DEFAULT_FIELD: &str = "vector";
 
+/// A vector field's name: shared, not owned a document (M120).
+///
+/// ⚠️ Every document of a segment names the same few fields, and a `String` key a document
+/// was an allocation a row on every decode, scan and build -- `Document::new` among them.
+/// One name is shared by all of them. It orders, hashes, compares and prints as the `str`
+/// it holds, so a map keyed by it iterates, finds and debugs as one keyed by `String` did.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Field(std::sync::Arc<str>);
+
+impl Field {
+    /// The name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `a` and `b` are one allocation: what a test asserts sharing by.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn same_allocation(a: &Self, b: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// [`DEFAULT_FIELD`], shared by every document that has it.
+    #[must_use]
+    pub fn default_field() -> Self {
+        static DEFAULT: std::sync::OnceLock<Field> = std::sync::OnceLock::new();
+        DEFAULT.get_or_init(|| Self(DEFAULT_FIELD.into())).clone()
+    }
+}
+
+impl std::ops::Deref for Field {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for Field {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Field {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl From<&str> for Field {
+    fn from(s: &str) -> Self {
+        if s == DEFAULT_FIELD {
+            return Self::default_field();
+        }
+        Self(s.into())
+    }
+}
+
+impl From<String> for Field {
+    fn from(s: String) -> Self {
+        if s == DEFAULT_FIELD {
+            return Self::default_field();
+        }
+        Self(s.into())
+    }
+}
+
+impl From<&String> for Field {
+    fn from(s: &String) -> Self {
+        s.as_str().into()
+    }
+}
+
+impl From<Field> for String {
+    fn from(f: Field) -> Self {
+        f.0.as_ref().to_owned()
+    }
+}
+
+impl PartialEq<str> for Field {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Field {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for Field {
+    fn eq(&self, other: &String) -> bool {
+        *self.0 == **other
+    }
+}
+
+impl PartialEq<Field> for str {
+    fn eq(&self, other: &Field) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<Field> for &str {
+    fn eq(&self, other: &Field) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<Field> for String {
+    fn eq(&self, other: &Field) -> bool {
+        **self == *other.0
+    }
+}
+
 /// A row: an id, its named vector fields, and typed attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
@@ -457,7 +585,7 @@ pub struct Document {
     /// ⚠️ **Named and plural.** `modalities-and-sequencing.md` §3 calls a singular `vector`
     /// field "the migration trap", and D-28 says retrofitting *n* vectors into a
     /// one-row-one-vector layout is a rewrite rather than a change.
-    pub vectors: BTreeMap<String, VectorField>,
+    pub vectors: BTreeMap<Field, VectorField>,
     /// Filterable attributes.
     pub attrs: BTreeMap<String, Value>,
 }
@@ -471,7 +599,7 @@ impl Document {
     pub fn new(id: impl Into<String>, vector: Vec<f32>) -> Self {
         Self {
             id: id.into(),
-            vectors: BTreeMap::from([(DEFAULT_FIELD.to_owned(), VectorField::dense(vector))]),
+            vectors: BTreeMap::from([(Field::default_field(), VectorField::dense(vector))]),
             attrs: BTreeMap::new(),
         }
     }

@@ -145,7 +145,7 @@ fn topical(i: usize) -> Document {
     };
     let mut doc = Document::new(format!("d{i:05}"), vec![1.0, 0.5, 0.25, 0.125]);
     doc.vectors.insert(
-        "late".to_owned(),
+        "late".into(),
         VectorField::Dense(vec![v(&mut r), v(&mut r)]),
     );
     doc
@@ -258,7 +258,7 @@ fn two_field(i: usize) -> Document {
     let j = (i * 5) % 9_000;
     let mut o = topical(j);
     let v = o.vectors.remove("late").unwrap();
-    d.vectors.insert("other".to_owned(), v);
+    d.vectors.insert("other".into(), v);
     d
 }
 

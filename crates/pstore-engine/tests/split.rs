@@ -45,11 +45,11 @@ fn doc(i: u32) -> Document {
         Value::Str(format!("common word{} tag{}", i % 5, i % 3)),
     );
     d.vectors.insert(
-        "v2".to_owned(),
+        "v2".into(),
         VectorField::Dense(vec![vec![(x * 0.11).cos(), (x * 0.7).sin(), 0.5]]),
     );
     d.vectors.insert(
-        "s".to_owned(),
+        "s".into(),
         VectorField::Sparse(vec![
             (3, Impact::new(0.5 + (i % 4) as f32 * 0.1)),
             (i % 7 + 10, Impact::new(0.25)),
@@ -1282,7 +1282,7 @@ fn mdoc(i: u32) -> Document {
     let mut v = || -> Vec<f32> { (0..4).map(|d| base(topic, d) + 0.3 * r()).collect() };
     let mut d = doc(i);
     d.vectors
-        .insert("late".to_owned(), VectorField::Dense(vec![v(), v()]));
+        .insert("late".into(), VectorField::Dense(vec![v(), v()]));
     d
 }
 

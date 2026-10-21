@@ -502,7 +502,7 @@ async fn a_query_names_the_field_it_searches() {
             Document {
                 id: format!("d{i}"),
                 vectors: std::collections::BTreeMap::from([(
-                    "body".to_owned(),
+                    "body".into(),
                     pstore_format::VectorField::dense(base.vector().to_vec()),
                 )]),
                 attrs: Default::default(),
@@ -554,7 +554,7 @@ async fn a_ragged_dimension_does_not_shift_every_later_row() {
     docs[bad] = Document {
         id: format!("d{bad}"),
         vectors: std::collections::BTreeMap::from([(
-            pstore_format::DEFAULT_FIELD.to_owned(),
+            pstore_format::DEFAULT_FIELD.into(),
             pstore_format::VectorField::dense(vec![0.5; DIM * 2]),
         )]),
         attrs: Default::default(),

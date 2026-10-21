@@ -28,13 +28,11 @@ fn doc(r: usize, with_tag: bool, wide: bool) -> Document {
     let mut d = Document::new(format!("d{r}"), vec![x.cos(), x.sin(), 1.0, 0.5]);
     if with_tag {
         d.vectors
-            .insert("tag".to_owned(), VectorField::Dense(vec![tag(r)]));
+            .insert("tag".into(), VectorField::Dense(vec![tag(r)]));
     }
     if wide {
-        d.vectors.insert(
-            "late".to_owned(),
-            VectorField::Dense(vec![tag(r), tag(r + 1)]),
-        );
+        d.vectors
+            .insert("late".into(), VectorField::Dense(vec![tag(r), tag(r + 1)]));
     }
     d
 }

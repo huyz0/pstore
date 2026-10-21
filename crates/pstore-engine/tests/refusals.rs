@@ -41,7 +41,7 @@ async fn a_document_naming_what_the_engine_reserves_is_refused() {
     // a document supplying one would be indexed as the derived encoding.
     let mut d = Document::new("b", vec![1.0, 0.5]);
     d.vectors.insert(
-        format!("m{}", pstore_format::fde::FIELD_SUFFIX),
+        format!("m{}", pstore_format::fde::FIELD_SUFFIX).into(),
         VectorField::Dense(vec![vec![1.0, 0.5]]),
     );
     format_error(e.write("idx", vec![d]).await, "is reserved");

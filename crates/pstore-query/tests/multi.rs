@@ -51,7 +51,7 @@ fn doc(r: usize) -> Document {
     let mut d = Document::new(format!("d{r}"), vec![x.cos(), x.sin(), 1.0, 0.5]);
     let vs = late(r);
     if !vs.is_empty() {
-        d.vectors.insert(FIELD.to_owned(), VectorField::Dense(vs));
+        d.vectors.insert(FIELD.into(), VectorField::Dense(vs));
     }
     d
 }
@@ -302,7 +302,7 @@ async fn a_segment_without_the_encoding_answers_nothing() {
                 if let (true, Some(VectorField::Dense(vs))) = (derived, d.vectors.get(FIELD)) {
                     let e = pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, vs);
                     d.vectors.insert(
-                        pstore_format::fde::field_name(FIELD),
+                        pstore_format::fde::field_name(FIELD).into(),
                         VectorField::Dense(vec![e]),
                     );
                 }
@@ -371,7 +371,7 @@ async fn fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced() {
         if let Some(VectorField::Dense(vs)) = d.vectors.get(FIELD) {
             let e = pstore_format::fde::encode_doc(&pstore_format::fde::DEFAULT, vs);
             d.vectors.insert(
-                pstore_format::fde::field_name(FIELD),
+                pstore_format::fde::field_name(FIELD).into(),
                 VectorField::Dense(vec![e]),
             );
         }

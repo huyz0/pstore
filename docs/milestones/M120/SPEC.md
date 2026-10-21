@@ -87,3 +87,5 @@ on a path that fails. No LIST.
 - **M120.4** — the ledgers say what landed, and count it.
 - **M120.5** — a cache key shared by every range of a call; tests for the two paths the
   findings appendix found unexercised by value (a cached range's bytes, a metered slice's).
+- **M120.6** — `Document.vectors` keyed by `Field`, a shared name: a scan, a decode and
+  `Document::new` allocate no name a row. It orders, hashes, compares and prints as its `str`.

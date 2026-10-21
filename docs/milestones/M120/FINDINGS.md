@@ -3,18 +3,18 @@
 The five read-only reviews M119 ran (one a crate group), each finding by its number in its
 review, with the commit that closed it and the evidence. **Fixed** means landed and covered
 by the gate run on that commit; a row naming a test names one that passes, and the ledgers
-record the mutation each went red under first, where one was run. **Rejected** gives the reason. The bench digests
+record the mutation each went red under first, where one was run. The bench digests
 ([M119](../M119/VERIFIED.md) criterion 2) held across every commit below.
 
 Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, M120.4
-`4bb3ef2` (this ledger's count), and M120.5 (engine 7's last sub-point, and the tests the
-appendix found missing). Each commit's gate run is the whole workspace's suite at that
+`4bb3ef2` (this ledger's count), M120.5 `85c64a3` (engine 7's last sub-point, and the tests
+the appendix found missing), and M120.6 (format 10's last sub-point). Each commit's gate run is the whole workspace's suite at that
 commit, so the last run covers every test named below at once.
 
 **The count.** The reviews numbered **47** findings: 10 index, 10 format, 9 query, 9 engine
-and cache, 9 server. **All 47 are fixed**, every sub-point included but one: format 10's
-per-row key clone, which is rejected below with the reason -- the allocation is the
-document's own map key, not a copy of anything. Three rows marked `—` are not among the 47: two
+and cache, 9 server. **All 47 are fixed, every sub-point included; none is rejected.** Format
+10's per-row key was the last: it needed `Document.vectors` keyed by a shared name, which
+M120.6 made it. Three rows marked `—` are not among the 47: two
 found later (the spikes, the projected mask) and fixed, and one the review itself declined.
 
 ## `pstore-index`
@@ -46,7 +46,7 @@ found later (the spikes, the projected mask) and fixed, and one the review itsel
 | 7 | external rows as `Vec`s, removed one by one | Fixed, M119.2: `Bytes` slices, walked |
 | 8 | the sparse dictionary copied a query | Fixed, M119.2: `decode_bytes` |
 | 9 | `rows_at` scans blocks linearly, files every row, clones hits | Fixed: bisection and asked rows only in M119.2; moved, not cloned, in M120.3 (`a_row_asked_twice_comes_back_twice`) |
-| 10 | a scan copies field vectors, reads fields one after another | Fixed: moved in M119.2; read together in M120 (`a_multi_field_scan_reads_its_fields_together`). **Rejected:** `first_field.clone()` a row -- the document's map owns its key, so a row needs its own |
+| 10 | a scan copies field vectors, reads fields one after another; names each row's field anew | Fixed: moved in M119.2; read together in M120 (`a_multi_field_scan_reads_its_fields_together`); `Document.vectors` keyed by `Field`, one shared name, in M120.6 (`a_scan_names_its_field_once`, red with a name made a row; `a_field_is_its_name`) |
 
 ## `pstore-query`
 
@@ -90,7 +90,7 @@ found later (the spikes, the projected mask) and fixed, and one the review itsel
 | 7 | an eviction pass locks once an engine | Fixed, M119.2 |
 | 8 | the external list copied a request | Fixed, M119.2 |
 | 9 | the meter copies every range | Fixed, M119.2: sliced |
-| — | `swim::dest_for` scans members per datagram | **Rejected by the review itself:** about 50 µs at 10,000 members, a few times a tick |
+| — | `swim::dest_for` scans members per datagram | Not a finding: the review checked it and judged it fine, at about 50 µs for 10,000 members, a few times a tick |
 
 The two independent reviews' findings are in [M119's](../M119/VERIFIED.md) and
 [this milestone's](VERIFIED.md) ledgers: the first's two majors are M120's Deltas 1 and 2,
@@ -121,7 +121,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | format 7 | `read_rows_returns_the_files_floats` =, `a_filter_on_the_files_own_column_equals_the_exact_filtered_cosine` = |
 | format 8 | `f32_impacts_rank_exactly_like_brute_force` =, `a_corrupt_dictionary_is_refused_not_guessed` |
 | format 9 | `a_row_asked_twice_comes_back_twice` =, `rows_at_returns_each_rows_id_and_attributes_in_one_round` = |
-| format 10 | `a_multi_field_scan_reads_its_fields_together` =, `a_scan_still_returns_whole_documents` = |
+| format 10 | `a_multi_field_scan_reads_its_fields_together` =, `a_scan_still_returns_whole_documents` =, `a_scan_names_its_field_once`, `a_field_is_its_name` = |
 | query 1, 2 | `global_statistics_change_the_ranking_across_segments` =, `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` |
 | query 3 | `rrf_is_the_reciprocal_rank_sum` =, `ties_break_on_the_pair_and_the_segment_comes_first` = |
 | query 4 | `multi_scores_by_maxsim` =, `fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced` = |

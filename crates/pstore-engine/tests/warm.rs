@@ -157,7 +157,7 @@ fn doc(id: String, x: f32, full: bool) -> Document {
     d.attrs.insert("n".to_owned(), Value::Int(x as i64));
     if full {
         d.vectors.insert(
-            "s".to_owned(),
+            "s".into(),
             VectorField::Sparse(vec![
                 (3, Impact::new(0.5)),
                 ((x as u32) % 7, Impact::new(0.25)),
@@ -498,10 +498,8 @@ async fn an_index_without_dense_vectors_has_no_centroids_to_ask_for() {
     let docs = (0..THRESHOLD)
         .map(|i| {
             let mut d = Document::new(format!("z{i}"), vec![]);
-            d.vectors.insert(
-                "s".to_owned(),
-                VectorField::Sparse(vec![(1, Impact::new(0.5))]),
-            );
+            d.vectors
+                .insert("s".into(), VectorField::Sparse(vec![(1, Impact::new(0.5))]));
             d
         })
         .collect();

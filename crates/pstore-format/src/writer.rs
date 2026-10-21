@@ -390,12 +390,14 @@ impl SegmentWriter {
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader
         // that predates the Fields table sees exactly the single-dense view it expects
         // rather than an arbitrary field's vectors.
+        // Distinct and sorted as a set of the borrowed names, owned once each (M120).
         let mut names: Vec<String> = docs
             .iter()
-            .flat_map(|d| d.vectors.keys().cloned())
+            .flat_map(|d| d.vectors.keys().map(crate::Field::as_str))
+            .collect::<std::collections::BTreeSet<&str>>()
+            .into_iter()
+            .map(str::to_owned)
             .collect();
-        names.sort();
-        names.dedup();
         // ⚠️ **The default field first** (M61). Field 0 takes the legacy `Vectors` section,
         // which the index and the exact scan read at a fixed width; a many-vectors field named
         // before it (`late` < `vector`) would have taken it, and every dense query would have

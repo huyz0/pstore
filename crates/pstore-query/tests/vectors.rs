@@ -142,7 +142,7 @@ async fn a_segment_whose_vectors_section_is_not_vector_resolves_without_one() {
             let mut d = Document::new(format!("n{i:02}"), Vec::new());
             d.vectors.remove(DEFAULT_FIELD);
             d.vectors.insert(
-                "emb".to_owned(),
+                "emb".into(),
                 VectorField::Dense(vec![vec![i as f32, 1.0, 2.0]]),
             );
             d
@@ -153,7 +153,7 @@ async fn a_segment_whose_vectors_section_is_not_vector_resolves_without_one() {
         .map(|i| {
             let mut d = Document::new(format!("s{i:02}"), v(i));
             d.vectors.insert(
-                DEFAULT_FIELD.to_owned(),
+                DEFAULT_FIELD.into(),
                 VectorField::Dense(vec![v(i), v(i + 1), v(i + 2)]),
             );
             d

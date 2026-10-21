@@ -27,8 +27,8 @@ fn a_document_carries_several_named_fields() {
     let d = Document {
         id: "d1".to_owned(),
         vectors: BTreeMap::from([
-            ("body_dense".to_owned(), VectorField::dense(vec![1.0, 2.0])),
-            ("title_dense".to_owned(), VectorField::dense(vec![3.0, 4.0])),
+            ("body_dense".into(), VectorField::dense(vec![1.0, 2.0])),
+            ("title_dense".into(), VectorField::dense(vec![3.0, 4.0])),
         ]),
         attrs: BTreeMap::new(),
     };
@@ -45,7 +45,7 @@ fn field_names_survive_a_new_field_being_added() {
     let mut d = Document::new("d1", vec![1.0, 2.0]);
     let before = d.field(DEFAULT_FIELD).to_vec();
     d.vectors
-        .insert("aaa_sorts_first".to_owned(), VectorField::dense(vec![9.0]));
+        .insert("aaa_sorts_first".into(), VectorField::dense(vec![9.0]));
     assert_eq!(
         d.field(DEFAULT_FIELD).to_vec(),
         before,
@@ -61,7 +61,7 @@ fn a_field_may_hold_many_vectors_per_document() {
     let d = Document {
         id: "d1".to_owned(),
         vectors: BTreeMap::from([(
-            "late".to_owned(),
+            "late".into(),
             VectorField::Dense(vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]),
         )]),
         attrs: BTreeMap::new(),
@@ -79,7 +79,7 @@ fn a_sparse_field_is_representable() {
     let d = Document {
         id: "d1".to_owned(),
         vectors: BTreeMap::from([(
-            "body_sparse".to_owned(),
+            "body_sparse".into(),
             VectorField::Sparse(vec![(7, Impact::new(0.5)), (2_999, Impact::new(1.25))]),
         )]),
         attrs: BTreeMap::new(),
@@ -146,10 +146,7 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     let mut w = SegmentWriter::new(8);
     w.push(Document {
         id: "d".to_owned(),
-        vectors: BTreeMap::from([(
-            "s".to_owned(),
-            VectorField::Sparse(vec![(1, Impact::new(0.5))]),
-        )]),
+        vectors: BTreeMap::from([("s".into(), VectorField::Sparse(vec![(1, Impact::new(0.5))]))]),
         attrs: BTreeMap::new(),
     });
     let err = w.try_finish().unwrap_err();
@@ -165,9 +162,9 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     w.push(Document {
         id: "d0".to_owned(),
         vectors: BTreeMap::from([
-            ("other".to_owned(), VectorField::dense(vec![1.0])),
+            ("other".into(), VectorField::dense(vec![1.0])),
             (
-                "late".to_owned(),
+                "late".into(),
                 VectorField::Dense(vec![vec![2.0], vec![3.0]]),
             ),
         ]),
@@ -190,9 +187,9 @@ async fn a_multi_field_scan_reads_its_fields_together() {
         .map(|i| {
             let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0]);
             d.vectors
-                .insert("a".to_owned(), VectorField::dense(vec![2.0, i as f32, 0.5]));
+                .insert("a".into(), VectorField::dense(vec![2.0, i as f32, 0.5]));
             d.vectors
-                .insert("b".to_owned(), VectorField::dense(vec![i as f32]));
+                .insert("b".into(), VectorField::dense(vec![i as f32]));
             d
         })
         .collect();
@@ -212,4 +209,93 @@ async fn a_multi_field_scan_reads_its_fields_together() {
         assert_eq!(got.vectors, want.vectors, "{}", want.id);
     }
     assert_eq!(s.depth(), 2, "a three-field scan took {} rounds", s.depth());
+}
+
+#[allow(
+    clippy::cmp_owned,
+    reason = "each of `Field`'s comparisons with an owned `String` is the subject"
+)]
+#[test]
+fn a_field_is_its_name() {
+    // M120: a map keyed by `Field` orders, finds, hashes, compares and prints as one keyed by
+    // `String` did -- the type changed, nothing a caller reads of it did.
+    use pstore_format::Field;
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let names = ["vector", "b", "a", "late$fde", "", "ſσk", "vector2"];
+    let by_field: BTreeMap<Field, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ((*n).into(), i))
+        .collect();
+    let by_string: BTreeMap<String, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ((*n).to_owned(), i))
+        .collect();
+    assert!(
+        by_field
+            .keys()
+            .map(Field::as_str)
+            .eq(by_string.keys().map(String::as_str))
+    );
+    assert_eq!(format!("{by_field:?}"), format!("{by_string:?}"));
+    let h = BuildHasherDefault::<DefaultHasher>::default();
+    for n in names {
+        let f: Field = n.into();
+        assert_eq!(by_field.get(n), by_string.get(n));
+        assert_eq!(h.hash_one(&f), h.hash_one(n.to_owned()), "{n}");
+        // Every comparison impl, each exercised.
+        assert!(f == n);
+        assert!(n == f);
+        assert!(f == *n);
+        assert!(f == n.to_owned());
+        assert!(n.to_owned() == f);
+        assert_eq!(f.to_string(), n);
+        assert_eq!(String::from(f), n);
+    }
+    // The default name is one allocation, however it is made.
+    assert!(Field::same_allocation(
+        &"vector".into(),
+        &Field::default_field()
+    ));
+    assert!(Field::same_allocation(
+        &"vector".to_owned().into(),
+        &Document::new("d", vec![1.0])
+            .vectors
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
+    ));
+}
+
+#[tokio::test]
+async fn a_scan_names_its_field_once() {
+    // M120 (format 10): every scanned row's field name is one shared allocation, not a
+    // `String` a row.
+    use pstore_blob::{BlobStore, Key, MemoryStore};
+    let mut w = pstore_format::SegmentWriter::new(8);
+    for i in 0..20 {
+        let mut d = Document::new(format!("d{i}"), vec![0.0; 2]);
+        d.vectors.clear();
+        d.vectors
+            .insert("emb".into(), VectorField::dense(vec![i as f32, 1.0]));
+        w.push(d);
+    }
+    let key = Key::new("t/one.seg");
+    let s = MemoryStore::new();
+    s.put(&key, w.finish()).await.unwrap();
+    let seg = pstore_format::Segment::open(&s, &key).await.unwrap();
+    let out = seg.scan(&s, &key, None).await.unwrap();
+    assert_eq!(out.len(), 20);
+    let first = out[0].vectors.keys().next().unwrap().clone();
+    assert_eq!(first, "emb");
+    for d in &out {
+        let k = d.vectors.keys().next().unwrap();
+        assert!(
+            pstore_format::Field::same_allocation(k, &first),
+            "{} named its field again",
+            d.id
+        );
+    }
 }

@@ -1269,7 +1269,7 @@ async fn fetch_rows<S: BlobStore>(
             for (row, doc) in rows.iter().zip(docs.iter_mut()) {
                 if let (Some(doc), Some(v)) = (doc.as_mut(), vectors.get(row)) {
                     doc.vectors.insert(
-                        pstore_format::DEFAULT_FIELD.to_owned(),
+                        pstore_format::DEFAULT_FIELD.into(),
                         pstore_format::VectorField::Dense(vec![v.clone()]),
                     );
                 }

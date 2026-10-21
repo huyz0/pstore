@@ -837,7 +837,7 @@ impl Segment {
         // the span comes from the field's layout row, the key by derivation — so fetching
         // them in sequence would turn every scan of a sparse segment into three rounds for
         // no reason a caller could see.
-        let sparse_name = self.sparse_field().map(str::to_owned);
+        let sparse_name: Option<crate::Field> = self.sparse_field().map(Into::into);
         let postings_at = sparse_name.as_ref().and_then(|n| {
             let span = self.field_section(n, Section::SparsePostings)?;
             all.push(span);
@@ -898,16 +898,17 @@ impl Segment {
                     .map(|f| self.field_vectors(store, key, &f.name)),
             )
             .await;
-            let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::with_capacity(dense.len());
+            let mut m: Vec<(crate::Field, Vec<Vec<Vec<f32>>>)> = Vec::with_capacity(dense.len());
             for (f, got) in dense.iter().zip(read) {
-                m.push((f.name.clone(), got?));
+                m.push((f.name.as_str().into(), got?));
             }
             m
         };
-        let first_field = self
+        // ⚠️ One name for every row, shared (M120): a `String` a row was an allocation each.
+        let first_field: crate::Field = self
             .fields
             .first()
-            .map_or_else(|| crate::DEFAULT_FIELD.to_owned(), |f| f.name.clone());
+            .map_or_else(crate::Field::default_field, |f| f.name.as_str().into());
 
         let mut out = Vec::new();
         for (n, block) in wanted.iter().enumerate() {

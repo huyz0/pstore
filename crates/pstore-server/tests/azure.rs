@@ -35,7 +35,7 @@ fn doc(i: u32) -> Document {
         Value::Str(format!("word{} word{}", i % 5, i % 3)),
     );
     d.vectors.insert(
-        "s".to_owned(),
+        "s".into(),
         VectorField::Sparse(vec![(3, Impact::new(0.5)), (i % 7, Impact::new(0.25))]),
     );
     d

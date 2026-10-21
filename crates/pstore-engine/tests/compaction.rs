@@ -27,7 +27,7 @@ fn doc(id: &str, v: f32) -> Document {
     Document {
         id: id.to_owned(),
         vectors: std::collections::BTreeMap::from([(
-            pstore_format::DEFAULT_FIELD.to_owned(),
+            pstore_format::DEFAULT_FIELD.into(),
             pstore_format::VectorField::dense(vec![v; 4]),
         )]),
         attrs: Default::default(),
@@ -306,7 +306,7 @@ async fn compaction_keeps_every_vector_of_a_segment_with_deletes() {
             .insert("n".to_owned(), pstore_format::Value::Int(i64::from(i)));
         // Named after `vector`, so field order is not what this tests (M61 fixes that).
         d.vectors.insert(
-            "words".to_owned(),
+            "words".into(),
             pstore_format::VectorField::Dense((0..i % 3 + 1).map(|j| vec![x, j as f32]).collect()),
         );
         d

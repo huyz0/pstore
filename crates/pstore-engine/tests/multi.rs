@@ -24,7 +24,7 @@ const T: TenantId = TenantId(6100);
 fn doc(id: &str, width: usize) -> Document {
     let mut d = Document::new(id, vec![1.0, 0.5, 0.25, 0.125]);
     d.vectors.insert(
-        "late".to_owned(),
+        "late".into(),
         VectorField::Dense(vec![vec![0.5; width], vec![-0.25; width]]),
     );
     d
@@ -147,7 +147,7 @@ async fn a_named_field_holding_no_vectors_derives_no_encoding() {
     let mut empty = Document::new("e", vec![1.0, 0.5, 0.25, 0.125]);
     empty
         .vectors
-        .insert("late".to_owned(), VectorField::Dense(Vec::new()));
+        .insert("late".into(), VectorField::Dense(Vec::new()));
     e.write("docs", vec![doc("a", 3), empty]).await.unwrap();
     e.flush().await.unwrap();
     e.fold().await.unwrap();
@@ -188,7 +188,7 @@ fn topical(i: usize) -> Document {
     };
     let mut doc = Document::new(format!("d{i:05}"), vec![1.0, 0.5, 0.25, 0.125]);
     doc.vectors.insert(
-        "late".to_owned(),
+        "late".into(),
         VectorField::Dense(vec![v(&mut r), v(&mut r)]),
     );
     doc
@@ -312,10 +312,8 @@ async fn a_big_segment_clusters_its_encoding_and_a_query_uses_it() {
 /// `doc`, with a second named field `other` of one vector at `width`.
 fn with_other(id: &str, late: usize, width: usize) -> Document {
     let mut d = doc(id, late);
-    d.vectors.insert(
-        "other".to_owned(),
-        VectorField::Dense(vec![vec![0.75; width]]),
-    );
+    d.vectors
+        .insert("other".into(), VectorField::Dense(vec![vec![0.75; width]]));
     d
 }
 

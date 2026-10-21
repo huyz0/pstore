@@ -34,7 +34,7 @@ fn a_sparse_document_is_refused_even_when_another_section_is_attached() {
     // by that section and the refusal disappears.
     let mut d = Document::new("d0".to_owned(), vec![1.0, 2.0]);
     d.vectors.insert(
-        "body_sparse".to_owned(),
+        "body_sparse".into(),
         VectorField::Sparse(vec![(3, Impact::new(0.5))]),
     );
 
