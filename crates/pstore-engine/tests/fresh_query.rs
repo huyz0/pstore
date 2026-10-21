@@ -445,3 +445,43 @@ async fn a_query_on_one_index_is_not_served_another_indexs_fresh_rows() {
         "a query on `b` was answered from another index's fresh rows: {unfolded:?}"
     );
 }
+
+#[tokio::test]
+async fn each_index_keeps_its_own_fresh_segment() {
+    // M119: one cached fresh segment an index. A single slot rebuilt a segment on every query
+    // of a tenant alternating between two indexes, with nothing written in between.
+    let store = Arc::new(MemoryStore::new());
+    let e =
+        Engine::new(Arc::clone(&store), TenantId(801), LaneId(1)).with_index_params(params(100));
+    e.write("a", (0..5).map(doc).collect()).await.unwrap();
+    e.write("b", (100..103).map(doc).collect()).await.unwrap();
+    e.flush().await.unwrap();
+    for round in 0..3 {
+        for (index, want) in [("a", 5), ("b", 3)] {
+            let got = e
+                .query(index, &dense(1, 10), Fusion::default(), 10)
+                .await
+                .unwrap();
+            assert_eq!(got.unfolded.len(), want, "{index} in round {round}");
+            let prefix = if index == "a" { "d0000" } else { "d0010" };
+            assert!(
+                got.unfolded.iter().all(|d| d.id.starts_with(prefix)),
+                "{index} answered with another index's rows: {:?}",
+                got.unfolded.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            e.fresh_indexes_for_test().await,
+            ["a", "b"],
+            "a query of one index dropped the other's segment"
+        );
+    }
+    // A write moves the generation: the next query's miss drops every stale segment.
+    e.write("a", vec![doc(9)]).await.unwrap();
+    let got = e
+        .query("a", &dense(1, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(got.unfolded.len(), 6);
+    assert_eq!(e.fresh_indexes_for_test().await, ["a"]);
+}

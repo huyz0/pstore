@@ -29,11 +29,16 @@ a review of every shipping crate for per-row, per-candidate and per-request wast
    replaced sort has a total comparator (`total_cmp`, then a unique id), so selecting then
    sorting the prefix returns what sorting everything did; every replaced accumulator adds
    the same terms in the same order from the same `+0.0`.
-3. **Findings rejected on verification** are listed in `VERIFIED.md` with why.
+3. **A filter's mask decodes only what its predicate reads** (found by the bench after 2):
+   the id when it names the id, and its own attributes; every other value is read through
+   and checked as the full decode checks it, and built never.
+4. **Findings rejected on verification** are listed in `VERIFIED.md` with why.
 
 **Not changed:** any blob request, its count, its class or its depth; any wire format; any
-answer, its order, or its ties; any error a caller can see, except the text of a serde
-parse error, which gains serde's position suffix where a body is no longer parsed twice.
+answer, its order, or its ties; any error a caller can see. ⚠️ Amended at review: two fixes
+that cut round-trip depth (an external column's pin checks, a multi-field scan's reads) and
+a write body parsed once into its type (which refused duplicate keys and let a malformed
+unknown field through) were taken out, not landed: each changes what this spec fixes.
 
 ## Acceptance criteria
 
@@ -44,8 +49,13 @@ parse error, which gains serde's position suffix where a body is no longer parse
    `text+filter`) are each at most 0.8 of their baseline p50, and no kind's p50 is above
    1.05 of its baseline, on the same host, baseline and change run back to back.
 4. **The replaced kernels agree with what they replace.** `top_k_matches_a_full_sort`,
-   `the_branchless_kernel_is_the_branchy_one`, `the_dense_accumulator_is_the_map` pass.
-5. `./scripts/gates.sh` passes.
+   `the_branchless_kernel_is_the_branchy_one`, `the_dense_accumulator_is_the_map`,
+   `a_projection_keeps_exactly_what_it_names`,
+   `a_projection_refuses_what_the_full_decode_refuses`,
+   `the_hand_written_vector_is_the_derived_one` pass.
+5. **One fresh segment an index.** `each_index_keeps_its_own_fresh_segment`: queries
+   alternating between two indexes keep both cached and answer each with its own rows.
+6. `./scripts/gates.sh` passes.
 
 ## Test plan
 
@@ -54,10 +64,13 @@ parse error, which gains serde's position suffix where a body is no longer parse
 | 1 | the bench | it does not exist | — |
 | 2 | digests compared by hand | — | any fix that reorders a tie or changes a sum |
 | 3 | p50 compared by hand | — | — (a number, not a predicate) |
-| 4 | `top_k_matches_a_full_sort` | the helper does not exist | `select_nth` at `k - 1`, a missing prefix sort |
-| 4 | `the_branchless_kernel_is_the_branchy_one` | the kernel does not exist | a sign flip on the set bit, a dropped tail |
+| 4 | `top_k_matches_a_full_sort` | the helper does not exist | a missing prefix sort |
+| 4 | `the_branchless_kernel_is_the_branchy_one` | the kernel does not exist | a dropped tail element |
 | 4 | `the_dense_accumulator_is_the_map` | it does not exist | a row touched only by a zero dropped |
-| 5 | gates | — | — |
+| 4 | `a_projection_refuses_what_the_full_decode_refuses` | it does not exist | a skipped bool left unchecked |
+| 4 | `the_hand_written_vector_is_the_derived_one` | it does not exist | a refusal's message changed |
+| 5 | `each_index_keeps_its_own_fresh_segment` | one slot: the other index's is dropped | the map cleared on a miss |
+| 6 | gates | — | — |
 
 ## RA budget
 
@@ -74,8 +87,6 @@ Unchanged: no blob request is added, removed or reordered, and none changes clas
 ## Tasks
 
 - **M119.1** — the bench, this spec.
-- **M119.2** — `pstore-index`.
-- **M119.3** — `pstore-format`.
-- **M119.4** — `pstore-query`.
-- **M119.5** — `pstore-engine`, `pstore-cache`.
-- **M119.6** — `pstore-server`, `pstore-meter`; the ledger.
+- **M119.2** — the fixes and the ledger. ⚠️ Amended from five commits, one a crate: the
+  crates' fixes depend on each other (`pstore-query` uses `pstore-index`'s `top` and
+  `pstore-format`'s projection), and one gate run costs about forty minutes on this host.

@@ -17,15 +17,22 @@ use crate::sq8;
 /// not have, and it is why `p` is the recall knob rather than a graph traversal depth.
 #[must_use]
 pub fn probe(clustering: &Clustering, query: &[f32], p: usize) -> Vec<usize> {
-    let mut d: Vec<(usize, f32)> = clustering
-        .centroids()
+    probe_centroids(clustering.centroids(), query, p)
+}
+
+/// [`probe`] over a centroid table alone, so a caller holding one does not copy it into a
+/// [`Clustering`] per query (M119).
+#[must_use]
+pub fn probe_centroids(centroids: &[Vec<f32>], query: &[f32], p: usize) -> Vec<usize> {
+    let mut d: Vec<(usize, f32)> = centroids
         .iter()
         .enumerate()
         .map(|(i, c)| (i, dist2(query, c)))
         .collect();
     // Ties by index so a probe set is reproducible; recall is compared across runs.
-    d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    d.truncate(p.max(1));
+    crate::top::top_k_by(&mut d, p.max(1), |a, b| {
+        a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+    });
     d.into_iter().map(|(i, _)| i).collect()
 }
 
@@ -106,7 +113,8 @@ pub fn probe_sq8(table: &[sq8::Code], query: &[f32], p: usize) -> Vec<(usize, f3
         })
         .collect();
     // Ties by index, as `probe`'s are.
-    d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    d.truncate(p.max(1));
+    crate::top::top_k_by(&mut d, p.max(1), |a, b| {
+        a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+    });
     d.into_iter().map(|(i, _, cq)| (i, cq)).collect()
 }

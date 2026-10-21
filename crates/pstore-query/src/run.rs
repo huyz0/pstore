@@ -137,14 +137,38 @@ pub struct Target {
 
 /// Which sidecars a query needs, derived from the legs.
 struct Opened {
-    segment: Segment,
+    /// Shared by the legs' and the mask's tasks rather than copied into each (M119): a footer
+    /// holds every block's zone maps, a `BTreeMap` of names per block.
+    segment: Arc<Segment>,
     centroids: Option<bytes::Bytes>,
     dictionary: Option<bytes::Bytes>,
     terms: Option<bytes::Bytes>,
     /// Its multi-vector encoding clusters (M71.2), when the target has them and a leg wants them.
     fde: Option<bytes::Bytes>,
     /// Rows its delete vector excludes; empty when it has none.
-    deleted: std::collections::HashSet<usize>,
+    deleted: crate::deletes::Rows,
+    /// Its text index, decoded once from `terms` for every text leg and the statistics
+    /// (M119), or `None` where it does not decode -- where each reader decodes `terms` again
+    /// to report why, as it did before.
+    text: Option<Arc<TextIndex>>,
+}
+
+impl Opened {
+    /// The segment's text index: decoded once at open, or again here to fail as it does.
+    fn text_index(&self, raw: &[u8]) -> Result<Arc<TextIndex>, FormatError> {
+        match &self.text {
+            Some(idx) => Ok(Arc::clone(idx)),
+            None => TextIndex::from_segment(&self.segment, raw).map(Arc::new),
+        }
+    }
+
+    /// This segment's BM25 statistics for `terms`, or `None` with no readable dictionary.
+    fn summary_for(&self, terms: &[String]) -> Option<Stats> {
+        let raw = self.terms.as_ref()?;
+        self.text_index(raw.as_ref())
+            .ok()
+            .map(|idx| idx.summary_for(terms))
+    }
 }
 
 /// Runs every leg over one segment and fuses the answers.
@@ -327,8 +351,9 @@ pub async fn open_part<S: BlobStore + Clone>(
         let raw = o.terms.as_ref().ok_or(FormatError::Corrupt(
             "a share's segment with text and no term dictionary",
         ))?;
-        parts.push(TextIndex::from_segment(&o.segment, raw.as_ref())?.summary());
+        parts.push(o.text_index(raw.as_ref())?.summary_for(terms));
     }
+    // Already `terms` alone, each summary built for them (M119); `only` keeps it so.
     let stats = only(Stats::merge(parts), terms);
     Ok((
         OpenPart {
@@ -532,12 +557,13 @@ async fn candidates<S: BlobStore + Clone>(
         // One copy a segment, shared by its legs (code review), without the delete vector: a
         // leg never reads it, and deleted rows are dropped below, from `items`.
         let shared = Arc::new(Opened {
-            segment: o.segment.clone(),
+            segment: Arc::clone(&o.segment),
             centroids: o.centroids.clone(),
             dictionary: o.dictionary.clone(),
             terms: o.terms.clone(),
             fde: o.fde.clone(),
-            deleted: std::collections::HashSet::new(),
+            deleted: crate::deletes::Rows::default(),
+            text: o.text.clone(),
         });
         for &(j, r) in legs.iter().filter(|(j, _)| runs(i, *j)) {
             let hidden = o.deleted.len() + if t.shadowed { shadow } else { 0 };
@@ -569,7 +595,7 @@ async fn candidates<S: BlobStore + Clone>(
                 let (store, key, segment, f) = (
                     store.clone(),
                     t.segment.clone(),
-                    o.segment.clone(),
+                    Arc::clone(&o.segment),
                     f.clone(),
                 );
                 mask_tasks.0.push(tokio::spawn(async move {
@@ -757,12 +783,25 @@ async fn run<S: BlobStore + Clone>(
         // was written first and removed: no test could distinguish it, and the mutation gate said
         // so. `a_missing_term_dictionary_is_an_error_not_a_smaller_corpus` pins the property
         // wherever it is enforced.
-        let mut stats = Stats::merge(opened.iter().filter_map(|o| {
-            let raw = o.terms.as_ref()?;
-            TextIndex::from_segment(&o.segment, raw.as_ref())
-                .ok()
-                .map(|idx| idx.summary())
-        }));
+        //
+        // ⚠️ **Only the query's terms** (M119): BM25 reads `df` for its own terms and nothing
+        // else, so merging every segment's whole vocabulary -- a `String` and a map insert per
+        // term per segment, on the query's own task -- bought numbers no leg reads. A phased
+        // share already sends only these (M55).
+        let text_terms: Vec<String> = {
+            let mut t: Vec<String> = prefetch
+                .iter()
+                .filter_map(|p| match p {
+                    Prefetch::Text { query, .. } => Some(query),
+                    _ => None,
+                })
+                .flat_map(|q| pstore_format::text::analyze(&text.analyzer, q))
+                .collect();
+            t.sort();
+            t.dedup();
+            t
+        };
+        let mut stats = Stats::merge(opened.iter().filter_map(|o| o.summary_for(&text_terms)));
         // M55: each phased share's statistics, or -- for a share whose phase 1 failed -- its
         // segments opened here, one more round, so the sum is never a share short.
         let mut scan_here: Vec<(usize, Target)> = Vec::new();
@@ -784,14 +823,13 @@ async fn run<S: BlobStore + Clone>(
         let opened_here = open_all(store, scan_here.iter().map(|(_, t)| t), prefetch)
             .join()
             .await?;
-        stats = Stats::merge(std::iter::once(stats).chain(summed_parts).chain(
-            opened_here.iter().filter_map(|o| {
-                let raw = o.terms.as_ref()?;
-                TextIndex::from_segment(&o.segment, raw.as_ref())
-                    .ok()
-                    .map(|idx| idx.summary())
-            }),
-        ));
+        stats = Stats::merge(
+            std::iter::once(stats).chain(summed_parts).chain(
+                opened_here
+                    .iter()
+                    .filter_map(|o| o.summary_for(&text_terms)),
+            ),
+        );
         // Shared by every leg task (M59), and built once.
         let stats = &Arc::new(stats);
 
@@ -1157,13 +1195,31 @@ async fn mask<S: BlobStore>(
     segment: &Segment,
     filter: &Predicate,
 ) -> Result<Mask, QueryError> {
-    Ok(segment
-        .rows_where(store, key, |zones| filter.could_admit(zones))
-        .await?
-        .into_iter()
-        .filter(|(_, d)| filter.admits(&d.id, &d.attrs))
-        .map(|(row, _)| row)
-        .collect())
+    // ⚠️ Each row built only as far as the predicate reads it (M119): the id when it reads the
+    // id, and its own attributes. Building every row whole -- its id, and every string
+    // attribute, the text field among them -- was most of a filtered query's time, and
+    // `admits` reads nothing else.
+    let names = filter.names();
+    let wanted = |name: &str| names.binary_search(&name).is_ok();
+    let project = pstore_format::Projection {
+        id: names.binary_search(&crate::filter::ID).is_ok(),
+        attrs: &wanted,
+    };
+    let mut admitted = Vec::new();
+    segment
+        .visit_rows_projected(
+            store,
+            key,
+            |zones| filter.could_admit(zones),
+            &project,
+            |row, d| {
+                if filter.admits(&d.id, &d.attrs) {
+                    admitted.push(row);
+                }
+            },
+        )
+        .await?;
+    Ok(admitted.into_iter().collect())
 }
 
 /// Documents already fetched this query, by `(segment, row)`.
@@ -1566,9 +1622,9 @@ async fn open<S: BlobStore>(
             Some(k) => store
                 .get_immutable(k, pstore_blob::Class::Pinned)
                 .await
-                .map(|raw| crate::deletes::decode(&raw))
+                .map(|raw| crate::deletes::Rows::decode(&raw))
                 .map_err(|e| QueryError::Format(FormatError::from(e))),
-            None => Ok(std::collections::HashSet::new()),
+            None => Ok(crate::deletes::Rows::default()),
         }
     };
     // M83: a dense leg over a named field reads that field's clusters when the segment has them.
@@ -1598,13 +1654,20 @@ async fn open<S: BlobStore>(
         fde_fut,
     )
     .await;
+    let segment = segment?;
+    let text = terms.as_ref().and_then(|raw| {
+        TextIndex::from_segment(&segment, raw.as_ref())
+            .ok()
+            .map(Arc::new)
+    });
     Ok(Opened {
-        segment: segment?,
+        segment: Arc::new(segment),
         centroids: cen,
         dictionary: dict,
         terms,
         fde,
         deleted: deleted?,
+        text,
     })
 }
 
@@ -1751,7 +1814,7 @@ async fn leg<S: BlobStore>(
             let raw = opened.terms.as_ref().ok_or(FormatError::Corrupt(
                 "a text leg over a segment with no term dictionary sidecar",
             ))?;
-            let idx = TextIndex::from_segment(&opened.segment, raw.as_ref())?;
+            let idx = opened.text_index(raw.as_ref())?;
             // ⚠️ The statistics are the CALLER's, summed across every segment in the query,
             // not this segment's own summary. That caller is what M5a, M5b and M5c each
             // handed forward by name, and scoring against a per-segment summary is wrong
@@ -1840,8 +1903,7 @@ async fn leg<S: BlobStore>(
                             .map(|v| (row, v.iter().zip(query.iter()).map(|(a, b)| a * b).sum()))
                     })
                     .collect();
-                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                scored.truncate(*limit);
+                pstore_index::top::top_k_by(&mut scored, *limit, pstore_index::top::best_first);
                 return Ok(scored
                     .into_iter()
                     .map(|(row, score)| Hit {
@@ -1856,7 +1918,7 @@ async fn leg<S: BlobStore>(
                 .field_layout(field)
                 .map_or(query.len(), |f| f.dims as usize);
             let idx = VecIndex::from_parts(
-                opened.segment.clone(),
+                Arc::clone(&opened.segment),
                 opened.centroids.as_ref().map(AsRef::as_ref),
                 dim,
             );
@@ -1913,8 +1975,7 @@ async fn leg<S: BlobStore>(
                 .enumerate()
                 .filter_map(|(row, d)| maxsim(query, d).map(|s| (row, s)))
                 .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            scored.truncate(*limit);
+            pstore_index::top::top_k_by(&mut scored, *limit, pstore_index::top::best_first);
             Ok(scored
                 .into_iter()
                 .map(|(row, score)| Hit {
@@ -1985,7 +2046,12 @@ async fn leg<S: BlobStore>(
                             .map(|e| (row, e.iter().zip(&encoded).map(|(a, b)| a * b).sum::<f32>()))
                     })
                     .collect();
-                flat.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                // Only what the cut below keeps, ordered (M119).
+                pstore_index::top::top_k_by(
+                    &mut flat,
+                    rerank.map_or(*limit, |w| w.max(*limit)),
+                    pstore_index::top::best_first,
+                );
                 flat
             };
             if let Some(window) = rerank {
@@ -1999,7 +2065,7 @@ async fn leg<S: BlobStore>(
                     .iter()
                     .filter_map(|(row, d)| maxsim(query, d).map(|s| (*row, s)))
                     .collect();
-                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                pstore_index::top::top_k_by(&mut scored, *limit, pstore_index::top::best_first);
             }
             scored.truncate(*limit);
             Ok(scored
@@ -2025,7 +2091,7 @@ async fn leg<S: BlobStore>(
             let raw = opened.dictionary.as_ref().ok_or(FormatError::Corrupt(
                 "a sparse leg over a segment with no dictionary sidecar",
             ))?;
-            let idx = SparseIndex::from_segment(&opened.segment, field, raw.as_ref())?;
+            let idx = SparseIndex::from_segment_bytes(&opened.segment, field, raw.clone())?;
             let hits = idx.search(store, key, query, *limit).await?;
             Ok(hits
                 .into_iter()

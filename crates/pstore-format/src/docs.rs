@@ -62,13 +62,54 @@ fn encode_value(e: &mut Enc, v: &Value) {
 }
 
 fn decode_attrs(d: &mut Dec<'_>) -> Result<BTreeMap<String, Value>, FormatError> {
+    decode_attrs_where(d, &every)
+}
+
+/// [`decode_attrs`], keeping only the names `keep` admits. A value it drops is still read
+/// through, and refused for exactly what [`decode_value`] refuses.
+fn decode_attrs_where(
+    d: &mut Dec<'_>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<BTreeMap<String, Value>, FormatError> {
     let n = d.u32()? as usize;
     let mut attrs = BTreeMap::new();
     for _ in 0..n {
-        let k = d.string()?;
-        attrs.insert(k, decode_value(d, true)?);
+        let k = d.str()?;
+        if keep(k) {
+            attrs.insert(k.to_owned(), decode_value(d, true)?);
+        } else {
+            skip_value(d, true)?;
+        }
     }
     Ok(attrs)
+}
+
+/// [`decode_value`]'s checks, in its order, building nothing.
+fn skip_value(d: &mut Dec<'_>, array: bool) -> Result<(), FormatError> {
+    match d.u8()? {
+        0 | 5 => {
+            d.i64()?;
+        }
+        1 => {
+            d.str()?;
+        }
+        2 => {
+            d.f64()?;
+        }
+        3 => match d.u8()? {
+            0 | 1 => {}
+            _ => return Err(FormatError::Corrupt("a bool that is neither 0 nor 1")),
+        },
+        4 if array => {
+            let n = d.u32()? as usize;
+            for _ in 0..n {
+                skip_value(d, false)?;
+            }
+        }
+        4 => return Err(FormatError::Corrupt("an array inside an array")),
+        _ => return Err(FormatError::Corrupt("unknown value tag")),
+    }
+    Ok(())
 }
 
 /// One tagged value; an array only where `array` allows it, so never nested.
@@ -212,12 +253,48 @@ pub fn encode_rows(docs: &[Document]) -> Vec<u8> {
 /// Decodes segment-block rows. Vectors come back empty and are filled from the
 /// [`crate::Section::Vectors`] section by the caller that wants them.
 pub fn decode_rows(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+    decode_rows_where(buf, &Projection::ALL)
+}
+
+/// What [`decode_rows_where`] builds of each row (M119): the rest is read through, checked,
+/// and dropped.
+pub struct Projection<'a> {
+    /// Whether the id is kept; dropped, it comes back empty.
+    pub id: bool,
+    /// The attributes kept.
+    pub attrs: &'a (dyn Fn(&str) -> bool + Sync),
+}
+
+impl Projection<'_> {
+    /// Everything: [`decode_rows`].
+    pub const ALL: Projection<'static> = Projection {
+        id: true,
+        attrs: &every,
+    };
+}
+
+fn every(_: &str) -> bool {
+    true
+}
+
+/// [`decode_rows`], building only what `keep` names of each row, and refusing exactly what
+/// it refuses.
+///
+/// ⚠️ For a filter's mask (M119): it reads a name or two of each row of every block it cannot
+/// prune, and building every row whole -- its id, and every string attribute, the text field
+/// among them -- was most of a filtered query's time.
+pub fn decode_rows_where(buf: &[u8], keep: &Projection<'_>) -> Result<Vec<Document>, FormatError> {
     let mut d = Dec::new(buf);
     let n = d.u32()? as usize;
     let mut out = Vec::with_capacity(n.min(1 << 20));
     for _ in 0..n {
-        let id = d.string()?;
-        let attrs = decode_attrs(&mut d)?;
+        let id = if keep.id {
+            d.string()?
+        } else {
+            d.str()?;
+            String::new()
+        };
+        let attrs = decode_attrs_where(&mut d, keep.attrs)?;
         out.push(Document {
             id,
             vectors: BTreeMap::new(),
@@ -225,4 +302,92 @@ pub fn decode_rows(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    fn rows() -> Vec<Document> {
+        let mut a = Document::new("a", Vec::new());
+        a.attrs.insert("n".to_owned(), Value::Int(3));
+        a.attrs
+            .insert("text".to_owned(), Value::Str("some words".to_owned()));
+        a.attrs.insert(
+            "tags".to_owned(),
+            Value::Array(vec![Value::Bool(true), Value::Float(1.5)]),
+        );
+        let mut b = Document::new("b", Vec::new());
+        b.attrs.insert("n".to_owned(), Value::Int(4));
+        b.attrs.insert("when".to_owned(), Value::DateTime(7));
+        vec![a, b]
+    }
+
+    #[test]
+    fn a_projection_keeps_exactly_what_it_names() {
+        let buf = encode_rows(&rows());
+        let only_n = |name: &str| name == "n";
+        let got = decode_rows_where(
+            &buf,
+            &Projection {
+                id: false,
+                attrs: &only_n,
+            },
+        )
+        .unwrap();
+        let want: Vec<(String, Vec<(String, Value)>)> = vec![
+            (String::new(), vec![("n".to_owned(), Value::Int(3))]),
+            (String::new(), vec![("n".to_owned(), Value::Int(4))]),
+        ];
+        let got: Vec<(String, Vec<(String, Value)>)> = got
+            .into_iter()
+            .map(|d| (d.id, d.attrs.into_iter().collect()))
+            .collect();
+        assert_eq!(got, want);
+        // Everything is `decode_rows`.
+        assert_eq!(
+            decode_rows_where(&buf, &Projection::ALL).unwrap(),
+            decode_rows(&buf).unwrap()
+        );
+    }
+
+    /// ⚠️ A dropped value is still checked (M119): every corruption of every byte that
+    /// `decode_rows` refuses, a projection keeping nothing refuses too, with the same error.
+    #[test]
+    fn a_projection_refuses_what_the_full_decode_refuses() {
+        let buf = encode_rows(&rows());
+        let nothing = |_: &str| false;
+        let none = Projection {
+            id: false,
+            attrs: &nothing,
+        };
+        let mut refused = 0;
+        for at in 0..buf.len() {
+            for byte in [0x00, 0x01, 0x04, 0x06, 0x7f, 0xff] {
+                let mut bad = buf.clone();
+                bad[at] = byte;
+                let full = decode_rows(&bad).map(|_| ());
+                let projected = decode_rows_where(&bad, &none).map(|_| ());
+                assert_eq!(
+                    projected.as_ref().err().map(ToString::to_string),
+                    full.as_ref().err().map(ToString::to_string),
+                    "byte {at} set to {byte:#x}"
+                );
+                refused += usize::from(full.is_err());
+            }
+            // And a truncation at every length.
+            let cut = &buf[..at];
+            assert_eq!(
+                decode_rows_where(cut, &none).err().map(|e| e.to_string()),
+                decode_rows(cut).err().map(|e| e.to_string()),
+                "cut at {at}"
+            );
+        }
+        assert!(refused > 10, "the corruptions refused nothing: {refused}");
+    }
 }

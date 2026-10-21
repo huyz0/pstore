@@ -119,11 +119,70 @@ pub struct WriteRequest {
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum VectorIn {
     Array(Vec<f32>),
     Base64(String),
+}
+
+/// What `#[serde(untagged)]` refused anything else with, kept word for word.
+const NOT_A_VECTOR: &str = "data did not match any variant of untagged enum VectorIn";
+
+/// ⚠️ **By hand, not `#[serde(untagged)]`** (M119): an untagged enum buffers its input into
+/// serde's `Content` -- about 32 bytes an element -- and then tries each variant over the
+/// buffer, so every vector of every write was parsed twice. This reads a sequence straight
+/// into `f32`s, each cast from the number as the derived `Vec<f32>` cast it, and a string as
+/// base64; anything else is refused with the derive's own message.
+impl<'de> Deserialize<'de> for VectorIn {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = VectorIn;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of numbers or a base64 string")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<VectorIn, A::Error> {
+                let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 16));
+                loop {
+                    match seq.next_element::<f32>() {
+                        Ok(Some(x)) => v.push(x),
+                        Ok(None) => return Ok(VectorIn::Array(v)),
+                        Err(_) => return Err(serde::de::Error::custom(NOT_A_VECTOR)),
+                    }
+                }
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<VectorIn, E> {
+                Ok(VectorIn::Base64(s.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<VectorIn, E> {
+                Ok(VectorIn::Base64(s))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<VectorIn, E> {
+                Err(E::custom(NOT_A_VECTOR))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, _: A) -> Result<VectorIn, A::Error> {
+                Err(serde::de::Error::custom(NOT_A_VECTOR))
+            }
+        }
+        d.deserialize_any(Visit)
+    }
 }
 
 /// A vector from either spelling. ⚠️ **Refused, never repaired**: a length that is not whole
@@ -616,4 +675,73 @@ pub struct Duty {
 pub struct Duties {
     /// Every duty, in the order the constant declares them.
     pub duties: &'static [Duty],
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    /// The derive `VectorIn` replaced (M119), verbatim, under its own name: the name is in
+    /// its message.
+    mod derived {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        pub(super) enum VectorIn {
+            Array(Vec<f32>),
+            Base64(String),
+        }
+    }
+    use derived::VectorIn as Derived;
+
+    fn by_hand(v: &serde_json::Value) -> Result<String, String> {
+        match serde_json::from_value::<VectorIn>(v.clone()) {
+            Ok(VectorIn::Array(a)) => Ok(format!(
+                "array {:?}",
+                a.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            )),
+            Ok(VectorIn::Base64(s)) => Ok(format!("base64 {s}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn derived(v: &serde_json::Value) -> Result<String, String> {
+        match serde_json::from_value::<Derived>(v.clone()) {
+            Ok(Derived::Array(a)) => Ok(format!(
+                "array {:?}",
+                a.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            )),
+            Ok(Derived::Base64(s)) => Ok(format!("base64 {s}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn the_hand_written_vector_is_the_derived_one() {
+        for raw in [
+            "[]",
+            "[1, 2.5, -3]",
+            "[0.1, 1e30, 1e-45, 123456789012]",
+            "[18446744073709551615, -9223372036854775808]",
+            "\"AACAPw==\"",
+            "\"\"",
+            "[1, \"a\"]",
+            "[null]",
+            "[[1]]",
+            "[true]",
+            "{}",
+            "{\"a\": 1}",
+            "true",
+            "1",
+            "-1",
+            "1.5",
+            "null",
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(by_hand(&v), derived(&v), "{raw}");
+        }
+    }
 }

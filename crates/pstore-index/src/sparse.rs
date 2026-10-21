@@ -45,7 +45,7 @@ impl SparseIndex {
         // exactly" fallback: without the dictionary the section is an undelimited byte
         // string, and answering from it would be guessing.
         let raw = raw.map_err(|e| FormatError::Blob(e.to_string()))?;
-        Self::from_segment(&seg?, field, raw.as_ref())
+        Self::from_segment_bytes(&seg?, field, raw)
     }
 
     /// Opens a sparse field over an **already-open** segment.
@@ -59,6 +59,19 @@ impl SparseIndex {
         segment: &Segment,
         field: &str,
         dictionary: &[u8],
+    ) -> Result<Self, FormatError> {
+        Self::from_segment_bytes(segment, field, bytes::Bytes::copy_from_slice(dictionary))
+    }
+
+    /// [`Self::from_segment`] over the fetched sidecar itself, which it keeps rather than
+    /// copies (M119).
+    ///
+    /// # Errors
+    /// As [`Self::from_segment`].
+    pub fn from_segment_bytes(
+        segment: &Segment,
+        field: &str,
+        dictionary: bytes::Bytes,
     ) -> Result<Self, FormatError> {
         let layout = segment
             .field_layout(field)
@@ -74,7 +87,7 @@ impl SparseIndex {
             .ok_or(FormatError::Corrupt(
                 "a sparse field with no postings section",
             ))?;
-        let dict = Dictionary::decode(dictionary)
+        let dict = Dictionary::decode_bytes(dictionary)
             .ok_or(FormatError::Corrupt("the sparse dictionary did not decode"))?;
         Ok(Self { dict, span })
     }
@@ -150,20 +163,18 @@ impl SparseIndex {
             .get_ranges_as(key, &ranges, pstore_blob::Class::Bulk)
             .await?;
 
-        let mut scores: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        let mut scores = crate::top::Accumulator::default();
         for (n, (e, qw)) in entries.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
             for (row, impact) in self.dict.decode_list(e, buf) {
-                *scores.entry(row).or_insert(0.0) += qw * impact;
+                scores.add(row, qw * impact);
             }
         }
 
-        let mut scored: Vec<(usize, f32)> =
-            scores.into_iter().map(|(r, s)| (r as usize, s)).collect();
-        // Ties by row so a ranking is reproducible across runs — a `HashMap` iteration order
-        // is not, and a test comparing against brute force would fail intermittently.
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(k);
+        let mut scored = scores.into_scored();
+        // Ties by row so a ranking is reproducible across runs: the accumulator's order is
+        // first touch, not rows.
+        crate::top::top_k_by(&mut scored, k, crate::top::best_first);
         Ok(scored)
     }
 }

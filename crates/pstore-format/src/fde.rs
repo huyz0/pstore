@@ -110,6 +110,11 @@ fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
             .map(|bit| (0..d).map(|i| gauss(p.seed, rep, bit, i)).collect())
             .collect();
         let of: Vec<usize> = vectors.iter().map(|v| bucket(&planes, v)).collect();
+        // The projection's signs, once per repetition (M119): they depend on neither the
+        // bucket nor the data, and drawing them per bucket hashed `buckets` times as often.
+        let negated: Vec<bool> = (0..p.d_proj)
+            .flat_map(|j| (0..d).map(move |i| signed(1.0, p.seed, rep, j, i) < 0.0))
+            .collect();
         for b in 0..buckets {
             let members: Vec<&&Vec<f32>> = vectors
                 .iter()
@@ -152,10 +157,11 @@ fn encode(p: &Params, vectors: &[Vec<f32>], doc: bool) -> Vec<f32> {
                 #[expect(clippy::cast_precision_loss, reason = "a dimension count")]
                 let scale = 1.0 / (p.d_proj as f64).sqrt();
                 for j in 0..p.d_proj {
+                    let row = negated.get(j * d..(j + 1) * d).unwrap_or_default();
                     let s: f64 = acc
                         .iter()
-                        .enumerate()
-                        .map(|(i, a)| signed(*a, p.seed, rep, j, i))
+                        .zip(row)
+                        .map(|(a, neg)| if *neg { -*a } else { *a })
                         .sum();
                     out.push((s * scale) as f32);
                 }

@@ -529,11 +529,17 @@ impl ExternalAttribute {
         };
         let rows = usize::try_from(column.rows).map_err(|_| ExternalError::Damaged)?;
         let present: Vec<usize> = (0..rows).filter(|r| column.is_present(*r)).collect();
-        let mut got = column.read_rows_bytes(store, &present).await?;
+        // Walked in step with the rows, both ascending (M119), rather than a removal from the
+        // map per row.
+        let mut got = column
+            .read_rows_bytes(store, &present)
+            .await?
+            .into_iter()
+            .peekable();
         (0..rows)
-            .map(|r| match got.remove(&r) {
+            .map(|r| match got.next_if(|(row, _)| *row == r) {
                 None => Ok(None),
-                Some(raw) => self
+                Some((_, raw)) => self
                     .kind
                     .decode(&raw)
                     .map(Some)
@@ -1011,7 +1017,7 @@ impl ExternalColumn {
         &self,
         store: &S,
         rows: &[usize],
-    ) -> Result<BTreeMap<usize, Vec<u8>>, ExternalError> {
+    ) -> Result<BTreeMap<usize, bytes::Bytes>, ExternalError> {
         let mut wanted: Vec<usize> = rows
             .iter()
             .copied()
@@ -1074,22 +1080,23 @@ impl ExternalColumn {
         let mut out = BTreeMap::new();
         for row in &raw_rows {
             let raw = bufs.next().ok_or(ExternalError::Damaged)?;
-            out.insert(*row, raw.to_vec());
+            out.insert(*row, raw);
         }
         // `bufs` yields the pages first and the dictionaries after, as `ranges` was built.
         let page_bufs: Vec<_> = (0..page_at.len()).filter_map(|_| bufs.next()).collect();
         let width = usize::try_from(self.width()).map_err(|_| ExternalError::Damaged)?;
-        let mut dicts: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut dicts: BTreeMap<u64, bytes::Bytes> = BTreeMap::new();
         for d in &dict_at {
             let raw = bufs.next().ok_or(ExternalError::Damaged)?;
             let want = usize::try_from(d.count)
                 .ok()
                 .and_then(|n| n.checked_mul(width))
                 .ok_or(ExternalError::Damaged)?;
+            // Held as `Bytes`, so a row is a slice of it rather than a copy (M119).
             let bytes = if d.codec == 0 {
-                raw.to_vec()
+                raw
             } else {
-                decompress(d.codec, &raw, want)?
+                bytes::Bytes::from(decompress(d.codec, &raw, want)?)
             };
             if bytes.len() != want {
                 return Err(ExternalError::Damaged);
@@ -1115,8 +1122,10 @@ impl ExternalColumn {
                     let at = usize::try_from(*indices.get(k).ok_or(ExternalError::Damaged)?)
                         .map_err(|_| ExternalError::Damaged)?
                         * width;
-                    let raw = table.get(at..at + width).ok_or(ExternalError::Damaged)?;
-                    out.insert(*r, raw.to_vec());
+                    if table.get(at..at + width).is_none() {
+                        return Err(ExternalError::Damaged);
+                    }
+                    out.insert(*r, table.slice(at..at + width));
                 }
                 continue;
             }
@@ -1130,16 +1139,17 @@ impl ExternalColumn {
                     .ok_or(ExternalError::Damaged)?;
                 (decompress(e.codec, &comp, expected)?, 0)
             };
+            let page = bytes::Bytes::from(page);
             for r in pages.get(&i).into_iter().flatten() {
                 let at = (*r as u64 - e.first_row)
                     .checked_add(skip)
                     .and_then(|n| usize::try_from(n).ok())
                     .and_then(|n| n.checked_mul(width))
                     .ok_or(ExternalError::Damaged)?;
-                let raw = page
-                    .get(at..at.saturating_add(width))
-                    .ok_or(ExternalError::Damaged)?;
-                out.insert(*r, raw.to_vec());
+                if page.get(at..at.saturating_add(width)).is_none() {
+                    return Err(ExternalError::Damaged);
+                }
+                out.insert(*r, page.slice(at..at.saturating_add(width)));
             }
         }
         Ok(out)

@@ -5,8 +5,7 @@ use pstore_blob::{BlobError, BlobStore, Capabilities, Class, Key, Precondition, 
 use pstore_types::CasTag;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a cached answer is stored against.
 ///
@@ -37,6 +36,10 @@ pub struct CacheCore {
     /// priorities** (D-21): a priority scheme still lets a large enough bulk burst walk the
     /// metadata out, because the bulk entries keep arriving and something has to go. A quota
     /// cannot, because the bulk arena is the only place bulk pressure is felt.
+    ///
+    /// ⚠️ `std` mutexes (M119), each held for a map operation and never across an await: an
+    /// async mutex cost a semaphore per acquisition, two or more per cached range read, for
+    /// every tenant on the node. A poisoned one is recovered, as the gates' are.
     pinned: Mutex<State>,
     meta: Mutex<State>,
     bulk: Mutex<State>,
@@ -202,7 +205,7 @@ impl CacheCore {
 
     async fn lookup(&self, id: &Id, class: Class) -> Option<Bytes> {
         let (arena, _) = self.arena(class);
-        let mut s = arena.lock().await;
+        let mut s = locked(arena);
         let hit = s.entries.get(id).map(|(b, _)| b.clone());
         if hit.is_some() {
             s.touch(id);
@@ -221,7 +224,7 @@ impl CacheCore {
         let hit = self.disk.as_ref()?.get(id, class).await?;
         if class != Class::Scan {
             let (arena, quota) = self.arena(class);
-            arena.lock().await.admit(id.clone(), hit.clone(), quota);
+            locked(arena).admit(id.clone(), hit.clone(), quota);
         }
         Some(hit)
     }
@@ -235,7 +238,7 @@ impl CacheCore {
             d.insert(&id, &bytes, class);
         }
         let (arena, quota) = self.arena(class);
-        arena.lock().await.admit(id, bytes, quota);
+        locked(arena).admit(id, bytes, quota);
     }
 
     /// Fetch under singleflight: whoever arrives first fetches, the rest wait and then read
@@ -318,7 +321,7 @@ impl<S: BlobStore> Caching<S> {
     pub fn resident_in(&self, class: Class) -> usize {
         self.core.as_ref().map_or(0, |c| {
             let (arena, _) = c.arena(class);
-            arena.try_lock().map_or(0, |s| s.resident)
+            locked(arena).resident
         })
     }
 
@@ -336,7 +339,7 @@ impl<S: BlobStore> Caching<S> {
         self.core.as_ref().is_some_and(|c| {
             [&c.pinned, &c.meta, &c.bulk]
                 .iter()
-                .any(|a| a.try_lock().is_ok_and(|s| s.entries.contains_key(&id)))
+                .any(|a| locked(a).entries.contains_key(&id))
         })
     }
 
@@ -346,10 +349,18 @@ impl<S: BlobStore> Caching<S> {
         self.core.as_ref().map_or(0, |c| {
             [&c.pinned, &c.meta, &c.bulk]
                 .iter()
-                .map(|a| a.try_lock().map_or(0, |s| s.resident))
+                .map(|a| locked(a).resident)
                 .sum()
         })
     }
+}
+
+/// An arena's state, recovered if a panic poisoned it: its maps are consistent between
+/// operations, since no operation on them panics part-way.
+fn locked(arena: &Mutex<State>) -> MutexGuard<'_, State> {
+    arena
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Debug, Default)]
@@ -465,26 +476,30 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             async move { core.find(&id, class).await }
         }))
         .await;
-        let missing: Vec<Range<u64>> = ranges
+        // Each miss with its slot (M119): placing a fetched range by searching `ranges` for it
+        // was O(misses x ranges). A range asked twice and missed twice is fetched for each slot,
+        // as the search's first-unfilled rule filled them.
+        let (slots, missing): (Vec<usize>, Vec<Range<u64>>) = ranges
             .iter()
             .zip(&out)
-            .filter(|(_, hit)| hit.is_none())
-            .map(|(r, _)| r.clone())
-            .collect();
+            .enumerate()
+            .filter(|(_, (_, hit))| hit.is_none())
+            .map(|(i, (r, _))| (i, r.clone()))
+            .unzip();
 
         if !missing.is_empty() {
             // ⚠️ The misses go to the inner `get_ranges`, so coalescing still happens — below
             // the cache, where it belongs. The cache decides *what* to fetch; the store
             // decides how few requests that takes.
             let fetched = self.inner.get_ranges_as(key, &missing, class).await?;
-            for (r, bytes) in missing.iter().zip(fetched) {
-                core.admit(id(r), bytes.clone(), class).await;
-                if let Some(slot) = ranges
-                    .iter()
-                    .zip(out.iter_mut())
-                    .find(|(rr, slot)| *rr == r && slot.is_none())
-                    .map(|(_, slot)| slot)
-                {
+            for ((i, r), bytes) in slots.into_iter().zip(&missing).zip(fetched) {
+                // ⚠️ **Admitted as its own bytes, not as a slice of the fetch** (M119). The
+                // store coalesces ranges up to a gap apart into one fetch, and a slice keeps
+                // that whole buffer alive: two 4 KiB ranges a mebibyte apart pinned the
+                // mebibyte while the quota counted 8 KiB. The caller still gets the slice.
+                core.admit(id(r), Bytes::copy_from_slice(&bytes), class)
+                    .await;
+                if let Some(slot) = out.get_mut(i) {
                     *slot = Some(bytes);
                 }
             }

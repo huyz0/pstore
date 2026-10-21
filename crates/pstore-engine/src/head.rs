@@ -353,7 +353,7 @@ pub(crate) fn dv_key(segment: &str, epoch: u64, lane: u64) -> String {
 /// this, so two indexes sharing a segment never share its deletes.
 #[must_use]
 pub(crate) fn dv_ref(index: &str, segment: &str) -> String {
-    if key_index(segment).as_deref() == Some(index) {
+    if key_index(segment) == Some(index) {
         segment.to_owned()
     } else {
         scoped(index, segment)
@@ -364,8 +364,15 @@ pub(crate) fn dv_ref(index: &str, segment: &str) -> String {
 /// it holds no dot of its own and `dv_of` still parses a vector key built on it.
 #[must_use]
 pub(crate) fn scoped(index: &str, segment: &str) -> String {
-    let hex: String = index.bytes().map(|b| format!("{b:02x}")).collect();
-    format!("{segment}.br-{hex}")
+    // One buffer, not a `String` a byte (M119): this runs per borrowed segment per query.
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(segment.len() + 4 + 2 * index.len());
+    out.push_str(segment);
+    out.push_str(".br-");
+    for b in index.bytes() {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// The segment and index a scoped key names, or `None` for any other key (M16). As a
@@ -1021,7 +1028,8 @@ impl Head {
                 // 16-digit zero-padded *sequence number* sitting exactly where a loose parser
                 // would read an epoch. The index comes from the key's own path, so a bundle
                 // simply has no index to belong to.
-                let (Some(index), Some(born)) = (key_index(key), key_epoch(key)) else {
+                let (Some(index), Some(born)) = (key_index(key).map(str::to_owned), key_epoch(key))
+                else {
                     continue;
                 };
                 if born <= epoch.0 {
@@ -1176,7 +1184,7 @@ pub(crate) fn key_epoch(key: &str) -> Option<u64> {
 ///
 /// ⚠️ The prefix is what separates a segment from a WAL bundle, which lives under `…/wal/` and
 /// whose filename is a sequence number in the same shape as an epoch.
-fn key_index(key: &str) -> Option<String> {
+fn key_index(key: &str) -> Option<&str> {
     // Only a segment's own key: a delete vector (M9c) and every sidecar share its path.
     if !key.ends_with(".seg") {
         return None;
@@ -1185,7 +1193,7 @@ fn key_index(key: &str) -> Option<String> {
     // would otherwise read as borrowed from the index named by the prefix before it.
     let (before, _) = key.rsplit_once("/seg/")?;
     let (_, index) = before.split_once("/idx/")?;
-    (!index.is_empty()).then(|| index.to_owned())
+    (!index.is_empty()).then_some(index)
 }
 
 /// HEAD as it was read, with the tag the next write must be conditioned on.
@@ -1720,7 +1728,7 @@ mod tests {
         let (seg, seg1) = (format!("{base}.seg"), format!("{base}_1.seg"));
         assert_eq!(key_epoch(&seg1), Some(7));
         assert_eq!(key_index(&seg1), key_index(&seg));
-        assert_eq!(key_index(&seg1).as_deref(), Some("a"));
+        assert_eq!(key_index(&seg1), Some("a"));
         let dv = dv_key(&seg, 9, 1);
         let dv1 = format!("{}_a.dv", dv.trim_end_matches(".dv"));
         assert_eq!(dv_of(&dv1), Some((seg.as_str(), 9)));

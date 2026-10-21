@@ -638,8 +638,9 @@ struct Fresh {
     rows: Vec<Document>,
     /// Every id with an unfolded operation, upsert or delete: the rows they supersede in the
     /// index's segments are hidden (M9c.2). ⚠️ From the SAME memtable snapshot as `rows`, so a
-    /// write landing between the two cannot show both versions of an id.
-    shadow: std::collections::HashSet<String>,
+    /// write landing between the two cannot show both versions of an id. Shared with every
+    /// view, never copied into one (M119).
+    shadow: Arc<std::collections::HashSet<String>>,
     /// The metric the unfolded rows were written under, when there are any (M9d): what a query
     /// of an index with no schema yet transforms by.
     metric: Option<Metric>,
@@ -1207,6 +1208,15 @@ fn odd_width(widths: &mut BTreeMap<String, usize>, d: &Document) -> Option<(usiz
     None
 }
 
+/// Whether `d` has a dense field other than [`pstore_format::DEFAULT_FIELD`]: the only rows
+/// [`odd_width`] reads.
+fn has_named_dense(d: &Document) -> bool {
+    d.vectors.iter().any(|(name, field)| {
+        name != pstore_format::DEFAULT_FIELD
+            && matches!(field, pstore_format::VectorField::Dense(_))
+    })
+}
+
 /// Why `docs` cannot join `index` by a named field's width (M61): against the widths its
 /// schema records (M98), then the rows this process holds for it, then each other, in the
 /// width the client wrote.
@@ -1342,7 +1352,7 @@ struct FreshView {
     target: Option<pstore_query::Target>,
     rows: Vec<Document>,
     store: Arc<pstore_blob::MemoryStore>,
-    shadow: std::collections::HashSet<String>,
+    shadow: Arc<std::collections::HashSet<String>>,
     metric: Option<Metric>,
     fts: FullText,
 }
@@ -1353,7 +1363,7 @@ impl Fresh {
             target: self.target.clone(),
             rows: self.rows.clone(),
             store: Arc::clone(&self.store),
-            shadow: self.shadow.clone(),
+            shadow: Arc::clone(&self.shadow),
             metric: self.metric,
             fts: self.fts,
         }
@@ -1448,7 +1458,7 @@ enum Folded {
 
 /// A query's HEAD and the unfolded rows consistent with it.
 struct Fetched {
-    at: head::HeadAt,
+    at: Arc<head::HeadAt>,
     fresh: Option<FreshView>,
     /// For `Strong`: the registered lanes, read beside HEAD.
     lanes: Option<Vec<LaneId>>,
@@ -1463,7 +1473,7 @@ struct Scope {
     refs: Vec<SegmentRef>,
     targets: Vec<pstore_query::Target>,
     unfolded: Vec<Document>,
-    shadow: std::collections::HashSet<String>,
+    shadow: Arc<std::collections::HashSet<String>>,
     epoch: Epoch,
     watermarks: BTreeMap<u64, u64>,
     staleness: std::time::Duration,
@@ -1573,7 +1583,10 @@ pub struct Engine<S> {
     replica_names: Mutex<std::collections::BTreeSet<String>>,
     /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
     /// Filled by nothing else, so no other read pays to clone HEAD.
-    head_cache: Mutex<Option<(tokio::time::Instant, head::HeadAt)>>,
+    ///
+    /// ⚠️ Shared, never copied under the lock (M119): a `HeadAt` is a dozen maps of strings,
+    /// and a hit cloned it whole while every other bounded query waited on the mutex.
+    head_cache: Mutex<Option<(tokio::time::Instant, Arc<head::HeadAt>)>>,
     /// Serialises this lane's flushes against each other.
     ///
     /// ⚠️ Not contention control — a lane is single-writer by definition. This *enforces*
@@ -1620,7 +1633,12 @@ pub struct Engine<S> {
     /// ⚠️ Cached on the generation counter so the cost lands on `write` and `flush` rather
     /// than on every query, and held in a **private** `MemoryStore` so sealing it costs the
     /// tenant's store nothing.
-    fresh: tokio::sync::Mutex<Option<Fresh>>,
+    ///
+    /// ⚠️ **One entry an index** (M119): a single slot made a tenant alternating between two
+    /// indexes rebuild a whole segment on every query, with no write in between. Each entry is
+    /// checked against the generation as the slot was, and a miss drops every stale one, so it
+    /// holds at most one segment an index with unfolded rows.
+    fresh: tokio::sync::Mutex<std::collections::HashMap<String, Fresh>>,
     /// What the dense index is built with.
     ///
     /// ⚠️ **`exact_scan_threshold` is the load-bearing one.** Below it nothing is clustered,
@@ -1748,7 +1766,7 @@ impl<S: BlobStore> Engine<S> {
             abandoned: Mutex::new(Vec::new()),
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
-            fresh: tokio::sync::Mutex::new(None),
+            fresh: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
             // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
             // recall on clustered data (0.9810 either way) and costs bytes (0.841 against
@@ -1816,12 +1834,23 @@ impl<S: BlobStore> Engine<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.as_ref().is_none_or(|(epoch, _)| head.epoch >= *epoch) {
-            *cache = Some((head.epoch, head.schemas.clone()));
-            *self
+            // ⚠️ Compared before copied (M119): every query reads an unchanged HEAD, and an
+            // equal epoch passes the test above, so this cloned every schema and every
+            // replica's name per query to store what was already held. What it holds after
+            // is what it held before: the newest HEAD's.
+            if cache
+                .as_ref()
+                .is_none_or(|(epoch, held)| *epoch != head.epoch || *held != head.schemas)
+            {
+                *cache = Some((head.epoch, head.schemas.clone()));
+            }
+            let mut names = self
                 .replica_names
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                head.replications.keys().cloned().collect();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !names.iter().eq(head.replications.keys()) {
+                *names = head.replications.keys().cloned().collect();
+            }
         }
     }
 
@@ -2674,15 +2703,23 @@ impl<S: BlobStore> Engine<S> {
         // refused every correct write after one wrong one. The schema records every property
         // the rungs below infer from rows, so they are for an index with no schema yet.
         // M61: a named field's width, which no schema records, against the same rows.
-        let held: Vec<&Document> = m
-            .pending
-            .get(index)
-            .into_iter()
-            .flatten()
-            .chain(m.durable_rows(index))
-            .collect();
-        let named =
-            |known: &BTreeMap<String, u32>| field_width_conflict(index, known, &held, docs, metric);
+        //
+        // ⚠️ **Only for a batch with a named field** (M119): a batch without one cannot conflict
+        // -- `odd_width` finds nothing in it -- and walking every held row first made each write
+        // cost every unfolded row of the index, under the lock every query also needs.
+        let named = |known: &BTreeMap<String, u32>| {
+            if !docs.iter().any(has_named_dense) {
+                return None;
+            }
+            let held: Vec<&Document> = m
+                .pending
+                .get(index)
+                .into_iter()
+                .flatten()
+                .chain(m.durable_rows(index))
+                .collect();
+            field_width_conflict(index, known, &held, docs, metric)
+        };
         if let Some(schema) = self.cached_schema(index) {
             return self
                 .batch_conflict(index, &schema, docs)
@@ -5128,54 +5165,61 @@ impl<S: BlobStore> Engine<S> {
         watermark: u64,
         schema: Option<&head::IndexSchema>,
     ) -> Result<Option<Option<FreshView>>, EngineError> {
-        let (generation, ops) = {
+        // M30: indexed over the index's text field, as the fold that seals these rows will be.
+        let text_field = self.text_field_of(schema).to_owned();
+        // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
+        // rows and store afterwards let a concurrent query on another index replace the cached
+        // segment in between, and this one then ran `mem/a.seg` against `b`'s store.
+        //
+        // ⚠️ Taken BEFORE the memtable (M119), so a hit is decided from the rows in place and
+        // copies none of them: the copy below is a miss's only. `mem` is a `std` mutex never
+        // held across an await, so it is never held while this one is awaited.
+        let mut slots = self.fresh.lock().await;
+        let (generation, ops, fts, trigram) = {
             let mut m = self.mem();
             if !m.prune(watermark) {
                 return Ok(None);
             }
             // ⚠️ Deferred operations are invisible until their fold (M13): they neither shadow a
             // segment row nor add one.
-            let ops: Vec<Document> = m
-                .durable_rows(index)
-                .chain(m.pending.get(index).into_iter().flatten())
-                .filter(|d| !is_deferred(d))
-                .cloned()
-                .collect();
-            (m.generation, ops)
+            let visible = || {
+                m.durable_rows(index)
+                    .chain(m.pending.get(index).into_iter().flatten())
+                    .filter(|d| !is_deferred(d))
+            };
+            // M14: analyzed as the folded half is, and before any fold as the first declaration.
+            let fts = schema
+                .map(|s| s.fts)
+                .or_else(|| visible().find_map(fts_of))
+                .unwrap_or_default();
+            // M15.2: sketched as the folded half is, before any fold as the first declaration.
+            let trigram = schema
+                .map(|s| s.trigram.clone())
+                .or_else(|| visible().find_map(trgm_of))
+                .unwrap_or_default();
+            if let Some(f) = slots.get(index)
+                && f.generation == m.generation
+                && f.index == index
+                && f.fts == fts
+                && f.trigram == trigram
+                && f.text_field == text_field
+            {
+                return Ok(Some(Some(f.view())));
+            }
+            let ops: Vec<Document> = visible().cloned().collect();
+            (m.generation, ops, fts, trigram)
         };
-        // M14: analyzed as the folded half is, and before any fold as the first declaration.
-        let fts = schema
-            .map(|s| s.fts)
-            .or_else(|| ops.iter().find_map(fts_of))
-            .unwrap_or_default();
-        // M15.2: sketched as the folded half is, before any fold as the first declaration.
-        let trigram = schema
-            .map(|s| s.trigram.clone())
-            .or_else(|| ops.iter().find_map(trgm_of))
-            .unwrap_or_default();
-        // M30: indexed over the index's text field, as the fold that seals these rows will be.
-        let text_field = self.text_field_of(schema).to_owned();
-        let mut slot = self.fresh.lock().await;
-        // ⚠️ The view is returned from UNDER this lock (M9c.1, row 37): re-locking to read the
-        // rows and store afterwards let a concurrent query on another index replace the cached
-        // segment in between, and this one then ran `mem/a.seg` against `b`'s store.
-        if let Some(f) = slot.as_ref()
-            && f.generation == generation
-            && f.index == index
-            && f.fts == fts
-            && f.trigram == trigram
-            && f.text_field == text_field
-        {
-            return Ok(Some(Some(f.view())));
-        }
+        // A miss: every entry another generation built is stale, and goes.
+        slots.retain(|_, f| f.generation == generation);
         if ops.is_empty() {
-            *slot = None;
+            slots.remove(index);
             return Ok(Some(None));
         }
         // ⚠️ The newest operation per id decides it (M9c.2): a later write replaces an earlier
         // one, a tombstone removes it -- and every id touched shadows its older rows in the
         // index's segments, whether its newest operation was a write or a delete.
-        let shadow: std::collections::HashSet<String> = ops.iter().map(|d| d.id.clone()).collect();
+        let shadow: Arc<std::collections::HashSet<String>> =
+            Arc::new(ops.iter().map(|d| d.id.clone()).collect());
         let rows: Vec<Document> = newest(ops)
             .into_iter()
             .filter(|d| !is_tombstone(d))
@@ -5197,7 +5241,7 @@ impl<S: BlobStore> Engine<S> {
                 text_field,
             };
             let view = fresh.view();
-            *slot = Some(fresh);
+            slots.insert(index.to_owned(), fresh);
             return Ok(Some(Some(view)));
         }
 
@@ -5286,7 +5330,7 @@ impl<S: BlobStore> Engine<S> {
             text_field,
         };
         let view = fresh.view();
-        *slot = Some(fresh);
+        slots.insert(index.to_owned(), fresh);
         Ok(Some(Some(view)))
     }
 
@@ -5617,13 +5661,7 @@ impl<S: BlobStore> Engine<S> {
                 targets.extend(v.target);
                 (v.rows, Some(v.store), v.shadow, v.metric, Some(v.fts))
             }
-            None => (
-                Vec::new(),
-                None,
-                std::collections::HashSet::new(),
-                None,
-                None,
-            ),
+            None => (Vec::new(), None, Arc::default(), None, None),
         };
         // M14: the same rule as the metric's, and the fresh segment was built by it.
         let fts = at
@@ -5729,7 +5767,7 @@ impl<S: BlobStore> Engine<S> {
                     )
                     .await?;
                     lanes = Some(live);
-                    at
+                    Arc::new(at)
                 }
                 // ⚠️ Only the first attempt may hit: a hit `fresh_view` refuses -- this engine
                 // pruned past it -- is retried as a miss, which refills the cache (M11.2).
@@ -5743,7 +5781,7 @@ impl<S: BlobStore> Engine<S> {
                         None => self.read_head_caching().await?,
                     }
                 }
-                _ => head::read(&*self.store, self.tenant).await?,
+                _ => Arc::new(head::read(&*self.store, self.tenant).await?),
             };
             let schema = at.head.schemas.get(index);
             // M22: a replica serves its source's folded state and nothing unfolded -- a row
@@ -5770,7 +5808,10 @@ impl<S: BlobStore> Engine<S> {
     /// The cached HEAD and its age, when it is no older than `max` and this engine has
     /// committed nothing since it was read (M11.2). A commit of its own -- a fold, a drop, a
     /// compaction, a `gc` -- changes what it would answer, and a drop does not even prune.
-    fn cached_head(&self, max: std::time::Duration) -> Option<(head::HeadAt, std::time::Duration)> {
+    fn cached_head(
+        &self,
+        max: std::time::Duration,
+    ) -> Option<(Arc<head::HeadAt>, std::time::Duration)> {
         let committed = self.epoch();
         let cache = self
             .head_cache
@@ -5778,14 +5819,14 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (read, at) = cache.as_ref()?;
         let age = read.elapsed();
-        (age <= max && committed <= at.head.epoch).then(|| (at.clone(), age))
+        (age <= max && committed <= at.head.epoch).then(|| (Arc::clone(at), age))
     }
 
     /// Reads HEAD and caches it, stamped with the instant **before** the GET so its age is
     /// never understated -- unless a concurrent read already cached a newer one (M11.2).
-    async fn read_head_caching(&self) -> Result<head::HeadAt, EngineError> {
+    async fn read_head_caching(&self) -> Result<Arc<head::HeadAt>, EngineError> {
         let read = tokio::time::Instant::now();
-        let at = head::read(&*self.store, self.tenant).await?;
+        let at = Arc::new(head::read(&*self.store, self.tenant).await?);
         let mut cache = self
             .head_cache
             .lock()
@@ -5794,7 +5835,7 @@ impl<S: BlobStore> Engine<S> {
             .as_ref()
             .is_none_or(|(_, held)| at.head.epoch >= held.head.epoch)
         {
-            *cache = Some((read, at.clone()));
+            *cache = Some((read, Arc::clone(&at)));
         }
         Ok(at)
     }
@@ -6216,7 +6257,7 @@ impl<S: BlobStore> Engine<S> {
                     None,
                     std::time::Duration::ZERO,
                     Vec::new(),
-                    std::collections::HashSet::new(),
+                    Arc::default(),
                     false,
                     fts,
                 )
@@ -6226,12 +6267,13 @@ impl<S: BlobStore> Engine<S> {
                     .head_and_fresh_as(index, consistency, allow_hit)
                     .await?;
                 *hit = got.hit;
-                let at = got.at;
+                // Owned here, where its HEAD is kept: a copy only if the cache still holds it.
+                let at = Arc::unwrap_or_clone(got.at);
                 self.remember_schemas(&at.head);
                 // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
                 let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
-                    || (Vec::new(), std::collections::HashSet::new(), None),
+                    || (Vec::new(), Arc::default(), None),
                     |v| (v.rows, v.shadow, Some(v.fts)),
                 );
                 let fts = at
@@ -6405,6 +6447,14 @@ impl<S: BlobStore> Engine<S> {
             watermarks: scope.watermarks,
             staleness: scope.staleness,
         })
+    }
+
+    /// The indexes whose fresh segment is cached, ascending (M119).
+    #[doc(hidden)]
+    pub async fn fresh_indexes_for_test(&self) -> Vec<String> {
+        let mut held: Vec<String> = self.fresh.lock().await.keys().cloned().collect();
+        held.sort();
+        held
     }
 
     /// Every folded segment's rows, in row order, for a test that resolves a hit.

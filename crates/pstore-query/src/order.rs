@@ -36,55 +36,79 @@ struct Rank {
 }
 
 impl Rank {
+    /// A row's rank, owned: what [`Selector::offer`] keeps, built here for a test.
+    #[cfg(test)]
     fn of(by: &OrderBy, doc: &Document) -> Self {
-        let value = if by.attr == crate::ID_ATTRIBUTE {
-            Some(Value::Str(doc.id.clone()))
-        } else {
-            doc.attrs.get(&by.attr).cloned()
-        };
-        // Ascending: bools, numbers, datetimes (M9h.3), strings, arrays; descending reverses
-        // the groups. Absent is last both ways.
-        let group = match &value {
-            Some(Value::Bool(_)) => 0,
-            Some(Value::Int(_) | Value::Float(_)) => 1,
-            Some(Value::DateTime(_)) => 2,
-            Some(Value::Str(_)) => 3,
-            Some(Value::Array(_)) => 4,
-            None => 5,
-        };
-        let group = if by.desc && group < 5 {
-            4 - group
-        } else {
-            group
-        };
+        let value = value_of(by, doc).map(std::borrow::Cow::into_owned);
         Self {
             desc: by.desc,
-            group,
+            group: group_of(by, value.as_ref()),
             value,
             id: doc.id.clone(),
         }
     }
 }
 
+/// The value `by` orders `doc` by, borrowed unless it is the id.
+fn value_of<'a>(by: &OrderBy, doc: &'a Document) -> Option<std::borrow::Cow<'a, Value>> {
+    if by.attr == crate::ID_ATTRIBUTE {
+        Some(std::borrow::Cow::Owned(Value::Str(doc.id.clone())))
+    } else {
+        doc.attrs.get(&by.attr).map(std::borrow::Cow::Borrowed)
+    }
+}
+
+/// A value's group in `by`'s direction.
+fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
+    // Ascending: bools, numbers, datetimes (M9h.3), strings, arrays; descending reverses
+    // the groups. Absent is last both ways.
+    let group = match value {
+        Some(Value::Bool(_)) => 0,
+        Some(Value::Int(_) | Value::Float(_)) => 1,
+        Some(Value::DateTime(_)) => 2,
+        Some(Value::Str(_)) => 3,
+        Some(Value::Array(_)) => 4,
+        None => 5,
+    };
+    if by.desc && group < 5 {
+        4 - group
+    } else {
+        group
+    }
+}
+
+/// [`Rank`]'s order over its parts, borrowed: so a row can be compared before it is owned.
+fn order(
+    desc: bool,
+    (group, value, id): (u8, Option<&Value>, &str),
+    (other_group, other_value, other_id): (u8, Option<&Value>, &str),
+) -> Ordering {
+    let values = match (value, other_value) {
+        // Bytewise, as the `Gt` cursor compares (`filter.rs`).
+        (Some(Value::Str(a)), Some(Value::Str(b))) => a.as_bytes().cmp(b.as_bytes()),
+        (Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
+        (Some(Value::DateTime(a)), Some(Value::DateTime(b))) => a.cmp(b),
+        (Some(a), Some(b)) => match (Number::of(a), Number::of(b)) {
+            // A NaN never reaches storage (`check_storable`), so `None` is unreachable.
+            (Some(a), Some(b)) => cmp_numbers(a, b).unwrap_or(Ordering::Equal),
+            // Different groups never reach here; the group decided.
+            _ => Ordering::Equal,
+        },
+        _ => Ordering::Equal,
+    };
+    group
+        .cmp(&other_group)
+        .then(if desc { values.reverse() } else { values })
+        .then_with(|| id.as_bytes().cmp(other_id.as_bytes()))
+}
+
 impl Ord for Rank {
     fn cmp(&self, other: &Self) -> Ordering {
-        let values = match (&self.value, &other.value) {
-            // Bytewise, as the `Gt` cursor compares (`filter.rs`).
-            (Some(Value::Str(a)), Some(Value::Str(b))) => a.as_bytes().cmp(b.as_bytes()),
-            (Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
-            (Some(Value::DateTime(a)), Some(Value::DateTime(b))) => a.cmp(b),
-            (Some(a), Some(b)) => match (Number::of(a), Number::of(b)) {
-                // A NaN never reaches storage (`check_storable`), so `None` is unreachable.
-                (Some(a), Some(b)) => cmp_numbers(a, b).unwrap_or(Ordering::Equal),
-                // Different groups never reach here; the group decided.
-                _ => Ordering::Equal,
-            },
-            _ => Ordering::Equal,
-        };
-        self.group
-            .cmp(&other.group)
-            .then(if self.desc { values.reverse() } else { values })
-            .then_with(|| self.id.as_bytes().cmp(other.id.as_bytes()))
+        order(
+            self.desc,
+            (self.group, self.value.as_ref(), &self.id),
+            (other.group, other.value.as_ref(), &other.id),
+        )
     }
 }
 
@@ -152,15 +176,32 @@ impl Selector {
         if self.cap == 0 {
             return;
         }
-        let rank = Rank::of(&self.by, &doc);
+        // ⚠️ Compared borrowed, and owned only once kept (M119): a full selector rejects almost
+        // every row it is offered, and building the rank first cloned the id and the value of
+        // each.
+        let value = value_of(&self.by, &doc);
+        let group = group_of(&self.by, value.as_deref());
         if self.kept.len() == self.cap {
             match self.kept.peek() {
-                Some(worst) if rank < worst.0 => {
+                Some(worst)
+                    if order(
+                        self.by.desc,
+                        (group, value.as_deref(), &doc.id),
+                        (worst.0.group, worst.0.value.as_ref(), &worst.0.id),
+                    )
+                    .is_lt() =>
+                {
                     self.kept.pop();
                 }
                 _ => return,
             }
         }
+        let rank = Rank {
+            desc: self.by.desc,
+            group,
+            value: value.map(std::borrow::Cow::into_owned),
+            id: doc.id.clone(),
+        };
         self.kept.push(Ranked(rank, doc));
     }
 
@@ -242,9 +283,9 @@ where
                     Some(k) => store
                         .get_immutable(k, pstore_blob::Class::Pinned)
                         .await
-                        .map(|raw| crate::deletes::decode(&raw))
+                        .map(|raw| crate::deletes::Rows::decode(&raw))
                         .map_err(|e| QueryError::Format(pstore_format::FormatError::from(e))),
-                    None => Ok(HashSet::new()),
+                    None => Ok(crate::deletes::Rows::default()),
                 }
             })
             .await;

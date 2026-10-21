@@ -185,9 +185,17 @@ impl Clustering {
                 if list.is_empty() {
                     continue;
                 }
-                for (d, slot) in c.iter_mut().enumerate() {
-                    let sum: f32 = list.iter().filter_map(|r| corpus.get(*r)?.get(d)).sum();
-                    *slot = sum / list.len() as f32;
+                // Row by row, one pass over each member (M119), rather than one pass over the
+                // list per dimension. Each dimension adds the same terms in the same order,
+                // from `-0.0` as `f32`'s `Sum` does, so the means are the same to the bit.
+                let mut sum = vec![-0.0f32; c.len()];
+                for v in list.iter().filter_map(|r| corpus.get(*r)) {
+                    for (a, x) in sum.iter_mut().zip(v) {
+                        *a += *x;
+                    }
+                }
+                for (slot, total) in c.iter_mut().zip(sum) {
+                    *slot = total / list.len() as f32;
                 }
             }
         }
@@ -274,13 +282,19 @@ fn augment(corpus: &[Vec<f32>], centroids: &[Vec<f32>], lists: &mut [Vec<usize>]
     // Pass one: every replica the boundary rule would admit, with its distance, so pass two
     // can prefer the closest when a list runs out of room.
     let mut extra: Vec<Vec<(usize, f32)>> = vec![Vec::new(); lists.len()];
+    // One buffer for every row, and only the nearest `1 + replicas` ordered (M119).
+    let mut d: Vec<(usize, f32)> = Vec::with_capacity(centroids.len());
     for (row, v) in corpus.iter().enumerate() {
-        let mut d: Vec<(usize, f32)> = centroids
-            .iter()
-            .enumerate()
-            .map(|(c, cen)| (c, dist2(v, cen)))
-            .collect();
-        d.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        d.clear();
+        d.extend(
+            centroids
+                .iter()
+                .enumerate()
+                .map(|(c, cen)| (c, dist2(v, cen))),
+        );
+        crate::top::top_k_by(&mut d, params.replicas.saturating_add(1), |a, b| {
+            a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        });
         let Some((_, nearest)) = d.first().copied() else {
             continue;
         };
@@ -326,16 +340,32 @@ fn augment(corpus: &[Vec<f32>], centroids: &[Vec<f32>], lists: &mut [Vec<usize>]
 /// Assigns every row to its nearest centroid that still has room.
 fn assign(corpus: &[Vec<f32>], centroids: &[Vec<f32>], cap: usize) -> Vec<Vec<usize>> {
     let mut lists: Vec<Vec<usize>> = vec![Vec::new(); centroids.len()];
+    let order =
+        |a: &(usize, f32), b: &(usize, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+    let mut prefs: Vec<(usize, f32)> = Vec::with_capacity(centroids.len());
     for (row, v) in corpus.iter().enumerate() {
-        let mut prefs: Vec<(usize, f32)> = centroids
-            .iter()
-            .enumerate()
-            .map(|(c, cen)| (c, dist2(v, cen)))
-            .collect();
+        prefs.clear();
+        prefs.extend(
+            centroids
+                .iter()
+                .enumerate()
+                .map(|(c, cen)| (c, dist2(v, cen))),
+        );
+        // ⚠️ The nearest first, and the full preference order only when it is full (M119):
+        // under the same total order, the first entry of the sort below is this minimum, so
+        // a row whose nearest list has room lands where the sort would have put it.
+        if let Some(best) = prefs.iter().copied().min_by(order)
+            && lists.get(best.0).is_some_and(|l| l.len() < cap)
+        {
+            if let Some(list) = lists.get_mut(best.0) {
+                list.push(row);
+            }
+            continue;
+        }
         // Ties by centroid index, so the order is total and two runs over the same corpus
         // agree exactly. Recall is compared across runs; a clustering that varies makes
         // every comparison noise.
-        prefs.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        prefs.sort_by(order);
 
         // Nearest centroid with room. Every vector lands somewhere: the fallback is the
         // least-full list, so a corpus can never lose a row to a full-everywhere state --

@@ -354,8 +354,9 @@ fn assemble(
     let quantizer = Quantizer::new(dim.max(1));
 
     // `home` is the list each INDEX row sits in, beside `order`; empty when unclustered.
-    let (order, home, centroids) = if docs.len() < params.exact_scan_threshold || dim == 0 {
-        ((0..docs.len()).collect::<Vec<_>>(), Vec::new(), None)
+    // `corpus` is every document's fitted vector when clustered, kept for the codes below.
+    let (order, home, centroids, corpus) = if docs.len() < params.exact_scan_threshold || dim == 0 {
+        ((0..docs.len()).collect::<Vec<_>>(), Vec::new(), None, None)
     } else {
         let corpus: Vec<Vec<f32>> = docs.iter().map(|d| fit(d, field, dim)).collect();
         let c = Clustering::build(&corpus, params);
@@ -376,6 +377,7 @@ fn assemble(
                 vectors: c.centroids().to_vec(),
                 spans,
             }),
+            Some(corpus),
         )
     };
 
@@ -385,25 +387,26 @@ fn assemble(
     // one to the other. Writing the blocks over `order` is what made 400 documents come back
     // as 431 rows and compound on every merge.
     let mut primary: Vec<usize> = Vec::with_capacity(order.len());
-    let mut slot_of: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    // Indexed by document row: `order` holds rows below `docs.len()`.
+    let mut slot_of: Vec<Option<u32>> = vec![None; docs.len()];
     let mut index_rows: Vec<u32> = Vec::with_capacity(order.len());
     for row in &order {
-        let slot = *slot_of.entry(*row).or_insert_with(|| {
-            primary.push(*row);
-            (primary.len() - 1) as u32
-        });
+        let slot = match slot_of.get_mut(*row) {
+            Some(Some(slot)) => *slot,
+            Some(free) => {
+                primary.push(*row);
+                let slot = (primary.len() - 1) as u32;
+                *free = Some(slot);
+                slot
+            }
+            None => continue,
+        };
         index_rows.push(slot);
     }
 
-    let mut w = SegmentWriter::new(64);
     let mut rabitq = Vec::new();
     let mut eights = Vec::new();
     let zero = vec![0.0f32; dim];
-    for row in &primary {
-        if let Some(d) = docs.get(*row) {
-            w.push(d.clone());
-        }
-    }
     for (slot, row) in order.iter().enumerate() {
         let Some(d) = docs.get(*row) else { continue };
         if dim > 0 {
@@ -421,7 +424,11 @@ fn assemble(
             // previous version silently swallowed the resulting dimension error with
             // `if let Ok`, producing a segment whose code section was EMPTY and an index
             // that returned nothing at all.
-            let v = fit(d, field, dim);
+            // The clustering's fitted copy when there is one, rather than fitting again.
+            let v: std::borrow::Cow<'_, [f32]> = match corpus.as_ref().and_then(|c| c.get(*row)) {
+                Some(v) => std::borrow::Cow::Borrowed(v),
+                None => std::borrow::Cow::Owned(fit(d, field, dim)),
+            };
             match quantizer.encode_residual(&v, cen) {
                 Ok(code) => code.write_to(&mut rabitq),
                 // Unreachable: `v` is `dim` long by construction. Filled rather than
@@ -446,6 +453,11 @@ fn assemble(
     let text = text_field.map(|name| pstore_format::text::build_with(&rows, name, analyzer));
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
     let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
+    // Moved in, never cloned again: `rows` is the blocks' documents, in their order.
+    let mut w = SegmentWriter::new(64);
+    for d in rows {
+        w.push(d);
+    }
     // ⚠️ **Between `RaBitQ` and `Sq8`, and the order is load-bearing.** Body sections are laid
     // out in attachment order, and the coalescer merges nearby ranges — so with the mapping
     // *after* `Sq8`, a rung-0 query fetching rabitq and the mapping bridges straight across
@@ -480,7 +492,8 @@ fn assemble(
 /// An opened index: the segment's directory and the centroid table, both in memory.
 #[derive(Debug)]
 pub struct VecIndex {
-    segment: Segment,
+    /// Shared with the caller that opened it, when it has one (M119).
+    segment: std::sync::Arc<Segment>,
     centroids: Option<Centroids>,
     dim: usize,
 }
@@ -533,7 +546,7 @@ impl VecIndex {
         )
         .await;
         Ok(Self {
-            segment: seg?,
+            segment: std::sync::Arc::new(seg?),
             // A missing centroid object is not an error: it is how an index below the
             // threshold says "scan me exactly" (D-10).
             centroids: cen.ok().and_then(|b| Centroids::decode(b.as_ref())),
@@ -548,9 +561,13 @@ impl VecIndex {
     /// stack it is invisible, because singleflight collapses the identical concurrent reads
     /// and the request counter reports the right answer for the wrong code.
     #[must_use]
-    pub fn from_parts(segment: Segment, centroids: Option<&[u8]>, dim: usize) -> Self {
+    pub fn from_parts(
+        segment: impl Into<std::sync::Arc<Segment>>,
+        centroids: Option<&[u8]>,
+        dim: usize,
+    ) -> Self {
         Self {
-            segment,
+            segment: segment.into(),
             // A missing or unreadable centroid table is not an error: it is how an index
             // below the threshold says "scan me exactly" (D-10).
             centroids: centroids.and_then(Centroids::decode),
@@ -610,13 +627,11 @@ impl VecIndex {
                 .enumerate()
                 .map(|(i, v)| (i, dot(v, query)))
                 .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            scored.truncate(q.k);
+            crate::top::top_k_by(&mut scored, q.k, crate::top::best_first);
             return Ok(scored);
         };
 
-        let clustering = Clustering::from_parts(centroids.vectors.clone(), Vec::new());
-        let probes = search::probe(&clustering, query, q.p);
+        let probes = search::probe_centroids(&centroids.vectors, query, q.p);
         let code_len = quantizer.code_len();
         let (Some(rabitq), Some(sq8_span)) = (
             self.segment.section(Section::RaBitQ),
@@ -658,25 +673,34 @@ impl VecIndex {
             }
         }
         let bufs = store.get_ranges(key, &ranges).await?;
-        // Index row -> data row, for the probed rows only.
-        let mut data_row: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-        if map_span.is_some() {
-            let base = rows.len() * if want_sq8 { 2 } else { 1 };
-            for (n, (_, first, len)) in rows.iter().enumerate() {
-                let Some(buf) = bufs.get(base + n) else {
-                    continue;
-                };
-                for i in 0..*len as usize {
-                    let Some(raw) = buf.get(i * 4..(i + 1) * 4) else {
-                        continue;
-                    };
-                    if let Ok(b) = <[u8; 4]>::try_from(raw) {
-                        data_row.insert(*first as usize + i, u32::from_le_bytes(b) as usize);
-                    }
-                }
+        // Index row -> data row, read from the probed lists' mapping buffers on demand.
+        // ⚠️ Looked up in place rather than copied into a map (M119): the map took one SipHash
+        // insert per probed row, tens of thousands per query, to be read for a few hundred.
+        let map_base = rows.len() * if want_sq8 { 2 } else { 1 };
+        let mapped = |n: usize, i: usize| -> Option<usize> {
+            let raw = bufs.get(map_base + n)?.get(i * 4..(i + 1) * 4)?;
+            Some(u32::from_le_bytes(<[u8; 4]>::try_from(raw).ok()?) as usize)
+        };
+        // Whether any probed row has a mapping: the old map's `!is_empty()`.
+        let has_mapping = map_span.is_some()
+            && rows
+                .iter()
+                .enumerate()
+                .any(|(n, (_, _, len))| (0..*len as usize).any(|i| mapped(n, i).is_some()));
+        // The mapping for an index row, found through the list it sits in.
+        let data_row_of = |row: usize| -> Option<usize> {
+            if !has_mapping {
+                return None;
             }
-        }
+            // The last list holding it, as the map it replaces kept the last list's entry.
+            rows.iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (_, first, len))| {
+                    row >= *first as usize && row < (*first + *len) as usize
+                })
+                .and_then(|(n, (_, first, _))| mapped(n, row - *first as usize))
+        };
 
         let Ok(prepared) = quantizer.prepare(query) else {
             return Err(pstore_format::FormatError::DimensionMismatch {
@@ -690,25 +714,26 @@ impl VecIndex {
             .map(|(li, _, _)| centroids.vectors.get(*li).map_or(0.0, |c| dot(c, query)))
             .collect();
 
-        let mut scored: Vec<(usize, f32)> = Vec::new();
+        // Each candidate's data row rides beside it, so deduplication needs no lookup.
+        let mut scored: Vec<(usize, f32, usize)> = Vec::new();
         for (n, (_, first, len)) in rows.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
+            let centroid_dot = dots.get(n).copied().unwrap_or(0.0);
             for i in 0..*len as usize {
                 let Some(raw) = buf.get(i * code_len..(i + 1) * code_len) else {
                     continue;
                 };
-                let Some(code) = quantizer.read_code(raw) else {
+                let Some(score) = quantizer.estimate_residual_raw(raw, &prepared, centroid_dot)
+                else {
                     continue;
                 };
                 let row = *first as usize + i;
-                scored.push((
-                    row,
-                    quantizer.estimate_residual(
-                        &code,
-                        &prepared,
-                        dots.get(n).copied().unwrap_or(0.0),
-                    ),
-                ));
+                let data = if has_mapping {
+                    mapped(n, i).unwrap_or(row)
+                } else {
+                    row
+                };
+                scored.push((row, score, data));
             }
         }
 
@@ -718,14 +743,25 @@ impl VecIndex {
         // after, because the rerank rungs read `Sq8` and `Vectors` at INDEX rows — mapping
         // early would send them to the wrong offsets — and deduplicating after `k` has been
         // truncated returns fewer than `k`.
-        if !data_row.is_empty() {
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            scored.retain(|(row, _)| seen.insert(*data_row.get(row).unwrap_or(row)));
+        if has_mapping {
+            scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // Data rows are below the segment's row count: a bitmap rather than a SipHash set,
+            // and a set only for a mapping past it, which a corrupt section could hold.
+            let mut seen = vec![false; self.segment.row_count().min(crate::top::DENSE_ROWS)];
+            let mut past: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            scored.retain(|(_, _, data)| match seen.get_mut(*data) {
+                Some(s) => !std::mem::replace(s, true),
+                None => past.insert(*data),
+            });
         }
 
         let ladder = Ladder::new(q.k, q.oversample);
-        let top = ladder.rung0(scored);
+        let top = ladder.rung0(scored.into_iter().map(|(row, s, _)| (row, s)));
+        // The survivors' mappings, the only ones read again.
+        let data_row: std::collections::HashMap<usize, usize> = top
+            .iter()
+            .filter_map(|(row, _)| Some((*row, data_row_of(*row)?)))
+            .collect();
         let ranked: Vec<(usize, f32)> = match q.rerank {
             Rerank::None => top.into_iter().take(q.k).collect(),
             Rerank::Fast => {

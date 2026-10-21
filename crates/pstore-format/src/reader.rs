@@ -884,7 +884,7 @@ impl Segment {
         // saves bytes. It cannot serve a variable-width field (several vectors per row), so
         // anything that is not exactly one fixed-width field is read whole, per field.
         let simple = self.fields.len() == 1 && self.fields.first().is_some_and(|f| f.per_row == 1);
-        let extra = if simple {
+        let mut extra = if simple {
             Vec::new()
         } else {
             let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::new();
@@ -924,10 +924,11 @@ impl Segment {
                     doc.vectors
                         .insert(first_field.clone(), crate::VectorField::dense(v));
                 }
-                for (name, all) in &extra {
-                    if let Some(v) = all.get(start + r) {
+                // Moved, not copied (M119): each `(block, row)` is visited once.
+                for (name, all) in &mut extra {
+                    if let Some(v) = all.get_mut(start + r) {
                         doc.vectors
-                            .insert(name.clone(), crate::VectorField::Dense(v.clone()));
+                            .insert(name.clone(), crate::VectorField::Dense(std::mem::take(v)));
                     }
                 }
                 if let Some(name) = &sparse_name
@@ -1008,6 +1009,23 @@ impl Segment {
         store: &S,
         key: &Key,
         keep: impl Fn(&Zones) -> bool,
+        visit: impl FnMut(usize, Document),
+    ) -> Result<(), FormatError> {
+        self.visit_rows_projected(store, key, keep, &crate::Projection::ALL, visit)
+            .await
+    }
+
+    /// [`Self::visit_rows_where`], each row built only as far as `project` asks (M119): the
+    /// same fetch, the same refusals.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn visit_rows_projected<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(&Zones) -> bool,
+        project: &crate::Projection<'_>,
         mut visit: impl FnMut(usize, Document),
     ) -> Result<(), FormatError> {
         let mut base = 0usize;
@@ -1027,7 +1045,10 @@ impl Segment {
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
         for ((start, _), buf) in wanted.iter().zip(&bufs) {
-            for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
+            for (r, doc) in crate::decode_rows_where(buf, project)?
+                .into_iter()
+                .enumerate()
+            {
                 visit(start + r, doc);
             }
         }
@@ -1060,11 +1081,13 @@ impl Segment {
             base.push(running);
             running += b.rows as usize;
         }
+        // The last block starting at or before `row`, if `row` is inside it: by bisection,
+        // since starts ascend (M119). An empty block holds no row, and one that shares its
+        // start with the block after it is never the last such.
         let block_of = |row: usize| -> Option<usize> {
-            self.blocks.iter().enumerate().position(|(i, b)| {
-                let start = base.get(i).copied().unwrap_or(0);
-                row >= start && row < start + b.rows as usize
-            })
+            let i = base.partition_point(|s| *s <= row).checked_sub(1)?;
+            let start = base.get(i).copied()?;
+            (row < start + self.blocks.get(i)?.rows as usize).then_some(i)
         };
 
         let mut wanted: Vec<usize> = rows.iter().filter_map(|r| block_of(*r)).collect();
@@ -1080,13 +1103,17 @@ impl Segment {
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
 
-        // Row -> its document, for the rows the fetched blocks happen to carry.
+        // Row -> its document, for the asked-for rows the fetched blocks carry: the rest of
+        // each block is decoded and dropped, never filed (M119).
+        let asked: std::collections::BTreeSet<usize> = rows.iter().copied().collect();
         let mut found: BTreeMap<usize, Document> = BTreeMap::new();
         for (n, block) in wanted.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
             let start = base.get(*block).copied().unwrap_or(0);
             for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
-                found.insert(start + r, doc);
+                if asked.contains(&(start + r)) {
+                    found.insert(start + r, doc);
+                }
             }
         }
         Ok(rows.iter().map(|r| found.get(r).cloned()).collect())

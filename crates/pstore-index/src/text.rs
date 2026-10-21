@@ -128,6 +128,23 @@ impl TextIndex {
         }
     }
 
+    /// [`Self::summary`] with `df` for `terms` only: what BM25 reads (M119).
+    ///
+    /// ⚠️ The same numbers for every term it keeps, and `summary`'s `df` restricted to `terms`
+    /// is what a query's scorer can see of it: [`Self::search_with`] reads the `df` of its own
+    /// terms and nothing else. A term the dictionary lacks is absent either way.
+    #[must_use]
+    pub fn summary_for(&self, terms: &[String]) -> Stats {
+        Stats {
+            doc_count: u64::from(self.dict.doc_count()),
+            total_tokens: self.dict.total_tokens(),
+            df: terms
+                .iter()
+                .filter_map(|t| self.dict.lookup(t).map(|e| (t.clone(), e.df)))
+                .collect(),
+        }
+    }
+
     /// Where the postings section lives, for a byte assertion that can name a section.
     #[must_use]
     pub fn span(&self) -> std::ops::Range<u64> {
@@ -224,7 +241,8 @@ impl TextIndex {
         {
             let n = stats.doc_count as f32;
             let avgdl = stats.avgdl();
-            let mut scores: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+            // Rows are this segment's, and the norms hold one per row (M119).
+            let mut scores = crate::top::Accumulator::with_rows(norms.len() / 4);
             for (i, (term, e)) in entries.iter().enumerate() {
                 let Some(buf) = bufs.get(i) else { continue };
                 // ⚠️ `stats.df`, never `e.df`. The entry's df is THIS SEGMENT's, which is the
@@ -247,13 +265,11 @@ impl TextIndex {
                         k1 * (1.0 - b)
                     };
                     let tf = tf as f32;
-                    *scores.entry(row).or_insert(0.0) += idf * (tf * (k1 + 1.0)) / (tf + norm);
+                    scores.add(row, idf * (tf * (k1 + 1.0)) / (tf + norm));
                 }
             }
-            let mut scored: Vec<(usize, f32)> =
-                scores.into_iter().map(|(r, s)| (r as usize, s)).collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            scored.truncate(k);
+            let mut scored = scores.into_scored();
+            crate::top::top_k_by(&mut scored, k, crate::top::best_first);
             Ok(scored)
         }
     }

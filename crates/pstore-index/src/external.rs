@@ -110,8 +110,10 @@ impl Clusters {
             .enumerate()
             .map(|(i, c)| (i, sq_dist(c, q)))
             .collect();
-        dist.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-        dist.into_iter().take(probes).map(|(i, _)| i).collect()
+        crate::top::top_k_by(&mut dist, probes, |a, b| {
+            a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
+        });
+        dist.into_iter().map(|(i, _)| i).collect()
     }
 }
 
@@ -656,8 +658,7 @@ impl ExternalIndex {
                 return None;
             }
             let raw = self.codes.get(row * step..(row + 1) * step)?;
-            let code = self.quantizer.read_code(raw)?;
-            Some((row, self.quantizer.estimate_prepared(&code, &prepared)))
+            Some((row, self.quantizer.estimate_prepared_raw(raw, &prepared)?))
         };
         let mut scored: Vec<(usize, f32)> = match probes {
             None => (0..self.codes.len() / step).filter_map(score).collect(),
@@ -677,8 +678,7 @@ impl ExternalIndex {
                     .collect()
             }
         };
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        scored.truncate(window.max(k));
+        crate::top::top_k_by(&mut scored, window.max(k), crate::top::best_first);
         let rows: Vec<usize> = scored.iter().map(|(r, _)| *r).collect();
         let got = self.column.read_rows(store, &rows).await?;
         let mut exact: Vec<(usize, f32)> = got
@@ -688,8 +688,7 @@ impl ExternalIndex {
                 Some((*row, u.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>()))
             })
             .collect();
-        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        exact.truncate(k);
+        crate::top::top_k_by(&mut exact, k, crate::top::best_first);
         Ok(exact)
     }
 }

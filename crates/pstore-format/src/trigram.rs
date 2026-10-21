@@ -35,9 +35,12 @@ pub fn fold(c: char) -> char {
 pub fn trigrams(s: &str) -> Vec<Trigram> {
     let folded: Vec<char> = s.chars().map(fold).collect();
     let mut out: Vec<Trigram> = Vec::new();
+    // ⚠️ A set beside the list (M119): `out.contains` made a long value quadratic -- two
+    // million comparisons for a 2 KB string. `out` keeps first-appearance order.
+    let mut seen: std::collections::HashSet<Trigram> = std::collections::HashSet::new();
     for w in folded.windows(3) {
         if let [a, b, c] = *w
-            && !out.contains(&[a, b, c])
+            && seen.insert([a, b, c])
         {
             out.push([a, b, c]);
         }
@@ -47,10 +50,16 @@ pub fn trigrams(s: &str) -> Vec<Trigram> {
 
 /// The two positions a trigram sets in a filter of `bits`: FNV-1a 64 over its UTF-8, seeded.
 fn positions(t: &Trigram, bits: u32) -> [u32; 2] {
-    let utf8: String = t.iter().collect();
+    // On the stack (M119): the same bytes a `String` of the three would hold.
+    let mut buf = [0u8; 12];
+    let mut len = 0;
+    for c in t {
+        len += c.encode_utf8(buf.get_mut(len..).unwrap_or_default()).len();
+    }
+    let utf8 = buf.get(..len).unwrap_or_default();
     [0u64, 0x9e37_79b9].map(|seed| {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
-        for b in utf8.bytes() {
+        for b in utf8.iter().copied() {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }

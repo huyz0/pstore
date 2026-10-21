@@ -414,11 +414,13 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
         for t in &tokens {
             *tf.entry(t.as_str()).or_insert(0) += 1;
         }
+        // The term allocated once per vocabulary word, not once per row it is in (M119).
         for (term, n) in tf {
-            by_term
-                .entry(term.to_owned())
-                .or_default()
-                .push((row as u32, n));
+            if let Some(list) = by_term.get_mut(term) {
+                list.push((row as u32, n));
+            } else {
+                by_term.insert(term.to_owned(), vec![(row as u32, n)]);
+            }
         }
     }
 
@@ -501,7 +503,10 @@ pub struct TermEntry {
 /// The term dictionary: sorted terms, fixed-width entries, and a blob of term bytes.
 #[derive(Debug, Clone)]
 pub struct TermDict {
-    terms: Vec<String>,
+    /// The term bytes, once, and each term's span in them (M119): a `String` per term was an
+    /// allocation per vocabulary word on every open of every text segment.
+    blob: Vec<u8>,
+    terms: Vec<(u32, u16)>,
     entries: Vec<TermEntry>,
     rows: u32,
     total_tokens: u64,
@@ -530,12 +535,9 @@ impl TermDict {
         for i in 0..count {
             let b = raw.get(HEADER + i * ENTRY..HEADER + (i + 1) * ENTRY)?;
             let at = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
-            let len = u16::from_le_bytes(b.get(4..6)?.try_into().ok()?) as usize;
-            terms.push(
-                std::str::from_utf8(blob.get(at..at + len)?)
-                    .ok()?
-                    .to_owned(),
-            );
+            let len = u16::from_le_bytes(b.get(4..6)?.try_into().ok()?);
+            std::str::from_utf8(blob.get(at..at + usize::from(len))?).ok()?;
+            terms.push((u32::try_from(at).ok()?, len));
             entries.push(TermEntry {
                 offset: u64::from(u32::from_le_bytes(b.get(6..10)?.try_into().ok()?)),
                 bytes: u32::from_le_bytes(b.get(10..14)?.try_into().ok()?),
@@ -544,11 +546,14 @@ impl TermDict {
             });
         }
         // Unsorted cannot be searched, and searching it anyway answers "absent" for terms that
-        // are present — a silent recall loss rather than a failure.
-        if !terms.is_sorted_by(|a, b| a < b) {
+        // are present — a silent recall loss rather than a failure. Bytes compare as the
+        // strings they spell do.
+        let at = |t: &(u32, u16)| blob.get(t.0 as usize..t.0 as usize + usize::from(t.1));
+        if !terms.is_sorted_by(|a, b| at(a) < at(b)) {
             return None;
         }
         Some(Self {
+            blob: blob.to_vec(),
             terms,
             entries,
             rows,
@@ -582,7 +587,15 @@ impl TermDict {
 
     /// Every term, ascending.
     pub fn terms(&self) -> impl Iterator<Item = &str> {
-        self.terms.iter().map(String::as_str)
+        self.terms.iter().map(|t| self.term(*t))
+    }
+
+    /// The term at a span `decode` validated as UTF-8 inside the blob.
+    fn term(&self, (at, len): (u32, u16)) -> &str {
+        self.blob
+            .get(at as usize..at as usize + usize::from(len))
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or_default()
     }
 
     /// One term's entry, or `None` when the vocabulary does not contain it.
@@ -592,7 +605,10 @@ impl TermDict {
     /// loop, for the reason `sparse::Dictionary::lookup` gives.
     #[must_use]
     pub fn lookup(&self, term: &str) -> Option<TermEntry> {
-        let i = self.terms.binary_search_by(|t| t.as_str().cmp(term)).ok()?;
+        let i = self
+            .terms
+            .binary_search_by(|t| self.term(*t).cmp(term))
+            .ok()?;
         self.entries.get(i).copied()
     }
 

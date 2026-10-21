@@ -274,7 +274,10 @@ impl FdeClusters {
             })
             .collect();
         let bufs = store.get_ranges(&vectors_key(segment_key), &ranges).await?;
-        let mut best: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
+        // Indexed by row, first score kept, as the `BTreeMap`'s `or_insert` was (M119); a row
+        // past any real segment's -- a corrupt sidecar's -- in a map beside it, as before.
+        let mut best: Vec<Option<f32>> = Vec::new();
+        let mut far: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
         for (i, raw) in chosen.iter().zip(&bufs) {
             let list = self.lists.get(*i).ok_or(FormatError::Corrupt("list"))?;
             if raw.len() != list.len() * dim * 4 {
@@ -288,12 +291,26 @@ impl FdeClusters {
                     .zip(q)
                     .map(|(b, x)| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])) * x)
                     .sum();
-                best.entry(*row as usize).or_insert(score);
+                let at = *row as usize;
+                if at >= crate::top::DENSE_ROWS {
+                    far.entry(at).or_insert(score);
+                    continue;
+                }
+                if best.len() <= at {
+                    best.resize(at + 1, None);
+                }
+                if let Some(slot) = best.get_mut(at) {
+                    slot.get_or_insert(score);
+                }
             }
         }
-        let mut scored: Vec<(usize, f32)> = best.into_iter().collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        scored.truncate(limit);
+        let mut scored: Vec<(usize, f32)> = best
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, s)| Some((row, s?)))
+            .chain(far)
+            .collect();
+        crate::top::top_k_by(&mut scored, limit, crate::top::best_first);
         Ok(scored)
     }
 }

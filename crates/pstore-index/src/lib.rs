@@ -14,4 +14,5 @@ pub mod search;
 pub mod sparse;
 pub mod sq8;
 pub mod text;
+pub mod top;
 pub mod vec_index;

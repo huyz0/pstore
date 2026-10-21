@@ -620,13 +620,14 @@ impl<S: BlobStore + 'static> Api<S> {
             .index_params
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let external = self
-            .external_prefixes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let mut engines = self.engines.lock().await;
         let slot = engines.entry(tenant).or_insert_with(|| {
+            // Read only for an engine being built (M119): every request copied the list.
+            let external = self
+                .external_prefixes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let engine = Engine::new(
                 Arc::new(Caching::over(
                     Arc::new(self.store.as_tenant(tenant)),
@@ -804,19 +805,6 @@ impl<S: BlobStore + 'static> Api<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Whether this server owes `tenant` a fold a refused `strong` read asked for (M9i.2): the
-    /// one thing it owes that its engine does not hold.
-    ///
-    /// ⚠️ **A backoff needs no check of its own** (mutation sweep): a fold that failed keeps
-    /// its own rows unfolded, or its request marked again, and a reap that failed keeps its
-    /// reapable records -- each of which keeps the tenant already.
-    fn owed(&self, tenant: TenantId) -> bool {
-        self.requested
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&tenant)
-    }
-
     /// One eviction pass (M26): past the cap, drops idle engines no request holds, least
     /// recently used first, down to `cap - cap / 10`. Memory only: no blob request.
     ///
@@ -841,8 +829,20 @@ impl<S: BlobStore + 'static> Api<S> {
         let target = cap - cap / 10;
         let mut idle: Vec<(tokio::time::Instant, TenantId)> = Vec::new();
         let mut held_idle = false;
+        // The tenants this server owes a fold a refused `strong` read asked for (M9i.2): the one
+        // thing it owes that its engine does not hold. Locked once for the pass (M119), not once
+        // an engine while every request waits on `engines`; nothing takes the two in the other
+        // order.
+        //
+        // ⚠️ **A backoff needs no check of its own** (mutation sweep): a fold that failed keeps
+        // its own rows unfolded, or its request marked again, and a reap that failed keeps its
+        // reapable records -- each of which keeps the tenant already.
+        let owed = self
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (t, s) in engines.iter() {
-            if !s.engine.is_idle(reaping) || self.owed(*t) {
+            if !s.engine.is_idle(reaping) || owed.contains(t) {
                 continue;
             }
             if Arc::strong_count(&s.engine) > 1 {
@@ -851,6 +851,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 idle.push((s.used, *t));
             }
         }
+        drop(owed);
         idle.sort_unstable();
         let n = (engines.len() - target).min(idle.len());
         for (_, t) in idle.iter().take(n) {
@@ -1383,9 +1384,16 @@ fn patch_of(
     let set: serde_json::Map<String, serde_json::Value> =
         attrs.into_iter().filter(|(_, v)| !v.is_null()).collect();
     // Converted as a document's attributes are: every refusal of one is a patch's too.
-    let as_doc: types::DocumentIn =
-        serde_json::from_value(serde_json::json!({"id": id, "vector": [], "attributes": set}))
-            .map_err(|e| ApiError::bad_request(format!("{who}: {e}")))?;
+    // ⚠️ Built, not parsed from a `json!` copy (M119): an empty vector and a map of values are
+    // what that parse produced, and it could refuse neither, so it copied every value twice
+    // to say nothing.
+    let as_doc = types::DocumentIn {
+        id: id.clone(),
+        vector: Vec::new(),
+        vectors: std::collections::BTreeMap::new(),
+        text: None,
+        attributes: set.into_iter().collect(),
+    };
     for name in &unset {
         if name.is_empty() || name.starts_with('$') || name == pstore_query::ID_ATTRIBUTE {
             return Err(ApiError::bad_request(format!(
@@ -1393,7 +1401,7 @@ fn patch_of(
             )));
         }
     }
-    let doc = to_document(&as_doc, dated)?;
+    let doc = to_document(as_doc, dated)?;
     Ok(pstore_engine::Patch {
         id,
         set: doc.attrs,
@@ -1452,7 +1460,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // ⚠️ Parsed here rather than by the `Json` extractor, because the extractor's own
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
-    let req: WriteRequest = parse_write(&body)?;
+    let mut req: WriteRequest = parse_write(&body)?;
     if let Some(src) = branch_source(&req, &body)? {
         return branch_index(&api, tenant, token, src, &index).await;
     }
@@ -1560,9 +1568,9 @@ async fn write_documents<S: BlobStore + 'static>(
 
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
-    let docs: Vec<Document> = req
-        .documents
-        .iter()
+    // Moved, not copied (M119): the documents are not read again.
+    let docs: Vec<Document> = std::mem::take(&mut req.documents)
+        .into_iter()
         .map(|d| to_document(d, &dated))
         .collect::<Result<_, _>>()?;
     let written = docs.len();
@@ -1685,7 +1693,7 @@ async fn query_index<S: BlobStore + 'static>(
         .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
     // ⚠️ Every query is planned -- every refusal found -- before any runs (M9g): one refused
     // sub-query refuses the request, and nothing partial is returned.
-    let Some(subs) = raw.get("queries") else {
+    if raw.get("queries").is_none() {
         let req = parse_query(raw)?;
         // M65: checked first, so every refusal names `facets`.
         let facet = facets::derive(&req)?;
@@ -1725,8 +1733,8 @@ async fn query_index<S: BlobStore + 'static>(
             }),
             &session,
         ));
-    };
-    let reqs = multi_query(&raw, subs)?;
+    }
+    let reqs = multi_query(raw)?;
     let plans = reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
@@ -1780,22 +1788,26 @@ fn parse_query(raw: serde_json::Value) -> Result<QueryRequest, ApiError> {
 }
 
 /// `{"queries": [...]}`'s sub-queries (M9g): 1 to 16, alone in the body, none nested.
-fn multi_query(
-    raw: &serde_json::Value,
-    subs: &serde_json::Value,
-) -> Result<Vec<QueryRequest>, ApiError> {
+///
+/// ⚠️ Takes the body by value (M119): each sub-query was deep-copied, vector and all, only to
+/// hand `parse_query` one it could own.
+fn multi_query(raw: serde_json::Value) -> Result<Vec<QueryRequest>, ApiError> {
     if raw.as_object().is_some_and(|o| o.len() > 1) {
         return Err(ApiError::bad_request(
             "queries is the whole request: each query carries its own fields",
         ));
     }
-    let subs = subs
-        .as_array()
-        .filter(|a| (1..=MAX_QUERIES).contains(&a.len()))
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("queries is an array of 1 to {MAX_QUERIES} queries"))
-        })?;
-    subs.iter()
+    let subs = match raw {
+        serde_json::Value::Object(mut o) => match o.remove("queries") {
+            Some(serde_json::Value::Array(a)) if (1..=MAX_QUERIES).contains(&a.len()) => Some(a),
+            _ => None,
+        },
+        _ => None,
+    }
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("queries is an array of 1 to {MAX_QUERIES} queries"))
+    })?;
+    subs.into_iter()
         .map(|q| {
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
@@ -1811,7 +1823,7 @@ fn multi_query(
                     "facets inside a multi-query is not offered",
                 ));
             }
-            parse_query(q.clone())
+            parse_query(q)
         })
         .collect()
 }
@@ -2968,8 +2980,8 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
     }
     if let Some(m) = &req.multi {
         let field = named_field(&m.field)?;
-        let query =
-            many(&m.vectors).map_err(|why| ApiError::bad_request(format!("multi: {why}")))?;
+        let query = many(m.vectors.clone())
+            .map_err(|why| ApiError::bad_request(format!("multi: {why}")))?;
         let fde = match m.mode.as_ref() {
             None => false,
             Some(v) => match v.as_str() {
@@ -3128,7 +3140,7 @@ fn named_field(name: &str) -> Result<String, ApiError> {
 
 /// A named field's vectors, or why they cannot be (M61): 1 to [`MAX_FIELD_VECTORS`], none
 /// empty. Non-finite components are refused as `vector`'s are, when they are read.
-fn many(vs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+fn many(vs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String> {
     if !(1..=MAX_FIELD_VECTORS).contains(&vs.len()) {
         return Err(format!(
             "1 to {MAX_FIELD_VECTORS} vectors, not {}",
@@ -3138,7 +3150,7 @@ fn many(vs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
     if vs.iter().any(Vec::is_empty) {
         return Err("an empty vector".to_owned());
     }
-    Ok(vs.to_vec())
+    Ok(vs)
 }
 
 /// The wire document, as the format's — or the reason it cannot be one.
@@ -3344,16 +3356,26 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     })
 }
 
+///
+/// ⚠️ Takes the document by value (M119): its vectors move into the format's, where a borrow
+/// copied every one of them.
 fn to_document(
-    d: &types::DocumentIn,
+    d: types::DocumentIn,
     dated: &std::collections::BTreeSet<String>,
 ) -> Result<Document, ApiError> {
     let text_field = pstore_format::text::DEFAULT_TEXT_FIELD;
-    let mut doc = Document::new(d.id.clone(), d.vector.clone());
+    let types::DocumentIn {
+        id,
+        vector,
+        vectors,
+        text,
+        attributes,
+    } = d;
+    let mut doc = Document::new(id.clone(), vector);
     let refuse = |name: &str, why: &str| {
-        ApiError::bad_request(format!("document {}: attribute `{name}` {why}", d.id))
+        ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
-    for (name, value) in &d.attributes {
+    for (name, value) in &attributes {
         if name.is_empty() {
             return Err(refuse(name, "has an empty name"));
         }
@@ -3387,23 +3409,23 @@ fn to_document(
         }
         doc.attrs.insert(name.clone(), v);
     }
-    if d.vectors.len() > MAX_NAMED_FIELDS {
+    if vectors.len() > MAX_NAMED_FIELDS {
         return Err(ApiError::bad_request(format!(
             "document {}: {} named vector fields, at most {MAX_NAMED_FIELDS}",
-            d.id,
-            d.vectors.len()
+            id,
+            vectors.len()
         )));
     }
-    for (name, vs) in &d.vectors {
-        let name = named_field(name)
-            .map_err(|e| ApiError::bad_request(format!("document {}: {}", d.id, e.message)))?;
+    for (name, vs) in vectors {
+        let name = named_field(&name)
+            .map_err(|e| ApiError::bad_request(format!("document {}: {}", id, e.message)))?;
         let vs = many(vs).map_err(|why| {
-            ApiError::bad_request(format!("document {}: field `{name}`: {why}", d.id))
+            ApiError::bad_request(format!("document {id}: field `{name}`: {why}"))
         })?;
         doc.vectors
             .insert(name, pstore_format::VectorField::Dense(vs));
     }
-    if let Some(t) = &d.text {
+    if let Some(t) = text {
         // `attributes.text` and top-level `text` are one field spelled twice; which one
         // wins would be a rule nobody wrote down.
         if doc.attrs.contains_key(text_field) {
@@ -3413,7 +3435,7 @@ fn to_document(
             ));
         }
         doc.attrs
-            .insert(text_field.to_owned(), pstore_format::Value::Str(t.clone()));
+            .insert(text_field.to_owned(), pstore_format::Value::Str(t));
     }
     Ok(doc)
 }

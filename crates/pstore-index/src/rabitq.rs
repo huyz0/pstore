@@ -384,16 +384,52 @@ impl Quantizer {
 
     /// `<x̄, q>` — the raw, **biased** inner product of the code with a rotated query.
     fn raw(&self, code: &Code, rotated_query: &[f32]) -> f32 {
-        let scale = 1.0 / (self.padded as f32).sqrt();
-        let mut acc = 0.0f32;
-        for (i, q) in rotated_query.iter().enumerate() {
-            let bit = code
-                .bits
-                .get(i / 8)
-                .is_some_and(|b| b & (1 << (i % 8)) != 0);
-            acc += if bit { *q } else { -*q };
+        signed_sum(&code.bits, rotated_query) * (1.0 / (self.padded as f32).sqrt())
+    }
+
+    /// [`Self::estimate_prepared`] over a code still in its record, as
+    /// [`Self::estimate_residual_raw`] is: `None` exactly where [`Self::read_code`] is.
+    #[must_use]
+    pub fn estimate_prepared_raw(&self, raw: &[u8], query: &Query) -> Option<f32> {
+        if raw.len() != self.code_len() {
+            return None;
         }
-        acc * scale
+        let (bits, tail) = raw.split_at_checked(self.padded.div_ceil(8))?;
+        let alignment = f32::from_le_bytes(tail.get(..4)?.try_into().ok()?);
+        if alignment == 0.0 {
+            return Some(0.0);
+        }
+        Some(signed_sum(bits, &query.0) * (1.0 / (self.padded as f32).sqrt()) / alignment)
+    }
+
+    /// [`Self::estimate_residual`] over a code still in its record, as [`Self::read_code`]
+    /// reads it: `None` exactly where `read_code` is.
+    ///
+    /// ⚠️ The per-candidate path (M119): `read_code` copies the sign bits into a `Vec`, one
+    /// allocation per scored row -- tens of thousands per clustered query -- to be read once.
+    #[must_use]
+    pub fn estimate_residual_raw(
+        &self,
+        raw: &[u8],
+        query: &Query,
+        centroid_dot: f32,
+    ) -> Option<f32> {
+        if raw.len() != self.code_len() {
+            return None;
+        }
+        let (bits, tail) = raw.split_at_checked(self.padded.div_ceil(8))?;
+        let alignment = f32::from_le_bytes(tail.get(..4)?.try_into().ok()?);
+        let residual_norm = f32::from_le_bytes(tail.get(4..8)?.try_into().ok()?);
+        // The same three steps as `estimate_residual` and `estimate_prepared`, in order.
+        if residual_norm == 0.0 {
+            return Some(centroid_dot);
+        }
+        let unit = if alignment == 0.0 {
+            0.0
+        } else {
+            signed_sum(bits, &query.0) * (1.0 / (self.padded as f32).sqrt()) / alignment
+        };
+        Some(centroid_dot + residual_norm * unit)
     }
 
     /// Rotates a query once, for scoring against many codes.
@@ -476,6 +512,31 @@ impl Quantizer {
     }
 }
 
+/// `Σ ±qᵢ`: `+qᵢ` where bit `i` of `bits` is set, `-qᵢ` where it is clear or past its end.
+///
+/// ⚠️ Branchless (M119): the sign is XORed into the float rather than chosen by a branch on a
+/// bit the rotation makes a coin flip, which mispredicted about half the time. Negation is a
+/// sign-bit flip, and the additions happen in index order from `+0.0`, so this is the
+/// branchy loop's sum to the bit.
+fn signed_sum(bits: &[u8], q: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    let mut chunks = q.chunks_exact(8);
+    let mut bytes = bits.iter();
+    for chunk in chunks.by_ref() {
+        let byte = bytes.next().copied().unwrap_or(0);
+        for (j, x) in chunk.iter().enumerate() {
+            let clear = u32::from((byte >> j) & 1 == 0) << 31;
+            acc += f32::from_bits(x.to_bits() ^ clear);
+        }
+    }
+    let byte = bytes.next().copied().unwrap_or(0);
+    for (j, x) in chunks.remainder().iter().enumerate() {
+        let clear = u32::from((byte >> j) & 1 == 0) << 31;
+        acc += f32::from_bits(x.to_bits() ^ clear);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +558,73 @@ mod tests {
                 "dim {dim} has a flip that is not +-1"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "assertions in tests are the reporting mechanism"
+    )]
+    fn the_branchless_kernel_is_the_branchy_one() {
+        // The loop `signed_sum` replaced, verbatim.
+        fn branchy(bits: &[u8], q: &[f32]) -> f32 {
+            let mut acc = 0.0f32;
+            for (i, x) in q.iter().enumerate() {
+                let bit = bits.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0);
+                acc += if bit { *x } else { -*x };
+            }
+            acc
+        }
+        let mut s = 0x5eed_u64;
+        let mut next = move || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            s >> 33
+        };
+        // Lengths off a multiple of 8, and bit vectors shorter than the query: past their end
+        // every sign is negative.
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 384, 768] {
+            for short in [0usize, 1, 2] {
+                let q: Vec<f32> = (0..len)
+                    .map(|_| (next() % 2_001) as f32 / 1_000.0 - 1.0)
+                    .collect();
+                let bits: Vec<u8> = (0..len.div_ceil(8).saturating_sub(short))
+                    .map(|_| (next() & 0xff) as u8)
+                    .collect();
+                assert_eq!(
+                    signed_sum(&bits, &q).to_bits(),
+                    branchy(&bits, &q).to_bits(),
+                    "len {len}, {short} bytes short"
+                );
+            }
+        }
+        // And the record path agrees with `read_code` then `estimate_residual`.
+        let quant = Quantizer::new(100);
+        let v: Vec<f32> = (0..100).map(|i| (i as f32 * 0.37).sin()).collect();
+        let c: Vec<f32> = (0..100).map(|i| (i as f32 * 0.11).cos() * 0.1).collect();
+        let query = quant
+            .prepare(
+                &(0..100)
+                    .map(|i| (i as f32 * 0.7).cos())
+                    .collect::<Vec<f32>>(),
+            )
+            .unwrap();
+        let mut rec = Vec::new();
+        quant.encode_residual(&v, &c).unwrap().write_to(&mut rec);
+        let code = quant.read_code(&rec).unwrap();
+        assert_eq!(
+            quant
+                .estimate_residual_raw(&rec, &query, 0.25)
+                .map(f32::to_bits),
+            Some(quant.estimate_residual(&code, &query, 0.25).to_bits())
+        );
+        assert_eq!(quant.estimate_residual_raw(&rec[1..], &query, 0.25), None);
+        assert_eq!(
+            quant.estimate_prepared_raw(&rec, &query).map(f32::to_bits),
+            Some(quant.estimate_prepared(&code, &query).to_bits())
+        );
+        assert_eq!(quant.estimate_prepared_raw(&rec[1..], &query), None);
     }
 }

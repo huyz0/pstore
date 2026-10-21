@@ -132,13 +132,14 @@ impl<S: BlobStore> Metered<S> {
                     usize::try_from(r.start - base).unwrap_or(usize::MAX),
                     usize::try_from(r.end - base).unwrap_or(usize::MAX),
                 );
-                let Some(slice) = buf.get(lo..hi) else {
+                if buf.get(lo..hi).is_none() {
                     return Err(BlobError::Other(format!(
                         "coalesced fetch for {key} returned {} bytes, short of {hi}",
                         buf.len()
                     )));
-                };
-                out.push((i, Bytes::copy_from_slice(slice)));
+                }
+                // Shared with the fetch, as the trait's default does, never copied (M119).
+                out.push((i, buf.slice(lo..hi)));
             }
         }
         out.sort_by_key(|(i, _)| *i);

@@ -125,6 +125,10 @@ impl<'a> Dec<'a> {
     pub(crate) fn string(&mut self) -> Result<String, FormatError> {
         String::from_utf8(self.bytes()?.to_vec()).map_err(|_| FormatError::Corrupt("bad utf8"))
     }
+    /// [`Self::string`], borrowed: the same checks, no allocation.
+    pub(crate) fn str(&mut self) -> Result<&'a str, FormatError> {
+        std::str::from_utf8(self.bytes()?).map_err(|_| FormatError::Corrupt("bad utf8"))
+    }
     pub(crate) fn raw(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
         self.take(n)
     }

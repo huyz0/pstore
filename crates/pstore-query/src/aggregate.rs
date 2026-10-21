@@ -178,6 +178,24 @@ pub enum Total {
     Null,
 }
 
+/// Adds one row to its group's accumulators.
+fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
+    for ((_, agg), acc) in labels.iter().zip(accs.iter_mut()) {
+        match agg {
+            Aggregate::Count(None) => acc.count += 1,
+            Aggregate::Count(Some(a)) => acc.count += u64::from(doc.attrs.contains_key(a)),
+            Aggregate::Sum(a) => match doc.attrs.get(a) {
+                Some(Value::Int(n)) => acc.ints += i128::from(*n),
+                Some(Value::Float(f)) => {
+                    acc.floats += f;
+                    acc.any_float = true;
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
 /// Counts and sums, per group, over rows offered one at a time.
 #[derive(Debug, Clone)]
 pub struct Aggregator {
@@ -207,6 +225,17 @@ impl Aggregator {
         if self.groups.contains_key(key) {
             return true;
         }
+        if !self.make_room(key) {
+            return false;
+        }
+        self.groups
+            .insert(key.to_vec(), vec![Acc::default(); self.spec.labels.len()]);
+        true
+    }
+
+    /// For a `key` not held: evicts the largest held if the groups are full and `key` is
+    /// smaller. Whether `key` may be inserted.
+    fn make_room(&mut self, key: &[Key]) -> bool {
         if self.groups.len() >= self.spec.top_k.max(1) {
             match self.groups.last_key_value() {
                 Some((largest, _)) if key < largest.as_slice() => {
@@ -215,8 +244,6 @@ impl Aggregator {
                 _ => return false,
             }
         }
-        self.groups
-            .insert(key.to_vec(), vec![Acc::default(); self.spec.labels.len()]);
         true
     }
 
@@ -229,27 +256,19 @@ impl Aggregator {
             .iter()
             .map(|a| Key::of(doc.attrs.get(a)))
             .collect();
-        if !self.admit(&key) {
+        // ⚠️ An existing group found in one search, and a new one's key moved in rather than
+        // copied (M119): `admit` then `get_mut` searched twice, and the spec's `Arc` was
+        // cloned, for every row.
+        if let Some(accs) = self.groups.get_mut(&key) {
+            fold(&self.spec.labels, accs, doc);
+            return true;
+        }
+        if !self.make_room(&key) {
             return false;
         }
-        let spec = Arc::clone(&self.spec);
-        let Some(accs) = self.groups.get_mut(&key) else {
-            return false;
-        };
-        for ((_, agg), acc) in spec.labels.iter().zip(accs.iter_mut()) {
-            match agg {
-                Aggregate::Count(None) => acc.count += 1,
-                Aggregate::Count(Some(a)) => acc.count += u64::from(doc.attrs.contains_key(a)),
-                Aggregate::Sum(a) => match doc.attrs.get(a) {
-                    Some(Value::Int(n)) => acc.ints += i128::from(*n),
-                    Some(Value::Float(f)) => {
-                        acc.floats += f;
-                        acc.any_float = true;
-                    }
-                    _ => {}
-                },
-            }
-        }
+        let mut accs = vec![Acc::default(); self.spec.labels.len()];
+        fold(&self.spec.labels, &mut accs, doc);
+        self.groups.insert(key, accs);
         true
     }
 

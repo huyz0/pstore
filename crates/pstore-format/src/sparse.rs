@@ -230,6 +230,13 @@ impl Dictionary {
     /// Decodes a dictionary, returning `None` for anything malformed.
     #[must_use]
     pub fn decode(raw: &[u8]) -> Option<Self> {
+        Self::decode_bytes(bytes::Bytes::copy_from_slice(raw))
+    }
+
+    /// [`Self::decode`] keeping `raw` itself, refcounted, rather than a copy (M119): a
+    /// caller holding the fetched `Bytes` copied the whole sidecar on every query.
+    #[must_use]
+    pub fn decode_bytes(raw: bytes::Bytes) -> Option<Self> {
         if raw.get(..8)? != MAGIC || u16::from_le_bytes(raw.get(8..10)?.try_into().ok()?) != VERSION
         {
             return None;
@@ -242,7 +249,7 @@ impl Dictionary {
             return None;
         }
         let mut me = Self {
-            raw: bytes::Bytes::copy_from_slice(raw),
+            raw,
             encoding,
             count,
             dims: Vec::new(),

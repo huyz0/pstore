@@ -55,8 +55,7 @@ impl Ladder {
     fn top(&self, mut scored: Vec<(usize, f32)>, keep: usize) -> Vec<(usize, f32)> {
         // Descending by score; ties broken by id so a result set is reproducible, which is
         // what lets a recall number be compared across runs at all.
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(keep);
+        crate::top::top_k_by(&mut scored, keep, crate::top::best_first);
         scored
     }
 
@@ -102,9 +101,15 @@ impl Ladder {
     ) -> Vec<(usize, f32)> {
         let all: Vec<(usize, f32, f32)> = scored.into_iter().collect();
         let mut lower: Vec<f32> = all.iter().map(|(_, e, b)| e - b).collect();
-        lower.sort_by(|a, b| b.total_cmp(a));
         // Fewer than `k` candidates: there is no `k`-th lower bound, and every one is kept.
-        let floor = lower.get(self.k - 1).copied().unwrap_or(f32::NEG_INFINITY);
+        // Selected, not sorted (M119): only the `k`-th largest is read.
+        let floor = if lower.len() >= self.k {
+            *lower
+                .select_nth_unstable_by(self.k - 1, |a, b| b.total_cmp(a))
+                .1
+        } else {
+            f32::NEG_INFINITY
+        };
         let kept = all
             .into_iter()
             .filter(|(_, e, b)| e + b >= floor)

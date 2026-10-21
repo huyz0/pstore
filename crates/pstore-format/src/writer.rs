@@ -190,6 +190,21 @@ impl SegmentWriter {
             return;
         }
         let offset = self.body.len() as u64;
+        let zones = self.zones_of(rows);
+        let blk = crate::encode_rows(rows);
+        let len = blk.len() as u32;
+        self.body.raw(&blk);
+        self.blocks.push(BlockMeta {
+            offset,
+            len,
+            rows: rows.len() as u32,
+            zones,
+        });
+        self.rows += rows.len() as u32;
+    }
+
+    /// One block's zone maps, or none when they are off.
+    fn zones_of(&self, rows: &[Document]) -> Zones {
         let mut zones = Zones::default();
         if self.zone_maps {
             for d in rows {
@@ -197,20 +212,31 @@ impl SegmentWriter {
                     // Zone maps are built here, from the rows as they are written -- never
                     // from a later pass that could disagree with the bytes.
                     match v {
+                        // ⚠️ The key cloned only for a name the block has not seen (M119):
+                        // `entry(k.clone())` allocated once per row per attribute.
                         Value::Int(n) => {
-                            let e = zones.ints.entry(k.clone()).or_insert((*n, *n));
-                            e.0 = e.0.min(*n);
-                            e.1 = e.1.max(*n);
+                            if let Some(e) = zones.ints.get_mut(k) {
+                                e.0 = e.0.min(*n);
+                                e.1 = e.1.max(*n);
+                            } else {
+                                zones.ints.insert(k.clone(), (*n, *n));
+                            }
                         }
                         Value::Float(f) => {
-                            let e = zones.floats.entry(k.clone()).or_insert((*f, *f));
-                            e.0 = e.0.min(*f);
-                            e.1 = e.1.max(*f);
+                            if let Some(e) = zones.floats.get_mut(k) {
+                                e.0 = e.0.min(*f);
+                                e.1 = e.1.max(*f);
+                            } else {
+                                zones.floats.insert(k.clone(), (*f, *f));
+                            }
                         }
                         Value::DateTime(t) => {
-                            let e = zones.datetimes.entry(k.clone()).or_insert((*t, *t, false));
-                            e.0 = e.0.min(*t);
-                            e.1 = e.1.max(*t);
+                            if let Some(e) = zones.datetimes.get_mut(k) {
+                                e.0 = e.0.min(*t);
+                                e.1 = e.1.max(*t);
+                            } else {
+                                zones.datetimes.insert(k.clone(), (*t, *t, false));
+                            }
                         }
                         Value::Str(_) | Value::Bool(_) | Value::Array(_) => {}
                     }
@@ -226,16 +252,7 @@ impl SegmentWriter {
                 }
             }
         }
-        let blk = crate::encode_rows(rows);
-        let len = blk.len() as u32;
-        self.body.raw(&blk);
-        self.blocks.push(BlockMeta {
-            offset,
-            len,
-            rows: rows.len() as u32,
-            zones,
-        });
-        self.rows += rows.len() as u32;
+        zones
     }
 
     /// Encodes the index section for the blocks sealed so far.
@@ -446,7 +463,16 @@ impl SegmentWriter {
             } else {
                 0
             };
-            let mut body: Vec<u8> = Vec::new();
+            let mut body: Vec<u8> = Vec::with_capacity(
+                docs.iter()
+                    .map(|d| d.field(name).len() * dims * 4)
+                    .sum::<usize>()
+                    + if per_row == 0 {
+                        (docs.len() + 1) * 8
+                    } else {
+                        0
+                    },
+            );
             if per_row == 0 {
                 // (rows + 1) offsets, so row `i` is `offsets[i]..offsets[i + 1]` and the
                 // last row needs no special case.
@@ -571,27 +597,45 @@ impl SegmentWriter {
         // requested block size: a block with no map is always read (`blocks_to_read`), which
         // costs pruning and never a row. A segment that fits is sealed exactly as before.
         let requested = self.rows_per_block;
-        let idx = loop {
+        //
+        // ⚠️ **Measured from the zones alone** (M119): a block's index entry is fixed-width
+        // except for its zone maps, so its size does not depend on the block's bytes, and
+        // encoding every row once per try re-encoded the segment up to a dozen times. The
+        // rows are sealed once, at the size the loop settles on.
+        loop {
             self.blocks.clear();
-            self.body = Enc::default();
-            self.rows = 0;
             for chunk in docs.chunks(self.rows_per_block) {
-                self.seal(chunk);
+                if chunk.is_empty() {
+                    continue;
+                }
+                let zones = self.zones_of(chunk);
+                self.blocks.push(BlockMeta {
+                    offset: 0,
+                    len: 0,
+                    rows: chunk.len() as u32,
+                    zones,
+                });
             }
-            let idx = self.encode_index();
-            if idx.len() <= target {
-                break idx;
+            if self.encode_index().len() <= target {
+                break;
             }
             if self.blocks.len() <= 1 {
                 if !self.zone_maps {
-                    break idx;
+                    break;
                 }
                 self.zone_maps = false;
                 self.rows_per_block = requested;
                 continue;
             }
             self.rows_per_block = self.rows_per_block.saturating_mul(2);
-        };
+        }
+        self.blocks.clear();
+        self.body = Enc::default();
+        self.rows = 0;
+        for chunk in docs.chunks(self.rows_per_block) {
+            self.seal(chunk);
+        }
+        let idx = self.encode_index();
 
         // M15.2: the sketch takes only what the block index left, less its own directory
         // entry, so a declaration never coarsens a block (spec review, M15). `bits` halves to

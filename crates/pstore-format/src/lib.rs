@@ -29,7 +29,7 @@ pub mod text;
 pub mod trigram;
 mod writer;
 
-pub use docs::{decode_docs, decode_rows, encode_docs, encode_rows};
+pub use docs::{Projection, decode_docs, decode_rows, decode_rows_where, encode_docs, encode_rows};
 pub use reader::Segment;
 pub use writer::{INDEX_BUDGET, SegmentWriter};
 

@@ -358,6 +358,32 @@ impl Predicate {
         !self.unbound() && self.holds(id, attrs)
     }
 
+    /// Every name it reads, [`ID`] among them when it reads the id (M119): what a mask must
+    /// decode of a row, and all [`Self::admits`] looks at.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.names_into(&mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn names_into<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::And(ps) | Self::Or(ps) => ps.iter().for_each(|p| p.names_into(out)),
+            Self::Not(p) => p.names_into(out),
+            Self::Cmp(name, ..)
+            | Self::Absent(name)
+            | Self::In(name, _)
+            | Self::ContainsAny(name, _)
+            | Self::Tokens(name, ..)
+            | Self::Pattern(name, _)
+            | Self::Fuzzy(name, ..)
+            | Self::GeoRadius(name, ..)
+            | Self::GeoBox(name, ..) => out.push(name),
+        }
+    }
+
     /// Whether a token predicate anywhere in it is unbound.
     fn unbound(&self) -> bool {
         match self {
@@ -387,20 +413,25 @@ impl Predicate {
 
     /// Two-valued, for a predicate [`Self::admits`] has found fully bound.
     fn holds(&self, id: &str, attrs: &BTreeMap<String, Value>) -> bool {
-        let get = |name: &str| -> Option<Value> {
+        // ⚠️ Borrowed, not cloned (M119): this runs for every row of every admitted block, per
+        // leaf, and a clone was an allocation for every string and a deep copy of every array.
+        // Only the id, which is not an attribute, is built.
+        let get = |name: &str| -> Option<std::borrow::Cow<'_, Value>> {
             if name == ID {
-                Some(Value::Str(id.to_owned()))
+                Some(std::borrow::Cow::Owned(Value::Str(id.to_owned())))
             } else {
-                attrs.get(name).cloned()
+                attrs.get(name).map(std::borrow::Cow::Borrowed)
             }
         };
         match self {
-            Self::Cmp(name, op, want) => get(name).is_some_and(|have| compare(&have, *op, want)),
+            Self::Cmp(name, op, want) => get(name)
+                .as_deref()
+                .is_some_and(|have| compare(have, *op, want)),
             Self::Absent(name) => get(name).is_none(),
-            Self::In(name, set) => {
-                get(name).is_some_and(|have| set.iter().any(|w| compare(&have, Op::Eq, w)))
-            }
-            Self::ContainsAny(name, set) => match get(name) {
+            Self::In(name, set) => get(name)
+                .as_deref()
+                .is_some_and(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
+            Self::ContainsAny(name, set) => match get(name).as_deref() {
                 Some(Value::Array(items)) => items
                     .iter()
                     .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
@@ -410,24 +441,22 @@ impl Predicate {
             Self::Or(any) => any.iter().any(|p| p.holds(id, attrs)),
             Self::Not(p) => !p.holds(id, attrs),
             // Unbound never reaches here: `admits` checked first.
-            Self::Tokens(name, op, _, bound) => match (get(name), bound) {
-                (Some(Value::Str(s)), Some(b)) => tokens_match(
-                    *op,
-                    &b.query,
-                    &pstore_format::text::analyze(&b.analyzer, &s),
-                ),
+            Self::Tokens(name, op, _, bound) => match (get(name).as_deref(), bound) {
+                (Some(Value::Str(s)), Some(b)) => {
+                    tokens_match(*op, &b.query, &pstore_format::text::analyze(&b.analyzer, s))
+                }
                 _ => false,
             },
-            Self::Pattern(name, p) => match get(name) {
-                Some(Value::Str(s)) => p.re.is_match(&s),
+            Self::Pattern(name, p) => match get(name).as_deref() {
+                Some(Value::Str(s)) => p.re.is_match(s),
                 _ => false,
             },
             Self::GeoRadius(name, lat, lon, meters) => get(name)
-                .as_ref()
+                .as_deref()
                 .and_then(pstore_format::geo::location)
                 .is_some_and(|at| pstore_format::geo::distance_m((*lat, *lon), at) <= *meters),
             Self::GeoBox(name, south, west, north, east) => get(name)
-                .as_ref()
+                .as_deref()
                 .and_then(pstore_format::geo::location)
                 .is_some_and(|(lat, lon)| {
                     let across = west > east;
@@ -438,7 +467,7 @@ impl Predicate {
                             (*west..=*east).contains(&lon)
                         }
                 }),
-            Self::Fuzzy(name, v, k) => match get(name) {
+            Self::Fuzzy(name, v, k) => match get(name).as_deref() {
                 Some(Value::Str(s)) => within(
                     &s.chars().collect::<Vec<_>>(),
                     &v.chars().collect::<Vec<_>>(),
@@ -586,7 +615,34 @@ fn compare(have: &Value, op: Op, want: &Value) -> bool {
 }
 
 /// The data rows of one segment a predicate admits.
-pub(crate) type Mask = std::collections::HashSet<usize>;
+///
+/// ⚠️ A bitmap over the segment's rows, not a `HashSet` (M119): under a filter every leg is
+/// exhaustive, so every candidate of every segment is looked up here, and SipHash on a dense
+/// row number cost more than the lookup it guarded.
+#[derive(Debug, Default)]
+pub(crate) struct Mask(Vec<bool>);
+
+impl Mask {
+    /// Whether `row` is admitted.
+    pub(crate) fn contains(&self, row: &usize) -> bool {
+        self.0.get(*row).copied().unwrap_or(false)
+    }
+}
+
+impl FromIterator<usize> for Mask {
+    fn from_iter<I: IntoIterator<Item = usize>>(rows: I) -> Self {
+        let mut bits = Vec::new();
+        for row in rows {
+            if row >= bits.len() {
+                bits.resize(row + 1, false);
+            }
+            if let Some(b) = bits.get_mut(row) {
+                *b = true;
+            }
+        }
+        Self(bits)
+    }
+}
 
 #[cfg(test)]
 #[allow(

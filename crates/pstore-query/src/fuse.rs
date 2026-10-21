@@ -123,8 +123,11 @@ impl Default for Fusion {
 /// rather than rare.
 #[must_use]
 pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
-    let mut acc: std::collections::BTreeMap<(usize, usize), f32> =
-        std::collections::BTreeMap::new();
+    // ⚠️ A hash map, sized up front (M119): the order a key's contributions are added in is the
+    // legs', whatever the map, and the cut below is a total order, so the map's own order was
+    // never read -- and under `Sum` every row of every segment passes through it.
+    let mut acc: std::collections::HashMap<(usize, usize), f32> =
+        std::collections::HashMap::with_capacity(legs.iter().map(Vec::len).sum());
     for (j, leg) in legs.iter().enumerate() {
         for (i, hit) in leg.iter().enumerate() {
             // ⚠️ Rank is **1-based**. Zero-based makes the first hit worth `1/k` and the
@@ -159,12 +162,13 @@ pub fn fuse(legs: &[Vec<Hit>], fusion: Fusion, top_k: usize) -> Vec<Hit> {
             score,
         })
         .collect();
-    out.sort_by(|a, b| {
+    // Selected, then the kept prefix sorted (M119): `(segment, row)` is unique, so the order
+    // is total and this is the full sort's first `top_k`.
+    pstore_index::top::top_k_by(&mut out, top_k, |a, b| {
         b.score
             .total_cmp(&a.score)
             .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
     });
-    out.truncate(top_k);
     out
 }
 

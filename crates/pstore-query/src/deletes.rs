@@ -21,3 +21,32 @@ pub fn decode(raw: &[u8]) -> HashSet<usize> {
         .map(|b| u32::from_le_bytes(b) as usize)
         .collect()
 }
+
+/// [`decode`]'s rows, sorted and distinct, for a query to test every candidate against
+/// (M119): a binary search over the vector as written rather than a SipHash set.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Rows(Vec<usize>);
+
+impl Rows {
+    /// The rows a vector deletes, as [`decode`] reads them.
+    pub(crate) fn decode(raw: &[u8]) -> Self {
+        let mut rows: Vec<usize> = raw
+            .chunks_exact(4)
+            .filter_map(|c| c.try_into().ok())
+            .map(|b| u32::from_le_bytes(b) as usize)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Self(rows)
+    }
+
+    /// Whether `row` is deleted.
+    pub(crate) fn contains(&self, row: &usize) -> bool {
+        self.0.binary_search(row).is_ok()
+    }
+
+    /// How many distinct rows are deleted: [`decode`]'s set's size.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
