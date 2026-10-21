@@ -6,7 +6,14 @@ by the gate run on that commit; a row naming a test names one that passes, and t
 record the mutation each went red under first, where one was run. **Rejected** gives the reason. The bench digests
 ([M119](../M119/VERIFIED.md) criterion 2) held across every commit below.
 
-Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 (this one).
+Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, and this
+ledger's correction after it. Each commit's gate run is the whole workspace's suite at that
+commit, so the last run covers every test named below at once.
+
+**The count.** The reviews numbered **47** findings: 10 index, 10 format, 9 query, 9 engine
+and cache, 9 server. **All 47 are fixed.** Two of them carried a sub-point that is rejected
+below (format 10, engine 7), with the reason. Three rows marked `—` are not among the 47: two
+found later (the spikes, the projected mask) and fixed, and one the review itself declined.
 
 ## `pstore-index`
 

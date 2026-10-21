@@ -35,7 +35,9 @@ info and incremental caches the workspace's test binaries did not fit the sessio
    `types::tests::the_hand_written_vector_is_the_derived_one` pass. **Red first**, each by
    its mutation, restored after: the prefix sort removed; a zero-only row not recorded; the
    last partial chunk's first element skipped; a skipped bool left unchecked; the refusal's
-   message changed. The vector test also failed once on the real code, on the test's own
+   message changed. `a_projection_keeps_exactly_what_it_names` was not run against one here;
+   it was afterwards, at M120.3: red with an unwanted id kept, and again with every
+   attribute kept. The vector test also failed once on the real code, on the test's own
    enum name inside serde's message; the derive now keeps the name.
 5. `each_index_keeps_its_own_fresh_segment` passes. **Red first** with the map cleared on
    every miss (the single slot): `a query of one index dropped the other's segment`.
@@ -64,19 +66,21 @@ a coalesced fetch. `pstore-server` — `VectorIn` by hand; a multi-query's sub-q
 patch built, not parsed; documents moved into the format; one lock an eviction pass; the
 external list read only to build. `pstore-meter` — ranges sliced, not copied.
 
-**Not landed, and why** (OBSERVED-NOT as fixes). ⚠️ Each is closed by
-[M120](../M120/VERIFIED.md), under a spec that names the depth it changes and an equivalence
-test for the parse:
+**Not landed in M119, and why.** ⚠️ **Every one has since landed**, in
+[M120](../M120/VERIFIED.md) `17e96bb`, under a spec naming the depth it changes and an
+equivalence test for the parse; [FINDINGS.md](../M120/FINDINGS.md) is the per-finding record.
 - An external column's pin checks and a multi-field scan's reads run together: each cuts
-  round-trip depth, which this spec does not change. A milestone with an RA budget for it.
+  round-trip depth, which this spec does not change. **Landed in M120** (Delta 1).
 - A write body and a peer part parsed once into their type: refuses a duplicate key the tree
   accepted, and accepts a malformed number or invalid UTF-8 in an unknown field that it
-  refused. Kept as a tree. A single query's tree is kept for the same reason.
-- The centroid table is still decoded once a dense leg a segment a query: removing it needs a
-  cache of decoded objects, not a fix on the path.
-- `scope` (order-by, aggregate) still owns its HEAD, so a cache hit there copies it once.
-- A fuzzy filter's characters and a pattern's trigrams are still gathered per row and per
-  block; `exq` and `lire` (spikes, no caller outside tests) were not touched.
+  refused. Kept as a tree here, as was a single query's. **Landed in M120** behind a
+  validation pass and a tree fallback (Delta 2).
+- The centroid table decoded once a dense leg a segment a query. **Landed in M120**: read in
+  place (Delta 3).
+- `scope` (order-by, aggregate) owning its HEAD, so a cache hit copies it. **Landed in M120**
+  (Delta 4).
+- A fuzzy filter's characters and trigrams gathered per row and per block; `exq` and `lire`
+  untouched. **Landed in M120** (Deltas 5 and 6).
 
 The independent review's minors, fixed: the multi-vector accumulator and the dedupe bitmap
 are capped, as the dense accumulator is; overlapping list mappings resolve to the last list,
