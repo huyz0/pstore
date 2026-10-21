@@ -179,3 +179,37 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     assert_eq!(out[0].field("other"), [vec![1.0]]);
     assert_eq!(out[0].field("late").len(), 2);
 }
+
+#[tokio::test]
+async fn a_multi_field_scan_reads_its_fields_together() {
+    // M120: a segment of three dense fields scans in two rounds -- its blocks, then every
+    // field's vectors together -- whatever the field count. One field after another, it was
+    // one round a field more.
+    use pstore_blob::{BlobStore, Key, MemoryStore};
+    let docs: Vec<Document> = (0..30)
+        .map(|i| {
+            let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0]);
+            d.vectors
+                .insert("a".to_owned(), VectorField::dense(vec![2.0, i as f32, 0.5]));
+            d.vectors
+                .insert("b".to_owned(), VectorField::dense(vec![i as f32]));
+            d
+        })
+        .collect();
+    let mut w = pstore_format::SegmentWriter::new(8);
+    for d in &docs {
+        w.push(d.clone());
+    }
+    let key = Key::new("t/seg.seg");
+    let inner = MemoryStore::new();
+    inner.put(&key, w.finish()).await.unwrap();
+    let s = pstore_testkit::depth::DepthCounting::new(inner);
+    let seg = pstore_format::Segment::open(&s, &key).await.unwrap();
+    s.reset();
+    let out = seg.scan(&s, &key, None).await.unwrap();
+    assert_eq!(out.len(), docs.len());
+    for (got, want) in out.iter().zip(&docs) {
+        assert_eq!(got.vectors, want.vectors, "{}", want.id);
+    }
+    assert_eq!(s.depth(), 2, "a three-field scan took {} rounds", s.depth());
+}

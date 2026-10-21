@@ -22,7 +22,7 @@ mod run;
 
 pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
 pub use filter::{
-    Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Op, Pattern, PatternKind, Predicate, TokenOp,
+    Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Needle, Op, Pattern, PatternKind, Predicate, TokenOp,
 };
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
 pub use order::{OrderBy, Selector, select};

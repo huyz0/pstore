@@ -1917,9 +1917,9 @@ async fn leg<S: BlobStore>(
                 .segment
                 .field_layout(field)
                 .map_or(query.len(), |f| f.dims as usize);
-            let idx = VecIndex::from_parts(
+            let idx = VecIndex::from_shared_parts(
                 Arc::clone(&opened.segment),
-                opened.centroids.as_ref().map(AsRef::as_ref),
+                opened.centroids.clone(),
                 dim,
             );
             if dim != query.len() {

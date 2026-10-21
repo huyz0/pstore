@@ -278,16 +278,21 @@ fn glob_class(it: &mut std::str::Chars<'_>) -> Result<String, String> {
 
 /// Whether `a` is within `k` edits of `b`, in characters (M15): a band of width `2k+1`, and
 /// out at once when the lengths differ by more.
-fn within(a: &[char], b: &[char], k: usize) -> bool {
-    if a.len().abs_diff(b.len()) > k {
+///
+/// ⚠️ `a` is read once, in order, beside its length (M120): a row's string was collected into
+/// a `Vec` of its characters per row, and the table took a fresh row per character. Two rows
+/// now, each reset as the fresh one was made.
+fn within(a_len: usize, a: impl Iterator<Item = char>, b: &[char], k: usize) -> bool {
+    if a_len.abs_diff(b.len()) > k {
         return false;
     }
     let inf = usize::MAX / 2;
     let mut prev: Vec<usize> = (0..=b.len())
         .map(|j| if j <= k { j } else { inf })
         .collect();
+    let mut row = vec![inf; b.len() + 1];
     for (i, ca) in (1..).zip(a) {
-        let mut row = vec![inf; b.len() + 1];
+        row.fill(inf);
         if let Some(first) = row.first_mut().filter(|_| i <= k) {
             *first = i;
         }
@@ -298,12 +303,52 @@ fn within(a: &[char], b: &[char], k: usize) -> bool {
                 continue;
             };
             if let Some(cell) = row.get_mut(j) {
-                *cell = (diag + usize::from(ca != cb)).min(up + 1).min(left + 1);
+                *cell = (diag + usize::from(ca != *cb)).min(up + 1).min(left + 1);
             }
         }
-        prev = row;
+        std::mem::swap(&mut prev, &mut row);
     }
     prev.last().is_some_and(|d| *d <= k)
+}
+
+/// A fuzzy predicate's value, with what every row and every block compares it by, taken once
+/// (M120): its characters, and its distinct folded trigrams.
+#[derive(Debug, Clone)]
+pub struct Needle {
+    text: String,
+    chars: Vec<char>,
+    trigrams: Vec<pstore_format::trigram::Trigram>,
+}
+
+impl Needle {
+    /// The value as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<String> for Needle {
+    fn from(text: String) -> Self {
+        Self {
+            chars: text.chars().collect(),
+            trigrams: pstore_format::trigram::trigrams(&text),
+            text,
+        }
+    }
+}
+
+impl From<&str> for Needle {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+/// Equal when the values are: the rest is derived from them.
+impl PartialEq for Needle {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
 }
 
 /// A predicate over one document's id and attributes.
@@ -336,7 +381,7 @@ pub enum Predicate {
     /// A scalar string attribute the pattern matches (M15). Anything else is false.
     Pattern(String, Pattern),
     /// A scalar string attribute within `k` edits of the value (M15). Anything else is false.
-    Fuzzy(String, String, u8),
+    Fuzzy(String, Needle, u8),
     /// A location within `meters` of `(lat, lon)`, inclusive (M66). An attribute that is not a
     /// location (see [`pstore_format::geo::location`]) is false.
     GeoRadius(String, f64, f64, f64),
@@ -468,11 +513,9 @@ impl Predicate {
                         }
                 }),
             Self::Fuzzy(name, v, k) => match get(name).as_deref() {
-                Some(Value::Str(s)) => within(
-                    &s.chars().collect::<Vec<_>>(),
-                    &v.chars().collect::<Vec<_>>(),
-                    usize::from(*k),
-                ),
+                Some(Value::Str(s)) => {
+                    within(s.chars().count(), s.chars(), &v.chars, usize::from(*k))
+                }
                 _ => false,
             },
         }
@@ -540,13 +583,13 @@ impl Predicate {
             // The q-gram lemma: within k edits, a value keeps all but at most 3k of `v`'s
             // distinct trigrams, so a block holding fewer cannot match.
             Self::Fuzzy(name, v, k) => {
-                let tris = pstore_format::trigram::trigrams(v);
+                let tris = &v.trigrams;
                 let need = tris.len().saturating_sub(3 * usize::from(*k));
                 need == 0
                     || zones
                         .sketch
                         .as_ref()
-                        .is_none_or(|(s, b)| s.held(name, *b, &tris).is_none_or(|n| n >= need))
+                        .is_none_or(|(s, b)| s.held(name, *b, tris).is_none_or(|n| n >= need))
             }
         }
     }
@@ -652,6 +695,75 @@ impl FromIterator<usize> for Mask {
 mod tests {
     use super::*;
 
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "a test's indexes are in range by construction"
+    )]
+    #[test]
+    fn the_needle_is_the_strings() {
+        // The distance M120 replaced, verbatim: a fresh row per character of `a`.
+        fn old(a: &[char], b: &[char], k: usize) -> bool {
+            if a.len().abs_diff(b.len()) > k {
+                return false;
+            }
+            let inf = usize::MAX / 2;
+            let mut prev: Vec<usize> = (0..=b.len())
+                .map(|j| if j <= k { j } else { inf })
+                .collect();
+            for (i, ca) in (1..).zip(a) {
+                let mut row = vec![inf; b.len() + 1];
+                if let Some(first) = row.first_mut().filter(|_| i <= k) {
+                    *first = i;
+                }
+                for j in i.saturating_sub(k).max(1)..=(i + k).min(b.len()) {
+                    let (Some(&diag), Some(&up), Some(&left), Some(cb)) =
+                        (prev.get(j - 1), prev.get(j), row.get(j - 1), b.get(j - 1))
+                    else {
+                        continue;
+                    };
+                    if let Some(cell) = row.get_mut(j) {
+                        *cell = (diag + usize::from(ca != cb)).min(up + 1).min(left + 1);
+                    }
+                }
+                prev = row;
+            }
+            prev.last().is_some_and(|d| *d <= k)
+        }
+        let mut s = 0x5eed_u64;
+        let mut next = move || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            s >> 33
+        };
+        let alphabet = ['a', 'b', 'c', 'ſ', 'σ'];
+        let mut word = |n: u64| -> String {
+            (0..next() % n)
+                .map(|_| alphabet[(next() % 5) as usize])
+                .collect()
+        };
+        let mut agreed = [0usize; 2];
+        for _ in 0..4_000 {
+            let (a, b) = (word(9), word(9));
+            for k in 0..=3 {
+                let (ac, needle) = (a.chars().collect::<Vec<_>>(), Needle::from(b.as_str()));
+                let want = old(&ac, &needle.chars, k);
+                assert_eq!(
+                    within(a.chars().count(), a.chars(), &needle.chars, k),
+                    want,
+                    "{a:?} {b:?} k {k}"
+                );
+                agreed[usize::from(want)] += 1;
+            }
+        }
+        assert!(
+            agreed.iter().all(|n| *n > 100),
+            "both answers exercised: {agreed:?}"
+        );
+        let n = Needle::from("ſσk");
+        assert_eq!(n.trigrams, pstore_format::trigram::trigrams("ſσk"));
+        assert_eq!(n.as_str(), "ſσk");
+    }
+
     #[test]
     fn a_regex_compiles_to_at_most_one_mebibyte() {
         // The limit is stated, not the crate's default. The boundary is found with the crate's
@@ -721,7 +833,7 @@ mod tests {
                 Pattern::new(PatternKind::Glob, "x*").unwrap(),
             )
         };
-        let fuzzy = || Predicate::Fuzzy("a".to_owned(), "abc".to_owned(), 1);
+        let fuzzy = || Predicate::Fuzzy("a".to_owned(), "abc".into(), 1);
         let not = |p| Predicate::Not(Box::new(p));
         assert_eq!(glob().patterns(), 1);
         assert_eq!(not(glob()).patterns(), 1);

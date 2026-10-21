@@ -1214,11 +1214,44 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let raw: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?;
-    let protocol = raw.get("protocol").and_then(serde_json::Value::as_u64);
-    let phase = raw.get("phase").and_then(serde_json::Value::as_str);
-    match (protocol, phase) {
+    // ⚠️ M120: a part with no key repeated, which the tree's parse accepts ([`crate::body`]),
+    // is dispatched by a probe and parsed once into its type; any other goes the tree's way.
+    // A tree held each integer of each query vector as a 32-byte node, then was walked again.
+    let raw = match crate::body::plain(&body).filter(|p| p.keys.is_some()) {
+        Some(_) => Body::Plain(&body),
+        None => Body::Tree(
+            serde_json::from_slice(&body)
+                .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?,
+        ),
+    };
+    let (protocol, phase) = match &raw {
+        Body::Tree(raw) => (
+            raw.get("protocol").and_then(serde_json::Value::as_u64),
+            raw.get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ),
+        // An object, no key twice: these are the tree's `get`s.
+        Body::Plain(body) => {
+            #[derive(serde::Deserialize)]
+            struct Probe {
+                #[serde(default)]
+                protocol: Option<serde_json::Value>,
+                #[serde(default)]
+                phase: Option<serde_json::Value>,
+            }
+            let p: Probe = serde_json::from_slice(body)
+                .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?;
+            (
+                p.protocol.as_ref().and_then(serde_json::Value::as_u64),
+                p.phase
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            )
+        }
+    };
+    match (protocol, phase.as_deref()) {
         (Some(p), None) if p == u64::from(PROTOCOL) => serve_whole(&api, tenant, raw).await,
         (Some(p), Some("open")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
             serve_open(&api, tenant, raw).await
@@ -1237,15 +1270,30 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
     }
 }
 
-fn wire_of<T: serde::de::DeserializeOwned>(raw: serde_json::Value) -> Result<T, ApiError> {
-    serde_json::from_value(raw).map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))
+/// A part's body: plain, to parse once, or the tree the rest are judged by (M120).
+enum Body<'a> {
+    Plain(&'a [u8]),
+    Tree(serde_json::Value),
+}
+
+fn wire_of<T: serde::de::DeserializeOwned>(raw: Body<'_>) -> Result<T, ApiError> {
+    let tree = match raw {
+        Body::Tree(v) => v,
+        Body::Plain(body) => match serde_json::from_slice(body) {
+            Ok(t) => return Ok(t),
+            // Refused as the tree refuses it, word for word.
+            Err(_) => serde_json::from_slice(body)
+                .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?,
+        },
+    };
+    serde_json::from_value(tree).map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))
 }
 
 /// A part in one exchange (M54).
 async fn serve_whole<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: serde_json::Value,
+    raw: Body<'_>,
 ) -> Result<Response, ApiError> {
     let wire: WirePart = wire_of(raw)?;
     guard(tenant, &wire)?;
@@ -1279,7 +1327,7 @@ async fn serve_whole<S: BlobStore + 'static>(
 async fn serve_open<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: serde_json::Value,
+    raw: Body<'_>,
 ) -> Result<Response, ApiError> {
     let wire: WirePart = wire_of(raw)?;
     guard(tenant, &wire)?;
@@ -1329,7 +1377,7 @@ async fn serve_open<S: BlobStore + 'static>(
 async fn serve_scan<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: serde_json::Value,
+    raw: Body<'_>,
 ) -> Result<Response, ApiError> {
     let wire: WireScan = wire_of(raw)?;
     let held = api
@@ -1501,6 +1549,48 @@ impl Holder {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fast_part_is_the_tree_part() {
+        // M120: a plain body parsed once, against the tree the rest are judged by.
+        let shown = |r: Result<String, ApiError>| match r {
+            Ok(s) => format!("ok {s}"),
+            Err(e) => format!("{e:?}"),
+        };
+        let mut bodies = crate::tests::bodies();
+        let scan = WireScan {
+            protocol: PHASED,
+            phase: "scan".to_owned(),
+            id: "x".to_owned(),
+            index: "docs".to_owned(),
+            stats: WireStats::of(&Stats {
+                doc_count: 7,
+                total_tokens: 91,
+                df: [("alpha".to_owned(), 3)].into(),
+            }),
+        };
+        let mut fast = 0;
+        bodies.push(serde_json::to_vec(&scan).unwrap());
+        for b in bodies {
+            let Some(_) = crate::body::plain(&b).filter(|p| p.keys.is_some()) else {
+                continue;
+            };
+            let tree: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let label = String::from_utf8_lossy(&b).into_owned();
+            assert_eq!(
+                shown(wire_of::<WireScan>(Body::Plain(&b)).map(|w| format!("{w:?}"))),
+                shown(wire_of::<WireScan>(Body::Tree(tree.clone())).map(|w| format!("{w:?}"))),
+                "scan: {label}"
+            );
+            assert_eq!(
+                shown(wire_of::<WirePart>(Body::Plain(&b)).map(|w| format!("{w:?}"))),
+                shown(wire_of::<WirePart>(Body::Tree(tree)).map(|w| format!("{w:?}"))),
+                "part: {label}"
+            );
+            fast += usize::from(serde_json::from_slice::<WireScan>(&b).is_ok());
+        }
+        assert!(fast >= 1, "no body took the fast path");
+    }
 
     #[test]
     fn a_part_survives_the_wire_bit_for_bit() {

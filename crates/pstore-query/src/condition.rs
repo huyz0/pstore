@@ -137,7 +137,7 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
         Predicate::Fuzzy(a, v, k) => {
             b.push(9);
             put_str(b, a);
-            put_str(b, v);
+            put_str(b, v.as_str());
             b.push(*k);
         }
         // M66: the name, then the numbers as `f64` bits.
@@ -288,7 +288,7 @@ impl Reader<'_> {
                 };
                 Predicate::Pattern(a, Pattern::new(kind, &self.string()?).ok()?)
             }
-            9 => Predicate::Fuzzy(self.string()?, self.string()?, self.u8()?),
+            9 => Predicate::Fuzzy(self.string()?, self.string()?.into(), self.u8()?),
             10 => Predicate::GeoRadius(self.string()?, self.f64()?, self.f64()?, self.f64()?),
             11 => Predicate::GeoBox(
                 self.string()?,

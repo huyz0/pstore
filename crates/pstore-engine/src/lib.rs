@@ -1468,6 +1468,21 @@ struct Fetched {
     hit: bool,
 }
 
+/// The HEAD a scope reads: one it read as of an epoch, or the one HEAD's cache shares (M120).
+enum Read {
+    Owned(Box<Head>),
+    Shared(Arc<head::HeadAt>),
+}
+
+impl Read {
+    fn head(&self) -> &Head {
+        match self {
+            Self::Owned(h) => h,
+            Self::Shared(at) => &at.head,
+        }
+    }
+}
+
 /// What an order or an aggregation reads: see `Engine::scope`.
 struct Scope {
     refs: Vec<SegmentRef>,
@@ -6252,7 +6267,7 @@ impl<S: BlobStore> Engine<S> {
                 let then = at.head.as_of(epoch)?;
                 let fts = schema_at(&at.head, index, epoch).fts;
                 (
-                    then,
+                    Read::Owned(Box::new(then)),
                     epoch,
                     None,
                     std::time::Duration::ZERO,
@@ -6267,8 +6282,9 @@ impl<S: BlobStore> Engine<S> {
                     .head_and_fresh_as(index, consistency, allow_hit)
                     .await?;
                 *hit = got.hit;
-                // Owned here, where its HEAD is kept: a copy only if the cache still holds it.
-                let at = Arc::unwrap_or_clone(got.at);
+                // ⚠️ Borrowed from the bounded cache, never copied out of it (M120): what the
+                // scope keeps of HEAD is copied below, a field at a time.
+                let at = got.at;
                 self.remember_schemas(&at.head);
                 // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
@@ -6285,7 +6301,7 @@ impl<S: BlobStore> Engine<S> {
                     .unwrap_or_default();
                 let epoch = at.head.epoch;
                 (
-                    at.head,
+                    Read::Shared(at),
                     epoch,
                     settle,
                     got.staleness,
@@ -6296,6 +6312,7 @@ impl<S: BlobStore> Engine<S> {
                 )
             }
         };
+        let head = head.head();
         let refs = head.indexes.get(index).cloned().unwrap_or_default();
         let targets = segment_targets(
             index,
@@ -6322,7 +6339,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded,
             shadow,
             epoch,
-            watermarks: head.watermarks,
+            watermarks: head.watermarks.clone(),
             staleness,
             settle,
             live,

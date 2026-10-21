@@ -23,7 +23,7 @@
 use crate::cluster::{Clustering, Params};
 use crate::ladder::Ladder;
 use crate::rabitq::Quantizer;
-use crate::{search, sq8};
+use crate::sq8;
 use pstore_blob::{BlobStore, Key};
 use pstore_format::{Document, Section, Segment, SegmentWriter};
 
@@ -152,6 +152,70 @@ impl Centroids {
             at = end;
         }
         Some(Self { vectors, spans })
+    }
+}
+
+/// A centroid table read where it lies (M120): its spans decoded, its vectors left as bytes.
+///
+/// ⚠️ [`Centroids::decode`] built a `Vec` a centroid on every query that opened a segment; a
+/// query reads each centroid once, for a distance and maybe a dot, and both are computed here
+/// from the bytes in the order the decoded table's `f32`s were, so they agree to the bit.
+#[derive(Debug)]
+struct Table {
+    raw: bytes::Bytes,
+    dim: usize,
+    spans: Vec<(u32, u32)>,
+}
+
+impl Table {
+    /// The table in `raw`, or `None` exactly where [`Centroids::decode`] is.
+    fn decode(raw: bytes::Bytes) -> Option<Self> {
+        let n = u32::from_le_bytes(raw.get(0..4)?.try_into().ok()?) as usize;
+        let dim = u32::from_le_bytes(raw.get(4..8)?.try_into().ok()?) as usize;
+        let vectors_end = n.checked_mul(dim.checked_mul(4)?)?.checked_add(8)?;
+        raw.get(8..vectors_end)?;
+        let mut spans = Vec::with_capacity(n.min(raw.len() / 8));
+        let mut at = vectors_end;
+        for _ in 0..n {
+            let end = at.checked_add(8)?;
+            let s = raw.get(at..end)?;
+            spans.push((
+                u32::from_le_bytes(s.get(0..4)?.try_into().ok()?),
+                u32::from_le_bytes(s.get(4..8)?.try_into().ok()?),
+            ));
+            at = end;
+        }
+        Some(Self { raw, dim, spans })
+    }
+
+    /// Centroid `i`'s components.
+    fn vector(&self, i: usize) -> Option<impl Iterator<Item = f32> + '_> {
+        let at = 8 + i.checked_mul(self.dim * 4)?;
+        Some(
+            self.raw
+                .get(at..at + self.dim * 4)?
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4]))),
+        )
+    }
+
+    /// [`crate::search::probe_centroids`] over the bytes: the same distances, the same order.
+    fn probe(&self, query: &[f32], p: usize) -> Vec<usize> {
+        let mut d: Vec<(usize, f32)> = (0..self.spans.len())
+            .filter_map(|i| {
+                let c = self.vector(i)?;
+                Some((i, query.iter().zip(c).map(|(x, y)| (x - y) * (x - y)).sum()))
+            })
+            .collect();
+        crate::top::top_k_by(&mut d, p.max(1), |a, b| {
+            a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        });
+        d.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// `<c_i, q>`, as `dot(c, q)` sums it.
+    fn dot(&self, i: usize, query: &[f32]) -> Option<f32> {
+        Some(self.vector(i)?.zip(query).map(|(x, y)| x * y).sum())
     }
 }
 
@@ -494,7 +558,7 @@ fn assemble(
 pub struct VecIndex {
     /// Shared with the caller that opened it, when it has one (M119).
     segment: std::sync::Arc<Segment>,
-    centroids: Option<Centroids>,
+    centroids: Option<Table>,
     dim: usize,
 }
 
@@ -549,7 +613,7 @@ impl VecIndex {
             segment: std::sync::Arc::new(seg?),
             // A missing centroid object is not an error: it is how an index below the
             // threshold says "scan me exactly" (D-10).
-            centroids: cen.ok().and_then(|b| Centroids::decode(b.as_ref())),
+            centroids: cen.ok().and_then(Table::decode),
             dim,
         })
     }
@@ -570,7 +634,24 @@ impl VecIndex {
             segment: segment.into(),
             // A missing or unreadable centroid table is not an error: it is how an index
             // below the threshold says "scan me exactly" (D-10).
-            centroids: centroids.and_then(Centroids::decode),
+            centroids: centroids
+                .map(bytes::Bytes::copy_from_slice)
+                .and_then(Table::decode),
+            dim,
+        }
+    }
+
+    /// [`Self::from_parts`] over the fetched table itself, which it reads in place rather than
+    /// copies (M120).
+    #[must_use]
+    pub fn from_shared_parts(
+        segment: impl Into<std::sync::Arc<Segment>>,
+        centroids: Option<bytes::Bytes>,
+        dim: usize,
+    ) -> Self {
+        Self {
+            segment: segment.into(),
+            centroids: centroids.and_then(Table::decode),
             dim,
         }
     }
@@ -631,7 +712,7 @@ impl VecIndex {
             return Ok(scored);
         };
 
-        let probes = search::probe_centroids(&centroids.vectors, query, q.p);
+        let probes = centroids.probe(query, q.p);
         let code_len = quantizer.code_len();
         let (Some(rabitq), Some(sq8_span)) = (
             self.segment.section(Section::RaBitQ),
@@ -711,7 +792,7 @@ impl VecIndex {
         // One `<c, q>` per probed list, not per candidate.
         let dots: Vec<f32> = rows
             .iter()
-            .map(|(li, _, _)| centroids.vectors.get(*li).map_or(0.0, |c| dot(c, query)))
+            .map(|(li, _, _)| centroids.dot(*li, query).unwrap_or(0.0))
             .collect();
 
         // Each candidate's data row rides beside it, so deduplication needs no lookup.
@@ -819,4 +900,65 @@ impl VecIndex {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_precision_loss,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_table_in_place_is_the_decoded_one() {
+        let mut s = 0x5eed_u64;
+        let mut unit = move || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        for (n, dim) in [(1usize, 1usize), (7, 3), (64, 16), (5, 0)] {
+            let table = Centroids {
+                vectors: (0..n).map(|_| (0..dim).map(|_| unit()).collect()).collect(),
+                spans: (0..n as u32).map(|i| (i * 10, i + 1)).collect(),
+            };
+            let raw = table.encode();
+            let decoded = Centroids::decode(&raw).unwrap();
+            let view = Table::decode(bytes::Bytes::from(raw.clone())).unwrap();
+            assert_eq!(view.spans, decoded.spans);
+            for _ in 0..20 {
+                let q: Vec<f32> = (0..dim).map(|_| unit()).collect();
+                for p in [1, 2, n, n + 3] {
+                    assert_eq!(
+                        view.probe(&q, p),
+                        crate::search::probe_centroids(&decoded.vectors, &q, p),
+                        "n {n} dim {dim} p {p}"
+                    );
+                }
+                for (i, c) in decoded.vectors.iter().enumerate() {
+                    assert_eq!(
+                        view.dot(i, &q).map(f32::to_bits),
+                        Some(dot(c, &q).to_bits())
+                    );
+                }
+            }
+            // Refused exactly where the decode refuses: every truncation, and a count that
+            // overstates the table.
+            for cut in 0..raw.len() {
+                assert_eq!(
+                    Table::decode(bytes::Bytes::copy_from_slice(&raw[..cut])).is_some(),
+                    Centroids::decode(&raw[..cut]).is_some(),
+                    "n {n} dim {dim} cut {cut}"
+                );
+            }
+            let mut big = raw.clone();
+            big[0..4].copy_from_slice(&(n as u32 + 1).to_le_bytes());
+            assert_eq!(
+                Table::decode(bytes::Bytes::from(big.clone())).is_some(),
+                Centroids::decode(&big).is_some()
+            );
+        }
+    }
 }

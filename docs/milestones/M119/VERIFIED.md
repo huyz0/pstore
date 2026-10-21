@@ -64,7 +64,9 @@ a coalesced fetch. `pstore-server` — `VectorIn` by hand; a multi-query's sub-q
 patch built, not parsed; documents moved into the format; one lock an eviction pass; the
 external list read only to build. `pstore-meter` — ranges sliced, not copied.
 
-**Not landed, and why** (OBSERVED-NOT as fixes):
+**Not landed, and why** (OBSERVED-NOT as fixes). ⚠️ Each is closed by
+[M120](../M120/VERIFIED.md), under a spec that names the depth it changes and an equivalence
+test for the parse:
 - An external column's pin checks and a multi-field scan's reads run together: each cuts
   round-trip depth, which this spec does not change. A milestone with an RA budget for it.
 - A write body and a peer part parsed once into their type: refuses a duplicate key the tree

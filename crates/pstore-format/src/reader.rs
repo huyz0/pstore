@@ -887,15 +887,20 @@ impl Segment {
         let mut extra = if simple {
             Vec::new()
         } else {
-            let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::new();
-            for f in &self.fields {
-                if f.kind == 1 {
-                    continue;
-                }
-                m.push((
-                    f.name.clone(),
-                    self.field_vectors(store, key, &f.name).await?,
-                ));
+            // Every field's read issued together (M120): one after another, a segment of `n`
+            // dense fields cost `n` sequential rounds for reads that depend on nothing. The
+            // first failure in field order is the error, as the loop reported it.
+            let dense: Vec<&crate::FieldLayout> =
+                self.fields.iter().filter(|f| f.kind != 1).collect();
+            let read = futures_util::future::join_all(
+                dense
+                    .iter()
+                    .map(|f| self.field_vectors(store, key, &f.name)),
+            )
+            .await;
+            let mut m: Vec<(String, Vec<Vec<Vec<f32>>>)> = Vec::with_capacity(dense.len());
+            for (f, got) in dense.iter().zip(read) {
+                m.push((f.name.clone(), got?));
             }
             m
         };

@@ -29,6 +29,7 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod body;
 mod boost;
 mod diversify;
 mod external;
@@ -1689,12 +1690,29 @@ async fn query_index<S: BlobStore + 'static>(
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
     let token = session_of(&headers, tenant)?;
-    let raw: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
+    // M120: one query, parsed once into its type where that is the tree's answer ([`body`]);
+    // a body naming `queries` is a multi-query, and goes the tree's way with every other.
+    let fast = body::typed::<QueryRequest>(&body)
+        .filter(|(shape, _)| {
+            shape
+                .keys
+                .as_ref()
+                .is_some_and(|k| !k.iter().any(|k| k == "queries"))
+        })
+        .map(|(_, req)| req);
+    let raw: serde_json::Value = if fast.is_some() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?
+    };
     // ⚠️ Every query is planned -- every refusal found -- before any runs (M9g): one refused
     // sub-query refuses the request, and nothing partial is returned.
-    if raw.get("queries").is_none() {
-        let req = parse_query(raw)?;
+    if fast.is_some() || raw.get("queries").is_none() {
+        let req = match fast {
+            Some(req) => checked_query(req)?,
+            None => parse_query(raw)?,
+        };
         // M65: checked first, so every refusal names `facets`.
         let facet = facets::derive(&req)?;
         let plan = plan(&req)?;
@@ -1781,6 +1799,11 @@ const MAX_QUERIES: usize = 16;
 fn parse_query(raw: serde_json::Value) -> Result<QueryRequest, ApiError> {
     let req: QueryRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request(format!("malformed query: {e}")))?;
+    checked_query(req)
+}
+
+/// A parsed query, or why it is not one.
+fn checked_query(req: QueryRequest) -> Result<QueryRequest, ApiError> {
     if req.top_k == 0 {
         return Err(ApiError::bad_request("top_k must be greater than zero"));
     }
@@ -2873,7 +2896,15 @@ async fn delete_index<S: BlobStore + 'static>(
 }
 
 /// A write body, with the durability level refused by name rather than by serde's message.
+///
+/// ⚠️ Parsed once into its type where that is the tree's answer (M120, [`body`]): a tree holds
+/// each number of each vector as a 32-byte node, and was walked again to build the request.
+/// A body that parses so cannot hold a durability the refusal below names: the type has no
+/// such variant.
 fn parse_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
+    if let Some((_, req)) = body::typed::<WriteRequest>(body) {
+        return Ok(req);
+    }
     let raw: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
     if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
@@ -3593,7 +3624,7 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
                         .and_then(serde_json::Value::as_u64)
                         .filter(|k| *k <= 2)
                         .ok_or_else(|| bad("Fuzzy's max_edits is 0, 1 or 2".to_owned()))?;
-                    Ok(Predicate::Fuzzy(attr, v.to_owned(), k as u8))
+                    Ok(Predicate::Fuzzy(attr, v.into(), k as u8))
                 }
                 // M66: a location is a two-number array; the clause's argument is numbers.
                 "GeoRadius" => {
@@ -4579,10 +4610,129 @@ pub async fn store_identity<S: BlobStore>(
 #[allow(
     clippy::unwrap_used,
     clippy::panic,
+    clippy::indexing_slicing,
     reason = "assertions in tests are the reporting mechanism"
 )]
 mod tests {
     use super::*;
+
+    /// Bodies the fast parse must answer exactly as the tree does (M120): valid ones of every
+    /// shape, and each way a typed parse and a tree disagree.
+    pub(crate) fn bodies() -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = [
+            r#"{"documents": [{"id": "a", "vector": [1, 2.5, -3e2], "attributes": {"n": 1, "s": "x", "f": 1.5, "b": true, "l": [1, "y"]}}]}"#,
+            r#"{"durability": "durable", "documents": [{"id": "a", "vector": "AACAPw==", "text": "hello"}], "deletes": ["b"]}"#,
+            r#"{"durability": "async", "documents": []}"#,
+            r#"{"durability": 5, "documents": []}"#,
+            r#"{"durability": null}"#,
+            r#"{"documents": [{"id": "a", "vector": [1]}], "documents": [{"id": "b", "vector": [2]}]}"#,
+            r#"{"documents": [{"id": "a", "id": "b", "vector": [1]}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1], "attributes": {"n": 1, "n": 2}}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1], "attributes": {"n": 1, "n": 2}}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1e999]}]}"#,
+            r#"{"documents": [], "x": 1e999}"#,
+            r#"{"documents": [], "x": [1, {"y": -1e400}]}"#,
+            r#"{"documents": [{"id": "a", "vector": [1, "a"]}]}"#,
+            r#"{"documents": [{"id": "a", "vector": {}}]}"#,
+            r#"{"documents": [{"vector": [1]}]}"#,
+            r#"{"vector": [1, 0.5], "top_k": 3}"#,
+            r#"{"vector": [1, 0.5], "top_k": 0}"#,
+            r#"{"vector": [1, 0.5], "top_k": 3, "top_k": 4}"#,
+            r#"{"text": "a b", "top_k": 10, "filters": ["n", "Gte", 3]}"#,
+            r#"{"text": "a", "top_k": 10, "filters": ["And", [["n", "Lt", 3], ["s", "Eq", "x"]]]}"#,
+            r#"{"queries": [{"vector": [1], "top_k": 1}]}"#,
+            r#"{"queries": null}"#,
+            r#"{"vector": [1], "top_k": 1, "nope": 1e999}"#,
+            r#"{"protocol": 1, "phase": "open"}"#,
+            r#"[]"#,
+            r#"[{"durability": "async"}]"#,
+            r#""x""#,
+            r#"1"#,
+            r#"null"#,
+            r#"{}"#,
+            r#"{} {}"#,
+            r#""#,
+        ]
+        .iter()
+        .map(|b| b.as_bytes().to_vec())
+        .collect();
+        // Invalid UTF-8, in a known field and in an unknown one.
+        let mut bad = br#"{"documents": [{"id": "a"#.to_vec();
+        bad.extend([0xff, 0xfe]);
+        bad.extend(br#"", "vector": [1]}]}"#);
+        out.push(bad);
+        let mut bad = br#"{"documents": [], "x": "a"#.to_vec();
+        bad.push(0xc0);
+        bad.extend(br#""}"#);
+        out.push(bad);
+        // Every truncation of a valid body.
+        let whole = out[0].clone();
+        out.extend((0..whole.len()).map(|n| whole[..n].to_vec()));
+        out
+    }
+
+    #[test]
+    fn the_fast_parse_is_the_tree_parse() {
+        // The tree's way, verbatim from before M120.
+        fn tree_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
+            let raw: serde_json::Value = serde_json::from_slice(body)
+                .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
+            if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
+                && !matches!(d, "batched" | "durable")
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_durability",
+                    format!("durability {d:?} is not implemented; use \"batched\" or \"durable\""),
+                ));
+            }
+            serde_json::from_value(raw)
+                .map_err(|e| ApiError::bad_request(format!("malformed body: {e}")))
+        }
+        fn tree_query(body: &[u8]) -> Option<Result<QueryRequest, ApiError>> {
+            let raw: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(ApiError::bad_request(format!("malformed query: {e}")))),
+            };
+            // A multi-query is not the single path's.
+            raw.get("queries").is_none().then(|| parse_query(raw))
+        }
+        fn fast_query(body: &[u8]) -> Option<Result<QueryRequest, ApiError>> {
+            let fast = body::typed::<QueryRequest>(body)
+                .filter(|(shape, _)| {
+                    shape
+                        .keys
+                        .as_ref()
+                        .is_some_and(|k| !k.iter().any(|k| k == "queries"))
+                })
+                .map(|(_, req)| req);
+            match fast {
+                Some(req) => Some(checked_query(req)),
+                None => tree_query(body),
+            }
+        }
+        let shown = |r: Result<String, ApiError>| match r {
+            Ok(s) => format!("ok {s}"),
+            Err(e) => format!("{} {} {}", e.status, e.code, e.message),
+        };
+        let mut fast_hits = 0;
+        for b in bodies() {
+            let label = String::from_utf8_lossy(&b).into_owned();
+            fast_hits += usize::from(body::typed::<WriteRequest>(&b).is_some());
+            assert_eq!(
+                shown(parse_write(&b).map(|r| format!("{r:?}"))),
+                shown(tree_write(&b).map(|r| format!("{r:?}"))),
+                "write: {label}"
+            );
+            assert_eq!(
+                fast_query(&b).map(|r| shown(r.map(|q| format!("{q:?}")))),
+                tree_query(&b).map(|r| shown(r.map(|q| format!("{q:?}")))),
+                "query: {label}"
+            );
+        }
+        // The fast path is taken at all: a corpus that always fell back proves nothing.
+        assert!(fast_hits >= 2, "the fast path parsed {fast_hits} bodies");
+    }
 
     fn dense_tune(body: serde_json::Value) -> pstore_index::vec_index::Query {
         let req: QueryRequest = serde_json::from_value(body).unwrap();

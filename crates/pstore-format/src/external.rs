@@ -1031,13 +1031,23 @@ impl ExternalColumn {
         if let Some(r) = wanted.iter().find(|r| !self.is_present(**r)) {
             return Err(ExternalError::Absent(*r));
         }
-        let key = Key::new(self.key.clone());
-        if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
-            return Err(ExternalError::Changed);
-        }
-        for o in &self.more {
-            let k = Key::new(o.key.clone());
-            if store.head(&k).await? != o.len || store.get_tag(&k).await? != o.tag {
+        // Every object's length and tag asked at once (M120): one after another they were two
+        // sequential rounds an object, for answers that depend on nothing here.
+        //
+        // ⚠️ Each answer judged in the order the serial checks met them -- the main object's
+        // first, its length before its tag -- so the error is the one they reported. A refusal
+        // now costs every object's two requests where the serial checks stopped at the first.
+        let pins = std::iter::once((&self.key, self.len, &self.tag))
+            .chain(self.more.iter().map(|o| (&o.key, o.len, &o.tag)));
+        let answers = futures_util::future::join_all(pins.map(|(key, len, tag)| async move {
+            let k = Key::new(key.clone());
+            let (got_len, got_tag) =
+                futures_util::future::join(store.head(&k), store.get_tag(&k)).await;
+            (len, tag, got_len, got_tag)
+        }))
+        .await;
+        for (len, tag, got_len, got_tag) in answers {
+            if got_len? != len || got_tag? != *tag {
                 return Err(ExternalError::Changed);
             }
         }

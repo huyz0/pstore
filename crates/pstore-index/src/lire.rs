@@ -381,9 +381,15 @@ fn recentre(c: &mut [f32], corpus: &[Vec<f32>], list: &[usize]) {
     if list.is_empty() {
         return;
     }
-    for (d, slot) in c.iter_mut().enumerate() {
-        let sum: f32 = list.iter().filter_map(|r| corpus.get(*r)?.get(d)).sum();
-        *slot = sum / list.len() as f32;
+    // Row by row, from `-0.0` as `Sum` starts (M120), as `cluster`'s means are.
+    let mut sum = vec![-0.0f32; c.len()];
+    for v in list.iter().filter_map(|r| corpus.get(*r)) {
+        for (a, x) in sum.iter_mut().zip(v) {
+            *a += *x;
+        }
+    }
+    for (slot, total) in c.iter_mut().zip(sum) {
+        *slot = total / list.len() as f32;
     }
 }
 

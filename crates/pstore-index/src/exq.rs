@@ -243,8 +243,10 @@ impl ExQuantizer {
                     mag += (1u32 << p) as f32;
                 }
             }
-            let positive = bits.get(byte).is_some_and(|b| b & bit != 0);
-            acc += if positive { mag * q } else { -mag * q };
+            // ⚠️ The sign XORed in, not chosen by a branch on a coin-flip bit (M120), as
+            // `rabitq`'s kernel does: `-mag * q` is `mag * q` with its sign bit flipped.
+            let negative = bits.get(byte).is_none_or(|b| b & bit == 0);
+            acc += f32::from_bits((mag * q).to_bits() ^ (u32::from(negative) << 31));
         }
         centroid_dot + code.residual_norm() * acc / (extra.norm * extra.cosine)
     }
