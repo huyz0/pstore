@@ -128,6 +128,27 @@ impl<S: crate::BlobStore> Accounted<S> {
             .sum()
     }
 
+    /// Drops `tenant`'s counters (M123): what an evicted tenant leaves, which nothing removed
+    /// -- so the counters held every tenant the process had ever served. A later request for
+    /// it counts from zero; a response's cost is a difference, so it is still exact.
+    pub fn forget(&self, tenant: TenantId) {
+        let mut c = self.lock();
+        c.per_tenant.retain(|(t, _), _| *t != tenant);
+        c.bytes_per_tenant.retain(|(t, _), _| *t != tenant);
+    }
+
+    /// How many tenants have counters (M123).
+    #[must_use]
+    pub fn tenants_counted(&self) -> usize {
+        let c = self.lock();
+        c.per_tenant
+            .keys()
+            .chain(c.bytes_per_tenant.keys())
+            .map(|(t, _)| *t)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     /// Requests of `class` across every tenant.
     #[must_use]
     pub fn total(&self, class: OpClass) -> u64 {

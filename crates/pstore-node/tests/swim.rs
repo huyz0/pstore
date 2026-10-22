@@ -577,3 +577,29 @@ async fn a_dropped_member_falls_silent_too() {
         "a dropped member was still counted alive after 40 periods"
     );
 }
+
+#[tokio::test]
+async fn a_member_that_leaves_is_gone_from_its_peers_view_at_once() {
+    // M123: a stop sent nothing, so a peer found the member dead by suspicion timeout -- at
+    // least eight periods here, ~40 s on a large fleet -- and routed work to it until then.
+    let (a_port, b_port) = (free_port(), free_port());
+    let a = member(a_port, &[]).await;
+    let b = member(b_port, &[format!("127.0.0.1:{a_port}")]).await;
+    for _ in 0..100 {
+        if a.member_count().await == 2 && b.member_count().await == 2 {
+            break;
+        }
+        tokio::time::sleep(FAST).await;
+    }
+    assert!(b.members().await.contains(&a.self_addr()));
+    let left = tokio::time::Instant::now();
+    a.leave().await;
+    while b.members().await.contains(&a.self_addr()) {
+        assert!(
+            left.elapsed() < FAST * 3,
+            "a peer still routed to a member that left, {:?} after",
+            left.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}

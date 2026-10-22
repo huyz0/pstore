@@ -290,28 +290,22 @@ async fn eviction_runs_with_fold_and_gc_off() {
 
 #[tokio::test(start_paused = true)]
 async fn eviction_costs_no_request() {
+    // ⚠️ Counted across every tenant, not per tenant (M123): an evicted tenant's own counters
+    // now go with it, so they read zero after -- and the process's totals are the stronger
+    // claim anyway, since they count a request billed to any tenant at all.
     let (store, a) = api(1);
     settled(&a, 100..105).await;
-    let t = TenantId(100);
-    let before = (
-        store.count(t, OpClass::Read),
-        store.count(t, OpClass::Write),
-    );
-    let all: u64 = (100..105)
-        .map(|n| store.count(TenantId(n), OpClass::Read) + store.count(TenantId(n), OpClass::Write))
-        .sum();
-    a.evict_tick().await;
-    let after: u64 = (100..105)
-        .map(|n| store.count(TenantId(n), OpClass::Read) + store.count(TenantId(n), OpClass::Write))
-        .sum();
-    assert_eq!(after, all);
-    assert_eq!(
-        (
-            store.count(t, OpClass::Read),
-            store.count(t, OpClass::Write)
-        ),
-        before
-    );
+    let classes = [
+        OpClass::Read,
+        OpClass::Write,
+        OpClass::List,
+        OpClass::Delete,
+    ];
+    let before: Vec<u64> = classes.iter().map(|c| store.total(*c)).collect();
+    let tick = a.evict_tick().await;
+    assert!(tick.evicted > 0, "{tick:?}");
+    let after: Vec<u64> = classes.iter().map(|c| store.total(*c)).collect();
+    assert_eq!(after, before);
 }
 
 #[tokio::test(start_paused = true)]
@@ -412,5 +406,22 @@ async fn a_served_registry_keeps_what_its_reap_loop_owes() {
     assert!(
         metrics.contains("pstore_engines_evicted_total 2"),
         "{metrics}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_evicted_tenants_counters_go_with_it() {
+    // M123: the per-tenant request counters kept every tenant this process ever touched --
+    // ~350 bytes each, past the engine cap that bounds everything else -- because nothing
+    // removed them. An evicted engine's tenant takes its counters with it.
+    let (store, a) = api(4);
+    settled(&a, 100..120).await;
+    assert_eq!(store.tenants_counted(), 20);
+    a.evict_tick().await;
+    assert_eq!(a.engines().await, 4);
+    assert_eq!(
+        store.tenants_counted(),
+        4,
+        "evicted tenants' counters stayed"
     );
 }

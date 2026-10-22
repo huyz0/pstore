@@ -875,3 +875,43 @@ async fn a_second_signal_exits_at_once() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+#[tokio::test]
+async fn a_stopping_server_is_not_ready() {
+    // M123: there was no readiness route, so nothing a load balancer polls could drain a
+    // server before its stop. It answers 200 while serving and 503 once a stop begins.
+    let w = world(1);
+    let a = Arc::clone(&w.apis[0]);
+    let ready = |api: &Arc<Api<Switch>>| {
+        let api = Arc::clone(api);
+        async move {
+            api.router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/ready")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(ready(&a).await, StatusCode::OK);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_folding(
+        Arc::clone(&a),
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        None,
+        None,
+        false,
+    ));
+    assert_eq!(ready(&a).await, StatusCode::OK);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert_eq!(ready(&a).await, StatusCode::SERVICE_UNAVAILABLE);
+}

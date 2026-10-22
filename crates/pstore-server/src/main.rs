@@ -146,10 +146,10 @@ async fn run<S: BlobStore + 'static>(
         return std::process::ExitCode::FAILURE;
     }
     // M56: or from a SWIM membership of its own, held for the life of the process.
-    let _gossip = match config.gossip.clone() {
+    let gossip = match config.gossip.clone() {
         None => None,
         Some(g) => match api.join_peers(g).await {
-            Ok(handle) => Some(handle),
+            Ok(handle) => Some(std::sync::Arc::new(handle)),
             Err(e) => {
                 eprintln!("pstore-server: refusing to serve: {e}");
                 return std::process::ExitCode::FAILURE;
@@ -194,7 +194,16 @@ async fn run<S: BlobStore + 'static>(
     );
     // M123: a second signal exits at once -- the stop's own deadlines are the operator's to
     // cut short, and nothing else listened for it.
-    let shutdown = pstore_server::stop_then_exit(stopped(), stopped, || {
+    // M123: and the first thing a stop does is leave the membership, so peers route away
+    // while the drain runs rather than ~40 s after it.
+    let leaving = gossip.clone();
+    let first = async move {
+        stopped().await;
+        if let Some(g) = leaving {
+            g.leave().await;
+        }
+    };
+    let shutdown = pstore_server::stop_then_exit(first, stopped, || {
         eprintln!("pstore-server: a second signal: exiting without finishing the stop");
         std::process::exit(130);
     });

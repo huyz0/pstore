@@ -366,6 +366,15 @@ impl Cluster {
         self.transition(id, State::Dead, |s| s != State::Dead);
     }
 
+    /// This node leaving on purpose (M123): its own record, dead at its own incarnation --
+    /// which outranks every `Alive` peers hold of it at that incarnation. The only way this
+    /// node's state is ever set to dead, and only by itself. Coming back is a refutation at a
+    /// higher incarnation, as after any death.
+    pub fn leave(&mut self) {
+        let me = self.me;
+        self.transition(&me, State::Dead, |s| s != State::Dead);
+    }
+
     /// A member's own claim that it is alive, at a stated incarnation.
     ///
     /// ⚠️ Accepted only at a **higher** incarnation than the one held. Equal-or-lower is what

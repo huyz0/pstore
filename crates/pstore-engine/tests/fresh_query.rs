@@ -517,3 +517,27 @@ async fn two_queries_share_the_unfolded_rows() {
     assert_eq!(three.unfolded.len(), 6);
     assert!(!Arc::ptr_eq(&one.unfolded, &three.unfolded));
 }
+
+#[tokio::test]
+async fn a_fold_drops_the_fresh_segments_it_made_stale() {
+    // M123: a fold left an idle engine's sealed in-memory segments -- rows, index, store --
+    // resident until that tenant's next query missed, counted by no budget. Now a fold drops
+    // every one built before it.
+    let store = Arc::new(MemoryStore::new());
+    let e =
+        Engine::new(Arc::clone(&store), TenantId(803), LaneId(1)).with_index_params(params(100));
+    e.write("a", (0..5).map(doc).collect()).await.unwrap();
+    e.write("b", (100..103).map(doc).collect()).await.unwrap();
+    e.flush().await.unwrap();
+    for index in ["a", "b"] {
+        e.query(index, &dense(1, 10), Fusion::default(), 10)
+            .await
+            .unwrap();
+    }
+    assert_eq!(e.fresh_indexes_for_test().await, ["a", "b"]);
+    e.fold().await.unwrap();
+    assert!(
+        e.fresh_indexes_for_test().await.is_empty(),
+        "a fold left stale fresh segments resident"
+    );
+}

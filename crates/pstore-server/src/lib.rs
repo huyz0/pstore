@@ -149,6 +149,8 @@ pub struct Api<S> {
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
+    /// Set when a stop begins (M123): `GET /v1/ready` answers 503 from then on.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 /// One tenant's engine in the registry (M26).
@@ -203,6 +205,9 @@ impl Default for FlushPolicy {
 
 /// How long a stop waits on each of its phases by default (M123): `PSTORE_DRAIN_MS`.
 pub const DEFAULT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One engine as an eviction pass's snapshot holds it (M123): tenant, last use, engine.
+type Snapped<S> = (TenantId, tokio::time::Instant, Arc<Tenant<S>>);
 
 /// What one eviction pass did (M26).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +382,7 @@ impl<S: BlobStore + 'static> Api<S> {
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
             external_prefixes: Mutex::new(None),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -662,6 +668,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/admin/gc", post(gc_tenant::<S>))
             .route("/v1/admin/duties", get(duties))
             .route("/metrics", get(metrics::<S>))
+            .route("/v1/ready", get(ready::<S>))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&self),
                 count_request::<S>,
@@ -953,17 +960,24 @@ impl<S: BlobStore + 'static> Api<S> {
             }
             (r.cap, r.reaping)
         };
-        let mut engines = self.engines.lock().await;
-        if engines.len() <= cap {
-            return EvictTick::default();
-        }
+        // ⚠️ **Idleness decided outside the registry's lock** (M123): every request waits on
+        // it, and checking every engine under it -- five locks each, one of them a memtable a
+        // fresh view may be copying -- stalled every tenant once a second while over the cap.
+        // A snapshot is checked, then only the chosen are checked again, under the lock.
+        let (len, snapshot): (usize, Vec<Snapped<S>>) = {
+            let engines = self.engines.lock().await;
+            if engines.len() <= cap {
+                return EvictTick::default();
+            }
+            let snap = engines
+                .iter()
+                .map(|(t, s)| (*t, s.used, Arc::clone(&s.engine)))
+                .collect();
+            (engines.len(), snap)
+        };
         let target = cap - cap / 10;
-        let mut idle: Vec<(tokio::time::Instant, TenantId)> = Vec::new();
-        let mut held_idle = false;
         // The tenants this server owes a fold a refused `strong` read asked for (M9i.2): the one
-        // thing it owes that its engine does not hold. Locked once for the pass (M119), not once
-        // an engine while every request waits on `engines`; nothing takes the two in the other
-        // order.
+        // thing it owes that its engine does not hold.
         //
         // ⚠️ **A backoff needs no check of its own** (mutation sweep): a fold that failed keeps
         // its own rows unfolded, or its request marked again, and a reap that failed keeps its
@@ -971,22 +985,38 @@ impl<S: BlobStore + 'static> Api<S> {
         let owed = self
             .requested
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (t, s) in engines.iter() {
-            if !s.engine.is_idle(reaping) || owed.contains(t) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut idle: Vec<(tokio::time::Instant, TenantId)> = snapshot
+            .into_iter()
+            .filter(|(t, _, e)| e.is_idle(reaping) && !owed.contains(t))
+            .map(|(t, used, _)| (used, t))
+            .collect();
+        idle.sort_unstable();
+        let mut engines = self.engines.lock().await;
+        let mut held_idle = false;
+        let mut n = 0;
+        let want = len.saturating_sub(target);
+        for (_, t) in &idle {
+            if n >= want {
+                break;
+            }
+            let Some(slot) = engines.get(t) else {
+                continue;
+            };
+            // Again, under the lock, for the chosen only: a request may have taken it, or
+            // written to it, since the snapshot.
+            if Arc::strong_count(&slot.engine) > 1 {
+                held_idle = true;
                 continue;
             }
-            if Arc::strong_count(&s.engine) > 1 {
-                held_idle = true;
-            } else {
-                idle.push((s.used, *t));
+            if !slot.engine.is_idle(reaping) {
+                continue;
             }
-        }
-        drop(owed);
-        idle.sort_unstable();
-        let n = (engines.len() - target).min(idle.len());
-        for (_, t) in idle.iter().take(n) {
             engines.remove(t);
+            // M123: its request counters with it -- nothing else removed them.
+            self.store.forget(*t);
+            n += 1;
         }
         drop(engines);
         let mut r = self.registry_mut();
@@ -1253,6 +1283,17 @@ async fn duties() -> Response {
 ///
 /// ⚠️ **Zero blob requests**: every number here is a process-local atomic or map. A metrics
 /// endpoint that reads the store is a load generator pointed at the thing it measures.
+/// `GET /v1/ready` (M123): 200 while serving, 503 from the moment a stop begins -- what a load
+/// balancer's health check drains on, beside the gossip leave peers route away on. Costs no
+/// request.
+async fn ready<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Response {
+    if api.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        (StatusCode::SERVICE_UNAVAILABLE, "stopping\n").into_response()
+    } else {
+        (StatusCode::OK, "ready\n").into_response()
+    }
+}
+
 async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Response {
     let mut out = String::new();
     // M26: the engine registry.
@@ -4743,8 +4784,13 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     };
     let drain = api.drain();
     let signal = Arc::clone(&tx);
+    let marked = Arc::clone(&api);
     let serving = serve(Arc::clone(&api), listener, async move {
         shutdown.await;
+        // M123: not ready, before the drain stops the listener.
+        marked
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = signal.send(true);
     });
     // ⚠️ **The drain is bounded** (M123): axum's graceful shutdown waits for every request in

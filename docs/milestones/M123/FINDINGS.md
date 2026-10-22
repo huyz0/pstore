@@ -13,10 +13,10 @@ closes it; [SPEC.md](SPEC.md) says what each delta does.
 | 3 | shutdown | The HTTP drain has no deadline | **Fixed, M123.1**: `PSTORE_DRAIN_MS`. `a_stop_returns_by_its_deadline_and_still_flushes` |
 | 4 | shutdown | A second signal cannot hurry a stuck stop | **Fixed, M123.1**: `stop_then_exit`. `a_second_signal_exits_at_once` |
 | 5 | shutdown | The replication worker finishes a whole tick of copies after the stop, and keeps its claims until their TTL | **Fixed, M123.1**: a halt flag, and claims released. `a_halted_tick_starts_no_copy`, `a_served_process_runs_its_worker` |
-| 6 | shutdown, scaling | No leave message: a stopping node answers gossip through its drain and ~40 s after; no readiness route | M123.2 |
-| 7 | scalability | Per-tenant request counters are never dropped: ~350 B a tenant ever touched | M123.2 |
-| 8 | scalability | A fold leaves an idle engine's stale fresh segments resident until its next query | M123.2 |
-| 9 | scalability | The eviction pass checks every engine's idleness under the registry's lock every request waits on | M123.2 |
+| 6 | shutdown, scaling | No leave message: a stopping node answers gossip through its drain and ~40 s after; no readiness route | **Fixed, M123.2**: a stop leaves first -- its record, dead, to `max(8, 3·log2 N)` peers -- and `GET /v1/ready` answers 503. `a_leaving_node_is_dead_everywhere_within_a_few_rounds_and_may_return`, `a_member_that_leaves_is_gone_from_its_peers_view_at_once`, `a_server_that_leaves_is_dropped_within_a_few_periods`, `a_stopping_server_is_not_ready` |
+| 7 | scalability | Per-tenant request counters are never dropped: ~350 B a tenant ever touched | **Fixed, M123.2**: an evicted tenant's go with it. `an_evicted_tenants_counters_go_with_it`; `eviction_costs_no_request` now counts the process's totals, since per-tenant counters of an evicted tenant read zero -- red with a request per evicted tenant |
+| 8 | scalability | A fold leaves an idle engine's stale fresh segments resident until its next query | **Fixed, M123.2**. `a_fold_drops_the_fresh_segments_it_made_stale` |
+| 9 | scalability | The eviction pass checks every engine's idleness under the registry's lock every request waits on | **Fixed, M123.2**: decided on a snapshot outside the lock, rechecked under it for the chosen only. No test can see a lock's hold time: checked by reading `evict_tick`; the registry suite passes unchanged |
 | 10 | scaling | **A tenant's lane registry fails for good at 4,097 lanes**; every fold probes 8 bundles of every lane | M123.3 |
 | 11 | scaling, scalability | A split query places each segment over every server: O(N) per segment, C-6 unused | M123.3 |
 | 12 | scaling, startup | Gossip and the roster never forget a dead node; a booting node seeds them all alive | M123.4 |

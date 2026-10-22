@@ -364,8 +364,16 @@ impl PeerGossip {
         Ok(Self { member, refresh })
     }
 
+    /// Leaves the membership, then stops (M123): peers stop assigning this server shares
+    /// within a round or two, where a [`Self::stop`] alone is found by a suspicion timeout --
+    /// ~40 s at a thousand servers. What a stop does first.
+    pub async fn leave(&self) {
+        self.refresh.abort();
+        self.member.leave().await;
+    }
+
     /// Stops the refresh and the member; the member's port is free when this returns. The
-    /// others declare this server dead by timeout: there is no leave message.
+    /// others declare this server dead by timeout: [`Self::leave`] tells them first.
     pub async fn stop(&self) {
         self.refresh.abort();
         self.member.stop().await;

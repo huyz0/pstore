@@ -44,6 +44,15 @@ pub struct Member {
     /// The receiver and the ticker (M56.1): held, so a member can be stopped. Detached, they
     /// outlived it, and a server that had stopped serving went on answering probes.
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// What [`Self::leave`] sends with (M123): the socket, its seal, and the node's seed.
+    /// Taken by the leave, so the port is not held past [`Self::stop`].
+    outbox: std::sync::Mutex<Option<Outbox>>,
+}
+
+struct Outbox {
+    socket: Arc<UdpSocket>,
+    sealing: Option<Arc<Sealing>>,
+    seed: u64,
 }
 
 /// Aborts the tasks, which cannot be awaited here: the socket closes shortly after, not by the
@@ -114,10 +123,46 @@ impl Member {
         self.stats.refused.load(Ordering::Relaxed)
     }
 
+    /// Leaves, then stops (M123): this member's own record, dead, is sent to a few live peers,
+    /// who spread it -- the fleet routes away within a round or two, where a [`Self::stop`]
+    /// alone is found by a suspicion timeout. Sent without injected loss: a leave is sent once.
+    pub async fn leave(&self) {
+        let outbox = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(o) = outbox {
+            let out = {
+                let mut p = self.proto.lock().await;
+                let out = p.leave(o.seed);
+                addressed(out, o.sealing.is_some(), None, p.cluster())
+            };
+            let mut rng = Bernoulli::new(o.seed);
+            send_all(
+                &o.socket,
+                &self.stats,
+                out,
+                0.0,
+                &mut rng,
+                o.sealing.as_deref(),
+            )
+            .await;
+        }
+        self.stop().await;
+    }
+
     /// Stops this member: its receiver and ticker end, and its socket is released by the time
-    /// this returns (M56.1). It sends nothing more -- there is no leave message -- so the
-    /// others declare it dead by timeout.
+    /// this returns (M56.1). It sends nothing more, so the others declare it dead by timeout:
+    /// [`Self::leave`] tells them first.
     pub async fn stop(&self) {
+        // The leave's handle on the socket too, so the port is free when this returns.
+        drop(
+            self.outbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         let tasks = std::mem::take(
             &mut *self
                 .tasks
@@ -297,7 +342,7 @@ pub async fn start_with(
     });
     let tasks = vec![
         spawn_receiver(&socket, &proto, &stats, loss, seed, sealing.clone()),
-        spawn_ticker(&socket, &proto, &stats, loss, seed, period, sealing),
+        spawn_ticker(&socket, &proto, &stats, loss, seed, period, sealing.clone()),
     ];
 
     Ok(Member {
@@ -305,6 +350,11 @@ pub async fn start_with(
         stats,
         me: advertise.to_owned(),
         tasks: std::sync::Mutex::new(tasks),
+        outbox: std::sync::Mutex::new(Some(Outbox {
+            socket,
+            sealing,
+            seed,
+        })),
     })
 }
 

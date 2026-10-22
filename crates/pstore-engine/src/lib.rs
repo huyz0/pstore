@@ -3510,6 +3510,7 @@ impl<S: BlobStore> Engine<S> {
             )
             .await?;
         self.fold_done(&folded);
+        self.drop_stale_fresh().await;
         match folded {
             Folded::Committed(epoch) | Folded::Nothing(epoch) => Ok(epoch),
             // Only a drop finds its index missing.
@@ -3530,11 +3531,22 @@ impl<S: BlobStore> Engine<S> {
             )
             .await?;
         self.fold_done(&folded);
+        self.drop_stale_fresh().await;
         match folded {
             Folded::Committed(_) => Ok(true),
             Folded::Nothing(_) => Ok(false),
             Folded::Missing => Err(EngineError::Lost),
         }
+    }
+
+    /// Drops every cached fresh segment built from an older memtable generation (M123): a
+    /// fold's prune moves the generation, and an idle engine's stale segments -- rows, index
+    /// and store -- otherwise stayed resident until its next query missed, in no budget.
+    /// Fresh before mem, as every path takes them.
+    async fn drop_stale_fresh(&self) {
+        let mut slots = self.fresh.lock().await;
+        let generation = self.mem().generation;
+        slots.retain(|_, f| f.generation == generation);
     }
 
     /// A fold finished: whatever a predecessor left on the lane is in HEAD now -- its bundles

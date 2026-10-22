@@ -251,6 +251,47 @@ impl Protocol {
         out
     }
 
+    /// Leaves the fleet (M123): this node's record, dead, as a `Part` to a few live peers --
+    /// `max(8, 3·log2 N)` of them from an offset `seed` picks -- which spread it by piggyback.
+    /// ⚠️ Without it a planned stop was found the way a crash is, by a suspicion timeout, and
+    /// peers routed work to the node until then. Send these, then stop: a node that goes on
+    /// answering after its leave refutes nothing, but is routed to by no one.
+    pub fn leave(&mut self, seed: u64) -> Vec<(String, Message)> {
+        self.cluster.leave();
+        let me = *self.cluster.me();
+        self.note_update(&me);
+        let Some(record) = self.cluster.member(&me).cloned() else {
+            return Vec::new();
+        };
+        let peers: Vec<String> = self
+            .cluster
+            .alive()
+            .into_iter()
+            .filter(|m| m.id != me)
+            .map(|m| m.addr.clone())
+            .collect();
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let n = peers.len();
+        let fanout = (3 * (usize::BITS - n.leading_zeros()) as usize)
+            .max(8)
+            .min(n);
+        let start = usize::try_from(seed % n as u64).unwrap_or(0);
+        (0..fanout)
+            .filter_map(|i| peers.get((start + i) % n))
+            .map(|to| {
+                (
+                    to.clone(),
+                    Message::Part {
+                        from: me,
+                        members: vec![record.clone()],
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Handle one datagram from `from_addr`. Returns the datagrams to send in response.
     ///
     /// ⚠️ The sender's address is a **parameter, not a field in the message**. UDP hands the

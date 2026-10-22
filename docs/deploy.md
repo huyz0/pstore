@@ -52,7 +52,9 @@ so a deploy is not a fleet-wide cold start. Unset, the server is uncached.
   at start, in 4 MiB blocks, with at least two blocks per class: 24 MiB is the floor, whatever
   the variable says. Endurance throttling is not configured yet.
 - **Stop it with SIGTERM or Ctrl-C.** Either flushes the disk tier's writes in flight; a
-  SIGKILL loses them, and costs only those.
+  SIGKILL loses them, and costs only those. Since M123 a stop first leaves the gossip
+  membership and fails `GET /v1/ready` (503), then drains HTTP within `PSTORE_DRAIN_MS`, then
+  flushes every tenant's `batched` rows and folds what it holds. A second signal exits at once.
 - **It records which store filled it.** Each start reads the bucket's store id at
   `_pstore/store-id`, creating it the first time: one GET, or one conditional PUT and a GET.
   A directory recorded for any other store, or a recreated bucket, is emptied before it serves

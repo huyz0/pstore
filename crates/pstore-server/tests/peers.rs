@@ -1781,3 +1781,33 @@ async fn a_sum_part_is_protocol_three() {
         assert_eq!(status, 400, "opened at {opened}, scanned at {scan}: {body}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_leaves_is_dropped_within_a_few_periods() {
+    // M123: a server stopping on purpose sent nothing, so its peers found it by suspicion
+    // timeout and sent it shares until then. Its leave is in every peer's list within a few
+    // periods: one for the datagram, one for the list's refresh, one of slack.
+    let (_store, mut fleet, _alone) = fleet().await;
+    let mut urls: Vec<String> = fleet.iter().map(|g| g.server.url.clone()).collect();
+    urls.sort();
+    assert!(
+        within_40_periods(async || fleet.iter().all(|g| g.server.api.peer_list() == urls)).await,
+        "the fleet never found itself"
+    );
+    let leaving = fleet.pop().unwrap();
+    let gone = leaving.server.url.clone();
+    let left = tokio::time::Instant::now();
+    leaving.gossip.leave().await;
+    while fleet
+        .iter()
+        .any(|g| g.server.api.peer_list().contains(&gone))
+    {
+        assert!(
+            left.elapsed() < PERIOD * 3,
+            "a server that left was still listed {:?} after",
+            left.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = leaving.http.send(());
+}

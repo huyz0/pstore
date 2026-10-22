@@ -1248,3 +1248,50 @@ fn the_cost_scales_with_the_fleet() {
         );
     }
 }
+
+#[test]
+fn a_leaving_node_is_dead_everywhere_within_a_few_rounds_and_may_return() {
+    // M123: there was no leave message, so a node that stopped on purpose was found dead the
+    // way a crashed one is -- by a suspicion timeout, ~40 s at a thousand nodes -- and peers
+    // kept assigning it work throughout. Now it says so: its own record, dead, sent to a few
+    // peers and spread by piggyback.
+    let n = 50u16;
+    let mut sim = Sim::new(n, true);
+    for r in 0..20 {
+        sim.round(r);
+    }
+    assert!(sim.all_see(usize::from(n)));
+    let gone = usize::from(n - 1);
+    let leaving = addr(n - 1);
+    let out = sim.nodes[gone].leave(7);
+    assert!(!out.is_empty(), "a leave told nobody");
+    sim.in_flight
+        .extend(out.into_iter().map(|(to, m)| (leaving.clone(), to, m)));
+    sim.by_addr.remove(&leaving);
+    let everywhere_dead = |sim: &Sim| {
+        sim.nodes
+            .iter()
+            .take(gone)
+            .all(|p| p.cluster().state(&id(n - 1)) == Some(State::Dead))
+    };
+    let rounds = rounds_until(&mut sim, 100, everywhere_dead).expect("the leave never spread");
+    // A suspicion timeout alone is at least six rounds past a missed probe's two.
+    assert!(rounds <= 6, "{rounds} rounds to spread a leave");
+    // Back at the same address with a fresh incarnation: it refutes its own death and returns.
+    sim.nodes[gone] = {
+        let mut c = Cluster::new(id(n - 1), leaving.clone(), "az-a".to_owned());
+        c.join(id(0), addr(0), "az-a".to_owned());
+        Protocol::new(c)
+    };
+    sim.by_addr.insert(leaving, gone);
+    let back = |sim: &Sim| {
+        sim.nodes
+            .iter()
+            .take(gone)
+            .all(|p| p.cluster().state(&id(n - 1)) == Some(State::Alive))
+    };
+    assert!(
+        rounds_until(&mut sim, 400, back).is_some(),
+        "a node that left could not come back"
+    );
+}
