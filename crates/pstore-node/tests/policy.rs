@@ -54,7 +54,7 @@ fn an_isolated_node_dials_the_whole_roster() {
 fn publishing_adds_what_the_roster_is_missing() {
     let known = Roster::from_nodes(nodes(3));
     let view = vec!["10.0.0.9:7946".to_owned(), "10.0.0.1:7946".to_owned()];
-    let out = union_to_publish(&known, &view).expect("a new member must be published");
+    let out = union_to_publish(&known, &view, &[]).expect("a new member must be published");
     assert_eq!(out.nodes().len(), 4, "the union must keep both sides");
     assert!(out.nodes().iter().any(|n| n == "10.0.0.9:7946"));
     assert!(
@@ -72,7 +72,7 @@ fn a_minority_view_still_cannot_shrink_the_roster() {
     let known = Roster::from_nodes(nodes(100));
     let isolated = vec!["10.0.0.7:7946".to_owned()];
     assert!(
-        union_to_publish(&known, &isolated).is_none(),
+        union_to_publish(&known, &isolated, &[]).is_none(),
         "a one-member view must add nothing, and must certainly not replace 100 members"
     );
 }
@@ -83,7 +83,7 @@ fn a_converged_fleet_writes_nothing() {
     // republished an identical roster every period would put one write per node per period
     // on a single key — a cost that scales with nodes and carries no information.
     let known = Roster::from_nodes(nodes(20));
-    assert!(union_to_publish(&known, &nodes(20)).is_none());
+    assert!(union_to_publish(&known, &nodes(20), &[]).is_none());
 }
 
 #[test]
@@ -360,4 +360,51 @@ fn seeds_and_in_cell_filter_exactly() {
         .collect();
     assert_eq!(pstore_node::policy::in_cell(&zoned, "z1"), ["a", "c"]);
     assert!(pstore_node::policy::in_cell(&zoned, "z9").is_empty());
+}
+
+#[test]
+fn a_member_this_node_holds_dead_leaves_the_roster() {
+    // M123: the roster only ever grew -- every address the cell ever had, read by every node
+    // every heal and seeded alive at every boot. An entry this node holds dead, and does not
+    // also see alive, is dropped from what it publishes; a live member partitioned from it
+    // writes itself back on its own next refold, so healing still reaches it.
+    let known = Roster::from_nodes(["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    let view = ["a".to_owned(), "c".to_owned()];
+    let published = union_to_publish(&known, &view, &["b".to_owned()]).unwrap();
+    assert_eq!(published.nodes(), ["a", "c"]);
+    // Dead here but alive in the view -- it came back -- stays.
+    assert!(
+        union_to_publish(&known, &["a".to_owned(), "b".to_owned()], &["b".to_owned()]).is_none()
+    );
+    // Nothing dead, nothing new: no write.
+    assert!(union_to_publish(&known, &view, &[]).is_none());
+    // New and dead together: one write with both changes.
+    let both = union_to_publish(&known, &["d".to_owned()], &["a".to_owned()]).unwrap();
+    assert_eq!(both.nodes(), ["b", "c", "d"]);
+}
+
+#[tokio::test]
+async fn an_announce_is_bounded_by_its_timeout() {
+    // M123: the announce at join was a CAS, and a rebase's GET and CAS, with no timeout --
+    // right after the join read the herd taught to bound. A store that holds the write held
+    // the node before its first view and before its heal loop, indistinguishable from dead.
+    let store = pstore_testkit::gated::Gated::new(2);
+    store.arm();
+    let cell = Cell::new("c", "az-a");
+    let started = std::time::Instant::now();
+    let out = pstore_node::policy::announce_within(
+        &store,
+        &cell,
+        &Roster::default(),
+        "10.0.0.1:7946",
+        None,
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert!(out.is_err(), "{out:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the announce waited {:?} on a held write",
+        started.elapsed()
+    );
 }

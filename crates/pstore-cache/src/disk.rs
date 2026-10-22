@@ -132,28 +132,38 @@ impl Tiers {
             .map_err(|e| format!("cache runtime: {e}"))?;
         let spawner = foyer::Spawner::from(rt.handle().clone());
         let workers = Workers(Some(rt));
-        let pinned = tier(&root.join("pinned"), p, c.block, &spawner).await?;
-        let meta = match tier(&root.join("meta"), m, c.block, &spawner).await {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = pinned.close().await;
-                return Err(e);
+        // ⚠️ **Together** (M123): each tier's recovery scans every block it holds, and one
+        // after another a restart waited for the sum of three scans before it could bind --
+        // now for the longest, the bulk tier's. The first failure in tier order is the error,
+        // as it was, and what did open is closed.
+        let (pinned, meta, bulk) = futures_util::future::join3(
+            tier(&root.join("pinned"), p, c.block, &spawner),
+            tier(&root.join("meta"), m, c.block, &spawner),
+            tier(&root.join("bulk"), b, c.block, &spawner),
+        )
+        .await;
+        match (pinned, meta, bulk) {
+            (Ok(pinned), Ok(meta), Ok(bulk)) => Ok(Self {
+                pinned,
+                meta,
+                bulk,
+                _workers: workers,
+            }),
+            (pinned, meta, bulk) => {
+                let mut first = None;
+                for t in [pinned, meta, bulk] {
+                    match t {
+                        Ok(t) => {
+                            let _ = t.close().await;
+                        }
+                        Err(e) => {
+                            first.get_or_insert(e);
+                        }
+                    }
+                }
+                Err(first.unwrap_or_default())
             }
-        };
-        let bulk = match tier(&root.join("bulk"), b, c.block, &spawner).await {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = pinned.close().await;
-                let _ = meta.close().await;
-                return Err(e);
-            }
-        };
-        Ok(Self {
-            pinned,
-            meta,
-            bulk,
-            _workers: workers,
-        })
+        }
     }
 
     fn of(&self, class: Class) -> &Tier {

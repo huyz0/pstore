@@ -415,3 +415,32 @@ fn finer_leaves_nest() {
         assert_eq!(folded, cs, "{fine} folded to {coarse}");
     }
 }
+
+#[test]
+fn a_dead_member_is_out_of_the_checksum_and_may_be_forgotten() {
+    // M123: a dead member was remembered for good and counted in the checksum, so a view grew
+    // with every node the fleet had ever lost, and forgetting one would have made two nodes
+    // reconcile forever. Out of the checksum, a death no peer has heard of yet costs no
+    // reconciliation, and forgetting it changes nothing a peer compares.
+    let mut a = cluster_of(10);
+    let mut b = cluster_of(10);
+    a.declare_dead(&id(4));
+    b.declare_dead(&id(4));
+    assert_eq!(a.checksum(), b.checksum());
+    let held = a.checksum();
+    assert!(a.forget(&id(4)), "a dead member was not forgotten");
+    assert_eq!(
+        a.checksum(),
+        held,
+        "forgetting a dead member moved the checksum"
+    );
+    assert_eq!(a.state(&id(4)), None);
+    assert_eq!(a.len(), 9);
+    // Only the dead are forgotten, and never this node.
+    assert!(!a.forget(&id(5)), "a live member was forgotten");
+    assert!(!a.forget(&id(0)));
+    assert_eq!(a.len(), 9);
+    // And the checksum still sees every live difference.
+    b.suspect(&id(6));
+    assert_ne!(a.checksum(), b.checksum());
+}

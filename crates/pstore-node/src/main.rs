@@ -71,6 +71,16 @@ impl Membership {
         }
     }
 
+    /// The members held dead in `zone` (M123): what a refold drops from the roster. The
+    /// `chitchat` arm reports none -- it keeps no dead set this crate can read -- so its roster
+    /// grows as it always did.
+    async fn dead_in(&self, zone: &str) -> Vec<String> {
+        match self {
+            Self::Chitchat(_) => Vec::new(),
+            Self::Swim(m) => m.dead_in(zone).await,
+        }
+    }
+
     /// The view SIZE, without materialising the view.
     ///
     /// ⚠️ The loop asks every period and only ever compares the number. At 1,000 members that
@@ -183,17 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every node that starts meanwhile also finds an empty roster and forms its own
     // one-member cluster. Measured: ten nodes, ten singleton views. The roster is a cache of
     // gossip, and a cache nobody writes until later is one nobody can join through.
-    let mine = roster.merged(&Roster::from_nodes([me.clone()]));
-    match Roster::refold(&store, &cell, &mine, tag).await {
-        Ok(()) => println!("ANNOUNCE ok members={}", mine.nodes().len()),
-        Err(_) => {
-            // Lost the race: rebase and try once. Losing repeatedly is fine — gossip will
-            // carry us in as soon as one peer knows us.
-            if let Ok((cur, t)) = Roster::read(&store, &cell).await {
-                let merged = cur.merged(&Roster::from_nodes([me.clone()]));
-                let _ = Roster::refold(&store, &cell, &merged, t).await;
-            }
-        }
+    // Lost the race, or timed out: fine -- gossip will carry us in as soon as one peer knows
+    // us. Bounded since M123, as the join read is.
+    if let Ok(n) = policy::announce_within(&store, &cell, &roster, &me, tag, ATTEMPT_TIMEOUT).await
+    {
+        println!("ANNOUNCE ok members={n}");
     }
 
     // Report the view, and refold the roster from it. The roster is a *cache of gossip*, so
@@ -254,7 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // the contents are the fleet, so placement crosses AZs anyway and every byte
                 // of it is billed.
                 let mine = policy::in_cell(&handle.members_zoned(&zone).await, &zone);
-                match policy::union_to_publish(&cur, &mine) {
+                let dead = handle.dead_in(&zone).await;
+                match policy::union_to_publish(&cur, &mine, &dead) {
                     None => {
                         if healed > 0 {
                             println!("HEAL dialled={healed} known={}", cur.nodes().len());

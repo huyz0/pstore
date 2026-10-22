@@ -142,6 +142,12 @@ enum Probe {
     Relayed,
 }
 
+/// Ticks a member stays dead in a view before it is forgotten (M123): ten minutes at a 1 s
+/// period -- far past the bounded retransmits of any message about it -- after which a stale
+/// `Alive` that did arrive is a member to probe and bury again, never a resurrection that
+/// sticks.
+pub const DEAD_RETENTION: u64 = 600;
+
 /// One node's protocol state.
 #[derive(Debug)]
 pub struct Protocol {
@@ -156,6 +162,9 @@ pub struct Protocol {
     relaying: BTreeMap<u64, (String, u64)>,
     /// When each suspect was first suspected, so it can be given up on.
     suspected_at: BTreeMap<NodeId, u64>,
+    /// When each dead member was first seen dead here (M123), so it can be forgotten after
+    /// [`DEAD_RETENTION`] ticks.
+    dead_since: BTreeMap<NodeId, u64>,
     /// Recent changes worth telling peers about, newest last, each with the number of times
     /// it has already ridden along.
     updates: Vec<(Member, u8)>,
@@ -193,6 +202,7 @@ impl Protocol {
             pending: BTreeMap::new(),
             relaying: BTreeMap::new(),
             suspected_at: BTreeMap::new(),
+            dead_since: BTreeMap::new(),
             updates: Vec::new(),
             tick: 0,
             unanswered: BTreeMap::new(),
@@ -230,6 +240,7 @@ impl Protocol {
 
         self.expire_probes(&mut out);
         self.bury_suspects();
+        self.forget_the_long_dead();
 
         // One direct probe per period. ⚠️ ONE, whatever the fleet size: this is the whole of
         // the O(1) claim, and a protocol that probes "a few percent of peers" is linear
@@ -249,6 +260,28 @@ impl Protocol {
             ));
         }
         out
+    }
+
+    /// Forgets every member dead here for [`DEAD_RETENTION`] ticks (M123): a view, and every
+    /// `Sync` of it, grew with the fleet's history rather than its size. Dead members carry
+    /// no checksum, so this moves no sum a peer compares.
+    fn forget_the_long_dead(&mut self) {
+        let now = self.tick;
+        let dead: Vec<NodeId> = self
+            .cluster
+            .members()
+            .filter(|m| m.state == State::Dead)
+            .map(|m| m.id)
+            .collect();
+        // Refuted since: no longer dead, no longer timed.
+        self.dead_since.retain(|id, _| dead.contains(id));
+        for id in dead {
+            let since = *self.dead_since.entry(id).or_insert(now);
+            if now.saturating_sub(since) >= DEAD_RETENTION && self.cluster.forget(&id) {
+                self.dead_since.remove(&id);
+                self.updates.retain(|(u, _)| u.id != id);
+            }
+        }
     }
 
     /// Leaves the fleet (M123): this node's record, dead, as a `Part` to a few live peers --
@@ -681,6 +714,12 @@ impl Protocol {
                 continue;
             }
             let Some(local) = self.cluster.member(&m.id).cloned() else {
+                // ⚠️ A stranger's death is not news (M123), as memberlist ignores it: it adds
+                // nothing to the checksum, and learning it would teach a forgotten member back
+                // to every view that had let it go.
+                if m.state == State::Dead {
+                    continue;
+                }
                 self.cluster.join(m.id, m.addr.clone(), m.zone.clone());
                 self.apply(m);
                 continue;
@@ -1839,13 +1878,15 @@ mod tests {
         // `TaggedDigest` delivered to it, and sends M34's `Digest` where this build tags.
         let mut new = mostly_dead(0);
         let mut old = mostly_dead(1);
-        // A record only the old node holds, past any piggyback.
+        // A record only the old node holds, past any piggyback. ⚠️ Suspect, not dead (M123): a
+        // dead member is out of the checksum, so a difference only in the dead is no
+        // divergence to reconcile -- this test's subject is the reconciliation.
         let newer = Member {
             id: nid(50),
             addr: "n50".to_owned(),
             zone: "az-a".to_owned(),
             incarnation: 9,
-            state: State::Dead,
+            state: State::Suspect,
         };
         old.cluster.upsert(newer.clone());
         assert_ne!(new.cluster.checksum(), old.cluster.checksum());

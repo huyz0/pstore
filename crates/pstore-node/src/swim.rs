@@ -110,6 +110,19 @@ impl Member {
             .collect()
     }
 
+    /// The addresses of the members this one holds dead, in `zone` (M123): what its refold
+    /// drops from the roster.
+    pub async fn dead_in(&self, zone: &str) -> Vec<String> {
+        self.proto
+            .lock()
+            .await
+            .cluster()
+            .members()
+            .filter(|m| m.state == pstore_gossip::State::Dead && m.zone == zone)
+            .map(|m| m.addr.clone())
+            .collect()
+    }
+
     /// Bytes sent, received, and dropped since start.
     #[must_use]
     pub fn traffic(&self) -> (u64, u64, u64) {

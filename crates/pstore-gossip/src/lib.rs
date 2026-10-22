@@ -24,5 +24,5 @@ mod wire;
 pub use cluster::{
     BUCKETS, Cluster, LEAVES, LEAVES_PER_BUCKET, Member, NodeId, State, bucket_of, leaf_at, leaf_of,
 };
-pub use protocol::Protocol;
+pub use protocol::{DEAD_RETENTION, Protocol};
 pub use wire::{MAX_DATAGRAM, Message, SEAL};

@@ -1295,3 +1295,90 @@ fn a_leaving_node_is_dead_everywhere_within_a_few_rounds_and_may_return() {
         "a node that left could not come back"
     );
 }
+
+#[test]
+fn a_long_dead_member_is_forgotten_everywhere_without_reconciling() {
+    // M123: a view never forgot a dead member, so it -- and every `Sync` -- grew with the
+    // fleet's history rather than its size. Dead past the retention, a member is forgotten,
+    // and the forgetting itself costs no reconciliation.
+    let n = 20u16;
+    let mut sim = Sim::new(n, true);
+    for r in 0..20 {
+        sim.round(r);
+    }
+    // Crashed: it neither answers nor sends. ⚠️ Not `by_addr.remove` alone, which leaves it
+    // probing the others -- and a member a view forgot is learned again from its own ping,
+    // as a restarted member is meant to be.
+    let crashed = addr(n - 1);
+    sim.by_addr.remove(&crashed);
+    let silent = |sim: &mut Sim, limit: u64, done: &dyn Fn(&Sim) -> bool| -> Option<u64> {
+        for r in 0..limit {
+            sim.round(r);
+            sim.in_flight.retain(|(from, _, _)| *from != crashed);
+            if done(sim) {
+                return Some(r + 1);
+            }
+        }
+        None
+    };
+    let gone = usize::from(n - 1);
+    let dead = |sim: &Sim| {
+        sim.nodes
+            .iter()
+            .take(gone)
+            .all(|p| p.cluster().state(&id(n - 1)) == Some(State::Dead))
+    };
+    silent(&mut sim, 400, &dead).expect("never declared dead");
+    // The death's own reconciliation -- views disagreeing while some still hold it alive --
+    // settles first; what is counted after is the forgetting's.
+    silent(&mut sim, 20, &|_| false);
+    let syncs = sim.syncs;
+    let forgotten = |sim: &Sim| {
+        sim.nodes
+            .iter()
+            .take(gone)
+            .all(|p| p.cluster().state(&id(n - 1)).is_none())
+    };
+    let limit = pstore_gossip::DEAD_RETENTION + 50;
+    silent(&mut sim, limit, &forgotten).expect("a dead member was never forgotten");
+    assert!(
+        sim.nodes
+            .iter()
+            .take(gone)
+            .all(|p| p.cluster().len() == gone),
+        "a survivor still counts the dead"
+    );
+    assert_eq!(
+        sim.syncs, syncs,
+        "forgetting the dead cost a reconciliation"
+    );
+}
+
+#[test]
+fn a_strangers_death_is_not_learned() {
+    // M123: a view that has forgotten a dead member must not be taught it back -- a `Sync`
+    // sent for any other difference carries every member its sender holds, the dead among
+    // them. Like memberlist, a death of a member never heard of is ignored.
+    let mut c = Cluster::new(id(1), addr(1), "az-a".to_owned());
+    c.join(id(0), addr(0), "az-a".to_owned());
+    let mut p = Protocol::new(c);
+    let stranger = pstore_gossip::Member {
+        id: id(9),
+        addr: addr(9),
+        zone: "az-a".to_owned(),
+        incarnation: 3,
+        state: State::Dead,
+    };
+    p.receive(
+        &addr(0),
+        &Message::Sync {
+            from: id(0),
+            members: vec![stranger],
+        },
+    );
+    assert_eq!(
+        p.cluster().state(&id(9)),
+        None,
+        "a stranger's death was learned"
+    );
+}

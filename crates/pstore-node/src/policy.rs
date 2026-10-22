@@ -81,10 +81,12 @@ pub async fn read_roster_patiently<S: BlobStore>(
 /// one sat at a one-member view for 493 ticks.
 #[must_use]
 pub fn to_dial<'a>(known: &'a Roster, view: &[String]) -> Vec<&'a str> {
+    // A set (M123): `view.contains` per roster entry was O(R·V), every heal.
+    let seen: std::collections::HashSet<&str> = view.iter().map(String::as_str).collect();
     known
         .nodes()
         .iter()
-        .filter(|n| !view.contains(n))
+        .filter(|n| !seen.contains(n.as_str()))
         .map(String::as_str)
         .collect()
 }
@@ -130,10 +132,65 @@ pub fn in_cell(zoned: &[(String, String)], zone: &str) -> Vec<String> {
 /// Returning `None` when nothing is new is what keeps a converged fleet's steady-state write
 /// rate at **zero** rather than one PUT per node per period — a cost that would scale with
 /// nodes and carry no information.
+///
+/// ⚠️ **Less what this node holds dead** (M123), unless it also sees it alive: the roster only
+/// ever grew -- every address the cell had ever had, read by every node at every heal and
+/// seeded alive at every boot. A live member on the far side of a partition, held dead here,
+/// writes itself back on its own next refold, so the healing this exists for still reaches it.
 #[must_use]
-pub fn union_to_publish(known: &Roster, view: &[String]) -> Option<Roster> {
+pub fn union_to_publish(known: &Roster, view: &[String], dead: &[String]) -> Option<Roster> {
+    let alive: std::collections::HashSet<&str> = view.iter().map(String::as_str).collect();
+    let gone: std::collections::HashSet<&str> = dead
+        .iter()
+        .map(String::as_str)
+        .filter(|d| !alive.contains(d))
+        .collect();
     let union = known.merged(&Roster::from_nodes(view.iter().cloned()));
-    (union.nodes().len() != known.nodes().len()).then_some(union)
+    let kept = Roster::from_nodes(
+        union
+            .nodes()
+            .iter()
+            .filter(|n| !gone.contains(n.as_str()))
+            .cloned(),
+    );
+    (kept.nodes() != known.nodes()).then_some(kept)
+}
+
+/// Publishes `me` into the roster at join (M123), each request bounded by `within`: the
+/// write, and on a lost race one rebase -- a read and a write. `Ok` with the members published,
+/// or why it did not: a lost or timed-out announce is fine, since gossip carries a node in as
+/// soon as one peer knows it.
+///
+/// ⚠️ **Bounded**, as the join read is: unbounded, a store holding the write held the node
+/// before its first view and its heal loop, where it could not be told from a dead one.
+///
+/// # Errors
+/// Why it was not published.
+pub async fn announce_within<S: BlobStore>(
+    store: &S,
+    cell: &pstore_cluster::Cell,
+    roster: &Roster,
+    me: &str,
+    tag: Option<pstore_types::CasTag>,
+    within: Duration,
+) -> Result<usize, String> {
+    let mine = roster.merged(&Roster::from_nodes([me.to_owned()]));
+    match tokio::time::timeout(within, Roster::refold(store, cell, &mine, tag)).await {
+        Ok(Ok(())) => return Ok(mine.nodes().len()),
+        Err(_) => return Err(format!("no answer in {within:?}")),
+        Ok(Err(_)) => {}
+    }
+    // Lost the race: rebase and try once.
+    let (cur, t) = tokio::time::timeout(within, Roster::read(store, cell))
+        .await
+        .map_err(|_| format!("no answer in {within:?}"))?
+        .map_err(|e| e.to_string())?;
+    let merged = cur.merged(&Roster::from_nodes([me.to_owned()]));
+    tokio::time::timeout(within, Roster::refold(store, cell, &merged, t))
+        .await
+        .map_err(|_| format!("no answer in {within:?}"))?
+        .map_err(|e| e.to_string())?;
+    Ok(merged.nodes().len())
 }
 
 /// How many of `shards` synthetic shards this node would hold, at replication `r`.

@@ -432,3 +432,30 @@ async fn a_node_that_loses_the_id_race_takes_the_winners() {
     let id = store_identity(&store, "e", "b").await.unwrap();
     assert_eq!(id, "s3 e b winner");
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_store_id_is_retried_and_bounded() {
+    // M123: the store id was one read, untimed and unretried, and any error exited the
+    // process -- so a fleet restart's herd on one key, refused with SlowDown, lost the nodes
+    // that lost the race. Briefly unreachable, it is retried; down, it gives up in bounded
+    // time rather than never.
+    use pstore_server::store_identity_patiently;
+    use std::time::Duration;
+    let brief = Accounted::new(pstore_testkit::flaky::Flaky::refusing_reads_at(&[0, 1, 2]));
+    let id = store_identity_patiently(&brief, "e", "b", 8, Duration::from_secs(5))
+        .await
+        .expect("a briefly unreachable store's id");
+    assert!(id.starts_with("s3 e b "), "{id}");
+    let down = Accounted::new(pstore_testkit::flaky::Flaky::refusing_reads());
+    let started = tokio::time::Instant::now();
+    assert!(
+        store_identity_patiently(&down, "e", "b", 8, Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(120),
+        "gave up after {:?}",
+        started.elapsed()
+    );
+}

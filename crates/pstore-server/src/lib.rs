@@ -4882,9 +4882,63 @@ pub async fn open_cache<S: BlobStore>(
     let Some(c) = &config.cache else {
         return Ok(None);
     };
-    let identity = store_identity(store, &config.endpoint, &config.bucket).await?;
+    let identity = store_identity_patiently(
+        store,
+        &config.endpoint,
+        &config.bucket,
+        STORE_ID_ATTEMPTS,
+        STORE_ID_WITHIN,
+    )
+    .await?;
     let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
     Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+}
+
+/// Attempts at the store id before a start gives up (M123), each bounded by [`STORE_ID_WITHIN`].
+const STORE_ID_ATTEMPTS: u32 = 8;
+
+/// How long one attempt at the store id may take (M123).
+const STORE_ID_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`store_identity`], each attempt bounded by `within`, retried up to `attempts` times with a
+/// backoff that doubles from 200 ms to 5 s and is jittered (M123).
+///
+/// ⚠️ It was one read, untimed and unretried, and any error exited the process: a fleet
+/// restarting at once is a herd on one key, and S3 answers a herd with SlowDown -- every node
+/// that lost the draw exited. Briefly unreachable is retried; down gives up, in bounded time.
+///
+/// # Errors
+/// The last attempt's, when none succeeded.
+pub async fn store_identity_patiently<S: BlobStore>(
+    store: &Accounted<S>,
+    endpoint: &str,
+    bucket: &str,
+    attempts: u32,
+    within: std::time::Duration,
+) -> Result<String, pstore_blob::BlobError> {
+    let mut last = pstore_blob::BlobError::Other("no attempt at the store id".to_owned());
+    for attempt in 0..attempts.max(1) {
+        match tokio::time::timeout(within, store_identity(store, endpoint, bucket)).await {
+            Ok(Ok(id)) => return Ok(id),
+            Ok(Err(e)) => last = e,
+            Err(_) => {
+                last = pstore_blob::BlobError::Other(format!(
+                    "the store id did not answer in {within:?}"
+                ));
+            }
+        }
+        if attempt + 1 < attempts {
+            let base = std::time::Duration::from_millis(200)
+                .saturating_mul(1 << attempt.min(5))
+                .min(std::time::Duration::from_secs(5));
+            // Jittered by the clock's low bits, so a herd that failed together retries apart.
+            let jitter = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::from(d.subsec_nanos()));
+            tokio::time::sleep(base + std::time::Duration::from_millis(jitter % 200)).await;
+        }
+    }
+    Err(last)
 }
 
 /// Where a store keeps the id its read caches are validated by (M20).

@@ -69,7 +69,7 @@ writers -- are owner decisions, recorded in FINDINGS.md.
 ## Acceptance criteria
 
 Each a test, seen red before its fix and against a deliberate break of it; named in
-VERIFIED.md as each task lands.
+[VERIFIED.md](VERIFIED.md) as each task lands.
 
 1. A batched write is in the blob store within the flush age, and after a stop.
 2. A successor's scheduled fold folds a stopped predecessor's bundles.

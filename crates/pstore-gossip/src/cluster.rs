@@ -64,7 +64,16 @@ impl Member {
     /// ⚠️ Covers identity, incarnation and state — **not** the address, which never changes
     /// for a given identity, and **not** any counter that advances on its own. A checksum
     /// over something that ticks can never match, which is exactly why this crate exists.
+    ///
+    /// ⚠️ **A dead member contributes nothing** (M123): to the checksum it is as if absent. So a
+    /// death a peer has not heard of yet costs no reconciliation -- it spreads by piggyback,
+    /// and a laggard still holding the member alive differs, and reconciles, by that -- and a
+    /// view may forget a long-dead member without moving any sum a peer compares. A fleet of
+    /// mixed builds reconciles while it holds a dead member; one build again, it agrees.
     fn fingerprint(&self) -> u64 {
+        if self.state == State::Dead {
+            return 0;
+        }
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut mix = |b: u8| {
             h ^= u64::from(b);
@@ -373,6 +382,26 @@ impl Cluster {
     pub fn leave(&mut self) {
         let me = self.me;
         self.transition(&me, State::Dead, |s| s != State::Dead);
+    }
+
+    /// Forgets a dead member (M123): what a view does once it has been dead longer than any
+    /// message about it still circulates. Never a live one, never this node. A dead member's
+    /// fingerprint is zero, so the checksum is unchanged. Answers whether it forgot.
+    pub fn forget(&mut self, id: &NodeId) -> bool {
+        if *id == self.me || self.state(id) != Some(State::Dead) {
+            return false;
+        }
+        if let Some(m) = self.members.remove(id) {
+            let old = m.fingerprint();
+            self.checksum = self.checksum.wrapping_sub(old);
+            if let Some(slot) = self.buckets.get_mut(bucket_of(id)) {
+                *slot = slot.wrapping_sub(old);
+            }
+            if let Some(slot) = self.leaves.get_mut(leaf_of(id)) {
+                *slot = slot.wrapping_sub(old);
+            }
+        }
+        true
     }
 
     /// A member's own claim that it is alive, at a stated incarnation.
