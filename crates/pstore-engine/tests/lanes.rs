@@ -189,3 +189,75 @@ async fn a_lane_with_nothing_to_fold_gets_no_watermark() {
         head.watermarks
     );
 }
+
+#[tokio::test]
+async fn a_fold_probes_an_idle_lane_once() {
+    // M123: a fold probed eight bundles of every lane the tenant ever had, idle or not --
+    // and a load balancer spreads one tenant's writes over many servers, so many lanes.
+    let s = Accounted::new(MemoryStore::new());
+    let t = TenantId(31);
+    let lanes = 4u64;
+    for l in 1..=lanes {
+        let e = Engine::new(Arc::new(s.as_tenant(t)), t, LaneId(l));
+        e.write("a", vec![doc(&format!("d{l}"), 1)]).await.unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    let e = Engine::new(Arc::new(s.as_tenant(t)), t, LaneId(1));
+    let before = s.count(t, OpClass::Read);
+    e.fold().await.unwrap();
+    let reads = s.count(t, OpClass::Read) - before;
+    // HEAD, the registry, and one probe a lane: every lane is idle.
+    assert!(
+        reads <= 2 + lanes,
+        "{reads} reads to fold {lanes} idle lanes, where one probe each is {}",
+        2 + lanes
+    );
+}
+
+#[tokio::test]
+async fn a_folded_lane_is_retired_and_a_later_write_registers_it_again() {
+    // M123: a lane stayed registered for good -- every server that ever wrote a tenant cost
+    // every later fold a probe. A clean stop retires its own lane once every bundle on it is
+    // folded; a lane with an unfolded bundle is kept; and a write after the retirement
+    // registers the lane again, so nothing it writes is lost to a fold.
+    let s = Arc::new(MemoryStore::new());
+    let t = TenantId(32);
+    let (a, b) = (
+        Engine::new(Arc::clone(&s), t, LaneId(1)),
+        Engine::new(Arc::clone(&s), t, LaneId(2)),
+    );
+    a.write("a", vec![doc("x", 1)]).await.unwrap();
+    a.flush().await.unwrap();
+    b.write("a", vec![doc("y", 2)]).await.unwrap();
+    b.flush().await.unwrap();
+    assert!(
+        !a.retire_lane().await.unwrap(),
+        "an unfolded lane was retired"
+    );
+    a.fold().await.unwrap();
+    assert!(a.retire_lane().await.unwrap());
+    assert_eq!(lanes::live(&*s, t).await.unwrap(), vec![LaneId(2)]);
+    a.write("a", vec![doc("z", 3)]).await.unwrap();
+    a.flush().await.unwrap();
+    let mut live = lanes::live(&*s, t).await.unwrap();
+    live.sort();
+    assert_eq!(
+        live,
+        vec![LaneId(1), LaneId(2)],
+        "a write after the retirement was not registered"
+    );
+    // And it folds: a successor sees every row.
+    let c = Engine::new(Arc::clone(&s), t, LaneId(3));
+    c.fold().await.unwrap();
+    let mut ids: Vec<String> = c
+        .segment_rows_for_test("a")
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .map(|d| d.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["x", "y", "z"]);
+}

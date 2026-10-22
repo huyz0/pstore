@@ -765,6 +765,16 @@ async fn a_stop_flushes_and_folds_what_it_holds() {
     server.await.unwrap().unwrap();
     assert_eq!(found(&b, 72).await, ["b", "d"]);
     assert_eq!(found(&b, 74).await, ["only"]);
+    // And its lane retired from each tenant it wrote: every bundle on it is folded.
+    for t in [72u64, 74] {
+        assert!(
+            pstore_engine::lanes::live(&w.switch.inner, TenantId(u128::from(t)))
+                .await
+                .unwrap()
+                .is_empty(),
+            "tenant {t} kept the stopped lane"
+        );
+    }
 }
 
 #[tokio::test]

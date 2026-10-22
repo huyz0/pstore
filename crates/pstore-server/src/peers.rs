@@ -313,6 +313,19 @@ pub fn peer_list_of(members: &[(String, String)], me: &str) -> (Vec<String>, usi
 pub(crate) struct List {
     pub(crate) servers: Vec<String>,
     pub(crate) me: usize,
+    /// The servers on a ring (M123), built once per list: a placement ranks a key's window,
+    /// not the fleet, which was `O(N)` hashes a segment on every split query.
+    pub(crate) ring: pstore_engine::Ring,
+}
+
+impl List {
+    pub(crate) fn new(servers: Vec<String>, me: usize) -> Self {
+        Self {
+            ring: pstore_engine::Ring::new(&servers),
+            servers,
+            me,
+        }
+    }
 }
 
 /// A server's own SWIM member and the task that refreshes its peer list from it (M56).
@@ -356,7 +369,7 @@ impl PeerGossip {
                 loop {
                     let view = member.members_zoned().await;
                     let (servers, me) = peer_list_of(&view, &url);
-                    cluster.set_list(List { servers, me });
+                    cluster.set_list(servers, me);
                     tokio::time::sleep(period).await;
                 }
             })
@@ -422,10 +435,7 @@ impl Cluster {
             })?;
         Ok(Self {
             client,
-            list: std::sync::RwLock::new(Arc::new(List {
-                servers: config.servers,
-                me: config.me,
-            })),
+            list: std::sync::RwLock::new(Arc::new(List::new(config.servers, config.me))),
             sent: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         })
@@ -441,12 +451,16 @@ impl Cluster {
         )
     }
 
-    /// Replaces the list (M56). The client and the counters stay.
-    pub(crate) fn set_list(&self, list: List) {
-        *self
+    /// Replaces the list (M56). The client and the counters stay. An unchanged list keeps its
+    /// ring (M123): the refresh runs every gossip period, and a ring is `O(N log N)` to build.
+    pub(crate) fn set_list(&self, servers: Vec<String>, me: usize) {
+        let mut list = self
             .list
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(list);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if list.servers != servers || list.me != me {
+            *list = Arc::new(List::new(servers, me));
+        }
     }
 }
 
@@ -467,6 +481,10 @@ impl Peers for QueryPeers {
 
     fn me(&self) -> usize {
         self.list.me
+    }
+
+    fn place(&self, key: &str) -> usize {
+        self.list.ring.place(key, &self.list.servers)
     }
 
     fn part(

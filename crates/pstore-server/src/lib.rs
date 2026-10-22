@@ -921,6 +921,12 @@ impl<S: BlobStore + 'static> Api<S> {
                 let flushed = e.unflushed().is_none() || e.flush().await.is_ok();
                 let owed = e.unfolded().is_some() || e.inherited();
                 let folded = !owed || e.fold().await.is_ok();
+                // M123: and its lane retired, every bundle on it folded, so the tenant's later
+                // folds stop probing a lane this process no longer writes. Best effort: a lane
+                // left registered costs a probe, never a row.
+                if flushed && folded {
+                    let _ = e.retire_lane().await;
+                }
                 (flushed, folded)
             })
             .buffer_unordered(FLUSH_CONCURRENCY)
@@ -1188,6 +1194,13 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            // M123: this server cannot become one more writer of the tenant; another, already
+            // registered, can take the write.
+            EngineError::TooManyLanes(_) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "lane_registry_full",
+                e.to_string(),
+            ),
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
                 use pstore_engine::ReplicaRefusal as R;

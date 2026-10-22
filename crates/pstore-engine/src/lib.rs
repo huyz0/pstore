@@ -376,6 +376,14 @@ pub enum EngineError {
     /// is a backend fault or a corrupted lane rather than a large one.
     #[error("lane {0:?} did not terminate within the probe bound")]
     LaneTooLong(pstore_types::LaneId),
+    /// M123: the tenant's lane registry is full -- `lanes::MAX_LANES` writers have written it.
+    /// Refused rather than registered: one more was a registry no reader could decode, which
+    /// failed every fold, strong read and new writer of the tenant for good.
+    #[error(
+        "the tenant's lane registry is full: {0} writers have written it; this write is \
+         refused, and the tenant's existing lanes are untouched"
+    )]
+    TooManyLanes(usize),
 }
 
 impl From<pstore_blob::BlobError> for EngineError {
@@ -3539,6 +3547,48 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
+    /// Retires this engine's lane from the tenant's registry when every bundle it wrote is
+    /// folded and it holds nothing unflushed (M123): what a clean stop does, so the tenant's
+    /// later folds stop probing a lane nobody writes. Answers whether it retired.
+    ///
+    /// ⚠️ **Under `flushing`**, so no bundle lands between the check and the removal: one that
+    /// did would be on a lane no fold reads -- an acknowledged write lost. And the resume is
+    /// forgotten, so a flush after this resumes the lane, and registers it again.
+    ///
+    /// # Errors
+    /// If HEAD or the registry cannot be read or written.
+    pub async fn retire_lane(&self) -> Result<bool, EngineError> {
+        let _flushing = self.flushing.lock().await;
+        if self.unflushed().is_some()
+            || self.unfolded().is_some()
+            || self.inherited()
+            || self.uncertain().is_some()
+        {
+            return Ok(false);
+        }
+        let next = self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.next.0);
+        // A lane this process never resumed may hold a predecessor's bundles it never looked
+        // for: not this process's to retire.
+        let Some(next) = next else {
+            return Ok(false);
+        };
+        let at = head::read(&*self.store, self.tenant).await?;
+        if self.watermark(&at.head) < next {
+            return Ok(false);
+        }
+        lanes::retire(&*self.store, self.tenant, self.lane).await?;
+        *self
+            .seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(true)
+    }
+
     /// Drops every cached fresh segment built from an older memtable generation (M123): a
     /// fold's prune moves the generation, and an idle engine's stale segments -- rows, index
     /// and store -- otherwise stayed resident until its next query missed, in no budget.
@@ -3957,7 +4007,8 @@ impl<S: BlobStore> Engine<S> {
             let spans = futures_util::future::try_join_all(live.iter().map(|l| {
                 let from = at.head.watermarks.get(&l.0).copied().unwrap_or(0);
                 async move {
-                    lanes::tail(&*self.store, self.tenant, *l, from)
+                    // M123: one probe first -- most of a tenant's lanes are idle at a fold.
+                    lanes::tail_from(&*self.store, self.tenant, *l, from, 1)
                         .await
                         .map(|tail| (*l, from, tail))
                 }
@@ -6708,6 +6759,11 @@ pub trait Peers: Send + Sync {
     fn servers(&self) -> &[String];
     /// This server's position in [`Self::servers`].
     fn me(&self) -> usize;
+    /// The server, by position in [`Self::servers`], a segment's legs run on: [`assign`] unless
+    /// the implementation keeps a [`Ring`] of its list (M123), as a server's does.
+    fn place(&self, key: &str) -> usize {
+        assign(key, self.servers())
+    }
     /// Runs `part` on `server`. An error is the coordinator's cue to run it itself.
     fn part(
         &self,
@@ -6769,30 +6825,90 @@ pub struct Part {
 /// bytes would land on servers by those bytes' low bits.
 #[must_use]
 pub fn assign(key: &str, servers: &[String]) -> usize {
+    best_of(key, servers, 0..servers.len())
+}
+
+/// The highest-scoring of `servers` at `at`, for `key`; ties to the earlier server.
+fn best_of(key: &str, servers: &[String], at: impl IntoIterator<Item = usize>) -> usize {
     let mut best: Option<(usize, u64)> = None;
-    for (i, s) in servers.iter().enumerate() {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in s
-            .trim_end_matches('/')
-            .bytes()
-            .chain([0])
-            .chain(key.bytes())
-        {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-        // SplitMix64's finaliser, less its last shift: that shift moves only the low 33 bits,
-        // and the highest hash is decided by the high ones (the sweep found it changed nothing).
-        h ^= h >> 30;
-        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h ^= h >> 27;
-        h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    for i in at {
+        let Some(s) = servers.get(i) else { continue };
+        let h = score(s.trim_end_matches('/').as_bytes(), key.as_bytes());
         // Ties to the earlier server: a fixed rule, so every coordinator agrees.
-        if best.is_none_or(|(_, top)| h > top) {
+        if best.is_none_or(|(j, top)| h > top || (h == top && i < j)) {
             best = Some((i, h));
         }
     }
     best.map_or(0, |(i, _)| i)
+}
+
+/// `mix(fnv(a ‖ 0 ‖ b))`: a server's weight for a key, as [`assign`] has always ranked them.
+fn score(a: &[u8], b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in a.iter().chain(&[0]).chain(b) {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    // SplitMix64's finaliser, less its last shift: that shift moves only the low 33 bits,
+    // and the highest hash is decided by the high ones (the sweep found it changed nothing).
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h.wrapping_mul(0x94d0_49bb_1331_11eb)
+}
+
+/// A server list placed on a ring (M123), so a key is ranked against the `window(N)` servers
+/// clockwise of it -- C-6's window, `max(32, 3·√N)` -- rather than all of them: [`assign`] was
+/// `O(N)` hashes a segment a split query, ~1 ms a segment at ten thousand servers. Built once
+/// per peer list, not per query.
+///
+/// ⚠️ **Exactly [`assign`] while the window covers the fleet** -- every fleet up to 32 -- so a
+/// small deployment's segments stay where they were. A server added takes keys only from the
+/// windows it lands in: ~1/N of them, 1.2–1.6× rendezvous's optimum (`pstore-cluster`).
+#[derive(Debug, Clone, Default)]
+pub struct Ring {
+    /// Each server's ring position and index, ascending.
+    ring: Vec<(u64, usize)>,
+    window: usize,
+}
+
+impl Ring {
+    /// The ring of `servers`.
+    #[must_use]
+    pub fn new(servers: &[String]) -> Self {
+        let mut ring: Vec<(u64, usize)> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (score(b"ring", s.trim_end_matches('/').as_bytes()), i))
+            .collect();
+        ring.sort_unstable();
+        Self {
+            window: pstore_cluster::placement::window(servers.len()),
+            ring,
+        }
+    }
+
+    /// Servers a placement ranks.
+    #[must_use]
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// The server, of the `servers` this ring was built from, that `key`'s legs run on.
+    #[must_use]
+    pub fn place(&self, key: &str, servers: &[String]) -> usize {
+        let n = self.ring.len();
+        if self.window >= n {
+            return assign(key, servers);
+        }
+        let pos = score(b"key", key.as_bytes());
+        let start = self.ring.partition_point(|(p, _)| *p < pos);
+        best_of(
+            key,
+            servers,
+            (0..self.window).filter_map(|k| self.ring.get((start + k) % n).map(|(_, i)| *i)),
+        )
+    }
 }
 
 /// The fewest folded segments a query is split over (M54): one segment is one scan.
@@ -6864,7 +6980,7 @@ fn shares(
     }
     let mut by_server: BTreeMap<usize, Vec<(usize, pstore_query::Target)>> = BTreeMap::new();
     for (i, t) in durable.iter().enumerate() {
-        let server = assign(t.segment.as_str(), servers);
+        let server = peers.place(t.segment.as_str());
         if server != peers.me() {
             by_server.entry(server).or_default().push((i, t.clone()));
         }
@@ -7353,6 +7469,155 @@ mod split_tests {
         assert_eq!(
             assign("k", &["http://a".to_owned(), "http://a".to_owned()]),
             0
+        );
+    }
+
+    /// `Named`, with every segment placed on its last server.
+    struct Last(Named);
+
+    impl Peers for Last {
+        fn servers(&self) -> &[String] {
+            self.0.servers()
+        }
+        fn me(&self) -> usize {
+            0
+        }
+        fn place(&self, _: &str) -> usize {
+            self.0.0.len() - 1
+        }
+        fn part(
+            &self,
+            s: usize,
+            p: Part,
+        ) -> futures_util::future::BoxFuture<'static, Result<pstore_query::PartHits, String>>
+        {
+            self.0.part(s, p)
+        }
+        fn phased(&self, s: usize, p: Part) -> Phased {
+            self.0.phased(s, p)
+        }
+    }
+
+    /// M123: a split places by its peers' `place`, which a server's ring overrides -- not by
+    /// `assign` over the list, which is the default and `O(N)`.
+    #[test]
+    fn a_split_places_by_its_peers() {
+        let peers = Last(Named(fleet(3)));
+        let targets: Vec<pstore_query::Target> = (0..6)
+            .map(|i| pstore_query::Target {
+                segment: Key::new(format!("0001/tnt/1/idx/x/seg/L0/{i}.seg")),
+                segment_len: None,
+                centroids: None,
+                deleted: None,
+                sparse_dict: false,
+                text_dict: false,
+                fde_clusters: false,
+                shadowed: false,
+            })
+            .collect();
+        let dense = vec![pstore_query::Prefetch::Dense {
+            field: "vector".to_owned(),
+            query: vec![1.0],
+            limit: 10,
+            tune: pstore_index::vec_index::Query::default(),
+        }];
+        let got = shares(
+            &peers,
+            "x",
+            &targets,
+            &dense,
+            pstore_format::text::FullText::default(),
+            0,
+            pstore_query::Fusion::default(),
+            10,
+            MAX_PART_SEGMENTS,
+        );
+        assert_eq!(got.len(), 1, "one share, on the server `place` named");
+        assert_eq!(got[0].targets, (0..6).collect::<Vec<_>>());
+    }
+
+    fn fleet(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("http://10.0.{}.{}:8080", i / 256, i % 256))
+            .collect()
+    }
+
+    /// M123: a ring ranks a key against its window, never the fleet -- and is exactly
+    /// `assign` while the window is the fleet, so a small deployment moves nothing.
+    #[test]
+    fn a_ring_ranks_a_window_and_is_assign_while_the_window_is_the_fleet() {
+        for n in [1, 2, 5, 32] {
+            let servers = fleet(n);
+            let ring = Ring::new(&servers);
+            for k in 0..500 {
+                let key = format!("0046/tnt/70/idx/a/seg/L0/{k:020}.seg");
+                assert_eq!(
+                    ring.place(&key, &servers),
+                    assign(&key, &servers),
+                    "{n}, {key}"
+                );
+            }
+        }
+        let servers = fleet(10_000);
+        let ring = Ring::new(&servers);
+        assert_eq!(ring.window(), 300, "3·√10000");
+        // Clockwise of the key, `window` of them, and the best of those by `assign`'s rank.
+        let mut by_pos: Vec<(u64, usize)> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (score(b"ring", s.as_bytes()), i))
+            .collect();
+        by_pos.sort_unstable();
+        let mut outside = 0;
+        for k in 0..200 {
+            let key = format!("seg/{k}");
+            let got = ring.place(&key, &servers);
+            let pos = score(b"key", key.as_bytes());
+            let start = by_pos.partition_point(|(p, _)| *p < pos);
+            let window: Vec<usize> = (0..300)
+                .map(|j| by_pos[(start + j) % by_pos.len()].1)
+                .collect();
+            assert!(window.contains(&got), "{key} placed outside its window");
+            let best = window
+                .iter()
+                .copied()
+                .max_by(|a, b| {
+                    score(servers[*a].as_bytes(), key.as_bytes())
+                        .cmp(&score(servers[*b].as_bytes(), key.as_bytes()))
+                        .then(b.cmp(a))
+                })
+                .unwrap();
+            assert_eq!(got, best, "{key}");
+            outside += usize::from(assign(&key, &servers) != got);
+        }
+        // The fleet-wide best is almost never in a 3% window: the ring is not `assign`.
+        assert!(outside > 150, "{outside} of 200 placed as assign does");
+    }
+
+    /// M123: a server joining a thousand moves ~1/N of the keys, most of them to itself.
+    /// ⚠️ Not all: a newcomer in a key's window pushes the window's last server out, and a key
+    /// that server won moves to another old one -- local rendezvous's 1.2-1.6x of the optimum.
+    #[test]
+    fn a_join_moves_about_one_in_n_keys_mostly_to_the_newcomer() {
+        let before = fleet(1000);
+        let mut after = before.clone();
+        after.push("http://10.9.9.9:8080".to_owned());
+        let (a, b) = (Ring::new(&before), Ring::new(&after));
+        let keys = 20_000;
+        let (mut moved, mut to_new) = (0, 0);
+        for k in 0..keys {
+            let key = format!("seg/{k}");
+            let (was, now) = (a.place(&key, &before), b.place(&key, &after));
+            if was != now {
+                moved += 1;
+                to_new += usize::from(now == 1000);
+            }
+        }
+        // 20 at the optimum; a sample of 20,000 and the window's edge on top.
+        assert!((5..=80).contains(&moved), "{moved} of {keys} keys moved");
+        assert!(
+            to_new * 2 >= moved,
+            "{to_new} of {moved} moves went to the newcomer"
         );
     }
 

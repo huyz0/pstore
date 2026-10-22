@@ -440,8 +440,10 @@ async fn an_uncontended_fold_compaction_and_branch_are_unchanged() {
     let (_, br, bw) = cost(&w, w.a.branch("idx", "copy")).await;
     // ⚠️ Exactly what the same operations cost before M23 (measured on the parent commit, code
     // review round 1): a create is the PUT it replaced, never a probe before it.
-    assert_eq!((fr, fw), (11, 2), "a fold");
-    assert_eq!((dr, dw), (15, 2), "a fold that deletes");
+    // M123: a fold's first probe of a lane is one bundle, not eight: its lane with one bundle
+    // costs three probes where it cost eight, five reads fewer a fold.
+    assert_eq!((fr, fw), (6, 2), "a fold");
+    assert_eq!((dr, dw), (10, 2), "a fold that deletes");
     assert_eq!((cr, cw), (8, 2), "a compaction");
     assert_eq!((br, bw), (2, 2), "a branch copying a delete vector");
     // Today's names, no suffix anywhere, and nothing written unconditionally.
@@ -478,7 +480,8 @@ async fn a_refused_name_costs_exactly_one_write() {
         .unwrap();
     let (got, r, wr) = cost(&w, w.a.fold()).await;
     got.unwrap();
-    assert_eq!((r, wr), (11, 3));
+    // M123: five reads fewer, as `an_uncontended_fold_compaction_and_branch_are_unchanged`.
+    assert_eq!((r, wr), (6, 3));
     assert!(segments(&w.head().await, "idx")[0].ends_with("_1.seg"));
 }
 

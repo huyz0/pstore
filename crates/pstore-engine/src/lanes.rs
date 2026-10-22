@@ -83,6 +83,11 @@ pub async fn register<S: BlobStore>(
         if current.contains(&lane) {
             return Ok(());
         }
+        // M123: refused at the ceiling, never written past it -- a registry `decode` refuses
+        // breaks the tenant for every reader, where this refuses one writer.
+        if current.len() >= MAX_LANES {
+            return Err(EngineError::TooManyLanes(current.len()));
+        }
         let mut next = current;
         next.insert(lane);
         match store.put_conditional(&k, encode(&next).into(), pre).await {
@@ -100,6 +105,41 @@ pub async fn register<S: BlobStore>(
             Err(CasError::Lost | CasError::Contended) => {
                 crate::backoff(lane, attempt).await;
             }
+            Err(CasError::Io(e)) => return Err(EngineError::Blob(e)),
+        }
+    }
+    Err(EngineError::Lost)
+}
+
+/// Removes `lane` from the registry, if it is there (M123): what a clean stop does once every
+/// bundle on its lane is folded, so later folds stop probing it. The lane's watermark stays in
+/// HEAD, so a writer that comes back on it resumes past it -- and registers again.
+///
+/// # Errors
+/// If the store refuses, or every attempt loses.
+pub async fn retire<S: BlobStore>(
+    store: &S,
+    tenant: TenantId,
+    lane: LaneId,
+) -> Result<(), EngineError> {
+    crate::require_fencing(store)?;
+    let k = key(tenant);
+    for attempt in 0..16 {
+        let (mut current, tag) = match store.get_with_tag(&k).await {
+            Ok((bytes, tag)) => (decode(&bytes)?, tag),
+            Err(pstore_blob::BlobError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if !current.remove(&lane) {
+            return Ok(());
+        }
+        match store
+            .put_conditional(&k, encode(&current).into(), Precondition::Match(tag))
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // A registration won: rebase, so its lane survives the removal of ours.
+            Err(CasError::Lost | CasError::Contended) => crate::backoff(lane, attempt).await,
             Err(CasError::Io(e)) => return Err(EngineError::Blob(e)),
         }
     }
@@ -126,8 +166,22 @@ pub async fn tail<S: BlobStore>(
     lane: LaneId,
     from: u64,
 ) -> Result<u64, EngineError> {
+    tail_from(store, tenant, lane, from, FIRST_PROBE_WINDOW).await
+}
+
+/// [`tail`], its first round `first` probes wide (M123). A fold probes every lane of the
+/// tenant, most of them idle, so it starts at one: an idle lane costs one HEAD where it cost
+/// eight, and a lane with bundles one round more. A resume keeps [`FIRST_PROBE_WINDOW`] -- it
+/// is on a write's path, where a round costs more than a HEAD.
+pub async fn tail_from<S: BlobStore>(
+    store: &S,
+    tenant: TenantId,
+    lane: LaneId,
+    from: u64,
+    first: u64,
+) -> Result<u64, EngineError> {
     let mut base = from;
-    let mut window = FIRST_PROBE_WINDOW;
+    let mut window = first.max(1);
     // ⚠️ Bounded, not `loop`. The termination condition is "the store answered 404", which
     // means a store that never does — hostile, buggy, or serving a lane genuinely longer
     // than any tenant could write — spins here forever, on a path a query waits on. An
@@ -190,5 +244,47 @@ mod tests {
 
         // And the other half of the same guard: a length that is not a whole number of ids.
         assert!(decode(&full[..full.len() - 1]).is_err());
+    }
+
+    /// M123: the registration past the ceiling wrote a registry `decode` refuses -- and every
+    /// fold, strong read and new writer of the tenant failed for good after it. Now the one
+    /// lane too many is refused, and the registry stays readable.
+    #[tokio::test]
+    async fn the_lane_past_the_ceiling_is_refused_and_the_registry_still_reads() {
+        let store = pstore_blob::MemoryStore::new();
+        let t = TenantId(9);
+        let full: BTreeSet<LaneId> = (1..=MAX_LANES as u64).map(LaneId).collect();
+        store.put(&key(t), encode(&full).into()).await.unwrap();
+        // A lane already in it still registers: idempotent at the ceiling.
+        register(&store, t, LaneId(1)).await.unwrap();
+        let err = register(&store, t, LaneId(MAX_LANES as u64 + 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::TooManyLanes(_)), "{err:?}");
+        assert_eq!(live(&store, t).await.unwrap().len(), MAX_LANES);
+    }
+
+    /// M123: a fold probed eight bundles of every lane, idle or not. From its first window of
+    /// one, an idle lane costs one HEAD; a lane with bundles still finds its whole tail.
+    #[tokio::test]
+    async fn a_first_window_of_one_probes_an_idle_lane_once() {
+        let store = pstore_testkit::depth::DepthCounting::new(pstore_blob::MemoryStore::new());
+        let (t, lane) = (TenantId(9), LaneId(3));
+        for n in 0..5 {
+            store
+                .inner()
+                .put(
+                    &crate::bundle_key(t, lane, pstore_types::Seq(n)),
+                    bytes::Bytes::new(),
+                )
+                .await
+                .unwrap();
+        }
+        store.reset();
+        assert_eq!(tail_from(&store, t, lane, 5, 1).await.unwrap(), 5);
+        assert_eq!(store.requests(), 1, "an idle lane");
+        store.reset();
+        assert_eq!(tail_from(&store, t, lane, 0, 1).await.unwrap(), 5);
+        assert_eq!(tail(&store, t, lane, 0).await.unwrap(), 5);
     }
 }

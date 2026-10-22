@@ -318,7 +318,9 @@ async fn a_rejecting_fold_costs_one_write_per_index() {
     );
     // ⚠️ Measured on the parent commit, the same fold: (19 reads, 2 writes). One more write
     // -- the quarantine for `docs`, beside `other`'s segment and the HEAD CAS -- and no read.
-    assert_eq!((r1 - r0, w1 - w0), (19, 3));
+    // M123: 12 reads fewer -- a fold's first probe of a lane is one bundle, not eight, so its
+    // one lane with one bundle costs a probe that finds it and two that find the tail.
+    assert_eq!((r1 - r0, w1 - w0), (7, 3));
 }
 
 #[tokio::test]
