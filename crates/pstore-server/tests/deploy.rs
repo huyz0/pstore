@@ -329,3 +329,20 @@ fn the_flush_and_the_stop_are_configured_and_refuse_a_non_count() {
         }
     }
 }
+
+#[test]
+fn routing_is_off_unless_on_and_refuses_anything_else() {
+    // M123: `PSTORE_ROUTE_WRITES`.
+    let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
+    assert!(!c.route_writes);
+    for (v, want) in [("on", true), ("off", false)] {
+        let c =
+            Config::from_vars(vars(&[("PSTORE_LANE", "1"), ("PSTORE_ROUTE_WRITES", v)])).unwrap();
+        assert_eq!(c.route_writes, want, "{v}");
+    }
+    let e = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_ROUTE_WRITES", "yes"),
+    ]));
+    assert!(e.unwrap_err().to_string().contains("PSTORE_ROUTE_WRITES"));
+}

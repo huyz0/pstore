@@ -53,8 +53,13 @@ pub struct CacheCore {
     /// duplicating the request. ⚠️ A `std` mutex, never held across an await, so a claim's
     /// `Drop` can take it (M28): a cancelled claimant must still remove its gate.
     gates: [std::sync::Mutex<Gates>; 3],
-    disk: Option<crate::disk::Tiers>,
-    state: DiskState,
+    /// Set once, when the tier has recovered (M123): a core serves memory-only until then.
+    disk: std::sync::OnceLock<crate::disk::Tiers>,
+    state: std::sync::OnceLock<DiskState>,
+    /// Whether a tier is on its way ([`CacheCore::opening`]), and whether the core was closed
+    /// before it arrived -- a tier recovered after `close` is closed, never attached.
+    opening: bool,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 type Gates = HashMap<Id, Arc<tokio::sync::Semaphore>>;
@@ -86,7 +91,7 @@ impl std::fmt::Debug for CacheCore {
             .field("quota_pinned", &self.quota_pinned)
             .field("quota_meta", &self.quota_meta)
             .field("quota_bulk", &self.quota_bulk)
-            .field("disk", &self.state)
+            .field("disk", self.disk_state())
             .finish_non_exhaustive()
     }
 }
@@ -101,6 +106,8 @@ pub enum DiskState {
     /// ⚠️ The directory could not be opened, so the core is memory only. A broken disk
     /// degrades to the store; it never fails a read (`disk-space-management.md`).
     Bypassed(String),
+    /// The disk tier is recovering (M123): memory only until it attaches.
+    Opening,
 }
 
 /// A read cache over an inner store.
@@ -143,8 +150,10 @@ impl CacheCore {
             quota_meta: meta,
             quota_bulk: bulk,
             gates: Default::default(),
-            disk: None,
-            state: DiskState::Off,
+            disk: std::sync::OnceLock::new(),
+            state: std::sync::OnceLock::new(),
+            opening: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -154,21 +163,54 @@ impl CacheCore {
     /// reporting [`DiskState::Bypassed`]. A directory filled for another store, or with no
     /// record of which store filled it, is emptied before it serves anything.
     pub async fn open(ram: usize, disk: crate::disk::DiskConfig) -> Self {
-        let mut core = Self::memory(ram);
-        match crate::disk::Tiers::open(&disk).await {
-            Ok(tiers) => {
-                core.disk = Some(tiers);
-                core.state = DiskState::Open;
-            }
-            Err(why) => core.state = DiskState::Bypassed(why),
-        }
+        let core = Self::opening(ram);
+        core.attach(disk).await;
         core
+    }
+
+    /// A core of `ram` bytes in memory whose disk tier [`Self::attach`] brings later (M123): it
+    /// serves at once, memory only, reporting [`DiskState::Opening`].
+    ///
+    /// ⚠️ What lets a start bind before the tier recovers: recovery scans every block on disk,
+    /// and a start that waited for it could not serve, uncached, for its whole length.
+    #[must_use]
+    pub fn opening(ram: usize) -> Self {
+        Self {
+            opening: true,
+            ..Self::memory(ram)
+        }
+    }
+
+    /// Opens `disk` and attaches it, as [`Self::open`] does: never fails, a directory that
+    /// cannot be used leaving the core memory only. A core closed before the tier recovered
+    /// closes it at once and stays without it.
+    pub async fn attach(&self, disk: crate::disk::DiskConfig) {
+        let state = match crate::disk::Tiers::open(&disk).await {
+            Ok(tiers) => {
+                if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    tiers.close().await;
+                    return;
+                }
+                let _ = self.disk.set(tiers);
+                DiskState::Open
+            }
+            Err(why) => DiskState::Bypassed(why),
+        };
+        let _ = self.state.set(state);
     }
 
     /// Whether this core has a disk tier.
     #[must_use]
     pub fn disk_state(&self) -> &DiskState {
-        &self.state
+        const OFF: DiskState = DiskState::Off;
+        const OPENING: DiskState = DiskState::Opening;
+        match self.state.get() {
+            Some(s) => s,
+            None if self.opening && !self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
+                &OPENING
+            }
+            None => &OFF,
+        }
     }
 
     /// Waits for the disk tier's writes queued so far, and keeps it open.
@@ -177,14 +219,16 @@ impl CacheCore {
     /// 16 MiB wait to be written (M115). A caller that must not lose a burst waits between its
     /// parts; `close` would do it too, but each reopen starts a fresh block and costs capacity.
     pub async fn wait(&self) {
-        if let Some(d) = &self.disk {
+        if let Some(d) = self.disk.get() {
             d.wait().await;
         }
     }
 
-    /// Flushes the disk tier's writes in flight, and closes it. A core is not used after.
+    /// Flushes the disk tier's writes in flight, and closes it. A core is not used after; a
+    /// tier still recovering is closed as it arrives (M123).
     pub async fn close(&self) {
-        if let Some(d) = &self.disk {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(d) = self.disk.get() {
             d.close().await;
         }
     }
@@ -224,7 +268,7 @@ impl CacheCore {
         if let Some(hit) = self.lookup(id, class).await {
             return Some(hit);
         }
-        let hit = self.disk.as_ref()?.get(id, class).await?;
+        let hit = self.disk.get()?.get(id, class).await?;
         if class != Class::Scan {
             let (arena, quota) = self.arena(class);
             locked(arena).admit(id.clone(), hit.clone(), quota);
@@ -237,7 +281,7 @@ impl CacheCore {
         if class == Class::Scan {
             return;
         }
-        if let Some(d) = &self.disk {
+        if let Some(d) = self.disk.get() {
             d.insert(&id, &bytes, class);
         }
         let (arena, quota) = self.arena(class);
@@ -256,7 +300,7 @@ impl CacheCore {
         if class == Class::Scan {
             return;
         }
-        if let Some(d) = &self.disk {
+        if let Some(d) = self.disk.get() {
             for (id, bytes) in &items {
                 d.insert(id, bytes, class);
             }

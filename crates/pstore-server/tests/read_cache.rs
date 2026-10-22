@@ -459,3 +459,31 @@ async fn the_store_id_is_retried_and_bounded() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_start_does_not_wait_for_the_disk_tier() {
+    // M123: the start awaited every tier's recovery before it could bind. The core it gets
+    // back is `Opening`, and the tier attaches on its own.
+    let dir = std::env::temp_dir().join(format!("pstore-attach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Accounted::new(MemoryStore::new());
+    let mut on = S3.to_vec();
+    on.push(("PSTORE_CACHE_DIR", dir.to_str().unwrap()));
+    let config = Config::from_vars(vars(&on)).unwrap();
+    let core = pstore_server::open_cache_attaching(&store, &config)
+        .await
+        .unwrap()
+        .expect("a cache");
+    assert_eq!(*core.disk_state(), DiskState::Opening);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while *core.disk_state() != DiskState::Open {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            core.disk_state()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    core.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -153,6 +153,21 @@ fn peer_url(s: &str) -> Option<String> {
     (!rest.is_empty() && !rest.contains('/')).then(|| s.to_owned())
 }
 
+/// What a server's gossip member declares as its zone (M123): `"<az> <url>"`, or the URL alone
+/// with no zone -- what every server declared before. A URL holds no space, so the split is
+/// the first one.
+#[must_use]
+pub fn gossip_zone(az: &str, url: &str) -> String {
+    if az.is_empty() {
+        url.to_owned()
+    } else {
+        format!("{az} {url}")
+    }
+}
+
+/// The header a routed request carries (M123): served where it lands, never sent on.
+pub(crate) const ROUTED: &str = "x-pstore-routed";
+
 /// A server's peers from a SWIM membership of its own (M56): `PSTORE_PEER_SELF` and the
 /// `PSTORE_PEER_GOSSIP_*` variables, read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +186,9 @@ pub struct GossipConfig {
     pub keys: Option<Vec<Vec<u8>>>,
     /// How long a peer has to answer a part, as M54's.
     pub timeout: Duration,
+    /// This server's availability zone, `PSTORE_PEER_GOSSIP_ZONE` (M123): a query splits only
+    /// over servers declaring the same. Empty for none, as before.
+    pub az: String,
 }
 
 impl GossipConfig {
@@ -189,6 +207,7 @@ impl GossipConfig {
                 "PSTORE_PEER_GOSSIP_ADVERTISE",
                 "PSTORE_PEER_GOSSIP_SEEDS",
                 "PSTORE_PEER_GOSSIP_PERIOD_MS",
+                "PSTORE_PEER_GOSSIP_ZONE",
             ] {
                 if let Some(v) = get(var) {
                     return Err(refuse(var, &v, "set PSTORE_PEER_GOSSIP_ADDR too"));
@@ -286,6 +305,17 @@ impl GossipConfig {
             period,
             keys,
             timeout: timeout_of(&get)?,
+            az: match get("PSTORE_PEER_GOSSIP_ZONE") {
+                None => String::new(),
+                Some(z) if !z.is_empty() && !z.contains(char::is_whitespace) => z,
+                Some(z) => {
+                    return Err(refuse(
+                        "PSTORE_PEER_GOSSIP_ZONE",
+                        &z,
+                        "a zone name, with no space",
+                    ));
+                }
+            },
         }))
     }
 }
@@ -295,10 +325,23 @@ impl GossipConfig {
 /// `pstore-node` on the same key, or one whose zone gossip has not filled yet -- is no server.
 #[must_use]
 pub fn peer_list_of(members: &[(String, String)], me: &str) -> (Vec<String>, usize) {
+    peer_list_in(members, me, "")
+}
+
+/// [`peer_list_of`], of the servers in availability zone `az` alone (M123): a member whose
+/// gossip zone is `"<az> <url>"` with this `az`. `""` is the servers that declare no zone --
+/// [`peer_list_of`]'s. ⚠️ Without it a peer list held every zone's servers, so a query's
+/// shares crossed AZs -- D-79's per-AZ cell broken, billed both ways, and every coordinator
+/// timing out on the shares of a lost AZ.
+#[must_use]
+pub fn peer_list_in(members: &[(String, String)], me: &str, az: &str) -> (Vec<String>, usize) {
     let me = peer_url(me).unwrap_or_else(|| me.to_owned());
     let mut list: Vec<String> = members
         .iter()
-        .filter_map(|(_, zone)| peer_url(zone))
+        .filter_map(|(_, zone)| {
+            let (theirs, url) = zone.split_once(' ').unwrap_or(("", zone.as_str()));
+            (theirs == az).then(|| peer_url(url)).flatten()
+        })
         .chain(std::iter::once(me.clone()))
         .collect();
     list.sort();
@@ -348,7 +391,7 @@ impl PeerGossip {
             pstore_node::swim::start_with(
                 &config.listen,
                 &config.advertise,
-                &config.url,
+                &gossip_zone(&config.az, &config.url),
                 &config.seeds,
                 0.0,
                 config.period,
@@ -365,10 +408,11 @@ impl PeerGossip {
         );
         let refresh = {
             let (member, url, period) = (Arc::clone(&member), config.url.clone(), config.period);
+            let az = config.az.clone();
             tokio::spawn(async move {
                 loop {
                     let view = member.members_zoned().await;
-                    let (servers, me) = peer_list_of(&view, &url);
+                    let (servers, me) = peer_list_in(&view, &url, &az);
                     cluster.set_list(servers, me);
                     tokio::time::sleep(period).await;
                 }
@@ -442,6 +486,66 @@ impl Cluster {
     }
 
     /// The list now: one snapshot, for one query.
+    /// The server that owns `tenant`'s requests when writes are routed (M123), when that is
+    /// another server than this one: placed on the peer list's ring, as a segment is.
+    pub(crate) fn owner_of(&self, tenant: TenantId) -> Option<String> {
+        let list = self.list();
+        if list.servers.len() < 2 {
+            return None;
+        }
+        let at = list
+            .ring
+            .place(&format!("tenant/{}", tenant.0), &list.servers);
+        (at != list.me)
+            .then(|| list.servers.get(at).cloned())
+            .flatten()
+    }
+
+    /// Sends `parts` and `body` to `server` as they came, marked routed so it is served there
+    /// and never sent on (M123). `Err` when the server could not be reached -- the caller's
+    /// cue to serve it itself, which is always correct: any server's lane is a valid lane.
+    pub(crate) async fn forward(
+        &self,
+        server: &str,
+        parts: &axum::http::request::Parts,
+        body: axum::body::Bytes,
+    ) -> Result<axum::response::Response, String> {
+        let path = parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| parts.uri.path().to_owned(), |p| p.as_str().to_owned());
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut req = self
+            .client
+            .request(method, format!("{server}{path}"))
+            .header(ROUTED, "1")
+            .body(body);
+        for (name, value) in &parts.headers {
+            if name != axum::http::header::HOST && name != axum::http::header::CONTENT_LENGTH {
+                req = req.header(name.as_str(), value.as_bytes());
+            }
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+        let status =
+            axum::http::StatusCode::from_u16(res.status().as_u16()).map_err(|e| e.to_string())?;
+        let headers = res.headers().clone();
+        let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+        let mut out = axum::response::Response::new(axum::body::Body::from(bytes));
+        *out.status_mut() = status;
+        for (name, value) in &headers {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
+                axum::http::HeaderValue::from_bytes(value.as_bytes()),
+            ) && n != axum::http::header::CONTENT_LENGTH
+                && n != axum::http::header::TRANSFER_ENCODING
+            {
+                out.headers_mut().insert(n, v);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn list(&self) -> Arc<List> {
         Arc::clone(
             &self

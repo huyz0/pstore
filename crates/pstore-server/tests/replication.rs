@@ -1297,3 +1297,28 @@ async fn status_notes_are_written_at_most_once_a_renewal_period() {
     let (_, b) = status(&api, DST, "dst").await;
     assert!(b["last_commit_ms"].as_u64().unwrap() > first, "{b}");
 }
+
+#[tokio::test]
+async fn a_start_scan_reads_every_shard_together() {
+    // M123: a worker's first scan claimed its 64 register shards one after another -- 64
+    // sequential rounds before a restarted lane took its replications back. It reads them
+    // together, shares its room out from what they hold, and claims them together.
+    let depth = Arc::new(pstore_testkit::depth::DepthCounting::new(MemoryStore::new()));
+    let api = Api::new(Accounted::new(Arc::clone(&depth)), LaneId(1)).unwrap();
+    api.configure_replication(
+        ReplicationPolicy {
+            shards: 64,
+            ..policy()
+        },
+        BTreeMap::new(),
+    );
+    let mut w = Worker::default();
+    w.halt_for_test();
+    depth.reset();
+    api.replication_tick(&mut w).await;
+    assert!(
+        depth.depth() <= 4,
+        "a start scan of 64 shards took {} rounds",
+        depth.depth()
+    );
+}

@@ -474,6 +474,8 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_PEER_GOSSIP_ADVERTISE` | the listen address | The `ip:port` the others reach this member on. Never unspecified, never port 0. |
 | `PSTORE_PEER_GOSSIP_SEEDS` | — | `ip:port`s of members to join first, comma-separated. |
 | `PSTORE_PEER_GOSSIP_PERIOD_MS` | `1000` | The SWIM period. A dead server is dropped from the list after about 14. |
+| `PSTORE_ROUTE_WRITES` | `off` | `on` sends each tenant's requests under `/v1/indexes` to the server its peers' ring places the tenant on (M123), and serves one here when that server cannot be reached. A tenant is then written by its owner: its lanes -- each one a probe for every fold and strong read of it -- are its owners over time, not every server a load balancer chose; and it is read there, so its unflushed rows are read-your-writes from any server. The cost is a hop for a request that lands elsewhere, and a hot tenant on one server's memtable. Needs peers. |
+| `PSTORE_PEER_GOSSIP_ZONE` | none | This server's availability zone (M123), declared in gossip beside its URL: a query splits only over servers in the same zone, D-79's per-AZ cell. Unset, it splits over the servers that declare none, as before -- so set it on every server of a fleet, or on none. A server that stops leaves the membership first, and is dropped within a period or two. |
 | `PSTORE_GOSSIP_KEY` / `PSTORE_GOSSIP_KEY_FILE` | — | The cluster key, as `pstore-node` reads it (M53). Required with gossip unless `PSTORE_GOSSIP_INSECURE=1`. |
 
 `pstore-node`'s gossip ([M53](milestones/M53/SPEC.md)):

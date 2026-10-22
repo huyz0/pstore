@@ -47,3 +47,12 @@ Every finding and the task closing it: [FINDINGS.md](FINDINGS.md).
     `64d349ed03f0a2f6`, `65559801f84a1412`, `b06b396d0aa759fb`, `60cf6bfe1f9fc517`,
     `d559aff4b3101b72`, `dd1bf0796e2ba34f`; no time is claimed. `./scripts/gates.sh` passed, run by the pre-commit hook on each task's commit;
     before this one, `cargo test --workspace --all-features --no-fail-fast`: 255 test binaries, none failed.
+11. `a_start_scan_reads_every_shard_together` passes, **red first** at 66 rounds for a bound of
+    4; `max_bounds_every_worker_and_the_rest_is_shared` fails with each shard handed the whole
+    room. `a_core_serves_from_memory_while_its_disk_tier_recovers` (red with a close before
+    attach ignored) and `a_start_does_not_wait_for_the_disk_tier` (red with the attach awaited)
+    pass. `a_server_splits_only_within_its_own_zone` (red with the zone ignored),
+    `a_gossip_zone_is_configured_and_refused_by_name`,
+    `a_routed_tenant_is_written_and_read_by_its_owner` and
+    `a_tenant_whose_owner_is_down_is_served_where_it_lands` (each red with routing off), and
+    `routing_is_off_unless_on_and_refuses_anything_else` pass.

@@ -7,8 +7,8 @@
 
 use pstore_blob::{Accounted, BlobStore, MemoryStore, ObjectStoreBackend};
 use pstore_server::{
-    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache, s3_capabilities,
-    serve_folding,
+    Api, Backend, Config, Profile, SourceConfig, azure_store, open_cache_attaching,
+    s3_capabilities, serve_folding,
 };
 use std::sync::Arc;
 
@@ -116,7 +116,8 @@ async fn run<S: BlobStore + 'static>(
     store: Accounted<S>,
     config: &Config,
 ) -> std::process::ExitCode {
-    let cache = match open_cache(&store, config).await {
+    // M123: without waiting for the disk tier to recover -- it attaches when it has.
+    let cache = match open_cache_attaching(&store, config).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("pstore-server: cannot read the store id the read cache needs: {e}");
@@ -140,6 +141,7 @@ async fn run<S: BlobStore + 'static>(
     api.limit_engines(config.engines);
     api.set_flush_policy(config.flush);
     api.set_drain(config.drain);
+    api.route_writes(config.route_writes);
     // M54: a query's vector legs split across the servers PSTORE_PEERS names.
     if let Err(e) = api.set_peers(config.peers.clone()) {
         eprintln!("pstore-server: refusing to serve: {e}");

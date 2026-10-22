@@ -39,7 +39,7 @@ mod peers;
 mod replication;
 mod session;
 mod types;
-pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
+pub use peers::{GossipConfig, PeerConfig, PeerGossip, gossip_zone, peer_list_in, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
@@ -151,6 +151,10 @@ pub struct Api<S> {
     external_prefixes: Mutex<Option<Vec<String>>>,
     /// Set when a stop begins (M123): `GET /v1/ready` answers 503 from then on.
     stopping: std::sync::atomic::AtomicBool,
+    /// Requests routed to their tenant's owner, and served here because it was unreachable
+    /// (M123).
+    routed: std::sync::atomic::AtomicU64,
+    routed_here: std::sync::atomic::AtomicU64,
 }
 
 /// One tenant's engine in the registry (M26).
@@ -178,6 +182,8 @@ struct Registry {
     flush: FlushPolicy,
     /// How long a stop waits on the HTTP drain, and again on its flush and fold (M123).
     drain: Option<std::time::Duration>,
+    /// Whether a tenant's requests go to the server that owns it (M123): `PSTORE_ROUTE_WRITES`.
+    route: bool,
 }
 
 /// When the flush loop writes a tenant's `batched` rows to the store (M123): the documented
@@ -383,6 +389,8 @@ impl<S: BlobStore + 'static> Api<S> {
             index_params: Mutex::new(None),
             external_prefixes: Mutex::new(None),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            routed: std::sync::atomic::AtomicU64::new(0),
+            routed_here: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -671,6 +679,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/ready", get(ready::<S>))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&self),
+                route_to_owner::<S>,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self),
                 count_request::<S>,
             ))
             .with_state(self)
@@ -844,6 +856,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// How long a stop waits on the HTTP drain, and then on its flush and fold (M123).
     pub fn set_drain(&self, within: std::time::Duration) {
         self.registry_mut().drain = Some(within);
+    }
+
+    /// Routes each tenant's requests under `/v1/indexes` to the server that owns it (M123,
+    /// `PSTORE_ROUTE_WRITES=on`): a tenant's lanes are then its owners, not every server a load
+    /// balancer sent it to. Needs peers; without them, or alone, it routes nothing.
+    pub fn route_writes(&self, on: bool) {
+        self.registry_mut().route = on;
     }
 
     /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
@@ -1281,6 +1300,70 @@ async fn count_request<S: BlobStore + 'static>(
     res
 }
 
+/// The largest body a routed request is forwarded with (M123): axum's own default limit, which
+/// every handler that reads a body already applies.
+const ROUTED_BODY_LIMIT: usize = 2 << 20;
+
+/// Sends a tenant's request under `/v1/indexes` to the server that owns the tenant, when
+/// writes are routed (M123, `PSTORE_ROUTE_WRITES=on`), and serves it here when that server
+/// cannot be reached.
+///
+/// ⚠️ **Why route at all:** a load balancer spreads a tenant's writes over every server, and
+/// every server that writes a tenant is a lane every fold and strong read of it probes -- per
+/// tenant, a cost that grows with the fleet. Routed, a tenant is written by its owner, so its
+/// lanes are its owners over time. Its queries go with its writes, so the rows the owner holds
+/// unflushed are read where they are: read-your-writes for every client, not only one that
+/// stays on a server. ⚠️ **And why serving here is always right:** any server's lane is a lane,
+/// so a write taken here when the owner is down is folded like any other.
+async fn route_to_owner<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !api.registry_mut().route
+        || !req.uri().path().starts_with("/v1/indexes")
+        || req.headers().contains_key(peers::ROUTED)
+    {
+        return next.run(req).await;
+    }
+    let Ok(tenant) = tenant_of(req.headers()) else {
+        return next.run(req).await;
+    };
+    let cluster = api
+        .peers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some((cluster, owner)) = cluster.and_then(|c| c.owner_of(tenant).map(|o| (c, o))) else {
+        return next.run(req).await;
+    };
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, ROUTED_BODY_LIMIT).await else {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            format!("a body over {ROUTED_BODY_LIMIT} bytes"),
+        )
+        .into_response();
+    };
+    match cluster.forward(&owner, &parts, bytes.clone()).await {
+        Ok(res) => {
+            api.routed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            res
+        }
+        Err(_) => {
+            api.routed_here
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            next.run(axum::extract::Request::from_parts(
+                parts,
+                axum::body::Body::from(bytes),
+            ))
+            .await
+        }
+    }
+}
+
 /// `GET /v1/admin/duties` — what this server does not do.
 ///
 /// ⚠️ **Zero blob requests** — it serves a constant, so a scraper cannot turn an honesty
@@ -1391,6 +1474,14 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             held.sweep(tokio::time::Instant::now());
             held.expired
         }
+    ));
+    out.push_str(&format!(
+        "# HELP pstore_routed Requests routed to their tenant's owner (M123).\n\
+         # TYPE pstore_routed counter\npstore_routed {}\n\
+         # HELP pstore_routed_here Requests served here because their owner was unreachable.\n\
+         # TYPE pstore_routed_here counter\npstore_routed_here {}\n",
+        api.routed.load(std::sync::atomic::Ordering::Relaxed),
+        api.routed_here.load(std::sync::atomic::Ordering::Relaxed),
     ));
     out.push_str("# HELP pstore_refusals_total Refusals by their stable code.\n");
     out.push_str("# TYPE pstore_refusals_total counter\n");
@@ -4030,6 +4121,9 @@ pub struct Config {
     pub flush: FlushPolicy,
     /// How long a stop waits on each phase (M123): `PSTORE_DRAIN_MS`.
     pub drain: std::time::Duration,
+    /// Whether a tenant's requests go to the server that owns it (M123): `PSTORE_ROUTE_WRITES`
+    /// `on`; off by default.
+    pub route_writes: bool,
     /// Half of `PSTORE_GC_AGE_S` (M39), with `PSTORE_GC` on or off: how stale an engine's read
     /// of its lane may grow before a flush reads HEAD again.
     pub lane_recheck: std::time::Duration,
@@ -4314,6 +4408,17 @@ impl Config {
             gc: gc_policy(&get)?,
             flush: flush_policy(&get)?,
             drain: positive_ms(&get, "PSTORE_DRAIN_MS")?.unwrap_or(DEFAULT_DRAIN),
+            route_writes: match get("PSTORE_ROUTE_WRITES").as_deref() {
+                None | Some("off") => false,
+                Some("on") => true,
+                Some(other) => {
+                    return Err(ConfigError::Stop(
+                        "PSTORE_ROUTE_WRITES",
+                        other.to_owned(),
+                        "on, or off",
+                    ));
+                }
+            },
             lane_recheck: reap_age(&get)? / 2,
             cache: cache_config(&get, backend)?,
             peers: PeerConfig::from_vars(&get)?,
@@ -4892,6 +4997,37 @@ pub async fn open_cache<S: BlobStore>(
     .await?;
     let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
     Ok(Some(Arc::new(CacheCore::open(c.ram, disk).await)))
+}
+
+/// [`open_cache`], without waiting for the disk tier (M123): the core serves memory-only,
+/// reporting `Opening`, while the tier recovers on its own task and attaches when it has.
+///
+/// ⚠️ Recovery scans every block on disk -- tens of seconds at a terabyte -- and a start that
+/// awaited it could not bind, though uncached it serves fine. The store id is still read
+/// first: it decides whether the directory is this store's at all.
+///
+/// # Errors
+/// The store id could not be read or created.
+pub async fn open_cache_attaching<S: BlobStore>(
+    store: &Accounted<S>,
+    config: &Config,
+) -> Result<Option<Arc<CacheCore>>, pstore_blob::BlobError> {
+    let Some(c) = &config.cache else {
+        return Ok(None);
+    };
+    let identity = store_identity_patiently(
+        store,
+        &config.endpoint,
+        &config.bucket,
+        STORE_ID_ATTEMPTS,
+        STORE_ID_WITHIN,
+    )
+    .await?;
+    let disk = pstore_cache::DiskConfig::new(&c.dir, config.lane.0, c.disk, identity);
+    let core = Arc::new(CacheCore::opening(c.ram));
+    let attaching = Arc::clone(&core);
+    tokio::spawn(async move { attaching.attach(disk).await });
+    Ok(Some(core))
 }
 
 /// Attempts at the store id before a start gives up (M123), each bounded by [`STORE_ID_WITHIN`].

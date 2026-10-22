@@ -61,10 +61,14 @@ its outcome: [FINDINGS.md](FINDINGS.md). No backlog row.
 9. **Startup.** The store-id read is bounded and retried with jitter; the three disk tiers
    open together; the announce is bounded; the 64 shards are claimed concurrently.
 
+10. **The rest** (M123.5): the start scan reads and claims its shards together, the room
+    shared out; a core serves before its disk tier recovers and attaches it after; a server
+    may declare its AZ beside its URL and split within it (`PSTORE_PEER_GOSSIP_ZONE`); and a
+    tenant's requests may go to its owner (`PSTORE_ROUTE_WRITES=on`), served where they land
+    when it is down.
+
 **Not changed:** any answer; any request on a path that succeeds, except as each delta
-states; no LIST anywhere. The AZ cell of a peer list (the zone field carries the URL) and
-routing a tenant's writes to an owner -- which would bound lanes by owners rather than by
-writers -- are owner decisions, recorded in FINDINGS.md.
+states; no LIST anywhere. Unset, the zone and routing change nothing.
 
 ## Acceptance criteria
 
@@ -84,6 +88,10 @@ Each a test, seen red before its fix and against a deliberate break of it; named
 8. A member dead past retention is forgotten, and the roster drops it.
 9. Each startup bound holds against a store that never answers.
 10. M119's bench: every digest unchanged. `./scripts/gates.sh` passes.
+11. A 64-shard start scan is at most 4 rounds and holds the worker's bound; a core is
+    `Opening` and serves before its tier attaches; a zoned server's list is its zone's; a
+    routed tenant has one lane and is read-your-writes from every server, and is served
+    where it lands when its owner is down.
 
 ## RA budget
 
@@ -98,3 +106,4 @@ Nothing scales with indexes or records. No LIST.
 - **M123.2** — Deltas 4, 7.
 - **M123.3** — Deltas 5, 6.
 - **M123.4** — Deltas 8, 9.
+- **M123.5** — Delta 10: the four findings M123.4 left kept, partial, or to the owner.

@@ -792,3 +792,45 @@ async fn a_tier_of_the_previous_format_is_emptied() {
     );
     core.close().await;
 }
+
+#[tokio::test]
+async fn a_core_serves_from_memory_while_its_disk_tier_recovers() {
+    // M123: a start waited for every tier's recovery -- a scan of every block on disk --
+    // before the listener could bind, though the core works memory-only. Now a core starts
+    // `Opening`, serves at once, and gains the tier when it has recovered; one closed first
+    // never gains it.
+    let dir = Dir::new("attach");
+    {
+        let core = open(&dir.0, "A").await;
+        let acct = store(1, 8192, 3).await;
+        over(&acct, &core).get_range(&key(0), 0..512).await.unwrap();
+        core.close().await;
+    }
+    let core = Arc::new(CacheCore::opening(RAM));
+    assert_eq!(*core.disk_state(), DiskState::Opening);
+    // Served before the tier is there: from the store, which a fresh one holds.
+    let other = store(1, 8192, 3).await;
+    let got = over(&other, &core)
+        .get_range(&key(0), 2048..2560)
+        .await
+        .unwrap();
+    assert_eq!(got, body(8192, 3).slice(2048..2560));
+    assert_eq!(reads(&other), 1);
+    core.attach(config(&dir.0, 1, "A")).await;
+    assert_eq!(*core.disk_state(), DiskState::Open);
+    // The recovered tier answers what the earlier process cached, with no request.
+    let acct = store(1, 8192, 3).await;
+    let got = over(&acct, &core).get_range(&key(0), 0..512).await.unwrap();
+    assert_eq!(got, body(8192, 3).slice(0..512));
+    assert_eq!(reads(&acct), 0, "the attached tier did not serve");
+    core.close().await;
+    // A core closed before its tier recovered closes the tier as it arrives.
+    let late = Arc::new(CacheCore::opening(RAM));
+    late.close().await;
+    late.attach(config(&dir.0, 1, "A")).await;
+    assert_eq!(
+        *late.disk_state(),
+        DiskState::Off,
+        "a closed core gained a tier"
+    );
+}

@@ -22,7 +22,7 @@ use pstore_blob::{
     PutOutcome,
 };
 use pstore_server::{Api, PeerConfig};
-use pstore_types::{CasTag, LaneId};
+use pstore_types::{CasTag, LaneId, TenantId};
 use serde_json::{Value, json};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1461,6 +1461,7 @@ async fn gossiping(store: &MemoryStore, lane: u64, seeds: &[String]) -> (Gossipi
         period: PERIOD,
         keys: Some(vec![vec![7u8; 32]]),
         timeout: Duration::from_secs(5),
+        az: String::new(),
     };
     let gossip = server.api.join_peers(config).await.unwrap();
     let (http, rx) = tokio::sync::oneshot::channel();
@@ -1561,6 +1562,7 @@ async fn servers_take_their_peers_from_membership() {
         period: PERIOD,
         keys: None,
         timeout: Duration::from_secs(5),
+        az: String::new(),
     };
     assert!(fleet[0].server.api.join_peers(again.clone()).await.is_err());
     alone
@@ -1810,4 +1812,192 @@ async fn a_server_that_leaves_is_dropped_within_a_few_periods() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let _ = leaving.http.send(());
+}
+
+#[test]
+fn a_server_splits_only_within_its_own_zone() {
+    // M123: a server declared only its URL in gossip's zone field, so a peer list held every
+    // zone's servers and a query's shares crossed AZs -- billed both ways, and timed out for
+    // every coordinator when one AZ went. With `PSTORE_PEER_GOSSIP_ZONE` it declares "<az> <url>",
+    // and its list holds its own zone's servers alone. Unset, nothing changes.
+    let m = |a: &str, z: &str| (a.to_owned(), z.to_owned());
+    let me = "http://10.0.0.2:8080";
+    let view = vec![
+        m("10.0.0.1:7000", "az-a http://10.0.0.1:8080"),
+        m("10.0.0.3:7000", "az-b http://10.0.0.3:8080"),
+        m("10.0.0.4:7000", "http://10.0.0.4:8080"),
+        m("10.0.0.5:7000", "az-a"),
+    ];
+    assert_eq!(
+        pstore_server::peer_list_in(&view, me, "az-a"),
+        (vec!["http://10.0.0.1:8080".to_owned(), me.to_owned()], 1)
+    );
+    assert_eq!(
+        pstore_server::peer_list_in(&view, me, "az-b"),
+        (vec![me.to_owned(), "http://10.0.0.3:8080".to_owned()], 0)
+    );
+    // No zone: the members that declare none, as before.
+    assert_eq!(
+        pstore_server::peer_list_in(&view, me, ""),
+        pstore_server::peer_list_of(&view, me)
+    );
+    assert_eq!(
+        pstore_server::peer_list_of(&view, me),
+        (vec![me.to_owned(), "http://10.0.0.4:8080".to_owned()], 0)
+    );
+    assert_eq!(
+        pstore_server::gossip_zone("az-a", me),
+        "az-a http://10.0.0.2:8080"
+    );
+    assert_eq!(pstore_server::gossip_zone("", me), me);
+}
+
+#[test]
+fn a_gossip_zone_is_configured_and_refused_by_name() {
+    // M123: `PSTORE_PEER_GOSSIP_ZONE`, a name with no space, only beside a membership.
+    use pstore_server::GossipConfig;
+    let base = [
+        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080/"),
+        ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
+        ("PSTORE_GOSSIP_KEY", KEY),
+    ];
+    assert_eq!(
+        GossipConfig::from_vars(vars(&base)).unwrap().unwrap().az,
+        ""
+    );
+    let mut zoned = base.to_vec();
+    zoned.push(("PSTORE_PEER_GOSSIP_ZONE", "us-east-1a"));
+    assert_eq!(
+        GossipConfig::from_vars(vars(&zoned)).unwrap().unwrap().az,
+        "us-east-1a"
+    );
+    for bad in ["", "us east"] {
+        let mut v = base.to_vec();
+        v.push(("PSTORE_PEER_GOSSIP_ZONE", bad));
+        let e = GossipConfig::from_vars(vars(&v)).unwrap_err();
+        assert!(
+            e.to_string().contains("PSTORE_PEER_GOSSIP_ZONE"),
+            "{bad:?}: {e}"
+        );
+    }
+    let alone = [
+        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080/"),
+        ("PSTORE_PEER_GOSSIP_ZONE", "us-east-1a"),
+    ];
+    let e = GossipConfig::from_vars(vars(&alone)).unwrap_err();
+    assert!(e.to_string().contains("PSTORE_PEER_GOSSIP_ADDR"), "{e}");
+}
+
+/// `send`, as `tenant`.
+async fn send_as(
+    api: &Arc<Api<View>>,
+    tenant: u64,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (u16, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-pstore-tenant", tenant.to_string())
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = Arc::clone(api).router().oneshot(req).await.unwrap();
+    let status = res.status().as_u16();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_routed_tenant_is_written_and_read_by_its_owner() {
+    // M123: a load balancer spread a tenant's writes over every server, and every server that
+    // wrote it was one more lane each of its folds and strong reads probed -- a per-tenant
+    // cost growing with the fleet. Routed, its owner writes it, and reads it, wherever the
+    // request lands: one lane, and read-your-writes from any server.
+    let (store, servers, _alone) = cluster(&[]).await;
+    for s in &servers {
+        s.api.route_writes(true);
+    }
+    for (i, s) in servers.iter().enumerate() {
+        let (st, b) = send(
+            &s.api,
+            "PUT",
+            "/v1/indexes/docs/documents",
+            json!({"documents": [doc(i)]}),
+        )
+        .await;
+        assert_eq!(st, 200, "{b}");
+    }
+    // Batched and unflushed, all three at the owner -- and every server answers with them.
+    for s in &servers {
+        let (st, got) = query(
+            &s.api,
+            &json!({"vector": [0.0, 1.0, 0.0, 1.0], "top_k": 10}),
+        )
+        .await;
+        assert_eq!(st, 200, "{got}");
+        assert_eq!(got["results"].as_array().unwrap().len(), 3, "{got}");
+    }
+    for (i, s) in servers.iter().enumerate() {
+        let (st, b) = send(
+            &s.api,
+            "PUT",
+            "/v1/indexes/docs/documents",
+            json!({"durability": "durable", "documents": [doc(10 + i)]}),
+        )
+        .await;
+        assert_eq!(st, 200, "{b}");
+    }
+    let lanes = pstore_engine::lanes::live(&store, TenantId(7))
+        .await
+        .unwrap();
+    assert_eq!(lanes.len(), 1, "a routed tenant was written by {lanes:?}");
+    let mut routed = 0;
+    for s in &servers {
+        routed += metric(&s.api, "pstore_routed").await;
+    }
+    assert_eq!(
+        routed,
+        3 * 2,
+        "two of three servers route, in each of three rounds"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_owner_is_down_is_served_where_it_lands() {
+    // M123: routing never refuses -- any server's lane is a lane, folded like the owner's.
+    let down = "http://127.0.0.1:9".to_owned();
+    let (_store, servers, _alone) = cluster(std::slice::from_ref(&down)).await;
+    for s in &servers {
+        s.api.route_writes(true);
+    }
+    let list = servers[0].api.peer_list();
+    let ring = pstore_engine::Ring::new(&list);
+    let tenant = (1..10_000u64)
+        .find(|t| list[ring.place(&format!("tenant/{t}"), &list)] == down)
+        .expect("a tenant the unreachable server owns");
+    let (st, b) = send_as(
+        &servers[0].api,
+        tenant,
+        "PUT",
+        "/v1/indexes/docs/documents",
+        json!({"documents": [doc(1)]}),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(metric(&servers[0].api, "pstore_routed_here").await, 1);
+    let (st, got) = send_as(
+        &servers[0].api,
+        tenant,
+        "POST",
+        "/v1/indexes/docs/query",
+        json!({"vector": [0.0, 1.0, 0.0, 1.0], "top_k": 10}),
+    )
+    .await;
+    assert_eq!(st, 200, "{got}");
+    assert_eq!(got["results"].as_array().unwrap().len(), 1);
 }

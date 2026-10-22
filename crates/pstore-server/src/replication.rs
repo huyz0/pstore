@@ -489,27 +489,47 @@ impl<S: BlobStore + 'static> Api<S> {
         if !scan.is_empty() {
             w.next_scan = Some(now + policy.scan);
         }
-        // ⚠️ **One shard at a time, the room shrinking as it fills** (code review B1): the start
-        // scan reads every shard, and the same room handed to each would take `max` from every
-        // one of them. Sequential, so S round trips -- once, at start.
-        let mut claimed = Vec::with_capacity(scan.len());
-        let mut taken = 0;
-        for s in &scan {
-            // Against the count of what is held AND reserved by control calls in flight.
-            let room = policy
-                .max
-                .saturating_sub(self.replicating.held.load(Ordering::SeqCst) + taken);
-            let got = reg
-                .claim(*s, self.lane.0, self.now_ms(), ttl_ms, room)
-                .await;
-            if let Ok(g) = &got {
-                taken += g
-                    .keys()
-                    .filter(|id| tenant_of_id(id).is_some_and(|t| !w.held.contains_key(&t)))
-                    .count();
-            }
-            claimed.push(got);
-        }
+        // ⚠️ **The room shared out, never handed whole to each shard** (code review B1): the
+        // start scan reads every shard, and the same room handed to each would take `max` from
+        // every one of them. It was one shard at a time -- S sequential round trips, 64 at
+        // start (M123). Now every shard is read together, the room is shared out over what
+        // each holds unclaimed, in scan order, and every shard is claimed together, each up to
+        // its share: two rounds, and the bound still holds, since the shares sum to the room.
+        // A race only lowers what a share takes.
+        //
+        // ⚠️ **Only for the start scan.** A steady scan is one shard, whose claim reads it
+        // anyway: reading it first as well doubled every scan's reads for no round saved.
+        let now_ms = self.now_ms();
+        // Against the count of what is held AND reserved by control calls in flight.
+        let mut room = policy
+            .max
+            .saturating_sub(self.replicating.held.load(Ordering::SeqCst));
+        let claimed: Vec<_> = if let [one] = scan.as_slice() {
+            vec![reg.claim(*one, self.lane.0, now_ms, ttl_ms, room).await]
+        } else {
+            let read = futures_util::future::join_all(scan.iter().map(|s| reg.read(*s))).await;
+            let shares: Vec<usize> = read
+                .iter()
+                .map(|r| {
+                    let free = r.as_ref().map_or(0, |shard| {
+                        shard
+                            .entries
+                            .values()
+                            .filter(|e| e.claim.is_none_or(|c| c.expires_ms <= now_ms))
+                            .count()
+                    });
+                    let share = free.min(room);
+                    room -= share;
+                    share
+                })
+                .collect();
+            futures_util::future::join_all(
+                scan.iter()
+                    .zip(&shares)
+                    .map(|(s, share)| reg.claim(*s, self.lane.0, now_ms, ttl_ms, *share)),
+            )
+            .await
+        };
         for (shard, got) in scan.iter().zip(claimed) {
             let Ok(got) = got else { continue };
             for (id, e) in got {
