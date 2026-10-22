@@ -8,8 +8,10 @@ record the mutation each went red under first, where one was run. The bench dige
 
 Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, M120.4
 `4bb3ef2` (this ledger's count), M120.5 `85c64a3` (engine 7's last sub-point, and the tests
-the appendix found missing), M120.6 `69ed65f` (format 10's last sub-point), and M120.7 (a
-test for engine 8, and the bench at five runs). Each commit's gate run is the whole workspace's suite at that
+the appendix found missing), M120.6 `69ed65f` (format 10's last sub-point), M120.7 `4b6f8d8`
+(a test for engine 8, and the bench at five runs), and M120.8 (tests for query 6 and engine
+6, the two rows the suite ran without constraining: hand mutation found both of engine 6's
+conditions surviving the whole engine and server suites). Each commit's gate run is the whole workspace's suite at that
 commit, so the last run covers every test named below at once.
 
 **The count.** The reviews numbered **47** findings: 10 index, 10 format, 9 query, 9 engine
@@ -127,7 +129,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | query 3 | `rrf_is_the_reciprocal_rank_sum` =, `ties_break_on_the_pair_and_the_segment_comes_first` = |
 | query 4 | `multi_scores_by_maxsim` =, `fde_scores_are_the_encodings_dot_and_shadowed_rows_are_replaced` = |
 | query 5, mask | `mixed_ints_and_floats_prune_soundly_with_zone_maps` =, `a_projection_keeps_exactly_what_it_names` =, `a_projection_refuses_what_the_full_decode_refuses` = |
-| query 6 | `four_segments_cost_one_open_round_and_one_leg_round`, `a_hybrid_query_opens_the_segment_once` -- the change shares a value it copied; it computes none |
+| query 6 | `an_index_shares_the_segment_it_is_given` (M120.8, red with the segment copied), `four_segments_cost_one_open_round_and_one_leg_round`, `a_hybrid_query_opens_the_segment_once` |
 | query 7 | `the_selector_holds_at_most_its_cap_and_equals_a_sort_truncated` =, `rank_by_orders_integers_then_strings_then_absent` = |
 | query 8 | `it_holds_at_most_top_k_groups_and_keeps_the_smallest_exactly` =, `counts_and_sums_equal_brute_force` =, `groups_equal_brute_force` = |
 | query 9 | `a_multi_leg_is_widened_past_deleted_rows`, `text_and_sparse_legs_are_widened_past_deleted_rows_too`, `unfolded_deletes_and_upserts_hide_the_folded_rows` |
@@ -135,7 +137,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | engine 3 | `a_hit_skips_head_and_says_how_stale_it_is` =, `a_hit_this_engine_has_pruned_past_is_read_fresh` |
 | engine 4 | `a_cached_range_owns_its_bytes` (M120.5, red with the slice admitted), `a_cached_range_equals_what_the_store_holds` = |
 | engine 5 | `the_schema_outranks_a_held_width_at_the_door`, `two_writers_widths_meet_in_the_fold` |
-| engine 6 | `the_write_door_uses_the_schema_the_process_has_read`, `the_schema_is_read_once_per_process` -- the change skips a copy of what is held; it computes none |
+| engine 6 | `the_schema_cache_keeps_the_newest_heads` (M120.8, red with an unchanged HEAD's epoch not recorded), `a_cancelled_replica_is_forgotten_by_the_door` (M120.8, red with replica names not refreshed), `the_write_door_uses_the_schema_the_process_has_read` |
 | engine 7 | `a_repeated_range_within_one_call_fills_both_positions` =, `eviction_follows_a_model_lru` =, `the_disk_hash_is_the_encodings` = |
 | engine 8 | `a_poisoned_arena_still_serves` = (M120.7, red with the poison not recovered -- the one value the change could alter: a `std` mutex can be poisoned and a tokio one cannot), `concurrent_misses_issue_one_request`, `eviction_follows_a_model_lru` = |
 | engine 9 | `only_a_scoped_segment_key_unscopes` =, `a_branch_equals_its_source_and_then_diverges` |

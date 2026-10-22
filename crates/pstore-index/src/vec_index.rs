@@ -912,6 +912,37 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_index_shares_the_segment_it_is_given() {
+        // M119 (query 6): a dense leg builds its index over the query's opened segment, shared
+        // by every leg and the mask, never a copy of its footer a leg.
+        use pstore_blob::BlobStore as _;
+        let docs: Vec<pstore_format::Document> = (0..30)
+            .map(|i| pstore_format::Document::new(format!("d{i}"), vec![i as f32, 1.0]))
+            .collect();
+        let built = build_all(
+            &docs,
+            Params::default(),
+            pstore_format::DEFAULT_FIELD,
+            None,
+            None,
+        );
+        let store = pstore_blob::MemoryStore::new();
+        let key = pstore_blob::Key::new("t/s.seg");
+        store.put(&key, built.segment).await.unwrap();
+        let opened = std::sync::Arc::new(Segment::open(&store, &key).await.unwrap());
+        let idx = VecIndex::from_shared_parts(std::sync::Arc::clone(&opened), None, 2);
+        assert!(
+            std::ptr::eq(idx.segment(), &*opened),
+            "the index copied its segment"
+        );
+        let idx = VecIndex::from_parts(std::sync::Arc::clone(&opened), None, 2);
+        assert!(
+            std::ptr::eq(idx.segment(), &*opened),
+            "the index copied its segment"
+        );
+    }
+
     #[test]
     fn the_table_in_place_is_the_decoded_one() {
         let mut s = 0x5eed_u64;

@@ -7358,3 +7358,54 @@ mod split_tests {
         assert!(only_durable.head(&f_key).await.is_err());
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod schema_cache_tests {
+    use super::*;
+
+    fn head(epoch: u64, dims: u32) -> Head {
+        let mut h = Head {
+            epoch: Epoch(epoch),
+            ..Head::default()
+        };
+        h.schemas.insert(
+            "i".to_owned(),
+            head::IndexSchema {
+                dims,
+                ..head::IndexSchema::default()
+            },
+        );
+        h
+    }
+
+    #[test]
+    fn the_schema_cache_keeps_the_newest_heads() {
+        // M119 (engine 6): `remember_schemas` skips a copy of what it already holds, and must
+        // still record each newer HEAD's epoch -- or an older HEAD read out of order, its
+        // schemas since changed back, would replace the newer ones.
+        let e = Engine::new(
+            Arc::new(pstore_blob::MemoryStore::new()),
+            TenantId(1),
+            LaneId(1),
+        );
+        let dims = |e: &Engine<pstore_blob::MemoryStore>| e.cached_schema("i").map(|s| s.dims);
+        e.remember_schemas(&head(1, 4));
+        assert_eq!(dims(&e), Some(4));
+        // Epoch 3 holds what epoch 1 held: nothing to copy, but its epoch is the cache's now.
+        e.remember_schemas(&head(3, 4));
+        // Epoch 2, read late, held other schemas: older than what the cache holds, so refused.
+        e.remember_schemas(&head(2, 8));
+        assert_eq!(
+            dims(&e),
+            Some(4),
+            "an older HEAD replaced a newer one's schemas"
+        );
+        // A newer one with other schemas is taken.
+        e.remember_schemas(&head(4, 8));
+        assert_eq!(dims(&e), Some(8));
+    }
+}

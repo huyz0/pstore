@@ -1629,3 +1629,32 @@ async fn a_replica_records_its_sources_dictionaries() {
         assert_eq!(r.dicts, Some(want), "{}", r.key);
     }
 }
+
+#[tokio::test]
+async fn a_cancelled_replica_is_forgotten_by_the_door() {
+    // M119 (engine 6): what the door knows of replicas is refreshed from each HEAD it reads,
+    // compared before it is copied. A name it failed to drop would send every later write to
+    // the index back to HEAD, to be refused or re-read: here, HEAD is made unreadable after
+    // the door has learned of the cancel, and a write must not need it.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    // The door knows `dst` is a replica: a write to it is refused.
+    assert!(s.dst.write("dst", vec![doc("refused", 1.0)]).await.is_err());
+    s.dst.cancel_replication("dst").await.unwrap();
+    // This write reads HEAD once, because the door last knew `dst` as a replica, and learns
+    // it is one no longer.
+    s.dst.write("dst", vec![doc("a", 1.0)]).await.unwrap();
+    s.here
+        .hooked
+        .fail
+        .lock()
+        .unwrap()
+        .push(format!("/tnt/{}/HEAD", DST.0));
+    s.dst
+        .write("dst", vec![doc("b", 1.0)])
+        .await
+        .expect("a write the door already knows is allowed read HEAD again");
+}
