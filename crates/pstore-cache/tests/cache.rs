@@ -328,6 +328,59 @@ async fn concurrent_misses_issue_one_request() {
 }
 
 #[tokio::test]
+async fn concurrent_batched_misses_issue_one_request_a_range() {
+    // M121: `get_ranges` -- how blocks, postings and vector rows are read -- claims each miss
+    // as `get_range` does. Without, eight callers racing on a cold segment sent eight copies
+    // of every request.
+    let key = Key::new("seg/hot");
+    let ranges = [0..64, 4096..4160, 7000..7100];
+    let inner = MemoryStore::with_coalesce_gap(GAP);
+    inner.put(&key, body()).await.unwrap();
+    let store = Arc::new(Barriered {
+        inner,
+        gate: tokio::sync::Semaphore::new(0),
+        reads: std::sync::atomic::AtomicU64::new(0),
+    });
+    let want: Vec<Bytes> = ranges
+        .iter()
+        .map(|r| body().slice(r.start as usize..r.end as usize))
+        .collect();
+
+    // What one caller alone sends.
+    let solo = Arc::new(Caching::new(Arc::clone(&store), 1 << 20));
+    let (c, k, rs) = (Arc::clone(&solo), key.clone(), ranges.to_vec());
+    let one = tokio::spawn(async move { c.get_ranges(&k, &rs).await });
+    store.gate.add_permits(16);
+    assert_eq!(one.await.unwrap().unwrap(), want);
+    let alone = store.reads.swap(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(alone >= 1);
+    // The solo call's unused permits, taken back: left, the first racer would pass the
+    // barrier alone and the rest would find its bytes admitted -- a race that never ran.
+    store.gate.forget_permits(usize::MAX >> 4);
+
+    let cache = Arc::new(Caching::new(Arc::clone(&store), 1 << 20));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (c, k, rs) = (Arc::clone(&cache), key.clone(), ranges.to_vec());
+        tasks.push(tokio::spawn(async move { c.get_ranges(&k, &rs).await }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    store.gate.add_permits(64);
+    for t in tasks {
+        assert_eq!(
+            t.await.unwrap().unwrap(),
+            want,
+            "a racing caller got the wrong bytes"
+        );
+    }
+    assert_eq!(
+        store.reads.load(std::sync::atomic::Ordering::Relaxed),
+        alone,
+        "eight concurrent batched misses should reach the store as one does"
+    );
+}
+
+#[tokio::test]
 async fn every_uncached_operation_reaches_the_store_unchanged() {
     // ⚠️ A decorator is mostly delegation, and delegation is where a store quietly stops
     // working: a `put_conditional` that drops its precondition breaks CAS — which is this

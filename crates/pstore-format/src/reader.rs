@@ -823,7 +823,11 @@ impl Segment {
         let per_row = self.vector_row_len();
         let mut all: Vec<std::ops::Range<u64>> = ranges;
         let block_count = all.len();
-        if let (Some(vec_span), true) = (self.section(Section::Vectors), per_row > 0) {
+        // ⚠️ Only a segment of one fixed-width field decodes these slices (M121). Any other
+        // reads each field whole below, so asking for them too sent the first field's
+        // vectors twice.
+        let simple = self.fields.len() == 1 && self.fields.first().is_some_and(|f| f.per_row == 1);
+        if let (Some(vec_span), true) = (self.section(Section::Vectors), simple && per_row > 0) {
             for i in &wanted {
                 let (Some(start), Some(b)) = (base.get(*i), self.blocks.get(*i)) else {
                     continue;
@@ -847,15 +851,29 @@ impl Segment {
         // sections of the same object, both spans are known before either is issued, and
         // awaiting one before the other would make every scan a two-hop read for no reason
         // a caller could see. Width is free; depth is not.
-        let (bufs, dict_raw) = if postings_at.is_some() {
-            let (b, d) = futures_util::future::join(
+        // Every field's whole read joins the same round (M121): its span is in the footer,
+        // as the blocks' are, so awaiting the blocks first was a second round for nothing.
+        let dense: Vec<&crate::FieldLayout> = if simple {
+            Vec::new()
+        } else {
+            self.fields.iter().filter(|f| f.kind != 1).collect()
+        };
+        let fields = futures_util::future::join_all(
+            dense
+                .iter()
+                .map(|f| self.field_vectors(store, key, &f.name)),
+        );
+        let (bufs, dict_raw, read) = if postings_at.is_some() {
+            let (b, d, read) = futures_util::future::join3(
                 store.get_ranges(key, &all),
                 store.get_immutable(&crate::sparse::dict_key(key), pstore_blob::Class::Pinned),
+                fields,
             )
             .await;
-            (b?, d.ok())
+            (b?, d.ok(), read)
         } else {
-            (store.get_ranges(key, &all).await?, None)
+            let (b, read) = futures_util::future::join(store.get_ranges(key, &all), fields).await;
+            (b?, None, read)
         };
         // Row -> its `(dimension, impact)` pairs. Empty unless this segment carries a sparse
         // field AND its dictionary was reachable; a missing sidecar is a read that cannot
@@ -883,27 +901,11 @@ impl Segment {
         // blocks the filter selected — the common case, and the one where zone-map pruning
         // saves bytes. It cannot serve a variable-width field (several vectors per row), so
         // anything that is not exactly one fixed-width field is read whole, per field.
-        let simple = self.fields.len() == 1 && self.fields.first().is_some_and(|f| f.per_row == 1);
-        let mut extra = if simple {
-            Vec::new()
-        } else {
-            // Every field's read issued together (M120): one after another, a segment of `n`
-            // dense fields cost `n` sequential rounds for reads that depend on nothing. The
-            // first failure in field order is the error, as the loop reported it.
-            let dense: Vec<&crate::FieldLayout> =
-                self.fields.iter().filter(|f| f.kind != 1).collect();
-            let read = futures_util::future::join_all(
-                dense
-                    .iter()
-                    .map(|f| self.field_vectors(store, key, &f.name)),
-            )
-            .await;
-            let mut m: Vec<(crate::Field, Vec<Vec<Vec<f32>>>)> = Vec::with_capacity(dense.len());
-            for (f, got) in dense.iter().zip(read) {
-                m.push((f.name.as_str().into(), got?));
-            }
-            m
-        };
+        // The first failure in field order is the error, as one read after another met it.
+        let mut extra: Vec<(crate::Field, Vec<Vec<Vec<f32>>>)> = Vec::with_capacity(dense.len());
+        for (f, got) in dense.iter().zip(read) {
+            extra.push((f.name.as_str().into(), got?));
+        }
         // ⚠️ One name for every row, shared (M120): a `String` a row was an allocation each.
         let first_field: crate::Field = self
             .fields
@@ -1110,16 +1112,15 @@ impl Segment {
         let bufs = store.get_ranges(key, &ranges).await?;
 
         // Row -> its document, for the asked-for rows the fetched blocks carry: the rest of
-        // each block is decoded and dropped, never filed (M119).
+        // each block is read through, never built (M121) -- and never filed (M119).
         let asked: std::collections::BTreeSet<usize> = rows.iter().copied().collect();
         let mut found: BTreeMap<usize, Document> = BTreeMap::new();
         for (n, block) in wanted.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
             let start = base.get(*block).copied().unwrap_or(0);
-            for (r, doc) in Self::decode_block(buf)?.into_iter().enumerate() {
-                if asked.contains(&(start + r)) {
-                    found.insert(start + r, doc);
-                }
+            let pick = |r: usize| asked.contains(&(start + r));
+            for (r, doc) in crate::decode_rows_picked(buf, &pick)? {
+                found.insert(start + r, doc);
             }
         }
         // Moved out at each row's last mention, copied only for one asked more than once

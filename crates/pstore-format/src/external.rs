@@ -425,8 +425,9 @@ impl ExternalAttribute {
         column: &str,
     ) -> Result<Self, ExternalError> {
         let (found, kind) = crate::parquet::locate_attribute(store, key, column).await?;
-        let tag = store.get_tag(key).await?;
-        if store.head(key).await? != found.len() {
+        // One probe for both (M121), so the length and the tag are of the same object.
+        let (len, tag) = store.stat(key).await?;
+        if len != found.len() {
             return Err(ExternalError::Changed);
         }
         let source = match found {
@@ -569,7 +570,7 @@ impl AttrChunks {
             ));
         }
         let key = Key::new(self.key.clone());
-        if store.head(&key).await? != self.len || store.get_tag(&key).await? != self.tag {
+        if store.stat(&key).await? != (self.len, self.tag.clone()) {
             return Err(ExternalError::Changed);
         }
         let ranges: Vec<Range<u64>> = self
@@ -689,8 +690,7 @@ impl ExternalColumn {
         stride: u64,
         rows: u64,
     ) -> Result<Self, ExternalError> {
-        let len = store.head(key).await?;
-        let tag = store.get_tag(key).await?;
+        let (len, tag) = store.stat(key).await?;
         let col = Self {
             key: key.as_str().to_owned(),
             base,
@@ -732,8 +732,8 @@ impl ExternalColumn {
         column: &str,
     ) -> Result<Self, ExternalError> {
         let found = crate::parquet::locate(store, key, column).await?;
-        let tag = store.get_tag(key).await?;
-        if store.head(key).await? != found.len {
+        let (len, tag) = store.stat(key).await?;
+        if len != found.len {
             return Err(ExternalError::Changed);
         }
         Self::from_runs(
@@ -770,8 +770,8 @@ impl ExternalColumn {
     ) -> Result<Self, ExternalError> {
         let mut objects = Vec::with_capacity(found.objects.len());
         for (key, len) in &found.objects {
-            let tag = store.get_tag(key).await?;
-            if store.head(key).await? != *len {
+            let (got, tag) = store.stat(key).await?;
+            if got != *len {
                 return Err(ExternalError::Changed);
             }
             objects.push(ObjectRef {
@@ -1041,13 +1041,13 @@ impl ExternalColumn {
             .chain(self.more.iter().map(|o| (&o.key, o.len, &o.tag)));
         let answers = futures_util::future::join_all(pins.map(|(key, len, tag)| async move {
             let k = Key::new(key.clone());
-            let (got_len, got_tag) =
-                futures_util::future::join(store.head(&k), store.get_tag(&k)).await;
-            (len, tag, got_len, got_tag)
+            // One probe an object (M121): the length and the tag were a billed HEAD each.
+            (len, tag, store.stat(&k).await)
         }))
         .await;
-        for (len, tag, got_len, got_tag) in answers {
-            if got_len? != len || got_tag? != *tag {
+        for (len, tag, got) in answers {
+            let (got_len, got_tag) = got?;
+            if got_len != len || got_tag != *tag {
                 return Err(ExternalError::Changed);
             }
         }

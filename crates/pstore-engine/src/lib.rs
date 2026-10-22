@@ -576,6 +576,12 @@ impl<S: BlobStore> BlobStore for Split<S> {
     async fn head(&self, key: &Key) -> Result<u64, pstore_blob::BlobError> {
         split_to!(self, key, head(key))
     }
+    async fn stat(
+        &self,
+        key: &Key,
+    ) -> Result<(u64, Option<pstore_types::CasTag>), pstore_blob::BlobError> {
+        split_to!(self, key, stat(key))
+    }
     async fn put(
         &self,
         key: &Key,

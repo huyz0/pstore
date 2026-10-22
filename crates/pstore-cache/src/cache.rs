@@ -246,6 +246,12 @@ impl CacheCore {
 
     /// [`Self::admit`] for several, under one lock of the arena (M120): a batched read's misses
     /// took the lock once each. The disk tier is written outside it, as `admit` writes it.
+    ///
+    /// ⚠️ **Each admitted as its own bytes, not as a slice of the fetch** (M119). The store
+    /// coalesces ranges up to a gap apart into one fetch, and a slice keeps that whole buffer
+    /// alive: two 4 KiB ranges a mebibyte apart pinned the mebibyte while the quota counted
+    /// 8 KiB. Copied here, after the class and the quota are judged (M121): a scan's ranges
+    /// and one past its quota are admitted nowhere, and were copied for nothing.
     async fn admit_all(&self, items: Vec<(Id, Bytes)>, class: Class) {
         if class == Class::Scan {
             return;
@@ -258,7 +264,9 @@ impl CacheCore {
         let (arena, quota) = self.arena(class);
         let mut state = locked(arena);
         for (id, bytes) in items {
-            state.admit(id, bytes, quota);
+            if bytes.len() <= quota {
+                state.admit(id, Bytes::copy_from_slice(&bytes), quota);
+            }
         }
     }
 
@@ -311,6 +319,40 @@ impl CacheCore {
         }
         drop(claim);
         out
+    }
+}
+
+impl<S: BlobStore> Caching<S> {
+    /// Fetches `misses` in one batched call and admits them; each fills every slot it names.
+    async fn fill(
+        &self,
+        core: &CacheCore,
+        key: &Key,
+        class: Class,
+        out: &mut [Option<Bytes>],
+        misses: Vec<(Vec<usize>, Range<u64>)>,
+    ) -> Result<(), BlobError> {
+        if misses.is_empty() {
+            return Ok(());
+        }
+        // ⚠️ The misses go to the inner `get_ranges`, so coalescing still happens — below
+        // the cache, where it belongs. The cache decides *what* to fetch; the store
+        // decides how few requests that takes.
+        let spans: Vec<Range<u64>> = misses.iter().map(|(_, r)| r.clone()).collect();
+        let fetched = self.inner.get_ranges_as(key, &spans, class).await?;
+        let name: Arc<str> = key.as_str().into();
+        let mut admitted = Vec::with_capacity(misses.len());
+        for ((slots, r), bytes) in misses.into_iter().zip(fetched) {
+            for i in slots {
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = Some(bytes.clone());
+                }
+            }
+            admitted.push((Id::Range(Arc::clone(&name), r.start, r.end), bytes));
+        }
+        // In fetch order, as one at a time admitted them, so eviction picks the same.
+        core.admit_all(admitted, class).await;
+        Ok(())
     }
 }
 
@@ -499,36 +541,66 @@ impl<S: BlobStore> BlobStore for Caching<S> {
             async move { core.find(&id, class).await }
         }))
         .await;
-        // Each miss with its slot (M119): placing a fetched range by searching `ranges` for it
-        // was O(misses x ranges). A range asked twice and missed twice is fetched for each slot,
-        // as the search's first-unfilled rule filled them.
-        let (slots, missing): (Vec<usize>, Vec<Range<u64>>) = ranges
-            .iter()
-            .zip(&out)
-            .enumerate()
-            .filter(|(_, (_, hit))| hit.is_none())
-            .map(|(i, (r, _))| (i, r.clone()))
-            .unzip();
-
-        if !missing.is_empty() {
-            // ⚠️ The misses go to the inner `get_ranges`, so coalescing still happens — below
-            // the cache, where it belongs. The cache decides *what* to fetch; the store
-            // decides how few requests that takes.
-            let fetched = self.inner.get_ranges_as(key, &missing, class).await?;
-            let mut admitted = Vec::with_capacity(missing.len());
-            for ((i, r), bytes) in slots.into_iter().zip(&missing).zip(fetched) {
-                // ⚠️ **Admitted as its own bytes, not as a slice of the fetch** (M119). The
-                // store coalesces ranges up to a gap apart into one fetch, and a slice keeps
-                // that whole buffer alive: two 4 KiB ranges a mebibyte apart pinned the
-                // mebibyte while the quota counted 8 KiB. The caller still gets the slice.
-                admitted.push((id(r), Bytes::copy_from_slice(&bytes)));
-                if let Some(slot) = out.get_mut(i) {
-                    *slot = Some(bytes);
+        // Each miss claimed, or found claimed (M121), as `fetch_once` does one: concurrent
+        // batched misses of a range reach the store once. ⚠️ What this call claimed is
+        // fetched, admitted and released BEFORE it waits on anyone, so two calls each
+        // waiting on the other's claim cannot deadlock. A range asked twice is fetched once.
+        let gates = core.gates(class);
+        let mut mine: Vec<(Vec<usize>, Range<u64>)> = Vec::new();
+        let mut claims: Vec<Claim<'_>> = Vec::new();
+        let mut theirs: Vec<(usize, Id, Arc<tokio::sync::Semaphore>)> = Vec::new();
+        {
+            let mut g = gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut at: HashMap<&Range<u64>, usize> = HashMap::new();
+            for (i, r) in ranges.iter().enumerate() {
+                if out.get(i).is_none_or(Option::is_some) {
+                    continue;
+                }
+                if let Some(&m) = at.get(r) {
+                    if let Some((slots, _)) = mine.get_mut(m) {
+                        slots.push(i);
+                    }
+                    continue;
+                }
+                let id = id(r);
+                match g.get(&id) {
+                    Some(gate) => theirs.push((i, id, Arc::clone(gate))),
+                    None => {
+                        if class != Class::Scan {
+                            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                            g.insert(id.clone(), Arc::clone(&gate));
+                            claims.push(Claim { gates, id, gate });
+                        }
+                        at.insert(r, mine.len());
+                        mine.push((vec![i], r.clone()));
+                    }
                 }
             }
-            // In fetch order, as one at a time admitted them, so eviction picks the same.
-            core.admit_all(admitted, class).await;
         }
+        self.fill(core, key, class, &mut out, mine).await?;
+        // Admitted, so the waiters find it.
+        drop(claims);
+
+        let mut again: Vec<(Vec<usize>, Range<u64>)> = Vec::new();
+        for (i, id, gate) in theirs {
+            let _ = gate.acquire().await;
+            match core.lookup(&id, class).await {
+                Some(hit) => {
+                    if let Some(slot) = out.get_mut(i) {
+                        *slot = Some(hit);
+                    }
+                }
+                // Its holder failed, was cancelled, or could not admit it: fetched here.
+                None => {
+                    if let Some(r) = ranges.get(i) {
+                        again.push((vec![i], r.clone()));
+                    }
+                }
+            }
+        }
+        self.fill(core, key, class, &mut out, again).await?;
 
         out.into_iter()
             .map(|b| {
@@ -566,6 +638,10 @@ impl<S: BlobStore> BlobStore for Caching<S> {
 
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
         self.inner.head(key).await
+    }
+
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<CasTag>), BlobError> {
+        self.inner.stat(key).await
     }
 
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {

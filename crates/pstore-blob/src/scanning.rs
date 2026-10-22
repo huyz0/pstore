@@ -97,6 +97,12 @@ impl<S: BlobStore> BlobStore for Scanning<S> {
     async fn head(&self, key: &Key) -> Result<u64, crate::BlobError> {
         self.0.head(key).await
     }
+    async fn stat(
+        &self,
+        key: &Key,
+    ) -> Result<(u64, Option<pstore_types::CasTag>), crate::BlobError> {
+        self.0.stat(key).await
+    }
     async fn put(
         &self,
         key: &Key,

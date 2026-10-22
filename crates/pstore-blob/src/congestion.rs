@@ -158,6 +158,10 @@ impl<S: crate::BlobStore> crate::BlobStore for Congested<S> {
         self.with_retry(|| self.inner.head(key)).await
     }
 
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<pstore_types::CasTag>), BlobError> {
+        self.with_retry(|| self.inner.stat(key)).await
+    }
+
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
         self.with_retry(|| self.inner.put(key, body.clone())).await
     }

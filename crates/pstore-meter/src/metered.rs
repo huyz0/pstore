@@ -225,6 +225,14 @@ impl<S: BlobStore> BlobStore for Metered<S> {
         out
     }
 
+    /// One request, as `head` is metered: the backend answers both with one probe (M121).
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<CasTag>), BlobError> {
+        let now = self.admit(1)?;
+        let out = self.inner.stat(key).await;
+        self.settle(OpClass::Read, 1, 0, now);
+        out
+    }
+
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
         let now = self.admit(1)?;
         let n = body.len() as u64;

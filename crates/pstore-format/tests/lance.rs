@@ -655,6 +655,30 @@ async fn a_deleted_row_is_never_returned() {
 }
 
 #[tokio::test]
+async fn a_column_check_is_one_request_an_object() {
+    // M121: before a read, every object of the column is checked -- its length and its tag,
+    // which one HEAD answers. Two calls an object were two billed HEADs of the same object.
+    use pstore_blob::{Accounted, OpClass};
+    let (store, manifest) = dataset("many").await;
+    let col = ExternalColumn::pin_lance(&store, &manifest, "emb")
+        .await
+        .unwrap();
+    let objects = 1 + col.more.len() as u64;
+    assert_eq!(objects, 3);
+    let acct = Accounted::new(store.clone());
+    let view = acct.as_tenant(pstore_types::TenantId(1));
+    acct.record_ranges();
+    let got = col.read_rows(&view, &[0]).await.unwrap();
+    assert_eq!(got.len(), 1);
+    let gets = acct.ranges().len() as u64;
+    assert_eq!(
+        acct.total(OpClass::Read) - gets,
+        objects,
+        "one check an object, besides the {gets} reads of the row"
+    );
+}
+
+#[tokio::test]
 async fn a_changed_fragment_is_noticed() {
     let (store, manifest) = dataset("many").await;
     let col = ExternalColumn::pin_lance(&store, &manifest, "emb")

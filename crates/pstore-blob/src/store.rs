@@ -182,6 +182,17 @@ pub trait BlobStore: Send + Sync + 'static {
     /// where the manifest already proves what exists.
     async fn head(&self, key: &Key) -> Result<u64, BlobError>;
 
+    /// [`Self::head`] and [`Self::get_tag`] together (M121): the length and the tag a pin
+    /// check compares. A backend whose one probe answers both overrides it -- on the object
+    /// stores each of the two is a billed HEAD of the same object.
+    ///
+    /// # Errors
+    /// As [`Self::head`], judged first, then as [`Self::get_tag`].
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<pstore_types::CasTag>), BlobError> {
+        let (len, tag) = futures_util::future::join(self.head(key), self.get_tag(key)).await;
+        Ok((len?, tag?))
+    }
+
     /// Atomic whole-object write.
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError>;
 
@@ -259,6 +270,9 @@ impl<S: BlobStore + ?Sized> BlobStore for std::sync::Arc<S> {
     }
     async fn head(&self, key: &Key) -> Result<u64, BlobError> {
         (**self).head(key).await
+    }
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<pstore_types::CasTag>), BlobError> {
+        (**self).stat(key).await
     }
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
         (**self).put(key, body).await

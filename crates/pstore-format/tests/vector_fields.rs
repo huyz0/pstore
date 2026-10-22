@@ -208,7 +208,42 @@ async fn a_multi_field_scan_reads_its_fields_together() {
     for (got, want) in out.iter().zip(&docs) {
         assert_eq!(got.vectors, want.vectors, "{}", want.id);
     }
-    assert_eq!(s.depth(), 2, "a three-field scan took {} rounds", s.depth());
+    assert_eq!(s.depth(), 1, "a three-field scan took {} rounds", s.depth());
+}
+
+#[tokio::test]
+async fn a_multi_field_scan_reads_each_fields_vectors_once() {
+    // M121: a segment that is not one fixed-width field reads each field whole, so the
+    // per-block slices of `Vectors` the simple path decodes are not asked for as well -- they
+    // were, and thrown away: the first field's vectors crossed the wire twice.
+    use pstore_blob::{Accounted, BlobStore, Key, MemoryStore};
+    let docs: Vec<Document> = (0..30)
+        .map(|i| {
+            let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0]);
+            d.vectors
+                .insert("a".into(), VectorField::dense(vec![2.0, i as f32, 0.5]));
+            d
+        })
+        .collect();
+    let mut w = pstore_format::SegmentWriter::new(8);
+    for d in &docs {
+        w.push(d.clone());
+    }
+    let key = Key::new("t/seg.seg");
+    let acct = Accounted::new(MemoryStore::new());
+    let store = acct.as_tenant(pstore_types::TenantId(1));
+    store.put(&key, w.finish()).await.unwrap();
+    let seg = pstore_format::Segment::open(&store, &key).await.unwrap();
+    acct.record_ranges();
+    let out = seg.scan(&store, &key, None).await.unwrap();
+    assert_eq!(out.len(), docs.len());
+    for name in [DEFAULT_FIELD, "a"] {
+        let span = seg
+            .field_section(name, pstore_format::Section::Vectors)
+            .unwrap();
+        let len = span.end - span.start;
+        assert_eq!(acct.bytes_in(&key, span), len, "field {name:?}'s vectors");
+    }
 }
 
 #[allow(

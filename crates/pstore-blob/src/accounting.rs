@@ -264,6 +264,12 @@ impl<S: crate::BlobStore> crate::BlobStore for TenantView<S> {
         self.inner.head(key).await
     }
 
+    /// One read, as the one HEAD a backend that answers both sends (M121).
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<pstore_types::CasTag>), BlobError> {
+        self.bill(OpClass::Read);
+        self.inner.stat(key).await
+    }
+
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
         self.bill(OpClass::Write);
         let n = body.len() as u64;

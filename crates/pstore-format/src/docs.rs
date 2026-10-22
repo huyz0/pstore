@@ -305,6 +305,39 @@ pub fn decode_rows_where(buf: &[u8], keep: &Projection<'_>) -> Result<Vec<Docume
     Ok(out)
 }
 
+/// The rows of a block `pick` names, with their positions, each built whole (M121); the
+/// rest are read through, checked as [`decode_rows`] checks them, and dropped.
+///
+/// ⚠️ For `rows_at`, which resolves a query's hits: a block holds as many rows as its index
+/// budget forces, thousands in a large segment, and building every one -- its id and every
+/// attribute -- to return the one or two asked was most of the work.
+pub fn decode_rows_picked(
+    buf: &[u8],
+    pick: &dyn Fn(usize) -> bool,
+) -> Result<Vec<(usize, Document)>, FormatError> {
+    let mut d = Dec::new(buf);
+    let n = d.u32()? as usize;
+    let mut out = Vec::new();
+    for i in 0..n {
+        if pick(i) {
+            let id = d.string()?;
+            let attrs = decode_attrs_where(&mut d, &every)?;
+            out.push((
+                i,
+                Document {
+                    id,
+                    vectors: BTreeMap::new(),
+                    attrs,
+                },
+            ));
+        } else {
+            d.str()?;
+            decode_attrs_where(&mut d, &|_| false)?;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -390,5 +423,52 @@ mod tests {
             );
         }
         assert!(refused > 10, "the corruptions refused nothing: {refused}");
+    }
+
+    #[test]
+    fn rows_at_builds_only_the_rows_asked() {
+        // M121: the rows `rows_at` asks are built, the rest read through -- the same rows the
+        // full decode gives, and the same refusal at every truncation.
+        let mut docs = Vec::new();
+        for i in 0..40u32 {
+            let mut d = Document::new(format!("r{i}"), Vec::new());
+            d.attrs.insert("n".to_owned(), Value::Int(i64::from(i)));
+            if i % 3 == 0 {
+                d.attrs
+                    .insert("text".to_owned(), Value::Str("x".repeat(i as usize)));
+            }
+            if i % 4 == 1 {
+                d.attrs.insert(
+                    "tags".to_owned(),
+                    Value::Array(vec![Value::Bool(true), Value::Float(f64::from(i))]),
+                );
+            }
+            docs.push(d);
+        }
+        let buf = encode_rows(&docs);
+        let full = decode_rows(&buf).unwrap();
+        let mut state: u64 = 7;
+        for _ in 0..50 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let mask = state;
+            let pick = |i: usize| mask >> (i % 64) & 1 == 1;
+            let want: Vec<(usize, Document)> = full
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter(|(i, _)| pick(*i))
+                .collect();
+            assert_eq!(decode_rows_picked(&buf, &pick).unwrap(), want);
+        }
+        let none = |_: usize| false;
+        for cut in 0..buf.len() {
+            let (a, b) = (
+                decode_rows(&buf[..cut]),
+                decode_rows_picked(&buf[..cut], &none),
+            );
+            assert_eq!(a.err(), b.err(), "cut at {cut}");
+        }
     }
 }

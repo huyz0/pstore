@@ -236,6 +236,16 @@ impl crate::BlobStore for ObjectStoreBackend {
             .map_err(Self::map_err)
     }
 
+    async fn stat(&self, key: &Key) -> Result<(u64, Option<CasTag>), BlobError> {
+        // One HEAD carries both (M121): `head` and `get_tag` were a billed request each.
+        // Absence is `head`'s refusal, which the default judges first too.
+        self.inner
+            .head(&Self::path(key))
+            .await
+            .map(|m| (m.size, m.e_tag.map(CasTag::new)))
+            .map_err(Self::map_err)
+    }
+
     async fn put(&self, key: &Key, body: Bytes) -> Result<PutOutcome, BlobError> {
         let r = self
             .inner
