@@ -91,3 +91,5 @@ on a path that fails. No LIST.
   `Document::new` allocate no name a row. It orders, hashes, compares and prints as its `str`.
 - **M120.7** — a test that a poisoned cache arena still serves; the bench at five runs.
 - **M120.8** — tests that constrain query 6 and engine 6, which the suite only ran.
+- **M120.9** — every finding row's fix broken once on purpose; a test for each break the
+  suite did not see (a repeated trigram, an unpadded scoped key).

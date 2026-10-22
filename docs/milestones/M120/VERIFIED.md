@@ -45,6 +45,10 @@ are all `7`). M120.6's: `a_scan_names_its_field_once` and `a_field_is_its_name` 
 first **red first** with the scan naming its field a row. The bench's digests are unchanged
 after it. `the_fast_part_is_the_tree_part`, not run against a mutation at M120, was:
 red with the dispatch's phase dropped, and with a typed failure not falling back.
+M120.9's: every finding row's fix broken once on purpose (FINDINGS.md's last table); 37
+of 39 went red, and the two that survived now have
+`the_set_beside_the_list_keeps_what_the_list_kept` and `a_scoped_key_is_the_byte_by_byte_one`,
+each **red first** against that same break -- a trigram kept twice, a name's hex unpadded.
 
 ## M119's open findings
 

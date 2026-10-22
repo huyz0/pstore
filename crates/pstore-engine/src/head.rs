@@ -1279,6 +1279,23 @@ mod tests {
         assert_eq!(unscoped(&dv_key(&key, 3, 1)), None);
     }
 
+    /// M120.9: one buffer is what a `String` a byte gave (M119), for every byte a name can
+    /// hold -- a low one included, whose hex needs its leading zero. The key is durable.
+    #[test]
+    fn a_scoped_key_is_the_byte_by_byte_one() {
+        let seg = "0046/tnt/70/idx/a/seg/L0/00000000000000000001-0000000000000001.seg";
+        let names: Vec<String> = vec![
+            (0u8..=0x7f).map(char::from).collect(),
+            "\u{1}\u{f}\u{10}".into(),
+            "é\u{2603}\u{1F600}".into(),
+            String::new(),
+        ];
+        for name in &names {
+            let by_byte: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(scoped(name, seg), format!("{seg}.br-{by_byte}"), "{name:?}");
+        }
+    }
+
     fn hex(b: &[u8]) -> String {
         b.iter().map(|b| format!("{b:02x}")).collect()
     }

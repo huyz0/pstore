@@ -118,7 +118,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | index 10 | `a_vector_query_scores_the_probed_lists_exactly` =, `clustered_search_finds_what_the_flat_scan_finds` = |
 | format 1 | `a_dictionary_of_terms_is_searchable_and_refuses_nonsense` =, `a_dictionary_from_another_format_or_an_unsorted_one_is_refused` |
 | format 2 | `the_draws_kept_are_the_draws_made` =, `the_encoding_is_frozen` = |
-| format 3 | `the_needle_is_the_strings` =, `a_trigram_sets_the_bits_fnv_1a_names` =, `a_fuzzy_match_at_distance_k_is_never_pruned` |
+| format 3 | `the_set_beside_the_list_keeps_what_the_list_kept` = (M120.9), `the_needle_is_the_strings` =, `a_trigram_sets_the_bits_fnv_1a_names` =, `a_fuzzy_match_at_distance_k_is_never_pruned` |
 | format 4, 5 | `pruning_does_not_change_the_answer` =, `a_segment_that_fits_keeps_its_zone_maps`, `mixed_ints_and_floats_prune_soundly_with_zone_maps` =, `a_segment_with_datetime_zones_prunes_soundly` = |
 | format 6 | `the_dictionary_carries_document_frequency` =, `bm25_matches_an_independent_implementation` = |
 | format 7 | `read_rows_returns_the_files_floats` =, `a_filter_on_the_files_own_column_equals_the_exact_filtered_cosine` = |
@@ -140,7 +140,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | engine 6 | `the_schema_cache_keeps_the_newest_heads` (M120.8, red with an unchanged HEAD's epoch not recorded), `a_cancelled_replica_is_forgotten_by_the_door` (M120.8, red with replica names not refreshed), `the_write_door_uses_the_schema_the_process_has_read` |
 | engine 7 | `a_repeated_range_within_one_call_fills_both_positions` =, `eviction_follows_a_model_lru` =, `the_disk_hash_is_the_encodings` = |
 | engine 8 | `a_poisoned_arena_still_serves` = (M120.7, red with the poison not recovered -- the one value the change could alter: a `std` mutex can be poisoned and a tokio one cannot), `concurrent_misses_issue_one_request`, `eviction_follows_a_model_lru` = |
-| engine 9 | `only_a_scoped_segment_key_unscopes` =, `a_branch_equals_its_source_and_then_diverges` |
+| engine 9 | `a_scoped_key_is_the_byte_by_byte_one` = (M120.9), `only_a_scoped_segment_key_unscopes` =, `a_branch_equals_its_source_and_then_diverges` |
 | server 1, 3 | `the_fast_parse_is_the_tree_parse` =, `a_multi_query_answers_each_as_it_would_alone` = |
 | server 2 | `the_fast_part_is_the_tree_part` = (red with the phase dropped, and with no fallback), `a_split_query_answers_exactly_as_one_server_does` = |
 | server 4 | `the_hand_written_vector_is_the_derived_one` =, `multi_vectors_are_refused_at_the_door` |
@@ -149,6 +149,63 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | server 7 | `a_requested_or_backing_off_tenant_is_kept`, `the_least_recently_used_goes_first` |
 | server 8 | `the_deployment_opts_in_by_name_and_names_its_prefixes`, `an_allowed_source_is_registered_queried_and_dropped_by_name` |
 | server 9 | `the_metered_slices_are_the_stores_bytes` = (M120.5, red with a slice at the wrong offset), `the_meter_and_the_accountant_agree_on_a_coalesced_fan_out` |
+
+## Every row broken on purpose (M120.9)
+
+Each row's fix was broken once, deliberately, at `057cec1`, and the crate's suite run
+(`cargo test --all-features -p <crate>`), then its dependents' if the crate's own passed.
+`RED` names the first test that failed. Rows already shown red by a test named in the
+appendix (format 2, query 6, engine 1, 4, 6, 7, 8, server 1--4, 9) are
+not repeated. **37 of 39 went red; the two that survived now have a test, each red against
+the same break and green without it:**
+
+- format 3, a trigram kept twice: invisible to a sketch, whose bits a repeat sets again.
+  `the_set_beside_the_list_keeps_what_the_list_kept` compares against the list alone.
+- engine 9, an index name's hex written unpadded: no name the suite uses has a byte below
+  `0x10`. `a_scoped_key_is_the_byte_by_byte_one` covers every ASCII byte and multi-byte
+  UTF-8 -- the key is durable, so its spelling is the contract.
+
+| Row | Break | Result | Caught by |
+|---|---|---|---|
+| index 1 | sign of a clear bit not flipped | RED | `the_branchless_kernel_is_the_branchy_one` |
+| index 2 | a probe's distance summed, not differenced | RED | `the_table_in_place_is_the_decoded_one` |
+| index 3 | the residual estimate's sign flipped | RED | `the_branchless_kernel_is_the_branchy_one` |
+| index 4 | the selected prefix left unsorted | RED | `top_k_matches_a_full_sort` |
+| index 5 | the data-row dedupe keeps every copy | RED | `every_rung_zero_score_is_the_rows_code_against_its_own_lists_centroid` |
+| index 6 | BM25 adds the IDF alone | RED | `an_empty_corpus_scores_without_a_length_term`, `bm25_matches_an_independent_implementation` |
+| index 7 | the nearest list taken even when full | RED | `a_full_list_takes_no_more_rows`, `a_zero_boundary_replicates_nothing_not_even_an_exact_tie` |
+| index 8 | a mean summed from 1.0 | RED | `a_seeding_tie_goes_to_the_first_row`, `a_zero_boundary_replicates_nothing_not_even_an_exact_tie` |
+| index 9 | the first document left out of the blocks | RED | `a_clustered_query_returns_the_documents_it_should`, `a_small_index_answers_exactly_and_builds_no_index` |
+| index 10 | a row's last score kept, not its first | RED | `a_vector_query_scores_the_probed_lists_exactly` |
+| spikes exq | the sign never flipped | RED | `exq_error_falls_with_bits`, `exq_residual_estimate_is_unbiased` |
+| spikes lire | a recentred mean summed from 1.0 | RED | `bisect_is_lloyd_from_the_farthest_pair_with_ties_to_the_first_seed` |
+| format 1 | a lookup's order reversed | RED | `a_dictionary_of_terms_is_searchable_and_refuses_nonsense`, `a_document_without_text_does_not_shift_the_rows` |
+| format 3 | a trigram kept twice | SURVIVED → now RED | `the_set_beside_the_list_keeps_what_the_list_kept` (M120.9) |
+| format 4 | the fit accepts any block size | RED | `field_rows_reads_only_the_named_rows` |
+| format 5 | an int zone's minimum is the last value | RED | `pruning_does_not_change_the_answer`, `zone_maps_skip_blocks_that_cannot_match` |
+| format 6 | a posting's term frequency off by one | RED | `a_text_field_round_trips` |
+| format 7 | an external row read from the next row | RED | `bit_packed_lance_columns_read_back`, `lance_scalar_columns_read_back_in_every_layout` |
+| format 8 | the sparse dictionary read a byte late | RED | `a_dimension_between_two_entries_is_not_found`, `a_dictionary_reports_the_encoding_it_was_built_with` |
+| format 9 | a row bisected into the block before | RED | `hits_in_several_blocks_cost_one_round_and_out_of_range_rows_are_none` |
+| format 10 | a field's vectors taken empty | RED | `a_field_may_hold_many_vectors_per_document`, `a_document_round_trips_several_named_fields` |
+| query 1 | statistics for no term | RED | `global_statistics_change_the_ranking_across_segments` |
+| query 2 | the decoded index never used | RED | `a_three_leg_query_is_no_deeper_than_its_deepest_leg`, `a_text_leg_naming_another_field_is_refused` |
+| query 3 | fused ties broken backwards | RED | `rrf_is_the_reciprocal_rank_sum` |
+| query 4 | a maxsim leg ranked worst first | RED | `a_multi_leg_is_widened_past_deleted_rows`, `multi_scores_by_maxsim` |
+| query 5 | a comparison read as equality | RED | `a_datetime_literal_compares_by_instant` |
+| query 7 | a full selector keeps the worse row | RED | `the_selector_holds_at_most_its_cap_and_equals_a_sort_truncated` |
+| query 8 | an existing group not counted | RED | `a_merge_is_exact_when_a_global_key_is_a_segments_last_kept`, `sums_are_typed_as_stated` |
+| query 9 mask | an unmasked row admitted | RED | `masks_leave_the_querys_thread` |
+| query 9 deletes | a deleted row kept | RED | `a_multi_leg_is_widened_past_deleted_rows` |
+| engine 2 | a stale fresh segment served | RED | `a_dropped_index_is_gone_wherever_its_rows_were` |
+| engine 3 | the bounded cache never filled | RED | `every_level_applies` (dependents) |
+| engine 5 | a named field's width never checked | RED | `the_schema_outranks_a_held_width_at_the_door` |
+| engine 9 | an index name's hex unpadded | SURVIVED → now RED | `a_scoped_key_is_the_byte_by_byte_one` (M120.9) |
+| cache 7 | every miss filled into the first slot | RED | `a_cached_range_equals_what_the_store_holds`, `a_repeated_range_within_one_call_fills_both_positions` |
+| server 5 | a column's cell taken one row late | RED | `a_patch_merges_into_the_folded_row` |
+| server 6 | a document's vector dropped | RED | `arrays_come_back_as_written`, `contains_finds_an_element_by_value` |
+| server 7 | an owed tenant evicted | RED | `a_requested_or_backing_off_tenant_is_kept` |
+| server 8 | the external prefixes never given | RED | `an_allowed_source_is_registered_queried_and_dropped_by_name`, `each_copy_refusal_has_its_status_and_code` |
 
 ## The bench, at five runs
 

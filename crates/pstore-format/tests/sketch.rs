@@ -237,3 +237,39 @@ fn a_sketch_of_a_width_that_is_no_power_of_two_or_out_of_range_is_refused() {
         );
     }
 }
+
+/// M120.9: `trigrams` keeps a set beside its list (M119), and is still what the list alone
+/// gave -- each trigram once, in order of first appearance -- over strings that repeat, fold
+/// together, and run long. A repeated trigram is invisible to a sketch, so only this sees it.
+#[test]
+fn the_set_beside_the_list_keeps_what_the_list_kept() {
+    fn by_list(s: &str) -> Vec<[char; 3]> {
+        let folded: Vec<char> = s.chars().map(fold).collect();
+        let mut out: Vec<[char; 3]> = Vec::new();
+        for w in folded.windows(3) {
+            let t = [w[0], w[1], w[2]];
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
+    }
+    let alphabet: Vec<char> = "abAB\u{17F}sS\u{3C3}\u{3A3}k\u{212A}".chars().collect();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        state >> 33
+    };
+    let mut cases: Vec<String> = vec![String::new(), "ab".into(), "aaaa".into(), "abcabc".into()];
+    for len in [3, 5, 8, 17, 64, 300] {
+        for _ in 0..20 {
+            let n = alphabet.len() as u64;
+            cases.push((0..len).map(|_| alphabet[(next() % n) as usize]).collect());
+        }
+    }
+    for s in &cases {
+        assert_eq!(pstore_format::trigram::trigrams(s), by_list(s), "{s:?}");
+    }
+}
