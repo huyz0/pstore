@@ -8,7 +8,8 @@ record the mutation each went red under first, where one was run. The bench dige
 
 Commits: M119.2 `7a94c49`, M120 `17e96bb`, M120.2 `4893a5e`, M120.3 `57351e3`, M120.4
 `4bb3ef2` (this ledger's count), M120.5 `85c64a3` (engine 7's last sub-point, and the tests
-the appendix found missing), and M120.6 (format 10's last sub-point). Each commit's gate run is the whole workspace's suite at that
+the appendix found missing), M120.6 `69ed65f` (format 10's last sub-point), and M120.7 (a
+test for engine 8, and the bench at five runs). Each commit's gate run is the whole workspace's suite at that
 commit, so the last run covers every test named below at once.
 
 **The count.** The reviews numbered **47** findings: 10 index, 10 format, 9 query, 9 engine
@@ -136,7 +137,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | engine 5 | `the_schema_outranks_a_held_width_at_the_door`, `two_writers_widths_meet_in_the_fold` |
 | engine 6 | `the_write_door_uses_the_schema_the_process_has_read`, `the_schema_is_read_once_per_process` -- the change skips a copy of what is held; it computes none |
 | engine 7 | `a_repeated_range_within_one_call_fills_both_positions` =, `eviction_follows_a_model_lru` =, `the_disk_hash_is_the_encodings` = |
-| engine 8 | `concurrent_misses_issue_one_request`, `each_class_stays_within_its_quota`, `eviction_follows_a_model_lru` = -- a lock's kind, not a value |
+| engine 8 | `a_poisoned_arena_still_serves` = (M120.7, red with the poison not recovered -- the one value the change could alter: a `std` mutex can be poisoned and a tokio one cannot), `concurrent_misses_issue_one_request`, `eviction_follows_a_model_lru` = |
 | engine 9 | `only_a_scoped_segment_key_unscopes` =, `a_branch_equals_its_source_and_then_diverges` |
 | server 1, 3 | `the_fast_parse_is_the_tree_parse` =, `a_multi_query_answers_each_as_it_would_alone` = |
 | server 2 | `the_fast_part_is_the_tree_part` = (red with the phase dropped, and with no fallback), `a_split_query_answers_exactly_as_one_server_does` = |
@@ -146,3 +147,22 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 | server 7 | `a_requested_or_backing_off_tenant_is_kept`, `the_least_recently_used_goes_first` |
 | server 8 | `the_deployment_opts_in_by_name_and_names_its_prefixes`, `an_allowed_source_is_registered_queried_and_dropped_by_name` |
 | server 9 | `the_metered_slices_are_the_stores_bytes` = (M120.5, red with a slice at the wrong offset), `the_meter_and_the_accountant_agree_on_a_coalesced_fan_out` |
+
+## The bench, at five runs
+
+`./scripts/query-bench.sh`'s binary built from `e7ea269` (before M119) and from `69ed65f`, five
+runs alternating on one host, p50 in ms, median and range. The digests are equal in every run.
+**The slowest run after is faster than the fastest run before on every kind**, so the gain is
+not this host's ±15% run-to-run noise.
+
+| kind | before | after | median ratio | slowest after / fastest before |
+|---|---|---|---|---|
+| dense | 9.58 (9.23–9.96) | 3.28 (3.00–3.54) | 0.34 | 0.38 |
+| text | 3.72 (3.33–4.07) | 1.79 (1.70–1.96) | 0.48 | 0.59 |
+| hybrid | 10.86 (10.57–11.29) | 3.89 (3.43–4.41) | 0.36 | 0.42 |
+| dense+filter | 22.29 (20.47–23.42) | 11.96 (11.67–12.66) | 0.54 | 0.62 |
+| text+filter | 15.47 (14.90–17.53) | 6.43 (6.28–7.55) | 0.42 | 0.51 |
+| dense k=100 | 17.40 (16.82–18.38) | 10.05 (9.47–10.32) | 0.58 | 0.61 |
+| text k=100 | 9.27 (8.75–9.72) | 6.75 (6.33–7.26) | 0.73 | 0.83 |
+
+`provisional` (AGENTS.md): one 4-core Linux container. NOT-RUN on other hosts.

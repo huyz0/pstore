@@ -608,6 +608,43 @@ mod tests {
     use super::{Id, State};
     use bytes::Bytes;
 
+    /// M119 (engine 8): an arena is a `std` mutex now, which a panic can poison -- a tokio one
+    /// could not be. A poisoned arena is recovered, not a failed read or a lost admission.
+    #[tokio::test]
+    async fn a_poisoned_arena_still_serves() {
+        use pstore_blob::BlobStore as _;
+        let store = std::sync::Arc::new(pstore_blob::MemoryStore::new());
+        let key = pstore_blob::Key::new("seg/poisoned");
+        let body = Bytes::from((0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        store.put(&key, body.clone()).await.unwrap();
+        let cache = super::Caching::with_quotas(store, 1 << 16, 1 << 16, 1 << 16);
+        let core = cache.core.as_ref().unwrap();
+        for arena in [&core.pinned, &core.meta, &core.bulk] {
+            let poisoned = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _held = arena.lock();
+                    panic!("poisoning the arena on purpose");
+                })
+                .join()
+            });
+            assert!(poisoned.is_err());
+            assert!(arena.is_poisoned());
+        }
+        let ranges = vec![0..64, 1000..1100];
+        let want: Vec<Bytes> = ranges
+            .iter()
+            .map(|r| body.slice(r.start as usize..r.end as usize))
+            .collect();
+        // A miss admits through the poisoned lock, and a hit reads through it.
+        assert_eq!(cache.get_ranges(&key, &ranges).await.unwrap(), want);
+        assert!(
+            cache.holds(&key, 0..64),
+            "the admission was lost to the poison"
+        );
+        assert_eq!(cache.get_ranges(&key, &ranges).await.unwrap(), want);
+        assert!(cache.resident_bytes() >= 164);
+    }
+
     /// M28 criterion 5: 100 000 entries touched and then evicted, which a recency kept as a
     /// `Vec` makes ~10^10 comparisons. ⚠️ A bound with a wide margin, checked as it goes so the
     /// slow version fails at the bound rather than running for minutes.

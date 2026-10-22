@@ -89,3 +89,4 @@ on a path that fails. No LIST.
   findings appendix found unexercised by value (a cached range's bytes, a metered slice's).
 - **M120.6** — `Document.vectors` keyed by `Field`, a shared name: a scan, a decode and
   `Document::new` allocate no name a row. It orders, hashes, compares and prints as its `str`.
+- **M120.7** — a test that a poisoned cache arena still serves; the bench at five runs.
