@@ -150,7 +150,7 @@ path fails it. Found by a read-only sweep of the suite; each name resolves.
 
 ## The bench, at five runs
 
-`./scripts/query-bench.sh`'s binary built from `e7ea269` (before M119) and from `69ed65f`, five
+`./scripts/query-bench.sh`'s binary built from `f250ecf` (the code of `e7ea269`, before M119, with the bench) and from `69ed65f`, five
 runs alternating on one host, p50 in ms, median and range. The digests are equal in every run.
 **The slowest run after is faster than the fastest run before on every kind**, so the gain is
 not this host's ±15% run-to-run noise.
