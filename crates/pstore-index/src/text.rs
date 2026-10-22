@@ -73,7 +73,8 @@ impl Stats {
 /// An opened text index: the segment's directory and the term dictionary.
 #[derive(Debug)]
 pub struct TextIndex {
-    dict: TermDict,
+    /// Shared with every other reader of the same fetched buffer (M122).
+    dict: std::sync::Arc<TermDict>,
     postings: std::ops::Range<u64>,
     norms: std::ops::Range<u64>,
 }
@@ -93,6 +94,27 @@ impl TextIndex {
 
     /// Opens a text index over an **already-open** segment, so a hybrid query opens once.
     pub fn from_segment(segment: &Segment, dictionary: &[u8]) -> Result<Self, FormatError> {
+        Self::with_dict(segment, || {
+            TermDict::decode(dictionary).map(std::sync::Arc::new)
+        })
+    }
+
+    /// [`Self::from_segment`] over the fetched buffer, whose decoded dictionary is kept for
+    /// it (M122): a text query decoded every text segment's dictionary again.
+    ///
+    /// # Errors
+    /// As [`Self::from_segment`].
+    pub fn from_segment_shared(
+        segment: &Segment,
+        dictionary: &bytes::Bytes,
+    ) -> Result<Self, FormatError> {
+        Self::with_dict(segment, || TermDict::decode_shared(dictionary))
+    }
+
+    fn with_dict(
+        segment: &Segment,
+        dict: impl FnOnce() -> Option<std::sync::Arc<TermDict>>,
+    ) -> Result<Self, FormatError> {
         // ⚠️ An error, not an empty index. A segment with no text answering every query with
         // nothing is indistinguishable from a corpus with no matches, so a caller could not
         // tell an unindexed field from an unlucky query.
@@ -105,8 +127,7 @@ impl TextIndex {
         let norms = segment
             .section(Section::Fieldnorms)
             .ok_or(FormatError::Corrupt("text with no fieldnorms section"))?;
-        let dict = TermDict::decode(dictionary)
-            .ok_or(FormatError::Corrupt("the term dictionary did not decode"))?;
+        let dict = dict().ok_or(FormatError::Corrupt("the term dictionary did not decode"))?;
         Ok(Self {
             dict,
             postings,

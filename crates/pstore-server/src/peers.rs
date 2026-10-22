@@ -1218,7 +1218,7 @@ pub(crate) async fn serve_part<S: BlobStore + 'static>(
     // is dispatched by a probe and parsed once into its type; any other goes the tree's way.
     // A tree held each integer of each query vector as a 32-byte node, then was walked again.
     let raw = match crate::body::plain(&body).filter(|p| p.keys.is_some()) {
-        Some(_) => Body::Plain(&body),
+        Some(p) => Body::Plain(&body, p.heading),
         None => Body::Tree(
             serde_json::from_slice(&body)
                 .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?,
@@ -1253,38 +1253,21 @@ fn heading(raw: &Body<'_>) -> Result<(Option<u64>, Option<String>), ApiError> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
         ),
-        // An object, no key twice: these are the tree's `get`s.
-        Body::Plain(body) => {
-            #[derive(serde::Deserialize)]
-            struct Probe {
-                #[serde(default)]
-                protocol: Option<serde_json::Value>,
-                #[serde(default)]
-                phase: Option<serde_json::Value>,
-            }
-            let p: Probe = serde_json::from_slice(body)
-                .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?;
-            (
-                p.protocol.as_ref().and_then(serde_json::Value::as_u64),
-                p.phase
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            )
-        }
+        // An object, no key twice: read by `plain`'s own pass as the tree's `get`s read them.
+        Body::Plain(_, h) => (h.protocol, h.phase.clone()),
     })
 }
 
 /// A part's body: plain, to parse once, or the tree the rest are judged by (M120).
 enum Body<'a> {
-    Plain(&'a [u8]),
+    Plain(&'a [u8], crate::body::Heading),
     Tree(serde_json::Value),
 }
 
 fn wire_of<T: serde::de::DeserializeOwned>(raw: Body<'_>) -> Result<T, ApiError> {
     let tree = match raw {
         Body::Tree(v) => v,
-        Body::Plain(body) => match serde_json::from_slice(body) {
+        Body::Plain(body, _) => match serde_json::from_slice(body) {
             Ok(t) => return Ok(t),
             // Refused as the tree refuses it, word for word.
             Err(_) => serde_json::from_slice(body)
@@ -1577,24 +1560,25 @@ mod tests {
         let mut fast = 0;
         bodies.push(serde_json::to_vec(&scan).unwrap());
         for b in bodies {
-            let Some(_) = crate::body::plain(&b).filter(|p| p.keys.is_some()) else {
+            let Some(plain) = crate::body::plain(&b).filter(|p| p.keys.is_some()) else {
                 continue;
             };
+            let h = plain.heading;
             let tree: serde_json::Value = serde_json::from_slice(&b).unwrap();
             let label = String::from_utf8_lossy(&b).into_owned();
             // The dispatch, too, reads what the tree's `get`s read.
             assert_eq!(
-                heading(&Body::Plain(&b)).map_err(|e| format!("{e:?}")),
+                heading(&Body::Plain(&b, h.clone())).map_err(|e| format!("{e:?}")),
                 heading(&Body::Tree(tree.clone())).map_err(|e| format!("{e:?}")),
                 "heading: {label}"
             );
             assert_eq!(
-                shown(wire_of::<WireScan>(Body::Plain(&b)).map(|w| format!("{w:?}"))),
+                shown(wire_of::<WireScan>(Body::Plain(&b, h.clone())).map(|w| format!("{w:?}"))),
                 shown(wire_of::<WireScan>(Body::Tree(tree.clone())).map(|w| format!("{w:?}"))),
                 "scan: {label}"
             );
             assert_eq!(
-                shown(wire_of::<WirePart>(Body::Plain(&b)).map(|w| format!("{w:?}"))),
+                shown(wire_of::<WirePart>(Body::Plain(&b, h)).map(|w| format!("{w:?}"))),
                 shown(wire_of::<WirePart>(Body::Tree(tree)).map(|w| format!("{w:?}"))),
                 "part: {label}"
             );

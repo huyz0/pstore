@@ -963,3 +963,22 @@ async fn a_vectors_section_too_narrow_for_a_row_does_not_displace_the_postings()
     assert_eq!(plain.len(), docs.len());
     assert_eq!(scan(Some(vec![0u8; 2])).await.unwrap(), plain);
 }
+
+#[test]
+fn a_sparse_dictionary_is_decoded_once_a_buffer() {
+    // M122: as a term dictionary is: by the buffer, never by its bytes alone.
+    let docs = corpus(300, 60, 5);
+    let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
+    let raw = bytes::Bytes::from(p.dictionary.clone());
+    let one = Dictionary::decode_shared(&raw).unwrap();
+    let two = Dictionary::decode_shared(&raw.clone()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&one, &two));
+    let three = Dictionary::decode_shared(&bytes::Bytes::from(p.dictionary.clone())).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&one, &three));
+    let fresh = Dictionary::decode(&p.dictionary).unwrap();
+    for dim in 0..60u32 {
+        assert_eq!(one.lookup(dim), fresh.lookup(dim), "{dim}");
+        assert_eq!(three.lookup(dim), fresh.lookup(dim), "{dim}");
+    }
+    assert!(Dictionary::decode_shared(&raw.slice(..raw.len() - 1)).is_none());
+}

@@ -24,6 +24,7 @@ pub mod geo;
 pub mod lance;
 pub mod parquet;
 mod reader;
+mod shared;
 pub mod sparse;
 pub mod text;
 pub mod trigram;

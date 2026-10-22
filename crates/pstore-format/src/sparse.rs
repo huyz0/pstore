@@ -263,6 +263,20 @@ impl Dictionary {
         Some(me)
     }
 
+    /// [`Self::decode_bytes`], kept for `raw` itself (M122), as
+    /// [`crate::text::TermDict::decode_shared`] keeps a term dictionary: a sparse leg walked
+    /// every dimension of its segment's dictionary on every query.
+    #[must_use]
+    pub fn decode_shared(raw: &bytes::Bytes) -> Option<std::sync::Arc<Self>> {
+        static KEPT: std::sync::LazyLock<crate::shared::ByBuffer<Dictionary>> =
+            std::sync::LazyLock::new(|| crate::shared::ByBuffer::new(crate::text::DECODED_BUDGET));
+        KEPT.get_or(
+            raw,
+            |d| d.dims.len() * std::mem::size_of::<u32>(),
+            |b| Self::decode_bytes(b.clone()),
+        )
+    }
+
     /// How impacts in this segment are stored.
     #[must_use]
     pub fn encoding(&self) -> ImpactEncoding {

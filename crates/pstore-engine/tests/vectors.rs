@@ -174,7 +174,7 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
     );
     let answer = Answer {
         hits: vec![hit(0), hit(1), hit(2)],
-        unfolded: Vec::new(),
+        unfolded: Default::default(),
         unfolded_at: 9,
         ids: vec![Some("a".into()), None, Some("c".into())],
         attributes: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],

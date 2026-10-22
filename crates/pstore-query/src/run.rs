@@ -1656,7 +1656,7 @@ async fn open<S: BlobStore>(
     .await;
     let segment = segment?;
     let text = terms.as_ref().and_then(|raw| {
-        TextIndex::from_segment(&segment, raw.as_ref())
+        TextIndex::from_segment_shared(&segment, raw)
             .ok()
             .map(Arc::new)
     });

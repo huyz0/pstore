@@ -500,6 +500,10 @@ pub struct TermEntry {
     pub df: u32,
 }
 
+/// What the decoded term dictionaries kept by [`TermDict::decode_shared`] may hold alive, in
+/// all: their buffers and their decoded heaps.
+pub const DECODED_BUDGET: usize = 32 << 20;
+
 /// The term dictionary: sorted terms, fixed-width entries, and a blob of term bytes.
 #[derive(Debug, Clone)]
 pub struct TermDict {
@@ -559,6 +563,23 @@ impl TermDict {
             rows,
             total_tokens,
         })
+    }
+
+    /// [`Self::decode`], kept for `raw` itself (M122): every text query decoded every text
+    /// segment's dictionary, though the pinned cache hands back the same buffer for it each
+    /// time. Process-wide, bounded; see `shared`.
+    #[must_use]
+    pub fn decode_shared(raw: &bytes::Bytes) -> Option<std::sync::Arc<Self>> {
+        static KEPT: std::sync::LazyLock<crate::shared::ByBuffer<TermDict>> =
+            std::sync::LazyLock::new(|| crate::shared::ByBuffer::new(DECODED_BUDGET));
+        KEPT.get_or(raw, Self::heap, |b| Self::decode(b))
+    }
+
+    /// The bytes this holds beyond itself.
+    fn heap(&self) -> usize {
+        self.blob.len()
+            + self.terms.len() * std::mem::size_of::<(u32, u16)>()
+            + self.entries.len() * std::mem::size_of::<TermEntry>()
     }
 
     /// Documents this segment holds, text or not — the `N` of IDF's numerator.

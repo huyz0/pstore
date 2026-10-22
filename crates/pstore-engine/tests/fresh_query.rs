@@ -485,3 +485,35 @@ async fn each_index_keeps_its_own_fresh_segment() {
     assert_eq!(got.unfolded.len(), 6);
     assert_eq!(e.fresh_indexes_for_test().await, ["a"]);
 }
+
+#[tokio::test]
+async fn two_queries_share_the_unfolded_rows() {
+    // M122: a query's unfolded rows are the fresh cache's own, shared: a copy was every
+    // document and vector of the index's memtable, on every query.
+    let store = Arc::new(MemoryStore::new());
+    let e =
+        Engine::new(Arc::clone(&store), TenantId(802), LaneId(1)).with_index_params(params(100));
+    e.write("a", (0..5).map(doc).collect()).await.unwrap();
+    e.flush().await.unwrap();
+    let one = e
+        .query("a", &dense(1, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    let two = e
+        .query("a", &dense(2, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(one.unfolded.len(), 5);
+    assert!(
+        Arc::ptr_eq(&one.unfolded, &two.unfolded),
+        "the second query copied the unfolded rows"
+    );
+    // A write is a new generation, and new rows.
+    e.write("a", vec![doc(9)]).await.unwrap();
+    let three = e
+        .query("a", &dense(1, 10), Fusion::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(three.unfolded.len(), 6);
+    assert!(!Arc::ptr_eq(&one.unfolded, &three.unfolded));
+}

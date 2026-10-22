@@ -643,7 +643,7 @@ struct Fresh {
     target: Option<pstore_query::Target>,
     /// The documents, in the segment's row order — which the clustering decides, so it is not
     /// the order they were written in.
-    rows: Vec<Document>,
+    rows: Arc<Vec<Document>>,
     /// Every id with an unfolded operation, upsert or delete: the rows they supersede in the
     /// index's segments are hidden (M9c.2). ⚠️ From the SAME memtable snapshot as `rows`, so a
     /// write landing between the two cannot show both versions of an id. Shared with every
@@ -1359,7 +1359,7 @@ mod memtable_tests {
 /// A fresh segment as one query uses it: its target, rows and store, taken together.
 struct FreshView {
     target: Option<pstore_query::Target>,
-    rows: Vec<Document>,
+    rows: Arc<Vec<Document>>,
     store: Arc<pstore_blob::MemoryStore>,
     shadow: Arc<std::collections::HashSet<String>>,
     metric: Option<Metric>,
@@ -1370,7 +1370,9 @@ impl Fresh {
     fn view(&self) -> FreshView {
         FreshView {
             target: self.target.clone(),
-            rows: self.rows.clone(),
+            // Shared, never copied (M122): a query reads the unfolded rows and keeps them in
+            // its answer, and a copy was every document and vector of the index's memtable.
+            rows: Arc::clone(&self.rows),
             store: Arc::clone(&self.store),
             shadow: Arc::clone(&self.shadow),
             metric: self.metric,
@@ -1393,7 +1395,7 @@ pub struct Answer {
     /// list for the index queried.
     pub hits: Vec<pstore_query::Hit>,
     /// The unfolded documents, in the row order [`Self::unfolded_at`]'s hits index.
-    pub unfolded: Vec<Document>,
+    pub unfolded: Arc<Vec<Document>>,
     /// The ordinal the freshness layer occupies — one past HEAD's last segment.
     ///
     /// ⚠️ When nothing is unfolded no fresh segment is built at all, so no hit carries this
@@ -1496,7 +1498,7 @@ impl Read {
 struct Scope {
     refs: Vec<SegmentRef>,
     targets: Vec<pstore_query::Target>,
-    unfolded: Vec<Document>,
+    unfolded: Arc<Vec<Document>>,
     shadow: Arc<std::collections::HashSet<String>>,
     epoch: Epoch,
     watermarks: BTreeMap<u64, u64>,
@@ -5261,7 +5263,7 @@ impl<S: BlobStore> Engine<S> {
                 index: index.to_owned(),
                 store: Arc::new(pstore_blob::MemoryStore::new()),
                 target: None,
-                rows,
+                rows: Arc::new(rows),
                 shadow,
                 metric,
                 fts,
@@ -5350,7 +5352,7 @@ impl<S: BlobStore> Engine<S> {
             index: index.to_owned(),
             store,
             target: Some(target),
-            rows: ordered,
+            rows: Arc::new(ordered),
             shadow,
             metric,
             fts,
@@ -5689,7 +5691,7 @@ impl<S: BlobStore> Engine<S> {
                 targets.extend(v.target);
                 (v.rows, Some(v.store), v.shadow, v.metric, Some(v.fts))
             }
-            None => (Vec::new(), None, Arc::default(), None, None),
+            None => (Arc::default(), None, Arc::default(), None, None),
         };
         // M14: the same rule as the metric's, and the fresh segment was built by it.
         let fts = at
@@ -6041,7 +6043,7 @@ impl<S: BlobStore> Engine<S> {
                 ids: Vec::new(),
                 attributes: Vec::new(),
                 dists: Vec::new(),
-                unfolded: Vec::new(),
+                unfolded: Arc::default(),
                 unfolded_at: 0,
                 segments: refs,
                 epoch: then.epoch,
@@ -6081,7 +6083,7 @@ impl<S: BlobStore> Engine<S> {
             ids,
             attributes,
             dists,
-            unfolded: Vec::new(),
+            unfolded: Arc::default(),
             unfolded_at,
             segments: refs,
             epoch: then.epoch,
@@ -6230,11 +6232,15 @@ impl<S: BlobStore> Engine<S> {
         let exists = !refs.is_empty() || !unfolded.is_empty();
         // The unfolded rows are the newest version of each id they carry, tombstones already
         // gone; the segments' older rows of those ids were shadowed above.
-        for mut d in unfolded {
+        for d in unfolded.iter() {
             if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
-                // As a block's rows are: attributes, no vectors.
-                d.vectors.clear();
-                selector.offer(d);
+                // As a block's rows are: attributes, no vectors -- copied only for a row the
+                // filter admits, the rows being shared with the fresh cache (M122).
+                selector.offer(Document {
+                    id: d.id.clone(),
+                    vectors: BTreeMap::new(),
+                    attrs: d.attrs.clone(),
+                });
             }
         }
         let rows: Vec<Document> = selector
@@ -6284,7 +6290,7 @@ impl<S: BlobStore> Engine<S> {
                     epoch,
                     None,
                     std::time::Duration::ZERO,
-                    Vec::new(),
+                    Arc::default(),
                     Arc::default(),
                     false,
                     fts,
@@ -6302,7 +6308,7 @@ impl<S: BlobStore> Engine<S> {
                 // Only a strong read keeps HEAD for its probes: `eventual` pays nothing.
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
                 let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
-                    || (Vec::new(), Arc::default(), None),
+                    || (Arc::default(), Arc::default(), None),
                     |v| (v.rows, v.shadow, Some(v.fts)),
                 );
                 let fts = at
@@ -6462,7 +6468,7 @@ impl<S: BlobStore> Engine<S> {
         }
         let exists = !scope.refs.is_empty() || !scope.unfolded.is_empty();
         let mut unfolded = 0;
-        for d in &scope.unfolded {
+        for d in scope.unfolded.iter() {
             // Counted only when its group was kept (code review): a row whose key fell outside
             // the `top_k` smallest was not aggregated.
             if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) && aggregator.offer(d) {

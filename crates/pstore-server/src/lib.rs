@@ -1467,8 +1467,8 @@ async fn write_documents<S: BlobStore + 'static>(
     // ⚠️ Parsed here rather than by the `Json` extractor, because the extractor's own
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
-    let mut req: WriteRequest = parse_write(&body)?;
-    if let Some(src) = branch_source(&req, &body)? {
+    let (mut req, keys) = parse_write(&body)?;
+    if let Some(src) = branch_source(&req, keys)? {
         return branch_index(&api, tenant, token, src, &index).await;
     }
     let dated = declared_datetimes(&req)?;
@@ -1638,7 +1638,7 @@ async fn write_documents<S: BlobStore + 'static>(
 /// The index a write asks to branch from (M16), if it asks -- refused unless the request says
 /// nothing else, since a branch beside a batch, a schema or a durability would have to mean an
 /// order or a promise the branch does not make.
-fn branch_source<'a>(req: &'a WriteRequest, body: &[u8]) -> Result<Option<&'a str>, ApiError> {
+fn branch_source(req: &WriteRequest, keys: usize) -> Result<Option<&str>, ApiError> {
     let src = match (&req.branch_from_namespace, &req.copy_from_namespace) {
         (None, None) => return Ok(None),
         (Some(s), None) | (None, Some(s)) => s.as_str(),
@@ -1650,10 +1650,8 @@ fn branch_source<'a>(req: &'a WriteRequest, body: &[u8]) -> Result<Option<&'a st
         }
     };
     // ⚠️ Counted on the raw body: `durability` has a default, so the parsed request cannot
-    // tell a stated one from an absent one.
-    let raw: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
-    if raw.as_object().is_none_or(|o| o.len() != 1) {
+    // tell a stated one from an absent one. The count is the parse's own (M122).
+    if keys != 1 {
         return Err(ApiError::bad_request(
             "a branch must come alone: no documents, patches, deletes, conditions, schema, \
              distance_metric or durability beside it",
@@ -2912,12 +2910,17 @@ async fn delete_index<S: BlobStore + 'static>(
 /// each number of each vector as a 32-byte node, and was walked again to build the request.
 /// A body that parses so cannot hold a durability the refusal below names: the type has no
 /// such variant.
-fn parse_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
-    if let Some((_, req)) = body::typed::<WriteRequest>(body) {
-        return Ok(req);
+///
+/// With it, how many keys the body's object holds (M122): a branch must come alone, and
+/// counting them parsed the body a second time, as a tree.
+fn parse_write(body: &[u8]) -> Result<(WriteRequest, usize), ApiError> {
+    if let Some((shape, req)) = body::typed::<WriteRequest>(body) {
+        // A body that parses as a request is an object, so `plain` named its keys.
+        return Ok((req, shape.keys.map_or(0, |k| k.len())));
     }
     let raw: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
+    let keys = raw.as_object().map_or(0, serde_json::Map::len);
     if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
         && !matches!(d, "batched" | "durable")
     {
@@ -2930,7 +2933,9 @@ fn parse_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
             format!("durability {d:?} is not implemented; use \"batched\" or \"durable\""),
         ));
     }
-    serde_json::from_value(raw).map_err(|e| ApiError::bad_request(format!("malformed body: {e}")))
+    serde_json::from_value(raw)
+        .map(|req| (req, keys))
+        .map_err(|e| ApiError::bad_request(format!("malformed body: {e}")))
 }
 
 /// The most a `rank_by` query may skip and return together (M9e): its rows are held in memory.
@@ -4668,6 +4673,11 @@ mod tests {
             r#"{"protocol": null, "phase": null}"#,
             r#"{"protocol": 2.0, "phase": 3}"#,
             r#"{"protocol": -1, "phase": "scan"}"#,
+            r#"{"protocol": {"protocol": 1}, "phase": ["scan"]}"#,
+            r#"{"\u0070rotocol": 1, "ph\u0061se": "open"}"#,
+            r#"{"protocol": 18446744073709551615, "phase": "scan\u0021"}"#,
+            r#"{"branch_from_namespace": "src"}"#,
+            r#"{"branch_from_namespace": "src", "durability": "batched"}"#,
             r#"[]"#,
             r#"[{"durability": "async"}]"#,
             r#""x""#,
@@ -4698,9 +4708,11 @@ mod tests {
     #[test]
     fn the_fast_parse_is_the_tree_parse() {
         // The tree's way, verbatim from before M120.
-        fn tree_write(body: &[u8]) -> Result<WriteRequest, ApiError> {
+        // With the key count `branch_source` read from the tree before M122.
+        fn tree_write(body: &[u8]) -> Result<(WriteRequest, usize), ApiError> {
             let raw: serde_json::Value = serde_json::from_slice(body)
                 .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
+            let keys = raw.as_object().map_or(0, serde_json::Map::len);
             if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
                 && !matches!(d, "batched" | "durable")
             {
@@ -4711,6 +4723,7 @@ mod tests {
                 ));
             }
             serde_json::from_value(raw)
+                .map(|r| (r, keys))
                 .map_err(|e| ApiError::bad_request(format!("malformed body: {e}")))
         }
         fn tree_query(body: &[u8]) -> Option<Result<QueryRequest, ApiError>> {

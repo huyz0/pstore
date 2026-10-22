@@ -825,15 +825,7 @@ impl VecIndex {
         // early would send them to the wrong offsets — and deduplicating after `k` has been
         // truncated returns fewer than `k`.
         if has_mapping {
-            scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            // Data rows are below the segment's row count: a bitmap rather than a SipHash set,
-            // and a set only for a mapping past it, which a corrupt section could hold.
-            let mut seen = vec![false; self.segment.row_count().min(crate::top::DENSE_ROWS)];
-            let mut past: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            scored.retain(|(_, _, data)| match seen.get_mut(*data) {
-                Some(s) => !std::mem::replace(s, true),
-                None => past.insert(*data),
-            });
+            scored = best_by_data(scored);
         }
 
         let ladder = Ladder::new(q.k, q.oversample);
@@ -900,6 +892,35 @@ impl VecIndex {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Each data row's best candidate, by the order a top-k ranks in -- score descending, then
+/// index row ascending -- in one pass (M122). Sorting every candidate to keep the first of
+/// each data row was `n log n` for a set the ladder ranks again, and a bitmap the size of the
+/// segment besides. The order of what is kept is not the sort's: the ladder decides it.
+fn best_by_data(scored: Vec<(usize, f32, usize)>) -> Vec<(usize, f32, usize)> {
+    let first = |a: &(usize, f32, usize), b: &(usize, f32, usize)| {
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)).is_lt()
+    };
+    let mut at: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(scored.len());
+    let mut kept: Vec<(usize, f32, usize)> = Vec::with_capacity(scored.len());
+    for c in scored {
+        match at.get(&c.2) {
+            Some(&i) => {
+                if let Some(k) = kept.get_mut(i)
+                    && first(&c, k)
+                {
+                    *k = c;
+                }
+            }
+            None => {
+                at.insert(c.2, kept.len());
+                kept.push(c);
+            }
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -990,6 +1011,44 @@ mod tests {
                 Table::decode(bytes::Bytes::from(big.clone())).is_some(),
                 Centroids::decode(&big).is_some()
             );
+        }
+    }
+
+    #[test]
+    fn the_one_pass_dedupe_is_the_sorted_one() {
+        // M122: the set each data row keeps is the sort-and-retain's, ties and NaN included.
+        fn sorted(mut scored: Vec<(usize, f32, usize)>) -> Vec<(usize, f32, usize)> {
+            scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut seen = std::collections::HashSet::new();
+            scored.retain(|c| seen.insert(c.2));
+            scored
+        }
+        let key = |c: &(usize, f32, usize)| (c.0, c.1.to_bits(), c.2);
+        let mut state: u64 = 11;
+        let mut next = move |m: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) % m
+        };
+        for n in [0usize, 1, 2, 7, 50, 400] {
+            for _ in 0..30 {
+                let scored: Vec<(usize, f32, usize)> = (0..n)
+                    .map(|row| {
+                        let score = match next(8) {
+                            0 => f32::NAN,
+                            1 => 0.5,
+                            _ => next(5) as f32 / 4.0,
+                        };
+                        (row, score, next(n.max(1) as u64 / 2 + 1) as usize)
+                    })
+                    .collect();
+                let mut a: Vec<_> = best_by_data(scored.clone()).iter().map(key).collect();
+                let mut b: Vec<_> = sorted(scored).iter().map(key).collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                assert_eq!(a, b);
+            }
         }
     }
 }

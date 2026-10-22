@@ -415,3 +415,32 @@ fn extending_over_marks_stops_at_the_next_token() {
     );
     assert_eq!(&s[toks[0].span.start..end], "e\u{301}");
 }
+
+#[test]
+fn a_dictionary_is_decoded_once_a_buffer() {
+    // M122: a text query decoded every text segment's dictionary again, though the pinned
+    // cache hands back the same buffer each time. Kept by the buffer: the same `Bytes` is one
+    // decoded dictionary; the same bytes in another buffer are another, which answers the
+    // same; a refusal is refused again.
+    let built = text::build(&corpus(), text::DEFAULT_TEXT_FIELD);
+    let raw = bytes::Bytes::from(built.dictionary.clone());
+    let one = TermDict::decode_shared(&raw).unwrap();
+    let two = TermDict::decode_shared(&raw.clone()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&one, &two));
+    let other = bytes::Bytes::from(built.dictionary.clone());
+    let three = TermDict::decode_shared(&other).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&one, &three));
+    let fresh = TermDict::decode(&built.dictionary).unwrap();
+    for d in [&one, &three] {
+        assert_eq!(
+            d.terms().collect::<Vec<_>>(),
+            fresh.terms().collect::<Vec<_>>()
+        );
+        for t in fresh.terms() {
+            assert_eq!(d.lookup(t), fresh.lookup(t), "{t}");
+        }
+    }
+    let cut = raw.slice(..raw.len() - 1);
+    assert!(TermDict::decode_shared(&cut).is_none());
+    assert!(TermDict::decode_shared(&cut).is_none());
+}

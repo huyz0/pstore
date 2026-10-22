@@ -15,12 +15,12 @@ three found a wrong answer.
 | 4 | cache | every missed range is copied before the class and quota are judged, so a scan's copy is thrown away | **Fixed** (Delta 3). No test can see a copy dropped. `a_cached_range_owns_its_bytes` still passes on the copy kept |
 | 5 | cache | concurrent batched misses each reach the store | **Fixed** (Delta 4). `concurrent_batched_misses_issue_one_request_a_range` was red at 24 requests for 3. Its first draft passed against the unfixed code: the solo call's spare permits let the first racer through alone. Draining them made the race run |
 | 6 | format | `rows_at` builds every row of a block to return the few asked | **Fixed** (Delta 5). `rows_at_builds_only_the_rows_asked` went red with a skipped row's attributes not read through |
-| 7 | format, index | the term dictionary, and a sparse dictionary's `dims`, are decoded again on every query | **Deferred**. Decoding lazily would lose the up-front refusal of a truncated or unsorted dictionary (`TermDict::decode`'s own warning). The fix is a decoded-dictionary cache per segment, with its own memory budget: a design of its own |
-| 8 | index | a clustered search with replicated rows sorts every candidate to dedupe it, and allocates a row-sized `Vec<bool>` | **Deferred**. CPU only, on the replicated path, and correct as written |
+| 7 | format, index | the term dictionary, and a sparse dictionary's `dims`, are decoded again on every query | **Deferred, then fixed in [M122](../M122/SPEC.md)**: a cache keyed by the fetched buffer. Decoding lazily would lose the up-front refusal of a truncated or unsorted dictionary (`TermDict::decode`'s own warning). The fix is a decoded-dictionary cache per segment, with its own memory budget: a design of its own |
+| 8 | index | a clustered search with replicated rows sorts every candidate to dedupe it, and allocates a row-sized `Vec<bool>` | **Deferred, then fixed in [M122](../M122/SPEC.md)**: one pass. CPU only, on the replicated path, and correct as written |
 | 9 | index | BM25's accumulator zero-fills `5 × rows` bytes a query | **Rejected**. `vec![0; n]` is a zeroed allocation: at this size the OS hands out zero pages lazily, and only the pages a posting touches are ever written |
-| 10 | engine | a fresh-view hit clones the unfolded rows | **Deferred**. CPU only. Sharing them needs `Document` behind an `Arc` through the query path |
+| 10 | engine | a fresh-view hit clones the unfolded rows | **Deferred, then fixed in [M122](../M122/SPEC.md)**: the rows behind an `Arc`, shared with every answer |
 | 11 | engine | the per-index fresh map keeps one sealed segment per index until a miss | **Rejected**. Bounded by the memtable times a small constant, because every live entry shares one generation. Not a leak |
-| 12 | server | a branch body is parsed into a tree to count its keys; a refused single query is parsed three times | **Deferred**. CPU only, on small or refused bodies |
+| 12 | server | a branch body is parsed into a tree to count its keys; a refused single query is parsed three times | **Deferred, then fixed in [M122](../M122/SPEC.md)** for the branch write, and a part's dispatch besides. The refused single query keeps its third pass, which words its refusal |
 
 ## The deliberate breaks
 

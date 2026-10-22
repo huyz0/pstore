@@ -17,7 +17,8 @@ use pstore_format::{FormatError, Section, Segment};
 /// An opened sparse field: the segment's directory and the term dictionary, both in memory.
 #[derive(Debug)]
 pub struct SparseIndex {
-    dict: Dictionary,
+    /// Shared with every other reader of the same fetched buffer (M122).
+    dict: std::sync::Arc<Dictionary>,
     span: std::ops::Range<u64>,
 }
 
@@ -87,7 +88,7 @@ impl SparseIndex {
             .ok_or(FormatError::Corrupt(
                 "a sparse field with no postings section",
             ))?;
-        let dict = Dictionary::decode_bytes(dictionary)
+        let dict = Dictionary::decode_shared(&dictionary)
             .ok_or(FormatError::Corrupt("the sparse dictionary did not decode"))?;
         Ok(Self { dict, span })
     }
