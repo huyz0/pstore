@@ -172,7 +172,37 @@ struct Registry {
     backoff: std::time::Duration,
     evicted: u64,
     scans: u64,
+    /// When a `batched` write is flushed (M123).
+    flush: FlushPolicy,
+    /// How long a stop waits on the HTTP drain, and again on its flush and fold (M123).
+    drain: Option<std::time::Duration>,
 }
+
+/// When the flush loop writes a tenant's `batched` rows to the store (M123): the documented
+/// loss window of D-80, "up to T seconds". From memory, so an idle tenant costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushPolicy {
+    /// How often the loop looks. Looking costs no request.
+    pub period: std::time::Duration,
+    /// A tenant is due once its oldest unflushed row is this old: `PSTORE_FLUSH_AGE_MS`.
+    pub age: std::time::Duration,
+    /// Or once its unflushed rows are about this many bytes: `PSTORE_FLUSH_BYTES`.
+    pub bytes: u64,
+}
+
+impl Default for FlushPolicy {
+    /// D-80's window: five seconds, or a mebibyte -- the fold's own size trigger.
+    fn default() -> Self {
+        Self {
+            period: std::time::Duration::from_millis(250),
+            age: std::time::Duration::from_secs(5),
+            bytes: 1 << 20,
+        }
+    }
+}
+
+/// How long a stop waits on each of its phases by default (M123): `PSTORE_DRAIN_MS`.
+pub const DEFAULT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What one eviction pass did (M26).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +250,27 @@ pub struct FoldTick {
 
 /// Folds at once, at most, per tick.
 const FOLD_CONCURRENCY: usize = 4;
+
+/// Flushes in flight at once (M123): a flush is one PUT.
+const FLUSH_CONCURRENCY: usize = 16;
+
+/// What one [`Api::flush_due`] did (M123).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FlushTick {
+    /// Tenants flushed.
+    pub flushed: usize,
+    /// Tenants whose flush failed: retried the next tick.
+    pub failed: usize,
+}
+
+/// What a stop's [`Api::settle`] could not do (M123): tenants left unflushed, or unfolded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SettleTick {
+    /// Tenants whose flush failed: their `batched` rows are lost with the process.
+    pub unflushed: usize,
+    /// Tenants whose fold failed: durable, and due for whoever folds the tenant next.
+    pub unfolded: usize,
+}
 
 /// When a scheduled reap runs (M18): a tenant is due once a commit this process made there is
 /// `age` old, and it is reaped through the highest such epoch. Decided from memory, never by
@@ -440,7 +491,9 @@ impl<S: BlobStore + 'static> Api<S> {
     }
 
     /// [`Self::fold_due`], starting no tenant's fold once `halt` is set: the ones already in
-    /// flight finish, the rest are left due for the next process to run.
+    /// flight finish, and the stop's [`Self::settle`] folds the rest. ⚠️ Not "left due for the
+    /// next process", as this said until M123: due-ness lives in this process's memory, and a
+    /// successor that never resumes the lane never learns the bundles are there.
     async fn fold_tick(
         &self,
         policy: &FoldPolicy,
@@ -467,7 +520,9 @@ impl<S: BlobStore + 'static> Api<S> {
             let old_or_large = engine.unfolded().is_some_and(|u| {
                 now.duration_since(u.oldest) >= policy.age || u.bytes >= policy.bytes
             });
-            if !old_or_large && !requested {
+            // M123: or it resumed a lane past HEAD's watermark -- a predecessor's bundles,
+            // of any age, which only this engine knows are there.
+            if !old_or_large && !requested && !engine.inherited() {
                 continue;
             }
             let waiting = self
@@ -774,6 +829,16 @@ impl<S: BlobStore + 'static> Api<S> {
         self.registry_mut().cap = cap;
     }
 
+    /// When the flush loop flushes a tenant's `batched` rows (M123).
+    pub fn set_flush_policy(&self, policy: FlushPolicy) {
+        self.registry_mut().flush = policy;
+    }
+
+    /// How long a stop waits on the HTTP drain, and then on its flush and fold (M123).
+    pub fn set_drain(&self, within: std::time::Duration) {
+        self.registry_mut().drain = Some(within);
+    }
+
     /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
     /// older than `within` (M39): half of `PSTORE_GC_AGE_S`, which `Config::lane_recheck`
     /// gives, whether or not this process reaps -- another server reaping the tenant reaps
@@ -798,6 +863,71 @@ impl<S: BlobStore + 'static> Api<S> {
     pub fn eviction_counts(&self) -> (u64, u64) {
         let r = self.registry_mut();
         (r.evicted, r.scans)
+    }
+
+    /// The engines this process holds, copied out of the registry's lock.
+    async fn engines_now(&self) -> Vec<(TenantId, Arc<Tenant<S>>)> {
+        self.engines
+            .lock()
+            .await
+            .iter()
+            .map(|(t, s)| (*t, Arc::clone(&s.engine)))
+            .collect()
+    }
+
+    /// Flushes every tenant whose `batched` rows the flush policy says are due (M123): older
+    /// than its age, or larger than its size. Decided from memory, so an idle tenant costs no
+    /// request; one PUT per due tenant, never per index.
+    pub async fn flush_due(&self) -> FlushTick {
+        use futures_util::StreamExt;
+        let policy = self.registry_mut().flush;
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .engines_now()
+            .await
+            .into_iter()
+            .filter(|(_, e)| {
+                e.unflushed().is_some_and(|u| {
+                    now.duration_since(u.oldest) >= policy.age || u.bytes >= policy.bytes
+                })
+            })
+            .collect();
+        let results: Vec<bool> = futures_util::stream::iter(due)
+            .map(|(_, e)| async move { e.flush().await.is_ok() })
+            .buffer_unordered(FLUSH_CONCURRENCY)
+            .collect()
+            .await;
+        FlushTick {
+            flushed: results.iter().filter(|ok| **ok).count(),
+            failed: results.iter().filter(|ok| !**ok).count(),
+        }
+    }
+
+    /// What a stop owes the store (M123): every tenant's unflushed rows flushed, then every
+    /// tenant with unfolded rows -- its own, or a predecessor's on its lane -- folded, so its
+    /// successor neither loses them nor waits a fold age to see them. Each tenant's two steps
+    /// in order, tenants together.
+    pub async fn settle(&self) -> SettleTick {
+        use futures_util::StreamExt;
+        let results: Vec<(bool, bool)> = futures_util::stream::iter(self.engines_now().await)
+            .map(|(_, e)| async move {
+                let flushed = e.unflushed().is_none() || e.flush().await.is_ok();
+                let owed = e.unfolded().is_some() || e.inherited();
+                let folded = !owed || e.fold().await.is_ok();
+                (flushed, folded)
+            })
+            .buffer_unordered(FLUSH_CONCURRENCY)
+            .collect()
+            .await;
+        SettleTick {
+            unflushed: results.iter().filter(|(f, _)| !*f).count(),
+            unfolded: results.iter().filter(|(_, f)| !*f).count(),
+        }
+    }
+
+    /// How long a stop waits on each phase (M123).
+    fn drain(&self) -> std::time::Duration {
+        self.registry_mut().drain.unwrap_or(DEFAULT_DRAIN)
     }
 
     fn registry_mut(&self) -> std::sync::MutexGuard<'_, Registry> {
@@ -3842,6 +3972,10 @@ pub struct Config {
     pub fold: Option<FoldPolicy>,
     /// The scheduled reap's policy, or `None` when `PSTORE_GC=off` (M18).
     pub gc: Option<GcPolicy>,
+    /// When a `batched` write is flushed (M123): `PSTORE_FLUSH_AGE_MS`, `PSTORE_FLUSH_BYTES`.
+    pub flush: FlushPolicy,
+    /// How long a stop waits on each phase (M123): `PSTORE_DRAIN_MS`.
+    pub drain: std::time::Duration,
     /// Half of `PSTORE_GC_AGE_S` (M39), with `PSTORE_GC` on or off: how stale an engine's read
     /// of its lane may grow before a flush reads HEAD again.
     pub lane_recheck: std::time::Duration,
@@ -4043,6 +4177,9 @@ pub enum ConfigError {
     /// A scheduled-fold variable that is not what it must be (M9i.1).
     #[error("{0}={1} is refused: {2}")]
     Fold(&'static str, String, &'static str),
+    /// A flush or stop variable that is not what it must be (M123).
+    #[error("{0}={1} is refused: {2}")]
+    Stop(&'static str, String, &'static str),
     /// A `PSTORE_CACHE_*` value that cannot be used (M20).
     #[error("{0}={1} is refused: {2}")]
     Cache(&'static str, String, &'static str),
@@ -4121,6 +4258,8 @@ impl Config {
             credentials: get("PSTORE_ACCESS_KEY").zip(get("PSTORE_SECRET_KEY")),
             fold: fold_policy(&get)?,
             gc: gc_policy(&get)?,
+            flush: flush_policy(&get)?,
+            drain: positive_ms(&get, "PSTORE_DRAIN_MS")?.unwrap_or(DEFAULT_DRAIN),
             lane_recheck: reap_age(&get)? / 2,
             cache: cache_config(&get, backend)?,
             peers: PeerConfig::from_vars(&get)?,
@@ -4262,6 +4401,39 @@ fn source_configs(get: &impl Fn(&str) -> Option<String>) -> Result<Vec<SourceCon
         });
     }
     Ok(out)
+}
+
+/// A positive integer from `var`, or `None` unset (M123); anything else refused by name.
+fn positive_u64(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+) -> Result<Option<u64>, ConfigError> {
+    get(var)
+        .map(|v| {
+            v.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(ConfigError::Stop(var, v, "a positive integer"))
+        })
+        .transpose()
+}
+
+/// [`positive_u64`], as milliseconds.
+fn positive_ms(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+) -> Result<Option<std::time::Duration>, ConfigError> {
+    Ok(positive_u64(get, var)?.map(std::time::Duration::from_millis))
+}
+
+/// When a `batched` write is flushed, from the environment (M123). Unset is the default.
+fn flush_policy(get: &impl Fn(&str) -> Option<String>) -> Result<FlushPolicy, ConfigError> {
+    let d = FlushPolicy::default();
+    Ok(FlushPolicy {
+        period: d.period,
+        age: positive_ms(get, "PSTORE_FLUSH_AGE_MS")?.unwrap_or(d.age),
+        bytes: positive_u64(get, "PSTORE_FLUSH_BYTES")?.unwrap_or(d.bytes),
+    })
 }
 
 /// The scheduled fold's policy from the environment (M9i.1). Unset is the default; anything
@@ -4459,6 +4631,50 @@ pub async fn run_reaps<S: BlobStore + 'static>(
     }
 }
 
+/// Resolves when `first` does, and from then on runs `exit` when `again()` resolves (M123):
+/// a second signal hurries a stop that is not finishing. `again` is called only once `first`
+/// has resolved, so a signal handler it installs cannot take the first signal.
+pub async fn stop_then_exit<A>(
+    first: impl std::future::Future<Output = ()>,
+    again: impl FnOnce() -> A + Send + 'static,
+    exit: impl FnOnce() + Send + 'static,
+) where
+    A: std::future::Future<Output = ()> + Send + 'static,
+{
+    first.await;
+    let second = again();
+    tokio::spawn(async move {
+        second.await;
+        exit();
+    });
+}
+
+/// Runs [`Api::flush_due`] every flush period until `stop` resolves (M123). Always on: a
+/// `batched` write is flushed by nothing else.
+pub async fn run_flushes<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    stop: impl std::future::Future<Output = ()> + Send,
+) {
+    tokio::pin!(stop);
+    loop {
+        let period = api.registry_mut().flush.period;
+        tokio::select! {
+            () = &mut stop => return,
+            () = tokio::time::sleep(period) => {}
+        }
+        let tick = api.flush_due();
+        tokio::pin!(tick);
+        tokio::select! {
+            // A flush in flight is finished: the stop's own settle flushes after it.
+            () = &mut stop => {
+                tick.await;
+                return;
+            }
+            _ = &mut tick => {}
+        }
+    }
+}
+
 /// Runs an eviction pass once a second until `stop` resolves (M26): whenever the registry has
 /// a cap, whatever the fold, reap and replication loops are doing.
 pub async fn run_evictions<S: BlobStore + 'static>(
@@ -4518,24 +4734,59 @@ pub async fn serve_folding<S: BlobStore + 'static>(
             let _ = rx.wait_for(|stopped| *stopped).await;
         }))
     });
+    // M123: the flush loop, always: a `batched` write is flushed by nothing else.
+    let flushes = {
+        let mut rx = rx.clone();
+        tokio::spawn(run_flushes(Arc::clone(&api), async move {
+            let _ = rx.wait_for(|stopped| *stopped).await;
+        }))
+    };
+    let drain = api.drain();
     let signal = Arc::clone(&tx);
-    let served = serve(api, listener, async move {
+    let serving = serve(Arc::clone(&api), listener, async move {
         shutdown.await;
         let _ = signal.send(true);
-    })
-    .await;
+    });
+    // ⚠️ **The drain is bounded** (M123): axum's graceful shutdown waits for every request in
+    // flight, so one stalled upload held the stop until the orchestrator's SIGKILL -- which
+    // then lost the flush below. Past the deadline the server future is dropped; its
+    // connections end with the process.
+    let mut stopping = rx.clone();
+    let served = tokio::select! {
+        r = serving => r,
+        () = async move {
+            let _ = stopping.wait_for(|stopped| *stopped).await;
+            tokio::time::sleep(drain).await;
+        } => Ok(()),
+    };
     // Also when `serve` failed before its signal: the loop must not outlive the server.
     let _ = tx.send(true);
-    if let Some(folds) = folds {
-        let _ = folds.await;
+    // The loops, each finishing what it had in flight, within the same bound.
+    let loops = async {
+        if let Some(folds) = folds {
+            let _ = folds.await;
+        }
+        if let Some(reaps) = reaps {
+            let _ = reaps.await;
+        }
+        if let Some(r) = replication {
+            let _ = r.await;
+        }
+        let _ = flushes.await;
+        let _ = evictions.await;
+    };
+    let _ = tokio::time::timeout(drain, loops).await;
+    // M123: what the store is owed, last, with no request arriving: every unflushed row
+    // flushed, every unfolded tenant folded. Bounded too: a store that never answers must not
+    // hold the stop forever.
+    match tokio::time::timeout(drain, api.settle()).await {
+        Ok(t) if t == SettleTick::default() => {}
+        Ok(t) => eprintln!(
+            "pstore-server: stopped with {} tenants unflushed and {} unfolded",
+            t.unflushed, t.unfolded
+        ),
+        Err(_) => eprintln!("pstore-server: stopped before every tenant was flushed and folded"),
     }
-    if let Some(reaps) = reaps {
-        let _ = reaps.await;
-    }
-    if let Some(r) = replication {
-        let _ = r.await;
-    }
-    let _ = evictions.await;
     served
 }
 

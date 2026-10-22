@@ -444,6 +444,9 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_FOLD_PERIOD_MS` | `1000` | How often the fold loop looks. Looking costs no request. |
 | `PSTORE_FOLD_AGE_S` | `3600` | A tenant is folded once its oldest unfolded write is this old. Shorter means faster visibility to other processes, and more folds: D-39 prices it. |
 | `PSTORE_FOLD_BYTES` | `1048576` | ...or once its unfolded bundles total this many bytes. |
+| `PSTORE_FLUSH_AGE_MS` | `5000` | A tenant's `batched` rows are flushed to the store once the oldest is this old: the window a crash can lose them in (D-80). One PUT per writing tenant per interval; an idle tenant costs nothing. A stop flushes them all regardless. |
+| `PSTORE_FLUSH_BYTES` | `1048576` | ...or once they are about this many bytes. |
+| `PSTORE_DRAIN_MS` | `10000` | How long a stop waits on the HTTP drain, and then again on flushing and folding what it holds. Keep twice this under the orchestrator's grace period. A second SIGTERM or Ctrl-C exits at once. |
 | `PSTORE_GC` | on | Exactly `off` disables the scheduled reap; anything else is refused. |
 | `PSTORE_GC_PERIOD_MS` | `1000` | How often the reap loop looks. Looking costs no request. |
 | `PSTORE_GC_AGE_S` | `3600` | How long a buried object is kept, and so how far back `as_of` reaches. Below an hour, a `bounded` read's cached HEAD can name a reaped object; the read retries fresh, at the cost of a request. |

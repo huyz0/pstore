@@ -138,6 +138,8 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     api.limit_engines(config.engines);
+    api.set_flush_policy(config.flush);
+    api.set_drain(config.drain);
     // M54: a query's vector legs split across the servers PSTORE_PEERS names.
     if let Err(e) = api.set_peers(config.peers.clone()) {
         eprintln!("pstore-server: refusing to serve: {e}");
@@ -190,7 +192,12 @@ async fn run<S: BlobStore + 'static>(
         config.fold,
         cache.as_ref().map(|c| c.disk_state())
     );
-    let shutdown = stopped();
+    // M123: a second signal exits at once -- the stop's own deadlines are the operator's to
+    // cut short, and nothing else listened for it.
+    let shutdown = pstore_server::stop_then_exit(stopped(), stopped, || {
+        eprintln!("pstore-server: a second signal: exiting without finishing the stop");
+        std::process::exit(130);
+    });
     let served = serve_folding(
         api,
         listener,

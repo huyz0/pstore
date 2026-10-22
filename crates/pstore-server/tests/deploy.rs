@@ -301,3 +301,31 @@ fn the_engine_cap_defaults_to_ten_thousand_and_refuses_a_non_count() {
     assert!(e.is_err());
     assert!(e.unwrap_err().to_string().contains("PSTORE_ENGINES"));
 }
+
+#[test]
+fn the_flush_and_the_stop_are_configured_and_refuse_a_non_count() {
+    // M123: `PSTORE_FLUSH_AGE_MS`, `PSTORE_FLUSH_BYTES`, `PSTORE_DRAIN_MS`.
+    let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
+    assert_eq!(c.flush, pstore_server::FlushPolicy::default());
+    assert_eq!(c.drain, pstore_server::DEFAULT_DRAIN);
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_FLUSH_AGE_MS", "750"),
+        ("PSTORE_FLUSH_BYTES", "4096"),
+        ("PSTORE_DRAIN_MS", "2500"),
+    ]))
+    .unwrap();
+    assert_eq!(c.flush.age, std::time::Duration::from_millis(750));
+    assert_eq!(c.flush.bytes, 4096);
+    assert_eq!(c.drain, std::time::Duration::from_millis(2500));
+    for var in [
+        "PSTORE_FLUSH_AGE_MS",
+        "PSTORE_FLUSH_BYTES",
+        "PSTORE_DRAIN_MS",
+    ] {
+        for bad in ["0", "soon"] {
+            let e = Config::from_vars(vars(&[("PSTORE_LANE", "1"), (var, bad)]));
+            assert!(e.unwrap_err().to_string().contains(var), "{var}={bad}");
+        }
+    }
+}

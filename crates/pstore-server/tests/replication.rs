@@ -506,6 +506,21 @@ async fn three_workers_converge_and_share_the_work() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_halted_tick_starts_no_copy() {
+    // M123: a stop let the tick in flight copy every due tenant, one after another -- up to
+    // `max` whole tenants past the signal. Halted, it claims and renews, and copies none.
+    let world = World::new();
+    let control = world.api(9);
+    ten_jobs(&world, &control).await;
+    let api = world.api(1);
+    let mut w = Worker::default();
+    w.halt_for_test();
+    let t = api.replication_tick(&mut w).await;
+    assert!(t.claimed > 0, "{t:?}");
+    assert_eq!(t.synced, 0, "{t:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dead_workers_tenants_move() {
     let world = World::new();
     let control = world.api(9);
@@ -949,6 +964,15 @@ async fn a_served_process_runs_its_worker() {
     }
     let _ = tx.send(());
     server.await.unwrap().unwrap();
+    // M123: a stopped worker gives its claims back, so another worker takes the tenant at its
+    // next scan rather than after the claim's TTL.
+    assert_eq!(
+        api.replication_entry_for_test(D)
+            .await
+            .map(|(_, owner)| owner),
+        Some(None),
+        "a stopped worker kept its claim"
+    );
 }
 
 const D: TenantId = TenantId(DST as u128);

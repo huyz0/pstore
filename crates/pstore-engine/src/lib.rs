@@ -463,15 +463,54 @@ struct Memtable {
     pruned: u64,
     /// Bumped whenever the rows change, so a cached fresh segment knows it is stale.
     generation: u64,
+    /// When the oldest row now in `pending` was buffered, and about how many bytes `pending`
+    /// holds (M123): what the flush loop decides from, without a request. `None` and `0` when
+    /// `pending` is empty.
+    pending_since: Option<tokio::time::Instant>,
+    pending_bytes: u64,
+}
+
+/// About how many bytes a row holds in a bundle: its id, vectors and attribute names. An
+/// estimate for the flush loop's size trigger, never an encoding.
+fn approx_bytes(d: &Document) -> u64 {
+    let vectors: usize = d
+        .vectors
+        .values()
+        .map(|v| match v {
+            pstore_format::VectorField::Dense(vs) => vs.iter().map(|v| v.len() * 4).sum(),
+            pstore_format::VectorField::Sparse(p) => p.len() * 8,
+        })
+        .sum();
+    let attrs: usize = d.attrs.keys().map(|k| k.len() + 16).sum();
+    (d.id.len() + vectors + attrs) as u64
 }
 
 impl Memtable {
+    /// `pending`'s age and size after rows left it: reset when it emptied, else counted again
+    /// over what is left -- the rows a flush did not take, few by construction.
+    fn settle_pending(&mut self, now: tokio::time::Instant) {
+        if self.pending.is_empty() {
+            self.pending_since = None;
+            self.pending_bytes = 0;
+        } else {
+            // What is left arrived after the flush took its snapshot; `now` is no later than
+            // the oldest of it would claim, so the age errs toward flushing sooner.
+            self.pending_since = self.pending_since.map(|_| now);
+            self.pending_bytes = self.pending.values().flatten().map(approx_bytes).sum();
+        }
+    }
+
     /// Buffers rows, and moves the generation so a cached fresh segment knows it is stale.
     ///
     /// ⚠️ One step shared by `write` and its test-only twin (M8g): each used to carry its own
     /// copy of the bump, so a mutant in the twin could survive while the real one was tested.
     fn buffer(&mut self, index: &str, docs: Vec<Document>) {
         self.generation += 1;
+        if !docs.is_empty() {
+            self.pending_since
+                .get_or_insert_with(tokio::time::Instant::now);
+            self.pending_bytes += docs.iter().map(approx_bytes).sum::<u64>();
+        }
         self.pending
             .entry(index.to_owned())
             .or_default()
@@ -1624,6 +1663,8 @@ pub struct Engine<S> {
     /// The highest watermark any HEAD this engine read gave its own lane (M17). Recorded where
     /// HEAD is read; compared only by the flush, under `flushing`.
     lane_seen: std::sync::atomic::AtomicU64,
+    /// A resume found the lane written past HEAD's watermark: see [`Engine::inherited`].
+    inherited: std::sync::atomic::AtomicBool,
     /// How stale this engine's last fresh read of its lane may grow before a flush reads HEAD
     /// again (M39), and when that read was made -- the instant before its GET.
     lane_recheck: Option<std::time::Duration>,
@@ -1785,6 +1826,7 @@ impl<S: BlobStore> Engine<S> {
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
+            inherited: std::sync::atomic::AtomicBool::new(false),
             lane_recheck: None,
             lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
@@ -3005,6 +3047,26 @@ impl<S: BlobStore> Engine<S> {
         })
     }
 
+    /// What this process holds and has not flushed (M123): when the oldest such row was
+    /// buffered, and about how many bytes they are. **Issues no request.** What the flush loop
+    /// decides from: a `batched` write is flushed by nothing else.
+    #[must_use]
+    pub fn unflushed(&self) -> Option<Unfolded> {
+        let m = self.mem();
+        m.pending_since.map(|oldest| Unfolded {
+            oldest,
+            bytes: m.pending_bytes,
+        })
+    }
+
+    /// Whether this process resumed its lane past HEAD's watermark (M123): bundles a
+    /// predecessor on the lane flushed and nobody folded. Due at once -- they may be of any
+    /// age, and the process that knew when they were written is gone. Cleared by a fold.
+    #[must_use]
+    pub fn inherited(&self) -> bool {
+        self.inherited.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
     /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
     /// than a prune this engine already did changes nothing.
@@ -3114,6 +3176,10 @@ impl<S: BlobStore> Engine<S> {
             lanes::register(&*self.store, self.tenant, self.lane),
         )
         .await?;
+        if tail > watermark {
+            self.inherited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         *self
             .seq
             .lock()
@@ -3421,7 +3487,9 @@ impl<S: BlobStore> Engine<S> {
         // so no cached fresh view keeps it. Until then -- and in the window before this drain,
         // where the rows are in `pending` AND a segment -- a query returns them twice. Residual.
         m.durable.push((seq.0, batch));
-        m.stamps.insert(seq.0, (tokio::time::Instant::now(), size));
+        let now = tokio::time::Instant::now();
+        m.stamps.insert(seq.0, (now, size));
+        m.settle_pending(now);
     }
 
     /// Replays **every lane's** unfolded WAL bundles into segments and commits them.
@@ -3435,13 +3503,14 @@ impl<S: BlobStore> Engine<S> {
     /// copy would make the WAL write-only: the objects would be paid for and never read,
     /// and a process that restarted could not recover a single acknowledged write.
     pub async fn fold(&self) -> Result<Epoch, EngineError> {
-        match self
+        let folded = self
             .fold_inner(
                 None,
                 None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
             )
-            .await?
-        {
+            .await?;
+        self.fold_done(&folded);
+        match folded {
             Folded::Committed(epoch) | Folded::Nothing(epoch) => Ok(epoch),
             // Only a drop finds its index missing.
             Folded::Missing => Err(EngineError::Lost),
@@ -3454,16 +3523,26 @@ impl<S: BlobStore> Engine<S> {
     /// # Errors
     /// As [`Self::fold`].
     pub async fn fold_committed(&self) -> Result<bool, EngineError> {
-        match self
+        let folded = self
             .fold_inner(
                 None,
                 None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
             )
-            .await?
-        {
+            .await?;
+        self.fold_done(&folded);
+        match folded {
             Folded::Committed(_) => Ok(true),
             Folded::Nothing(_) => Ok(false),
             Folded::Missing => Err(EngineError::Lost),
+        }
+    }
+
+    /// A fold finished: whatever a predecessor left on the lane is in HEAD now -- its bundles
+    /// existed before this process did, so every fold probed them (M123).
+    fn fold_done(&self, folded: &Folded) {
+        if matches!(folded, Folded::Committed(_) | Folded::Nothing(_)) {
+            self.inherited
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -3477,6 +3556,10 @@ impl<S: BlobStore> Engine<S> {
             if !m.pending.is_empty() || !m.durable.is_empty() {
                 return false;
             }
+        }
+        // M123: a predecessor's unfolded bundles, whose due-ness only this engine knows.
+        if self.inherited() {
+            return false;
         }
         // M17: a lane known to be taken refuses every flush; a rebuilt engine would forget it.
         let taken = self
@@ -4316,6 +4399,7 @@ impl<S: BlobStore> Engine<S> {
                     if let Some(x) = drop {
                         let mut m = self.mem();
                         m.pending.remove(x);
+                        m.settle_pending(tokio::time::Instant::now());
                         m.generation += 1;
                         // M17: an uncertain write's rows of it are gone too, so resolving it
                         // must not drain the index's newer rows in their place.

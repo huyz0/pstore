@@ -210,6 +210,17 @@ pub struct Worker {
     renew_at: BTreeMap<u16, Instant>,
     next_scan: Option<Instant>,
     cursor: u64,
+    /// Set by a stop (M123): a tick in flight syncs no further tenant. Shared, so the stop
+    /// can set it while the tick holds the worker.
+    halt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Worker {
+    /// Halts the worker, as a stop does. Not part of the API.
+    #[doc(hidden)]
+    pub fn halt_for_test(&self) {
+        self.halt.store(true, Ordering::SeqCst);
+    }
 }
 
 /// What one [`Api::replication_tick`] did.
@@ -537,6 +548,11 @@ impl<S: BlobStore + 'static> Api<S> {
             .collect();
         let mut gone = Vec::new();
         for tenant in due {
+            // M123: a stop starts no further copy -- each is a whole tenant's segments, and a
+            // tick's worth of them held the stop past the orchestrator's grace period.
+            if w.halt.load(Ordering::SeqCst) {
+                break;
+            }
             // Before every sync, not once a tick: a long copy must not let every other claim
             // lapse behind it (code review M2).
             self.renew_due(w, reg).await;
@@ -642,6 +658,27 @@ impl<S: BlobStore + 'static> Api<S> {
     /// Renews each held shard whose time has come: one CAS per shard per `ttl / 3`, keeping
     /// exactly the tenants held there and releasing the rest. A tenant it lost, or whose
     /// entry is gone, is dropped; a changed `gen` re-reads HEAD at the next sync.
+    /// Releases every claim `w` holds (M123): what a stopping worker owes the others. A shard
+    /// that cannot be written keeps its claims until their TTL, as a crash would.
+    async fn release_claims(&self, w: &mut Worker) {
+        let Ok(reg) = self.register().await else {
+            return;
+        };
+        let ttl_ms = u64::try_from(self.policy().ttl.as_millis()).unwrap_or(u64::MAX);
+        let shards: Vec<u16> = w.renew_at.keys().copied().collect();
+        let none = std::collections::BTreeSet::new();
+        futures_util::future::join_all(
+            shards
+                .iter()
+                .map(|s| reg.renew(*s, self.lane.0, self.now_ms(), ttl_ms, &none)),
+        )
+        .await;
+        let released = w.held.len();
+        w.held.clear();
+        w.renew_at.clear();
+        self.release(released);
+    }
+
     async fn renew_due(&self, w: &mut Worker, reg: &Register<TenantView<S>>) {
         let policy = self.policy();
         let now = Instant::now();
@@ -931,6 +968,7 @@ pub async fn run_replication<S: BlobStore + 'static>(
     stop: impl std::future::Future<Output = ()> + Send,
 ) {
     let mut w = Worker::default();
+    let halt = Arc::clone(&w.halt);
     let period = api.policy().period;
     tokio::pin!(stop);
     loop {
@@ -938,6 +976,7 @@ pub async fn run_replication<S: BlobStore + 'static>(
         tokio::pin!(tick);
         tokio::select! {
             () = &mut stop => {
+                halt.store(true, Ordering::SeqCst);
                 tick.await;
                 break;
             }
@@ -948,6 +987,9 @@ pub async fn run_replication<S: BlobStore + 'static>(
             () = tokio::time::sleep(period) => {}
         }
     }
+    // M123: its claims given back, so another worker takes its tenants at its next scan
+    // rather than after their TTL. A renewal keeping nothing releases them.
+    api.release_claims(&mut w).await;
     api.replicating.worker.store(false, Ordering::SeqCst);
 }
 

@@ -19,7 +19,7 @@ use pstore_blob::{
     Accounted, BlobError, BlobStore, Capabilities, CasError, Key, MemoryStore, OpClass,
     Precondition, PutOutcome,
 };
-use pstore_server::{Api, Config, FoldPolicy, run_folds, serve_folding};
+use pstore_server::{Api, Config, FlushPolicy, FoldPolicy, run_folds, serve_folding};
 use pstore_types::{CasTag, LaneId, TenantId};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -680,5 +680,198 @@ async fn the_fold_duty_tells_the_truth() {
         "PSTORE_FOLD`",
     ] {
         assert!(deploy.contains(var), "deploy.md does not document {var}");
+    }
+}
+
+// ---- M123.1: the writes a stop, or an idle tenant, lost --------------------------------------
+
+/// A fold policy that never fires on its own: what is folded below, a stop or a flush folded.
+fn never() -> FoldPolicy {
+    FoldPolicy {
+        period: Duration::from_millis(20),
+        age: Duration::from_secs(3600),
+        bytes: u64::MAX,
+    }
+}
+
+#[tokio::test]
+async fn a_batched_write_is_flushed_within_the_flush_age() {
+    // M123: a `batched` write was flushed by nothing but a later `durable` one -- on no timer,
+    // and not at a stop. Now the flush loop flushes it once it is older than the flush age.
+    let w = world(2);
+    let (a, b) = (Arc::clone(&w.apis[0]), Arc::clone(&w.apis[1]));
+    a.set_flush_policy(FlushPolicy {
+        period: Duration::from_millis(20),
+        age: Duration::from_millis(50),
+        bytes: MIB,
+    });
+    let quick = FoldPolicy {
+        period: Duration::from_millis(20),
+        age: Duration::from_millis(50),
+        bytes: MIB,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_folding(
+        Arc::clone(&a),
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        Some(quick),
+        None,
+        false,
+    ));
+    write(&a, 71, &["x"], false).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while found(&b, 71).await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a batched write never reached the store"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_flushes_and_folds_what_it_holds() {
+    // M123: a stop dropped every batched row, and left its durable bundles unfolded and undue
+    // -- due-ness lived in the stopped process. Now a stop flushes, then folds, what it holds.
+    let w = world(2);
+    let (a, b) = (Arc::clone(&w.apis[0]), Arc::clone(&w.apis[1]));
+    a.set_flush_policy(FlushPolicy {
+        period: Duration::from_millis(20),
+        age: Duration::from_secs(3600),
+        bytes: u64::MAX,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_folding(
+        Arc::clone(&a),
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        Some(never()),
+        None,
+        false,
+    ));
+    write(&a, 72, &["d"], true).await;
+    write(&a, 72, &["b"], false).await;
+    write(&a, 74, &["only"], false).await;
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert_eq!(found(&b, 72).await, ["b", "d"]);
+    assert_eq!(found(&b, 74).await, ["only"]);
+}
+
+#[tokio::test]
+async fn a_stop_returns_by_its_deadline_and_still_flushes() {
+    // M123: the HTTP drain waited for every request in flight, without bound. A request held
+    // past the deadline no longer holds the stop -- and another tenant's batched rows are
+    // flushed all the same.
+    let w = world(2);
+    let (a, b) = (Arc::clone(&w.apis[0]), Arc::clone(&w.apis[1]));
+    a.set_drain(Duration::from_millis(300));
+    a.set_flush_policy(FlushPolicy {
+        period: Duration::from_millis(20),
+        age: Duration::from_secs(3600),
+        bytes: u64::MAX,
+    });
+    write(&a, 75, &["b"], false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_folding(
+        Arc::clone(&a),
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        Some(never()),
+        None,
+        false,
+    ));
+    // A durable write to another tenant, held inside its bundle PUT and never released.
+    *w.switch.hold.lock().unwrap() = Some("/tnt/76/".to_owned());
+    let body = serde_json::to_vec(&json!({"durability": "durable",
+        "documents": [{"id": "h", "vector": [1.0, 0.5]}]}))
+    .unwrap();
+    let held = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "PUT /v1/indexes/docs/documents HTTP/1.1\r\nhost: x\r\nx-pstore-tenant: 76\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(&body).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+    });
+    w.switch.held.notified().await;
+    let started = tokio::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the stop waited for a request held past its deadline")
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(found(&b, 75).await, ["b"]);
+    held.abort();
+}
+
+#[tokio::test]
+async fn a_successor_folds_its_predecessors_bundles() {
+    // M123: a process restarted on a lane stamped only its own bundles, so its predecessor's
+    // -- acknowledged, durable, unfolded -- waited out a whole fold age behind them. A resume
+    // that finds bundles past HEAD's watermark makes the tenant due at once.
+    let w = world(1);
+    let b = Arc::clone(&w.apis[0]);
+    let lane = LaneId(9);
+    let before = Api::new(Accounted::new(w.switch.clone()), lane).unwrap();
+    write(&before, 77, &["old"], true).await;
+    drop(before);
+    let after = Api::new(Accounted::new(w.switch.clone()), lane).unwrap();
+    write(&after, 77, &["new"], true).await;
+    let t = after.fold_due(&never()).await;
+    assert_eq!(t.folded, 1, "{t:?}");
+    assert_eq!(found(&b, 77).await, ["new", "old"]);
+}
+
+#[tokio::test]
+async fn a_second_signal_exits_at_once() {
+    // M123: once handlers were installed for the first signal, nothing listened for a second,
+    // so a stop that was not finishing could be ended only by SIGKILL.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (first, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let (second, second_rx) = tokio::sync::oneshot::channel::<()>();
+    let exited = Arc::new(AtomicBool::new(false));
+    let e = Arc::clone(&exited);
+    let stopping = tokio::spawn(pstore_server::stop_then_exit(
+        async move {
+            let _ = first_rx.await;
+        },
+        move || async move {
+            let _ = second_rx.await;
+        },
+        move || e.store(true, Ordering::SeqCst),
+    ));
+    first.send(()).unwrap();
+    stopping.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!exited.load(Ordering::SeqCst), "the first signal exited");
+    second.send(()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !exited.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second signal did nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
