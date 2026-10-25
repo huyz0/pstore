@@ -3,6 +3,18 @@
 **Synthesizes:** D34
 **Status:** v1 comparison, 2026-09-25
 
+> **Corrected 2026-10-25:** The current comparison is
+> [pstore and turbopuffer at M125](../../comparisons/turbopuffer-2026-10-25.md), with an
+> exhaustive pinned OpenAPI inventory and a [next-delivery plan](../../comparisons/turbopuffer-next-plan.md).
+> This page mixes M8-era observations with later updates and must not be used as a
+> current capability list. In particular, pstore now supports upserts, deletes,
+> attributes, filters, metric selection, ordered paging and more. Matching feature
+> names do not establish matching defaults, completion or snapshot guarantees.
+> Physical copies provide independent storage/encryption/backup boundaries that a
+> shared-object branch does not. Reserved compute/cache pinning need not introduce
+> durable node ownership. These corrections supersede the corresponding rationale
+> below; the old text remains as historical evidence.
+
 What a turbopuffer client can do that a pstore client cannot, row by row, and which
 milestone closes each gap — or why it is not closed. The architecture comparison is
 [`turbopuffer.md`](../01-prior-art/turbopuffer.md); this is the **API** one.
