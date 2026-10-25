@@ -14,6 +14,13 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let auth = match pstore_server::Auth::from_vars(|k| std::env::var(k).ok()) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("pstore-server: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let config = match Config::from_vars(|k| std::env::var(k).ok()) {
         Ok(c) => c,
         Err(e) => {
@@ -21,10 +28,24 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    let peer = match pstore_server::PeerListenerConfig::from_vars(
+        config.peers.is_some() || config.gossip.is_some(),
+        |key| std::env::var(key).ok(),
+    ) {
+        Ok(peer) => peer,
+        Err(error) => {
+            eprintln!("pstore-server: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let auth = match &peer {
+        Some(peer) => auth.with_peer_tls(peer.tls.clone(), peer.transport),
+        None => auth,
+    };
     match config.backend {
-        Backend::Memory => run(Accounted::new(MemoryStore::new()), &config).await,
+        Backend::Memory => run(Accounted::new(MemoryStore::new()), &config, auth, peer).await,
         Backend::S3 => match s3(&config) {
-            Ok(store) => run(Accounted::new(store), &config).await,
+            Ok(store) => run(Accounted::new(store), &config, auth, peer).await,
             Err(e) => {
                 eprintln!("pstore-server: cannot open {}: {e}", config.endpoint);
                 std::process::ExitCode::FAILURE
@@ -35,7 +56,7 @@ async fn main() -> std::process::ExitCode {
             .as_ref()
             .map(|a| azure_store(a, config.profile))
         {
-            Some(Ok(store)) => run(Accounted::new(store), &config).await,
+            Some(Ok(store)) => run(Accounted::new(store), &config, auth, peer).await,
             Some(Err(e)) => {
                 eprintln!("pstore-server: cannot open the Azure container: {e}");
                 std::process::ExitCode::FAILURE
@@ -115,6 +136,8 @@ fn env(key: &str, default: &str) -> String {
 async fn run<S: BlobStore + 'static>(
     store: Accounted<S>,
     config: &Config,
+    auth: pstore_server::Auth,
+    peer: Option<pstore_server::PeerListenerConfig>,
 ) -> std::process::ExitCode {
     let cache = match open_cache(&store, config).await {
         Ok(c) => c,
@@ -124,8 +147,8 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     let built = match &cache {
-        Some(c) => Api::with_cache(store, config.lane, Arc::clone(c)),
-        None => Api::new(store, config.lane),
+        Some(c) => Api::with_cache_and_auth(store, config.lane, Arc::clone(c), auth),
+        None => Api::with_auth(store, config.lane, auth),
     };
     let api = match built {
         Ok(a) => a,
@@ -190,16 +213,64 @@ async fn run<S: BlobStore + 'static>(
         config.fold,
         cache.as_ref().map(|c| c.disk_state())
     );
-    let shutdown = stopped();
-    let served = serve_folding(
-        api,
-        listener,
-        shutdown,
-        config.fold,
-        config.gc,
-        config.replication.is_some(),
-    )
-    .await;
+    let served = match peer {
+        None => {
+            serve_folding(
+                api,
+                listener,
+                stopped(),
+                config.fold,
+                config.gc,
+                config.replication.is_some(),
+            )
+            .await
+        }
+        Some(peer) => {
+            let tcp = match tokio::net::TcpListener::bind(peer.bind).await {
+                Ok(tcp) => tcp,
+                Err(error) => {
+                    eprintln!("pstore-server: cannot bind peer TCP listener: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let udp = match tcp.local_addr().and_then(std::net::UdpSocket::bind) {
+                Ok(udp) => udp,
+                Err(error) => {
+                    eprintln!("pstore-server: cannot bind peer UDP listener: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let (halt, mut peer_halt) = tokio::sync::watch::channel(false);
+            let mut public_halt = peer_halt.clone();
+            let mut peers = Box::pin(pstore_server::serve_peers(
+                api.clone(),
+                tcp,
+                udp,
+                async move {
+                    let _ = peer_halt.changed().await;
+                },
+            ));
+            let mut public = Box::pin(serve_folding(
+                api,
+                listener,
+                async move {
+                    let _ = public_halt.changed().await;
+                },
+                config.fold,
+                config.gc,
+                config.replication.is_some(),
+            ));
+            tokio::select! {
+                result = &mut public => { let _ = halt.send(true); result.and(peers.await) },
+                result = &mut peers => { let _ = halt.send(true); result.and(public.await) },
+                () = stopped() => {
+                    let _ = halt.send(true);
+                    let (public, peers) = tokio::join!(public, peers);
+                    public.and(peers)
+                },
+            }
+        }
+    };
     // ⚠️ After the server has stopped: the disk tier's writes in flight are flushed, or a
     // deploy would lose them every time (M20).
     if let Some(c) = &cache {

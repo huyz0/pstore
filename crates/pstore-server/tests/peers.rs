@@ -29,6 +29,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
+#[path = "support/peer.rs"]
+mod peer_fixture;
+
+fn peer_addresses() -> &'static Mutex<std::collections::HashMap<usize, String>> {
+    static ADDRESSES: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    ADDRESSES.get_or_init(Mutex::default)
+}
 
 /// One server's view of the shared store: what it read, and whether it fails or waits.
 #[derive(Debug, Clone)]
@@ -161,17 +169,28 @@ fn params() -> pstore_index::cluster::Params {
 /// A server over `store`, listening on a port of its own.
 async fn start(store: &MemoryStore, lane: u64) -> (Server, tokio::net::TcpListener) {
     let view = View::over(store);
-    let api = Api::new(Accounted::new(view.clone()), LaneId(lane)).unwrap();
+    let api = Api::with_auth(
+        Accounted::new(view.clone()),
+        LaneId(lane),
+        peer_fixture::auth(),
+    )
+    .unwrap();
     api.set_index_params_for_test(params());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    peer_addresses()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(&api) as usize, url.clone());
     (Server { api, view, url }, listener)
 }
 
 fn serve(server: &Server, listener: tokio::net::TcpListener) {
-    tokio::spawn(pstore_server::serve(
+    let udp = std::net::UdpSocket::bind(listener.local_addr().unwrap()).unwrap();
+    tokio::spawn(pstore_server::serve_peers(
         Arc::clone(&server.api),
         listener,
+        udp,
         std::future::pending(),
     ));
 }
@@ -205,6 +224,16 @@ async fn cluster(extra: &[String]) -> (MemoryStore, Vec<Server>, Server) {
 }
 
 async fn send(api: &Arc<Api<View>>, method: &str, uri: &str, body: Value) -> (u16, Value) {
+    if uri == "/peer/v1/part" {
+        assert_eq!(method, "POST");
+        let address = peer_addresses()
+            .lock()
+            .unwrap()
+            .get(&(Arc::as_ptr(api) as usize))
+            .unwrap()
+            .clone();
+        return peer_fixture::call(&address, "7", body).await;
+    }
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -380,13 +409,9 @@ async fn exchanges(api: &Arc<Api<View>>) -> u64 {
     let text =
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     text.lines()
-        .find_map(|l| {
-            l.strip_prefix(
-                "pstore_http_requests_total{route=\"/v1/internal/part\",status=\"200\"} ",
-            )
-        })
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+        .filter(|line| line.starts_with("pstore_peer_parts_completed_total{transport=\"h2\","))
+        .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+        .sum()
 }
 
 #[tokio::test]
@@ -525,7 +550,7 @@ async fn a_failed_peer_costs_rounds_not_answers() {
     // A server in the list that is not listening: its segments' parts fail to connect.
     let dead = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        format!("https://{}", l.local_addr().unwrap())
     };
     let (store, servers, alone) = cluster(std::slice::from_ref(&dead)).await;
     let mut all = urls(&servers);
@@ -555,7 +580,7 @@ async fn a_failed_peer_costs_rounds_not_answers_for_a_multi_leg() {
     // dense leg, and beside a text leg (two phases).
     let dead = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        format!("https://{}", l.local_addr().unwrap())
     };
     let (store, servers, alone) = cluster(std::slice::from_ref(&dead)).await;
     let mut all = urls(&servers);
@@ -593,12 +618,12 @@ async fn a_failed_peer_costs_rounds_not_answers_for_a_multi_leg() {
 async fn a_peer_of_another_protocol_is_refused_and_run_here() {
     // A peer that answers every part with the version refusal.
     let fake = axum::Router::new().route(
-        "/v1/internal/part",
+        "/peer/v1/part",
         axum::routing::post(|| async { (axum::http::StatusCode::CONFLICT, "protocol_mismatch") }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let other = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let other = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
     let (store, servers, alone) = cluster(std::slice::from_ref(&other)).await;
     let mut all = urls(&servers);
     all.push(other);
@@ -617,7 +642,7 @@ async fn a_peer_of_another_protocol_is_refused_and_run_here() {
     let (status, body) = send(
         &servers[1].api,
         "POST",
-        "/v1/internal/part",
+        "/peer/v1/part",
         json!({"protocol": 999, "index": "docs", "fts": "", "filters": null, "shadow": 0,
                "legs": [], "targets": []}),
     )
@@ -628,9 +653,9 @@ async fn a_peer_of_another_protocol_is_refused_and_run_here() {
         let (status, body) = send(
             &servers[1].api,
             "POST",
-            "/v1/internal/part",
+            "/peer/v1/part",
             json!({"protocol": 1, "phase": phase, "index": "docs", "fts": "", "filters": null,
-                   "shadow": 0, "legs": [], "targets": [], "id": "00", "stats": null}),
+                   "shadow": 0, "legs": [], "targets": [], "id": "00", "stats": {"doc_count":0,"total_tokens":0,"df":[]}}),
         )
         .await;
         assert_eq!(status, 409, "{phase}: {body}");
@@ -703,7 +728,7 @@ async fn a_part_outside_its_tenant_is_refused() {
     let s = &servers[1];
     for p in refused {
         s.view.take();
-        let (status, body) = send(&s.api, "POST", "/v1/internal/part", p.clone()).await;
+        let (status, body) = send(&s.api, "POST", "/peer/v1/part", p.clone()).await;
         assert_eq!(status, 400, "{p} -> {body}");
         assert!(
             s.view.take().is_empty(),
@@ -712,13 +737,13 @@ async fn a_part_outside_its_tenant_is_refused() {
     }
     // An index named `a..b` is one of the tenant's: `..` refuses only as a path component.
     let dotted = "0007/tnt/7/idx/a..b/seg/L0/00000000000000000001-0000000000000001.seg";
-    let (status, body) = send(&s.api, "POST", "/v1/internal/part", part(dotted, None, 1)).await;
+    let (status, body) = send(&s.api, "POST", "/peer/v1/part", part(dotted, None, 1)).await;
     assert_ne!(status, 400, "{body}");
     // The same part with its own keys is admitted, and reads.
     let (status, body) = send(
         &s.api,
         "POST",
-        "/v1/internal/part",
+        "/peer/v1/part",
         part(ours, Some(&format!("{ours}.1-1.dv")), 1),
     )
     .await;
@@ -862,50 +887,50 @@ fn peers_are_both_or_neither_and_include_self() {
     };
     assert_eq!(read(&[]).unwrap(), None);
     let ok = read(&[
-        ("PSTORE_PEERS", "http://a:1, http://b:1/,http://c:1"),
-        ("PSTORE_PEER_SELF", "http://b:1/"),
+        ("PSTORE_PEERS", "https://a:1, https://b:1/,https://c:1"),
+        ("PSTORE_PEER_SELF", "https://b:1/"),
     ])
     .unwrap()
     .unwrap();
-    assert_eq!(ok.servers, ["http://a:1", "http://b:1", "http://c:1"]);
+    assert_eq!(ok.servers, ["https://a:1", "https://b:1", "https://c:1"]);
     assert_eq!(ok.me, 1);
     assert_eq!(ok.timeout, Duration::from_millis(2_000));
     let timed = read(&[
-        ("PSTORE_PEERS", "http://a:1,http://b:1"),
-        ("PSTORE_PEER_SELF", "http://a:1"),
+        ("PSTORE_PEERS", "https://a:1,https://b:1"),
+        ("PSTORE_PEER_SELF", "https://a:1"),
         ("PSTORE_PEER_TIMEOUT_MS", "150"),
     ])
     .unwrap()
     .unwrap();
     assert_eq!(timed.timeout, Duration::from_millis(150));
     for bad in [
-        vec![("PSTORE_PEERS", "http://a:1,http://b:1")],
-        vec![("PSTORE_PEER_SELF", "http://a:1")],
+        vec![("PSTORE_PEERS", "https://a:1,https://b:1")],
+        vec![("PSTORE_PEER_SELF", "https://a:1")],
         vec![
-            ("PSTORE_PEERS", "http://a:1,http://b:1"),
-            ("PSTORE_PEER_SELF", "http://c:1"),
+            ("PSTORE_PEERS", "https://a:1,https://b:1"),
+            ("PSTORE_PEER_SELF", "https://c:1"),
         ],
         vec![
-            ("PSTORE_PEERS", "http://a:1,http://a:1/"),
-            ("PSTORE_PEER_SELF", "http://a:1"),
+            ("PSTORE_PEERS", "https://a:1,https://a:1/"),
+            ("PSTORE_PEER_SELF", "https://a:1"),
         ],
         vec![
-            ("PSTORE_PEERS", "http://a:1"),
-            ("PSTORE_PEER_SELF", "http://a:1"),
+            ("PSTORE_PEERS", "https://a:1"),
+            ("PSTORE_PEER_SELF", "https://a:1"),
             ("PSTORE_PEER_TIMEOUT_MS", "0"),
         ],
         vec![("PSTORE_PEER_TIMEOUT_MS", "soon")],
         vec![
-            ("PSTORE_PEERS", "https://a:1,http://b:1"),
-            ("PSTORE_PEER_SELF", "http://b:1"),
+            ("PSTORE_PEERS", "http://a:1,https://b:1"),
+            ("PSTORE_PEER_SELF", "https://b:1"),
         ],
         vec![
-            ("PSTORE_PEERS", "http://a:1/v1,http://b:1"),
-            ("PSTORE_PEER_SELF", "http://b:1"),
+            ("PSTORE_PEERS", "https://a:1/v1,https://b:1"),
+            ("PSTORE_PEER_SELF", "https://b:1"),
         ],
         vec![
-            ("PSTORE_PEERS", "a:1,http://b:1"),
-            ("PSTORE_PEER_SELF", "http://b:1"),
+            ("PSTORE_PEERS", "a:1,https://b:1"),
+            ("PSTORE_PEER_SELF", "https://b:1"),
         ],
     ] {
         assert!(read(&bad).is_err(), "{bad:?}");
@@ -923,7 +948,7 @@ async fn failed_shares_are_run_here_together() {
     // a connection closed at once fails in one loopback round trip on every OS.
     let dead = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
+        let url = format!("https://{}", l.local_addr().unwrap());
         std::thread::spawn(move || {
             for c in l.incoming() {
                 drop(c);
@@ -1091,7 +1116,7 @@ async fn a_vector_query_makes_one_exchange_and_an_old_peer_is_run_here() {
     let (status, body) = send(
         &servers[1].api,
         "POST",
-        "/v1/internal/part",
+        "/peer/v1/part",
         json!({"protocol": 1, "index": "docs",
                "fts": pstore_format::text::FullText::default().encode(),
                "filters": null, "shadow": 0, "legs": [], "targets": []}),
@@ -1103,7 +1128,7 @@ async fn a_vector_query_makes_one_exchange_and_an_old_peer_is_run_here() {
     // and its legs have no `text` kind, so a phase-1 part with a text leg is `400 malformed
     // part` -- not the `409` the spec expected. Any status but 200 and 422 runs the share here.
     let fake = axum::Router::new().route(
-        "/v1/internal/part",
+        "/peer/v1/part",
         axum::routing::post(|body: axum::body::Bytes| async move {
             let v: Value = serde_json::from_slice(&body).unwrap();
             let text = v["legs"]
@@ -1117,8 +1142,8 @@ async fn a_vector_query_makes_one_exchange_and_an_old_peer_is_run_here() {
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let old = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let old = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
     let (store, servers, alone2) = cluster(std::slice::from_ref(&old)).await;
     let mut all = urls(&servers);
     all.push(old);
@@ -1143,13 +1168,13 @@ async fn a_failed_text_peer_costs_rounds_not_answers() {
     // phase 2 with the real server's `410`.
     let dead = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        format!("https://{}", l.local_addr().unwrap())
     };
     let opener: Arc<Mutex<String>> = Arc::default();
     let fake = {
         let opener = Arc::clone(&opener);
         axum::Router::new().route(
-            "/v1/internal/part",
+            "/peer/v1/part",
             axum::routing::post(
                 move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
                     let opener = opener.lock().unwrap().clone();
@@ -1158,28 +1183,24 @@ async fn a_failed_text_peer_costs_rounds_not_answers() {
                         if v["phase"] != "open" {
                             return (axum::http::StatusCode::GONE, Bytes::from("part_gone"));
                         }
-                        let res = reqwest::Client::builder()
-                            .no_proxy()
-                            .build()
-                            .unwrap()
-                            .post(format!("{opener}/v1/internal/part"))
-                            .header("x-pstore-tenant", headers["x-pstore-tenant"].clone())
-                            .header("content-type", "application/json")
-                            .body(body)
-                            .send()
-                            .await
-                            .unwrap();
-                        let status =
-                            axum::http::StatusCode::from_u16(res.status().as_u16()).unwrap();
-                        (status, res.bytes().await.unwrap())
+                        let (status, body) = peer_fixture::call(
+                            &opener,
+                            headers["x-pstore-tenant"].to_str().unwrap(),
+                            v,
+                        )
+                        .await;
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            Bytes::from(serde_json::to_vec(&body).unwrap()),
+                        )
                     }
                 },
             ),
         )
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let lost = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let lost = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
     let (store, servers, alone) = cluster(&[dead.clone(), lost.clone()]).await;
     *opener.lock().unwrap() = servers[1].url.clone();
     let mut all = urls(&servers);
@@ -1208,15 +1229,16 @@ async fn a_failed_text_peer_costs_rounds_not_answers() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_part_never_scanned_expires_without_more_traffic() {
     // Code review: expiry swept only on the next open or scan would leave a quiet peer holding
     // an abandoned part, uncounted, for as long as no query came. A scrape sweeps too.
-    let (server, _listener) = start(&MemoryStore::new(), 1).await;
+    let (server, listener) = start(&MemoryStore::new(), 1).await;
+    serve(&server, listener);
     let (status, body) = send(
         &server.api,
         "POST",
-        "/v1/internal/part",
+        "/peer/v1/part",
         json!({"protocol": 2, "phase": "open", "index": "docs",
                "fts": pstore_format::text::FullText::default().encode(),
                "filters": null, "shadow": 0, "legs": [], "targets": [], "terms": []}),
@@ -1224,6 +1246,7 @@ async fn a_part_never_scanned_expires_without_more_traffic() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(metric(&server.api, "pstore_peer_parts_expired").await, 0);
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(11)).await;
     assert_eq!(metric(&server.api, "pstore_peer_parts_expired").await, 1);
 }
@@ -1244,12 +1267,12 @@ fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
     use pstore_server::GossipConfig;
     let base = [
-        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080/"),
+        ("PSTORE_PEER_SELF", "https://10.0.0.1:8080/"),
         ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
         ("PSTORE_GOSSIP_KEY", KEY),
     ];
     let g = GossipConfig::from_vars(vars(&base)).unwrap().unwrap();
-    assert_eq!(g.url, "http://10.0.0.1:8080");
+    assert_eq!(g.url, "https://10.0.0.1:8080");
     assert_eq!(
         (g.listen.as_str(), g.advertise.as_str()),
         ("10.0.0.1:7000", "10.0.0.1:7000")
@@ -1283,7 +1306,7 @@ fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
     assert_eq!(g.period, Duration::from_millis(250));
     assert_eq!(g.timeout, Duration::from_millis(900));
     let insecure = [
-        ("PSTORE_PEER_SELF", "http://10.0.0.1:8080"),
+        ("PSTORE_PEER_SELF", "https://10.0.0.1:8080"),
         ("PSTORE_PEER_GOSSIP_ADDR", "10.0.0.1:7000"),
         ("PSTORE_GOSSIP_INSECURE", "1"),
     ];
@@ -1298,20 +1321,20 @@ fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
     // None of it: no gossip, and M54's list the only way to have peers.
     assert_eq!(GossipConfig::from_vars(vars(&[])).unwrap(), None);
     let listed = [
-        ("PSTORE_PEERS", "http://a:1,http://b:1"),
-        ("PSTORE_PEER_SELF", "http://a:1"),
+        ("PSTORE_PEERS", "https://a:1,https://b:1"),
+        ("PSTORE_PEER_SELF", "https://a:1"),
     ];
     assert_eq!(GossipConfig::from_vars(vars(&listed)).unwrap(), None);
     assert!(PeerConfig::from_vars(vars(&listed)).unwrap().is_some());
     assert!(
-        PeerConfig::from_vars(vars(&[("PSTORE_PEER_SELF", "http://a:1")])).is_err(),
+        PeerConfig::from_vars(vars(&[("PSTORE_PEER_SELF", "https://a:1")])).is_err(),
         "without gossip, a lone PSTORE_PEER_SELF is still refused"
     );
 
     let refused: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("beside a list", {
             let mut v = base.to_vec();
-            v.push(("PSTORE_PEERS", "http://10.0.0.1:8080"));
+            v.push(("PSTORE_PEERS", "https://10.0.0.1:8080"));
             v
         }),
         (
@@ -1321,9 +1344,9 @@ fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
                 ("PSTORE_GOSSIP_KEY", KEY),
             ],
         ),
-        ("https self", {
+        ("plaintext self", {
             let mut v = base.to_vec();
-            v[0] = ("PSTORE_PEER_SELF", "https://10.0.0.1:8080");
+            v[0] = ("PSTORE_PEER_SELF", "http://10.0.0.1:8080");
             v
         }),
         (
@@ -1396,25 +1419,25 @@ fn gossip_peers_are_configured_whole_and_never_beside_a_list() {
 #[test]
 fn the_peer_list_is_the_servers_in_the_view() {
     let m = |addr: &str, zone: &str| (addr.to_owned(), zone.to_owned());
-    let me = "http://10.0.0.2:8080";
+    let me = "https://10.0.0.2:8080";
     let view = vec![
-        m("10.0.0.3:7000", "http://10.0.0.3:8080"),
+        m("10.0.0.3:7000", "https://10.0.0.3:8080"),
         m("10.0.0.9:7000", "us-east-1a"),
         m("10.0.0.8:7000", ""),
-        m("10.0.0.1:7000", "http://10.0.0.1:8080/"),
-        m("10.0.0.1:7001", "http://10.0.0.1:8080"),
-        m("10.0.0.6:7000", "https://10.0.0.6:8080"),
-        m("10.0.0.7:7000", "http://10.0.0.7:8080/path"),
-        m("[::1]:7000", "http://[::1]:8080"),
+        m("10.0.0.1:7000", "https://10.0.0.1:8080/"),
+        m("10.0.0.1:7001", "https://10.0.0.1:8080"),
+        m("10.0.0.6:7000", "http://10.0.0.6:8080"),
+        m("10.0.0.7:7000", "https://10.0.0.7:8080/path"),
+        m("[::1]:7000", "https://[::1]:8080"),
     ];
     let (list, at) = pstore_server::peer_list_of(&view, me);
     assert_eq!(
         list,
         vec![
-            "http://10.0.0.1:8080".to_owned(),
-            "http://10.0.0.2:8080".to_owned(),
-            "http://10.0.0.3:8080".to_owned(),
-            "http://[::1]:8080".to_owned(),
+            "https://10.0.0.1:8080".to_owned(),
+            "https://10.0.0.2:8080".to_owned(),
+            "https://10.0.0.3:8080".to_owned(),
+            "https://[::1]:8080".to_owned(),
         ]
     );
     assert_eq!(at, 1);
@@ -1452,6 +1475,7 @@ fn udp_port() -> u16 {
 
 async fn gossiping(store: &MemoryStore, lane: u64, seeds: &[String]) -> (Gossiping, String) {
     let (server, listener) = start(store, lane).await;
+    let udp = std::net::UdpSocket::bind(listener.local_addr().unwrap()).unwrap();
     let gossip_at = format!("127.0.0.1:{}", udp_port());
     let config = pstore_server::GossipConfig {
         url: server.url.clone(),
@@ -1464,9 +1488,10 @@ async fn gossiping(store: &MemoryStore, lane: u64, seeds: &[String]) -> (Gossipi
     };
     let gossip = server.api.join_peers(config).await.unwrap();
     let (http, rx) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(pstore_server::serve(
+    let serving = tokio::spawn(pstore_server::serve_peers(
         Arc::clone(&server.api),
         listener,
+        udp,
         async move {
             let _ = rx.await;
         },
@@ -1670,7 +1695,7 @@ async fn a_sum_part_is_protocol_three() {
     let fake = {
         let seen = Arc::clone(&seen);
         axum::Router::new().route(
-            "/v1/internal/part",
+            "/peer/v1/part",
             axum::routing::post(move |body: axum::body::Bytes| {
                 let seen = Arc::clone(&seen);
                 async move {
@@ -1685,8 +1710,8 @@ async fn a_sum_part_is_protocol_three() {
         )
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let old = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, fake).await });
+    let old = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
     let (store, servers, alone) = cluster(std::slice::from_ref(&old)).await;
     let mut all = urls(&servers);
     all.push(old);
@@ -1718,7 +1743,7 @@ async fn a_sum_part_is_protocol_three() {
         let (status, body) = send(
             &servers[1].api,
             "POST",
-            "/v1/internal/part",
+            "/peer/v1/part",
             open(protocol, sum.clone()),
         )
         .await;
@@ -1727,7 +1752,7 @@ async fn a_sum_part_is_protocol_three() {
     let (status, body) = send(
         &servers[1].api,
         "POST",
-        "/v1/internal/part",
+        "/peer/v1/part",
         open(3, cut.clone()),
     )
     .await;
@@ -1743,17 +1768,17 @@ async fn a_sum_part_is_protocol_three() {
     ] {
         let mut part = open(3, cut.clone());
         part["legs"] = legs.clone();
-        let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", part).await;
+        let (status, body) = send(&servers[1].api, "POST", "/peer/v1/part", part).await;
         assert_eq!(status, 400, "{legs}: {body}");
     }
     let mut part = open(3, cut.clone());
     part["legs"] = json!([leg(15)]);
-    let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", part).await;
+    let (status, body) = send(&servers[1].api, "POST", "/peer/v1/part", part).await;
     assert_eq!(status, 200, "leg 15 is the last a query may have: {body}");
     // A cut by sum in one exchange is refused.
     let mut whole = open(1, cut.clone());
     whole.as_object_mut().unwrap().remove("phase");
-    let (status, body) = send(&servers[1].api, "POST", "/v1/internal/part", whole).await;
+    let (status, body) = send(&servers[1].api, "POST", "/peer/v1/part", whole).await;
     assert_eq!(status, 400, "protocol 1 with a cut: {body}");
     // A scan speaks its part's protocol.
     for (opened, scan) in [(3u64, 2u64), (2, 3)] {
@@ -1762,18 +1787,13 @@ async fn a_sum_part_is_protocol_three() {
         } else {
             Value::Null
         };
-        let (status, body) = send(
-            &servers[1].api,
-            "POST",
-            "/v1/internal/part",
-            open(opened, sum),
-        )
-        .await;
+        let (status, body) =
+            send(&servers[1].api, "POST", "/peer/v1/part", open(opened, sum)).await;
         assert_eq!(status, 200, "{body}");
         let (status, body) = send(
             &servers[1].api,
             "POST",
-            "/v1/internal/part",
+            "/peer/v1/part",
             json!({"protocol": scan, "phase": "scan", "id": body["id"], "index": "docs",
                    "stats": {"doc_count": 0, "total_tokens": 0, "df": []}}),
         )

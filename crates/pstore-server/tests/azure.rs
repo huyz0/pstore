@@ -115,7 +115,7 @@ async fn the_server_writes_folds_and_answers_as_of_against_azurite() {
     let config = Config::from_vars(|k| std::env::var(k).ok()).unwrap();
     let azure = config.azure.expect("PSTORE_BACKEND=azure");
     let store = azure_store(&azure, Profile::Conforming).unwrap();
-    let api = Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     let tenant = TenantId(T.0 + 1000 + u128::from(std::process::id() % 1000));
     let mut at = 0;
     for k in 0..3u32 {
@@ -163,7 +163,7 @@ async fn writes_folds_queries_and_reads_as_of_against_azurite() {
     let store = azure_store(&azure, Profile::Conforming).unwrap();
     assert!(!store.capabilities().suffix_read);
     // The profile admits durable writes, so a server would serve this container.
-    assert!(Api::new(Accounted::new(store.clone()), LaneId(9)).is_ok());
+    assert!(Api::unsecured(Accounted::new(store.clone()), LaneId(9)).is_ok());
 
     // A tenant of its own each run, so a reused emulator never answers from an old one.
     let tenant = TenantId(T.0 + u128::from(std::process::id() % 1000));

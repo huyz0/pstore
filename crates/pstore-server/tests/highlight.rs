@@ -42,7 +42,7 @@ async fn send<S: BlobStore + Clone + 'static>(
 }
 
 fn api() -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
 }
 
 /// Writes `rows` as `(id, text)` durably, declaring `fts` when given.
@@ -416,7 +416,7 @@ async fn a_highlight_costs_nothing() {
     use pstore_testkit::depth::DepthCounting;
     for segments in [1, 4] {
         let store = DepthCounting::new(MemoryStore::new());
-        let cold = || Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+        let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
         let writer = cold();
         for k in 0..segments {
             let rows: Vec<(String, String)> = (0..10)

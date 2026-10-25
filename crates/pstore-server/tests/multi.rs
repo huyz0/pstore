@@ -30,7 +30,7 @@ use tower::ServiceExt;
 const TENANT: u128 = 14;
 
 fn api(store: &MemoryStore) -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(store.clone()), LaneId(1)).expect("a fencing backend")
+    Api::unsecured(Accounted::new(store.clone()), LaneId(1)).expect("a fencing backend")
 }
 
 async fn send<S: pstore_blob::BlobStore + Clone + 'static>(
@@ -607,7 +607,7 @@ async fn a_multi_query_keeps_the_depth() {
     let multi = json!({"field": "late", "vectors": q});
     for segments in [1, 4] {
         let store = DepthCounting::new(MemoryStore::new());
-        let cold = || Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+        let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
         let writer = cold();
         for k in 0..segments {
             let docs: Vec<Value> = (k * 10..k * 10 + 10)

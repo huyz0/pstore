@@ -75,6 +75,7 @@ server() {
   # rather than by the image.
   docker run -d --name "${IMAGE}-${name}" --network host \
     -e PSTORE_BIND="0.0.0.0:${port}" \
+    -e PSTORE_ALLOW_UNAUTHENTICATED=1 \
     -e PSTORE_LANE="$lane" \
     -e PSTORE_BACKEND=s3 \
     -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${STORE_PORT}" \
@@ -124,6 +125,7 @@ say "criterion 3 — an unprobed profile refuses to serve"
 # never returns, and the `bad` line below is unreachable. The script's own header forbids that
 # for `req`; a foreground `docker run` is the same hazard wearing different clothes.
 out=$(timeout 30 docker run --rm --network host \
+  -e PSTORE_ALLOW_UNAUTHENTICATED=1 \
   -e PSTORE_LANE=1 -e PSTORE_BACKEND=s3 \
   -e PSTORE_S3_ENDPOINT="http://127.0.0.1:${STORE_PORT}" "$IMAGE" 2>&1) && code=0 || code=$?
 case "$code" in
@@ -141,7 +143,7 @@ case "$out" in *"cas=Divergent"*) ok "named the primitive" ;; *) bad "did not na
 
 # --- Criterion 4: a lane is required in the image too. ----------------------------------
 say "criterion 4 — no lane, no server"
-out=$(timeout 30 docker run --rm --network host -e PSTORE_BACKEND=memory "$IMAGE" 2>&1) && code=0 || code=$?
+out=$(timeout 30 docker run --rm --network host -e PSTORE_ALLOW_UNAUTHENTICATED=1 -e PSTORE_BACKEND=memory "$IMAGE" 2>&1) && code=0 || code=$?
 case "$code" in
   0)   bad "started without a lane" ;;
   124) bad "did not exit -- the image has a default lane" ;;

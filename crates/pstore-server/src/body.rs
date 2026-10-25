@@ -23,10 +23,11 @@ pub(crate) struct Plain {
     /// A part's dispatch (M122), read in the same pass: the top-level `protocol` where it is
     /// an unsigned integer and `phase` where it is a string, as the tree's `as_u64` and
     /// `as_str` read them. A probe was a third pass over every part.
+    #[cfg(test)]
     pub(crate) heading: Heading,
 }
 
-/// The top-level `protocol` and `phase`, as [`Plain::heading`] reads them.
+/// The historical JSON part heading retained by parser conformance controls.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Heading {
     pub(crate) protocol: Option<u64>,
@@ -46,6 +47,7 @@ pub(crate) fn plain(body: &[u8]) -> Option<Plain> {
     de.end().ok()?;
     (!repeated).then_some(Plain {
         keys: top.keys,
+        #[cfg(test)]
         heading: top.heading,
     })
 }
@@ -225,3 +227,6 @@ impl<'de> Visitor<'de> for KeyOf {
         Ok(Cow::Owned(s.to_owned()))
     }
 }
+
+#[cfg(test)]
+mod tests;

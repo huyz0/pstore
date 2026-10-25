@@ -159,7 +159,7 @@ fn fde(a: usize, b: usize, k: usize, extra: Value) -> Value {
 #[tokio::test]
 async fn fde_mode_ranks_and_exact_mode_is_unchanged() {
     let store = MemoryStore::new();
-    let api = Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     // Two segments, then compacted into one, then a third: encodings survive each.
     put(&api, 0..32).await;
     fold(&api).await;
@@ -191,7 +191,7 @@ async fn fde_mode_ranks_and_exact_mode_is_unchanged() {
 #[tokio::test]
 async fn rerank_exact_orders_by_maxsim() {
     let store = MemoryStore::new();
-    let api = Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     put(&api, 0..40).await;
     fold(&api).await;
     put(&api, 40..80).await;
@@ -223,7 +223,7 @@ async fn rerank_exact_orders_by_maxsim() {
 async fn fde_reads_less_than_the_exact_leg() {
     use pstore_testkit::depth::DepthCounting;
     let store = DepthCounting::new(MemoryStore::new());
-    let cold = || Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     let writer = cold();
     for k in 0..2 {
         put(&writer, k * 20..k * 20 + 20).await;
@@ -256,7 +256,7 @@ async fn fde_reads_less_than_the_exact_leg() {
 
 #[tokio::test]
 async fn the_derived_field_is_not_a_name_a_client_may_write() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     put(&api, 0..4).await;
     let mut d = doc(9);
     d["vectors"]["late$fde"] = json!([[1.0, 2.0]]);
@@ -280,7 +280,7 @@ async fn the_derived_field_is_not_a_name_a_client_may_write() {
 
 #[tokio::test]
 async fn fde_options_are_refused_at_the_door() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     put(&api, 0..8).await;
     fold(&api).await;
     let q = |extra: Value| fde(1, 2, 5, extra);

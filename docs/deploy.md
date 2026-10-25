@@ -98,8 +98,8 @@ bit, and the depth stays at four rounds.
     unspecified (`0.0.0.0`, `::`) or port-0 advertise address is refused.
   - **Open the UDP gossip port between servers.** Gossip is sealed under
     `PSTORE_GOSSIP_KEY`, as `pstore-node`'s is (M53); `PSTORE_GOSSIP_INSECURE=1` runs it
-    unsealed. ⚠️ Unsealed, any datagram can add a URL to every list, and queries' shares,
-    tenant filters included, are then sent to it.
+    unsealed. Unsealed gossip can inject membership hints. Peer mTLS must still
+    authenticate a discovered endpoint before query data is sent.
   - **A new server takes segments** once the others' views hold it, usually within a few
     periods. **A server that dies is sent shares until it is declared dead**: about 14 periods
     (14 s at the default 1 s). Each of those shares fails, counted in
@@ -127,8 +127,11 @@ bit, and the depth stays at four rounds.
   server still listed but no longer answering.
 - **A peer holds a text query's opened segments between its two exchanges:** at most 10 s,
   256 parts and about 256 MiB, oldest out first, counted in `pstore_peer_parts_expired`.
-- ⚠️ `POST /v1/internal/part` authenticates its caller no more than the public API does: keep
-  it on the deployment's own network, as the public endpoints already must be.
+- M127 removes `POST /v1/internal/part` from the public API. The replacement peer
+  listener uses mTLS 1.3, HTTP/2 and HTTP/3, and versioned MessagePack at
+  `POST /peer/v1/part`. Peer URLs name this dedicated HTTPS authority. See the
+  [operator contract](milestones/M127/AUTH.md) and
+  [verification status](milestones/M127/VERIFIED.md) before deploying the change.
 - `meta.cost` counts the receiving server's requests only.
 
 ## Multi-vector documents
@@ -313,8 +316,9 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
   Every worker also reads one register shard per `SCAN`, with or without work.
 - ⚠️ **Every server must name the same sources.** A worker without the store a job names
   records `unknown_store` in that job's `last_error` and keeps the claim.
-- ⚠️ **No auth**: any tenant header may name any source index in any configured store (see
-  `auth` below).
+- Source reads require signed authority for the exact tenant/store pair, or
+  `read` scope for the caller's own local source. Destination `write` scope alone
+  does not authorize a source. Accepted durable jobs continue until cancelled.
 
 A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
 HMAC keys. It is only ever read.
@@ -344,9 +348,10 @@ the codes are reaped by GC after its window, and the customer's file is never to
   ⚠️ The copying deployment must itself allow the registration's `source` prefix, and a copy from
   another store reads the customer's object of the same key **in its own store**: none there is a
   query refusal, a different one is `external_source_changed`, never a stale answer.
-- ⚠️ **No auth**: the tenant is whatever the header says, so any tenant may point at any source
-  under an allowed prefix (see `auth` below). Allow only prefixes whose every tenant may read
-  them.
+- The prefix policy remains deployment-wide: authenticated tenants with `write`
+  scope can register objects under those prefixes. Allow only prefixes intended
+  for that audience. Cross-tenant/store copies additionally require an exact
+  signed source grant.
 
 ## The engine registry
 
@@ -412,17 +417,22 @@ than answered wrongly, so `PSTORE_GC_AGE_S` **is** your retention policy.
 tenant nothing commits to after a restart keeps its buried segments, billed, until something
 commits there again or you call `POST /v1/admin/gc` for it.
 
-### `tls` — the server speaks HTTP in the clear
+### `tls` — public ingress and peer identities
 
-Terminate TLS in a reverse proxy in front of this process. The server will not be given a
-certificate loader; there is one transport crate in this workspace and it is confined to
-`pstore-server` by `cargo deny`.
+Terminate public HTTP TLS in a trusted reverse proxy. The separate peer listeners
+use native mutual TLS with a dedicated deployment peer CA and server SAN
+verification. Peer certificates grant internal authority across tenants. Keep
+their issuance separate from public client credentials.
 
-### `auth` — the tenant is whatever the header says
+### `auth` — signed tenant identity and operation scopes
 
-Authenticate and authorize before the request reaches this process. `X-Pstore-Tenant` is
-taken at face value, and there is no quota: `pstore-meter` exists and is not wired. **Do not
-expose this port to anyone you would not give the whole bucket to.**
+Configure `PSTORE_AUTH_CONFIG` and issue HS256 bearer tokens with issuer,
+audience, expiration, decimal tenant ID and explicit operation scopes. A tenant
+header, if present, must match the signed identity. Missing authentication
+configuration refuses standalone startup. See the [authentication contract](milestones/M127/AUTH.md)
+for claims, source grants and rotation. `PSTORE_ALLOW_UNAUTHENTICATED=1` selects
+private/test mode explicitly and cannot be combined with key configuration.
+Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 
 ## Environment
 
@@ -430,6 +440,8 @@ expose this port to anyone you would not give the whole bucket to.**
 |---|---|---|
 | `PSTORE_LANE` | — | **Required.** See above. |
 | `PSTORE_BIND` | `127.0.0.1:8080` | ⚠️ The image sets `0.0.0.0:8080`; the library default is loopback, which inside a container is reachable by nothing. |
+| `PSTORE_AUTH_CONFIG` | — | Required signed-credential configuration unless explicit private mode is selected. See the authentication contract above. |
+| `PSTORE_ALLOW_UNAUTHENTICATED` | `0` | Exactly `1` selects private/test mode; incompatible with key configuration. |
 | `PSTORE_BACKEND` | `memory` | `memory`, `s3` or `azure`. `memory` is durable for exactly as long as the process. |
 | `PSTORE_PROFILE` | `unprobed` | `unprobed` refuses to serve. |
 | `PSTORE_S3_ENDPOINT` | — | e.g. `http://rustfs:9000`. |
@@ -465,6 +477,9 @@ expose this port to anyone you would not give the whole bucket to.**
 | `PSTORE_PEERS` | — | Every server's base URL, comma-separated, this one included (M54, above). |
 | `PSTORE_PEER_SELF` | — | This server's URL, as it appears in `PSTORE_PEERS`. Both or neither. |
 | `PSTORE_PEER_TIMEOUT_MS` | `2000` | How long a peer has to answer a share before this server runs it itself. |
+| `PSTORE_PEER_BIND` | — | Required when peering is configured. Dedicated TCP and UDP listeners share this address. |
+| `PSTORE_PEER_CA_FILE` / `PSTORE_PEER_CERT_FILE` / `PSTORE_PEER_KEY_FILE` | — | Required bounded PEM files for peer mTLS. Both roles verify the deployment CA; the client verifies the server SAN. |
+| `PSTORE_PEER_TRANSPORT` | `auto` | `h2`, `h3` or `auto`. Controls outgoing connections; both listeners remain available. |
 | `PSTORE_PEER_GOSSIP_ADDR` | — | The UDP `ip:port` this server's gossip member listens on (M56). With it, `PSTORE_PEER_SELF` alone names this server, and `PSTORE_PEERS` is refused. |
 | `PSTORE_PEER_GOSSIP_ADVERTISE` | the listen address | The `ip:port` the others reach this member on. Never unspecified, never port 0. |
 | `PSTORE_PEER_GOSSIP_SEEDS` | — | `ip:port`s of members to join first, comma-separated. |

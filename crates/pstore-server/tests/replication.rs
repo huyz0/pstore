@@ -54,14 +54,14 @@ impl World {
         self.api_with(lane, policy())
     }
     fn api_with(&self, lane: u64, policy: ReplicationPolicy) -> A {
-        let api = Api::new(self.acct.clone(), LaneId(lane)).unwrap();
+        let api = Api::unsecured(self.acct.clone(), LaneId(lane)).unwrap();
         let far: Arc<dyn BlobStore> = Arc::new(self.far.as_tenant(TenantId(0)));
         api.configure_replication(policy, BTreeMap::from([("far".to_owned(), far)]));
         api
     }
     /// A process serving the remote store's tenants.
     fn far_api(&self) -> A {
-        Api::new(self.far.clone(), LaneId(50)).unwrap()
+        Api::unsecured(self.far.clone(), LaneId(50)).unwrap()
     }
 }
 
@@ -653,7 +653,7 @@ async fn creates_racing_a_tick_claim_no_more_than_max() {
 
 #[test]
 fn the_worker_state_shows_in_debug_output() {
-    let api = Api::new(World::new().acct.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(World::new().acct.clone(), LaneId(1)).unwrap();
     let out = format!("{:?}", api.replicating_for_test());
     assert!(out.contains("worker") && out.contains("held"), "{out}");
 }
@@ -894,7 +894,7 @@ async fn a_worker_without_the_named_store_says_why() {
         json!({"index": "src", "tenant": SRC.to_string(), "store": "far"}),
     )
     .await;
-    let bare = Api::new(world.acct.clone(), LaneId(1)).unwrap();
+    let bare = Api::unsecured(world.acct.clone(), LaneId(1)).unwrap();
     bare.configure_replication(policy(), BTreeMap::new());
     let mut workers = vec![(Arc::clone(&bare), Worker::default())];
     let ticks = usize::try_from((policy().ttl / 3).as_secs()).unwrap() + 2;
@@ -944,7 +944,7 @@ async fn the_last_cancel_takes_the_status_notes_with_it() {
 #[tokio::test]
 async fn a_served_process_runs_its_worker() {
     let world = World::new();
-    let api = Api::new(world.acct.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(world.acct.clone(), LaneId(1)).unwrap();
     api.configure_replication(
         ReplicationPolicy {
             period: Duration::from_millis(20),

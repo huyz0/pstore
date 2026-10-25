@@ -107,7 +107,7 @@ fn policy(max: usize) -> ReplicationPolicy {
 }
 
 fn api(acct: &Accounted<Yielding>, lane: u64, max: usize) -> A {
-    let api = Api::new(acct.clone(), LaneId(lane)).unwrap();
+    let api = Api::unsecured(acct.clone(), LaneId(lane)).unwrap();
     api.configure_replication(policy(max), BTreeMap::new());
     api
 }

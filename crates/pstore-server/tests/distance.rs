@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn api() -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).expect("a fencing backend")
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).expect("a fencing backend")
 }
 
 async fn send(api: &Arc<Api<MemoryStore>>, req: Request<Body>) -> (StatusCode, Value) {

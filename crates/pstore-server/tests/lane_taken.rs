@@ -43,8 +43,8 @@ async fn put(api: &A, id: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn a_write_on_a_taken_lane_answers_lane_taken() {
     let store = Accounted::new(MemoryStore::new());
-    let a = Api::new(store.clone(), LaneId(4)).unwrap();
-    let b = Api::new(store, LaneId(4)).unwrap();
+    let a = Api::unsecured(store.clone(), LaneId(4)).unwrap();
+    let b = Api::unsecured(store, LaneId(4)).unwrap();
     for (api, id) in [(&a, "a1"), (&b, "b1")] {
         let (s, body) = put(api, id).await;
         assert_eq!(s, StatusCode::OK, "{body}");

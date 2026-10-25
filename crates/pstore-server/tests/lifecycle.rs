@@ -56,7 +56,7 @@ async fn list(api: &Arc<Api<MemoryStore>>, query: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn indexes_list_a_page_at_a_time() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     // 250 names, most folded, a few only in memory: the pages span both.
     for i in 0..250 {
         put(&api, &format!("ix{i:03}"), i < 240).await;
@@ -121,7 +121,7 @@ async fn indexes_list_a_page_at_a_time() {
 
 #[tokio::test]
 async fn an_index_reports_when_its_contents_last_changed() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     put(&api, "a", true).await;
     let first = fold(&api).await;
     put(&api, "b", true).await;
@@ -147,8 +147,8 @@ async fn an_index_reports_when_its_contents_last_changed() {
 #[tokio::test]
 async fn rows_another_process_folded_are_no_longer_reported_unfolded() {
     let backend = MemoryStore::new();
-    let writer = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
-    let folder = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
+    let writer = Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let folder = Api::unsecured(Accounted::new(backend), LaneId(2)).unwrap();
     put(&writer, "a", true).await;
     fold(&folder).await;
     // The writer has not queried or folded since; its GET is its only read of HEAD.
@@ -163,8 +163,8 @@ async fn a_list_forgets_what_another_process_folded_away() {
     // flushed batches; once another process folds them, HEAD names no such index, and the
     // list -- which read that HEAD -- must stop naming it too.
     let backend = MemoryStore::new();
-    let writer = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
-    let folder = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
+    let writer = Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let folder = Api::unsecured(Accounted::new(backend), LaneId(2)).unwrap();
     let del = json!({"durability": "durable", "deletes": ["q"]});
     let (s, b) = send(
         &writer,
@@ -185,7 +185,7 @@ async fn a_list_forgets_what_another_process_folded_away() {
 #[tokio::test]
 async fn delete_removes_an_index_and_refuses_a_missing_one() {
     // M9f.2, through the API.
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     put(&api, "gone", true).await;
     put(&api, "kept", true).await;
     fold(&api).await;

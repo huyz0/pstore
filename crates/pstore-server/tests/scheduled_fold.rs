@@ -150,7 +150,7 @@ fn world(servers: u64) -> World {
     let mut apis = Vec::new();
     for lane in 1..=servers {
         let store = Accounted::new(switch.clone());
-        apis.push(Api::new(store.clone(), LaneId(lane)).unwrap());
+        apis.push(Api::unsecured(store.clone(), LaneId(lane)).unwrap());
         stores.push(store);
     }
     World {

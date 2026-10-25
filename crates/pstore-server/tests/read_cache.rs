@@ -136,7 +136,8 @@ async fn a_restarted_server_is_not_a_flush() {
     let store = MemoryStore::new();
     let first = core(&dir).await;
     let api =
-        Api::with_cache(Accounted::new(store.clone()), LaneId(1), Arc::clone(&first)).unwrap();
+        Api::with_cache_unsecured(Accounted::new(store.clone()), LaneId(1), Arc::clone(&first))
+            .unwrap();
     seed(&api).await;
     let mut before = Vec::new();
     for q in queries() {
@@ -145,7 +146,8 @@ async fn a_restarted_server_is_not_a_flush() {
     first.close().await;
 
     let second = core(&dir).await;
-    let api = Api::with_cache(Accounted::new(store), LaneId(1), Arc::clone(&second)).unwrap();
+    let api =
+        Api::with_cache_unsecured(Accounted::new(store), LaneId(1), Arc::clone(&second)).unwrap();
     for ((q, cost), want) in queries_and_warm_cost().iter().zip(before) {
         let (got, reads) = query(&api, q).await;
         assert_eq!(got, want, "{q}");
@@ -161,10 +163,12 @@ async fn a_restarted_server_is_not_a_flush() {
 async fn cached_answers_equal_uncached_ones() {
     let dir = Dir::new("equal");
     let store = MemoryStore::new();
-    let plain = Api::new(Accounted::new(store.clone()), LaneId(2)).unwrap();
+    let plain = Api::unsecured(Accounted::new(store.clone()), LaneId(2)).unwrap();
     seed(&plain).await;
     let c = core(&dir).await;
-    let cached = Api::with_cache(Accounted::new(store.clone()), LaneId(1), Arc::clone(&c)).unwrap();
+    let cached =
+        Api::with_cache_unsecured(Accounted::new(store.clone()), LaneId(1), Arc::clone(&c))
+            .unwrap();
     for q in queries() {
         let want = query(&plain, &q).await.0;
         assert_eq!(query(&cached, &q).await.0, want, "cold {q}");
@@ -172,7 +176,8 @@ async fn cached_answers_equal_uncached_ones() {
     }
     c.close().await;
     let c = core(&dir).await;
-    let cached = Api::with_cache(Accounted::new(store), LaneId(1), Arc::clone(&c)).unwrap();
+    let cached =
+        Api::with_cache_unsecured(Accounted::new(store), LaneId(1), Arc::clone(&c)).unwrap();
     for q in queries() {
         assert_eq!(
             query(&cached, &q).await.0,
@@ -189,7 +194,7 @@ async fn a_hit_is_not_billed() {
     for (q, cost) in queries_and_warm_cost() {
         let dir = Dir::new("billed");
         let c = core(&dir).await;
-        let api = Api::with_cache(
+        let api = Api::with_cache_unsecured(
             Accounted::new(MemoryStore::new()),
             LaneId(1),
             Arc::clone(&c),
@@ -206,7 +211,7 @@ async fn a_hit_is_not_billed() {
 
 #[tokio::test]
 async fn the_uncached_api_repeats_its_reads() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     seed(&api).await;
     for q in queries() {
         let (_, first) = query(&api, &q).await;
@@ -225,7 +230,7 @@ async fn a_server_over_a_bypassed_cache_serves() {
     std::fs::write(&dir.0, b"a file").unwrap();
     let c = core(&dir).await;
     assert!(matches!(c.disk_state(), DiskState::Bypassed(_)));
-    let api = Api::with_cache(Accounted::new(MemoryStore::new()), LaneId(1), c).unwrap();
+    let api = Api::with_cache_unsecured(Accounted::new(MemoryStore::new()), LaneId(1), c).unwrap();
     seed(&api).await;
     assert_eq!(query(&api, &queries()[0]).await.0.len(), 10);
     let _ = std::fs::remove_file(&dir.0);

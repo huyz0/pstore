@@ -97,7 +97,7 @@ async fn settled(api: &A, tenants: std::ops::Range<u64>) {
 
 fn api(cap: usize) -> (Accounted<MemoryStore>, A) {
     let store = Accounted::new(MemoryStore::new());
-    let a = Api::new(store.clone(), LaneId(1)).unwrap();
+    let a = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     a.limit_engines(cap);
     a.set_reaping(true);
     (store, a)
@@ -138,8 +138,8 @@ async fn unflushed_rows_are_never_evicted() {
 fn two() -> (Faulty<MemoryStore>, F, F) {
     let faulty = Faulty::new(MemoryStore::new(), 1, Faults::none());
     let store = Accounted::new(faulty.clone());
-    let a = Api::new(store.clone(), LaneId(1)).unwrap();
-    let other = Api::new(store, LaneId(2)).unwrap();
+    let a = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    let other = Api::unsecured(store, LaneId(2)).unwrap();
     a.limit_engines(1);
     (faulty, a, other)
 }
@@ -274,7 +274,7 @@ async fn the_cap_is_soft_and_a_fruitless_scan_backs_off() {
 async fn eviction_runs_with_fold_and_gc_off() {
     // No reap loop: a reapable commit keeps nothing, so a tenant that committed is evictable.
     let store = Accounted::new(MemoryStore::new());
-    let a = Api::new(store, LaneId(1)).unwrap();
+    let a = Api::unsecured(store, LaneId(1)).unwrap();
     a.limit_engines(1);
     let (fold, _) = now_due();
     for t in 100..103 {
@@ -367,7 +367,7 @@ async fn a_registry_at_its_cap_is_not_scanned() {
 /// `serve_folding` with a cap of 1 over three committed tenants, for three seconds, with `gc`.
 async fn served(gc: Option<GcPolicy>) -> (A, String) {
     let store = Accounted::new(MemoryStore::new());
-    let a = Api::new(store, LaneId(1)).unwrap();
+    let a = Api::unsecured(store, LaneId(1)).unwrap();
     a.limit_engines(1);
     for t in 100..103 {
         write(&a, t, "x", "durable").await;

@@ -28,7 +28,7 @@ fn apis(lanes: &[u64]) -> (Accounted<MemoryStore>, Vec<A>) {
     let store = Accounted::new(MemoryStore::new());
     let apis = lanes
         .iter()
-        .map(|l| Api::new(store.clone(), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(store.clone(), LaneId(*l)).unwrap())
         .collect();
     (store, apis)
 }
@@ -383,7 +383,7 @@ async fn the_analyzer_is_recorded_and_never_shown_as_an_attribute() {
     .await;
     fold(a).await;
     // A new process, reading HEAD cold.
-    let fresh = Api::new(store.clone(), LaneId(9)).unwrap();
+    let fresh = Api::unsecured(store.clone(), LaneId(9)).unwrap();
     assert_eq!(ids(&fresh, "running").await, ["r"]);
     let st = stats(&fresh).await;
     assert_eq!(st["schema"]["full_text_search"]["stemming"], true, "{st}");

@@ -55,13 +55,13 @@ async fn fold(api: &Arc<Api<MemoryStore>>) {
 #[tokio::test]
 async fn a_restart_on_the_same_lane_keeps_every_acknowledged_write() {
     let store = Accounted::new(MemoryStore::new());
-    let before = Api::new(store.clone(), LaneId(1)).unwrap();
+    let before = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     put(&before, "a").await;
     fold(&before).await;
     put(&before, "b").await;
     drop(before);
 
-    let after = Api::new(store, LaneId(1)).unwrap();
+    let after = Api::unsecured(store, LaneId(1)).unwrap();
     put(&after, "c").await;
     fold(&after).await;
     let q = json!({"vector": [1.0, 0.5], "top_k": 10});

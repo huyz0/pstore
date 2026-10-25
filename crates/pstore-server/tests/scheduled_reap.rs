@@ -103,7 +103,7 @@ struct World {
 fn world() -> World {
     let switch = Switch::default();
     let store = Accounted::new(switch.clone());
-    let api = Api::new(store.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     World { switch, store, api }
 }
 
@@ -422,7 +422,7 @@ fn the_lane_recheck_is_half_the_reap_age_on_or_off() {
 #[tokio::test(start_paused = true)]
 async fn the_server_rechecks_within_half_the_reap_age() {
     let store = Accounted::new(MemoryStore::new());
-    let api = Api::new(store.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     api.recheck_lanes_within(Duration::from_secs(30));
     let t = TenantId(39);
     let engine = api.hold_engine_for_test(t).await;

@@ -58,7 +58,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 async fn setup(metric: &str) -> Arc<Api<MemoryStore>> {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     let docs: Vec<Value> = (0..60).map(doc).collect();
     let (s, b) = send(
         &api,

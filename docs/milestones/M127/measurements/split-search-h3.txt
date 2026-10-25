@@ -1,0 +1,26 @@
+
+running 1 test
+peer transport H3, mTLS/MessagePack, provisional
+layout: 48 segments x 2000 rows, dim 64, held [20, 17, 11], built in 1.9 s
+ cpu  dense unsplit: p50     1.58 ms  p95     1.67 ms  parts/query 0.0
+ cpu  dense   split: p50     1.54 ms  p95     1.70 ms  parts/query 2.0
+ cpu  dense   ratio: split/unsplit p50 = 0.97
+ cpu   text unsplit: p50     0.71 ms  p95     0.77 ms  parts/query 0.0
+ cpu   text   split: p50     1.08 ms  p95     1.18 ms  parts/query 2.0
+ cpu   text   ratio: split/unsplit p50 = 1.51
+ cpu hybrid unsplit: p50     1.74 ms  p95     1.89 ms  parts/query 0.0
+ cpu hybrid   split: p50     2.05 ms  p95     2.13 ms  parts/query 2.0
+ cpu hybrid   ratio: split/unsplit p50 = 1.18
+wait  dense unsplit: p50    95.12 ms  p95    96.99 ms  parts/query 0.0
+wait  dense   split: p50    95.10 ms  p95    97.05 ms  parts/query 2.0
+wait  dense   ratio: split/unsplit p50 = 1.00
+wait   text unsplit: p50    92.24 ms  p95    94.14 ms  parts/query 0.0
+test split_bench has been running for over 60 seconds
+wait   text   split: p50    92.99 ms  p95    95.72 ms  parts/query 2.0
+wait   text   ratio: split/unsplit p50 = 1.01
+wait hybrid unsplit: p50    95.85 ms  p95    97.77 ms  parts/query 0.0
+wait hybrid   split: p50    97.22 ms  p95    99.56 ms  parts/query 2.0
+wait hybrid   ratio: split/unsplit p50 = 1.01
+test split_bench ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 92.39s

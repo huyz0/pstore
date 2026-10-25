@@ -1,0 +1,11 @@
+kind,sample,transport,iterations,ns_per_cold_rpc
+cold,0,h2,10,701982.30
+cold,0,h3,10,2155610.40
+cold,1,h3,10,2118775.10
+cold,1,h2,10,640672.60
+cold,2,h2,10,612736.70
+cold,2,h3,10,3242560.20
+cold,3,h3,10,2400630.20
+cold,3,h2,10,646342.40
+cold,4,h2,10,643457.40
+cold,4,h3,10,3299418.20

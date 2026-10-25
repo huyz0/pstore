@@ -1,0 +1,6 @@
+kind,sample,case,iterations,ns_per_refusal
+refusal,0,auto_wrong_ca,1,4828925
+refusal,1,auto_wrong_ca,1,3661051
+refusal,2,auto_wrong_ca,1,3992924
+refusal,3,auto_wrong_ca,1,3233631
+refusal,4,auto_wrong_ca,1,5636686

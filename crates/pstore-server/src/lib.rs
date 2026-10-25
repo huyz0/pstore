@@ -4,10 +4,8 @@
 //! noun, every tradeoff is a client parameter, every response is honest about what it cost
 //! and how fresh it is, and batches are the natural unit.
 //!
-//! ⚠️ **What this is not**, stated here because the alternative is implying otherwise
-//! everywhere: there is **no authentication and no quota**. A tenant is whatever the request
-//! header says it is. `pstore-meter` exists and is not wired. This server is not deployable
-//! to anyone, and M7c's spec says so in one place rather than pretending.
+//! M127 binds tenants and operation scopes to locally verified bearer credentials.
+//! Quotas, TLS termination and deployment isolation remain operator work.
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -29,12 +27,22 @@ const DEFAULT_RETENTION: u64 = 64;
 use std::sync::Arc;
 use types::Schema as SchemaOut;
 
+mod auth;
+pub use auth::{Auth, AuthError};
 mod body;
 mod boost;
 mod diversify;
 mod external;
 mod facets;
 mod highlight;
+mod peer_http;
+pub use peer_http::PeerTransport;
+mod peer_tls;
+mod peer_wire;
+#[cfg(test)]
+#[path = "../tests/support/tls.rs"]
+mod tls_for_tests;
+pub use peer_tls::{PeerListenerConfig, PeerTls};
 mod peers;
 mod replication;
 mod session;
@@ -68,13 +76,13 @@ pub const UNSCHEDULED: [Duty; 4] = [
     },
     Duty {
         id: "tls",
-        instead: "terminate TLS in a reverse proxy in front of this process; the server \
-                  speaks HTTP/1.1 in the clear and will not be given a certificate loader",
+        instead: "terminate public HTTP TLS in a trusted ingress; configure a dedicated \
+                  deployment CA and mTLS identity for HTTP/2 and HTTP/3 peer listeners",
     },
     Duty {
         id: "auth",
-        instead: "authenticate and authorize before the request reaches this process; the \
-                  tenant is whatever the X-Pstore-Tenant header says it is",
+        instead: "configure PSTORE_AUTH_CONFIG and issue scoped credentials; distribute and \
+                  rotate signing keys through the deployment's secret facility",
     },
 ];
 
@@ -112,6 +120,7 @@ type Tenant<S> = Engine<Caching<TenantView<S>>>;
 /// request, and owed no fold or reap.
 #[derive(Debug)]
 pub struct Api<S> {
+    auth: Auth,
     store: Accounted<S>,
     lane: LaneId,
     /// The read cache every tenant's view shares, or `None` for an uncached server (M20).
@@ -139,8 +148,11 @@ pub struct Api<S> {
     replicating: replication::Replicating<S>,
     /// The servers a query's vector legs may run on (M54), or `None` for a single server.
     peers: Mutex<Option<Arc<peers::Cluster>>>,
+    peer_pool: Mutex<Option<Arc<peer_http::Pool>>>,
+    peer_limits: Arc<peer_http::Limits>,
     /// Parts of other servers' queries this one ran (M54).
     parts_served: std::sync::atomic::AtomicU64,
+    parts_completed: [[std::sync::atomic::AtomicU64; 3]; 2],
     /// Parts held between their two phases (M55).
     held: Mutex<peers::Holder>,
     /// Index parameters every engine is built with, when set (M54's tests cluster small
@@ -276,7 +288,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// is anything but `Supported`. **Zero requests**: it reads the profile the store already
     /// carries and probes nothing.
     pub fn new(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None)
+        Self::build(store, lane, None, Auth::closed())
     }
 
     /// [`Api::new`], reading every tenant's segments through `cache` (M20).
@@ -291,13 +303,59 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Arc<CacheCore>,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache))
+        Self::build(store, lane, Some(cache), Auth::closed())
+    }
+
+    /// Builds an HTTP server with an explicit authentication policy.
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_auth(
+        store: Accounted<S>,
+        lane: LaneId,
+        auth: Auth,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, None, auth)
+    }
+
+    /// [`Api::with_auth`] with a shared read cache.
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_cache_and_auth(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Arc<CacheCore>,
+        auth: Auth,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, Some(cache), auth)
+    }
+
+    /// Explicitly anonymous HTTP for private embeddings and test fixtures.
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn unsecured(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, None, Auth::unsecured())
+    }
+
+    /// [`Api::unsecured`] with a shared read cache.
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_cache_unsecured(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Arc<CacheCore>,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, Some(cache), Auth::unsecured())
     }
 
     fn build(
         store: Accounted<S>,
         lane: LaneId,
         cache: Option<Arc<CacheCore>>,
+        auth: Auth,
     ) -> Result<Arc<Self>, StartupError> {
         // ⚠️ `Accounted` is not itself a `BlobStore` — a tenant view is — so the profile is
         // read through one. It is the same underlying backend's, and reading it costs nothing.
@@ -311,6 +369,7 @@ impl<S: BlobStore + 'static> Api<S> {
             });
         }
         Ok(Arc::new(Self {
+            auth,
             store,
             lane,
             cache,
@@ -322,7 +381,12 @@ impl<S: BlobStore + 'static> Api<S> {
             reap_backoff: Mutex::new(HashMap::new()),
             replicating: replication::Replicating::default(),
             peers: Mutex::new(None),
+            peer_pool: Mutex::new(None),
+            peer_limits: Arc::new(peer_http::Limits::default()),
             parts_served: std::sync::atomic::AtomicU64::new(0),
+            parts_completed: std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+            }),
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
             external_prefixes: Mutex::new(None),
@@ -555,58 +619,72 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/v1/indexes", get(list_indexes::<S>))
+        use auth::Scope::{Admin, List, Read, Write};
+        auth::ScopedRouter::new()
+            .route("/v1/indexes", List.on(get(list_indexes::<S>)))
+            .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
                 "/v1/indexes/{index}",
-                get(index_summary::<S>).delete(delete_index::<S>),
+                Write.on(axum::routing::delete(delete_index::<S>)),
             )
-            .route("/v1/indexes/{index}/documents", put(write_documents::<S>))
-            .route("/v1/indexes/{index}/query", post(query_index::<S>))
-            // M54: one share of another server's query.
-            .route("/v1/internal/part", post(peers::serve_part::<S>))
-            .route("/v1/indexes/{index}/warm", post(warm_index::<S>))
+            .route(
+                "/v1/indexes/{index}/documents",
+                Write.on(put(write_documents::<S>)),
+            )
+            .route("/v1/indexes/{index}/query", Read.on(post(query_index::<S>)))
+            .route("/v1/indexes/{index}/warm", Read.on(post(warm_index::<S>)))
             // M86: an external index, over the customer's own object.
             .route(
                 "/v1/indexes/{index}/external",
-                put(external::register::<S>).delete(external::drop_index::<S>),
+                Write.on(put(external::register::<S>).delete(external::drop_index::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/external/query",
-                post(external::query::<S>),
+                Read.on(post(external::query::<S>)),
             )
             // M92: a copy of another external index, codes moved and nothing rebuilt.
             .route(
                 "/v1/indexes/{index}/external/copy",
-                put(external::copy::<S>),
+                Write.on(put(external::copy::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/quarantine",
-                get(export_quarantine::<S>).delete(discard_quarantine::<S>),
+                Read.on(get(export_quarantine::<S>)),
             )
-            .route("/v1/replications", get(replication::list::<S>))
+            .route(
+                "/v1/indexes/{index}/quarantine",
+                Write.on(axum::routing::delete(discard_quarantine::<S>)),
+            )
+            .route("/v1/replications", List.on(get(replication::list::<S>)))
             .route(
                 "/v1/indexes/{index}/replication",
-                put(replication::create::<S>)
-                    .get(replication::status::<S>)
-                    .delete(replication::cancel::<S>),
+                Write.on(put(replication::create::<S>).delete(replication::cancel::<S>)),
+            )
+            .route(
+                "/v1/indexes/{index}/replication",
+                Read.on(get(replication::status::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/replication/pause",
-                post(replication::pause::<S>),
+                Write.on(post(replication::pause::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/replication/resume",
-                post(replication::resume::<S>),
+                Write.on(post(replication::resume::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/schema",
-                axum::routing::patch(patch_schema),
+                Write.on(axum::routing::patch(patch_schema)),
             )
-            .route("/v1/admin/fold", post(fold_tenant::<S>))
-            .route("/v1/admin/gc", post(gc_tenant::<S>))
-            .route("/v1/admin/duties", get(duties))
-            .route("/metrics", get(metrics::<S>))
+            .route("/v1/admin/fold", Admin.on(post(fold_tenant::<S>)))
+            .route("/v1/admin/gc", Admin.on(post(gc_tenant::<S>)))
+            .route("/v1/admin/duties", Admin.on(get(duties)))
+            .route("/metrics", Admin.on(get(metrics::<S>)))
+            .finish()
+            .layer(axum::middleware::from_fn_with_state(
+                self.auth.clone(),
+                auth::authenticate,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&self),
                 count_request::<S>,
@@ -669,12 +747,58 @@ impl<S: BlobStore + 'static> Api<S> {
     /// # Errors
     /// No HTTP client can be built for the peers.
     pub fn set_peers(&self, peers: Option<PeerConfig>) -> Result<(), ConfigError> {
-        let cluster = peers.map(peers::Cluster::new).transpose()?.map(Arc::new);
+        let cluster = peers
+            .map(|config| {
+                let pool = self.peer_pool(config.timeout)?;
+                peers::Cluster::new(config, pool).map(Arc::new)
+            })
+            .transpose()?;
+        if let Some(pool) = self
+            .peer_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            pool.retain(
+                &cluster
+                    .as_ref()
+                    .map(|c| c.list().servers.clone())
+                    .unwrap_or_default(),
+            );
+        }
         *self
             .peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cluster;
         Ok(())
+    }
+
+    fn peer_pool(&self, timeout: std::time::Duration) -> Result<Arc<peer_http::Pool>, ConfigError> {
+        let (tls, mode) = self.auth.peer_tls().ok_or_else(|| {
+            ConfigError::Peers(
+                "PSTORE_PEER_TLS",
+                String::new(),
+                "peer mTLS identity is required",
+            )
+        })?;
+        let mut pool = self
+            .peer_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pool) = pool.as_ref() {
+            return Ok(pool.clone());
+        }
+        let created =
+            peer_http::Pool::with_limits(tls.clone(), *mode, timeout, self.peer_limits.clone())
+                .map_err(|_| {
+                    ConfigError::Peers(
+                        "PSTORE_PEER_TLS",
+                        String::new(),
+                        "valid TLS peer transport and timeout required",
+                    )
+                })?;
+        *pool = Some(created.clone());
+        Ok(created)
     }
 
     /// Builds every engine from now on with `params` (M54's tests: small clustered segments).
@@ -717,11 +841,15 @@ impl<S: BlobStore + 'static> Api<S> {
                 "this server's peers are set already: a static list or gossip, once",
             ));
         }
-        let cluster = Arc::new(peers::Cluster::new(PeerConfig {
-            servers: vec![config.url.clone()],
-            me: 0,
-            timeout: config.timeout,
-        })?);
+        let pool = self.peer_pool(config.timeout)?;
+        let cluster = Arc::new(peers::Cluster::new(
+            PeerConfig {
+                servers: vec![config.url.clone()],
+                me: 0,
+                timeout: config.timeout,
+            },
+            pool,
+        )?);
         let gossip = PeerGossip::start(&config, Arc::clone(&cluster)).await?;
         *self
             .peers
@@ -962,6 +1090,12 @@ impl IntoResponse for ApiError {
         let retry_after = self.retry_after;
         let body = ErrorBody::new(self.code, self.message, self.retryable);
         let mut res = (self.status, axum::Json(body)).into_response();
+        if code == "unauthenticated" {
+            res.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
         if let Some(secs) = retry_after {
             res.headers_mut()
                 .insert(axum::http::header::RETRY_AFTER, secs.into());
@@ -1190,6 +1324,59 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
         "# HELP pstore_peer_servers Servers a query may split across now, this one included.\n\
          # TYPE pstore_peer_servers gauge\npstore_peer_servers {servers}\n"
     ));
+    out.push_str("# HELP pstore_peer_parts_completed_total Successful peer phases by transport.\n# TYPE pstore_peer_parts_completed_total counter\n");
+    let peer_stats = api
+        .peer_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|pool| pool.stats());
+    for (name, value) in [
+        (
+            "pstore_peer_pool_entries",
+            peer_stats.as_ref().map_or(0, |s| s.entries),
+        ),
+        (
+            "pstore_peer_connections",
+            peer_stats
+                .as_ref()
+                .map_or_else(|| api.peer_limits.connections(), |s| s.connections),
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} Current bounded peer transport resources.\n# TYPE {name} gauge\n{name} {value}\n"));
+    }
+    out.push_str("# HELP pstore_peer_connections_created_total Established peer connections by transport.\n# TYPE pstore_peer_connections_created_total counter\n");
+    for (name, count) in [
+        ("h2", peer_stats.as_ref().map_or(0, |s| s.h2)),
+        ("h3", peer_stats.as_ref().map_or(0, |s| s.h3)),
+    ] {
+        out.push_str(&format!(
+            "pstore_peer_connections_created_total{{transport=\"{name}\"}} {count}\n"
+        ));
+    }
+    for (name, value) in [
+        (
+            "pstore_peer_http3_probes_total",
+            peer_stats.as_ref().map_or(0, |s| s.probes),
+        ),
+        (
+            "pstore_peer_transport_fallbacks_total",
+            peer_stats.as_ref().map_or(0, |s| s.fallbacks),
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} Peer transport availability attempts.\n# TYPE {name} counter\n{name} {value}\n"));
+    }
+    for (transport, phases) in ["h2", "h3"].iter().zip(&api.parts_completed) {
+        for (phase, counter) in ["whole", "open", "scan"].iter().zip(phases) {
+            out.push_str(&format!("pstore_peer_parts_completed_total{{transport=\"{transport}\",phase=\"{phase}\"}} {}\n", counter.load(std::sync::atomic::Ordering::Relaxed)));
+        }
+    }
+    let held_now = {
+        let mut held = api.holder();
+        held.sweep(tokio::time::Instant::now());
+        held.len()
+    };
+    out.push_str(&format!("# HELP pstore_peer_parts_held Opened peer parts awaiting scans.\n# TYPE pstore_peer_parts_held gauge\npstore_peer_parts_held {held_now}\n"));
     out.push_str(&format!(
         "# HELP pstore_peer_parts_sent Parts of this server's queries sent to peers (M54).\n\
          # TYPE pstore_peer_parts_sent counter\npstore_peer_parts_sent {sent}\n\
@@ -1234,6 +1421,8 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
 /// ⚠️ A list, so `/metrics` can emit a zero for each: an alert on a series that does not exist
 /// until the first failure is an alert that fires late, if at all.
 const REFUSAL_CODES: &[&str] = &[
+    "unauthenticated",
+    "forbidden",
     "tenant_required",
     "bad_request",
     "unsupported_durability",
@@ -1460,6 +1649,7 @@ async fn write_documents<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(index): Path<String>,
     headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
@@ -1469,6 +1659,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let (mut req, keys) = parse_write(&body)?;
     if let Some(src) = branch_source(&req, keys)? {
+        principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
     }
     let dated = declared_datetimes(&req)?;
@@ -4539,11 +4730,91 @@ pub async fn serve_folding<S: BlobStore + 'static>(
     served
 }
 
-/// Serves until `shutdown` resolves.
+/// Serves dedicated MessagePack peers over mutually authenticated HTTP/2 and HTTP/3.
 ///
-/// ⚠️ Takes a bound listener rather than an address, so a caller — a test, or a supervisor
-/// passing a socket down — decides what it is listening on. Returning on shutdown rather than
-/// being killed is what makes "the process stops cleanly" a thing a test can assert.
+/// # Errors
+/// Missing peer identity, mismatched listener authorities or a transport failure.
+pub async fn serve_peers<S: BlobStore + 'static>(
+    api: Arc<Api<S>>,
+    tcp: tokio::net::TcpListener,
+    udp: std::net::UdpSocket,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
+    let tls = api
+        .auth
+        .peer_tls()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "peer mTLS identity is required",
+            )
+        })?
+        .0
+        .clone();
+    if tcp.local_addr()? != udp.local_addr()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "peer TCP and UDP listeners must share one authority",
+        ));
+    }
+    let limits = api.peer_limits.clone();
+    let handler: peer_http::Handler<peers::Command, peers::Outcome> =
+        Arc::new(move |protocol, request| {
+            let api = api.clone();
+            Box::pin(async move {
+                let phase = match &request.body {
+                    peers::Command::Whole(_) => 0,
+                    peers::Command::Open(_) => 1,
+                    peers::Command::Scan(_) => 2,
+                };
+                let tenant = request
+                    .tenant
+                    .parse::<u128>()
+                    .map(TenantId)
+                    .map_err(|_| ApiError::bad_request("invalid peer tenant"));
+                let result = match tenant {
+                    Ok(tenant) => peers::execute(&api, tenant, request.body).await,
+                    Err(error) => Err(error),
+                };
+                let (status, body) = match result {
+                    Ok(body) => {
+                        let transport = match protocol {
+                            peer_http::Protocol::H2 => 0,
+                            peer_http::Protocol::H3 => 1,
+                        };
+                        if let Some(counter) = api
+                            .parts_completed
+                            .get(transport)
+                            .and_then(|phases| phases.get(phase))
+                        {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        (200, body)
+                    }
+                    Err(error) => (
+                        error.status.as_u16(),
+                        peers::Outcome::Error {
+                            code: error.code.to_owned(),
+                            message: error.message,
+                            retryable: error.retryable,
+                        },
+                    ),
+                };
+                peer_wire::Reply {
+                    version: peer_wire::VERSION,
+                    id: request.id,
+                    status,
+                    body,
+                }
+            })
+        });
+    tokio::select! {
+        result = peer_http::serve_with_limits(tcp, udp, tls, handler, limits) => result.map_err(std::io::Error::other),
+        () = shutdown => Ok(()),
+    }
+}
+
+/// Serves the public API until `shutdown` resolves.
 ///
 /// # Errors
 /// If the server stops with an I/O error.

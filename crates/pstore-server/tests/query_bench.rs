@@ -114,7 +114,7 @@ type Make = fn(&mut Rng) -> Value;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a benchmark: run by scripts/query-bench.sh, in release"]
 async fn query_bench() {
-    let api: Server = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api: Server = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     // Every segment clustered, as at scale: a dense leg reads its centroids, then its lists.
     api.set_index_params_for_test(pstore_index::cluster::Params {
         exact_scan_threshold: 1_000,

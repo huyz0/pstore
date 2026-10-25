@@ -27,7 +27,7 @@ fn apis(lanes: &[u64]) -> Vec<A> {
     let store = Accounted::new(MemoryStore::new());
     lanes
         .iter()
-        .map(|l| Api::new(store.clone(), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(store.clone(), LaneId(*l)).unwrap())
         .collect()
 }
 

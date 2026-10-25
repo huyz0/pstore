@@ -111,7 +111,7 @@ async fn corpus() -> (
     BTreeMap<String, (f64, f64)>,
     BTreeMap<String, i64>,
 ) {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     put(&api, 0..100, &[]).await;
     fold(&api).await;
     put(&api, 100..200, &[]).await;
@@ -309,7 +309,7 @@ async fn geo_decay_scores_by_distance() {
         assert!(moved > 10, "{shape}: only {moved} rows moved");
     }
     // At exactly `scale` meters every shape is one half.
-    let probe = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let probe = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     let there = (0.0, 0.0);
     let d = 1_000_000.0;
     // A point `d` meters along the equator.

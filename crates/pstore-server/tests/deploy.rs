@@ -233,7 +233,7 @@ fn an_unprobed_s3_profile_cannot_fence_and_a_conforming_one_can() {
 /// the gate that compares it against the document.
 #[tokio::test]
 async fn the_duties_endpoint_reports_every_unscheduled_duty() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     let req = Request::builder()
         .uri("/v1/admin/duties")
         .body(Body::empty())

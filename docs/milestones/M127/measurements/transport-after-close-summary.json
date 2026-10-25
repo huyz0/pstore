@@ -1,0 +1,384 @@
+{
+  "auto_cached_h2": {
+    "ns_per_rpc": {
+      "max": 223982.89,
+      "median": 165349.24,
+      "min": 148019.75
+    },
+    "p50_ns": {
+      "max": 131279.0,
+      "median": 117209.0,
+      "min": 105959.0
+    },
+    "p95_ns": {
+      "max": 626671.0,
+      "median": 410418.0,
+      "min": 322836.0
+    },
+    "process_cpu_ticks": {
+      "max": 3.0,
+      "median": 2.0,
+      "min": 2.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "auto_udp_unavailable_cold": {
+    "ns_per_rpc": {
+      "max": 258226651.0,
+      "median": 257294757.0,
+      "min": 256502249.0
+    },
+    "p50_ns": {
+      "max": 258218631.0,
+      "median": 257289740.0,
+      "min": 256497738.0
+    },
+    "p95_ns": {
+      "max": 258218631.0,
+      "median": 257289740.0,
+      "min": 256497738.0
+    },
+    "process_cpu_ticks": {
+      "max": 2.0,
+      "median": 1.0,
+      "min": 1.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "cold": {
+    "h2": {
+      "max": 701982.3,
+      "median": 643457.4,
+      "min": 612736.7
+    },
+    "h3": {
+      "max": 3299418.2,
+      "median": 2400630.2,
+      "min": 2118775.1
+    }
+  },
+  "h2_large": {
+    "ns_per_rpc": {
+      "max": 627498.53,
+      "median": 559723.44,
+      "min": 554173.97
+    },
+    "p50_ns": {
+      "max": 602063.0,
+      "median": 549285.0,
+      "min": 542258.0
+    },
+    "p95_ns": {
+      "max": 764470.0,
+      "median": 645744.0,
+      "min": 591269.0
+    },
+    "process_cpu_ticks": {
+      "max": 2.0,
+      "median": 2.0,
+      "min": 1.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "h2_multiplex": {
+    "ns_per_rpc": {
+      "max": 30802.39,
+      "median": 28553.84,
+      "min": 23862.84
+    },
+    "p50_ns": {
+      "max": 563282.0,
+      "median": 505933.0,
+      "min": 408615.0
+    },
+    "p95_ns": {
+      "max": 1079440.0,
+      "median": 956691.0,
+      "min": 557165.0
+    },
+    "process_cpu_ticks": {
+      "max": 2.0,
+      "median": 2.0,
+      "min": 1.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "h2_warm": {
+    "ns_per_rpc": {
+      "max": 123988.92,
+      "median": 120547.07,
+      "min": 118828.78
+    },
+    "p50_ns": {
+      "max": 120213.0,
+      "median": 118157.0,
+      "min": 116166.0
+    },
+    "p95_ns": {
+      "max": 153604.0,
+      "median": 139325.0,
+      "min": 133527.0
+    },
+    "process_cpu_ticks": {
+      "max": 5.0,
+      "median": 4.0,
+      "min": 4.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "h3_large": {
+    "ns_per_rpc": {
+      "max": 751584.91,
+      "median": 743964.97,
+      "min": 709291.19
+    },
+    "p50_ns": {
+      "max": 741696.0,
+      "median": 731118.0,
+      "min": 696011.0
+    },
+    "p95_ns": {
+      "max": 970917.0,
+      "median": 845411.0,
+      "min": 834804.0
+    },
+    "process_cpu_ticks": {
+      "max": 4.0,
+      "median": 3.0,
+      "min": 3.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "h3_loss_every20": {
+    "ns_per_rpc": {
+      "max": 6919134.53,
+      "median": 6445962.58,
+      "min": 5029969.39
+    },
+    "p50_ns": {
+      "max": 1404586.0,
+      "median": 1338408.0,
+      "min": 1229660.0
+    },
+    "p95_ns": {
+      "max": 29438657.0,
+      "median": 29197949.0,
+      "min": 28673026.0
+    },
+    "process_cpu_ticks": {
+      "max": 19.0,
+      "median": 18.0,
+      "min": 16.0
+    },
+    "udp_bytes": {
+      "max": 1105390.0,
+      "median": 1102999.0,
+      "min": 1100208.0
+    },
+    "udp_dropped": {
+      "max": 64.0,
+      "median": 64.0,
+      "min": 62.0
+    },
+    "udp_packets": {
+      "max": 1287.0,
+      "median": 1285.0,
+      "min": 1256.0
+    }
+  },
+  "h3_multiplex": {
+    "ns_per_rpc": {
+      "max": 38784.15,
+      "median": 36967.52,
+      "min": 35627.8
+    },
+    "p50_ns": {
+      "max": 651121.0,
+      "median": 600872.0,
+      "min": 567134.0
+    },
+    "p95_ns": {
+      "max": 961508.0,
+      "median": 886995.0,
+      "min": 840950.0
+    },
+    "process_cpu_ticks": {
+      "max": 2.0,
+      "median": 2.0,
+      "min": 2.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "h3_relay_control": {
+    "ns_per_rpc": {
+      "max": 162998.6,
+      "median": 151931.6,
+      "min": 151452.84
+    },
+    "p50_ns": {
+      "max": 156820.0,
+      "median": 150154.0,
+      "min": 147645.0
+    },
+    "p95_ns": {
+      "max": 211566.0,
+      "median": 186094.0,
+      "min": 167131.0
+    },
+    "process_cpu_ticks": {
+      "max": 3.0,
+      "median": 2.0,
+      "min": 2.0
+    },
+    "udp_bytes": {
+      "max": 1045201.0,
+      "median": 1044840.0,
+      "min": 1044821.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 1224.0,
+      "median": 1212.0,
+      "min": 1210.0
+    }
+  },
+  "h3_warm": {
+    "ns_per_rpc": {
+      "max": 135893.49,
+      "median": 131945.27,
+      "min": 130753.3
+    },
+    "p50_ns": {
+      "max": 135180.0,
+      "median": 130157.0,
+      "min": 128930.0
+    },
+    "p95_ns": {
+      "max": 162127.0,
+      "median": 151706.0,
+      "min": 147504.0
+    },
+    "process_cpu_ticks": {
+      "max": 5.0,
+      "median": 4.0,
+      "min": 4.0
+    },
+    "udp_bytes": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_dropped": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    },
+    "udp_packets": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  }
+}

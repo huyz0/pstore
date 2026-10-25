@@ -46,7 +46,7 @@ async fn send<S: BlobStore + Clone + 'static>(
 }
 
 fn api() -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
 }
 
 async fn query<S: BlobStore + Clone + 'static>(api: &Arc<Api<S>>, body: &Value) -> Value {
@@ -726,7 +726,7 @@ async fn a_boost_costs_its_window() {
     // which rows the row round reads.
     for (segments, unfolded) in [(1, false), (4, false), (4, true)] {
         let store = DepthCounting::new(MemoryStore::new());
-        let cold = || Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+        let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
         let writer = cold();
         for k in 0..segments {
             write(&writer, k * 10..k * 10 + 10).await;
