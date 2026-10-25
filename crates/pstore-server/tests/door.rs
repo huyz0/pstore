@@ -20,7 +20,7 @@ use tower::ServiceExt;
 
 /// A server over an in-memory store that can fence.
 fn api() -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).expect("a fencing backend")
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).expect("a fencing backend")
 }
 
 async fn send(api: &Arc<Api<MemoryStore>>, req: Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -128,7 +128,7 @@ async fn a_backend_that_cannot_fence_is_refused_before_the_socket_is_bound() {
     // guard a *batched* write to a divergent backend answers 200 -- `Engine::write` calls
     // only `check_storable`, and the fencing guard is at the flush.
     let divergent = pstore_testkit::claims::Claims::divergent_cas("wildcard accepted and ignored");
-    let refused = Api::new(Accounted::new(divergent), LaneId(1));
+    let refused = Api::unsecured(Accounted::new(divergent), LaneId(1));
     assert!(
         refused.is_err(),
         "a backend that cannot fence was allowed to serve"

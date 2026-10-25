@@ -13,10 +13,14 @@ hybrid search — where the blob store is the **only** durable tier, for data *a
 | Blob API discipline | LIST banned on hot paths; writes batched; reads free. |
 
 **Status: building.** 14 crates, ~50k lines of Rust, 802 tests, 36 milestone ledgers.
-**There is a server**: `cargo run -p pstore-server` with `PSTORE_LANE` set answers
+**There is a server**: `cargo run -p pstore-server` with `PSTORE_LANE` and
+`PSTORE_AUTH_CONFIG` set answers
 `PUT /v1/indexes/{id}/documents` and `POST /v1/indexes/{id}/query` over HTTP, and every
-response says what it cost in blob requests and how fresh it is — with no authentication and
-no quota, which [M7c](docs/milestones/M7c/VERIFIED.md) states rather than implies.
+response says what it cost in blob requests and how fresh it is. Signed tenant
+identity and operation scopes are described in the [authentication contract](docs/milestones/M127/AUTH.md).
+Private/test embeddings opt in explicitly with `PSTORE_ALLOW_UNAUTHENTICATED=1`;
+fleet quotas remain unwired. Native peers use mTLS with HTTP/2 or HTTP/3 and
+MessagePack, tracked by [M127 verification](docs/milestones/M127/VERIFIED.md).
 Client-facing contract changes are recorded in the [API migration notes](docs/api-migrations.md).
 ⚠️ **And it runs in a container against a real object store**: `scripts/byoc.sh` brings up
 **two servers on two lanes against one bucket**, and a document written and folded through one

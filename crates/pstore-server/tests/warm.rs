@@ -72,14 +72,14 @@ fn reads(acct: &Accounted<MemoryStore>) -> u64 {
 /// the folds' own reads warmed the cache of the process that made them.
 async fn cached() -> (A, Accounted<MemoryStore>) {
     let acct = Accounted::new(MemoryStore::new());
-    let writer = Api::new(acct.clone(), LaneId(1)).unwrap();
+    let writer = Api::unsecured(acct.clone(), LaneId(1)).unwrap();
     write(&writer, "docs", 0..20).await;
     fold(&writer).await;
     write(&writer, "docs", 20..40).await;
     fold(&writer).await;
     let core = Arc::new(CacheCore::memory(64 << 20));
     (
-        Api::with_cache(acct.clone(), LaneId(2), core).unwrap(),
+        Api::with_cache_unsecured(acct.clone(), LaneId(2), core).unwrap(),
         acct,
     )
 }
@@ -124,7 +124,7 @@ async fn warm_of_a_missing_index_is_404() {
 #[tokio::test]
 async fn warm_without_a_cache_is_409_and_free() {
     let acct = Accounted::new(MemoryStore::new());
-    let api = Api::new(acct.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(acct.clone(), LaneId(1)).unwrap();
     write(&api, "docs", 0..5).await;
     fold(&api).await;
     let before = reads(&acct);

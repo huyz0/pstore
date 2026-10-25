@@ -1,0 +1,78 @@
+{
+  "invalid_signature": {
+    "allocated_bytes": {
+      "max": 6622.0,
+      "median": 6622.0,
+      "min": 6622.0
+    },
+    "allocations": {
+      "max": 52.0,
+      "median": 52.0,
+      "min": 52.0
+    },
+    "ns_per_request": {
+      "max": 3661.15,
+      "median": 3604.79,
+      "min": 3542.67
+    },
+    "reallocations": {
+      "max": 0.0,
+      "median": 0.0,
+      "min": 0.0
+    }
+  },
+  "paired_valid_minus_private_ns": {
+    "median": 2540.7799999999997,
+    "samples": [
+      2588.85,
+      2539.5499999999997,
+      2590.9199999999996,
+      2507.4500000000003,
+      2540.7799999999997
+    ]
+  },
+  "private": {
+    "allocated_bytes": {
+      "max": 7697.0,
+      "median": 7697.0,
+      "min": 7697.0
+    },
+    "allocations": {
+      "max": 48.0,
+      "median": 48.0,
+      "min": 48.0
+    },
+    "ns_per_request": {
+      "max": 3500.87,
+      "median": 3470.39,
+      "min": 3445.23
+    },
+    "reallocations": {
+      "max": 3.0,
+      "median": 3.0,
+      "min": 3.0
+    }
+  },
+  "valid_jwt": {
+    "allocated_bytes": {
+      "max": 9273.0,
+      "median": 9273.0,
+      "min": 9273.0
+    },
+    "allocations": {
+      "max": 66.0,
+      "median": 66.0,
+      "min": 66.0
+    },
+    "ns_per_request": {
+      "max": 6041.65,
+      "median": 6036.15,
+      "min": 5989.13
+    },
+    "reallocations": {
+      "max": 3.0,
+      "median": 3.0,
+      "min": 3.0
+    }
+  }
+}

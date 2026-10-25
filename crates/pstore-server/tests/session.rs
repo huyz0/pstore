@@ -36,7 +36,7 @@ fn apis(lanes: &[u64]) -> Vec<A> {
     let store = Accounted::new(MemoryStore::new());
     lanes
         .iter()
-        .map(|l| Api::new(store.clone(), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(store.clone(), LaneId(*l)).unwrap())
         .collect()
 }
 
@@ -398,8 +398,8 @@ impl BlobStore for Slow {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_of_many_concurrent_durable_writes_is_required_of_another_process() {
     let store = Accounted::new(Slow::default());
-    let a = Api::new(store.clone(), LaneId(1)).unwrap();
-    let b = Api::new(store, LaneId(2)).unwrap();
+    let a = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    let b = Api::unsecured(store, LaneId(2)).unwrap();
     let writes = (0..12).map(|i| {
         let a = Arc::clone(&a);
         tokio::spawn(async move {
@@ -488,10 +488,10 @@ async fn send_any<S: BlobStore>(
 #[tokio::test]
 async fn a_token_is_not_trusted_by_a_restarted_process_on_its_lane() {
     let store = Accounted::new(MemoryStore::new());
-    let before = Api::new(store.clone(), LaneId(1)).unwrap();
+    let before = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     let t = write(&before, "x", true, None).await;
     drop(before);
-    let after = Api::new(store, LaneId(1)).unwrap();
+    let after = Api::unsecured(store, LaneId(1)).unwrap();
     let (s, _, body) = query(&after, &q("session"), Some(&t)).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "not resumed: {body}");
     // Resumed past the token: the predecessor's bundle is in neither HEAD nor memory.

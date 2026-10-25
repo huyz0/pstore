@@ -83,8 +83,8 @@ fn ids(b: &Value) -> Vec<String> {
 fn two() -> (Arc<Api<MemoryStore>>, Arc<Api<MemoryStore>>) {
     let store = Accounted::new(MemoryStore::new());
     (
-        Api::new(store.clone(), LaneId(1)).unwrap(),
-        Api::new(store, LaneId(2)).unwrap(),
+        Api::unsecured(store.clone(), LaneId(1)).unwrap(),
+        Api::unsecured(store, LaneId(2)).unwrap(),
     )
 }
 

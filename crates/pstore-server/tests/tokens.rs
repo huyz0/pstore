@@ -31,7 +31,7 @@ fn world(lanes: &[u64]) -> (Store, Vec<A>) {
     let store = Accounted::new(depth.clone());
     let apis = lanes
         .iter()
-        .map(|l| Api::new(store.clone(), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(store.clone(), LaneId(*l)).unwrap())
         .collect();
     (depth, apis)
 }

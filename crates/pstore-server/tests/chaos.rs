@@ -118,7 +118,7 @@ async fn under_injected_faults_every_answer_is_correct_or_a_refusal() {
                 ..Faults::none()
             },
         );
-        let api: Arc<Api<Store>> = Api::new(Accounted::new(backend), LaneId(1)).unwrap();
+        let api: Arc<Api<Store>> = Api::unsecured(Accounted::new(backend), LaneId(1)).unwrap();
 
         // ⚠️ **Attempted, not acknowledged**, and the difference is a finding this suite made
         // rather than a weakening of it. A `durable` write buffers its rows and then flushes;
@@ -189,7 +189,8 @@ async fn an_acknowledged_document_is_never_missing_under_faults() {
     let mut answered = 0;
     for seed in 0..10u64 {
         let backend = Faulty::new(MemoryStore::new(), seed, Faults::none());
-        let writer: Arc<Api<Store>> = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+        let writer: Arc<Api<Store>> =
+            Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
 
         let mut durable: BTreeSet<String> = BTreeSet::new();
         for i in 0..CORPUS {
@@ -218,7 +219,7 @@ async fn an_acknowledged_document_is_never_missing_under_faults() {
             read_error: 0.05,
             ..Faults::none()
         });
-        let reader: Arc<Api<Store>> = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
+        let reader: Arc<Api<Store>> = Api::unsecured(Accounted::new(backend), LaneId(2)).unwrap();
         let (status, body) = send(&reader, query(0)).await;
         if !status.is_success() {
             assert!(
@@ -253,7 +254,7 @@ async fn a_successful_query_is_never_short() {
     // With the faults lifted, every row is either folded or in this process's memtable, so a
     // successful query must return **all** of them. Nothing here is probabilistic.
     let backend = Faulty::new(MemoryStore::new(), 1, Faults::none());
-    let api: Arc<Api<Store>> = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let api: Arc<Api<Store>> = Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
     let mut sent: BTreeSet<String> = BTreeSet::new();
     for i in 0..CORPUS {
         let (status, _) = send(&api, write(i)).await;

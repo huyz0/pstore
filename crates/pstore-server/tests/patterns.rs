@@ -25,7 +25,7 @@ use tower::ServiceExt;
 type A = Arc<Api<MemoryStore>>;
 
 fn api() -> A {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
 }
 
 async fn send(api: &A, method: &str, uri: &str, body: &Value) -> (StatusCode, Value) {

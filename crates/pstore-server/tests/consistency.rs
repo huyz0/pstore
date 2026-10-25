@@ -153,7 +153,7 @@ fn world(lanes: &[u64]) -> World {
     let mut apis = Vec::new();
     for lane in lanes {
         let store = Accounted::new(depth.clone());
-        apis.push(Api::new(store.clone(), LaneId(*lane)).unwrap());
+        apis.push(Api::unsecured(store.clone(), LaneId(*lane)).unwrap());
         stores.push(store);
     }
     World {
@@ -363,7 +363,7 @@ async fn a_dead_writers_lane_is_not_trusted_after_a_restart() {
         .await
         .unwrap();
     // A second process on lane 1, holding nothing: a restart.
-    let again = Api::new(w.stores[0].clone(), LaneId(1)).unwrap();
+    let again = Api::unsecured(w.stores[0].clone(), LaneId(1)).unwrap();
     let (s, _, body) = query(&again, 104, &relevance(Some("strong"))).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "not_folded");

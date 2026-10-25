@@ -12,7 +12,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | Plan workstream | Improvement | Status / evidence |
 |---|---|---|
 | A | Close native write/query/document envelopes without mutation or I/O on refusal | Verified: [M126 spec](../milestones/M126/SPEC.md), [verification](../milestones/M126/VERIFIED.md) |
-| A | Authenticated tenant identity and admin/internal authorization | Pending |
+| A | Authenticated tenant identity and admin/internal authorization | In progress: [M127 spec](../milestones/M127/SPEC.md), [verification](../milestones/M127/VERIFIED.md) |
 | A | Bounded decoding, memory/concurrency admission, overload responses | Pending |
 | B | Native OpenAPI, generated SDKs and semantic fixtures | Pending |
 | B | Versioned compatibility facade with durable/strong defaults and correct envelopes | Pending |

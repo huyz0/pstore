@@ -151,6 +151,7 @@ pub(crate) async fn copy<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(dest): Path<String>,
     headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::auth::Principal>,
     raw: Bytes,
 ) -> Result<axum::Json<Committed>, ApiError> {
     let tenant = tenant_of(&headers)?;
@@ -163,6 +164,7 @@ pub(crate) async fn copy<S: BlobStore + 'static>(
         ),
     };
     let store = req.store.unwrap_or_default();
+    principal.source(source_tenant, &store)?;
     let Some(from) = api.source_store(tenant, &store) else {
         return Err(ApiError::bad_request(format!(
             "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"

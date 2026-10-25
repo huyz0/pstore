@@ -69,8 +69,8 @@ async fn a_folded_write_is_visible_to_a_second_server() {
     // dense: two processes on one lane both start at sequence zero and overwrite each
     // other's bundles, silently. That is the hazard `PSTORE_LANE` exists to make explicit.
     let backend = MemoryStore::new();
-    let first = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
-    let second = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
+    let first = Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let second = Api::unsecured(Accounted::new(backend), LaneId(2)).unwrap();
 
     let (status, body) = send(&first, write("durable")).await;
     assert_eq!(status, StatusCode::OK);
@@ -114,8 +114,8 @@ async fn a_batched_write_survives_nothing() {
     // policy: a batched write is acknowledged, queryable here, and in no object at all. A
     // fold cannot make durable what was never flushed.
     let backend = MemoryStore::new();
-    let first = Api::new(Accounted::new(backend.clone()), LaneId(1)).unwrap();
-    let second = Api::new(Accounted::new(backend), LaneId(2)).unwrap();
+    let first = Api::unsecured(Accounted::new(backend.clone()), LaneId(1)).unwrap();
+    let second = Api::unsecured(Accounted::new(backend), LaneId(2)).unwrap();
 
     send(&first, write("batched")).await;
     let (status, _) = send(&first, query()).await;
@@ -137,7 +137,7 @@ async fn a_batched_write_survives_nothing() {
 #[tokio::test]
 async fn the_index_list_names_folded_and_unfolded_alike() {
     let backend = MemoryStore::new();
-    let api = Api::new(Accounted::new(backend), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(backend), LaneId(1)).unwrap();
     send(&api, write("batched")).await;
     let list = Request::builder()
         .method("GET")

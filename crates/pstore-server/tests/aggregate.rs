@@ -42,7 +42,7 @@ fn world(lanes: &[u64]) -> World {
     let apis = lanes
         .iter()
         .zip(&stores)
-        .map(|(l, s)| Api::new(s.clone(), LaneId(*l)).unwrap())
+        .map(|(l, s)| Api::unsecured(s.clone(), LaneId(*l)).unwrap())
         .collect();
     World {
         depth,

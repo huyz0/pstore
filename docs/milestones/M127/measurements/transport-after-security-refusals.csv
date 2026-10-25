@@ -1,0 +1,6 @@
+kind,sample,case,attempts,ns_to_refusal
+refusal,0,auto_wrong_ca,1,4322888
+refusal,1,auto_wrong_ca,1,2747559
+refusal,2,auto_wrong_ca,1,4273866
+refusal,3,auto_wrong_ca,1,2131800
+refusal,4,auto_wrong_ca,1,4884954

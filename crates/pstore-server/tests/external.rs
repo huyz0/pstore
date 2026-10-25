@@ -27,7 +27,7 @@ type A = Arc<Api<MemoryStore>>;
 /// A server whose store holds the customer's file, with the sources off unless `prefixes`.
 async fn api(prefixes: Option<&[&str]>) -> (A, Accounted<MemoryStore>) {
     let store = Accounted::new(MemoryStore::new());
-    let api = Api::new(store.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     if let Some(p) = prefixes {
         api.allow_external_sources(p.iter().map(|s| (*s).to_owned()).collect());
     }

@@ -25,7 +25,9 @@ use pstore_blob::{
     Accounted, BlobError, BlobStore, Capabilities, CasError, Class, Key, MemoryStore, Precondition,
     PutOutcome,
 };
-use pstore_server::{Api, PeerConfig};
+use pstore_server::{Api, Auth, PeerConfig, PeerTls, PeerTransport};
+#[path = "support/tls.rs"]
+mod tls_fixture;
 use pstore_types::{CasTag, LaneId};
 use serde_json::{Value, json};
 use std::ops::Range;
@@ -40,6 +42,34 @@ const DIM: usize = 64;
 const WARM: usize = 5;
 const RUNS: usize = 100;
 const WAIT_MS: u64 = 20;
+
+fn transport() -> PeerTransport {
+    match std::env::var("PSTORE_SPLIT_TRANSPORT")
+        .as_deref()
+        .unwrap_or("h2")
+    {
+        "h2" => PeerTransport::H2,
+        "h3" => PeerTransport::H3,
+        other => panic!("unknown benchmark transport {other}"),
+    }
+}
+
+fn auth() -> Auth {
+    static IDENTITY: std::sync::OnceLock<PeerTls> = std::sync::OnceLock::new();
+    let tls = IDENTITY.get_or_init(|| {
+        let ca = tls_fixture::Authority::new();
+        let material = ca.issue(&["127.0.0.1"], false);
+        PeerTls::from_pem(
+            material.ca.as_bytes(),
+            material.cert.as_bytes(),
+            material.key.as_bytes(),
+        )
+        .unwrap()
+    });
+    Auth::from_vars(|key| (key == "PSTORE_ALLOW_UNAUTHENTICATED").then(|| "1".to_owned()))
+        .unwrap()
+        .with_peer_tls(tls.clone(), transport())
+}
 
 /// The shared store, as one server sees it: waiting `delay_ms` before every read.
 #[derive(Debug, Clone)]
@@ -146,14 +176,14 @@ async fn start(store: &MemoryStore, lane: u64) -> (Server, tokio::net::TcpListen
         inner: store.clone(),
         delay_ms: Arc::default(),
     };
-    let api = Api::new(Accounted::new(view.clone()), LaneId(lane)).unwrap();
+    let api = Api::with_auth(Accounted::new(view.clone()), LaneId(lane), auth()).unwrap();
     // Every segment clustered, as at scale: a dense leg reads its centroids, then its lists.
     api.set_index_params_for_test(pstore_index::cluster::Params {
         exact_scan_threshold: 1_000,
         ..pstore_index::cluster::Params::default()
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let url = format!("https://{}", listener.local_addr().unwrap());
     (
         Server {
             api,
@@ -244,6 +274,10 @@ fn percentile(sorted: &[Duration], p: usize) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a benchmark: run by scripts/split-bench.sh, in release"]
 async fn split_bench() {
+    println!(
+        "peer transport {:?}, mTLS/MessagePack, provisional",
+        transport()
+    );
     let store = MemoryStore::new();
     let mut servers = Vec::new();
     let mut listeners = Vec::new();
@@ -263,9 +297,11 @@ async fn split_bench() {
             .unwrap();
     }
     for (s, l) in servers.iter().zip(listeners) {
-        tokio::spawn(pstore_server::serve(
+        let udp = std::net::UdpSocket::bind(l.local_addr().unwrap()).unwrap();
+        tokio::spawn(pstore_server::serve_peers(
             Arc::clone(&s.api),
             l,
+            udp,
             std::future::pending(),
         ));
     }
@@ -352,6 +388,7 @@ async fn split_bench() {
                 .enumerate()
             {
                 let sent = metric(api, "pstore_peer_parts_sent").await;
+                let failed = metric(api, "pstore_peer_parts_failed").await;
                 let mut took = Vec::with_capacity(RUNS);
                 for (n, q) in queries.iter().enumerate() {
                     let started = Instant::now();
@@ -372,6 +409,11 @@ async fn split_bench() {
                     }
                 }
                 took.sort();
+                assert_eq!(
+                    metric(api, "pstore_peer_parts_failed").await,
+                    failed,
+                    "benchmark must measure remote work rather than local fallback"
+                );
                 let parts = (metric(api, "pstore_peer_parts_sent").await - sent) as f64
                     / (WARM + RUNS) as f64;
                 p50[l] = percentile(&took, 50);

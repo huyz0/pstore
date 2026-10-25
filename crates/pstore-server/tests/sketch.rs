@@ -27,7 +27,7 @@ fn apis(lanes: &[u64]) -> (Accounted<MemoryStore>, Vec<A>) {
     let store = Accounted::new(MemoryStore::new());
     let apis = lanes
         .iter()
-        .map(|l| Api::new(store.clone(), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(store.clone(), LaneId(*l)).unwrap())
         .collect();
     (store, apis)
 }
@@ -299,7 +299,7 @@ async fn a_declaration_is_fixed_when_its_index_is_created() {
     assert_eq!(s, StatusCode::OK, "{b}");
     fold(a).await;
     // A new process sees the set.
-    let fresh = Api::new(store.clone(), LaneId(9)).unwrap();
+    let fresh = Api::unsecured(store.clone(), LaneId(9)).unwrap();
     let (s, b) = send(&fresh, "GET", "/v1/indexes/docs", &json!({})).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["schema"]["regex"], json!(["s"]), "{b}");

@@ -21,7 +21,7 @@ const TENANT: TenantId = TenantId(9);
 
 fn api() -> (Arc<Api<MemoryStore>>, Accounted<MemoryStore>) {
     let store = Accounted::new(MemoryStore::new());
-    let api = Api::new(store.clone(), LaneId(1)).unwrap();
+    let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
     (api, store)
 }
 

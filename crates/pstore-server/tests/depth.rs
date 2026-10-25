@@ -73,7 +73,7 @@ async fn depth_at(segments: usize) -> (usize, usize) {
     // `DepthCounting` is `Clone` and shares its counters, so the handle the test keeps and
     // the one the server writes through are the same meter.
     let store = DepthCounting::new(MemoryStore::new());
-    let api = Api::new(pstore_blob::Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let api = Api::unsecured(pstore_blob::Accounted::new(store.clone()), LaneId(1)).unwrap();
     for i in 0..segments {
         send(&api, write(i)).await;
         send(&api, fold()).await;

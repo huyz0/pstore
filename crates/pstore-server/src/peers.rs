@@ -1,7 +1,7 @@
 //! One index searched by several servers at once (M54).
 //!
 //! A server with peers sends each folded segment's dense and sparse legs to the server
-//! [`pstore_engine::assign`] gives it, over `POST /v1/internal/part`, and merges what comes
+//! [`pstore_engine::assign`] gives it, over the mTLS MessagePack peer transport, and merges what comes
 //! back exactly as it merges its own segments. The per-segment work is
 //! [`pstore_query::part`] on both sides, so the split answer is the single-server one.
 //!
@@ -12,10 +12,8 @@
 //! ⚠️ **Nothing here decides an answer.** A part that fails, for any reason, is run by the
 //! coordinator itself: a peer costs rounds, never answers.
 
-use crate::{Api, ApiError, ConfigError, predicate, tenant_of};
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use crate::{Api, ApiError, ConfigError, predicate};
+use axum::http::StatusCode;
 use pstore_blob::{BlobStore, Key};
 use pstore_engine::{Part, Peers, Phased};
 use pstore_index::text::Stats;
@@ -72,8 +70,8 @@ impl PeerConfig {
     /// Either variable without the other, this server absent from the list, a URL named
     /// twice, or a timeout that is not a positive number of milliseconds.
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
-        let refuse = |var: &'static str, v: &str, why: &'static str| {
-            ConfigError::Peers(var, v.to_owned(), why)
+        let refuse = |var: &'static str, _v: &str, why: &'static str| {
+            ConfigError::Peers(var, String::new(), why)
         };
         let timeout = timeout_of(&get)?;
         let (list, me) = match (get("PSTORE_PEERS"), get("PSTORE_PEER_SELF")) {
@@ -101,13 +99,11 @@ impl PeerConfig {
             .map(|s| s.trim().trim_end_matches('/').to_owned())
             .filter(|s| !s.is_empty())
             .collect();
-        // ⚠️ Plain HTTP only (code review): this build's client has no TLS, so an `https://`
-        // peer would fail every part at run time, counted, instead of here.
         if let Some(bad) = servers.iter().find(|s| peer_url(s).is_none()) {
             return Err(refuse(
                 "PSTORE_PEERS",
                 bad,
-                "each server is http://host:port: no TLS, no path",
+                "each server must be an HTTPS authority without credentials or a path",
             ));
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -145,12 +141,10 @@ fn timeout_of(get: &impl Fn(&str) -> Option<String>) -> Result<Duration, ConfigE
     }
 }
 
-/// `s` as a server's URL, `http://host:port` without a trailing `/`; `None` for anything else
+/// `s` as a canonical HTTPS peer authority; `None` for anything else
 /// (M54's rule, and M56's filter on a member's zone).
 fn peer_url(s: &str) -> Option<String> {
-    let s = s.trim().trim_end_matches('/');
-    let rest = s.strip_prefix("http://")?;
-    (!rest.is_empty() && !rest.contains('/')).then(|| s.to_owned())
+    crate::peer_http::Pool::canonical(s.trim()).ok()
 }
 
 /// A server's peers from a SWIM membership of its own (M56): `PSTORE_PEER_SELF` and the
@@ -181,8 +175,8 @@ impl GossipConfig {
     /// gossip variable without `PSTORE_PEER_GOSSIP_ADDR`, an address that is not an IP literal
     /// with a port, an unroutable advertise address, a bad period, and the key's refusals.
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
-        let refuse = |var: &'static str, v: &str, why: &'static str| {
-            ConfigError::Peers(var, v.to_owned(), why)
+        let refuse = |var: &'static str, _v: &str, why: &'static str| {
+            ConfigError::Peers(var, String::new(), why)
         };
         let Some(listen) = get("PSTORE_PEER_GOSSIP_ADDR") else {
             for var in [
@@ -214,7 +208,7 @@ impl GossipConfig {
             refuse(
                 "PSTORE_PEER_SELF",
                 &url,
-                "this server is http://host:port: no TLS, no path",
+                "this server must be an HTTPS authority without credentials or a path",
             )
         })?;
         // ⚠️ IP literals only (spec review): a member first heard by probe is held at its
@@ -389,13 +383,21 @@ impl std::fmt::Debug for PeerGossip {
 }
 
 /// The peers, a client to reach them, and what `GET /metrics` reports of them.
-#[derive(Debug)]
 pub(crate) struct Cluster {
     /// Swapped by the membership refresh (M56); a static list never moves.
     list: std::sync::RwLock<Arc<List>>,
-    client: reqwest::Client,
+    pool: Arc<crate::peer_http::Pool>,
+    timeout: Duration,
     pub(crate) sent: AtomicU64,
     pub(crate) failed: AtomicU64,
+}
+
+impl std::fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cluster")
+            .field("list", &self.list())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cluster {
@@ -404,16 +406,23 @@ impl Cluster {
     /// ⚠️ **Refused, never defaulted** (code review): a default client has no timeout, and a
     /// hung peer would then hang the query -- rule 5 rests on the timeout. And no proxy: peer
     /// traffic stays on the deployment's network whatever `HTTP_PROXY` says for blob egress.
-    pub(crate) fn new(config: PeerConfig) -> Result<Self, ConfigError> {
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .no_proxy()
-            .build()
-            .map_err(|e| {
-                ConfigError::Peers("PSTORE_PEERS", e.to_string(), "no HTTP client for peers")
-            })?;
+    pub(crate) fn new(
+        config: PeerConfig,
+        pool: Arc<crate::peer_http::Pool>,
+    ) -> Result<Self, ConfigError> {
+        if config.timeout.is_zero()
+            || config.me >= config.servers.len()
+            || config.servers.iter().any(|url| peer_url(url).is_none())
+        {
+            return Err(ConfigError::Peers(
+                "PSTORE_PEERS",
+                String::new(),
+                "valid HTTPS peers, self position and positive timeout required",
+            ));
+        }
         Ok(Self {
-            client,
+            pool,
+            timeout: config.timeout,
             list: std::sync::RwLock::new(Arc::new(List {
                 servers: config.servers,
                 me: config.me,
@@ -435,6 +444,7 @@ impl Cluster {
 
     /// Replaces the list (M56). The client and the counters stay.
     pub(crate) fn set_list(&self, list: List) {
+        self.pool.retain(&list.servers);
         *self
             .list
             .write()
@@ -467,12 +477,8 @@ impl Peers for QueryPeers {
         part: Part,
     ) -> futures_util::future::BoxFuture<'static, Result<PartHits, String>> {
         let cluster = Arc::clone(&self.cluster);
-        let url = self
-            .list
-            .servers
-            .get(server)
-            .map(|s| format!("{s}/v1/internal/part"));
-        let body = serde_json::to_vec(&WirePart::of(&part, self.filters.clone()));
+        let url = self.list.servers.get(server).cloned();
+        let body = Command::Whole(WirePart::of(&part, self.filters.clone()));
         let tenant = self.tenant;
         Box::pin(async move {
             cluster.sent.fetch_add(1, Ordering::Relaxed);
@@ -489,8 +495,8 @@ impl Peers for QueryPeers {
     fn phased(&self, server: usize, part: Part) -> Phased {
         let cluster = Arc::clone(&self.cluster);
         let base = self.list.servers.get(server).cloned();
-        let url = base.as_ref().map(|s| format!("{s}/v1/internal/part"));
-        let body = serde_json::to_vec(&WirePart::opening(&part, self.filters.clone()));
+        let url = base;
+        let body = Command::Open(WirePart::opening(&part, self.filters.clone()));
         let tenant = self.tenant;
         let index = part.index.clone();
         let sum_part = part.sum.is_some();
@@ -538,7 +544,7 @@ impl Peers for QueryPeers {
                     .take();
                 let got = match id {
                     Some(id) => {
-                        let body = serde_json::to_vec(&WireScan {
+                        let body = Command::Scan(WireScan {
                             protocol: if sum_part { SUMMED } else { PHASED },
                             phase: "scan".to_owned(),
                             id,
@@ -571,36 +577,20 @@ impl Failure {
 async fn open(
     cluster: &Cluster,
     url: Option<String>,
-    body: Result<Vec<u8>, serde_json::Error>,
+    body: Command,
     tenant: TenantId,
 ) -> Result<(String, Stats), Failure> {
     let url = url.ok_or_else(|| Failure::Counted("no such server".to_owned()))?;
-    let body = body.map_err(|e| Failure::Counted(e.to_string()))?;
-    let res = cluster
-        .client
-        .post(url)
-        .header("x-pstore-tenant", tenant.0.to_string())
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
+    let res: crate::peer_wire::Reply<Outcome> = cluster
+        .pool
+        .call_with_timeout(&url, tenant, body, cluster.timeout)
         .await
         .map_err(|e| Failure::Counted(e.to_string()))?;
-    let status = res.status().as_u16();
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| Failure::Counted(e.to_string()))?;
-    match status {
-        200 => {
-            let wire: WireOpened =
-                serde_json::from_slice(&bytes).map_err(|e| Failure::Counted(e.to_string()))?;
-            Ok((wire.id, wire.stats.stats()))
-        }
-        422 => Err(Failure::Query(String::from_utf8_lossy(&bytes).into_owned())),
-        s => Err(Failure::Counted(format!(
-            "{s}: {}",
-            String::from_utf8_lossy(&bytes)
-        ))),
+    match (res.status, res.body) {
+        (200, Outcome::Opened(wire)) => Ok((wire.id, wire.stats.stats())),
+        (422, Outcome::Error { message, .. }) => Err(Failure::Query(message)),
+        (_, Outcome::Error { message, .. }) => Err(Failure::Counted(message)),
+        _ => Err(Failure::Counted("invalid open reply".to_owned())),
     }
 }
 
@@ -616,47 +606,49 @@ enum Failure {
 async fn send(
     cluster: &Cluster,
     url: Option<String>,
-    body: Result<Vec<u8>, serde_json::Error>,
+    body: Command,
     tenant: TenantId,
     part: &Part,
 ) -> Result<PartHits, Failure> {
     let url = url.ok_or_else(|| Failure::Counted("no such server".to_owned()))?;
-    let body = body.map_err(|e| Failure::Counted(e.to_string()))?;
-    let res = cluster
-        .client
-        .post(url)
-        .header("x-pstore-tenant", tenant.0.to_string())
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
+    let res: crate::peer_wire::Reply<Outcome> = cluster
+        .pool
+        .call_with_timeout(&url, tenant, body, cluster.timeout)
         .await
         .map_err(|e| Failure::Counted(e.to_string()))?;
-    let status = res.status().as_u16();
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| Failure::Counted(e.to_string()))?;
-    match status {
-        200 => {
-            let wire: WireHits =
-                serde_json::from_slice(&bytes).map_err(|e| Failure::Counted(e.to_string()))?;
-            wire.hits(part).ok_or_else(|| {
-                Failure::Counted("a part answered for a segment or leg it was not given".into())
-            })
-        }
-        422 => Err(Failure::Query(String::from_utf8_lossy(&bytes).into_owned())),
-        s => Err(Failure::Counted(format!(
-            "{s}: {}",
-            String::from_utf8_lossy(&bytes)
-        ))),
+    match (res.status, res.body) {
+        (200, Outcome::Hits(wire)) => wire.hits(part).ok_or_else(|| {
+            Failure::Counted("a part answered for a segment or leg it was not given".into())
+        }),
+        (422, Outcome::Error { message, .. }) => Err(Failure::Query(message)),
+        (_, Outcome::Error { message, .. }) => Err(Failure::Counted(message)),
+        _ => Err(Failure::Counted("invalid hits reply".to_owned())),
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Command {
+    Whole(WirePart),
+    Open(WirePart),
+    Scan(WireScan),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Outcome {
+    Hits(WireHits),
+    Opened(WireOpened),
+    Error {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// A part on the wire. Floats travel as their bits: the coordinator merges a peer's scores
 /// with its own and breaks ties on them, so a decimal round trip that moved one would move
 /// the answer.
 #[derive(Debug, Serialize, Deserialize)]
-struct WirePart {
+pub(crate) struct WirePart {
     protocol: u32,
     /// `"open"` for phase 1 of a phased part (M55); absent for a part in one exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -701,7 +693,7 @@ impl WireSum {
 
 /// Phase 2 of a phased part (M55).
 #[derive(Debug, Serialize, Deserialize)]
-struct WireScan {
+pub(crate) struct WireScan {
     protocol: u32,
     phase: String,
     id: String,
@@ -737,7 +729,7 @@ impl WireStats {
 
 /// What phase 1 answers (M55).
 #[derive(Debug, Serialize, Deserialize)]
-struct WireOpened {
+pub(crate) struct WireOpened {
     id: String,
     stats: WireStats,
 }
@@ -809,7 +801,7 @@ type WireShare = (usize, usize, Vec<(usize, u32)>);
 
 /// A part's hits.
 #[derive(Debug, Serialize, Deserialize)]
-struct WireHits {
+pub(crate) struct WireHits {
     hits: Vec<WireShare>,
 }
 
@@ -1206,45 +1198,38 @@ fn part_error(e: &pstore_query::QueryError) -> ApiError {
     }
 }
 
-/// `POST /v1/internal/part`: runs one share of another server's query (M54), or one phase of
-/// it (M55).
-pub(crate) async fn serve_part<S: BlobStore + 'static>(
-    State(api): State<Arc<Api<S>>>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Response, ApiError> {
-    let tenant = tenant_of(&headers)?;
-    // ⚠️ M120: a part with no key repeated, which the tree's parse accepts ([`crate::body`]),
-    // is dispatched by a probe and parsed once into its type; any other goes the tree's way.
-    // A tree held each integer of each query vector as a 32-byte node, then was walked again.
-    let raw = match crate::body::plain(&body).filter(|p| p.keys.is_some()) {
-        Some(p) => Body::Plain(&body, p.heading),
-        None => Body::Tree(
-            serde_json::from_slice(&body)
-                .map_err(|e| ApiError::bad_request(format!("malformed part: {e}")))?,
-        ),
-    };
-    let (protocol, phase) = heading(&raw)?;
-    match (protocol, phase.as_deref()) {
-        (Some(p), None) if p == u64::from(PROTOCOL) => serve_whole(&api, tenant, raw).await,
-        (Some(p), Some("open")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
-            serve_open(&api, tenant, raw).await
-        }
-        (Some(p), Some("scan")) if p == u64::from(PHASED) || p == u64::from(SUMMED) => {
-            serve_scan(&api, tenant, raw).await
-        }
-        _ => Err(ApiError::new(
+/// Execute a typed command after transport authentication and frame validation.
+pub(crate) async fn execute<S: BlobStore + 'static>(
+    api: &Arc<Api<S>>,
+    tenant: TenantId,
+    command: Command,
+) -> Result<Outcome, ApiError> {
+    let mismatch = || {
+        ApiError::new(
             StatusCode::CONFLICT,
             "protocol_mismatch",
-            format!(
-                "this server speaks part protocols {PROTOCOL}, and {PHASED} and {SUMMED} (open, \
-                 scan), not {protocol:?} {phase:?}"
-            ),
-        )),
+            "unsupported peer part protocol or phase",
+        )
+    };
+    match command {
+        Command::Whole(wire) if wire.protocol == PROTOCOL && wire.phase.is_none() => {
+            serve_whole(api, tenant, wire).await.map(Outcome::Hits)
+        }
+        Command::Open(wire)
+            if matches!(wire.protocol, PHASED | SUMMED)
+                && wire.phase.as_deref() == Some("open") =>
+        {
+            serve_open(api, tenant, wire).await.map(Outcome::Opened)
+        }
+        Command::Scan(wire) if matches!(wire.protocol, PHASED | SUMMED) && wire.phase == "scan" => {
+            serve_scan(api, tenant, wire).await.map(Outcome::Hits)
+        }
+        _ => Err(mismatch()),
     }
 }
 
 /// A part's protocol and phase, read as the tree's `get`s read them.
+#[cfg(test)]
 fn heading(raw: &Body<'_>) -> Result<(Option<u64>, Option<String>), ApiError> {
     Ok(match raw {
         Body::Tree(raw) => (
@@ -1259,11 +1244,13 @@ fn heading(raw: &Body<'_>) -> Result<(Option<u64>, Option<String>), ApiError> {
 }
 
 /// A part's body: plain, to parse once, or the tree the rest are judged by (M120).
+#[cfg(test)]
 enum Body<'a> {
     Plain(&'a [u8], crate::body::Heading),
     Tree(serde_json::Value),
 }
 
+#[cfg(test)]
 fn wire_of<T: serde::de::DeserializeOwned>(raw: Body<'_>) -> Result<T, ApiError> {
     let tree = match raw {
         Body::Tree(v) => v,
@@ -1281,9 +1268,8 @@ fn wire_of<T: serde::de::DeserializeOwned>(raw: Body<'_>) -> Result<T, ApiError>
 async fn serve_whole<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: Body<'_>,
-) -> Result<Response, ApiError> {
-    let wire: WirePart = wire_of(raw)?;
+    wire: WirePart,
+) -> Result<WireHits, ApiError> {
     guard(tenant, &wire)?;
     // M58 (code review): a cut by sum is protocol 3's alone, never one exchange's.
     if wire.sum.is_some() {
@@ -1307,7 +1293,7 @@ async fn serve_whole<S: BlobStore + 'static>(
     engine
         .part(&part, filter.as_ref())
         .await
-        .map(|hits| axum::Json(WireHits::of(&hits)).into_response())
+        .map(|hits| WireHits::of(&hits))
         .map_err(|e| part_error(&e))
 }
 
@@ -1315,9 +1301,8 @@ async fn serve_whole<S: BlobStore + 'static>(
 async fn serve_open<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: Body<'_>,
-) -> Result<Response, ApiError> {
-    let wire: WirePart = wire_of(raw)?;
+    wire: WirePart,
+) -> Result<WireOpened, ApiError> {
     guard(tenant, &wire)?;
     // M58: a cut by sum is protocol 3's, and protocol 3 is a cut by sum. `WirePart` ignores a
     // field it does not know, so nothing else would refuse a `sum` sent at 2.
@@ -1354,20 +1339,18 @@ async fn serve_open<S: BlobStore + 'static>(
                 "this part is larger than the bytes a server holds between phases",
             )
         })?;
-    Ok(axum::Json(WireOpened {
+    Ok(WireOpened {
         id,
         stats: WireStats::of(&stats),
     })
-    .into_response())
 }
 
 /// Phase 2 of a phased part (M55): the held part, scanned against the global statistics.
 async fn serve_scan<S: BlobStore + 'static>(
     api: &Arc<Api<S>>,
     tenant: TenantId,
-    raw: Body<'_>,
-) -> Result<Response, ApiError> {
-    let wire: WireScan = wire_of(raw)?;
+    wire: WireScan,
+) -> Result<WireHits, ApiError> {
     let held = api
         .holder()
         .take(tokio::time::Instant::now(), &wire.id, tenant, &wire.index)
@@ -1391,7 +1374,7 @@ async fn serve_scan<S: BlobStore + 'static>(
     engine
         .scan_part(&held.part, &held.open, filter.as_ref(), &wire.stats.stats())
         .await
-        .map(|hits| axum::Json(WireHits::of(&hits)).into_response())
+        .map(|hits| WireHits::of(&hits))
         .map_err(|e| part_error(&e))
 }
 
@@ -1521,7 +1504,6 @@ impl Holder {
     }
 
     /// Parts held now.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.parts.len()
     }
@@ -1870,12 +1852,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_phase_says_why() {
+        let ca = crate::tls_for_tests::Authority::new();
+        let material = ca.issue(&["localhost"], false);
+        let tls = crate::PeerTls::from_pem(
+            material.ca.as_bytes(),
+            material.cert.as_bytes(),
+            material.key.as_bytes(),
+        )
+        .unwrap();
+        let pool =
+            crate::peer_http::Pool::new(tls, crate::PeerTransport::H2, Duration::from_secs(1))
+                .unwrap();
         let cluster = Arc::new(
-            Cluster::new(PeerConfig {
-                servers: vec!["http://127.0.0.1:1".to_owned()],
-                me: 0,
-                timeout: Duration::from_secs(1),
-            })
+            Cluster::new(
+                PeerConfig {
+                    servers: vec!["https://127.0.0.1:1".to_owned()],
+                    me: 0,
+                    timeout: Duration::from_secs(1),
+                },
+                pool,
+            )
             .unwrap(),
         );
         let peers = QueryPeers {

@@ -52,8 +52,8 @@ async fn put(api: &A, id: &str, text: &str, fts: Value) {
 /// Two processes, each creating `docs` under its own analyzer; one fold rejects one row.
 async fn rejected() -> (A, A) {
     let store = Accounted::new(MemoryStore::new());
-    let a = Api::new(store.clone(), LaneId(1)).unwrap();
-    let b = Api::new(store, LaneId(2)).unwrap();
+    let a = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    let b = Api::unsecured(store, LaneId(2)).unwrap();
     put(&a, "r", "he runs daily", json!({"stemming": true})).await;
     put(&b, "s", "she runs daily", json!({"case_sensitive": true})).await;
     let (s, body) = send(&a, "POST", "/v1/admin/fold", &json!({})).await;

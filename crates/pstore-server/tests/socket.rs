@@ -39,7 +39,7 @@ async fn request(addr: std::net::SocketAddr, head: &str, body: &str) -> (String,
 
 #[tokio::test]
 async fn the_server_answers_over_a_real_socket() {
-    let api = Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    let api = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

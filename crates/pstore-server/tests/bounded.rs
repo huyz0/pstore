@@ -34,7 +34,7 @@ fn world(lanes: &[u64]) -> World {
     let depth = DepthCounting::new(MemoryStore::new());
     let apis = lanes
         .iter()
-        .map(|l| Api::new(Accounted::new(depth.clone()), LaneId(*l)).unwrap())
+        .map(|l| Api::unsecured(Accounted::new(depth.clone()), LaneId(*l)).unwrap())
         .collect();
     World { depth, apis }
 }

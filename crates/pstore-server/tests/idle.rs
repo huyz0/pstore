@@ -89,7 +89,7 @@ async fn fold(api: &Arc<Api<MemoryStore>>) {
 /// tenants with two indexes each.
 async fn seeded(siblings: usize, others: u64) -> MemoryStore {
     let store = MemoryStore::new();
-    let writer = Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let writer = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     put(&writer, A, SERVED, 50).await;
     for s in 0..siblings {
         put(&writer, A, &format!("sib{s}"), 3).await;
@@ -204,7 +204,7 @@ async fn serve(store: &MemoryStore, also: Option<(u64, &str)>) -> Served {
         inner: store.clone(),
         keys: Arc::default(),
     };
-    let node = Api::with_cache(
+    let node = Api::with_cache_unsecured(
         Accounted::new(touched.clone()),
         LaneId(2),
         Arc::clone(&core),

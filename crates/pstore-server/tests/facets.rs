@@ -40,7 +40,7 @@ async fn send<S: BlobStore + Clone + 'static>(
 }
 
 fn api() -> Arc<Api<MemoryStore>> {
-    Api::new(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
+    Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap()
 }
 
 async fn query<S: BlobStore + Clone + 'static>(api: &Arc<Api<S>>, q: &Value) -> Value {
@@ -220,7 +220,7 @@ async fn facets_ride_beside_the_ranking() {
     use pstore_testkit::depth::DepthCounting;
     for (segments, unfolded) in [(1, false), (1, true), (4, false), (4, true)] {
         let store = DepthCounting::new(MemoryStore::new());
-        let cold = || Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+        let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
         let writer = cold();
         for k in 0..segments {
             write(&writer, k * 10..k * 10 + 10).await;
@@ -257,14 +257,14 @@ async fn facets_ride_beside_the_ranking() {
 #[tokio::test]
 async fn facets_honour_the_consistency_level() {
     let store = MemoryStore::new();
-    let a = Api::new(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let a = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     write(&a, 0..10).await;
     fold(&a).await;
     // Another process with an unfolded durable write: a strong aggregation refuses (M12), and
     // so does a strong ranked query with facets.
-    let w = Api::new(Accounted::new(store.clone()), LaneId(2)).unwrap();
+    let w = Api::unsecured(Accounted::new(store.clone()), LaneId(2)).unwrap();
     write(&w, 10..11).await;
-    let b = Api::new(Accounted::new(store.clone()), LaneId(3)).unwrap();
+    let b = Api::unsecured(Accounted::new(store.clone()), LaneId(3)).unwrap();
     let agg = json!({"n": ["Count", "id"]});
     let alone = json!({"aggregate_by": agg, "consistency": "strong"});
     let (alone_status, _) = send(&b, "POST", "/v1/indexes/docs/query", Some(&alone)).await;
@@ -274,7 +274,7 @@ async fn facets_honour_the_consistency_level() {
     let (s, body) = send(&b, "POST", "/v1/indexes/docs/query", Some(&ranked)).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     // Bounded: the facets are served, and staleness is reported.
-    let c = Api::new(Accounted::new(store.clone()), LaneId(4)).unwrap();
+    let c = Api::unsecured(Accounted::new(store.clone()), LaneId(4)).unwrap();
     let got = query(
         &c,
         &json!({"vector": Q, "exact": true, "consistency": "bounded", "max_staleness_ms": 60000,
