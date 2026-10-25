@@ -189,3 +189,77 @@ async fn a_lane_with_nothing_to_fold_gets_no_watermark() {
         head.watermarks
     );
 }
+
+#[tokio::test]
+async fn tail_probing_does_not_wrap_at_sequence_exhaustion() {
+    use pstore_blob::BlobStore;
+    use pstore_types::Seq;
+    let store = MemoryStore::new();
+    let tenant = TenantId(123);
+    let lane = LaneId(7);
+    assert_eq!(
+        lanes::tail(&store, tenant, lane, u64::MAX - 1)
+            .await
+            .unwrap(),
+        u64::MAX - 1
+    );
+    store
+        .put(
+            &pstore_engine::bundle_key(tenant, lane, Seq(u64::MAX - 1)),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lanes::tail(&store, tenant, lane, u64::MAX - 1)
+            .await
+            .unwrap(),
+        u64::MAX
+    );
+    assert!(lanes::tail(&store, tenant, lane, u64::MAX).await.is_err());
+}
+
+#[tokio::test]
+async fn registering_past_the_lane_ceiling_preserves_the_registry() {
+    use pstore_blob::BlobStore;
+    let store = MemoryStore::new();
+    let tenant = TenantId(124);
+    let bytes: Vec<u8> = (0..4096u64).flat_map(u64::to_le_bytes).collect();
+    store
+        .put(&lanes::key(tenant), bytes::Bytes::from(bytes))
+        .await
+        .unwrap();
+    lanes::register(&store, tenant, LaneId(4095)).await.unwrap();
+    assert!(
+        lanes::register(&store, tenant, LaneId(4096)).await.is_err(),
+        "registration made the registry unreadable"
+    );
+    assert_eq!(
+        lanes::live(&store, tenant).await.unwrap(),
+        (0..4096).map(LaneId).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn an_exhausted_lane_refuses_a_write_without_losing_pending_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let lane = LaneId(7);
+    let engine = Engine::new(store, TenantId(125), lane);
+    engine
+        .commit_head_for_test(|head| {
+            head.watermarks.insert(lane.0, u64::MAX - 1);
+        })
+        .await
+        .unwrap();
+    engine.write("idx", vec![doc("last", 1)]).await.unwrap();
+    assert_eq!(
+        engine.flush().await.unwrap(),
+        Some(pstore_types::Seq(u64::MAX - 1))
+    );
+    engine.write("idx", vec![doc("pending", 2)]).await.unwrap();
+    assert!(
+        engine.flush().await.is_err(),
+        "an exhausted sequence was acknowledged"
+    );
+    assert_eq!(engine.pending_for_test().await, vec!["pending"]);
+}

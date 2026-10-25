@@ -83,6 +83,9 @@ pub async fn register<S: BlobStore>(
         if current.contains(&lane) {
             return Ok(());
         }
+        if current.len() >= MAX_LANES {
+            return Err(EngineError::LaneRegistryFull);
+        }
         let mut next = current;
         next.insert(lane);
         match store.put_conditional(&k, encode(&next).into(), pre).await {
@@ -135,7 +138,11 @@ pub async fn tail<S: BlobStore>(
     // correct the logic is; mutation testing surfaced it as a hung test rather than a
     // failing one, which is the expensive way to find out.
     for _ in 0..MAX_PROBE_ROUNDS {
-        let keys: Vec<Key> = (base..base + window)
+        let width = window.min(u64::MAX - base);
+        if width == 0 {
+            return Err(EngineError::LaneTooLong(lane));
+        }
+        let keys: Vec<Key> = (base..base + width)
             .map(|n| crate::bundle_key(tenant, lane, pstore_types::Seq(n)))
             .collect();
         // All at once: the window is width, not depth.
@@ -153,7 +160,7 @@ pub async fn tail<S: BlobStore>(
             }
         }
         base += found;
-        if found < window {
+        if found < width || base == u64::MAX {
             return Ok(base);
         }
         window = (window * 2).min(MAX_PROBE_WINDOW);

@@ -376,6 +376,9 @@ pub enum EngineError {
     /// is a backend fault or a corrupted lane rather than a large one.
     #[error("lane {0:?} did not terminate within the probe bound")]
     LaneTooLong(pstore_types::LaneId),
+    /// Registering another lane would exceed the registry's decoding bound.
+    #[error("the tenant lane registry is full")]
+    LaneRegistryFull,
 }
 
 impl From<pstore_blob::BlobError> for EngineError {
@@ -3247,6 +3250,9 @@ impl<S: BlobStore> Engine<S> {
             Some(l) => l.next,
             None => self.resume(watermark).await?,
         };
+        if seq.0 == u64::MAX {
+            return Err(EngineError::LaneTooLong(self.lane));
+        }
         // ⚠️ **Decided here, under the flush lock, and never where HEAD is read** (M17, spec
         // review N1): a fold may commit a watermark past the bundle this flush writes before
         // the flush has advanced `next`, so the same comparison made in `prune_to` would mark
