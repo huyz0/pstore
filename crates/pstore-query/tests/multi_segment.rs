@@ -361,3 +361,25 @@ async fn a_one_segment_query_is_unchanged() {
         "a one-segment query produced a hit from another segment"
     );
 }
+
+#[tokio::test]
+async fn prefetch_limit_applies_to_the_global_union() {
+    let store = MemoryStore::new();
+    let a = put(&store, "global-limit-a", &[doc("a", &["gamma"])]).await;
+    let b = put(&store, "global-limit-b", &[doc("b", &["gamma"])]).await;
+    let out = query(
+        &store,
+        &[a, b],
+        &text_leg("gamma", 1),
+        Fusion::default(),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out.len(),
+        1,
+        "a global limit of one contributed multiple RRF hits"
+    );
+    assert_eq!(out[0].segment, 0);
+}

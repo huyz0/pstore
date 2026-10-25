@@ -1017,10 +1017,10 @@ async fn run<S: BlobStore + Clone>(
             leg.extend(hits);
         }
     }
-    for leg in &mut legs {
+    for (leg, request) in legs.iter_mut().zip(&runnable) {
         // Every retriever in this build ranks higher-is-better; ties break on the pair, the
         // same rule `fuse` itself applies, so the union's order is not a new convention.
-        leg.sort_by(|a, b| {
+        pstore_index::top::top_k_by(leg, request.limit(), |a, b| {
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| (a.segment, a.row).cmp(&(b.segment, b.row)))
