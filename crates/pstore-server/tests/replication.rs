@@ -84,7 +84,7 @@ async fn send(api: &A, tenant: u64, method: &str, uri: &str, body: &Value) -> (S
 
 async fn write(api: &A, tenant: u64, index: &str, ids: std::ops::Range<u32>) {
     let docs: Vec<Value> = ids
-        .map(|i| json!({"id": format!("d{i:04}"), "vector": [f64::from(i).sin(), 1.0], "n": i}))
+        .map(|i| json!({"id": format!("d{i:04}"), "vector": [f64::from(i).sin(), 1.0], "attributes": {"n": i}}))
         .collect();
     let (s, b) = send(
         api,
@@ -153,6 +153,40 @@ async fn run(workers: &mut [(A, Worker)], n: usize, step: Duration) {
         }
         tokio::time::advance(step).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_returns_the_written_attributes() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..3).await;
+    let (status, created) = create(
+        &api,
+        DST,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 2, Duration::from_secs(1)).await;
+    let (status, got) = send(
+        &api,
+        DST,
+        "POST",
+        "/v1/indexes/dst/query",
+        &json!({"rank_by": ["id", "asc"], "include_attributes": ["n"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["results"],
+        json!([
+            {"id": "d0000", "attributes": {"n": 0}},
+            {"id": "d0001", "attributes": {"n": 1}},
+            {"id": "d0002", "attributes": {"n": 2}}
+        ])
+    );
 }
 
 #[tokio::test(start_paused = true)]

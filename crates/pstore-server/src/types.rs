@@ -39,6 +39,7 @@ pub enum Durability {
 
 /// One document, as a client sends it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentIn {
     /// The client's identifier.
     pub id: String,
@@ -62,6 +63,7 @@ pub struct DocumentIn {
 
 /// `PUT /v1/indexes/{id}/documents`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteRequest {
     /// Defaults to `batched`. ⚠️ An unknown value is **refused**, never downgraded.
     #[serde(default)]
@@ -298,6 +300,7 @@ pub struct WriteResponse {
 
 /// `POST /v1/indexes/{id}/query`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     /// The dense leg's query vector, as a document's is written (M9d).
     #[serde(default, deserialize_with = "some_vector")]

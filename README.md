@@ -17,6 +17,7 @@ hybrid search — where the blob store is the **only** durable tier, for data *a
 `PUT /v1/indexes/{id}/documents` and `POST /v1/indexes/{id}/query` over HTTP, and every
 response says what it cost in blob requests and how fresh it is — with no authentication and
 no quota, which [M7c](docs/milestones/M7c/VERIFIED.md) states rather than implies.
+Client-facing contract changes are recorded in the [API migration notes](docs/api-migrations.md).
 ⚠️ **And it runs in a container against a real object store**: `scripts/byoc.sh` brings up
 **two servers on two lanes against one bucket**, and a document written and folded through one
 is returned by the other. That is the first thing in this repository to cross a process
