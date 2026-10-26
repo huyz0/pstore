@@ -7,7 +7,7 @@
     reason = "assertions in tests are the reporting mechanism"
 )]
 
-mod support;
+use crate::support;
 use axum::http::StatusCode;
 use jsonwebtoken::Algorithm;
 use pstore_blob::{Accounted, BlobStore, MemoryStore};

@@ -6,8 +6,7 @@
     clippy::panic,
     reason = "fixture and assertion failures report through panic"
 )]
-#[path = "support/peer.rs"]
-mod peer_fixture;
+use crate::peer_fixture;
 use serde_json::json;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::process::{Child, Command, Stdio};

@@ -457,7 +457,7 @@ async fn a_highlight_costs_nothing() {
 #[test]
 fn the_docs_say_marks_are_not_escaped() {
     // A predicate over files (gate-design): the sentence that makes escaping the client's.
-    let docs = include_str!("../../../docs/deploy.md");
+    let docs = include_str!("../../../../docs/deploy.md");
     let at = docs
         .find("## Highlighting")
         .expect("a Highlighting section");

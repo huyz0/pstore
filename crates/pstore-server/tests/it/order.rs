@@ -209,7 +209,7 @@ async fn paging_by_id_visits_every_document_once_while_the_index_changes() {
         // Bounded: a filter that stopped applying would return the first page forever.
         assert!(page <= 20, "the cursor stopped advancing");
         // Between pages, every kind of change the API offers -- each beyond the cursor. A
-        // compaction between pages is the engine test's (`--test order`): no route runs one.
+        // compaction between pages is the engine test's (`pstore-engine`, `--test it order::`): no route runs one.
         match page {
             1 => put(&api, &json!({"documents": [doc("d99", json!(99))]})).await,
             2 => put(&api, &json!({"durability": "durable", "deletes": ["d40"]})).await,

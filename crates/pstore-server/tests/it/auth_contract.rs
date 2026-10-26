@@ -7,7 +7,7 @@
     reason = "assertions in tests are the reporting mechanism"
 )]
 
-mod support;
+use crate::support;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;

@@ -9,7 +9,7 @@
 
 //! The register's operations (M22 criterion 7): `open`, `claim`, `renew`, `reconcile`.
 
-mod common;
+use crate::common;
 
 use common::Counting;
 use pstore_jobs::{Claim, Entry, JobsError, Register, fnv1a};
