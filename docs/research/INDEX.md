@@ -11,7 +11,7 @@ blob-API spend.
 
 ---
 
-**Status: research phase complete.** 58 documents, 49 research questions answered, 173 open
+**Status: research phase complete.** 59 documents, 49 research questions answered, 173 open
 questions logged. Workspace scaffold live: `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`,
 `crates/pstore-types`. Dev scaffold in [`dev/`](../../dev/README.md). Scale target: **1M tenants × up to 50 indexes = ~50M indexes**, 10% of
 tenants active in any second. Next step is [M0 in the roadmap](11-design/roadmap.md) — measure the
@@ -149,6 +149,7 @@ If you read nothing else:
 | [key-layout.md](11-design/key-layout.md) | D33 | Every key derivable; **seven kinds of mutable object in the entire system**. Storage-class routing by prefix. |
 | **[session-and-affinity-protocol.md](11-design/session-and-affinity-protocol.md)** | Q38 | One opaque token solves read-your-writes *and* cold-cache routing, because the nodes holding fresh data are the nodes we'd route to for warmth. **`session` becomes the default consistency mode** (as in Cosmos DB): read-your-writes at ~1 ms and 0 blob requests. |
 | [api-design.md](11-design/api-design.md) | D34 | Every tradeoff (consistency, recall, completeness) is a client parameter. Responses report freshness and cost. |
+| [mutation-completion.md](11-design/mutation-completion.md) | D34, Q10 | **Two completion points: intent (the bundle PUT) and applied (the HEAD commit that folds it).** Exact affected counts exist only for applied writes, attributed per request by a `$req` stamp and kept in one outcome object per commit. The fold already serializes conditions; applied mode reports it and costs latency, not a CAS per request. |
 | [slos.md](11-design/slos.md) | D34, D104 | **Every objective is `enforced` with a gate that exists or `blocked` with its blocker named — there is no third status.** Request counts and round-trip depth are enforced today; **every latency objective is blocked**, because a p99 from WSL2 wearing a production label is what D-104 forbids. `scripts/check-slos.py` is the gate. |
 | [turbopuffer-api-parity.md](11-design/turbopuffer-api-parity.md) | D34 | Historical M8/M9 API comparison with later partial updates. **Superseded for current capability claims by the [2026-10-25 comparison](../comparisons/turbopuffer-2026-10-25.md) and [delivery plan](../comparisons/turbopuffer-next-plan.md).** |
 | [roadmap.md](11-design/roadmap.md) | D35 | Built in descending order of "if this is wrong, the architecture is wrong." M0 measures CAS before anything else. |
