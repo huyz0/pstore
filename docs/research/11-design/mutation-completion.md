@@ -120,8 +120,8 @@ queries. `batched` and `durable` keep their depth. M129 records the measured dep
 ## 7. What this does not provide, and must not be claimed
 
 - **Exactly-once.** A client that lost an applied response cannot learn its outcome,
-  because it never learned the operation id. A client-supplied id, deduplicated against
-  the retained outcome objects (bounded by K), is the follow-up.
+  because it never learned the operation id. ⚠️ **Superseded by §9** (M132): an
+  idempotency key makes a retried applied write apply at most once, or be refused.
 - **Rollback safety.** A HEAD with the outcome list must write every optional section
   before it, and an old binary that re-commits drops the list, leaking the objects it named
   until a sweep exists. Rollback after enabling applied mode leaks bounded garbage. Until then a retried
@@ -146,3 +146,149 @@ queries. `batched` and `durable` keep their depth. M129 records the measured dep
 The extra reads for stamped unconditional deletes and upserts are bytes, not a new chain:
 the fold already reads every segment of an index with a deferred operation in one pass
 (`prepare`). M129 measures it rather than asserting it.
+
+## 9. Idempotency keys: at most once, or an explicit refusal (M132)
+
+§7 left a retry after a lost response free to apply twice. This section closes it for
+applied writes, within a stated retention, and says exactly what happens outside it.
+
+### 9.1 The problem is retention, not detection
+
+Detecting a retry is easy while the first attempt's outcome is listed in HEAD: the fold
+finds the key there. The hard case is a key whose first attempt's commit has **fallen off
+the list**: absent from 32 entries, the key looks new, and a retry would apply again. A
+key that carries nothing but random bits cannot tell "never applied" from "applied and
+forgotten". So a key must carry **when it was issued**, in a unit the fold can compare
+against what HEAD still lists.
+
+### 9.2 The key, and HEAD's horizon
+
+A key is `<e0>-<32 hex>`: an epoch and 128 random bits. The server issues one
+(`POST /v1/indexes/{index}/idempotency-keys`) with `e0` set to the issuing engine's M129
+mark, which is at most the HEAD epoch. A client may also mint its own. **The door refuses a
+key whose `e0` is above HEAD**: when `e0` exceeds this engine's mark, it reads HEAD once
+and refuses if `e0` is still above it. So every attempt of a key reaches the store after
+HEAD reached `e0`, and every commit that folds one has an epoch above `e0`, because HEAD
+only moves forward and a commit CASes on a HEAD at least as new. Epoch arithmetic on `e0`
+saturates; a bundle can never stop a fold.
+
+HEAD gains one trailing field, **`keys_since`**: every commit with epoch above it that
+tallied an applied write is in HEAD's outcome list. Commits maintain it:
+
+- Every commit carries it forward, because commits copy the HEAD they read.
+- ⚠️ **Every M132 fold raises it** to the epoch of any entry it drops from the list, and
+  decides keys, whatever the engine's level. An engine that dropped an entry without raising
+  would leave a retry covered with its winner forgotten (spec review, round 2).
+- An engine started for keys (level 3, §9.6) also **initialises** it: any commit it makes,
+  fold, gc or compact, on a HEAD without the field sets it to the epoch of the HEAD it read.
+  Nothing is known about earlier commits; this one, if it tallies, is listed. That is the
+  flag's only effect. A deployment below level 3 never initialises it, so it writes the
+  bytes M131 writes.
+
+⚠️ **It must exist before keys are used, not appear with the first key.** If the first
+keyed fold set it, it would set it to its own read epoch. That is above the `e0` of every
+key issued before any commit happened, so a key would expire on first use at any tenant
+where something else committed meanwhile (spec review, round 2). Keys issued on a tenant
+before its first level-3 commit can still expire that way, once, at enablement. That costs
+a retry with a new key, never a double application.
+
+A HEAD that lost the field, because a pre-M132 binary re-committed it during a rollback,
+reads as "nothing known before this HEAD", and the next level-3 commit starts over from
+there. So a HEAD re-commit can only expire keys. ⚠️ **A pre-M132 fold, though, applies
+every keyed attempt it folds**: it reads the stamp as an opaque request id. The rollback
+order is therefore: stop sending keys, let every keyed bundle fold, then downgrade.
+
+The **horizon** of a HEAD is `keys_since`, or its own epoch when the field is absent. A key
+is **covered** by a HEAD when `e0 >= horizon`: every commit after `e0` that applied
+anything is still listed.
+
+Every attempt of a keyed write keeps its own random operation id, as today, and adds the
+key to its stamp. The tally stays per attempt, so two attempts never merge.
+
+### 9.3 The fold rule
+
+Each fold attempt, after reading HEAD and before any pass that applies or sets aside an
+operation, decides every key its stamped operations carry. It decides them once for the
+whole fold, across indexes, in bundle order (lane, then sequence, then position):
+
+1. **Decided.** The key has a winning attempt, named in an outcome object HEAD lists (as
+   the winner, or as the winner a duplicate was refused for) or by an earlier attempt in
+   this fold. An operation of the winner proceeds; one attempt can span bundles (§2). Any
+   other attempt's operation is discarded unapplied, counted `rejected`, and its attempt is
+   recorded as a duplicate of the winner.
+2. **Expired.** Otherwise, if the HEAD it read does not cover the key, the operation is
+   discarded and its attempt recorded as expired. A commit that fell off the list may have
+   applied this key, so nothing of it may apply now.
+3. **Winner.** Otherwise this attempt wins the key, and its operations proceed as any
+   stamped operation does.
+
+To apply rule 1 the fold reads the listed outcome objects it has not cached, in one
+parallel round per attempt, and only when a keyed operation is present. A listed object
+that is gone (404) means a newer HEAD dropped it, so this attempt's CAS would fail: the
+attempt is retried from a fresh HEAD. Any other read error fails the fold, as a bundle read
+error does.
+
+The commit's outcome object records each attempt it decided a key for: the key, and won,
+duplicate (with the winner), or expired. A losing CAS recomputes everything against the new
+HEAD, as the tally already does (M111), so the decision is made against exactly the HEAD
+the commit replaces.
+
+**Why at most once.** Suppose two attempts of one key both applied, at commits `c1 <= c2`.
+If `c1 = c2`, rule 1's in-fold check refused the later attempt. Otherwise `c2` read the HEAD
+`c1` produced or a later one, call it `H`. If `H` lists any record naming the winner of
+the key, rule 1 refused `c2`'s attempt. If not, `c1`'s entry was dropped by some commit up
+to `H`, which raised `keys_since` to at least `c1`. Or the field was lost by a rollback, in
+which case `H`'s horizon is its own epoch, at least `c1`. Either way the horizon is at
+least `c1 > e0`, so rule 2 refused it. Each case contradicts the assumption. Nothing here
+uses time, a lock or a lease; the CAS on HEAD is the serialization point it always was.
+
+### 9.4 What a waiter reports
+
+A waiter reads its window `(mark, HEAD]` as today. Its own attempt's records are always
+in it, because every commit that folds the attempt follows the mark, unless the window
+itself fell off the list, which is today's `outcome_unavailable`.
+
+| Its own records in the window | Response |
+|---|---|
+| none refused | its own outcome, as today |
+| a duplicate of attempt W | W's outcome, summed over every listed commit after `e0`, with `replayed: true`; when HEAD does not cover the key, or an object was reaped, `replayed: true` with `outcome_unavailable` |
+| expired, the window intact, and none of its operations applied | refused, `409 idempotency_expired`: nothing applied |
+| expired, beside applied operations | refused, `409 idempotency_partial` (§9.5) |
+| expired, and the window fell off the list | refused, `409 idempotency_partial`: it may be partly applied, and what fell off is exactly what would say |
+
+⚠️ **A keyed waiter whose window fell off still reads its own records** in the commits
+still listed after its mark (round-2 spec review). Its refusing commit is listed unless 32
+more tallying commits land before the waiter reads, which would need them inside one
+gate-held wait; then it answers `outcome_unavailable`, as for any fallen window (round 3). Today's waiter answers `outcome_unavailable` before looking, which would report
+an expired attempt as applied. Without a refusing record, a fallen window still answers
+`outcome_unavailable`.
+
+A replayed answer is W's whatever this attempt's body was: a retry must resend the same
+write. Comparing bodies would need W's operations stored, which is a per-record cost; the
+docs say so instead. A replay reports what W's folds decided **so far**: if W's request
+failed between two flushes, or its second bundle is not yet folded, the replay counts only
+what was applied.
+
+### 9.5 The one partial case
+
+One attempt can span bundles (§2). If its first bundle wins at `c1`, and its second is
+folded only after `c1` and every record naming it have left the list, rule 2 refuses the
+second, and the attempt is half applied. The waiter says so (`idempotency_partial`) rather
+than reporting success. It needs the two flushes of one request to be 32 tallying commits
+apart, and M132 tests the response rather than the odds.
+
+### 9.6 Cost and limits
+
+- No new object: the decisions ride in the outcome object a commit with applied writes
+  already writes. HEAD gains one `u64`, written only at level 3, plus the empty optional
+  sections before it on a HEAD that had none.
+- A fold attempt with keyed operations reads every listed outcome object it has not
+  cached: at most 32 parallel GETs in one round per attempt, then about one per commit.
+  That is on the fold, so on applied mode's latency, which is already outside D-34.
+- **Retention is 32 tallying commits of the tenant, not a duration.** A key issued at a busy
+  tenant can expire in seconds; the client then gets a new key and retries. That is a
+  refusal, never a double application.
+- Keys are per tenant, not per index: a key reused on another index is a duplicate.
+- Mixed versions: an M131 fold would ignore keys and apply every attempt, and an M130
+  decoder refuses an object with a keys section. Keys are therefore refused unless every
+  node is started with `PSTORE_APPLIED_WRITES=3`.
