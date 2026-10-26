@@ -3,16 +3,32 @@
 # Gates and rationale: docs/research/09-rust-stack/engineering-standards.md
 name: ci
 on:
+  # ⚠️ `main` only. Delivery sessions push the same commit to their branch and to `main`, so an
+  # unfiltered `push` ran every commit twice: 22 jobs where 11 answer the question, queued
+  # behind each other for up to 20 minutes. A branch is checked when it opens a PR.
   push:
+    branches: [main]
   pull_request:
   # ⚠️ The full mutation sweep, nightly. `--in-diff` on a PR cannot see a commit that only
   # changed test code, because the diff is matched against the code under test.
   schedule:
     - cron: "0 3 * * *"
 
+# A newer push to the same PR supersedes the run in flight. Not on `main`, where every commit
+# keeps its own result, nor the nightly sweep: those are grouped by commit, because a group
+# holds one pending run and a third arrival cancels the second whatever `cancel-in-progress` says.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # No debug info in CI builds: `.cargo/config.toml` keeps `debug = 1` for a local debugger,
+  # which CI never attaches, and it costs link time across 234 test binaries and cache size.
+  # Coverage reads llvm-cov's own mapping, not DWARF.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   check:

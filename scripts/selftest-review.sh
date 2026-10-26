@@ -6,6 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 export REVIEW_ROUND_BUDGET=2
+# ⚠️ The counter is what this tests, not the gates, which `gates.sh` runs itself. Without this
+# every `context` below replayed clippy and the whole test suite: four suite runs per
+# `gates.sh`, 21 of its 26 minutes on a 4-core container, and 22 of the CI harness job's 22.
+export REVIEW_SKIP_GATES=1
 TAG="selftest-$$"
 DIR=.harness/review; mkdir -p "$DIR"
 cleanup() { rm -f "$DIR/${TAG}."*; }
@@ -22,6 +26,18 @@ fi
 REVIEW_ROUND_BUDGET=3 ./scripts/review.sh context "$TAG" >/dev/null 2>&1 \
   || { echo "FAIL explicit override should be honoured"; exit 1; }
 echo "ok round counter advances, budget refuses the round, override works"
+
+# A packet built with REVIEW_SKIP_GATES says so, rather than reporting gates it never ran.
+grep -q '^  SKIPPED ' "$DIR/${TAG}.r1.packet" || { echo "FAIL a packet with skipped gates does not say so"; exit 1; }
+grep -q '^  PASS ' "$DIR/${TAG}.r1.packet" && { echo "FAIL a packet reports PASS for a gate it skipped"; exit 1; }
+# The gates a packet replays are the ones gates.sh runs, flag for flag. A replay with other
+# flags (no --all-features) builds a second copy of the workspace: a review round cost ten
+# minutes of rebuild in M131.
+for g in "cargo clippy --all-targets --all-features -- -D warnings" "cargo test --workspace --all-features --quiet"; do
+  grep -qF "$g" scripts/review.sh || { echo "FAIL review.sh does not replay: $g"; exit 1; }
+  grep -qF "$g" scripts/gates.sh  || { echo "FAIL gates.sh does not run: $g"; exit 1; }
+done
+echo "ok skipped gates are labelled, and replayed gates match gates.sh"
 
 # ⚠️ Everything below runs in a SCRATCH repository, because the two properties being
 # checked are about HEAD moving and about the staged tree -- neither of which may be

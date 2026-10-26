@@ -83,9 +83,14 @@ PACKET="$DIR/${TAG}.r${N}.packet"
   echo "You are NOT given the author's reasoning. That is deliberate."
   echo
   echo "=== GATES THAT ALREADY PASSED (do not re-check these) ==="
-  for g in "cargo fmt --check" "cargo clippy --all-targets -- -D warnings" \
-           "cargo test -q" "./scripts/check-links.sh" "py ./scripts/build-index.py --check"; do
-    if eval "$g" >/dev/null 2>&1; then echo "  PASS  $g"; else echo "  FAIL  $g   <-- fix before reviewing"; fi
+  # ⚠️ The same invocations as `gates.sh`, flag for flag, so a replay reuses its build. This
+  # ran `cargo test -q` without `--all-features`, a second feature set that rebuilt and
+  # relinked the whole workspace: ten minutes per review round in M131.
+  for g in "cargo fmt --all --check" "cargo clippy --all-targets --all-features -- -D warnings" \
+           "cargo test --workspace --all-features --quiet" "./scripts/check-links.sh" \
+           "py ./scripts/build-index.py --check"; do
+    if [ -n "${REVIEW_SKIP_GATES:-}" ]; then echo "  SKIPPED  $g   (REVIEW_SKIP_GATES)"
+    elif eval "$g" >/dev/null 2>&1; then echo "  PASS  $g"; else echo "  FAIL  $g   <-- fix before reviewing"; fi
   done
   echo
   if [ "$N" -eq 1 ]; then
