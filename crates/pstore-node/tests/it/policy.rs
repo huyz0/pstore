@@ -322,14 +322,17 @@ fn zone_from_env_reads_pstore_az() {
         }
         _ => {}
     }
+    // The child is named by its full test path, which carries this module's name now that
+    // the crate's tests share one binary (`tests/it`): `--exact` on the bare function name
+    // matches nothing there, and both children fail with "0 passed".
+    let name = match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::zone_from_env_reads_pstore_az"),
+        None => "zone_from_env_reads_pstore_az".to_owned(),
+    };
     for (role, value) in [("set", Some("az-q")), ("unset", None)] {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child
-            .args([
-                "zone_from_env_reads_pstore_az",
-                "--exact",
-                "--test-threads=1",
-            ])
+            .args([name.as_str(), "--exact", "--test-threads=1"])
             .env(ROLE, role);
         match value {
             Some(v) => child.env("PSTORE_AZ", v),

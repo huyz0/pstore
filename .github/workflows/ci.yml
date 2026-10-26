@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   # No debug info in CI builds: `.cargo/config.toml` keeps `debug = 1` for a local debugger,
-  # which CI never attaches, and it costs link time across 234 test binaries and cache size.
+  # which CI never attaches, and it costs link time and cache size.
   # Coverage reads llvm-cov's own mapping, not DWARF.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"

@@ -13,6 +13,7 @@
 //! none, and is what a split answer must equal. Each server's view of the store records the
 //! keys it reads, can fail every read, and can wait before each request.
 
+use crate::peer_fixture;
 use axum::body::Body;
 use axum::http::Request;
 use bytes::Bytes;
@@ -29,8 +30,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
-#[path = "support/peer.rs"]
-mod peer_fixture;
 
 fn peer_addresses() -> &'static Mutex<std::collections::HashMap<usize, String>> {
     static ADDRESSES: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, String>>> =

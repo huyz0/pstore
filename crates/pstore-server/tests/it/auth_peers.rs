@@ -6,9 +6,8 @@
     clippy::indexing_slicing,
     reason = "assertions and fixtures report failure by panic"
 )]
-mod support;
-#[path = "support/tls.rs"]
-mod tls_fixture;
+use crate::support;
+use crate::tls_fixture;
 use axum::http::StatusCode;
 use pstore_blob::{Accounted, MemoryStore};
 use pstore_server::{Api, PeerConfig, PeerTls, PeerTransport};

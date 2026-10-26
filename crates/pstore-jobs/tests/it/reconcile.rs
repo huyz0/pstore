@@ -14,7 +14,7 @@
 //! order, depth first. The property: when everyone is done, the shard has an entry iff the
 //! truth says there is work, carrying the truth's generation.
 
-mod common;
+use crate::common;
 
 use common::{Counting, Gate};
 use pstore_blob::TagStyle;

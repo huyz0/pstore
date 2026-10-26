@@ -73,9 +73,9 @@ row is therefore not a claim that an existing turbopuffer SDK works against psto
 Sources: [guarantees](https://turbopuffer.com/docs/guarantees), pinned OpenAPI;
 pstore [wire types](../../crates/pstore-server/src/types.rs),
 [write/read handlers](../../crates/pstore-server/src/lib.rs),
-[patch tests](../../crates/pstore-server/tests/patch.rs),
-[quarantine tests](../../crates/pstore-server/tests/quarantine.rs),
-[consistency tests](../../crates/pstore-server/tests/consistency.rs).
+[patch tests](../../crates/pstore-server/tests/it/patch.rs),
+[quarantine tests](../../crates/pstore-server/tests/it/quarantine.rs),
+[consistency tests](../../crates/pstore-server/tests/it/consistency.rs).
 
 ## Every vendor endpoint
 
@@ -158,9 +158,9 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 
 Source: [conversion and parsers](../../crates/pstore-server/src/lib.rs),
 [document/vector representation](../../crates/pstore-format/src/lib.rs),
-[typed-value tests](../../crates/pstore-server/tests/typed_values.rs),
-[array tests](../../crates/pstore-server/tests/arrays.rs),
-[named-field tests](../../crates/pstore-server/tests/named_dense.rs).
+[typed-value tests](../../crates/pstore-server/tests/it/typed_values.rs),
+[array tests](../../crates/pstore-server/tests/it/arrays.rs),
+[named-field tests](../../crates/pstore-server/tests/it/named_dense.rs).
 
 ## Query fields and responses
 
@@ -230,9 +230,9 @@ it does not enforce the hard group quota represented by `limit.per`.
 Sources: [query planning](../../crates/pstore-server/src/lib.rs),
 [boost](../../crates/pstore-server/src/boost.rs), [diversify](../../crates/pstore-server/src/diversify.rs),
 [highlight](../../crates/pstore-server/src/highlight.rs),
-[multi tests](../../crates/pstore-server/tests/multi.rs),
-[composition tests](../../crates/pstore-server/tests/composition.rs),
-[FDE tests](../../crates/pstore-server/tests/multi_fde.rs).
+[multi tests](../../crates/pstore-server/tests/it/multi.rs),
+[composition tests](../../crates/pstore-server/tests/it/composition.rs),
+[FDE tests](../../crates/pstore-server/tests/it/multi_fde.rs).
 
 ### Every filter operator
 
@@ -256,10 +256,10 @@ requires application-supplied document permission filters; it does not provide n
 document-level RBAC. Both products need trusted application enforcement for those filters.
 
 Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
-[filter tests](../../crates/pstore-server/tests/filters.rs),
-[pattern tests](../../crates/pstore-server/tests/patterns.rs),
-[token tests](../../crates/pstore-server/tests/tokens.rs),
-[geo tests](../../crates/pstore-server/tests/geo.rs).
+[filter tests](../../crates/pstore-server/tests/it/filters.rs),
+[pattern tests](../../crates/pstore-server/tests/it/patterns.rs),
+[token tests](../../crates/pstore-server/tests/it/tokens.rs),
+[geo tests](../../crates/pstore-server/tests/it/geo.rs).
 
 ### Every response and accounting field
 
@@ -344,11 +344,11 @@ separate object reachability, retention, restore and source-deletion proofs.
 make a node the durable owner of data. A reservation can fit pstore's architecture if a
 node loss only affects availability/cache warmth and CAS still fences publication.
 
-Sources: [schema tests](../../crates/pstore-server/tests/schema.rs),
+Sources: [schema tests](../../crates/pstore-server/tests/it/schema.rs),
 [analyzer implementation](../../crates/pstore-format/src/text.rs),
-[analyzer tests](../../crates/pstore-server/tests/analyzer.rs),
-[branch tests](../../crates/pstore-server/tests/branch.rs),
-[lifecycle tests](../../crates/pstore-server/tests/lifecycle.rs).
+[analyzer tests](../../crates/pstore-server/tests/it/analyzer.rs),
+[branch tests](../../crates/pstore-server/tests/it/branch.rs),
+[lifecycle tests](../../crates/pstore-server/tests/it/lifecycle.rs).
 
 ## Limits and request behavior
 
@@ -453,9 +453,9 @@ Sources: [router](../../crates/pstore-server/src/lib.rs),
 [external handlers](../../crates/pstore-server/src/external.rs),
 [replication handlers](../../crates/pstore-server/src/replication.rs),
 [facets](../../crates/pstore-server/src/facets.rs),
-[time travel tests](../../crates/pstore-server/tests/time_travel.rs),
-[session tests](../../crates/pstore-server/tests/session.rs),
-[bounded tests](../../crates/pstore-server/tests/bounded.rs).
+[time travel tests](../../crates/pstore-server/tests/it/time_travel.rs),
+[session tests](../../crates/pstore-server/tests/it/session.rs),
+[bounded tests](../../crates/pstore-server/tests/it/bounded.rs).
 
 ## Architecture, operations, security, and cost
 

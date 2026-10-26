@@ -18,7 +18,7 @@ use pstore_index::cluster::{Clustering, Params};
 use pstore_index::ladder::Ladder;
 use pstore_index::search;
 
-mod common;
+use crate::common;
 use common::{Corpus, recall_at, rung0_scores};
 
 const DIM: usize = 128;

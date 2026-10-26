@@ -26,7 +26,7 @@ use pstore_index::cluster::Params;
 use pstore_index::rabitq::{BOUND_EPSILON, Quantizer};
 use pstore_index::search;
 
-mod common;
+use crate::common;
 
 const DIM: usize = 384;
 const SEED: u64 = 0x5EED;
