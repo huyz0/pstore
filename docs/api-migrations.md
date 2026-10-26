@@ -1,5 +1,18 @@
 # Native API migration notes
 
+## M131: one snapshot per request
+
+The sub-queries of a multi-query, and a query's `facets` beside its hits, now answer from
+one snapshot: one HEAD and one view of the unfolded rows, taken before any of them runs.
+Every epoch in `meta.epochs` is the same, and `meta.facets_epoch` equals `meta.epoch`. A
+request reads HEAD once instead of once per leg.
+
+This applies when every leg has the same consistency (`session` counts as the level it
+maps to; two `bounded` legs need the same `max_staleness_ms`) and none has `as_of`. Any
+other request runs its legs separately, as before. If a `bounded` request's cached HEAD
+names a segment that has since been reaped, the whole request is retried once from a
+fresh HEAD; such a retry now also covers an `index_not_found` from a stale cached HEAD.
+
 ## M130: `affected_ids`, and the order inside one write
 
 An applied write may add `"affected_ids": true`. Its `applied` object then carries

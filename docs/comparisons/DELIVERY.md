@@ -18,7 +18,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | B | Versioned compatibility facade with durable/strong defaults and correct envelopes | Pending |
 | C | Applied mutation completion, actual affected counts/IDs, mixed-operation ordering | Partial: applied completion and exact counts verified in [M129](../milestones/M129/VERIFIED.md) ([proof](../research/11-design/mutation-completion.md)); affected ids and the order inside one request verified in [M130](../milestones/M130/VERIFIED.md); ids for by-filter operations pending |
 | C | Conditions with new-value references, partial filter progress and retry/idempotency policy | Pending |
-| C/F | Shared durable snapshots for query legs, aggregates and facets | Pending |
+| C/F | Shared durable snapshots for query legs, aggregates and facets | Partial: a multi-query's legs and a query's facets share one snapshot, verified in [M131](../milestones/M131/VERIFIED.md); lane tails are still probed per leg, and legs at mixed levels or `as_of` run apart |
 | D | Text-only documents and persistent typed schemas | Pending |
 | D | Typed IDs, uint64/UUID/bytes/datetime/nullable arrays and column upserts | Pending |
 | D | Public string-key sparse vectors and named-field ANN contracts | Pending |

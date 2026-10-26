@@ -2057,13 +2057,26 @@ async fn query_index<S: BlobStore + 'static>(
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
-        // ⚠️ Together, never one after the other: depth is the deeper of the two (M65).
-        let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
         let (got, faceted) = match facet {
-            None => (api.requesting(tenant, ranked.await).await?, None),
-            Some((freq, fplan)) => {
-                let beside = run(&engine, &index, &freq, fplan, &token, None);
-                let both = futures_util::future::try_join(ranked, beside).await;
+            None => {
+                let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
+                (api.requesting(tenant, ranked.await).await?, None)
+            }
+            Some((freq, _)) => {
+                // ⚠️ Together, never one after the other: depth is the deeper of the two
+                // (M65). M131: and from one snapshot, unless the query reads a past epoch;
+                // planned inside, so a pinned retry can run both again.
+                let (req, freq, token, peers, engine, index) =
+                    (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
+                let both = move || async move {
+                    let ranked = run(engine, index, req, crate::plan(req)?, token, peers);
+                    let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
+                    futures_util::future::try_join(ranked, beside).await
+                };
+                let both = match pinnable(std::slice::from_ref(req), token)? {
+                    Some(level) => engine.pinned(index, level, both).await,
+                    None => both().await,
+                };
                 let (got, faceted) = api.requesting(tenant, both).await?;
                 (got, Some(faceted))
             }
@@ -2091,19 +2104,26 @@ async fn query_index<S: BlobStore + 'static>(
         ));
     }
     let reqs = multi_query(raw)?;
-    let plans = reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
+    reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
     let peers: Vec<Option<peers::QueryPeers>> =
         reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
-    let got = futures_util::future::try_join_all(
-        reqs.iter()
-            .zip(plans)
-            .zip(&peers)
-            .map(|((req, plan), p)| run(&engine, &index, req, plan, &token, p.as_ref())),
-    )
-    .await;
+    // Planned again inside, so a pinned retry (M131) can run every leg once more.
+    let all = {
+        let (reqs, peers, engine, index, token) = (&reqs, &peers, &engine, &index, &token);
+        move || {
+            futures_util::future::try_join_all(reqs.iter().zip(peers).map(|(req, p)| async {
+                run(engine, index, req, plan(req)?, token, p.as_ref()).await
+            }))
+        }
+    };
+    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
+    let got = match pinnable(&reqs, &token)? {
+        Some(level) => engine.pinned(&index, level, all).await,
+        None => all().await,
+    };
     let got = api.requesting(tenant, got).await?;
     // From the sub-queries' own tokens, never the request's: each already carries it, less
     // the entries its HEAD covers, and merging the request's back would restore them.
@@ -2504,6 +2524,27 @@ fn engine_level(level: Level, token: &session::Token) -> pstore_engine::Consiste
         Level::Eventual | Level::Session => pstore_engine::Consistency::Eventual,
         Level::Bounded(max) => pstore_engine::Consistency::Bounded(max),
     }
+}
+
+/// The level a request's legs share, when they can run from one snapshot (M131): every leg
+/// at one engine level -- `session` mapped, a `bounded` tolerance part of it -- and none
+/// `as_of` an epoch. `None` runs each leg on its own, as before.
+fn pinnable(
+    reqs: &[QueryRequest],
+    token: &session::Token,
+) -> Result<Option<pstore_engine::Consistency>, ApiError> {
+    let mut shared = None;
+    for req in reqs {
+        if req.as_of.is_some() {
+            return Ok(None);
+        }
+        let level = engine_level(level(req)?, token);
+        if shared.is_some_and(|s| s != level) {
+            return Ok(None);
+        }
+        shared = Some(level);
+    }
+    Ok(shared)
 }
 
 /// Checks a served answer against the session token and returns the token to send back

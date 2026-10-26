@@ -1413,6 +1413,7 @@ mod memtable_tests {
 }
 
 /// A fresh segment as one query uses it: its target, rows and store, taken together.
+#[derive(Clone)]
 struct FreshView {
     target: Option<pstore_query::Target>,
     rows: Arc<Vec<Document>>,
@@ -1523,7 +1524,22 @@ enum Folded {
     Missing,
 }
 
+tokio::task_local! {
+    /// The snapshot [`Engine::pinned`] runs its legs under (M131).
+    static PINNED: Pin;
+}
+
+/// One engine's snapshot of one index at one consistency (M131).
+struct Pin {
+    /// The engine's address: a pin never serves another engine's reads.
+    engine: usize,
+    index: String,
+    consistency: Consistency,
+    fetched: Fetched,
+}
+
 /// A query's HEAD and the unfolded rows consistent with it.
+#[derive(Clone)]
 struct Fetched {
     at: Arc<head::HeadAt>,
     fresh: Option<FreshView>,
@@ -4975,6 +4991,52 @@ impl<S: BlobStore> Engine<S> {
         head::commit(&*self.store, self.tenant, &at, &next).await
     }
 
+    /// Runs `f` with every live read of `index` at `consistency` inside it served from one
+    /// snapshot (M131): one HEAD -- with the lane registry for `strong`, or the cached one
+    /// for `bounded` -- and one view of the unfolded rows, taken before `f` runs. A read at
+    /// another consistency, of another index, or `as_of` an epoch is not served from it.
+    ///
+    /// ⚠️ **The one retry is here** (M131 spec review): a read under the pin never retries on
+    /// its own, or a leg retried fresh would answer from another epoch than its siblings. A
+    /// snapshot from the `bounded` cache whose `f` fails -- a segment `gc` reaped -- is taken
+    /// again from a fresh HEAD and `f` runs once more, every leg.
+    ///
+    /// ⚠️ A task-local, as [`applying`] is: the legs must run in this task. A leg that spawns
+    /// loses the pin and reads HEAD itself.
+    ///
+    /// # Errors
+    /// The snapshot's reads, or what `f` returns.
+    pub async fn pinned<F, Fut, T, E>(
+        &self,
+        index: &str,
+        consistency: Consistency,
+        f: F,
+    ) -> Result<T, E>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: From<EngineError>,
+    {
+        let engine = std::ptr::from_ref(self) as usize;
+        let mut allow_hit = true;
+        loop {
+            let mut fetched = self
+                .head_and_fresh_as(index, consistency, allow_hit)
+                .await?;
+            let hit = std::mem::replace(&mut fetched.hit, false);
+            let pin = Pin {
+                engine,
+                index: index.to_owned(),
+                consistency,
+                fetched,
+            };
+            match PINNED.scope(pin, f()).await {
+                Err(_) if hit => allow_hit = false,
+                done => return done,
+            }
+        }
+    }
+
     /// How many commits' outcomes this engine holds (M129), so a test can assert the bound.
     #[doc(hidden)]
     pub fn outcome_cache_len_for_test(&self) -> usize {
@@ -6051,6 +6113,15 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         allow_hit: bool,
     ) -> Result<Fetched, EngineError> {
+        // M131: under a pin of this engine, index and level, its snapshot, and no hit: a leg
+        // never retries on its own.
+        let engine = std::ptr::from_ref(self) as usize;
+        if let Ok(Some(pinned)) = PINNED.try_with(|p| {
+            (p.engine == engine && p.index == index && p.consistency == consistency)
+                .then(|| p.fetched.clone())
+        }) {
+            return Ok(pinned);
+        }
         let mut lanes = None;
         for attempt in 0..STALE_HEAD_RETRIES {
             let mut staleness = std::time::Duration::ZERO;
