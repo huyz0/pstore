@@ -1,5 +1,36 @@
 # Native API migration notes
 
+## M132: idempotency keys for applied writes
+
+An applied write may carry `"idempotency_key"`. Of all the attempts that carry one key,
+at most one applies. Get a key from `POST /v1/indexes/{index}/idempotency-keys` (write
+scope), which answers `{"idempotency_key": "<epoch>-<32 hex>"}` and costs no blob request
+while the server's view of HEAD is fresh. Keys are per tenant, whichever index's route
+issued them. Send the same key again, with the same body, when a response is lost:
+
+- the first attempt to be folded applies, and answers as any applied write does;
+- a later attempt applies nothing. It answers `200` with `"replayed": true` and the
+  winner's `applied` counts. If those counts can no longer be read, `applied` is `null`
+  and `outcome_unavailable` is `true`. The body is not compared, so a retry must resend the
+  same write;
+- `409 idempotency_expired`: the fold could not prove that no earlier attempt applied,
+  because HEAD's list of the last 32 commits that decided applied writes no longer reaches
+  back to the key. Nothing of this write applied. Get a new key and send it again;
+- `409 idempotency_partial`: part of the write was refused as expired, and part was, or
+  may have been, applied. That happens when its window fell off the list, for example
+  after 32 other commits on a busy tenant. Read the rows before sending it again.
+
+Retention is 32 commits that decided applied writes on the tenant, not a duration, so a
+key can expire within seconds on a busy tenant. It is refused with `bad_request` beside
+`batched` or `durable`, when it is malformed, or when its epoch is ahead of HEAD. It is
+refused with `unsupported_durability`, as is the issuing route, unless every node runs
+this release and is started with `PSTORE_APPLIED_WRITES=3`. Level 3 adds `keys_since` to
+HEAD.
+
+To roll back, do it in this order: stop sending keys, let every keyed write be folded
+(answered), and only then downgrade. An older fold applies every attempt of a key it finds
+in a bundle. See the [proof](research/11-design/mutation-completion.md), §9.
+
 ## M131: one snapshot per request
 
 The sub-queries of a multi-query, and a query's `facets` beside its hits, now answer from
@@ -45,7 +76,7 @@ It is refused with `unsupported_durability` unless every node runs this release 
 operator starts them with `PSTORE_APPLIED_WRITES=1`. `batched` and `durable` are
 unchanged, and their `documents_*` counters still count what was submitted. An applied
 write waits for a fold, so it is slower; it is not exactly-once, and a retry after a lost
-response may apply again. See the [proof](research/11-design/mutation-completion.md).
+response may apply again (M132's idempotency keys close that). See the [proof](research/11-design/mutation-completion.md).
 
 ## M127: explicit authentication and encrypted peers
 

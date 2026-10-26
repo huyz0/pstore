@@ -254,8 +254,13 @@ pub struct Head {
     pub externals: BTreeMap<String, ExternalRef>,
     /// The last [`crate::OUTCOMES_KEPT`] commits that tallied an applied request's outcome
     /// (M129), oldest first: `(epoch, outcome object key)`. A pair that falls off is buried.
-    /// ⚠️ The last trailing section, after the widths: absent means none.
+    /// ⚠️ A trailing section after the widths: absent means none.
     pub outcomes: Vec<(u64, String)>,
+    /// M132: every commit above this epoch that tallied an applied outcome is in
+    /// [`Self::outcomes`]; `None` means nothing is known before this HEAD. Initialised by an
+    /// engine set for idempotency keys, raised by every fold that drops a listed pair. ⚠️ The
+    /// last trailing section, after the outcomes: absent means `None`.
+    pub keys_since: Option<u64>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -532,8 +537,9 @@ impl Head {
             .iter()
             .filter(|(_, _, s, _)| !s.fields.is_empty())
             .collect();
-        // M129: the applied outcomes are last, and force the widths.
-        let outs = !self.outcomes.is_empty();
+        // M129: the applied outcomes follow, and force the widths.
+        // M132: `keys_since` is last, and forces the outcomes.
+        let outs = !self.outcomes.is_empty() || self.keys_since.is_some();
         let wide = !widths.is_empty() || outs;
         let ext = wide || !self.externals.is_empty();
         let lens = ext || self.indexes.values().flatten().any(|r| r.len.is_some());
@@ -646,6 +652,9 @@ impl Head {
                 out.extend_from_slice(&epoch.to_le_bytes());
                 put_str(&mut out, key);
             }
+        }
+        if let Some(since) = self.keys_since {
+            out.extend_from_slice(&since.to_le_bytes());
         }
         out
     }
@@ -970,6 +979,15 @@ impl Head {
         for _ in 0..c.u32()? {
             let epoch = c.u64()?;
             h.outcomes.push((epoch, c.string()?));
+        }
+        // M132: and here, no `keys_since`. ⚠️ M131 stopped here without checking for the end,
+        // so it reads a HEAD that has one (and drops it on re-commit).
+        if c.at_end() {
+            return Ok(h);
+        }
+        h.keys_since = Some(c.u64()?);
+        if !c.at_end() {
+            return Err(EngineError::CorruptHead);
         }
         Ok(h)
     }
@@ -1644,11 +1662,54 @@ mod tests {
             hex(&Head {
                 externals: BTreeMap::new(),
                 outcomes: Vec::new(),
+                keys_since: None,
                 ..sample()
             }
             .encode()),
             hex(&sample().encode())
         );
+        Ok(())
+    }
+
+    /// M132 criterion 10: `keys_since` round-trips; without it a HEAD encodes as M131's, and
+    /// with it the M131 bytes are a prefix, so M131's decoder -- which stopped after the
+    /// outcome list without checking for the end -- reads it. A cut inside it is refused.
+    #[test]
+    fn keys_since_round_trips_after_the_m131_bytes() -> Result<(), EngineError> {
+        for outcomes in [vec![], vec![(3, "o3".to_owned()), (5, "o5".to_owned())]] {
+            let m131 = Head {
+                outcomes: outcomes.clone(),
+                ..sample()
+            };
+            let with = Head {
+                keys_since: Some(4),
+                ..m131.clone()
+            };
+            let bytes = with.encode();
+            assert_eq!(Head::decode(&bytes)?, with);
+            if outcomes.is_empty() {
+                // Its empty optional sections are forced before it, then the field.
+                let back = Head::decode(&bytes)?;
+                assert!(back.outcomes.is_empty());
+            } else {
+                let old = m131.encode();
+                assert_eq!(
+                    hex(bytes.get(..old.len()).ok_or(EngineError::CorruptHead)?),
+                    hex(&old)
+                );
+                assert_eq!(bytes.len(), old.len() + 8);
+                assert_eq!(Head::decode(&old)?.keys_since, None);
+                for cut in old.len() + 1..bytes.len() {
+                    assert!(
+                        Head::decode(bytes.get(..cut).ok_or(EngineError::CorruptHead)?).is_err(),
+                        "a cut at {cut} decoded"
+                    );
+                }
+                let mut longer = bytes.clone();
+                longer.push(0);
+                assert!(Head::decode(&longer).is_err());
+            }
+        }
         Ok(())
     }
 

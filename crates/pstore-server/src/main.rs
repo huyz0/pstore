@@ -165,8 +165,10 @@ async fn run<S: BlobStore + 'static>(
     // that folds it. Any other value, or none, leaves it refused.
     // M129: `1` serves applied writes; M130: `2` also serves their affected ids.
     let applied = std::env::var("PSTORE_APPLIED_WRITES");
-    api.set_applied_writes(matches!(applied.as_deref(), Ok("1" | "2")));
-    api.set_affected_ids(applied.as_deref() == Ok("2"));
+    api.set_applied_writes(matches!(applied.as_deref(), Ok("1" | "2" | "3")));
+    api.set_affected_ids(matches!(applied.as_deref(), Ok("2" | "3")));
+    // M132: idempotency keys need every node at level 3.
+    api.set_idempotency(applied.as_deref() == Ok("3"));
     // M54: a query's vector legs split across the servers PSTORE_PEERS names.
     if let Err(e) = api.set_peers(config.peers.clone()) {
         eprintln!("pstore-server: refusing to serve: {e}");

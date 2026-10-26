@@ -19,6 +19,9 @@ const MAGIC: &[u8; 8] = b"PSTOREOC";
 /// `$req` whatever its value, so it never seals one.
 const IDS: &str = ":ids";
 
+/// What separates a stamp's request from its idempotency key (M132).
+const KEY: char = ';';
+
 /// An applied request's id: 128 random bits, drawn by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u128);
@@ -77,6 +80,71 @@ pub enum Applied {
     /// A commit in the request's window fell off HEAD's list or was reaped. The request
     /// was applied; what it did cannot be reported.
     Unavailable,
+    /// M132: another attempt of the request's key won it, and this one applied nothing. Its
+    /// outcome, summed over the listed commits after the key's `e0`; `None` when HEAD no
+    /// longer covers the key or an object was reaped.
+    Replayed(Option<(Outcome, Option<Affected>)>),
+    /// M132: the fold could not prove no other attempt of the key applied, and this one
+    /// applied nothing.
+    Expired,
+    /// M132: part of the attempt was refused as expired, and part applied, or may have.
+    Partial,
+}
+
+/// An idempotency key (M132): the epoch it was issued at, and 128 random bits. Spelled
+/// `<e0>-<32 lowercase hex>`, `e0` in decimal without leading zeros.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    e0: u64,
+    random: u128,
+}
+
+impl IdempotencyKey {
+    /// The key issued at `e0` with these random bits.
+    #[must_use]
+    pub const fn new(e0: u64, random: u128) -> Self {
+        Self { e0, random }
+    }
+
+    /// The epoch the key was issued at.
+    #[must_use]
+    pub const fn e0(&self) -> u64 {
+        self.e0
+    }
+
+    /// The key `s` spells, if it spells one exactly as [`std::fmt::Display`] writes it.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let (e0, hex) = s.split_once('-')?;
+        let digits = |t: &str, f: fn(&u8) -> bool| !t.is_empty() && t.as_bytes().iter().all(f);
+        if !digits(e0, u8::is_ascii_digit) || (e0.len() > 1 && e0.starts_with('0')) {
+            return None;
+        }
+        if hex.len() != 32 || !digits(hex, |b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+            return None;
+        }
+        Some(Self {
+            e0: e0.parse().ok()?,
+            random: u128::from_str_radix(hex, 16).ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{:032x}", self.e0, self.random)
+    }
+}
+
+/// What a commit decided for one attempt of a key (M132).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The attempt holds the key: its operations proceed.
+    Won,
+    /// Another attempt, named, holds the key: its operations were discarded.
+    Duplicate(String),
+    /// No winner is listed and HEAD does not cover the key: its operations were discarded.
+    Expired,
 }
 
 /// Where an applied request stood before its flush: the lower bound of its window.
@@ -84,17 +152,42 @@ pub enum Applied {
 pub struct Mark(pub(crate) u64);
 
 tokio::task_local! {
-    static APPLYING: (OperationId, bool);
+    static APPLYING: (OperationId, bool, Option<IdempotencyKey>);
 }
 
 /// Runs `f` with every operation it buffers stamped as `op`'s (M129).
 pub async fn applying<F: std::future::Future>(op: OperationId, f: F) -> F::Output {
-    APPLYING.scope((op, false), f).await
+    APPLYING.scope((op, false, None), f).await
 }
 
 /// As [`applying`], and the fold also records the ids `op` changes (M130).
 pub async fn applying_with_ids<F: std::future::Future>(op: OperationId, f: F) -> F::Output {
-    APPLYING.scope((op, true), f).await
+    APPLYING.scope((op, true, None), f).await
+}
+
+/// As [`applying`] (or [`applying_with_ids`] when `ids`), for an attempt of `key` (M132): of
+/// the attempts carrying one key, the fold applies at most one.
+pub async fn keyed<F: std::future::Future>(
+    op: OperationId,
+    key: &IdempotencyKey,
+    ids: bool,
+    f: F,
+) -> F::Output {
+    APPLYING.scope((op, ids, Some(*key)), f).await
+}
+
+/// Runs `f` stamped as `op`'s when there is one, as [`keyed`] (with `ids`) does; else
+/// unstamped.
+pub async fn stamped<F: std::future::Future>(
+    op: Option<OperationId>,
+    ids: bool,
+    key: Option<&IdempotencyKey>,
+    f: F,
+) -> F::Output {
+    match op {
+        Some(op) => APPLYING.scope((op, ids, key.copied()), f).await,
+        None => f.await,
+    }
 }
 
 /// Which kind of change an operation made, for the tally.
@@ -122,14 +215,18 @@ impl Kind {
 /// the fold resolves it against the current version. That is what makes `deleted` mean a
 /// version existed.
 pub(crate) fn stamp(docs: &mut [Document], tombstone: impl Fn(&Document) -> bool) {
-    let Ok((op, ids)) = APPLYING.try_with(|a| *a) else {
+    let Ok((op, ids, key)) = APPLYING.try_with(|a| *a) else {
         return;
     };
-    let id = Value::Str(if ids {
-        format!("{}{IDS}", op.hex())
-    } else {
-        op.hex()
-    });
+    let mut id = op.hex();
+    if ids {
+        id.push_str(IDS);
+    }
+    if let Some(k) = key {
+        id.push(KEY);
+        id.push_str(&k.to_string());
+    }
+    let id = Value::Str(id);
     for d in docs {
         if !d.attrs.contains_key(crate::OP_ATTR) {
             let code = if tombstone(d) {
@@ -155,11 +252,25 @@ pub(crate) fn req_of(d: &Document) -> Option<&str> {
 /// in one index takes back only that index's changes.
 type IdCounts = [BTreeMap<String, u64>; 3];
 
-/// One commit's decisions: per request, its outcome, and, for those that asked, its ids.
+/// One commit's decisions: per request, its outcome, and, for those that asked, its ids; and
+/// per keyed attempt it decided (M132), its key and the verdict.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Decided {
     pub(crate) counts: BTreeMap<String, Outcome>,
     pub(crate) ids: BTreeMap<String, Affected>,
+    pub(crate) keys: BTreeMap<String, (String, Verdict)>,
+}
+
+impl Decided {
+    /// Per key, the attempt this commit names as its winner (M132): one it let win, or the
+    /// one it refused a duplicate for.
+    pub(crate) fn winners(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.keys.iter().filter_map(|(attempt, (key, v))| match v {
+            Verdict::Won => Some((key.as_str(), attempt.as_str())),
+            Verdict::Duplicate(w) => Some((key.as_str(), w.as_str())),
+            Verdict::Expired => None,
+        })
+    }
 }
 
 /// One fold attempt's tally: per request, its outcome; per index and id, the stamped
@@ -170,14 +281,23 @@ pub(crate) struct Tally {
     /// M130: only for requests whose stamp asked.
     ids: BTreeMap<String, IdCounts>,
     touched: BTreeMap<String, Vec<(String, Kind)>>,
+    /// M132: the keyed attempts this fold attempt decided.
+    keys: BTreeMap<String, (String, Verdict)>,
 }
 
 /// A stamp's request id, and whether it asked for ids.
 fn parse(stamp: &str) -> (&str, bool) {
+    let stamp = stamp.split_once(KEY).map_or(stamp, |(s, _)| s);
     match stamp.strip_suffix(IDS) {
         Some(hex) => (hex, true),
         None => (stamp, false),
     }
+}
+
+/// A stamp's request id and idempotency key, if it carries one (M132).
+pub(crate) fn key_of(stamp: &str) -> Option<(&str, IdempotencyKey)> {
+    let (_, key) = stamp.split_once(KEY)?;
+    Some((parse(stamp).0, IdempotencyKey::parse(key)?))
 }
 
 impl Tally {
@@ -226,6 +346,11 @@ impl Tally {
         }
     }
 
+    /// M132: what this attempt decided for `attempt` of `key`.
+    pub(crate) fn decided(&mut self, attempt: &str, key: &IdempotencyKey, v: Verdict) {
+        self.keys.insert(attempt.to_owned(), (key.to_string(), v));
+    }
+
     /// The row `id` resolved to was set aside, so its id is left untouched: every stamped
     /// change this fold made to it is undone, and counts as rejected.
     pub(crate) fn set_aside(&mut self, id: &str) {
@@ -268,6 +393,7 @@ impl Tally {
         Decided {
             counts: std::mem::take(&mut self.by_req),
             ids,
+            keys: std::mem::take(&mut self.keys),
         }
     }
 
@@ -277,8 +403,124 @@ impl Tally {
     }
 }
 
+/// Notes each keyed attempt among `docs` not yet in `keyed`, in order (M132).
+pub(crate) fn note_keys(docs: &[Document], keyed: &mut Vec<(String, IdempotencyKey)>) {
+    for (a, k) in docs.iter().filter_map(|d| req_of(d).and_then(key_of)) {
+        if !keyed.iter().any(|(seen, _)| seen == a) {
+            keyed.push((a.to_owned(), k));
+        }
+    }
+}
+
+/// Decides every key a fold attempt met, in its order, against the outcome objects HEAD lists
+/// and HEAD's horizon (`mutation-completion.md` §9.3), records the verdicts in `tally`, and
+/// discards from `by_index` every operation of an attempt that did not win, counting it
+/// `rejected`. Whether any was discarded.
+pub(crate) fn decide(
+    keyed: Vec<(String, IdempotencyKey)>,
+    listed: &[std::sync::Arc<Decided>],
+    horizon: u64,
+    tally: &mut Tally,
+    by_index: &mut BTreeMap<String, Vec<Document>>,
+) -> bool {
+    let mut winners: BTreeMap<String, String> = BTreeMap::new();
+    for d in listed {
+        for (k, w) in d.winners() {
+            winners.insert(k.to_owned(), w.to_owned());
+        }
+    }
+    let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
+    for (a, k) in keyed {
+        let v = match winners.get(&k.to_string()) {
+            Some(w) if *w == a => Verdict::Won,
+            Some(w) => Verdict::Duplicate(w.clone()),
+            None if k.e0() >= horizon => {
+                winners.insert(k.to_string(), a.clone());
+                Verdict::Won
+            }
+            None => Verdict::Expired,
+        };
+        tally.decided(&a, &k, v.clone());
+        verdicts.insert(a, v);
+    }
+    let mut discarded = false;
+    for docs in by_index.values_mut() {
+        docs.retain(|d| {
+            let keep = req_of(d)
+                .and_then(key_of)
+                .is_none_or(|(a, _)| verdicts.get(a) == Some(&Verdict::Won));
+            if !keep {
+                tally.rejected(d);
+                discarded = true;
+            }
+            keep
+        });
+    }
+    by_index.retain(|_, docs| !docs.is_empty());
+    discarded
+}
+
+/// What a keyed waiter's own records say (M132): its answer, or that it must sum the named
+/// winner.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Own {
+    Answer(Applied),
+    Replay(String),
+}
+
+/// A keyed waiter's answer from its own window (`mutation-completion.md` §9.4): `own` are the
+/// listed commits after its mark, `None` where one was reaped, and `fallen` whether the window
+/// reaches past the list. ⚠️ Read even when the window fell (round-2 spec review): the
+/// refusing commit is the newest, so it is still listed.
+pub(crate) fn own_answer(me: &str, fallen: bool, own: Vec<Option<std::sync::Arc<Decided>>>) -> Own {
+    let lost = fallen || own.iter().any(Option::is_none);
+    let own: Vec<std::sync::Arc<Decided>> = own.into_iter().flatten().collect();
+    let verdicts: Vec<&Verdict> = own
+        .iter()
+        .filter_map(|c| c.keys.get(me).map(|(_, v)| v))
+        .collect();
+    if verdicts.contains(&&Verdict::Expired) {
+        let (o, _) = sum(me, own.iter().map(|c| &**c));
+        let applied = o.upserted + o.deleted + o.patched + o.skipped;
+        return Own::Answer(if lost || applied > 0 {
+            Applied::Partial
+        } else {
+            Applied::Expired
+        });
+    }
+    if let Some(Verdict::Duplicate(w)) = verdicts
+        .into_iter()
+        .find(|v| matches!(v, Verdict::Duplicate(_)))
+    {
+        return Own::Replay(w.clone());
+    }
+    if lost {
+        return Own::Answer(Applied::Unavailable);
+    }
+    let (outcome, ids) = sum(me, own.iter().map(|c| &**c));
+    Own::Answer(Applied::Known(outcome, ids))
+}
+
+/// The winner `w`'s outcome, summed over `theirs` (the listed commits after the key's `e0`),
+/// when HEAD covers the key and none was reaped (M132).
+pub(crate) fn replay(
+    w: &str,
+    covered: bool,
+    theirs: Vec<Option<std::sync::Arc<Decided>>>,
+) -> Applied {
+    Applied::Replayed(
+        theirs
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .filter(|_| covered)
+            .map(|c| sum(w, c.iter().map(|c| &**c))),
+    )
+}
+
 /// Encodes one commit's outcomes: M129's layout, then, only if a request asked for its ids,
 /// a trailing ids section (M130) an M129 decoder never meets -- ids need every node at M130.
+/// Then, only if the commit decided a key, a keys section (M132), which forces the ids
+/// section, empty if need be; an M130 decoder refuses it, so keys need every node at M132.
 pub(crate) fn encode(d: &Decided) -> Vec<u8> {
     fn str(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -292,7 +534,7 @@ pub(crate) fn encode(d: &Decided) -> Vec<u8> {
             out.extend_from_slice(&n.to_le_bytes());
         }
     }
-    if !d.ids.is_empty() {
+    if !d.ids.is_empty() || !d.keys.is_empty() {
         out.extend_from_slice(&(d.ids.len() as u32).to_le_bytes());
         for (req, a) in &d.ids {
             str(&mut out, req);
@@ -301,6 +543,21 @@ pub(crate) fn encode(d: &Decided) -> Vec<u8> {
                 for id in l {
                     str(&mut out, id);
                 }
+            }
+        }
+    }
+    if !d.keys.is_empty() {
+        out.extend_from_slice(&(d.keys.len() as u32).to_le_bytes());
+        for (attempt, (key, v)) in &d.keys {
+            str(&mut out, attempt);
+            str(&mut out, key);
+            match v {
+                Verdict::Won => out.push(0),
+                Verdict::Duplicate(w) => {
+                    out.push(1);
+                    str(&mut out, w);
+                }
+                Verdict::Expired => out.push(2),
             }
         }
     }
@@ -343,6 +600,21 @@ pub(crate) fn decode(body: &[u8]) -> Result<Decided, EngineError> {
                 patched: list()?,
             };
             out.ids.insert(req, a);
+        }
+    }
+    // M132: and the end of the buffer here is no keys section.
+    if !c.0.is_empty() {
+        let n = c.u32().ok_or_else(bad)?;
+        for _ in 0..n {
+            let attempt = c.str().ok_or_else(bad)?;
+            let key = c.str().ok_or_else(bad)?;
+            let v = match c.take(1).ok_or_else(bad)? {
+                [0] => Verdict::Won,
+                [1] => Verdict::Duplicate(c.str().ok_or_else(bad)?),
+                [2] => Verdict::Expired,
+                _ => return Err(bad()),
+            };
+            out.keys.insert(attempt, (key, v));
         }
     }
     if !c.0.is_empty() {
@@ -440,11 +712,12 @@ mod tests {
         for d in [
             Decided {
                 counts: counts(),
-                ids: BTreeMap::new(),
+                ..Decided::default()
             },
             Decided {
                 counts: counts(),
                 ids,
+                ..Decided::default()
             },
         ] {
             let body = encode(&d);
@@ -489,6 +762,7 @@ mod tests {
     #[test]
     fn every_truncation_is_refused() {
         let d = Decided {
+            keys: BTreeMap::new(),
             counts: counts(),
             ids: BTreeMap::from([(
                 "ab".to_owned(),
@@ -508,6 +782,71 @@ mod tests {
         assert!(decode(b"NOTOUTCM").is_err());
     }
 
+    /// M132 criterion 10: an object with keys round-trips; it is M130's bytes and then the
+    /// keys section; and every cut is refused except at a section boundary, which decodes as
+    /// the older format with nothing claimed about keys.
+    #[test]
+    fn keys_round_trip_after_the_m130_bytes() {
+        let keys = BTreeMap::from([
+            ("a1".to_owned(), ("1-ab".to_owned(), Verdict::Won)),
+            (
+                "a2".to_owned(),
+                ("1-ab".to_owned(), Verdict::Duplicate("a1".to_owned())),
+            ),
+            ("a3".to_owned(), ("2-cd".to_owned(), Verdict::Expired)),
+        ]);
+        for ids in [
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "a1".to_owned(),
+                Affected {
+                    upserted: vec!["x".to_owned()],
+                    deleted: vec![],
+                    patched: vec![],
+                },
+            )]),
+        ] {
+            let m130 = Decided {
+                counts: counts(),
+                ids: ids.clone(),
+                ..Decided::default()
+            };
+            let d = Decided {
+                keys: keys.clone(),
+                ..m130.clone()
+            };
+            let body = encode(&d);
+            assert_eq!(decode(&body).unwrap(), d);
+            // The ids section is forced, empty if need be; the rest is M130's.
+            let mut old = encode(&m130);
+            if ids.is_empty() {
+                old.extend_from_slice(&0u32.to_le_bytes());
+            }
+            assert!(body.starts_with(&old));
+            let m129 = 8 + 4 + 4 + 2 + 5 * 8;
+            for cut in (0..body.len()).filter(|&c| c != m129 && c != old.len()) {
+                assert!(decode(&body[..cut]).is_err(), "a cut at {cut} decoded");
+            }
+            assert!(decode(&body[..old.len()]).unwrap().keys.is_empty());
+            let mut bad = body.clone();
+            // The last verdict's byte (`a3`, expired) as an unknown verdict.
+            *bad.last_mut().unwrap() = 3;
+            assert!(decode(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn a_stamp_carries_its_key() {
+        let k = IdempotencyKey::new(7, 0xab);
+        let stamp = format!("{}{IDS}{KEY}{k}", OperationId(1).hex());
+        assert_eq!(key_of(&stamp), Some((OperationId(1).hex().as_str(), k)));
+        assert_eq!(parse(&stamp), (OperationId(1).hex().as_str(), true));
+        let plain = format!("{}{KEY}{k}", OperationId(1).hex());
+        assert_eq!(parse(&plain), (OperationId(1).hex().as_str(), false));
+        assert_eq!(key_of(&OperationId(1).hex()), None);
+        assert_eq!(key_of(&format!("{}{KEY}junk", OperationId(1).hex())), None);
+    }
+
     /// M130 criterion 3: an object an M129 node wrote, spelled out byte by byte.
     #[test]
     fn an_m129_outcome_object_decodes() {
@@ -524,7 +863,7 @@ mod tests {
         // And a commit with no id-asking request is written exactly so.
         let m129 = Decided {
             counts: counts(),
-            ids: BTreeMap::new(),
+            ..Decided::default()
         };
         assert_eq!(encode(&m129), body);
     }

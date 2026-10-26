@@ -82,9 +82,15 @@ Not done:
    commits, and when there were fewer than 32 it asserts that every replay has counts.
 4. **Survives restart.** The retry of criterion 1, served by a new engine on the same store
    with empty caches, answers the same.
-5. **Expiry is a refusal, at the exact boundary.** A key is issued and its first attempt is
-   committed at `e0 + 1`. After 31 more tallying commits a retry is replayed. After 32 a
-   retry is refused `idempotency_expired`, and the row it would write does not exist.
+5. **Expiry is a refusal.** A key is issued and its first attempt is committed at `e0 + 1`.
+   After 30 more tallying commits, a retry is replayed with the winner's counts; its own
+   commit is the 32nd listed. A second retry is replayed with `outcome_unavailable`: it is
+   decided while the winner is listed, but its own commit drops the winner's. Once 32
+   further tallying commits leave no listed record naming the winner, a retry is refused
+   `idempotency_expired`, and the row it would write does not exist. *(Amended during
+   implementation: the first draft said "after 31 replayed, after 32 refused". That draft
+   missed that a retry's own commit is tallying, and that a duplicate's record keeps naming
+   the winner.)*
 6. **A stale key never applies.** A key issued and then left unused through 33 tallying
    commits is refused `idempotency_expired` on first use, and its row does not exist. A key
    left unused through 32 is still accepted. Its `e0 + 1` is then the oldest listed epoch.

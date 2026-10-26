@@ -225,7 +225,7 @@ impl<S: BlobStore> Engine<S> {
             if change(&at.head, &mut next)?.is_none() {
                 return Ok(at.head.epoch);
             }
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.remember_schemas(&next);
@@ -661,7 +661,7 @@ impl<S: BlobStore> Engine<S> {
             if let Some(f) = interfere.take() {
                 f.await;
             }
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);

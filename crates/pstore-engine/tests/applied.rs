@@ -35,7 +35,7 @@ fn doc(id: &str, n: i64) -> Document {
 fn known(a: Applied) -> Outcome {
     match a {
         Applied::Known(o, _) => o,
-        Applied::Unavailable => panic!("an outcome reported unavailable"),
+        other => panic!("not a known outcome: {other:?}"),
     }
 }
 

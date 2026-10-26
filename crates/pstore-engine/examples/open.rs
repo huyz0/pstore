@@ -205,6 +205,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 quarantine: Default::default(),
                 externals: Default::default(),
                 outcomes: Vec::new(),
+                keys_since: None,
             };
             store
                 .put(

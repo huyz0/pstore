@@ -9,7 +9,8 @@ pub mod lanes;
 mod replica;
 
 pub use applied::{
-    Affected, Applied, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying, applying_with_ids,
+    Affected, Applied, IdempotencyKey, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying,
+    applying_with_ids, keyed, stamped,
 };
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
@@ -234,8 +235,51 @@ struct Observed {
     /// This engine's lane's watermark in it.
     watermark: u64,
     outcomes: Vec<(u64, String)>,
+    /// M132: its `keys_since`.
+    keys_since: Option<u64>,
     /// When it was read or committed; `None` before the first.
     at: Option<tokio::time::Instant>,
+}
+
+/// ⚠️ Whether a full list whose oldest is past `mark` may have dropped a commit in the
+/// window `(mark, seen.epoch]`.
+fn fallen(seen: &Observed, mark: Mark) -> bool {
+    seen.outcomes.len() >= applied::OUTCOMES_KEPT
+        && seen.outcomes.first().is_some_and(|(e, _)| *e > mark.0 + 1)
+}
+
+/// M132: `next` with `keys_since` set to `init` when it has none; borrowed otherwise.
+fn initialised(next: &Head, init: Option<u64>) -> std::borrow::Cow<'_, Head> {
+    match init {
+        Some(e) if next.keys_since.is_none() => {
+            let mut next = next.clone();
+            next.keys_since = Some(e);
+            std::borrow::Cow::Owned(next)
+        }
+        _ => std::borrow::Cow::Borrowed(next),
+    }
+}
+
+/// M129: lists the outcome object `written`, if any, on `next`; the oldest listed falls off
+/// and is buried. M132: `keys_since` is first set to `init` when it has none, and raised to
+/// the epoch of every entry that falls off.
+fn list_outcome(next: &mut Head, init: Option<u64>, written: Option<String>) {
+    if next.keys_since.is_none() {
+        next.keys_since = init;
+    }
+    let Some(key) = written else {
+        return;
+    };
+    next.outcomes.push((next.epoch.0, key));
+    while next.outcomes.len() > applied::OUTCOMES_KEPT {
+        let (dropped, old) = next.outcomes.remove(0);
+        // ⚠️ M132: raised by every fold, whatever its flag (spec review M1): a dropped entry
+        // left uncovered would let its key's retry win again.
+        if let Some(since) = &mut next.keys_since {
+            *since = (*since).max(dropped);
+        }
+        next.graveyard.entry(next.epoch.0).or_default().push(old);
+    }
 }
 
 /// How old an engine's newest HEAD may be for [`Engine::mark`] to use it unread (M129).
@@ -1729,6 +1773,8 @@ pub struct Engine<S> {
     observed: Mutex<Observed>,
     /// M129: outcome objects this engine wrote or read, by key; a few dozen at most.
     outcome_cache: Mutex<BTreeMap<String, Arc<applied::Decided>>>,
+    /// M132: this engine initialises HEAD's `keys_since` on every commit.
+    keys_on: std::sync::atomic::AtomicBool,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
     /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
@@ -1877,6 +1923,7 @@ impl<S: BlobStore> Engine<S> {
             mark_gate: tokio::sync::Mutex::new(()),
             observed: Mutex::new(Observed::default()),
             outcome_cache: Mutex::new(BTreeMap::new()),
+            keys_on: std::sync::atomic::AtomicBool::new(false),
             fresh: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
             // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
@@ -2287,17 +2334,22 @@ impl<S: BlobStore> Engine<S> {
                 epoch: h.epoch.0,
                 watermark: h.watermarks.get(&self.lane.0).copied().unwrap_or(0),
                 outcomes: h.outcomes.clone(),
+                keys_since: h.keys_since,
                 at: Some(tokio::time::Instant::now()),
             };
         }
     }
 
     fn cache_outcomes(&self, key: String, outcomes: applied::Decided) {
+        self.cache_shared(key, Arc::new(outcomes));
+    }
+
+    fn cache_shared(&self, key: String, outcomes: Arc<applied::Decided>) {
         let mut c = self
             .outcome_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        c.insert(key, Arc::new(outcomes));
+        c.insert(key, outcomes);
         // Bounded: twice what HEAD lists, oldest key (lowest epoch) first.
         while c.len() > 2 * applied::OUTCOMES_KEPT {
             c.pop_first();
@@ -2315,36 +2367,137 @@ impl<S: BlobStore> Engine<S> {
     /// As [`Self::fold`]; and an outcome object that cannot be read for a reason other than
     /// its absence.
     pub async fn await_applied(&self, mark: Mark, op: OperationId) -> Result<Applied, EngineError> {
-        let Some(target) = self.next_seq() else {
+        let Some((_gate, seen)) = self.caught_up().await? else {
             // Nothing was ever flushed here, so nothing of `op`'s was.
             return Ok(Applied::Known(Outcome::default(), None));
         };
-        // ⚠️ Held through the outcome reads too (code review): waiters released one at a time
-        // and reading after would each miss the cache and read the same object.
-        let _gate = self.fold_gate.lock().await;
-        {
-            let mut attempts = 0;
-            while self.observed().watermark < target {
-                if attempts == MAX_COMMIT_ATTEMPTS {
-                    return Err(EngineError::Lost);
-                }
-                attempts += 1;
-                self.fold().await?;
-            }
-        }
-        let seen = self.observed().clone();
-        // ⚠️ A full list whose oldest is past the mark may have dropped a commit in the window.
-        if seen.outcomes.len() >= applied::OUTCOMES_KEPT
-            && seen.outcomes.first().is_some_and(|(e, _)| *e > mark.0 + 1)
-        {
+        if fallen(&seen, mark) {
             return Ok(Applied::Unavailable);
         }
-        let window: Vec<&String> = seen
+        let window = self.window(&seen, mark.0).await?;
+        let Some(commits) = window.into_iter().collect::<Option<Vec<_>>>() else {
+            // Reaped: the request was applied, and what it did can no longer be read.
+            return Ok(Applied::Unavailable);
+        };
+        let (outcome, ids) = applied::sum(&op.hex(), commits.iter().map(|c| &**c));
+        Ok(Applied::Known(outcome, ids))
+    }
+
+    /// [`Self::await_keyed`] when `key` is set, else [`Self::await_applied`].
+    ///
+    /// # Errors
+    /// As [`Self::await_applied`].
+    pub async fn await_outcome(
+        &self,
+        mark: Mark,
+        op: OperationId,
+        key: Option<&IdempotencyKey>,
+    ) -> Result<Applied, EngineError> {
+        match key {
+            Some(k) => self.await_keyed(mark, op, k).await,
+            None => self.await_applied(mark, op).await,
+        }
+    }
+
+    /// As [`Self::await_applied`], for an attempt of `key` (M132): its own outcome if it won
+    /// the key, the winner's if another attempt did, or a refusal (`mutation-completion.md`
+    /// §9.4).
+    ///
+    /// # Errors
+    /// As [`Self::await_applied`].
+    pub async fn await_keyed(
+        &self,
+        mark: Mark,
+        op: OperationId,
+        key: &IdempotencyKey,
+    ) -> Result<Applied, EngineError> {
+        let Some((_gate, seen)) = self.caught_up().await? else {
+            return Ok(Applied::Known(Outcome::default(), None));
+        };
+        // ⚠️ M132: a keyed waiter reads its own records even when its window fell off (round-2
+        // spec review): its refusing commit is the newest, so it is still listed.
+        let own = self.window(&seen, mark.0).await?;
+        match applied::own_answer(&op.hex(), fallen(&seen, mark), own) {
+            applied::Own::Answer(a) => Ok(a),
+            applied::Own::Replay(w) => {
+                // Every commit of the winner is after `e0`, and listed while HEAD covers it.
+                let covered = seen.keys_since.unwrap_or(seen.epoch) <= key.e0();
+                let theirs = self.window(&seen, key.e0()).await?;
+                Ok(applied::replay(&w, covered, theirs))
+            }
+        }
+    }
+
+    /// Folds until a HEAD covers everything this engine has flushed, and returns that HEAD as
+    /// seen with the fold gate still held; `None` if nothing was ever flushed here.
+    ///
+    /// ⚠️ The gate is held through the outcome reads too (code review): waiters released one
+    /// at a time and reading after would each miss the cache and read the same object.
+    async fn caught_up(
+        &self,
+    ) -> Result<Option<(tokio::sync::MutexGuard<'_, ()>, Observed)>, EngineError> {
+        let Some(target) = self.next_seq() else {
+            return Ok(None);
+        };
+        let gate = self.fold_gate.lock().await;
+        let mut attempts = 0;
+        while self.observed().watermark < target {
+            if attempts == MAX_COMMIT_ATTEMPTS {
+                return Err(EngineError::Lost);
+            }
+            attempts += 1;
+            self.fold().await?;
+        }
+        let seen = self.observed().clone();
+        Ok(Some((gate, seen)))
+    }
+
+    /// M132: decides every keyed attempt of a fold against `head` (`mutation-completion.md`
+    /// §9.3), and whether any operation was discarded; `None` when an object `head` lists is
+    /// gone, so the fold must read HEAD again.
+    async fn decide_keys(
+        &self,
+        head: &Head,
+        keyed: Vec<(String, applied::IdempotencyKey)>,
+        tally: &mut applied::Tally,
+        by_index: &mut BTreeMap<String, Vec<Document>>,
+    ) -> Result<Option<bool>, EngineError> {
+        if keyed.is_empty() {
+            return Ok(Some(false));
+        }
+        let listed: Vec<String> = head.outcomes.iter().map(|(_, k)| k.clone()).collect();
+        let read = self.outcomes_read(&listed).await?;
+        let Some(loaded) = read.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        let horizon = head.keys_since.unwrap_or(head.epoch.0);
+        Ok(Some(applied::decide(
+            keyed, &loaded, horizon, tally, by_index,
+        )))
+    }
+
+    /// The outcome objects `seen` lists with an epoch in `(after, seen.epoch]`, oldest first;
+    /// `None` for one that was reaped.
+    async fn window(
+        &self,
+        seen: &Observed,
+        after: u64,
+    ) -> Result<Vec<Option<Arc<applied::Decided>>>, EngineError> {
+        let keys: Vec<String> = seen
             .outcomes
             .iter()
-            .filter(|(e, _)| *e > mark.0 && *e <= seen.epoch)
-            .map(|(_, k)| k)
+            .filter(|(e, _)| *e > after && *e <= seen.epoch)
+            .map(|(_, k)| k.clone())
             .collect();
+        self.outcomes_read(&keys).await
+    }
+
+    /// The outcome objects named `keys`, through the engine's cache, the rest read in one
+    /// parallel round; `None` for one that is absent.
+    async fn outcomes_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Option<Arc<applied::Decided>>>, EngineError> {
         let cached = |k: &str| {
             self.outcome_cache
                 .lock()
@@ -2352,31 +2505,70 @@ impl<S: BlobStore> Engine<S> {
                 .get(k)
                 .cloned()
         };
-        // One parallel round for whatever this engine has not seen.
         let fetched =
-            futures_util::future::try_join_all(window.iter().filter(|k| cached(k).is_none()).map(
+            futures_util::future::try_join_all(keys.iter().filter(|k| cached(k).is_none()).map(
                 |k| async move {
-                    match self.store.get(&Key::new((*k).clone())).await {
-                        Ok(body) => applied::decode(&body).map(|o| Some(((*k).clone(), o))),
+                    match self.store.get(&Key::new(k.clone())).await {
+                        Ok(body) => applied::decode(&body).map(|o| Some((k.clone(), o))),
                         Err(pstore_blob::BlobError::NotFound(_)) => Ok(None),
                         Err(e) => Err(EngineError::from(e)),
                     }
                 },
             ))
             .await?;
-        if fetched.iter().any(Option::is_none) {
-            // Reaped: the request was applied, and what it did can no longer be read.
-            return Ok(Applied::Unavailable);
-        }
+        let mut read: BTreeMap<String, Arc<applied::Decided>> = BTreeMap::new();
         for (k, o) in fetched.into_iter().flatten() {
-            self.cache_outcomes(k, o);
+            let o = Arc::new(o);
+            read.insert(k.clone(), Arc::clone(&o));
+            self.cache_shared(k, o);
         }
-        let commits: Vec<Arc<applied::Decided>> = window.iter().filter_map(|k| cached(k)).collect();
-        if commits.len() != window.len() {
-            return Ok(Applied::Unavailable);
+        Ok(keys
+            .iter()
+            .map(|k| read.get(k).cloned().or_else(|| cached(k)))
+            .collect())
+    }
+
+    /// M132: whether this engine initialises HEAD's `keys_since`.
+    fn keys_on(&self) -> bool {
+        self.keys_on.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Sets this engine for idempotency keys (M132): every commit it makes on a HEAD without
+    /// `keys_since` initialises it. The server sets it at `PSTORE_APPLIED_WRITES=3`, on every
+    /// node. ⚠️ Every M132 fold decides keys and raises `keys_since` whatever this says.
+    pub fn set_idempotency(&self, on: bool) {
+        self.keys_on.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A fresh idempotency key (M132), issued at this engine's mark: at most one HEAD read a
+    /// second, none per key.
+    ///
+    /// # Errors
+    /// As [`Self::mark`].
+    pub async fn idempotency_key(&self, random: u128) -> Result<IdempotencyKey, EngineError> {
+        Ok(IdempotencyKey::new(self.mark().await?.0, random))
+    }
+
+    /// Whether `key` may be used (M132): its `e0` is at most HEAD's epoch. HEAD is read only
+    /// when `e0` is past the newest this engine has seen. ⚠️ This is what keeps every commit
+    /// that folds an attempt above `e0`.
+    ///
+    /// # Errors
+    /// A HEAD read that fails.
+    pub async fn admit_key(&self, key: &IdempotencyKey) -> Result<bool, EngineError> {
+        if key.e0() <= self.observed().epoch {
+            return Ok(true);
         }
-        let (outcome, ids) = applied::sum(&op.hex(), commits.iter().map(|c| &**c));
-        Ok(Applied::Known(outcome, ids))
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.observe(&at.head);
+        Ok(key.e0() <= at.head.epoch.0)
+    }
+
+    /// Commits `next` on `at`. M132: an engine set for keys initialises `keys_since` on a HEAD
+    /// without it, with the epoch of the HEAD it read.
+    async fn commit_head(&self, at: &head::HeadAt, next: &Head) -> Result<Epoch, EngineError> {
+        let next = initialised(next, self.keys_on().then_some(at.head.epoch.0));
+        head::commit(&*self.store, self.tenant, at, &next).await
     }
 
     /// The last epoch this engine committed.
@@ -3800,7 +3992,7 @@ impl<S: BlobStore> Engine<S> {
                 .entry(next.epoch.0)
                 .or_default()
                 .extend(due.iter().map(|(k, _)| k.clone()));
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
@@ -3985,7 +4177,7 @@ impl<S: BlobStore> Engine<S> {
             if let Some(f) = interfere.take() {
                 f.await;
             }
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
@@ -4117,14 +4309,26 @@ impl<S: BlobStore> Engine<S> {
                     .await?;
 
             let mut by_index: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+            // M132: each keyed attempt once, in bundle order, which decides who wins a key.
+            let mut keyed: Vec<(String, applied::IdempotencyKey)> = Vec::new();
             for body in &bodies {
                 for (name, entry) in bundle::read_index(body)? {
-                    by_index
-                        .entry(name)
-                        .or_default()
-                        .extend(bundle::read_entry(body, &entry)?);
+                    let docs = bundle::read_entry(body, &entry)?;
+                    applied::note_keys(&docs, &mut keyed);
+                    by_index.entry(name).or_default().extend(docs);
                 }
             }
+            // ⚠️ **Keys are decided before any pass can apply or set aside an operation**, once
+            // for the whole fold and against exactly the HEAD this attempt CASes on (M132,
+            // `mutation-completion.md` §9.3). A discarded operation counts `rejected`.
+            let Some(discarded) = self
+                .decide_keys(&at.head, keyed, &mut tally, &mut by_index)
+                .await?
+            else {
+                // A listed object is gone, so a newer HEAD dropped it: this attempt's CAS
+                // would fail. Read HEAD again.
+                continue;
+            };
             // ⚠️ **Existence is decided here, on every attempt** (M9f.2): after the bundles are
             // read and before anything is sealed, so a missing index on the first attempt writes
             // nothing. Rows that are all deletes do not make an index exist, as queries decide.
@@ -4170,7 +4374,9 @@ impl<S: BlobStore> Engine<S> {
                     true
                 }
             });
-            if by_index.is_empty() && drop.is_none() && replica_rows.is_empty() {
+            // M132: a fold whose operations were all discarded still commits: its verdicts
+            // are what the attempts' waiters read, and its watermarks move past them.
+            if by_index.is_empty() && drop.is_none() && replica_rows.is_empty() && !discarded {
                 self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
@@ -4541,20 +4747,24 @@ impl<S: BlobStore> Engine<S> {
             // M129: one outcome object for every applied request this commit decides, listed in
             // HEAD; the oldest listed falls off and is buried.
             let outcomes = tally.take();
-            if !outcomes.counts.is_empty() {
-                let key = self
-                    .create_object(
+            let written = if outcomes.counts.is_empty() {
+                None
+            } else {
+                Some(
+                    self.create_object(
                         names,
                         self.outcome_key(next.epoch).as_str(),
                         bytes::Bytes::from(applied::encode(&outcomes)),
                     )
-                    .await?;
-                next.outcomes.push((next.epoch.0, key));
-                while next.outcomes.len() > applied::OUTCOMES_KEPT {
-                    let (_, old) = next.outcomes.remove(0);
-                    next.graveyard.entry(next.epoch.0).or_default().push(old);
-                }
-            }
+                    .await?,
+                )
+            };
+            // M132: initialised here, not in `commit_head`, so `observe(&next)` below sees it.
+            list_outcome(
+                &mut next,
+                self.keys_on().then_some(at.head.epoch.0),
+                written,
+            );
             if let Some(f) = interfere.take() {
                 f.await;
             }
@@ -4955,7 +5165,7 @@ impl<S: BlobStore> Engine<S> {
             for e in &due {
                 next.graveyard.remove(e);
             }
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     return Ok(doomed.len());
@@ -5181,7 +5391,7 @@ impl<S: BlobStore> Engine<S> {
             if bury_into(&mut next, keys) == 0 {
                 return;
             }
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
@@ -5421,7 +5631,7 @@ impl<S: BlobStore> Engine<S> {
             // manifest, the merge and its inputs together. The merge itself is live in `next`.
             bury_into(&mut next, &names.written);
 
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);

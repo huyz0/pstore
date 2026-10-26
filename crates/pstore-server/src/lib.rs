@@ -50,9 +50,9 @@ mod types;
 pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
-    Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IndexList, IndexSummary, ListParams,
-    MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest, QueryResponse, ResultRow, Schema,
-    TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
+    Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
+    IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest,
+    QueryResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -181,6 +181,8 @@ struct Registry {
     applied_writes: bool,
     /// `PSTORE_APPLIED_WRITES=2` (M130): every node writes and reads outcome ids.
     affected_ids: bool,
+    /// `PSTORE_APPLIED_WRITES=3` (M132): every node decides idempotency keys.
+    idempotency: bool,
     /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
     lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
@@ -637,6 +639,11 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/query", Read.on(post(query_index::<S>)))
             .route("/v1/indexes/{index}/warm", Read.on(post(warm_index::<S>)))
+            // M132: a key that makes an applied write's retry safe.
+            .route(
+                "/v1/indexes/{index}/idempotency-keys",
+                Write.on(post(issue_idempotency_key::<S>)),
+            )
             // M86: an external index, over the customer's own object.
             .route(
                 "/v1/indexes/{index}/external",
@@ -698,7 +705,10 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
-        let recheck = self.registry_mut().lane_recheck;
+        let (recheck, keys) = {
+            let r = self.registry_mut();
+            (r.lane_recheck, r.idempotency)
+        };
         let params = *self
             .index_params
             .lock()
@@ -723,6 +733,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 Some(p) => engine.with_index_params(p),
                 None => engine,
             };
+            engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
                 None => engine,
@@ -932,6 +943,14 @@ impl<S: BlobStore + 'static> Api<S> {
     /// an ids section.
     pub fn set_affected_ids(&self, on: bool) {
         self.registry_mut().affected_ids = on;
+    }
+
+    /// Whether an applied write may carry an `idempotency_key` (M132), and every engine
+    /// initialises HEAD's `keys_since`. ⚠️ **An operator's statement that every node runs
+    /// M132**: an older fold applies every attempt of a key, and an M130 waiter refuses an
+    /// outcome object with a keys section.
+    pub fn set_idempotency(&self, on: bool) {
+        self.registry_mut().idempotency = on;
     }
 
     /// Engines the registry holds.
@@ -1698,6 +1717,7 @@ async fn write_documents<S: BlobStore + 'static>(
             "affected_ids is not enabled on this deployment (PSTORE_APPLIED_WRITES=2)",
         ));
     }
+    let key = idempotency_key_of(&api, req.idempotency_key.as_deref(), applied)?;
     if let Some(src) = branch_source(&req, keys)? {
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
@@ -1815,6 +1835,7 @@ async fn write_documents<S: BlobStore + 'static>(
     }
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
+    admit(&engine, key.as_ref()).await?;
 
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
@@ -1859,11 +1880,8 @@ async fn write_documents<S: BlobStore + 'static>(
         }
         Ok::<_, ApiError>((written, patched, deleted))
     };
-    let (written, patched, deleted) = match op {
-        Some(op) if ids_wanted => pstore_engine::applying_with_ids(op, buffer).await?,
-        Some(op) => pstore_engine::applying(op, buffer).await?,
-        None => buffer.await?,
-    };
+    let (written, patched, deleted) =
+        pstore_engine::stamped(op, ids_wanted, key.as_ref(), buffer).await?;
     let durable = matches!(
         req.durability,
         types::Durability::Durable | types::Durability::Applied
@@ -1878,19 +1896,79 @@ async fn write_documents<S: BlobStore + 'static>(
         }
     }
     let outcome = match (op, mark) {
-        (Some(op), Some(mark)) => Some((op, engine.await_applied(mark, op).await?)),
+        (Some(op), Some(mark)) => Some((op, engine.await_outcome(mark, op, key.as_ref()).await?)),
         _ => None,
     };
+    let answer = applied_answer(outcome, ids_wanted)?;
     token.saw(engine.epoch().0);
     let session = token.encode();
+    Ok(with_session(
+        axum::Json(WriteResponse {
+            epoch: engine.epoch().0,
+            documents_written: written,
+            documents_deleted: deleted,
+            documents_patched: patched,
+            durable,
+            cost: api.spend(tenant).since(before),
+            session: session.clone(),
+            completion: answer.completion,
+            operation: answer.operation,
+            applied: answer.applied,
+            outcome_unavailable: answer.outcome_unavailable,
+            replayed: answer.replayed,
+        }),
+        &session,
+    ))
+}
+
+/// What an applied write's response says of its outcome (M129, M132).
+struct AppliedAnswer {
+    completion: Option<&'static str>,
+    operation: Option<String>,
+    applied: Option<Option<types::AppliedOut>>,
+    outcome_unavailable: Option<bool>,
+    replayed: Option<bool>,
+}
+
+/// The response fields for an applied write's outcome, or its refusal (M132): an attempt the
+/// fold refused applied nothing, or only part, and says so. ⚠️ Not generic over the store,
+/// so one test's instantiation covers it.
+fn applied_answer(
+    outcome: Option<(pstore_engine::OperationId, pstore_engine::Applied)>,
+    ids_wanted: bool,
+) -> Result<AppliedAnswer, ApiError> {
+    use pstore_engine::Applied;
+    match outcome.as_ref().map(|(_, a)| a) {
+        Some(Applied::Expired) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "idempotency_expired",
+                "this idempotency key's retention has passed and nothing of this write was \
+                 applied; send it again with a new key",
+            ));
+        }
+        Some(Applied::Partial) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "idempotency_partial",
+                "part of this write was refused as expired, and part was or may have been \
+                 applied; read the rows before sending it again",
+            ));
+        }
+        _ => {}
+    }
+    let replayed = outcome
+        .as_ref()
+        .is_some_and(|(_, a)| matches!(a, Applied::Replayed(_)))
+        .then_some(true);
     let completion = outcome.as_ref().map(|_| "applied");
     let operation = outcome.as_ref().map(|(op, _)| op.hex());
     let outcome_unavailable = outcome
         .as_ref()
-        .map(|(_, a)| *a == pstore_engine::Applied::Unavailable)
+        .map(|(_, a)| matches!(a, Applied::Unavailable | Applied::Replayed(None)))
         .filter(|u| *u);
     let applied = outcome.map(|(_, a)| match a {
-        pstore_engine::Applied::Known(o, ids) => Some(types::AppliedOut {
+        Applied::Known(o, ids) | Applied::Replayed(Some((o, ids))) => Some(types::AppliedOut {
             upserted: o.upserted,
             deleted: o.deleted,
             patched: o.patched,
@@ -1904,24 +1982,87 @@ async fn write_documents<S: BlobStore + 'static>(
                     patched: i.patched,
                 }),
         }),
-        pstore_engine::Applied::Unavailable => None,
+        Applied::Unavailable | Applied::Replayed(None) | Applied::Expired | Applied::Partial => {
+            None
+        }
     });
-    Ok(with_session(
-        axum::Json(WriteResponse {
-            epoch: engine.epoch().0,
-            documents_written: written,
-            documents_deleted: deleted,
-            documents_patched: patched,
-            durable,
-            cost: api.spend(tenant).since(before),
-            session: session.clone(),
-            completion,
-            operation,
-            applied,
-            outcome_unavailable,
-        }),
-        &session,
-    ))
+    Ok(AppliedAnswer {
+        completion,
+        operation,
+        applied,
+        outcome_unavailable,
+        replayed,
+    })
+}
+
+/// The write's idempotency key, if it carries one (M132): refused beside any durability but
+/// `applied`, below `PSTORE_APPLIED_WRITES=3`, or when it is not spelled as one is issued.
+fn idempotency_key_of<S: BlobStore + 'static>(
+    api: &Api<S>,
+    key: Option<&str>,
+    applied: bool,
+) -> Result<Option<pstore_engine::IdempotencyKey>, ApiError> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if !applied {
+        return Err(ApiError::bad_request(
+            "idempotency_key needs durability \"applied\": only a fold decides which attempt \
+             applies",
+        ));
+    }
+    if !api.registry_mut().idempotency {
+        return Err(keys_not_enabled());
+    }
+    pstore_engine::IdempotencyKey::parse(key)
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "idempotency_key {key:?} is not one this API issues: <epoch>-<32 lowercase hex>"
+            ))
+        })
+}
+
+/// M132: refuses a key from ahead of HEAD, which would let a commit at or below its `e0`
+/// apply it.
+async fn admit<S: BlobStore + 'static>(
+    engine: &Engine<S>,
+    key: Option<&pstore_engine::IdempotencyKey>,
+) -> Result<(), ApiError> {
+    match key {
+        Some(k) if !engine.admit_key(k).await? => Err(ApiError::bad_request(format!(
+            "idempotency_key {k} was not issued by this deployment: its epoch is ahead of HEAD"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn keys_not_enabled() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "unsupported_durability",
+        "idempotency keys are not enabled on this deployment (PSTORE_APPLIED_WRITES=3)",
+    )
+}
+
+/// `POST /v1/indexes/{index}/idempotency-keys` (M132): a fresh key, issued at this engine's
+/// mark. Free while the mark is fresh; one HEAD read a second at most otherwise. Keys are
+/// per tenant: the index only scopes the route.
+async fn issue_idempotency_key<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(_index): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<types::IdempotencyKeyResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    if !api.registry_mut().idempotency {
+        return Err(keys_not_enabled());
+    }
+    let engine = api.engine(tenant).await;
+    let random = operation_id()?.0;
+    let key = engine.idempotency_key(random).await?;
+    Ok(axum::Json(types::IdempotencyKeyResponse {
+        idempotency_key: key.to_string(),
+    }))
 }
 
 /// The most distinct ids an `affected_ids` write may name (M130): its lists are bounded by
@@ -2023,6 +2164,7 @@ async fn branch_index<S: BlobStore + 'static>(
             operation: None,
             applied: None,
             outcome_unavailable: None,
+            replayed: None,
         }),
         &session,
     ))

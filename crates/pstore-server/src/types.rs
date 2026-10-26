@@ -125,6 +125,10 @@ pub struct WriteRequest {
     /// other durability, beside a by-filter operation, or past 10,000 distinct ids.
     #[serde(default)]
     pub affected_ids: bool,
+    /// An applied write's idempotency key (M132): of the attempts carrying one, at most one
+    /// applies. Issued by `POST /v1/indexes/{index}/idempotency-keys`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.
@@ -316,6 +320,17 @@ pub struct WriteResponse {
     /// `true` beside `applied: null` (M129).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_unavailable: Option<bool>,
+    /// `true` when another attempt of the write's idempotency key applied, and `applied` is
+    /// that attempt's (M132).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
+}
+
+/// A fresh idempotency key (M132).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdempotencyKeyResponse {
+    /// `<e0>-<32 hex>`: the epoch it was issued at, and 128 random bits.
+    pub idempotency_key: String,
 }
 
 /// An applied write's outcome (M129), in rows; `skipped` and `rejected` in operations.

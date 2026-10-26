@@ -170,7 +170,7 @@ impl<S: BlobStore> Engine<S> {
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
             next.externals.insert(index.to_owned(), entry.clone());
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
@@ -304,7 +304,7 @@ impl<S: BlobStore> Engine<S> {
                 .entry(next.epoch.0)
                 .or_default()
                 .push(entry.codes);
-            match head::commit(&*self.store, self.tenant, &at, &next).await {
+            match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
