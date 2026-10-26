@@ -8,7 +8,9 @@ mod head;
 pub mod lanes;
 mod replica;
 
-pub use applied::{Applied, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying};
+pub use applied::{
+    Affected, Applied, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying, applying_with_ids,
+};
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
@@ -1710,7 +1712,7 @@ pub struct Engine<S> {
     /// M129: the highest-epoch HEAD this engine has read or committed.
     observed: Mutex<Observed>,
     /// M129: outcome objects this engine wrote or read, by key; a few dozen at most.
-    outcome_cache: Mutex<BTreeMap<String, Arc<BTreeMap<String, Outcome>>>>,
+    outcome_cache: Mutex<BTreeMap<String, Arc<applied::Decided>>>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
     /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
@@ -2274,7 +2276,7 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
-    fn cache_outcomes(&self, key: String, outcomes: BTreeMap<String, Outcome>) {
+    fn cache_outcomes(&self, key: String, outcomes: applied::Decided) {
         let mut c = self
             .outcome_cache
             .lock()
@@ -2299,7 +2301,7 @@ impl<S: BlobStore> Engine<S> {
     pub async fn await_applied(&self, mark: Mark, op: OperationId) -> Result<Applied, EngineError> {
         let Some(target) = self.next_seq() else {
             // Nothing was ever flushed here, so nothing of `op`'s was.
-            return Ok(Applied::Known(Outcome::default()));
+            return Ok(Applied::Known(Outcome::default(), None));
         };
         // ⚠️ Held through the outcome reads too (code review): waiters released one at a time
         // and reading after would each miss the cache and read the same object.
@@ -2353,15 +2355,12 @@ impl<S: BlobStore> Engine<S> {
         for (k, o) in fetched.into_iter().flatten() {
             self.cache_outcomes(k, o);
         }
-        let commits: Vec<Arc<BTreeMap<String, Outcome>>> =
-            window.iter().filter_map(|k| cached(k)).collect();
+        let commits: Vec<Arc<applied::Decided>> = window.iter().filter_map(|k| cached(k)).collect();
         if commits.len() != window.len() {
             return Ok(Applied::Unavailable);
         }
-        Ok(Applied::Known(applied::sum(
-            &op.hex(),
-            commits.iter().map(|c| &**c),
-        )))
+        let (outcome, ids) = applied::sum(&op.hex(), commits.iter().map(|c| &**c));
+        Ok(Applied::Known(outcome, ids))
     }
 
     /// The last epoch this engine committed.
@@ -4525,8 +4524,8 @@ impl<S: BlobStore> Engine<S> {
             }
             // M129: one outcome object for every applied request this commit decides, listed in
             // HEAD; the oldest listed falls off and is buried.
-            let outcomes = std::mem::take(&mut tally.by_req);
-            if !outcomes.is_empty() {
+            let outcomes = tally.take();
+            if !outcomes.counts.is_empty() {
                 let key = self
                     .create_object(
                         names,
@@ -4573,7 +4572,9 @@ impl<S: BlobStore> Engine<S> {
                     // ⚠️ Only what this fold folded (M9c.1, row 36): a batch flushed after the
                     // lane was probed has a sequence at or past the new watermark and stays.
                     self.mem().prune(self.watermark(&next));
-                    if let Some((_, key)) = next.outcomes.last().filter(|_| !outcomes.is_empty()) {
+                    if let Some((_, key)) =
+                        next.outcomes.last().filter(|_| !outcomes.counts.is_empty())
+                    {
                         self.cache_outcomes(key.clone(), outcomes);
                     }
                     self.observe(&next);

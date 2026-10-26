@@ -179,6 +179,8 @@ struct Registry {
     reaping: bool,
     /// `PSTORE_APPLIED_WRITES=1` (M129): every node of the deployment folds applied writes.
     applied_writes: bool,
+    /// `PSTORE_APPLIED_WRITES=2` (M130): every node writes and reads outcome ids.
+    affected_ids: bool,
     /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
     lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
@@ -925,6 +927,13 @@ impl<S: BlobStore + 'static> Api<S> {
         self.registry_mut().applied_writes = on;
     }
 
+    /// Whether an applied write may ask for `affected_ids` (M130). ⚠️ **An operator's
+    /// statement that every node runs M130**: an M129 waiter refuses an outcome object with
+    /// an ids section.
+    pub fn set_affected_ids(&self, on: bool) {
+        self.registry_mut().affected_ids = on;
+    }
+
     /// Engines the registry holds.
     pub async fn engines(&self) -> usize {
         self.engines.lock().await.len()
@@ -1668,11 +1677,25 @@ async fn write_documents<S: BlobStore + 'static>(
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let (mut req, keys) = parse_write(&body)?;
     let applied = matches!(req.durability, types::Durability::Applied);
+    let ids_wanted = req.affected_ids;
     if applied && !api.registry_mut().applied_writes {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "unsupported_durability",
             "durability \"applied\" is not enabled on this deployment (PSTORE_APPLIED_WRITES)",
+        ));
+    }
+    // M130: ids are what a fold decided, so only an applied write can report them.
+    if ids_wanted && !applied {
+        return Err(ApiError::bad_request(
+            "affected_ids needs durability \"applied\": only a fold knows which ids changed",
+        ));
+    }
+    if ids_wanted && !api.registry_mut().affected_ids {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_durability",
+            "affected_ids is not enabled on this deployment (PSTORE_APPLIED_WRITES=2)",
         ));
     }
     if let Some(src) = branch_source(&req, keys)? {
@@ -1736,6 +1759,9 @@ async fn write_documents<S: BlobStore + 'static>(
         &req.delete_condition,
         !req.deletes.is_empty(),
     )?;
+    if ids_wanted {
+        affected_ids_bounded(&req, &patches, delete_by.is_some() || patch_by.is_some())?;
+    }
     // ⚠️ **Deferred operations are durable only** (M13, spec review M4): a batched one would sit
     // where no fold reads it and no probe finds it, so a strong read here could miss it.
     let deferred = !patches.is_empty()
@@ -1834,6 +1860,7 @@ async fn write_documents<S: BlobStore + 'static>(
         Ok::<_, ApiError>((written, patched, deleted))
     };
     let (written, patched, deleted) = match op {
+        Some(op) if ids_wanted => pstore_engine::applying_with_ids(op, buffer).await?,
         Some(op) => pstore_engine::applying(op, buffer).await?,
         None => buffer.await?,
     };
@@ -1856,6 +1883,29 @@ async fn write_documents<S: BlobStore + 'static>(
     };
     token.saw(engine.epoch().0);
     let session = token.encode();
+    let completion = outcome.as_ref().map(|_| "applied");
+    let operation = outcome.as_ref().map(|(op, _)| op.hex());
+    let outcome_unavailable = outcome
+        .as_ref()
+        .map(|(_, a)| *a == pstore_engine::Applied::Unavailable)
+        .filter(|u| *u);
+    let applied = outcome.map(|(_, a)| match a {
+        pstore_engine::Applied::Known(o, ids) => Some(types::AppliedOut {
+            upserted: o.upserted,
+            deleted: o.deleted,
+            patched: o.patched,
+            skipped: o.skipped,
+            rejected: o.rejected,
+            ids: ids_wanted
+                .then(|| ids.unwrap_or_default())
+                .map(|i| types::AffectedIds {
+                    upserted: i.upserted,
+                    deleted: i.deleted,
+                    patched: i.patched,
+                }),
+        }),
+        pstore_engine::Applied::Unavailable => None,
+    });
     Ok(with_session(
         axum::Json(WriteResponse {
             epoch: engine.epoch().0,
@@ -1865,24 +1915,46 @@ async fn write_documents<S: BlobStore + 'static>(
             durable,
             cost: api.spend(tenant).since(before),
             session: session.clone(),
-            completion: outcome.map(|_| "applied"),
-            operation: outcome.map(|(op, _)| op.hex()),
-            applied: outcome.map(|(_, a)| match a {
-                pstore_engine::Applied::Known(o) => Some(types::AppliedOut {
-                    upserted: o.upserted,
-                    deleted: o.deleted,
-                    patched: o.patched,
-                    skipped: o.skipped,
-                    rejected: o.rejected,
-                }),
-                pstore_engine::Applied::Unavailable => None,
-            }),
-            outcome_unavailable: outcome
-                .map(|(_, a)| a == pstore_engine::Applied::Unavailable)
-                .filter(|u| *u),
+            completion,
+            operation,
+            applied,
+            outcome_unavailable,
         }),
         &session,
     ))
+}
+
+/// The most distinct ids an `affected_ids` write may name (M130): its lists are bounded by
+/// what it names, so its response and its outcome object are too.
+const AFFECTED_IDS_MAX: usize = 10_000;
+
+/// Refuses an `affected_ids` write whose lists could be unbounded (M130): one with a
+/// by-filter operation, whose ids are whatever its filter admits at the fold, or one naming
+/// more than [`AFFECTED_IDS_MAX`] distinct ids.
+fn affected_ids_bounded(
+    req: &WriteRequest,
+    patches: &[pstore_engine::Patch],
+    by_filter: bool,
+) -> Result<(), ApiError> {
+    if by_filter {
+        return Err(ApiError::bad_request(
+            "affected_ids beside a by-filter operation is not served: its ids are unbounded",
+        ));
+    }
+    let named: std::collections::HashSet<&str> = req
+        .documents
+        .iter()
+        .map(|d| d.id.as_str())
+        .chain(req.deletes.iter().map(String::as_str))
+        .chain(patches.iter().map(|p| p.id.as_str()))
+        .collect();
+    if named.len() > AFFECTED_IDS_MAX {
+        return Err(ApiError::bad_request(format!(
+            "affected_ids names {} distinct ids; at most {AFFECTED_IDS_MAX}",
+            named.len()
+        )));
+    }
+    Ok(())
 }
 
 /// A fresh applied operation's id (M129): 128 random bits.

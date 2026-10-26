@@ -1,5 +1,24 @@
 # Native API migration notes
 
+## M130: `affected_ids`, and the order inside one write
+
+An applied write may add `"affected_ids": true`. Its `applied` object then carries
+`ids: {upserted, deleted, patched}`: for each kind, the distinct ids an operation of that
+kind changed, sorted, over every commit that folded the write. Counts stay per operation,
+so `x` upserted twice is `upserted: 2` with `["x"]`, and an id upserted then deleted is in
+both lists. A row the fold set aside is in no list.
+
+It is refused with `bad_request` beside `batched` or `durable`, beside `patch_by_filter` or
+`delete_by_filter`, or past 10,000 distinct ids, and with `unsupported_durability` unless
+every node runs this release and is started with `PSTORE_APPLIED_WRITES=2` (`1` serves
+applied writes without ids, as M129 did).
+
+Order, now documented: inside one write, upserts apply first, then patches, then deletes,
+then `patch_by_filter`, then `delete_by_filter`, even when the write is split across two
+bundles. Between writes the order is unspecified unless the first was folded before the
+second was sent: a `durable` answer is not enough, because a fold applies lanes in lane order,
+not arrival order. Send the second after the first is answered with `durability: "applied"`.
+
 ## M129: `durability: "applied"`
 
 A write may ask for `"applied"`: it is made durable, then answered only once a commit has

@@ -15,6 +15,10 @@ pub const OUTCOMES_KEPT: usize = 32;
 
 const MAGIC: &[u8; 8] = b"PSTOREOC";
 
+/// What a stamp ends with when its request asked for its ids (M130). An M129 fold strips
+/// `$req` whatever its value, so it never seals one.
+const IDS: &str = ":ids";
+
 /// An applied request's id: 128 random bits, drawn by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u128);
@@ -53,11 +57,23 @@ impl Outcome {
     }
 }
 
+/// The distinct ids an applied request's operations changed (M130), each list sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Affected {
+    /// Ids an upsert wrote.
+    pub upserted: Vec<String>,
+    /// Ids a delete removed.
+    pub deleted: Vec<String>,
+    /// Ids a patch changed.
+    pub patched: Vec<String>,
+}
+
 /// An applied request's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
-    /// The fold's decisions, summed over every commit that folded the request.
-    Known(Outcome),
+    /// The fold's decisions, summed over every commit that folded the request; and, when it
+    /// asked for them (M130), the ids it changed, unioned over those commits.
+    Known(Outcome, Option<Affected>),
     /// A commit in the request's window fell off HEAD's list or was reaped. The request
     /// was applied; what it did cannot be reported.
     Unavailable,
@@ -68,12 +84,17 @@ pub enum Applied {
 pub struct Mark(pub(crate) u64);
 
 tokio::task_local! {
-    static APPLYING: OperationId;
+    static APPLYING: (OperationId, bool);
 }
 
 /// Runs `f` with every operation it buffers stamped as `op`'s (M129).
 pub async fn applying<F: std::future::Future>(op: OperationId, f: F) -> F::Output {
-    APPLYING.scope(op, f).await
+    APPLYING.scope((op, false), f).await
+}
+
+/// As [`applying`], and the fold also records the ids `op` changes (M130).
+pub async fn applying_with_ids<F: std::future::Future>(op: OperationId, f: F) -> F::Output {
+    APPLYING.scope((op, true), f).await
 }
 
 /// Which kind of change an operation made, for the tally.
@@ -84,15 +105,31 @@ pub(crate) enum Kind {
     Patched,
 }
 
+impl Kind {
+    /// This kind's id counts, in [`Affected`]'s order.
+    fn of(self, c: &mut IdCounts) -> &mut BTreeMap<String, u64> {
+        let [u, d, p] = c;
+        match self {
+            Self::Upserted => u,
+            Self::Deleted => d,
+            Self::Patched => p,
+        }
+    }
+}
+
 /// Stamps `docs` when the current task is applying (M129): each carries the request's id,
 /// and an unconditional upsert or delete becomes the deferred kind with no condition, so
 /// the fold resolves it against the current version. That is what makes `deleted` mean a
 /// version existed.
 pub(crate) fn stamp(docs: &mut [Document], tombstone: impl Fn(&Document) -> bool) {
-    let Ok(op) = APPLYING.try_with(|op| *op) else {
+    let Ok((op, ids)) = APPLYING.try_with(|a| *a) else {
         return;
     };
-    let id = Value::Str(op.hex());
+    let id = Value::Str(if ids {
+        format!("{}{IDS}", op.hex())
+    } else {
+        op.hex()
+    });
     for d in docs {
         if !d.attrs.contains_key(crate::OP_ATTR) {
             let code = if tombstone(d) {
@@ -114,25 +151,60 @@ pub(crate) fn req_of(d: &Document) -> Option<&str> {
     }
 }
 
+/// Per kind, how many of this fold's changes touched each id (M130): a count, so a set-aside
+/// in one index takes back only that index's changes.
+type IdCounts = [BTreeMap<String, u64>; 3];
+
+/// One commit's decisions: per request, its outcome, and, for those that asked, its ids.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Decided {
+    pub(crate) counts: BTreeMap<String, Outcome>,
+    pub(crate) ids: BTreeMap<String, Affected>,
+}
+
 /// One fold attempt's tally: per request, its outcome; per index and id, the stamped
 /// changes `resolve` made to it, so a row the width pass sets aside takes them back.
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
-    pub(crate) by_req: BTreeMap<String, Outcome>,
+    by_req: BTreeMap<String, Outcome>,
+    /// M130: only for requests whose stamp asked.
+    ids: BTreeMap<String, IdCounts>,
     touched: BTreeMap<String, Vec<(String, Kind)>>,
 }
 
+/// A stamp's request id, and whether it asked for ids.
+fn parse(stamp: &str) -> (&str, bool) {
+    match stamp.strip_suffix(IDS) {
+        Some(hex) => (hex, true),
+        None => (stamp, false),
+    }
+}
+
 impl Tally {
+    /// `stamp`'s outcome, with its id counts made to exist if it asked for them: a request
+    /// that changed nothing still answers with empty lists.
+    fn entry(&mut self, stamp: &str) -> &mut Outcome {
+        let (req, ids) = parse(stamp);
+        if ids {
+            self.ids.entry(req.to_owned()).or_default();
+        }
+        self.by_req.entry(req.to_owned()).or_default()
+    }
+
     /// An operation of `req` changed `id`'s row as `kind` does.
     pub(crate) fn changed(&mut self, req: Option<&str>, id: &str, kind: Kind) {
-        let Some(req) = req else {
+        let Some(stamp) = req else {
             return;
         };
-        let o = self.by_req.entry(req.to_owned()).or_default();
+        let o = self.entry(stamp);
         match kind {
             Kind::Upserted => o.upserted += 1,
             Kind::Deleted => o.deleted += 1,
             Kind::Patched => o.patched += 1,
+        }
+        let req = parse(stamp).0;
+        if let Some(c) = self.ids.get_mut(req) {
+            *kind.of(c).entry(id.to_owned()).or_default() += 1;
         }
         self.touched
             .entry(id.to_owned())
@@ -142,15 +214,15 @@ impl Tally {
 
     /// An operation of `req` changed nothing.
     pub(crate) fn skipped(&mut self, req: Option<&str>) {
-        if let Some(req) = req {
-            self.by_req.entry(req.to_owned()).or_default().skipped += 1;
+        if let Some(stamp) = req {
+            self.entry(stamp).skipped += 1;
         }
     }
 
     /// `d` was discarded before it could change anything.
     pub(crate) fn rejected(&mut self, d: &Document) {
-        if let Some(req) = req_of(d) {
-            self.by_req.entry(req.to_owned()).or_default().rejected += 1;
+        if let Some(stamp) = req_of(d) {
+            self.entry(stamp).rejected += 1;
         }
     }
 
@@ -158,6 +230,15 @@ impl Tally {
     /// change this fold made to it is undone, and counts as rejected.
     pub(crate) fn set_aside(&mut self, id: &str) {
         for (req, kind) in self.touched.remove(id).unwrap_or_default() {
+            if let Some(c) = self.ids.get_mut(&req) {
+                let m = kind.of(c);
+                if let Some(n) = m.get_mut(id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        m.remove(id);
+                    }
+                }
+            }
             let o = self.by_req.entry(req).or_default();
             match kind {
                 Kind::Upserted => o.upserted -= 1,
@@ -168,21 +249,59 @@ impl Tally {
         }
     }
 
+    /// What this attempt decided, for its commit's outcome object; the tally is left empty.
+    pub(crate) fn take(&mut self) -> Decided {
+        let ids = std::mem::take(&mut self.ids)
+            .into_iter()
+            .map(|(req, [u, d, p])| {
+                let keys = |m: BTreeMap<String, u64>| m.into_keys().collect();
+                (
+                    req,
+                    Affected {
+                        upserted: keys(u),
+                        deleted: keys(d),
+                        patched: keys(p),
+                    },
+                )
+            })
+            .collect();
+        Decided {
+            counts: std::mem::take(&mut self.by_req),
+            ids,
+        }
+    }
+
     /// Forgets the ids `resolve` touched, between indexes: ids are per index.
     pub(crate) fn next_index(&mut self) {
         self.touched.clear();
     }
 }
 
-/// Encodes one commit's outcomes.
-pub(crate) fn encode(by_req: &BTreeMap<String, Outcome>) -> Vec<u8> {
+/// Encodes one commit's outcomes: M129's layout, then, only if a request asked for its ids,
+/// a trailing ids section (M130) an M129 decoder never meets -- ids need every node at M130.
+pub(crate) fn encode(d: &Decided) -> Vec<u8> {
+    fn str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
     let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&(by_req.len() as u32).to_le_bytes());
-    for (req, o) in by_req {
-        out.extend_from_slice(&(req.len() as u32).to_le_bytes());
-        out.extend_from_slice(req.as_bytes());
+    out.extend_from_slice(&(d.counts.len() as u32).to_le_bytes());
+    for (req, o) in &d.counts {
+        str(&mut out, req);
         for n in [o.upserted, o.deleted, o.patched, o.skipped, o.rejected] {
             out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    if !d.ids.is_empty() {
+        out.extend_from_slice(&(d.ids.len() as u32).to_le_bytes());
+        for (req, a) in &d.ids {
+            str(&mut out, req);
+            for l in [&a.upserted, &a.deleted, &a.patched] {
+                out.extend_from_slice(&(l.len() as u32).to_le_bytes());
+                for id in l {
+                    str(&mut out, id);
+                }
+            }
         }
     }
     out
@@ -192,14 +311,13 @@ pub(crate) fn encode(by_req: &BTreeMap<String, Outcome>) -> Vec<u8> {
 ///
 /// # Errors
 /// A body that is not an outcome object.
-pub(crate) fn decode(body: &[u8]) -> Result<BTreeMap<String, Outcome>, EngineError> {
+pub(crate) fn decode(body: &[u8]) -> Result<Decided, EngineError> {
     let bad = || EngineError::Format("an outcome object that does not decode".to_owned());
     let mut c = Cursor(body.strip_prefix(MAGIC.as_slice()).ok_or_else(bad)?);
     let n = c.u32().ok_or_else(bad)?;
-    let mut out = BTreeMap::new();
+    let mut out = Decided::default();
     for _ in 0..n {
-        let len = c.u32().ok_or_else(bad)? as usize;
-        let req = String::from_utf8(c.take(len).ok_or_else(bad)?.to_vec()).map_err(|_| bad())?;
+        let req = c.str().ok_or_else(bad)?;
         let mut word = || c.u64().ok_or_else(bad);
         let o = Outcome {
             upserted: word()?,
@@ -208,7 +326,24 @@ pub(crate) fn decode(body: &[u8]) -> Result<BTreeMap<String, Outcome>, EngineErr
             skipped: word()?,
             rejected: word()?,
         };
-        out.insert(req, o);
+        out.counts.insert(req, o);
+    }
+    // M130: the end of the buffer is no ids section.
+    if !c.0.is_empty() {
+        let n = c.u32().ok_or_else(bad)?;
+        for _ in 0..n {
+            let req = c.str().ok_or_else(bad)?;
+            let mut list = || -> Result<Vec<String>, EngineError> {
+                let n = c.u32().ok_or_else(bad)?;
+                (0..n).map(|_| c.str().ok_or_else(bad)).collect()
+            };
+            let a = Affected {
+                upserted: list()?,
+                deleted: list()?,
+                patched: list()?,
+            };
+            out.ids.insert(req, a);
+        }
     }
     if !c.0.is_empty() {
         return Err(bad());
@@ -236,20 +371,38 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Option<u64> {
         self.take(8)?.try_into().ok().map(u64::from_le_bytes)
     }
+
+    fn str(&mut self) -> Option<String> {
+        let len = self.u32()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
 }
 
-/// Sums `req`'s entries over several commits' outcomes.
+/// Sums `req`'s counts over several commits' outcomes, and unions its ids if any commit
+/// recorded them (M130).
 pub(crate) fn sum<'a>(
     req: &str,
-    commits: impl IntoIterator<Item = &'a BTreeMap<String, Outcome>>,
-) -> Outcome {
+    commits: impl IntoIterator<Item = &'a Decided>,
+) -> (Outcome, Option<Affected>) {
     let mut total = Outcome::default();
+    let mut ids: Option<[std::collections::BTreeSet<String>; 3]> = None;
     for c in commits {
-        if let Some(o) = c.get(req) {
+        if let Some(o) = c.counts.get(req) {
             total.add(o);
         }
+        if let Some(a) = c.ids.get(req) {
+            let sets = ids.get_or_insert_default();
+            for (set, l) in sets.iter_mut().zip([&a.upserted, &a.deleted, &a.patched]) {
+                set.extend(l.iter().cloned());
+            }
+        }
     }
-    total
+    let ids = ids.map(|[u, d, p]| Affected {
+        upserted: u.into_iter().collect(),
+        deleted: d.into_iter().collect(),
+        patched: p.into_iter().collect(),
+    });
+    (total, ids)
 }
 
 #[cfg(test)]
@@ -261,9 +414,8 @@ mod tests {
     )]
     use super::*;
 
-    #[test]
-    fn an_outcome_object_round_trips_and_refuses_trailing_bytes() {
-        let m = BTreeMap::from([(
+    fn counts() -> BTreeMap<String, Outcome> {
+        BTreeMap::from([(
             "ab".to_owned(),
             Outcome {
                 upserted: 1,
@@ -272,12 +424,56 @@ mod tests {
                 skipped: 4,
                 rejected: 5,
             },
+        )])
+    }
+
+    #[test]
+    fn an_outcome_object_round_trips_and_refuses_trailing_bytes() {
+        let ids = BTreeMap::from([(
+            "ab".to_owned(),
+            Affected {
+                upserted: vec!["x".to_owned(), "y".to_owned()],
+                deleted: vec![],
+                patched: vec!["x".to_owned()],
+            },
         )]);
-        let body = encode(&m);
-        assert_eq!(decode(&body).unwrap(), m);
-        let mut longer = body.clone();
-        longer.push(0);
-        assert!(decode(&longer).is_err());
-        assert!(decode(&body[..body.len() - 1]).is_err());
+        for d in [
+            Decided {
+                counts: counts(),
+                ids: BTreeMap::new(),
+            },
+            Decided {
+                counts: counts(),
+                ids,
+            },
+        ] {
+            let body = encode(&d);
+            assert_eq!(decode(&body).unwrap(), d);
+            let mut longer = body.clone();
+            longer.push(0);
+            assert!(decode(&longer).is_err());
+            assert!(decode(&body[..body.len() - 1]).is_err());
+        }
+    }
+
+    /// M130 criterion 3: an object an M129 node wrote, spelled out byte by byte.
+    #[test]
+    fn an_m129_outcome_object_decodes() {
+        let mut body = b"PSTOREOC".to_vec();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(b"ab");
+        for n in 1u64..=5 {
+            body.extend_from_slice(&n.to_le_bytes());
+        }
+        let d = decode(&body).unwrap();
+        assert_eq!(d.counts, counts());
+        assert!(d.ids.is_empty());
+        // And a commit with no id-asking request is written exactly so.
+        let m129 = Decided {
+            counts: counts(),
+            ids: BTreeMap::new(),
+        };
+        assert_eq!(encode(&m129), body);
     }
 }

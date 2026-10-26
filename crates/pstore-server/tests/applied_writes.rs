@@ -45,6 +45,18 @@ async fn send(
     (status, serde_json::from_slice(&body).unwrap())
 }
 
+fn with_ids(store: &Accounted<MemoryStore>, lane: u64) -> Arc<Api<MemoryStore>> {
+    let a = api(store, lane, true);
+    a.set_affected_ids(true);
+    a
+}
+
+fn spent(store: &Accounted<MemoryStore>) -> Vec<u64> {
+    [OpClass::Read, OpClass::Write, OpClass::List]
+        .map(|c| store.count(TENANT, c))
+        .to_vec()
+}
+
 async fn write(api: &Arc<Api<MemoryStore>>, body: Value) -> Value {
     let (s, b) = send(api, "PUT", "/v1/indexes/docs/documents", &body).await;
     assert_eq!(s, StatusCode::OK, "{b}");
@@ -168,4 +180,130 @@ async fn applied_needs_the_rollout_flag() {
     for k in ["completion", "operation", "applied", "outcome_unavailable"] {
         assert!(b.get(k).is_none(), "{k} in {b}");
     }
+}
+
+/// M130 criterion 1, at the API.
+#[tokio::test]
+async fn affected_ids_are_what_the_fold_decided() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = with_ids(&store, 1);
+    write(
+        &a,
+        json!({"durability": "durable", "documents": [doc("a", 1), doc("b", 2)]}),
+    )
+    .await;
+    let b = write(
+        &a,
+        json!({"durability": "applied", "affected_ids": true,
+               "documents": [doc("c", 3), doc("a", 10)],
+               "patch_rows": [{"id": "c", "attributes": {"n": 4}}, {"id": "zz", "attributes": {"n": 1}}],
+               "deletes": ["b", "nope"]}),
+    )
+    .await;
+    assert_eq!(counts(&b), [2, 1, 1, 2, 0], "{b}");
+    assert_eq!(
+        b["applied"]["ids"],
+        json!({"upserted": ["a", "c"], "deleted": ["b"], "patched": ["c"]}),
+        "{b}"
+    );
+}
+
+/// M130 criterion 3, at the API: no `ids` unless asked.
+#[tokio::test]
+async fn ids_are_opt_in() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = with_ids(&store, 1);
+    let b = write(
+        &a,
+        json!({"durability": "applied", "documents": [doc("a", 1)]}),
+    )
+    .await;
+    assert_eq!(counts(&b), [1, 0, 0, 0, 0], "{b}");
+    assert!(b["applied"].get("ids").is_none(), "{b}");
+}
+
+/// M130 criterion 4: every refusal comes before any blob request.
+#[tokio::test]
+async fn affected_ids_refusals_cost_nothing() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = with_ids(&store, 1);
+    let many: Vec<String> = (0..=10_000).map(|i| format!("d{i}")).collect();
+    let cases = [
+        (
+            json!({"durability": "durable", "affected_ids": true, "documents": [doc("a", 1)]}),
+            "bad_request",
+        ),
+        (
+            json!({"affected_ids": true, "documents": [doc("a", 1)]}),
+            "bad_request",
+        ),
+        (
+            json!({"durability": "applied", "affected_ids": true, "delete_by_filter": ["n", "Eq", 1]}),
+            "bad_request",
+        ),
+        (
+            json!({"durability": "applied", "affected_ids": true,
+                "patch_by_filter": {"filters": ["n", "Eq", 1], "attributes": {"n": 2}}}),
+            "bad_request",
+        ),
+        (
+            json!({"durability": "applied", "affected_ids": true, "deletes": many}),
+            "bad_request",
+        ),
+    ];
+    for (body, code) in &cases {
+        let before = spent(&store);
+        let (s, b) = send(&a, "PUT", "/v1/indexes/docs/documents", body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {b}");
+        assert_eq!(b["error"]["code"], *code, "{body}: {b}");
+        assert_eq!(before, spent(&store), "{body} made blob requests");
+    }
+    // Applied writes on, ids not: every node must be at M130 first.
+    let old = api(&store, 2, true);
+    let before = spent(&store);
+    let (s, b) = send(
+        &old,
+        "PUT",
+        "/v1/indexes/docs/documents",
+        &json!({"durability": "applied", "affected_ids": true, "documents": [doc("a", 1)]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "unsupported_durability", "{b}");
+    assert_eq!(before, spent(&store));
+    // And 10,000 distinct ids, counted across kinds with repeats once, are served.
+    let mut deletes: Vec<String> = (0..9_999).map(|i| format!("d{i}")).collect();
+    deletes.push("a".to_owned());
+    let b = write(
+        &a,
+        json!({"durability": "applied", "affected_ids": true,
+               "documents": [doc("a", 1)], "deletes": deletes}),
+    )
+    .await;
+    assert_eq!(b["applied"]["ids"]["deleted"], json!(["a"]), "{b}");
+}
+
+/// M130 criterion 5, at the API: upserts, then patches, then deletes.
+#[tokio::test]
+async fn one_request_applies_in_the_documented_order() {
+    let store = Accounted::new(MemoryStore::new());
+    let a = with_ids(&store, 1);
+    write(
+        &a,
+        json!({"durability": "durable", "documents": [doc("a", 1)]}),
+    )
+    .await;
+    let b = write(
+        &a,
+        json!({"durability": "applied",
+               "documents": [doc("q", 1)],
+               "patch_rows": [{"id": "q", "attributes": {"n": 2}}],
+               "deletes": ["q"]}),
+    )
+    .await;
+    assert_eq!(counts(&b), [1, 1, 1, 0, 0], "{b}");
+    let q = json!({"rank_by": ["id", "asc"], "top_k": 10, "consistency": "strong"});
+    let (s, b) = send(&a, "POST", "/v1/indexes/docs/query", &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(!b.to_string().contains("\"q\""), "{b}");
 }

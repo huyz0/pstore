@@ -14,7 +14,8 @@ use pstore_blob::{
     BlobError, BlobStore, Capabilities, CasError, Class, Key, MemoryStore, Precondition, PutOutcome,
 };
 use pstore_engine::{
-    Applied, Engine, Metric, OUTCOMES_KEPT, OperationId, Outcome, Patch, applying,
+    Affected, Applied, Engine, Metric, OUTCOMES_KEPT, OperationId, Outcome, Patch, applying,
+    applying_with_ids,
 };
 use pstore_format::{Document, Value};
 use pstore_query::{Op, Predicate};
@@ -33,9 +34,21 @@ fn doc(id: &str, n: i64) -> Document {
 
 fn known(a: Applied) -> Outcome {
     match a {
-        Applied::Known(o) => o,
+        Applied::Known(o, _) => o,
         Applied::Unavailable => panic!("an outcome reported unavailable"),
     }
+}
+
+/// The ids an applied write reported (M130): it must have asked, and its outcome be known.
+fn ids(a: Applied) -> Affected {
+    match a {
+        Applied::Known(_, Some(ids)) => ids,
+        other => panic!("no ids in {other:?}"),
+    }
+}
+
+fn list(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|&s| s.to_owned()).collect()
 }
 
 /// Counts what the tests assert on, and lets a rival fold before one HEAD commit.
@@ -641,4 +654,234 @@ async fn waiters_share_the_read_of_anothers_outcome() {
     }
     let reads = store.outcome_reads.load(Ordering::SeqCst);
     assert_eq!(reads, 1, "{reads} reads of one outcome object");
+}
+
+/// M130 criterion 1: each list is exactly the distinct ids its kind changed.
+#[tokio::test]
+async fn affected_ids_are_what_the_fold_decided() {
+    let e = Engine::new(Arc::new(MemoryStore::new()), T, LaneId(1));
+    seeded(&e).await;
+    let op = OperationId(130);
+    let mark = e.mark().await.unwrap();
+    applying_with_ids(op, async {
+        // New and existing ids, and one upserted twice.
+        e.write(
+            "idx",
+            vec![doc("c", 3), doc("a", 10), doc("x", 1), doc("x", 2)],
+        )
+        .await
+        .unwrap();
+        // b has n = 2: the first condition holds, the second does not.
+        e.write_if("idx", vec![doc("b", 20)], Metric::DotProduct, &n_is(2))
+            .await
+            .unwrap();
+        e.write_if("idx", vec![doc("b", 30)], Metric::DotProduct, &n_is(2))
+            .await
+            .unwrap();
+        // A real patch, a patch to the same value, and a patch of nothing.
+        e.patch(
+            "idx",
+            vec![set_n("c", 4), set_n("a", 10), set_n("zz", 1)],
+            None,
+        )
+        .await
+        .unwrap();
+        // c was upserted, then is deleted; nope never existed.
+        e.delete("idx", vec!["c".to_owned(), "nope".to_owned()])
+            .await
+            .unwrap();
+    })
+    .await;
+    e.flush().await.unwrap();
+    let got = e.await_applied(mark, op).await.unwrap();
+    assert_eq!(
+        known(got.clone()),
+        Outcome {
+            upserted: 5,
+            deleted: 1,
+            patched: 1,
+            skipped: 4,
+            rejected: 0,
+        }
+    );
+    assert_eq!(
+        ids(got),
+        Affected {
+            upserted: list(&["a", "b", "c", "x"]),
+            deleted: list(&["c"]),
+            patched: list(&["c"]),
+        }
+    );
+}
+
+/// M130 criterion 1: a row the fold set aside is in no list.
+#[tokio::test]
+async fn a_set_aside_row_is_in_no_list() {
+    // As `a_row_set_aside_after_resolve_is_rejected`.
+    fn late(id: &str, width: usize) -> Document {
+        let mut d = Document::new(id, vec![1.0, 0.5, 0.25, 0.125]);
+        d.vectors.insert(
+            "late".into(),
+            pstore_format::VectorField::Dense(vec![vec![0.5; width]]),
+        );
+        d
+    }
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write("docs", vec![late("a", 3)]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.commit_head_for_test(|h| {
+        for s in h.schemas.values_mut() {
+            s.fields.clear();
+        }
+    })
+    .await
+    .unwrap();
+    let other = Engine::new(Arc::clone(&store), T, LaneId(0));
+    other.write("docs", vec![late("x", 4)]).await.unwrap();
+    other.flush().await.unwrap();
+    let op = OperationId(62);
+    let mark = e.mark().await.unwrap();
+    applying_with_ids(op, e.patch("docs", vec![set_n("a", 7)], None))
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    let got = e.await_applied(mark, op).await.unwrap();
+    assert_eq!(known(got.clone()).rejected, 1, "{got:?}");
+    assert_eq!(ids(got), Affected::default());
+}
+
+/// M130 criterion 2: a request folded by another engine, in two commits.
+#[tokio::test]
+async fn ids_union_across_commits_and_engines() {
+    let store = Arc::new(MemoryStore::new());
+    let a = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2));
+    seeded(&b).await;
+    let op = OperationId(131);
+    let mark = a.mark().await.unwrap();
+    // x is upserted in both commits, and listed once; each commit deletes its own id.
+    applying_with_ids(op, async {
+        a.write("idx", vec![doc("x", 1)]).await.unwrap();
+        a.delete("idx", vec!["b".to_owned()]).await.unwrap();
+    })
+    .await;
+    a.flush().await.unwrap();
+    b.fold().await.unwrap();
+    applying_with_ids(op, async {
+        a.write("idx", vec![doc("x", 2), doc("y", 1)])
+            .await
+            .unwrap();
+        a.delete("idx", vec!["a".to_owned()]).await.unwrap();
+    })
+    .await;
+    a.flush().await.unwrap();
+    b.fold().await.unwrap();
+    let got = a.await_applied(mark, op).await.unwrap();
+    assert_eq!(known(got.clone()).upserted, 3, "{got:?}");
+    assert_eq!(
+        ids(got),
+        Affected {
+            upserted: list(&["x", "y"]),
+            deleted: list(&["a", "b"]),
+            patched: vec![],
+        }
+    );
+}
+
+/// M130 criterion 3: a request that did not ask gets no ids, and its commit's outcome object
+/// is M129's, byte for byte: magic, one entry, its 32-digit id, five counts.
+#[tokio::test]
+async fn ids_are_opt_in() {
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let op = OperationId(132);
+    let mark = e.mark().await.unwrap();
+    applying(op, e.write("idx", vec![doc("p", 1)]))
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    let got = e.await_applied(mark, op).await.unwrap();
+    assert!(matches!(got, Applied::Known(_, None)), "{got:?}");
+    let head = e.head_for_test().await;
+    let (_, key) = head.outcomes.last().unwrap();
+    let body = store.get(&Key::new(key.clone())).await.unwrap();
+    assert_eq!(
+        body.len(),
+        8 + 4 + 4 + 32 + 5 * 8,
+        "an ids section was written"
+    );
+}
+
+/// M130 criterion 5: upserts, then patches, then deletes, even when a flush between the
+/// buffer calls splits the request into two bundles.
+#[tokio::test]
+async fn one_request_applies_in_the_documented_order() {
+    for split in [false, true] {
+        let e = Engine::new(Arc::new(MemoryStore::new()), T, LaneId(1));
+        seeded(&e).await;
+        let op = OperationId(133);
+        let mark = e.mark().await.unwrap();
+        applying_with_ids(op, async {
+            e.write("idx", vec![doc("q", 1)]).await.unwrap();
+            if split {
+                e.flush().await.unwrap();
+            }
+            e.patch("idx", vec![set_n("q", 2)], None).await.unwrap();
+            e.delete("idx", vec!["q".to_owned()]).await.unwrap();
+        })
+        .await;
+        e.flush().await.unwrap();
+        let got = e.await_applied(mark, op).await.unwrap();
+        let o = known(got.clone());
+        assert_eq!(
+            (o.upserted, o.patched, o.deleted, o.skipped),
+            (1, 1, 1, 0),
+            "split {split}: {got:?}"
+        );
+        let rows: Vec<String> = e
+            .segment_rows_for_test("idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|r| r.id)
+            .collect();
+        assert!(!rows.contains(&"q".to_owned()), "split {split}: {rows:?}");
+        assert_eq!(
+            ids(got),
+            Affected {
+                upserted: list(&["q"]),
+                deleted: list(&["q"]),
+                patched: list(&["q"]),
+            }
+        );
+    }
+}
+
+/// M130 criterion 6: an id-asking stamp is never sealed either.
+#[tokio::test]
+async fn ids_are_never_sealed() {
+    let e = Engine::new(Arc::new(MemoryStore::new()), T, LaneId(1));
+    seeded(&e).await;
+    let op = OperationId(134);
+    let mark = e.mark().await.unwrap();
+    applying_with_ids(op, async {
+        e.write("idx", vec![doc("p", 1)]).await.unwrap();
+        e.patch("idx", vec![set_n("a", 5)], None).await.unwrap();
+    })
+    .await;
+    e.flush().await.unwrap();
+    e.await_applied(mark, op).await.unwrap();
+    for seg in e.segment_rows_for_test("idx").await.unwrap() {
+        for r in seg {
+            assert!(
+                r.attrs.keys().all(|k| !k.starts_with('$')),
+                "{} sealed with {:?}",
+                r.id,
+                r.attrs.keys().collect::<Vec<_>>()
+            );
+        }
+    }
 }

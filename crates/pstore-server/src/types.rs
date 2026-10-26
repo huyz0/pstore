@@ -121,6 +121,10 @@ pub struct WriteRequest {
     /// physical copy would buy nothing a branch does not.
     #[serde(default)]
     pub copy_from_namespace: Option<String>,
+    /// An applied write's ask for the ids its operations changed (M130). Refused beside any
+    /// other durability, beside a by-filter operation, or past 10,000 distinct ids.
+    #[serde(default)]
+    pub affected_ids: bool,
 }
 
 /// A vector as the wire carries it (M9d): an array, or base64 of little-endian `f32`s.
@@ -315,7 +319,7 @@ pub struct WriteResponse {
 }
 
 /// An applied write's outcome (M129), in rows; `skipped` and `rejected` in operations.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AppliedOut {
     /// Rows an upsert wrote.
     pub upserted: u64,
@@ -327,6 +331,21 @@ pub struct AppliedOut {
     pub skipped: u64,
     /// Operations a reject, width, replica or drop pass discarded.
     pub rejected: u64,
+    /// The distinct ids each kind changed, sorted, when the write asked (M130).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ids: Option<AffectedIds>,
+}
+
+/// An applied write's affected ids (M130): distinct and sorted, so a list can be shorter than
+/// its count, and an id changed by two kinds is in both.
+#[derive(Debug, Clone, Serialize)]
+pub struct AffectedIds {
+    /// Ids an upsert wrote.
+    pub upserted: Vec<String>,
+    /// Ids a delete removed.
+    pub deleted: Vec<String>,
+    /// Ids a patch changed.
+    pub patched: Vec<String>,
 }
 
 /// `POST /v1/indexes/{id}/query`.

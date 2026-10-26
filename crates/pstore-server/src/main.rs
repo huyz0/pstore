@@ -163,7 +163,10 @@ async fn run<S: BlobStore + 'static>(
     api.limit_engines(config.engines);
     // M129: `durability: "applied"` only once the operator says every node runs a release
     // that folds it. Any other value, or none, leaves it refused.
-    api.set_applied_writes(std::env::var("PSTORE_APPLIED_WRITES").as_deref() == Ok("1"));
+    // M129: `1` serves applied writes; M130: `2` also serves their affected ids.
+    let applied = std::env::var("PSTORE_APPLIED_WRITES");
+    api.set_applied_writes(matches!(applied.as_deref(), Ok("1" | "2")));
+    api.set_affected_ids(applied.as_deref() == Ok("2"));
     // M54: a query's vector legs split across the servers PSTORE_PEERS names.
     if let Err(e) = api.set_peers(config.peers.clone()) {
         eprintln!("pstore-server: refusing to serve: {e}");
