@@ -1,12 +1,14 @@
 //! The storage engine: HEAD and the commit protocol, WAL lanes carrying cross-index
 //! bundles, and the memtable that makes a write visible before it is folded.
 
+mod applied;
 mod bundle;
 mod external;
 mod head;
 pub mod lanes;
 mod replica;
 
+pub use applied::{Applied, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying};
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
@@ -143,6 +145,7 @@ fn bury_into<'k>(next: &mut Head, keys: impl IntoIterator<Item = &'k String>) ->
         .map(|r| r.key.clone())
         .chain(next.deletes.values().map(|(k, _)| k.clone()))
         .chain(next.quarantine.values().flatten().map(|(k, _)| k.clone()))
+        .chain(next.outcomes.iter().map(|(_, k)| k.clone()))
         .chain(next.graveyard.values().flatten().cloned())
         .collect();
     // A set: a branch's retry can derive, and record, the same copy key twice.
@@ -220,6 +223,21 @@ pub struct Quarantined {
     /// longer conflicts. Depends on this process's text field.
     pub reason: Option<String>,
 }
+
+/// The highest-epoch HEAD an engine has seen (M129): what an applied request's coverage and
+/// window are judged by.
+#[derive(Debug, Default, Clone)]
+struct Observed {
+    epoch: u64,
+    /// This engine's lane's watermark in it.
+    watermark: u64,
+    outcomes: Vec<(u64, String)>,
+    /// When it was read or committed; `None` before the first.
+    at: Option<tokio::time::Instant>,
+}
+
+/// How old an engine's newest HEAD may be for [`Engine::mark`] to use it unread (M129).
+pub const MARK_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The names one fold, compaction or branch call has used (M23): segments and delete vectors
 /// are created, never replaced, so a retry at an unchanged epoch takes a name past every one
@@ -473,7 +491,9 @@ impl Memtable {
     ///
     /// ⚠️ One step shared by `write` and its test-only twin (M8g): each used to carry its own
     /// copy of the bump, so a mutant in the twin could survive while the real one was tested.
-    fn buffer(&mut self, index: &str, docs: Vec<Document>) {
+    fn buffer(&mut self, index: &str, mut docs: Vec<Document>) {
+        // M129: an applied request's operations carry its id to the fold.
+        applied::stamp(&mut docs, is_tombstone);
         self.generation += 1;
         self.pending
             .entry(index.to_owned())
@@ -829,6 +849,7 @@ impl<'a> Conditions<'a> {
 /// The operation without its deferral markers: what is sealed.
 fn cleaned(mut d: Document) -> Document {
     d.attrs.remove(OP_ATTR);
+    d.attrs.remove(applied::REQ_ATTR);
     d.attrs.remove(COND_ATTR);
     d.attrs.remove(UNSET_ATTR);
     d
@@ -878,17 +899,20 @@ fn merged(mut base: Document, patch: &Document) -> Document {
 /// must not fall back to `base` and bring the row back (spec review, M2). And a skipped
 /// operation -- a refused condition, a patch of nothing -- is no entry at all, so it touches
 /// nothing: the id's segment row and delete vector stay as they are.
+///
+/// M129: each stamped operation's decision goes into `tally`.
 fn resolve(
     ops: Vec<Document>,
     base: &std::collections::HashMap<String, Document>,
     cx: &mut Conditions<'_>,
+    tally: &mut applied::Tally,
 ) -> (Vec<String>, Vec<Document>) {
     let mut state: std::collections::HashMap<String, Option<Document>> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for op in ops {
         if is_by_filter(&op) {
-            by_filter(&op, base, &mut state, &mut order, cx);
+            by_filter(&op, base, &mut state, &mut order, cx, tally);
             continue;
         }
         let id = op.id.clone();
@@ -902,9 +926,16 @@ fn resolve(
             Some(Some(p)) => p.admits(&cur.id, &cur.attrs),
             None => false,
         };
+        // M129: what the operation will do, read before `op` moves into the state.
+        let kind = match op_code(&op) {
+            Some(OP_PATCH) => applied::Kind::Patched,
+            Some(OP_COND_DELETE) => applied::Kind::Deleted,
+            _ => applied::Kind::Upserted,
+        };
+        let req = applied::req_of(&op).map(str::to_owned);
         let next: Option<Option<Document>> = match op_code(&op) {
             None if is_tombstone(&op) => Some(None),
-            None => Some(Some(op)),
+            None => Some(Some(cleaned(op))),
             // A patch that changes nothing touches nothing (code review, M13.1): no delete
             // vector, and no segment row, for a version that is already what it would write.
             Some(OP_PATCH) => current
@@ -919,6 +950,11 @@ fn resolve(
             // A kind this build does not know is skipped, never applied as something else.
             Some(_) => None,
         };
+        if next.is_some() {
+            tally.changed(req.as_deref(), &id, kind);
+        } else {
+            tally.skipped(req.as_deref());
+        }
         if let Some(v) = next {
             if !state.contains_key(&id) {
                 order.push(id.clone());
@@ -995,10 +1031,18 @@ fn by_filter(
     state: &mut std::collections::HashMap<String, Option<Document>>,
     order: &mut Vec<String>,
     cx: &mut Conditions<'_>,
+    tally: &mut applied::Tally,
 ) {
     let Some(Some(filter)) = cx.of(op) else {
+        tally.skipped(applied::req_of(op));
         return;
     };
+    let kind = if op_code(op) == Some(OP_DELETE_BY_FILTER) {
+        applied::Kind::Deleted
+    } else {
+        applied::Kind::Patched
+    };
+    let mut changed = false;
     let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
     ids.sort_unstable();
     ids.dedup();
@@ -1019,10 +1063,15 @@ fn by_filter(
             }
             Some(m)
         };
+        tally.changed(applied::req_of(op), &id, kind);
+        changed = true;
         if !state.contains_key(&id) {
             order.push(id.clone());
         }
         state.insert(id, next);
+    }
+    if !changed {
+        tally.skipped(applied::req_of(op));
     }
 }
 
@@ -1183,6 +1232,8 @@ const TEXT_ATTR: &str = "$text";
 /// writer's text field.
 fn stripped(mut d: Document) -> Document {
     d.attrs.remove(TEXT_ATTR);
+    // M129: never sealed, whatever path a row took to the seal.
+    d.attrs.remove(applied::REQ_ATTR);
     d.attrs.remove(METRIC_ATTR);
     d.attrs.remove(FTS_ATTR);
     d.attrs.remove(TRGM_ATTR);
@@ -1651,6 +1702,15 @@ pub struct Engine<S> {
     /// old enough. Never a reap's own commit.
     reapable: Mutex<std::collections::VecDeque<Reapable>>,
     committed: Mutex<Epoch>,
+    /// M129: an applied request folds, and reads outcome objects, only through this, so
+    /// concurrent ones share a fold and its reads.
+    fold_gate: tokio::sync::Mutex<()>,
+    /// M129: one HEAD read refreshes a stale mark for every request waiting on it.
+    mark_gate: tokio::sync::Mutex<()>,
+    /// M129: the highest-epoch HEAD this engine has read or committed.
+    observed: Mutex<Observed>,
+    /// M129: outcome objects this engine wrote or read, by key; a few dozen at most.
+    outcome_cache: Mutex<BTreeMap<String, Arc<BTreeMap<String, Outcome>>>>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
     /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
@@ -1795,6 +1855,10 @@ impl<S: BlobStore> Engine<S> {
             abandoned: Mutex::new(Vec::new()),
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
+            fold_gate: tokio::sync::Mutex::new(()),
+            mark_gate: tokio::sync::Mutex::new(()),
+            observed: Mutex::new(Observed::default()),
+            outcome_cache: Mutex::new(BTreeMap::new()),
             fresh: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
             // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
@@ -2160,6 +2224,144 @@ impl<S: BlobStore> Engine<S> {
             .committed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+    }
+
+    /// Where this engine stands before an applied request's flush (M129): the highest HEAD
+    /// epoch it has read or committed. Every commit that can fold the request comes after
+    /// its flush, so its epoch is above this.
+    ///
+    /// ⚠️ **Refreshed when older than [`MARK_FRESH`]** (round-2 spec review): a bound only
+    /// ever moved by this engine's own folds falls behind on a tenant other engines fold, and
+    /// a window reaching past HEAD's list reports `outcome_unavailable`. One HEAD read a
+    /// second at most, per engine, not per request.
+    ///
+    /// # Errors
+    /// A HEAD read that fails.
+    pub async fn mark(&self) -> Result<Mark, EngineError> {
+        let stale = || {
+            self.observed()
+                .at
+                .is_none_or(|at| at.elapsed() > MARK_FRESH)
+        };
+        if stale() {
+            // ⚠️ Re-checked under the gate (code review): a burst after an idle second would
+            // otherwise read HEAD once a request.
+            let _one = self.mark_gate.lock().await;
+            if stale() {
+                let at = head::read(&*self.store, self.tenant).await?;
+                self.observe(&at.head);
+            }
+        }
+        Ok(Mark(self.observed().epoch))
+    }
+
+    fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
+        self.observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remembers `h` if it is the newest HEAD this engine has seen (M129).
+    fn observe(&self, h: &Head) {
+        let mut o = self.observed();
+        if h.epoch.0 >= o.epoch {
+            *o = Observed {
+                epoch: h.epoch.0,
+                watermark: h.watermarks.get(&self.lane.0).copied().unwrap_or(0),
+                outcomes: h.outcomes.clone(),
+                at: Some(tokio::time::Instant::now()),
+            };
+        }
+    }
+
+    fn cache_outcomes(&self, key: String, outcomes: BTreeMap<String, Outcome>) {
+        let mut c = self
+            .outcome_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        c.insert(key, Arc::new(outcomes));
+        // Bounded: twice what HEAD lists, oldest key (lowest epoch) first.
+        while c.len() > 2 * applied::OUTCOMES_KEPT {
+            c.pop_first();
+        }
+    }
+
+    /// Waits until a HEAD commit covers everything this engine has flushed, then reports what
+    /// the folds decided for `op` (M129), summed over every commit after `mark`.
+    ///
+    /// ⚠️ **Through the fold gate**: a waiter holding it folds only if the newest HEAD this
+    /// engine has seen does not already cover its target, so waiters queued behind one fold
+    /// are answered by it -- it began after their bundles landed.
+    ///
+    /// # Errors
+    /// As [`Self::fold`]; and an outcome object that cannot be read for a reason other than
+    /// its absence.
+    pub async fn await_applied(&self, mark: Mark, op: OperationId) -> Result<Applied, EngineError> {
+        let Some(target) = self.next_seq() else {
+            // Nothing was ever flushed here, so nothing of `op`'s was.
+            return Ok(Applied::Known(Outcome::default()));
+        };
+        // ⚠️ Held through the outcome reads too (code review): waiters released one at a time
+        // and reading after would each miss the cache and read the same object.
+        let _gate = self.fold_gate.lock().await;
+        {
+            let mut attempts = 0;
+            while self.observed().watermark < target {
+                if attempts == MAX_COMMIT_ATTEMPTS {
+                    return Err(EngineError::Lost);
+                }
+                attempts += 1;
+                self.fold().await?;
+            }
+        }
+        let seen = self.observed().clone();
+        // ⚠️ A full list whose oldest is past the mark may have dropped a commit in the window.
+        if seen.outcomes.len() >= applied::OUTCOMES_KEPT
+            && seen.outcomes.first().is_some_and(|(e, _)| *e > mark.0 + 1)
+        {
+            return Ok(Applied::Unavailable);
+        }
+        let window: Vec<&String> = seen
+            .outcomes
+            .iter()
+            .filter(|(e, _)| *e > mark.0 && *e <= seen.epoch)
+            .map(|(_, k)| k)
+            .collect();
+        let cached = |k: &str| {
+            self.outcome_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(k)
+                .cloned()
+        };
+        // One parallel round for whatever this engine has not seen.
+        let fetched =
+            futures_util::future::try_join_all(window.iter().filter(|k| cached(k).is_none()).map(
+                |k| async move {
+                    match self.store.get(&Key::new((*k).clone())).await {
+                        Ok(body) => applied::decode(&body).map(|o| Some(((*k).clone(), o))),
+                        Err(pstore_blob::BlobError::NotFound(_)) => Ok(None),
+                        Err(e) => Err(EngineError::from(e)),
+                    }
+                },
+            ))
+            .await?;
+        if fetched.iter().any(Option::is_none) {
+            // Reaped: the request was applied, and what it did can no longer be read.
+            return Ok(Applied::Unavailable);
+        }
+        for (k, o) in fetched.into_iter().flatten() {
+            self.cache_outcomes(k, o);
+        }
+        let commits: Vec<Arc<BTreeMap<String, Outcome>>> =
+            window.iter().filter_map(|k| cached(k)).collect();
+        if commits.len() != window.len() {
+            return Ok(Applied::Unavailable);
+        }
+        Ok(Applied::Known(applied::sum(
+            &op.hex(),
+            commits.iter().map(|c| &**c),
+        )))
     }
 
     /// The last epoch this engine committed.
@@ -3840,6 +4042,10 @@ impl<S: BlobStore> Engine<S> {
         let mut named: Option<Vec<(LaneId, u64)>> = None;
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
             let at = head::read(&*self.store, self.tenant).await?;
+            self.observe(&at.head);
+            // M129: this attempt's decisions for applied requests. Recomputed by every attempt,
+            // and published only by the one that commits.
+            let mut tally = applied::Tally::default();
             // ⚠️ **A fold that lost stops once a winner folded what it first read** (M111). A
             // loser rebased onto everything left -- including what other lanes flushed while it
             // worked -- so under steady writes it always found more, and a fold slower than its
@@ -3929,7 +4135,9 @@ impl<S: BlobStore> Engine<S> {
                     return Ok(Folded::Missing);
                 }
                 // Before the reject pass, so none of its rows are counted as rejects.
-                by_index.remove(x);
+                for d in by_index.remove(x).unwrap_or_default() {
+                    tally.rejected(&d);
+                }
             }
             // ⚠️ M22: a replica takes no writes. A row that slipped past a door that had not
             // read this HEAD is dropped here -- every kind, tombstones and patches too -- and
@@ -3939,6 +4147,9 @@ impl<S: BlobStore> Engine<S> {
             by_index.retain(|idx, docs| {
                 if at.head.replications.contains_key(idx) {
                     replica_rows.insert(idx.clone(), docs.len() as u64);
+                    for d in docs.iter() {
+                        tally.rejected(d);
+                    }
                     false
                 } else {
                     true
@@ -4005,6 +4216,9 @@ impl<S: BlobStore> Engine<S> {
                     .partition(|d| odd_width(&mut widths, d).is_none());
                 learned.insert(idx.clone(), widths);
                 out.extend(odd);
+                for d in &out {
+                    tally.rejected(d);
+                }
                 *docs = keep;
                 if !out.is_empty() {
                     rejects.insert(idx.clone(), out.len() as u64);
@@ -4089,7 +4303,8 @@ impl<S: BlobStore> Engine<S> {
                         (d.id.clone(), d)
                     })
                     .collect();
-                let (changed, sealed) = resolve(docs, &base, &mut cx);
+                tally.next_index();
+                let (changed, sealed) = resolve(docs, &base, &mut cx, &mut tally);
                 // ⚠️ **And the widths again, over what is sealed** (M61 code review): a patch
                 // merges into its base row here, after the width pass, and the base row keeps
                 // its folded fields. A row that disagrees with this fold's first of a field, in
@@ -4105,6 +4320,9 @@ impl<S: BlobStore> Engine<S> {
                 learned.insert(idx.clone(), widths);
                 let odd_ids: std::collections::HashSet<&str> =
                     odd.iter().map(|d| d.id.as_str()).collect();
+                for id in &odd_ids {
+                    tally.set_aside(id);
+                }
                 touched.insert(
                     idx.clone(),
                     changed
@@ -4305,6 +4523,23 @@ impl<S: BlobStore> Engine<S> {
                     next.dropped.push((x.to_owned(), next.epoch.0, schema));
                 }
             }
+            // M129: one outcome object for every applied request this commit decides, listed in
+            // HEAD; the oldest listed falls off and is buried.
+            let outcomes = std::mem::take(&mut tally.by_req);
+            if !outcomes.is_empty() {
+                let key = self
+                    .create_object(
+                        names,
+                        self.outcome_key(next.epoch).as_str(),
+                        bytes::Bytes::from(applied::encode(&outcomes)),
+                    )
+                    .await?;
+                next.outcomes.push((next.epoch.0, key));
+                while next.outcomes.len() > applied::OUTCOMES_KEPT {
+                    let (_, old) = next.outcomes.remove(0);
+                    next.graveyard.entry(next.epoch.0).or_default().push(old);
+                }
+            }
             if let Some(f) = interfere.take() {
                 f.await;
             }
@@ -4338,6 +4573,10 @@ impl<S: BlobStore> Engine<S> {
                     // ⚠️ Only what this fold folded (M9c.1, row 36): a batch flushed after the
                     // lane was probed has a sequence at or past the new watermark and stays.
                     self.mem().prune(self.watermark(&next));
+                    if let Some((_, key)) = next.outcomes.last().filter(|_| !outcomes.is_empty()) {
+                        self.cache_outcomes(key.clone(), outcomes);
+                    }
+                    self.observe(&next);
                     self.record_commit(epoch);
                     self.record_reapable(epoch);
                     return Ok(Folded::Committed(epoch));
@@ -4620,6 +4859,8 @@ impl<S: BlobStore> Engine<S> {
                         .flatten()
                         .map(|(k, _)| k.as_str()),
                 )
+                // And every listed outcome object (M129).
+                .chain(at.head.outcomes.iter().map(|(_, k)| k.as_str()))
                 .collect();
             // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
             // it is a burial of the segment.
@@ -4741,6 +4982,15 @@ impl<S: BlobStore> Engine<S> {
             .await
             .map(|at| at.head)
             .unwrap_or_default()
+    }
+
+    /// Where a commit's applied outcomes go (M129): under `/out/`, never ending `.seg`, so
+    /// `as_of` cannot read one as a segment; with the lane, as every fold output is.
+    fn outcome_key(&self, epoch: Epoch) -> Key {
+        Key::new(format!(
+            "{:04x}/tnt/{}/out/{:020}-{:016x}.o",
+            self.tenant.0 as u16, self.tenant.0, epoch.0, self.lane.0
+        ))
     }
 
     /// Where a fold attempt at `epoch` sets aside an index's rejected rows (M25): the first

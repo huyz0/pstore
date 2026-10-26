@@ -1,5 +1,20 @@
 # Native API migration notes
 
+## M129: `durability: "applied"`
+
+A write may ask for `"applied"`: it is made durable, then answered only once a commit has
+folded every operation in it, with what the fold decided. The response adds
+`completion: "applied"`, `operation` (32 hex digits) and `applied` with `upserted`,
+`deleted` and `patched` (rows changed), `skipped` (operations that changed nothing) and
+`rejected` (operations a schema or width pass set aside). If an outcome can no longer be
+read, `applied` is `null` and `outcome_unavailable` is `true`; counts are never invented.
+
+It is refused with `unsupported_durability` unless every node runs this release and the
+operator starts them with `PSTORE_APPLIED_WRITES=1`. `batched` and `durable` are
+unchanged, and their `documents_*` counters still count what was submitted. An applied
+write waits for a fold, so it is slower; it is not exactly-once, and a retry after a lost
+response may apply again. See the [proof](research/11-design/mutation-completion.md).
+
 ## M127: explicit authentication and encrypted peers
 
 Standalone startup now requires `PSTORE_AUTH_CONFIG`, or the explicit

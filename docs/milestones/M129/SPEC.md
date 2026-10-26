@@ -62,6 +62,9 @@ Every new test is observed red against the parent before the change.
 Intent modes: unchanged. Applied: bundle 1 W + the gated fold (its HEAD, registry, probes,
 bundle reads, `prepare`, seal PUTs, 1 CAS) + 1 W outcome per tallying commit + ≤32 Rpar in
 one round per fold per engine. 0 LIST. Rseq depth = the fold's + 1; measured, opt-in.
+**Amended in implementation:** `Engine::mark` re-reads HEAD when the engine's newest view
+is over 1 s old, so a lane that rarely commits keeps its window short: ≤1 R per engine
+per second, not per request.
 
 ## Risks
 Fold latency becomes write latency; a large deferred backlog makes applied writes slow,

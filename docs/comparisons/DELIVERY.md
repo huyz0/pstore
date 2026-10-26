@@ -16,7 +16,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | A | Bounded decoding, memory/concurrency admission, overload responses | Pending |
 | B | Native OpenAPI, generated SDKs and semantic fixtures | Pending |
 | B | Versioned compatibility facade with durable/strong defaults and correct envelopes | Pending |
-| C | Applied mutation completion, actual affected counts/IDs, mixed-operation ordering | Pending |
+| C | Applied mutation completion, actual affected counts/IDs, mixed-operation ordering | Partial: applied completion and exact counts verified in [M129](../milestones/M129/VERIFIED.md) ([proof](../research/11-design/mutation-completion.md)); affected IDs and a pinned mixed-operation order pending |
 | C | Conditions with new-value references, partial filter progress and retry/idempotency policy | Pending |
 | C/F | Shared durable snapshots for query legs, aggregates and facets | Pending |
 | D | Text-only documents and persistent typed schemas | Pending |

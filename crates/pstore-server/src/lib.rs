@@ -177,6 +177,8 @@ struct Registry {
     cap: usize,
     /// Whether a reap loop runs: only then does a reapable commit keep an engine.
     reaping: bool,
+    /// `PSTORE_APPLIED_WRITES=1` (M129): every node of the deployment folds applied writes.
+    applied_writes: bool,
     /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
     lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
@@ -914,6 +916,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// nothing else would ever collect it. [`serve_folding`] sets it.
     pub fn set_reaping(&self, on: bool) {
         self.registry_mut().reaping = on;
+    }
+
+    /// Whether `durability: "applied"` is served (M129). ⚠️ **An operator's statement that
+    /// every node runs this release**: an older fold would seal the `$req` stamp as an
+    /// attribute and drop HEAD's outcome list.
+    pub fn set_applied_writes(&self, on: bool) {
+        self.registry_mut().applied_writes = on;
     }
 
     /// Engines the registry holds.
@@ -1658,6 +1667,14 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let (mut req, keys) = parse_write(&body)?;
+    let applied = matches!(req.durability, types::Durability::Applied);
+    if applied && !api.registry_mut().applied_writes {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_durability",
+            "durability \"applied\" is not enabled on this deployment (PSTORE_APPLIED_WRITES)",
+        ));
+    }
     if let Some(src) = branch_source(&req, keys)? {
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
@@ -1726,7 +1743,12 @@ async fn write_documents<S: BlobStore + 'static>(
         || delete_if.is_some()
         || delete_by.is_some()
         || patch_by.is_some();
-    if deferred && !matches!(req.durability, types::Durability::Durable) {
+    if deferred
+        && !matches!(
+            req.durability,
+            types::Durability::Durable | types::Durability::Applied
+        )
+    {
         return Err(ApiError::bad_request(
             "patches, conditional writes and by-filter operations are durable only: they are \
              applied at a fold, which \
@@ -1775,32 +1797,50 @@ async fn write_documents<S: BlobStore + 'static>(
         .into_iter()
         .map(|d| to_document(d, &dated))
         .collect::<Result<_, _>>()?;
-    let written = docs.len();
-    if !docs.is_empty() {
-        engine
-            .write_declared(&index, docs, metric, upsert_if.as_ref(), &declared)
-            .await?;
-    }
-    // Then the patches, then the deletes (M13): a later operation on an id wins.
-    let patched = patches.len();
-    if !patches.is_empty() {
-        engine.patch(&index, patches, patch_if.as_ref()).await?;
-    }
-    // After the documents: a request that writes and deletes an id deletes it.
-    let deleted = req.deletes.len();
-    match &delete_if {
-        Some(c) => engine.delete_if(&index, req.deletes, c).await?,
-        None => engine.delete(&index, req.deletes).await?,
-    }
-    // Then the by-filter operations (M13.2), each one deferred operation: a patch, then a
-    // delete, so a request that does both deletes what it patched into matching.
-    if let Some((filter, patch)) = patch_by {
-        engine.patch_by_filter(&index, &filter, patch).await?;
-    }
-    if let Some(filter) = &delete_by {
-        engine.delete_by_filter(&index, filter).await?;
-    }
-    let durable = matches!(req.durability, types::Durability::Durable);
+    // M129: an applied write's window starts at the HEAD this engine knew BEFORE its
+    // operations are buffered, and every one of them carries its id to the fold.
+    let op = applied.then(operation_id).transpose()?;
+    let mark = match op {
+        Some(_) => Some(engine.mark().await?),
+        None => None,
+    };
+    let deletes = std::mem::take(&mut req.deletes);
+    let buffer = async {
+        let written = docs.len();
+        if !docs.is_empty() {
+            engine
+                .write_declared(&index, docs, metric, upsert_if.as_ref(), &declared)
+                .await?;
+        }
+        // Then the patches, then the deletes (M13): a later operation on an id wins.
+        let patched = patches.len();
+        if !patches.is_empty() {
+            engine.patch(&index, patches, patch_if.as_ref()).await?;
+        }
+        // After the documents: a request that writes and deletes an id deletes it.
+        let deleted = deletes.len();
+        match &delete_if {
+            Some(c) => engine.delete_if(&index, deletes, c).await?,
+            None => engine.delete(&index, deletes).await?,
+        }
+        // Then the by-filter operations (M13.2), each one deferred operation: a patch, then a
+        // delete, so a request that does both deletes what it patched into matching.
+        if let Some((filter, patch)) = patch_by {
+            engine.patch_by_filter(&index, &filter, patch).await?;
+        }
+        if let Some(filter) = &delete_by {
+            engine.delete_by_filter(&index, filter).await?;
+        }
+        Ok::<_, ApiError>((written, patched, deleted))
+    };
+    let (written, patched, deleted) = match op {
+        Some(op) => pstore_engine::applying(op, buffer).await?,
+        None => buffer.await?,
+    };
+    let durable = matches!(
+        req.durability,
+        types::Durability::Durable | types::Durability::Applied
+    );
     if durable {
         engine.flush().await?;
         // ⚠️ **The engine's next sequence, not this flush's own** (M11.1, spec review B1): a
@@ -1810,6 +1850,10 @@ async fn write_documents<S: BlobStore + 'static>(
             token.wrote(engine.lane().0, next);
         }
     }
+    let outcome = match (op, mark) {
+        (Some(op), Some(mark)) => Some((op, engine.await_applied(mark, op).await?)),
+        _ => None,
+    };
     token.saw(engine.epoch().0);
     let session = token.encode();
     Ok(with_session(
@@ -1821,9 +1865,37 @@ async fn write_documents<S: BlobStore + 'static>(
             durable,
             cost: api.spend(tenant).since(before),
             session: session.clone(),
+            completion: outcome.map(|_| "applied"),
+            operation: outcome.map(|(op, _)| op.hex()),
+            applied: outcome.map(|(_, a)| match a {
+                pstore_engine::Applied::Known(o) => Some(types::AppliedOut {
+                    upserted: o.upserted,
+                    deleted: o.deleted,
+                    patched: o.patched,
+                    skipped: o.skipped,
+                    rejected: o.rejected,
+                }),
+                pstore_engine::Applied::Unavailable => None,
+            }),
+            outcome_unavailable: outcome
+                .map(|(_, a)| a == pstore_engine::Applied::Unavailable)
+                .filter(|u| *u),
         }),
         &session,
     ))
+}
+
+/// A fresh applied operation's id (M129): 128 random bits.
+fn operation_id() -> Result<pstore_engine::OperationId, ApiError> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("no randomness for an operation id: {e}"),
+        )
+    })?;
+    Ok(pstore_engine::OperationId(u128::from_le_bytes(b)))
 }
 
 /// The index a write asks to branch from (M16), if it asks -- refused unless the request says
@@ -1875,6 +1947,10 @@ async fn branch_index<S: BlobStore + 'static>(
             durable: true,
             cost: api.spend(tenant).since(before),
             session: session.clone(),
+            completion: None,
+            operation: None,
+            applied: None,
+            outcome_unavailable: None,
         }),
         &session,
     ))
@@ -3113,7 +3189,7 @@ fn parse_write(body: &[u8]) -> Result<(WriteRequest, usize), ApiError> {
         .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
     let keys = raw.as_object().map_or(0, serde_json::Map::len);
     if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
-        && !matches!(d, "batched" | "durable")
+        && !matches!(d, "batched" | "durable" | "applied")
     {
         // ⚠️ **Refused, never downgraded.** Accepting `async` and treating it as `batched`
         // is a promise about durability that the system does not keep, which is the one
@@ -3121,7 +3197,9 @@ fn parse_write(body: &[u8]) -> Result<(WriteRequest, usize), ApiError> {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "unsupported_durability",
-            format!("durability {d:?} is not implemented; use \"batched\" or \"durable\""),
+            format!(
+                "durability {d:?} is not implemented; use \"batched\", \"durable\" or \"applied\""
+            ),
         ));
     }
     serde_json::from_value(raw)
@@ -4985,12 +5063,14 @@ mod tests {
                 .map_err(|e| ApiError::bad_request(format!("malformed JSON: {e}")))?;
             let keys = raw.as_object().map_or(0, serde_json::Map::len);
             if let Some(d) = raw.get("durability").and_then(serde_json::Value::as_str)
-                && !matches!(d, "batched" | "durable")
+                && !matches!(d, "batched" | "durable" | "applied")
             {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "unsupported_durability",
-                    format!("durability {d:?} is not implemented; use \"batched\" or \"durable\""),
+                    format!(
+                        "durability {d:?} is not implemented; use \"batched\", \"durable\" or \"applied\""
+                    ),
                 ));
             }
             serde_json::from_value(raw)

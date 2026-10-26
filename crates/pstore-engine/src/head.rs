@@ -252,6 +252,10 @@ pub struct Head {
     /// Each external index (M86), by name. ⚠️ The last trailing section, after the segment
     /// lengths: absent means none.
     pub externals: BTreeMap<String, ExternalRef>,
+    /// The last [`crate::OUTCOMES_KEPT`] commits that tallied an applied request's outcome
+    /// (M129), oldest first: `(epoch, outcome object key)`. A pair that falls off is buried.
+    /// ⚠️ The last trailing section, after the widths: absent means none.
+    pub outcomes: Vec<(u64, String)>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -528,7 +532,10 @@ impl Head {
             .iter()
             .filter(|(_, _, s, _)| !s.fields.is_empty())
             .collect();
-        let ext = !widths.is_empty() || !self.externals.is_empty();
+        // M129: the applied outcomes are last, and force the widths.
+        let outs = !self.outcomes.is_empty();
+        let wide = !widths.is_empty() || outs;
+        let ext = wide || !self.externals.is_empty();
         let lens = ext || self.indexes.values().flatten().any(|r| r.len.is_some());
         let dicts = lens || self.indexes.values().flatten().any(|r| r.dicts.is_some());
         let more = !self.replications.is_empty() || !self.quarantine.is_empty() || dicts;
@@ -622,7 +629,7 @@ impl Head {
                 out.extend_from_slice(&e.source_len.to_le_bytes());
             }
         }
-        if !widths.is_empty() {
+        if wide {
             out.extend_from_slice(&(widths.len() as u32).to_le_bytes());
             for (kind, at, s, name) in widths {
                 put_ref(&mut out, *kind, *at, *name);
@@ -631,6 +638,13 @@ impl Head {
                     put_str(&mut out, field);
                     out.extend_from_slice(&width.to_le_bytes());
                 }
+            }
+        }
+        if outs {
+            out.extend_from_slice(&(self.outcomes.len() as u32).to_le_bytes());
+            for (epoch, key) in &self.outcomes {
+                out.extend_from_slice(&epoch.to_le_bytes());
+                put_str(&mut out, key);
             }
         }
         out
@@ -948,6 +962,14 @@ impl Head {
                 }
                 schema.fields.insert(field, c.u32()?);
             }
+        }
+        // ⚠️ M129: end of buffer here is "no applied outcome listed".
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let epoch = c.u64()?;
+            h.outcomes.push((epoch, c.string()?));
         }
         Ok(h)
     }
@@ -1621,6 +1643,7 @@ mod tests {
         assert_eq!(
             hex(&Head {
                 externals: BTreeMap::new(),
+                outcomes: Vec::new(),
                 ..sample()
             }
             .encode()),

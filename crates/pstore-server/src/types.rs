@@ -35,6 +35,9 @@ pub enum Durability {
     Batched,
     /// Written as one bundle object before the response. `RA = 1 W` for the batch.
     Durable,
+    /// Durable, then answered only once a HEAD commit has folded the whole request, with
+    /// what the fold decided (M129). Refused unless the process enables it.
+    Applied,
 }
 
 /// One document, as a client sends it.
@@ -296,6 +299,34 @@ pub struct WriteResponse {
     pub cost: Cost,
     /// The session token, as the `x-pstore-session` header carries it (M11.1).
     pub session: String,
+    /// `"applied"` for an applied write (M129); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<&'static str>,
+    /// An applied write's operation id, 32 hex digits (M129).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// What the folds decided for an applied write (M129), or `null` when that can no
+    /// longer be read -- never invented counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<Option<AppliedOut>>,
+    /// `true` beside `applied: null` (M129).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_unavailable: Option<bool>,
+}
+
+/// An applied write's outcome (M129), in rows; `skipped` and `rejected` in operations.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AppliedOut {
+    /// Rows an upsert wrote.
+    pub upserted: u64,
+    /// Rows a delete removed: a version existed.
+    pub deleted: u64,
+    /// Rows a patch changed.
+    pub patched: u64,
+    /// Operations that changed nothing.
+    pub skipped: u64,
+    /// Operations a reject, width, replica or drop pass discarded.
+    pub rejected: u64,
 }
 
 /// `POST /v1/indexes/{id}/query`.
