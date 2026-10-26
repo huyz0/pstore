@@ -57,6 +57,8 @@ struct Watched {
     rival: Engine<MemoryStore>,
     /// The next HEAD commit is preceded by a rival fold of everything, so it loses.
     overtake: AtomicBool,
+    /// Every outcome object read fails, other than as absent.
+    fail_outcome_reads: AtomicBool,
     head_commits: AtomicU64,
     head_reads: AtomicU64,
     outcome_puts: AtomicU64,
@@ -70,6 +72,7 @@ impl Watched {
             rival: Engine::new(Arc::clone(&inner), T, LaneId(9)),
             inner,
             overtake: AtomicBool::new(false),
+            fail_outcome_reads: AtomicBool::new(false),
             head_commits: AtomicU64::new(0),
             head_reads: AtomicU64::new(0),
             outcome_reads: AtomicU64::new(0),
@@ -86,6 +89,9 @@ impl BlobStore for Watched {
     async fn get(&self, key: &Key) -> Result<Bytes, BlobError> {
         if key.as_str().contains("/out/") {
             self.outcome_reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_outcome_reads.load(Ordering::SeqCst) {
+                return Err(BlobError::Other("injected".to_owned()));
+            }
             // Slow enough that concurrent waiters' reads overlap, if they are not shared.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -884,4 +890,75 @@ async fn ids_are_never_sealed() {
             );
         }
     }
+}
+
+/// M129: a request that never flushed anything has nothing to wait for, and did nothing.
+#[tokio::test]
+async fn nothing_flushed_is_nothing_applied() {
+    let e = Engine::new(Arc::new(MemoryStore::new()), T, LaneId(1));
+    let mark = e.mark().await.unwrap();
+    assert_eq!(
+        e.await_applied(mark, OperationId(5)).await.unwrap(),
+        Applied::Known(Outcome::default(), None)
+    );
+}
+
+/// The request another engine folded, whose outcome object is then gone: never invented.
+#[tokio::test]
+async fn a_reaped_outcome_is_unavailable() {
+    let store = Arc::new(MemoryStore::new());
+    let a = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2));
+    let op = OperationId(78);
+    let mark = a.mark().await.unwrap();
+    applying(op, a.write("idx", vec![doc("mine", 1)]))
+        .await
+        .unwrap();
+    a.flush().await.unwrap();
+    b.fold().await.unwrap();
+    let head = b.head_for_test().await;
+    let (_, key) = head.outcomes.last().unwrap();
+    store.delete_batch(&[Key::new(key.clone())]).await.unwrap();
+    assert_eq!(
+        a.await_applied(mark, op).await.unwrap(),
+        Applied::Unavailable
+    );
+}
+
+/// A failed outcome read is an error, not an answer.
+#[tokio::test]
+async fn an_outcome_read_failure_is_an_error() {
+    let store = Watched::new();
+    let a = Engine::new(Arc::clone(&store), T, LaneId(1));
+    let b = Engine::new(Arc::clone(&store), T, LaneId(2));
+    let op = OperationId(79);
+    let mark = a.mark().await.unwrap();
+    applying(op, a.write("idx", vec![doc("mine", 1)]))
+        .await
+        .unwrap();
+    a.flush().await.unwrap();
+    b.fold().await.unwrap();
+    store.fail_outcome_reads.store(true, Ordering::SeqCst);
+    let got = a.await_applied(mark, op).await;
+    assert!(
+        matches!(&got, Err(pstore_engine::EngineError::Blob(m)) if m.contains("injected")),
+        "{got:?}"
+    );
+}
+
+/// The outcome cache holds twice what HEAD lists and no more; what it evicts is the oldest,
+/// so every answer here still comes from this engine's own commit, never a read.
+#[tokio::test]
+async fn the_outcome_cache_is_bounded() {
+    let store = Watched::new();
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    for i in 0..2 * OUTCOMES_KEPT + 5 {
+        let got = known(one(&e, i as u128 + 1, &format!("c{i}")).await);
+        assert_eq!(got.upserted, 1);
+        assert_eq!(
+            e.outcome_cache_len_for_test(),
+            (i + 1).min(2 * OUTCOMES_KEPT)
+        );
+    }
+    assert_eq!(store.outcome_reads.load(Ordering::SeqCst), 0);
 }

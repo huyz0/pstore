@@ -456,6 +456,58 @@ mod tests {
         }
     }
 
+    /// M130: a set-aside takes back every kind's count and id, leaving another index's.
+    #[test]
+    fn a_set_aside_takes_back_every_kind() {
+        let stamp = format!("{}{IDS}", OperationId(1).hex());
+        let mut t = Tally::default();
+        t.changed(Some(&stamp), "x", Kind::Upserted);
+        t.next_index();
+        // The same id upserted in a second index, then set aside there: the first stands.
+        t.changed(Some(&stamp), "x", Kind::Upserted);
+        t.changed(Some(&stamp), "x", Kind::Patched);
+        t.changed(Some(&stamp), "x", Kind::Deleted);
+        t.set_aside("x");
+        let d = t.take();
+        let o = d.counts[&OperationId(1).hex()];
+        assert_eq!((o.upserted, o.patched, o.deleted, o.rejected), (1, 0, 0, 3));
+        assert_eq!(
+            d.ids[&OperationId(1).hex()],
+            Affected {
+                upserted: vec!["x".to_owned()],
+                deleted: vec![],
+                patched: vec![],
+            }
+        );
+        // And a request that did not ask has no ids, whatever its stamp's id.
+        let mut t = Tally::default();
+        t.changed(Some(&OperationId(2).hex()), "y", Kind::Upserted);
+        assert!(t.take().ids.is_empty());
+    }
+
+    /// Every truncation of an object with ids is refused, never read as a shorter answer.
+    #[test]
+    fn every_truncation_is_refused() {
+        let d = Decided {
+            counts: counts(),
+            ids: BTreeMap::from([(
+                "ab".to_owned(),
+                Affected {
+                    upserted: vec!["x".to_owned()],
+                    deleted: vec!["y".to_owned()],
+                    patched: vec!["z".to_owned()],
+                },
+            )]),
+        };
+        let body = encode(&d);
+        // The end of the counts is a whole M129 object, and decodes as one.
+        let m129 = 8 + 4 + 4 + 2 + 5 * 8;
+        for cut in (0..body.len()).filter(|&c| c != m129) {
+            assert!(decode(&body[..cut]).is_err(), "a cut at {cut} decoded");
+        }
+        assert!(decode(b"NOTOUTCM").is_err());
+    }
+
     /// M130 criterion 3: an object an M129 node wrote, spelled out byte by byte.
     #[test]
     fn an_m129_outcome_object_decodes() {

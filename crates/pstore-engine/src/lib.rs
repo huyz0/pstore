@@ -4975,6 +4975,15 @@ impl<S: BlobStore> Engine<S> {
         head::commit(&*self.store, self.tenant, &at, &next).await
     }
 
+    /// How many commits' outcomes this engine holds (M129), so a test can assert the bound.
+    #[doc(hidden)]
+    pub fn outcome_cache_len_for_test(&self) -> usize {
+        self.outcome_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// The published manifest, so a test can assert on what is *referenced* rather than
     /// inferring it from what a scan happens to return.
     #[doc(hidden)]

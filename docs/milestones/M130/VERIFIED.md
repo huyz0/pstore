@@ -39,8 +39,16 @@ skipping M127's two `[::1]` tests (no IPv6 here, as M129 records): 2,185 passed,
 `scripts/check-poison.sh`, `check-links.sh`, `build-index.py --check`, `check-verified.py`,
 `check-slos.py`, `check-milestone-ids.py`, the self-tests and `check-portable.sh` passed;
 `scripts/recall.sh`, `scripts/ndcg.sh` and `scripts/depth.sh` passed. NOT-RUN here:
-`scripts/coverage.sh`, `scripts/mutants.sh` and `cargo deny check` (their tools are not
-installed in this container); CI runs them on the push.
+`scripts/mutants.sh` and `cargo deny check` (their tools are not installed in this
+container).
+
+Coverage, after the push: CI's coverage job had been red since M129 at 94.98% regions
+(floor 95%); M129 was pushed without running it. Measured here with `cargo-llvm-cov`
+installed, skipping the two IPv6 tests: 94.98% regions before, 95.01% after a follow-up
+commit adding tests for the unexercised outcome paths (nothing flushed, a reaped object,
+a failed read, the cache bound, cross-index set-aside, every truncation). Each new test
+was checked by a hand mutation that it kills. `cargo deny` is red on main since M127 for
+four zstd advisories, which is not this milestone's change.
 
 Review: one round, verdict pass with two minors, recorded in the commit body. (The packet
 is numbered round 2 because an earlier packet build was cut off by a full disk and
