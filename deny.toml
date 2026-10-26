@@ -8,6 +8,15 @@ yanked = "deny"
 # `cargo deny` warns about an ignore that matches nothing, so the gate will say when.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable; compile-time only, via foyer-memory; owner accepted 2026-10-20" },
+    # zstd 0.13: foyer 0.22.3 and chitchat 0.13 pin it, and the fixes are in zstd 0.14.3 and
+    # zstd-safe 8.2, which neither can take. None of the four vulnerable paths is called: foyer
+    # uses `stream::write::Encoder::new` and `read::Decoder`, chitchat and `pstore-format` the
+    # bulk API and `read::Decoder`. Remove these once both move to zstd 0.14 -- the gate warns
+    # about an ignore that matches nothing.
+    { id = "RUSTSEC-2026-0391", reason = "zstd with_context stream reuse; no caller uses with_context; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd seekable decompress; the seekable feature is not enabled; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd legacy-frame decompress_stream into a Vec; no caller decodes a stream into a Vec; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys allocator shim on wasm32 only; pstore ships no wasm32 target; pinned by foyer 0.22.3 and chitchat 0.13; owner accepted 2026-10-26" },
 ]
 
 [licenses]
