@@ -8180,7 +8180,7 @@ mod query_error_tests {
             EngineError::UnknownField(f) if f == "late"
         ));
         assert!(matches!(
-            query_error(m, &[fde.clone()], unknown()),
+            query_error(m, std::slice::from_ref(&fde), unknown()),
             EngineError::UnknownField(f) if f == "later"
         ));
         // M155: a text field the query layer named is that field, even beside a `multi` leg.
