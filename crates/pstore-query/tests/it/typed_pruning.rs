@@ -127,6 +127,14 @@ fn predicates() -> Vec<Predicate> {
     for x in [Value::Float(1e12), Value::Int(1), Value::Float(1.0)] {
         out.push(Predicate::ContainsAny(n(), vec![x]));
     }
+    // M135: an ordered element test never prunes on the scalar zone beside the arrays.
+    for x in literals() {
+        for op in [Op::Lt, Op::Lte, Op::Gt, Op::Gte] {
+            let p = Predicate::AnyCmp(n(), op, x.clone());
+            out.push(Predicate::Not(Box::new(p.clone())));
+            out.push(p);
+        }
+    }
     out.push(Predicate::ContainsAny(n(), vec![]));
     out.push(Predicate::In(n(), vec![Value::Float(-0.0)]));
     out.push(Predicate::In(n(), vec![Value::Int(0)]));

@@ -363,6 +363,11 @@ pub enum Predicate {
     /// An array holding an element equal to one of these (M9h.2). `Contains x` is
     /// `ContainsAny [x]`. A scalar or absent attribute is false; an empty list admits nothing.
     ContainsAny(String, Vec<Value>),
+    /// An array holding an element `e` with `e op value`, compared as [`Self::Cmp`] compares
+    /// (M135): `AnyLt`, `AnyLte`, `AnyGt`, `AnyGte`. An element of another type is false for
+    /// that element; a scalar, absent or empty attribute is false. The operator is never
+    /// [`Op::Eq`]: that is [`Self::ContainsAny`].
+    AnyCmp(String, Op, Value),
     /// Every clause; `And []` is true.
     And(Vec<Predicate>),
     /// Any clause; `Or []` is false.
@@ -421,6 +426,7 @@ impl Predicate {
             | Self::Absent(name)
             | Self::In(name, _)
             | Self::ContainsAny(name, _)
+            | Self::AnyCmp(name, ..)
             | Self::Tokens(name, ..)
             | Self::Pattern(name, _)
             | Self::Fuzzy(name, ..)
@@ -480,6 +486,10 @@ impl Predicate {
                 Some(Value::Array(items)) => items
                     .iter()
                     .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
+                _ => false,
+            },
+            Self::AnyCmp(name, op, want) => match get(name).as_deref() {
+                Some(Value::Array(items)) => items.iter().any(|have| compare(have, *op, want)),
                 _ => false,
             },
             Self::And(all) => all.iter().all(|p| p.holds(id, attrs)),
@@ -570,7 +580,7 @@ impl Predicate {
             Self::Or(any) => any.iter().any(|p| p.could_admit(zones)),
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
-            Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
+            Self::ContainsAny(..) | Self::AnyCmp(..) | Self::Absent(_) | Self::Not(_) => true,
             // Tokens have no zone: every block could hold a match (M14.2). Nor has a
             // location, an array of two numbers (M66).
             Self::Tokens(..) | Self::GeoRadius(..) | Self::GeoBox(..) => true,
@@ -1032,5 +1042,84 @@ mod tests {
             );
         }
         assert!(tok(TokenOp::All, "x").could_admit(&Zones::default()));
+    }
+
+    #[test]
+    fn any_comparisons_match_the_reference() {
+        // M135 criterion 1: every row shape against every literal, each operator, and the
+        // compositions a client writes. The reference is the scalar comparison applied to each
+        // element of an array, and false for anything that is not an array.
+        let scalars = [
+            Value::Int(-1),
+            Value::Int(2),
+            Value::Float(1.5),
+            Value::Float(2.0),
+            Value::Str("b".to_owned()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::DateTime(1_000_000),
+        ];
+        let mut rows: Vec<Option<Value>> = vec![None, Some(Value::Array(vec![]))];
+        for a in &scalars {
+            rows.push(Some(a.clone()));
+            rows.push(Some(Value::Array(vec![a.clone()])));
+            for b in &scalars {
+                rows.push(Some(Value::Array(vec![a.clone(), b.clone()])));
+            }
+        }
+        let literals = [
+            Value::Int(-2),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Float(1.5),
+            Value::Float(1.75),
+            Value::Str("a".to_owned()),
+            Value::Str("b".to_owned()),
+            Value::Str("c".to_owned()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::DateTime(999_999),
+            Value::DateTime(1_000_000),
+            Value::Str("1970-01-01T00:00:01Z".to_owned()),
+            Value::Str("1970-01-01T00:00:02Z".to_owned()),
+        ];
+        let at = |v: &Option<Value>| -> BTreeMap<String, Value> {
+            v.iter().map(|v| ("a".to_owned(), v.clone())).collect()
+        };
+        let reference = |op: Op, want: &Value, v: &Option<Value>| match v {
+            Some(Value::Array(items)) => items.iter().any(|e| {
+                Predicate::Cmp("a".to_owned(), op, want.clone()).admits("x", &at(&Some(e.clone())))
+            }),
+            _ => false,
+        };
+        let mut admitted = 0;
+        for op in [Op::Lt, Op::Lte, Op::Gt, Op::Gte] {
+            for want in &literals {
+                let any = Predicate::AnyCmp("a".to_owned(), op, want.clone());
+                let not = |p: Predicate| Predicate::Not(Box::new(p));
+                let has = Predicate::ContainsAny("a".to_owned(), vec![want.clone()]);
+                for v in &rows {
+                    let r = reference(op, want, v);
+                    let c = has.admits("x", &at(v));
+                    let row = at(v);
+                    let case = format!("{op:?} {want:?} over {v:?}");
+                    assert_eq!(any.admits("x", &row), r, "{case}");
+                    assert_eq!(not(any.clone()).admits("x", &row), !r, "Not {case}");
+                    assert_eq!(not(not(any.clone())).admits("x", &row), r, "Not Not {case}");
+                    let and = Predicate::And(vec![any.clone(), has.clone()]);
+                    assert_eq!(and.admits("x", &row), r && c, "And {case}");
+                    let or = Predicate::Or(vec![any.clone(), has.clone()]);
+                    assert_eq!(or.admits("x", &row), r || c, "Or {case}");
+                    admitted += usize::from(r);
+                }
+                // An array has no zone: a block is never ruled out.
+                assert!(any.could_admit(&zones(&[("a", 100, 200)])));
+                assert_eq!(any.names(), vec!["a"]);
+            }
+        }
+        // The corpus is not vacuous: both outcomes occur.
+        assert!(admitted > 0 && admitted < 4 * literals.len() * rows.len());
     }
 }
