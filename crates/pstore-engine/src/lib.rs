@@ -16,7 +16,7 @@ pub use applied::{
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
-    Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, Metric, ReplicaSource,
+    Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource,
     Replication, SegmentRef, TimeTravel,
 };
 pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
@@ -1518,25 +1518,35 @@ fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::T
     }
 }
 
-/// Whether one share's `Part` describes a query (M152, M153): its text legs read at most one
-/// field, and that field scores under `fts`, which also binds the filter. M156: and no token
-/// predicate in its filter is over a further field, which binds to that field's analyzer.
-fn one_part(
-    texts: &pstore_query::Texts,
-    prefetch: &[pstore_query::Prefetch],
-    filter: Option<&pstore_query::Predicate>,
-) -> bool {
+/// The one text field a query's text legs read, if any (M153): a share's `Part` carries one
+/// `Stats`, so a query over two or more fields is never split (M157 lifts it). `Err` for such
+/// a query.
+fn one_text_field(prefetch: &[pstore_query::Prefetch]) -> Result<Option<&str>, ()> {
     let mut fields = prefetch.iter().filter_map(|p| match p {
         pstore_query::Prefetch::Text { field, .. } => Some(field.as_str()),
         _ => None,
     });
     let first = fields.next();
-    fields.all(|f| Some(f) == first)
-        && first.is_none_or(|f| *texts.of(f) == texts.default)
-        && filter.is_none_or(|p| {
+    if fields.all(|f| Some(f) == first) {
+        Ok(first)
+    } else {
+        Err(())
+    }
+}
+
+/// Whether a share must carry the index's further fields (M154): its text legs read one, or
+/// its filter holds a token predicate over one (M156). Otherwise its `Part` is today's, byte
+/// for byte.
+fn needs_texts(
+    texts: &pstore_query::Texts,
+    field: Option<&str>,
+    filter: Option<&pstore_query::Predicate>,
+) -> bool {
+    field.is_some_and(|f| texts.fields.contains_key(f))
+        || filter.is_some_and(|p| {
             p.token_fields()
                 .iter()
-                .all(|f| !texts.fields.contains_key(*f))
+                .any(|f| texts.fields.contains_key(*f))
         })
 }
 
@@ -6684,7 +6694,7 @@ impl<S: BlobStore> Engine<S> {
         part: &Part,
         filter: Option<&pstore_query::Predicate>,
     ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
-        let bound = filter.map(|f| f.bound(&part.fts.analyzer));
+        let bound = filter.map(|f| f.bound_texts(&part.fts.analyzer, &part.texts));
         pstore_query::part(
             &self.store,
             &part.targets,
@@ -6692,7 +6702,7 @@ impl<S: BlobStore> Engine<S> {
             bound.as_ref(),
             part.shadow,
             &pstore_index::text::Stats::default(),
-            &part.fts,
+            &scoring(part.fts, &part.texts),
             part.sum,
         )
         .await
@@ -6723,14 +6733,14 @@ impl<S: BlobStore> Engine<S> {
         filter: Option<&pstore_query::Predicate>,
         stats: &pstore_index::text::Stats,
     ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
-        let bound = filter.map(|f| f.bound(&part.fts.analyzer));
+        let bound = filter.map(|f| f.bound_texts(&part.fts.analyzer, &part.texts));
         pstore_query::scan_part(
             &self.store,
             held,
             bound.as_ref(),
             part.shadow,
             stats,
-            &part.fts,
+            &scoring(part.fts, &part.texts),
             part.sum,
         )
         .await
@@ -6838,25 +6848,26 @@ impl<S: BlobStore> Engine<S> {
             fresh: fresh_store,
         };
         // M54: the folded segments only; the fresh one is this process's alone.
-        // ⚠️ M152: never a query scored under another `FullText` than the index's: a share's
-        // `Part` carries one, which binds the filter and scores alike (M154 lifts it). M153: nor
-        // one over several text fields, which a `Part` has one `Stats` for.
-        // M156: nor one whose filter binds a token predicate to a further field's analyzer.
-        let peers = peers.filter(|_| one_part(&scored, prefetch, filter));
-        let elsewhere = peers.map_or_else(Vec::new, |p| {
-            let durable = targets.get(..unfolded_at).unwrap_or_default();
-            shares(
-                p,
-                index,
-                durable,
-                prefetch,
-                fts,
-                shadow.len(),
-                fusion,
-                top_k,
-                MAX_PART_SEGMENTS,
-            )
-        });
+        // ⚠️ M153: never a query over several text fields, which a `Part` has one `Stats` for.
+        let elsewhere = match (peers, one_text_field(prefetch)) {
+            (Some(p), Ok(field)) => {
+                let durable = targets.get(..unfolded_at).unwrap_or_default();
+                shares(
+                    p,
+                    index,
+                    durable,
+                    prefetch,
+                    &scored,
+                    needs_texts(&scored, field, filter),
+                    field,
+                    shadow.len(),
+                    fusion,
+                    top_k,
+                    MAX_PART_SEGMENTS,
+                )
+            }
+            _ => Vec::new(),
+        };
         let resolved = pstore_query::query_rows_split_texts(
             &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere, vectors,
         )
@@ -7769,6 +7780,10 @@ pub struct Part {
     /// Its full-text schema, which binds the filter's token predicates as the coordinator's
     /// are bound.
     pub fts: pstore_format::text::FullText,
+    /// The index's further text fields (M154), when the query reads one or its filter holds a
+    /// token predicate over one; empty otherwise. A text leg over one of them scores under its
+    /// entry, and a token predicate over one binds to its analyzer, as the coordinator's do.
+    pub texts: BTreeMap<String, pstore_format::text::FullText>,
     /// The splittable legs, each with its position in the query -- after the metric's
     /// transform, so the vectors the peer scores are the coordinator's, bit for bit.
     pub legs: Vec<(usize, pstore_query::Prefetch)>,
@@ -7777,7 +7792,7 @@ pub struct Part {
     /// How many ids the query's shadow holds: what each segment's candidates are cut to
     /// leave room for.
     pub shadow: usize,
-    /// Every text leg's terms, analysed by `fts` (M55): the `df` a share's statistics carry.
+    /// Every text leg's terms, analysed by its field's analyzer (M55, M154): the `df` a share's statistics carry.
     /// Empty for a share in one exchange.
     pub terms: Vec<String>,
     /// Under `sum` fusion, how the share is cut (M58); `None` otherwise.
@@ -7846,7 +7861,9 @@ fn shares(
     index: &str,
     durable: &[pstore_query::Target],
     prefetch: &[pstore_query::Prefetch],
-    fts: pstore_format::text::FullText,
+    texts: &pstore_query::Texts,
+    carry: bool,
+    field: Option<&str>,
     shadow: usize,
     fusion: pstore_query::Fusion,
     top_k: usize,
@@ -7866,9 +7883,11 @@ fn shares(
         .filter(|(_, p)| two || pstore_query::splittable(p))
         .map(|(j, p)| (j, p.clone()))
         .collect();
+    // M154: under the analyzer of the field the legs read, as the coordinator's own are.
+    let analyzer = &texts.of(field.unwrap_or_default()).analyzer;
     let mut terms: Vec<String> = text
         .iter()
-        .flat_map(|q| pstore_format::text::analyze(&fts.analyzer, q))
+        .flat_map(|q| pstore_format::text::analyze(analyzer, q))
         .collect();
     terms.sort();
     terms.dedup();
@@ -7902,7 +7921,12 @@ fn shares(
             let ordinals = targets.iter().map(|(i, _)| *i).collect();
             let part = Part {
                 index: index.to_owned(),
-                fts,
+                fts: texts.default,
+                texts: if carry {
+                    texts.fields.clone()
+                } else {
+                    BTreeMap::new()
+                },
                 legs: legs.clone(),
                 targets,
                 shadow,
@@ -8303,13 +8327,15 @@ mod split_tests {
             query: "a".to_owned(),
             limit: 10,
         }];
-        let fts = pstore_format::text::FullText::default();
+        let texts = pstore_query::Texts::from(pstore_format::text::FullText::default());
         let rrf = pstore_query::Fusion::default();
         let split = |t: &[pstore_query::Target], legs, fusion, cap| {
-            shares(&peers, "x", t, legs, fts, 0, fusion, 10, cap)
-                .into_iter()
-                .map(|e| e.targets)
-                .collect::<Vec<_>>()
+            shares(
+                &peers, "x", t, legs, &texts, false, None, 0, fusion, 10, cap,
+            )
+            .into_iter()
+            .map(|e| e.targets)
+            .collect::<Vec<_>>()
         };
         let got = split(&targets, &dense, rrf, MAX_PART_SEGMENTS);
         assert_eq!(got.len(), 2, "one share per other server");
@@ -8338,7 +8364,9 @@ mod split_tests {
                 "x",
                 &targets,
                 legs,
-                fts,
+                &texts,
+                false,
+                None,
                 0,
                 fusion,
                 10,
@@ -8360,7 +8388,9 @@ mod split_tests {
             "x",
             &targets,
             &dense,
-            fts,
+            &texts,
+            false,
+            None,
             0,
             rrf,
             10,

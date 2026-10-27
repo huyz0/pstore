@@ -94,7 +94,7 @@ pub struct IndexSchema {
 }
 
 /// The most further text fields an index may declare (M152).
-pub(crate) const MAX_TEXTS: usize = 8;
+pub const MAX_TEXTS: usize = 8;
 
 impl IndexSchema {
     /// The width a client writes and queries: `dims` less what the metric's transform adds.

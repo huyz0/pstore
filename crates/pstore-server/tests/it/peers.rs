@@ -328,16 +328,26 @@ async fn fill_with(
     min: usize,
     make: fn(usize) -> Value,
 ) {
+    fill_declared(store, api, urls, min, make, &json!({})).await;
+}
+
+/// [`fill_with`], every write declaring `schema` (M154).
+async fn fill_declared(
+    store: &MemoryStore,
+    api: &Arc<Api<View>>,
+    urls: &[String],
+    min: usize,
+    make: fn(usize) -> Value,
+    schema: &Value,
+) {
     let mut k = 0;
     loop {
         let docs: Vec<Value> = (k * 24..k * 24 + 24).map(make).collect();
-        let (s, b) = send(
-            api,
-            "PUT",
-            "/v1/indexes/docs/documents",
-            json!({"durability": "durable", "documents": docs}),
-        )
-        .await;
+        let mut body = json!({"durability": "durable", "documents": docs});
+        if schema.as_object().is_some_and(|o| !o.is_empty()) {
+            body["schema"] = schema.clone();
+        }
+        let (s, b) = send(api, "PUT", "/v1/indexes/docs/documents", body).await;
         assert_eq!(s, 200, "{b}");
         let (s, b) = send(api, "POST", "/v1/admin/fold", Value::Null).await;
         assert_eq!(s, 200, "{b}");
@@ -1821,5 +1831,238 @@ async fn a_sum_part_is_protocol_three() {
         )
         .await;
         assert_eq!(status, 400, "opened at {opened}, scanned at {scan}: {body}");
+    }
+}
+
+/// M154's rows: [`doc`]'s, each with a `title` declared English and stemming, so "running"
+/// and "runs" are the term "run" in `title` and themselves in `text`.
+fn titled(i: usize) -> Value {
+    let mut d = doc(i);
+    let head = ["run fast", "running late", "walk slowly", "runs daily"][i % 4];
+    let tail = ["stories", "story told twice", "news"][i % 3];
+    d["attributes"]["title"] = json!(format!("{head} {tail}"));
+    d
+}
+
+fn title_schema() -> Value {
+    json!({"title": {"type": "string",
+                     "full_text_search": {"language": "english", "stemming": true}}})
+}
+
+/// M154 criterion 4's queries, each with the protocol its parts are sent at (criterion 5).
+fn titled_queries() -> Vec<(&'static str, Value, u64)> {
+    let over_title = json!(["title", "ContainsAnyToken", "Running"]);
+    vec![
+        (
+            "over title",
+            json!({"text": [{"field": "title", "query": "running stories"}], "top_k": 10}),
+            5,
+        ),
+        (
+            "sum over title",
+            json!({"text": [{"field": "title", "query": "running"},
+                            {"field": "title", "query": "runs story"}],
+                   "top_k": 10, "fusion": {"sum": {"weights": [1.0, 0.5]}}}),
+            6,
+        ),
+        (
+            "vector, title filter",
+            json!({"vector": Q, "top_k": 10, "filters": over_title}),
+            4,
+        ),
+        (
+            "text, title filter",
+            json!({"text": "word2 tag1", "top_k": 10, "filters": over_title}),
+            5,
+        ),
+    ]
+}
+
+/// The same index's queries that need no further field, and their protocols (criterion 5).
+fn untitled_queries() -> Vec<(&'static str, Value, u64)> {
+    vec![
+        ("text", json!({"text": "word2 tag1", "top_k": 10}), 2),
+        (
+            "sum",
+            json!({"text": ["word2 tag1", "common word3"], "top_k": 10,
+                   "fusion": {"sum": {"weights": [2.0, 0.5]}}}),
+            3,
+        ),
+        ("vector", json!({"vector": Q, "top_k": 10}), 1),
+    ]
+}
+
+#[tokio::test]
+async fn a_query_over_a_further_text_field_is_split_as_one_server_answers() {
+    // M154 criterion 4: scored and filtered under `title`'s analyzer on every peer.
+    let (store, servers, alone) = cluster(&[]).await;
+    fill_declared(
+        &store,
+        &servers[0].api,
+        &urls(&servers),
+        8,
+        titled,
+        &title_schema(),
+    )
+    .await;
+    for (name, q, _) in titled_queries() {
+        let (s0, want) = query(&alone.api, &q).await;
+        assert_eq!(s0, 200, "{name}: {want}");
+        assert!(!want["results"].as_array().unwrap().is_empty(), "{name}");
+        for (i, server) in servers.iter().enumerate() {
+            let sent = metric(&server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&server.api, &q).await;
+            assert_eq!(s, 200, "{name} at {i}: {got}");
+            assert_eq!(answer(&got), answer(&want), "{name} at {i}");
+            assert!(
+                metric(&server.api, "pstore_peer_parts_sent").await > sent,
+                "{name} at {i} was not split"
+            );
+        }
+    }
+    for s in &servers {
+        assert_eq!(metric(&s.api, "pstore_peer_parts_failed").await, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_part_with_further_fields_is_its_own_protocol() {
+    // M154 criterion 5: a peer that records each part's protocol and whether it carries
+    // `texts`, and refuses everything, as a server of an earlier build refuses 4 to 6.
+    let seen: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+    let fake = {
+        let seen = Arc::clone(&seen);
+        axum::Router::new().route(
+            "/peer/v1/part",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().push((
+                        v["protocol"].as_u64().unwrap_or(0),
+                        v.get("texts").is_some(),
+                    ));
+                    (axum::http::StatusCode::CONFLICT, "protocol_mismatch")
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
+    let (store, servers, alone) = cluster(std::slice::from_ref(&old)).await;
+    let mut all = urls(&servers);
+    all.push(old);
+    fill_declared(&store, &servers[0].api, &all, 8, titled, &title_schema()).await;
+    for (name, q, protocol) in titled_queries().into_iter().chain(untitled_queries()) {
+        let (_, want) = query(&alone.api, &q).await;
+        let failed = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+        seen.lock().unwrap().clear();
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(s, 200, "{name}: {got}");
+        assert_eq!(answer(&got), answer(&want), "{name}");
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            failed + 1,
+            "{name}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(protocol, protocol >= 4)],
+            "{name}: sent at the wrong protocol"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_part_with_further_fields_is_judged_at_the_door() {
+    // M154 criterion 6, against a real server.
+    let (_, servers, _) = cluster(&[]).await;
+    let api = &servers[1].api;
+    let fts = pstore_format::text::FullText::default().encode();
+    let cut = json!({"weights": [1.0f32.to_bits()], "keep": 10});
+    let texts = json!({"title": fts});
+    let part = |protocol: u64, phase: Option<&str>, texts: &Value, sum: &Value| {
+        let mut p = json!({"protocol": protocol, "index": "docs", "fts": fts,
+                           "filters": null, "shadow": 0, "legs": [], "targets": []});
+        if let Some(phase) = phase {
+            p["phase"] = json!(phase);
+        }
+        if !texts.is_null() {
+            p["texts"] = texts.clone();
+        }
+        if !sum.is_null() {
+            p["sum"] = sum.clone();
+        }
+        p
+    };
+    let post = |body: Value| send(api, "POST", "/peer/v1/part", body);
+    let none = Value::Null;
+    let nine: serde_json::Map<String, Value> =
+        (0..9).map(|i| (format!("f{i}"), json!(fts))).collect();
+    let refused = [
+        (
+            "open at 5 without texts",
+            part(5, Some("open"), &none, &none),
+        ),
+        (
+            "open at 6 without texts",
+            part(6, Some("open"), &none, &cut),
+        ),
+        ("whole at 4 without texts", part(4, None, &none, &none)),
+        ("whole at 1 with texts", part(1, None, &texts, &none)),
+        ("open at 2 with texts", part(2, Some("open"), &texts, &none)),
+        ("open at 3 with texts", part(3, Some("open"), &texts, &cut)),
+        (
+            "open at 5, texts that do not decode",
+            part(5, Some("open"), &json!({"title": "v9;nope"}), &none),
+        ),
+        (
+            "open at 5, nine texts",
+            part(5, Some("open"), &Value::Object(nine), &none),
+        ),
+        ("open at 5 with a sum", part(5, Some("open"), &texts, &cut)),
+        (
+            "open at 6 without a sum",
+            part(6, Some("open"), &texts, &none),
+        ),
+        ("whole at 4 with a sum", part(4, None, &texts, &cut)),
+    ];
+    for (name, body) in refused {
+        let (status, got) = post(body).await;
+        assert_eq!(status, 400, "{name}: {got}");
+    }
+    let (status, got) = post(part(4, None, &texts, &none)).await;
+    assert_eq!(status, 200, "whole at 4: {got}");
+    // A scan speaks its part's protocol; each scan takes its part, so each opens its own.
+    let opened_at = |protocol: u64| {
+        let (t, c) = match protocol {
+            2 => (&none, &none),
+            5 => (&texts, &none),
+            _ => (&texts, &cut),
+        };
+        part(protocol, Some("open"), t, c)
+    };
+    let scan = |protocol: u64, id: &Value| {
+        json!({"protocol": protocol, "phase": "scan", "id": id, "index": "docs",
+               "stats": {"doc_count": 0, "total_tokens": 0, "df": []}})
+    };
+    for (opened, scanned, want) in [
+        (5, 2, 400),
+        (5, 3, 400),
+        (5, 6, 400),
+        (2, 5, 400),
+        (6, 3, 400),
+        (6, 5, 400),
+        (5, 5, 200),
+        (6, 6, 200),
+    ] {
+        let (status, got) = post(opened_at(opened)).await;
+        assert_eq!(status, 200, "open at {opened}: {got}");
+        let (status, got) = post(scan(scanned, &got["id"])).await;
+        assert_eq!(
+            status, want,
+            "opened at {opened}, scanned at {scanned}: {got}"
+        );
     }
 }

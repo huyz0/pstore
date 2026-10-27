@@ -65,8 +65,10 @@ and outcomes.
    One finding while writing the test: the title writer's flush refuses its stale row once,
    then waives it to the fold's quarantine. That is M35's rule, unchanged, and the test
    asserts it.
-4. `a_query_over_a_further_text_field_is_not_split` (split.rs): green after. Killed: "a
-   further-field query is split", "a primary query is not split".
+4. a_query_over_a_further_text_field_is_not_split (split.rs): green after. Killed: "a
+   further-field query is split", "a primary query is not split". ⚠️ **Reversed by
+   [M154](../M154/SPEC.md)**, which lifts the limit this criterion pinned: the test is now
+   `a_query_over_a_further_text_field_is_split_as_unsplit`.
 5. `a_damaged_further_fields_section_is_a_corrupt_head` (head.rs): green after. Killed: "a
    truncated section decodes as fewer fields".
 

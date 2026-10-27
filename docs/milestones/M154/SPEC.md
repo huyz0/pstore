@@ -83,7 +83,7 @@ several text fields, which is not split.
 4. **Over HTTP, through real peers.** Over `peers.rs`'s three-server cluster, on an index
    created with `title` declared as `{"language": "english", "stemming": true}`, each of these
    queries answers exactly as the server alone, and is split (`pstore_peer_parts_sent` grows):
-   - `{"text": {"field": "title", "query": ...}}`;
+   - `{"text": [{"field": "title", "query": ...}]}`;
    - a `sum` over two `title` legs;
    - a vector query filtered by `["title", "ContainsAnyToken", ...]`;
    - a text query over `text` with that filter.

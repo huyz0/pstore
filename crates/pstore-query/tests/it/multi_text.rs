@@ -346,7 +346,7 @@ async fn a_share_without_the_field_adds_nothing_and_refuses_nothing() {
             stats: Box::pin(async move { Ok(stats) }),
             scan: Box::new(move |sum| {
                 Box::pin(async move {
-                    scan_part(&store, &part, None, 0, &sum, &ft, None)
+                    scan_part(&store, &part, None, 0, &sum, &ft.into(), None)
                         .await
                         .map_err(|e| e.to_string())
                 })
@@ -591,7 +591,7 @@ async fn two_fields_are_refused_before_any_request_on_every_path() {
         None,
         0,
         &pstore_index::text::Stats::default(),
-        &fts("a"),
+        &fts("a").into(),
         None,
     )
     .await

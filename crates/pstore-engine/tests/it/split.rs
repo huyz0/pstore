@@ -1415,19 +1415,20 @@ async fn a_split_clustered_fde_query_equals_the_unsplit_one() {
     );
 }
 
-/// M152 criterion 4: a query that scores a further text field is never split, since a share's
-/// `Part` carries one `FullText` (M154 lifts it). Through phased shares it makes no peer
-/// call and answers exactly as unsplit; a query over the primary is still split.
-#[tokio::test]
-async fn a_query_over_a_further_text_field_is_not_split() {
-    use pstore_format::text::FullText;
-    use pstore_query::TokenOp;
-    let store = Arc::new(MemoryStore::new());
-    let coordinator = engine(&store, 1);
+/// An index whose further field `title` differs from the primary in its analyzer (English,
+/// stemming) and in BM25's `k1` and `b`, over four folded segments (M154). Its primary `text`
+/// holds "walking", "walk" or neither, and each `title` "run", "running", "runs" or "walk".
+async fn further(store: &Arc<MemoryStore>) -> Engine<MemoryStore> {
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let coordinator = engine(store, 1);
     let title = FullText {
+        analyzer: Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        },
         k1: 2.0,
         b: 0.3,
-        ..FullText::default()
     };
     let declared = pstore_engine::Declared {
         texts: Some(std::collections::BTreeMap::from([(
@@ -1440,9 +1441,20 @@ async fn a_query_over_a_further_text_field_is_not_split() {
         let rows = (k * 25..k * 25 + 25)
             .map(|i| {
                 let mut d = doc(i);
+                let primary = ["walking dogs", "walk dog", "cats sleep"][(i % 3) as usize];
+                d.attrs.insert(
+                    "text".to_owned(),
+                    Value::Str(format!("{primary} word{}", i % 5)),
+                );
+                let head = ["run fast", "running late", "walk slowly", "runs daily"];
+                let tail = ["stories", "story told twice", "news"];
                 d.attrs.insert(
                     "title".to_owned(),
-                    Value::Str(format!("headline{} story tag{}", i % 4, i % 3)),
+                    Value::Str(format!(
+                        "{} {}",
+                        head[(i % 4) as usize],
+                        tail[(i % 3) as usize]
+                    )),
                 );
                 d
             })
@@ -1460,53 +1472,204 @@ async fn a_query_over_a_further_text_field_is_not_split() {
         coordinator.flush().await.unwrap();
         coordinator.fold().await.unwrap();
     }
-    let over_title = Prefetch::Text {
+    coordinator
+}
+
+fn over_title(q: &str) -> Prefetch {
+    Prefetch::Text {
         field: "title".to_owned(),
-        query: "headline2 story".to_owned(),
+        query: q.to_owned(),
         limit: 10,
-    };
-    // A token filter over the primary, bound by the primary's analyzer.
-    let tokens = Predicate::Tokens("text".to_owned(), TokenOp::Any, "word1 word2".into(), None);
-    for filter in [None, Some(tokens)] {
-        let peers = Three::new(trio(&store).engines, filter.clone());
-        let legs = vec![over_title.clone()];
-        let split = coordinator
-            .query_split_as(
-                "idx",
-                &legs,
-                filter.as_ref(),
-                Fusion::default(),
-                10,
-                pstore_engine::Consistency::Eventual,
-                Some(&peers),
-            )
-            .await
-            .unwrap();
-        let whole = coordinator
-            .query_filtered_as(
-                "idx",
-                &legs,
-                filter.as_ref(),
-                Fusion::default(),
-                10,
-                pstore_engine::Consistency::Eventual,
-            )
-            .await
-            .unwrap();
-        assert!(!whole.hits.is_empty(), "the control answer is empty");
-        assert_eq!(exactly(&split), exactly(&whole));
-        let calls = peers.parts.load(Ordering::SeqCst)
-            + peers.opens.load(Ordering::SeqCst)
-            + peers.scans.load(Ordering::SeqCst);
-        assert_eq!(calls, 0, "a further-field query was split ({filter:?})");
     }
-    // The primary is still split.
-    let peers = trio(&store);
-    split_equals_unsplit(&coordinator, &peers, &[text()], Fusion::default()).await;
+}
+
+fn any_token(field: &str, q: &str) -> Predicate {
+    Predicate::Tokens(
+        field.to_owned(),
+        pstore_query::TokenOp::Any,
+        q.to_owned(),
+        None,
+    )
+}
+
+/// The ids `filter` admits on `further`'s index: every row a dense leg over all of them keeps.
+async fn admitted(coordinator: &Engine<MemoryStore>, filter: &Predicate) -> Vec<String> {
+    let all = Prefetch::Dense {
+        field: pstore_format::DEFAULT_FIELD.to_owned(),
+        query: vec![0.3, 0.9, -0.2, 1.0],
+        limit: 1000,
+        tune: pstore_index::vec_index::Query::default(),
+    };
+    let whole = coordinator
+        .query_split_as(
+            "idx",
+            &[all],
+            Some(filter),
+            Fusion::default(),
+            1000,
+            pstore_engine::Consistency::Eventual,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = whole.ids.into_iter().flatten().collect();
+    ids.sort();
+    ids
+}
+
+/// `legs` under `filter`, split over fresh peers and unsplit: equal, and not empty. The peers,
+/// for the caller to count their calls.
+async fn split_as_unsplit(
+    store: &Arc<MemoryStore>,
+    coordinator: &Engine<MemoryStore>,
+    legs: &[Prefetch],
+    filter: Option<&Predicate>,
+    fusion: Fusion,
+) -> Three {
+    let peers = Three::new(trio(store).engines, filter.cloned());
+    let split = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            filter,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            Some(&peers),
+        )
+        .await
+        .unwrap();
+    let whole = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            filter,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            None,
+        )
+        .await
+        .unwrap();
     assert!(
-        peers.opens.load(Ordering::SeqCst) > 0,
-        "a query over the primary was not split"
+        !whole.hits.is_empty(),
+        "{legs:?} {filter:?}: the control is empty"
     );
+    assert_eq!(exactly(&split), exactly(&whole), "{legs:?} {filter:?}");
+    peers
+}
+
+/// M154 criterion 1 (reversing M152's criterion 4, the limit it named as M154's): a query
+/// that scores a further text field is split through phased shares, and answers exactly as
+/// unsplit -- scored under the field's own `FullText`, its terms analysed by the field's
+/// analyzer ("running" counts as "run" only under `title`'s).
+#[tokio::test]
+async fn a_query_over_a_further_text_field_is_split_as_unsplit() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = further(&store).await;
+    // Over the primary, bound by the primary's analyzer: "walking" admits the rows holding
+    // it; under `title`'s, it would be "walk" and admit others.
+    let walking = any_token("text", "walking");
+    let ids = admitted(&coordinator, &walking).await;
+    assert!(
+        !ids.is_empty() && ids.len() < 100,
+        "the primary filter admits {}",
+        ids.len()
+    );
+    let as_title = Predicate::Tokens(
+        "text".to_owned(),
+        pstore_query::TokenOp::Any,
+        "walk".to_owned(),
+        None,
+    );
+    assert_ne!(
+        ids,
+        admitted(&coordinator, &as_title).await,
+        "the filter's words analyse alike under both analyzers"
+    );
+    let sum = Fusion::Sum {
+        weights: pstore_query::Weights::of(&[1.0, 0.5]).unwrap(),
+    };
+    let dense_leg = dense(pstore_format::DEFAULT_FIELD, vec![0.3, 0.9, -0.2, 1.0]);
+    let cases: Vec<(&str, Vec<Prefetch>, Option<&Predicate>, Fusion)> = vec![
+        (
+            "rrf",
+            vec![over_title("running stories")],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "sum",
+            vec![over_title("running"), over_title("runs story")],
+            None,
+            sum,
+        ),
+        (
+            "with a dense leg",
+            vec![over_title("running late"), dense_leg],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "filtered over the primary",
+            // "twice" is in the titles of the rows holding "walk", which a bind under
+            // `title`'s analyzer would admit, and rank first.
+            vec![over_title("running twice")],
+            Some(&walking),
+            Fusion::default(),
+        ),
+    ];
+    for (name, legs, filter, fusion) in cases {
+        let peers = split_as_unsplit(&store, &coordinator, &legs, filter, fusion).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0,
+            "{name}: no open call"
+        );
+        assert!(
+            peers.scans.load(Ordering::SeqCst) > 0,
+            "{name}: no scan call"
+        );
+    }
+}
+
+/// M154 criterion 2 (reversing M156's criterion 3 for a further field): a token filter over a
+/// further field is split -- through one-exchange shares for a vector-only query, phased ones
+/// beside a text leg over the primary -- at the top level and under `Not`, and answers exactly
+/// as unsplit.
+#[tokio::test]
+async fn a_token_filter_over_a_further_field_is_split_as_unsplit() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = further(&store).await;
+    let running = any_token("title", "Running");
+    let ids = admitted(&coordinator, &running).await;
+    assert!(
+        !ids.is_empty() && ids.len() < 100,
+        "the title filter admits {}",
+        ids.len()
+    );
+    let vector = vec![dense(
+        pstore_format::DEFAULT_FIELD,
+        vec![0.3, 0.9, -0.2, 1.0],
+    )];
+    let primary = vec![Prefetch::Text {
+        field: "text".to_owned(),
+        query: "walking word2".to_owned(),
+        limit: 10,
+    }];
+    for f in [running.clone(), Predicate::Not(Box::new(running.clone()))] {
+        let peers =
+            split_as_unsplit(&store, &coordinator, &vector, Some(&f), Fusion::default()).await;
+        assert!(
+            peers.parts.load(Ordering::SeqCst) > 0,
+            "vector-only {f:?}: no part call"
+        );
+        let peers =
+            split_as_unsplit(&store, &coordinator, &primary, Some(&f), Fusion::default()).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0,
+            "primary text {f:?}: no open call"
+        );
+    }
 }
 
 /// M153 criterion 4: a query over the primary and a further field is never split -- whether
@@ -1582,10 +1745,10 @@ async fn a_query_over_several_text_fields_is_not_split() {
     );
 }
 
-/// M156 criterion 3: a token filter over a further field binds to that field's analyzer, which
-/// a share's `Part` cannot carry, so such a query is not split -- through one-exchange shares
-/// (a vector-only query) or phased ones (a text leg over the primary), at the top level and
-/// under `Not`. The same filters over the primary are split, as before.
+/// M156 criterion 3, as M154 reverses it: a token filter over a further field binds to that
+/// field's analyzer, which a share's `Part` now carries in `texts`, so such a query is split --
+/// through one-exchange shares (a vector-only query) or phased ones (a text leg over the
+/// primary), at the top level and under `Not` -- as the same filters over the primary are.
 #[tokio::test]
 async fn a_token_filter_over_a_further_field_is_not_split() {
     use pstore_format::text::{Analyzer, FullText, Language};
@@ -1646,7 +1809,8 @@ async fn a_token_filter_over_a_further_field_is_not_split() {
             + peers.opens.load(Ordering::SeqCst)
             + peers.scans.load(Ordering::SeqCst)
     };
-    for (field, q, split) in [("title", "Running", false), ("text", "word2", true)] {
+    // M154: the further-field half is split too, now that a `Part` carries `texts`.
+    for (field, q, split) in [("title", "Running", true), ("text", "word2", true)] {
         for f in [tokens(field, q), Predicate::Not(Box::new(tokens(field, q)))] {
             for (legs, kind) in [(&vector, "vector-only"), (&primary, "primary text")] {
                 let peers = Three::new(

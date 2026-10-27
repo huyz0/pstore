@@ -39,6 +39,31 @@ pub(crate) const PHASED: u32 = 2;
 /// does: it speaks 1 and 2 only.
 pub(crate) const SUMMED: u32 = 3;
 
+/// [`PROTOCOL`]'s exchange for a part that carries `texts`, the index's further text fields
+/// (M154). A peer of an earlier build would ignore `texts` and bind or score under the primary,
+/// so a part that carries them is sent at a number such a peer refuses with `409`.
+pub(crate) const WHOLE_TEXTS: u32 = 4;
+/// [`PHASED`]'s, for a part that carries `texts` (M154).
+pub(crate) const PHASED_TEXTS: u32 = 5;
+/// [`SUMMED`]'s, for a part that carries `texts` (M154).
+pub(crate) const SUMMED_TEXTS: u32 = 6;
+
+/// The protocol a phased part, and each of its phases, speaks: by whether it is cut by sum
+/// (M58) and whether it carries `texts` (M154).
+fn phased_protocol(sum: bool, texts: bool) -> u32 {
+    match (sum, texts) {
+        (false, false) => PHASED,
+        (true, false) => SUMMED,
+        (false, true) => PHASED_TEXTS,
+        (true, true) => SUMMED_TEXTS,
+    }
+}
+
+/// Whether `protocol` is one whose parts carry `texts` (M154).
+fn carries_texts(protocol: u32) -> bool {
+    matches!(protocol, WHOLE_TEXTS | PHASED_TEXTS | SUMMED_TEXTS)
+}
+
 /// How long a part is held between its phases (M55).
 pub(crate) const HOLD_FOR: Duration = Duration::from_secs(10);
 /// The most parts held at once (M55).
@@ -499,7 +524,7 @@ impl Peers for QueryPeers {
         let body = Command::Open(WirePart::opening(&part, self.filters.clone()));
         let tenant = self.tenant;
         let index = part.index.clone();
-        let sum_part = part.sum.is_some();
+        let protocol = phased_protocol(part.sum.is_some(), !part.texts.is_empty());
         // The id phase 1 returns, for phase 2; and whether this part's failure is counted yet:
         // once per part, whichever phase fails (spec rule 11).
         let held: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
@@ -545,7 +570,7 @@ impl Peers for QueryPeers {
                 let got = match id {
                     Some(id) => {
                         let body = Command::Scan(WireScan {
-                            protocol: if sum_part { SUMMED } else { PHASED },
+                            protocol,
                             phase: "scan".to_owned(),
                             id,
                             index,
@@ -662,6 +687,10 @@ pub(crate) struct WirePart {
     /// The text legs' analysed terms (M55).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     terms: Vec<String>,
+    /// The index's further text fields, each as `FullText::encode` writes it (M154); at
+    /// protocols 4, 5 and 6 only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    texts: std::collections::BTreeMap<String, String>,
     /// A `sum` part's cut (M58), protocol 3 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sum: Option<WireSum>,
@@ -840,7 +869,7 @@ impl WirePart {
     /// Phase 1 of a phased part (M55): every leg, and the text legs' terms.
     fn opening(part: &Part, filters: Option<serde_json::Value>) -> Self {
         Self {
-            protocol: if part.sum.is_some() { SUMMED } else { PHASED },
+            protocol: phased_protocol(part.sum.is_some(), !part.texts.is_empty()),
             phase: Some("open".to_owned()),
             terms: part.terms.clone(),
             sum: part.sum.map(WireSum::of),
@@ -850,10 +879,19 @@ impl WirePart {
 
     fn of(part: &Part, filters: Option<serde_json::Value>) -> Self {
         Self {
-            protocol: PROTOCOL,
+            protocol: if part.texts.is_empty() {
+                PROTOCOL
+            } else {
+                WHOLE_TEXTS
+            },
             phase: None,
             terms: Vec::new(),
             sum: None,
+            texts: part
+                .texts
+                .iter()
+                .map(|(name, f)| (name.clone(), f.encode()))
+                .collect(),
             index: part.index.clone(),
             fts: part.fts.encode(),
             filters,
@@ -1006,6 +1044,19 @@ fn guard(tenant: TenantId, wire: &WirePart) -> Result<(), ApiError> {
     if wire.targets.len() > MAX_SEGMENTS {
         return Err(refuse(format!("at most {MAX_SEGMENTS} segments a part")));
     }
+    // M154: `texts` at 4, 5 and 6, and only there -- a part read under the other's rules
+    // would bind or score under the wrong analyzer.
+    if carries_texts(wire.protocol) == wire.texts.is_empty() {
+        return Err(refuse(
+            "a part carries further text fields at protocols 4, 5 and 6, and only there".to_owned(),
+        ));
+    }
+    if wire.texts.len() > pstore_engine::MAX_TEXTS {
+        return Err(refuse(format!(
+            "at most {} further text fields a part",
+            pstore_engine::MAX_TEXTS
+        )));
+    }
     // ⚠️ A leg's number is a query position, under `MAX_LEGS` and named once (code review,
     // M58): a cut by sum sizes its legs by it, so an unbounded one was an allocation the
     // caller chose.
@@ -1052,6 +1103,15 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
     let refuse = |m: &str| ApiError::new(StatusCode::BAD_REQUEST, "bad_part", m.to_owned());
     let fts = pstore_format::text::FullText::decode(&wire.fts)
         .ok_or_else(|| refuse("the full-text schema did not decode"))?;
+    let texts = wire
+        .texts
+        .iter()
+        .map(|(name, f)| {
+            pstore_format::text::FullText::decode(f)
+                .map(|f| (name.clone(), f))
+                .ok_or_else(|| refuse("a further text field's full-text schema did not decode"))
+        })
+        .collect::<Result<_, _>>()?;
     let legs = wire
         .legs
         .into_iter()
@@ -1175,6 +1235,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
         Part {
             index: wire.index,
             fts,
+            texts,
             legs,
             targets,
             shadow: wire.shadow,
@@ -1213,16 +1274,21 @@ pub(crate) async fn execute<S: BlobStore + 'static>(
         )
     };
     match command {
-        Command::Whole(wire) if wire.protocol == PROTOCOL && wire.phase.is_none() => {
+        Command::Whole(wire)
+            if matches!(wire.protocol, PROTOCOL | WHOLE_TEXTS) && wire.phase.is_none() =>
+        {
             serve_whole(api, tenant, wire).await.map(Outcome::Hits)
         }
         Command::Open(wire)
-            if matches!(wire.protocol, PHASED | SUMMED)
+            if matches!(wire.protocol, PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS)
                 && wire.phase.as_deref() == Some("open") =>
         {
             serve_open(api, tenant, wire).await.map(Outcome::Opened)
         }
-        Command::Scan(wire) if matches!(wire.protocol, PHASED | SUMMED) && wire.phase == "scan" => {
+        Command::Scan(wire)
+            if matches!(wire.protocol, PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS)
+                && wire.phase == "scan" =>
+        {
             serve_scan(api, tenant, wire).await.map(Outcome::Hits)
         }
         _ => Err(mismatch()),
@@ -1306,12 +1372,12 @@ async fn serve_open<S: BlobStore + 'static>(
 ) -> Result<WireOpened, ApiError> {
     guard(tenant, &wire)?;
     // M58: a cut by sum is protocol 3's, and protocol 3 is a cut by sum. `WirePart` ignores a
-    // field it does not know, so nothing else would refuse a `sum` sent at 2.
-    if (wire.protocol == SUMMED) != wire.sum.is_some() {
+    // field it does not know, so nothing else would refuse a `sum` sent at 2. M154: and 6's.
+    if matches!(wire.protocol, SUMMED | SUMMED_TEXTS) != wire.sum.is_some() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "bad_part",
-            "a part cut by sum is protocol 3, and protocol 3 is cut by sum",
+            "a part cut by sum is protocol 3 or 6, and those are cut by sum",
         ));
     }
     let (part, filters) = decode(wire)?;
@@ -1363,11 +1429,13 @@ async fn serve_scan<S: BlobStore + 'static>(
             )
         })?;
     // M58 (code review): a scan speaks its part's protocol, 3 for a cut by sum and 2 else.
-    if (wire.protocol == SUMMED) != held.part.sum.is_some() {
+    // M154: 6 and 5 for a part that carries `texts`.
+    if wire.protocol != phased_protocol(held.part.sum.is_some(), !held.part.texts.is_empty()) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "bad_part",
-            "a scan's protocol is its part's: 3 for a part cut by sum, 2 otherwise",
+            "a scan's protocol is its part's: 3 for a part cut by sum, 2 otherwise, \
+             and 6 and 5 for one that carries further text fields",
         ));
     }
     let filter = held.filters.as_ref().map(predicate).transpose()?;
@@ -1576,6 +1644,7 @@ mod tests {
         let part = Part {
             index: "docs".to_owned(),
             fts: pstore_format::text::FullText::default(),
+            texts: std::collections::BTreeMap::new(),
             legs: vec![
                 (
                     0,
@@ -1737,6 +1806,7 @@ mod tests {
         let part = Part {
             index: "docs".to_owned(),
             fts: pstore_format::text::FullText::default(),
+            texts: std::collections::BTreeMap::new(),
             legs: vec![
                 (
                     1,
@@ -1805,6 +1875,7 @@ mod tests {
             protocol: PROTOCOL,
             phase: None,
             terms: vec![],
+            texts: std::collections::BTreeMap::new(),
             sum: None,
             index: "docs".to_owned(),
             fts: String::new(),
@@ -1830,6 +1901,7 @@ mod tests {
             part: Part {
                 index: index.to_owned(),
                 fts: pstore_format::text::FullText::default(),
+                texts: std::collections::BTreeMap::new(),
                 legs: vec![],
                 targets: vec![],
                 shadow: 0,
@@ -1884,6 +1956,7 @@ mod tests {
         let part = || Part {
             index: "docs".to_owned(),
             fts: pstore_format::text::FullText::default(),
+            texts: std::collections::BTreeMap::new(),
             legs: vec![],
             targets: vec![],
             shadow: 0,

@@ -535,8 +535,8 @@ fn cut_sum(hits: PartHits, cut: SumCut) -> PartHits {
         .collect()
 }
 
-/// Phase 2 of a share (M55): every leg over the held segments, scored with `stats`, masked by
-/// `filter`, rid of deleted rows and cut to what a shadow of `shadow` ids can leave -- exactly
+/// Phase 2 of a share (M55): every leg over the held segments, scored with `stats` under its
+/// field's `FullText` in `texts` (M154), masked by `filter`, rid of deleted rows and cut to what a shadow of `shadow` ids can leave -- exactly
 /// as [`run`] does over its own segments, because it is the same function.
 ///
 /// # Errors
@@ -551,7 +551,7 @@ pub async fn scan_part<S: BlobStore + Clone>(
     filter: Option<&Predicate>,
     shadow: usize,
     stats: &Stats,
-    text: &FullText,
+    texts: &Texts,
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
     let runnable = part
@@ -575,7 +575,7 @@ pub async fn scan_part<S: BlobStore + Clone>(
         shadow,
         sum.is_some(),
         &Arc::new(one_field(&part.legs, stats)),
-        &Texts::from(*text),
+        texts,
     )
     .await?;
     Ok(match sum {
@@ -601,7 +601,7 @@ pub async fn part<S: BlobStore + Clone>(
     filter: Option<&Predicate>,
     shadow: usize,
     stats: &Stats,
-    text: &FullText,
+    texts: &Texts,
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
     // M151: before the open round. `scan_part` needs no check of its own: its `OpenPart` comes
@@ -616,7 +616,7 @@ pub async fn part<S: BlobStore + Clone>(
         legs: legs.to_vec(),
         opened,
     };
-    scan_part(store, &held, filter, shadow, stats, text, sum).await
+    scan_part(store, &held, filter, shadow, stats, texts, sum).await
 }
 
 /// Every running `(segment, leg)` pair's candidates: each leg widened by what the segment may
@@ -801,9 +801,8 @@ async fn run<S: BlobStore + Clone>(
             "a phased share of several text fields",
         ));
     }
-    // The one field a phased share's statistics are for, and its full-text schema.
+    // The one field a phased share's statistics are for.
     let shared_field = text_fields.first().copied().unwrap_or_default();
-    let shared_text = *texts.of(shared_field);
 
     // ⚠️ Every segment and every sidecar in ONE round. `Engine::scan`'s comment already made
     // this argument with a measurement: a loop over segment refs "turns a ten-segment index
@@ -1087,7 +1086,7 @@ async fn run<S: BlobStore + Clone>(
                     filter,
                     shadow.len(),
                     stats,
-                    &shared_text,
+                    texts,
                     // M58 (spec review): under `sum` it runs whole and is cut by sum, as the
                     // peer would have -- never cut leg by leg at its limit.
                     match fusion {
@@ -1112,7 +1111,7 @@ async fn run<S: BlobStore + Clone>(
                     filter,
                     shadow.len(),
                     stats,
-                    &shared_text,
+                    texts,
                     None,
                 )
                 .await
