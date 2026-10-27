@@ -112,6 +112,13 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
             put_str(b, a);
             put_values(b, vs);
         }
+        // M135: the attribute, the operator's code and the literal.
+        Predicate::AnyCmp(a, op, v) => {
+            b.push(12);
+            put_str(b, a);
+            b.push(op_code(*op));
+            put_value(b, v);
+        }
         Predicate::And(ps) | Predicate::Or(ps) => {
             b.push(if matches!(p, Predicate::And(_)) { 4 } else { 5 });
             b.extend((ps.len() as u32).to_le_bytes());
@@ -265,6 +272,18 @@ impl Reader<'_> {
             1 => Predicate::Absent(self.string()?),
             2 => Predicate::In(self.string()?, self.values()?),
             3 => Predicate::ContainsAny(self.string()?, self.values()?),
+            12 => {
+                let a = self.string()?;
+                let op = match self.u8()? {
+                    1 => Op::Lt,
+                    2 => Op::Lte,
+                    3 => Op::Gt,
+                    4 => Op::Gte,
+                    _ => return None,
+                };
+                // A scalar literal only: the parser accepts nothing else (M135).
+                Predicate::AnyCmp(a, op, self.value(false)?)
+            }
             t @ (4 | 5) => {
                 let n = self.u32()?;
                 let mut ps = Vec::with_capacity(n.min(1024));
@@ -340,6 +359,10 @@ mod tests {
             Predicate::Absent(a()),
             Predicate::In(a(), vec![Value::Int(1), Value::Array(vec![Value::Int(2)])]),
             Predicate::ContainsAny(a(), vec![Value::Str(String::new())]),
+            Predicate::AnyCmp(a(), Op::Lt, Value::Int(3)),
+            Predicate::AnyCmp(a(), Op::Lte, Value::Str("é".into())),
+            Predicate::AnyCmp(a(), Op::Gt, Value::Bool(false)),
+            Predicate::AnyCmp(a(), Op::Gte, Value::DateTime(-1)),
             Predicate::Or(vec![]),
             Predicate::Not(Box::new(Predicate::And(vec![]))),
             Predicate::Tokens(a(), TokenOp::All, "x y".into(), None),
@@ -395,10 +418,12 @@ mod tests {
             }
         }
         // An unknown tag at every place one is read: the predicate, a value, an operator, a
-        // pattern kind, a token operator, an analyzer.
+        // pattern kind, a token operator, an analyzer. M135: an `AnyCmp` operator is one of
+        // the four orderings, so `Eq` (0) is as unknown as 5.
         let s1 = "0100000061";
         for bad in [
-            "0c".to_owned(),
+            "0d".to_owned(),
+            format!("0c{s1}05"),
             format!("00{s1}0006"),
             format!("00{s1}05"),
             format!("08{s1}03"),
@@ -411,6 +436,14 @@ mod tests {
         ] {
             assert_eq!(decode(&bad), None, "{bad}");
         }
+        // M135: a whole `AnyCmp` whose operator alone is `Eq`.
+        let lt = encode(&Predicate::AnyCmp("a".to_owned(), Op::Lt, Value::Int(3)));
+        assert_eq!(&lt[..14], format!("0c{s1}01"));
+        let eq = format!("{}00{}", &lt[..12], &lt[14..]);
+        assert_eq!(decode(&eq), None, "{eq}");
+        // ... and a whole `AnyCmp` whose literal alone is an array.
+        let arr = Predicate::AnyCmp("a".to_owned(), Op::Lt, Value::Array(vec![Value::Int(3)]));
+        assert_eq!(decode(&encode(&arr)), None);
     }
 
     #[test]

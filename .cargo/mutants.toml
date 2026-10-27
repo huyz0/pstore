@@ -20,7 +20,14 @@ profile = "mutants"
 # ⚠️ No doctests. Every doctest example becomes its own test binary, which is among the
 # slowest things `cargo test` does. This workspace has none today; stated explicitly so
 # adding one does not silently multiply every sweep.
-additional_cargo_test_args = ["--all-targets"]
+#
+# ⚠️ **`--all-targets` is in `additional_cargo_args`, so the BUILD phase builds what the test
+# phase runs.** It sat in `additional_cargo_test_args`, which `cargo test --no-run` never sees:
+# every mutant then compiled the workspace's examples inside its TIMED test phase. A mutant in
+# `pstore-query` relinks ten of them, and on CI's two jobs per 4-core runner four such mutants
+# hit the 300 s timeout twice in a row (PR #5) although each is caught by its own crate's
+# tests. Measured locally on one of them, `provisional` (a 4-core cloud container, one job):
+# test phase 204 s before, 136 s after, with no compilation left in it.
 
 # ⚠️ **Feature-gated code must be built, or its mutants are false negatives.**
 # `pstore-blob`'s `object_store` adapter is behind a feature, and without this a sweep
@@ -35,7 +42,7 @@ additional_cargo_test_args = ["--all-targets"]
 # our code behind that feature, so without it every mutant in `gcs_batch.rs` reads as MISSED
 # for the M7a reason. It costs the gcp client in each per-mutant build, and nothing narrower
 # compiles the code.
-additional_cargo_args = ["--features", "pstore-blob/object_store,pstore-blob/gcs"]
+additional_cargo_args = ["--all-targets", "--features", "pstore-blob/object_store,pstore-blob/gcs"]
 
 # ⚠️ **Equivalent mutants, excluded by name -- each with its reason, and each premise tested.**
 # D-111's exclusion policy (engineering-standards.md): an exclusion says why and is reviewed

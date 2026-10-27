@@ -25,7 +25,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | D/H | Stored-vector projection, float/base64 response encoding and reconstructable export | Pending |
 | D | f16/i8 and multi-vector schema/precision contracts | Pending |
 | E | Multi-field/array BM25, tokenizer versions, language configuration, token/prefix queries | Pending |
-| E | Missing array predicates and compatible fuzzy semantics | Pending |
+| E | Missing array predicates and compatible fuzzy semantics | Partial: `AnyLt`/`AnyLte`/`AnyGt`/`AnyGte` verified in [M135](../milestones/M135/VERIFIED.md); vendor `Fuzzy` configuration pending |
 | E | Exact scoring expressions and computed distance/clause signals | Pending |
 | E | Structured highlights with fragment/offset contracts | Pending |
 | F | Atomic multi-query, outer RRF, candidate merging and global windows | Pending |

@@ -4242,6 +4242,11 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
                 "Lte" => cmp(Op::Lte),
                 "Gt" => cmp(Op::Gt),
                 "Gte" => cmp(Op::Gte),
+                // M135: an array holding an element in that order to the literal.
+                "AnyLt" => Ok(Predicate::AnyCmp(attr, Op::Lt, scalar(value)?)),
+                "AnyLte" => Ok(Predicate::AnyCmp(attr, Op::Lte, scalar(value)?)),
+                "AnyGt" => Ok(Predicate::AnyCmp(attr, Op::Gt, scalar(value)?)),
+                "AnyGte" => Ok(Predicate::AnyCmp(attr, Op::Gte, scalar(value)?)),
                 // M9h.2: `Contains x` is `ContainsAny [x]`, over an array attribute's elements.
                 "Contains" | "NotContains" => {
                     let p = Predicate::ContainsAny(attr, vec![scalar(value)?]);
