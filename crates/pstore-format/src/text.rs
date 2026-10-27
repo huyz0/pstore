@@ -535,7 +535,10 @@ pub struct Fields {
 const CONTAINER_MAGIC: &[u8; 8] = b"PSTORETM";
 const CONTAINER_VERSION: u16 = 1;
 /// MAGIC(8) VERSION(2) fields(2).
-const CONTAINER_HEADER: usize = 8 + 2 + 2;
+///
+/// ⚠️ Written as one number: `8 + 2 + 2` has an equivalent mutant, `2 + 2` as `2 * 2`, which
+/// no test can fail and which PR #8's mutation gate reported as missed.
+const CONTAINER_HEADER: usize = 12;
 /// dictionary_len(4) postings_start(8) postings_len(8).
 const CONTAINER_ENTRY: usize = 4 + 8 + 8;
 
