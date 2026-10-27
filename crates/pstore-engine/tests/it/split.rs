@@ -1414,3 +1414,97 @@ async fn a_split_clustered_fde_query_equals_the_unsplit_one() {
         "the segments carry a clustered sidecar and the part says so"
     );
 }
+
+/// M152 criterion 4: a query that scores a further text field is never split, since a share's
+/// `Part` carries one `FullText` (M154 lifts it). Through phased shares it makes no peer
+/// call and answers exactly as unsplit; a query over the primary is still split.
+#[tokio::test]
+async fn a_query_over_a_further_text_field_is_not_split() {
+    use pstore_format::text::FullText;
+    use pstore_query::TokenOp;
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    let title = FullText {
+        k1: 2.0,
+        b: 0.3,
+        ..FullText::default()
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([(
+            "title".to_owned(),
+            title,
+        )])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                d.attrs.insert(
+                    "title".to_owned(),
+                    Value::Str(format!("headline{} story tag{}", i % 4, i % 3)),
+                );
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let over_title = Prefetch::Text {
+        field: "title".to_owned(),
+        query: "headline2 story".to_owned(),
+        limit: 10,
+    };
+    // A token filter over the primary, bound by the primary's analyzer.
+    let tokens = Predicate::Tokens("text".to_owned(), TokenOp::Any, "word1 word2".into(), None);
+    for filter in [None, Some(tokens)] {
+        let peers = Three::new(trio(&store).engines, filter.clone());
+        let legs = vec![over_title.clone()];
+        let split = coordinator
+            .query_split_as(
+                "idx",
+                &legs,
+                filter.as_ref(),
+                Fusion::default(),
+                10,
+                pstore_engine::Consistency::Eventual,
+                Some(&peers),
+            )
+            .await
+            .unwrap();
+        let whole = coordinator
+            .query_filtered_as(
+                "idx",
+                &legs,
+                filter.as_ref(),
+                Fusion::default(),
+                10,
+                pstore_engine::Consistency::Eventual,
+            )
+            .await
+            .unwrap();
+        assert!(!whole.hits.is_empty(), "the control answer is empty");
+        assert_eq!(exactly(&split), exactly(&whole));
+        let calls = peers.parts.load(Ordering::SeqCst)
+            + peers.opens.load(Ordering::SeqCst)
+            + peers.scans.load(Ordering::SeqCst);
+        assert_eq!(calls, 0, "a further-field query was split ({filter:?})");
+    }
+    // The primary is still split.
+    let peers = trio(&store);
+    split_equals_unsplit(&coordinator, &peers, &[text()], Fusion::default()).await;
+    assert!(
+        peers.opens.load(Ordering::SeqCst) > 0,
+        "a query over the primary was not split"
+    );
+}

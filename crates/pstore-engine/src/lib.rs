@@ -727,6 +727,8 @@ struct Fresh {
     fts: FullText,
     /// The attributes it sketched (M15.2), by the same rule.
     trigram: Vec<String>,
+    /// Its further text fields (M152), by the same rule.
+    texts: BTreeMap<String, FullText>,
     /// The attribute its text index was built over (M30): the index's, else this process's.
     text_field: String,
 }
@@ -1351,6 +1353,85 @@ pub struct Declared {
     pub fts: Option<FullText>,
     /// The attributes whose trigrams are sketched, sorted and distinct.
     pub trigram: Option<Vec<String>>,
+    /// The index's further text fields (M152), each under its own analyzer and parameters.
+    pub texts: Option<BTreeMap<String, FullText>>,
+}
+
+/// The reserved attribute a row carries its write's declared further text fields in (M152):
+/// each name, then its [`FullText::encode`], in name order. As `$fts`, absent is no opinion.
+const TEXTS_ATTR: &str = "$texts";
+
+/// The further text fields a row's write declared, or `None`.
+fn texts_of(d: &Document) -> Option<BTreeMap<String, FullText>> {
+    let Some(pstore_format::Value::Array(items)) = d.attrs.get(TEXTS_ATTR) else {
+        return None;
+    };
+    let strs: Option<Vec<&str>> = items
+        .iter()
+        .map(|v| match v {
+            pstore_format::Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    strs?
+        .chunks(2)
+        .map(|pair| match pair {
+            [name, fts] => Some(((*name).to_owned(), FullText::decode(fts)?)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A further-text-fields conflict, from what the index has and what a row declares.
+fn texts_conflict(
+    index: &str,
+    expected: &BTreeMap<String, FullText>,
+    got: &BTreeMap<String, FullText>,
+) -> EngineError {
+    let list = |t: &BTreeMap<String, FullText>| {
+        t.iter()
+            .map(|(n, f)| format!("{n} ({})", describe(f)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "the further text fields",
+        expected: format!(
+            "[{}]. They are fixed when the index is created: a different set is a reindex, \
+             by copying the rows into a new index",
+            list(expected)
+        ),
+        got: format!("[{}]", list(got)),
+    }
+}
+
+/// Why a declaration of further text fields cannot be accepted from a writer over `own`
+/// (M152), if it cannot.
+fn texts_refusal(texts: &BTreeMap<String, FullText>, own: &str) -> Option<String> {
+    if texts.len() > head::MAX_TEXTS {
+        return Some(format!(
+            "at most {} further text fields, not {}",
+            head::MAX_TEXTS,
+            texts.len()
+        ));
+    }
+    texts.keys().find_map(|n| {
+        if n.is_empty() || n.len() > 128 {
+            Some(format!(
+                "a text field's name is 1 to 128 bytes, not {}",
+                n.len()
+            ))
+        } else if n.starts_with('$') || n == pstore_query::ID_ATTRIBUTE {
+            Some(format!("{n:?} is reserved, and cannot be a text field"))
+        } else if n == own {
+            Some(format!(
+                "{n:?} is this writer's own text field, and cannot also be a further one"
+            ))
+        } else {
+            None
+        }
+    })
 }
 
 /// A full-text schema as a refusal names it.
@@ -1400,6 +1481,39 @@ fn same_row(a: &Document, b: &Document) -> bool {
     a.id == b.id && a.vectors == b.vectors && attrs(a) == attrs(b)
 }
 
+/// The text fields a seal builds (M152): the primary, under `fts`, then each further field
+/// under its own analyzer, in name order -- each only when some row has text under it, as
+/// the primary always was (M30).
+fn text_fields<'a>(
+    primary: Option<&'a str>,
+    fts: &'a FullText,
+    texts: &'a BTreeMap<String, FullText>,
+    docs: &[Document],
+) -> Vec<(&'a str, &'a pstore_format::text::Analyzer)> {
+    primary
+        .map(|f| (f, &fts.analyzer))
+        .into_iter()
+        .chain(texts.iter().map(|(n, f)| (n.as_str(), &f.analyzer)))
+        .filter(|(f, _)| docs.iter().any(|d| has_text(d, f)))
+        .collect()
+}
+
+/// The `FullText` a query's text legs are scored under (M152): the queried field's own when
+/// it is a further field, else the index's.
+fn scoring(
+    fts: FullText,
+    texts: &BTreeMap<String, FullText>,
+    prefetch: &[pstore_query::Prefetch],
+) -> FullText {
+    prefetch
+        .iter()
+        .find_map(|p| match p {
+            pstore_query::Prefetch::Text { field, .. } => texts.get(field).copied(),
+            _ => None,
+        })
+        .unwrap_or(fts)
+}
+
 /// Whether `doc` carries a non-empty string under `field`.
 fn has_text(doc: &Document, field: &str) -> bool {
     // M150: a string, or an array of strings, one of them non-empty.
@@ -1422,6 +1536,7 @@ fn stripped(mut d: Document) -> Document {
     d.attrs.remove(METRIC_ATTR);
     d.attrs.remove(FTS_ATTR);
     d.attrs.remove(TRGM_ATTR);
+    d.attrs.remove(TEXTS_ATTR);
     d
 }
 
@@ -1604,6 +1719,7 @@ struct FreshView {
     shadow: Arc<std::collections::HashSet<String>>,
     metric: Option<Metric>,
     fts: FullText,
+    texts: BTreeMap<String, FullText>,
 }
 
 impl Fresh {
@@ -1617,6 +1733,7 @@ impl Fresh {
             shadow: Arc::clone(&self.shadow),
             metric: self.metric,
             fts: self.fts,
+            texts: self.texts.clone(),
         }
     }
 }
@@ -2265,6 +2382,12 @@ impl<S: BlobStore> Engine<S> {
                 .find_map(trgm_of)
                 .unwrap_or_default(),
             fields: Default::default(),
+            // M152: by the same rule.
+            texts: docs
+                .iter()
+                .filter(|d| !is_rowless(d))
+                .find_map(texts_of)
+                .unwrap_or_default(),
         }
     }
 
@@ -2368,6 +2491,12 @@ impl<S: BlobStore> Engine<S> {
         {
             return Some(trgm_conflict(index, &schema.trigram, &t));
         }
+        // M152: and declared further text fields, the same way.
+        if let Some(t) = texts_of(doc)
+            && t != schema.texts
+        {
+            return Some(texts_conflict(index, &schema.texts, &t));
+        }
         let dims = doc.vector().len() as u32;
         if dims != schema.dims {
             // In the width the client wrote: the metric's transform is not theirs to know.
@@ -2396,6 +2525,26 @@ impl<S: BlobStore> Engine<S> {
                     got: (v.len() as u32).saturating_sub(extra).to_string(),
                 });
             }
+        }
+        // ⚠️ M152: **no name is both**. A row whose text is under a further field never joins
+        // as the primary's, so `filled` never fills the primary with it.
+        if let Some(field) = self.text_of(doc)
+            && schema.texts.contains_key(field)
+        {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "the text field",
+                expected: format!(
+                    "{}: \"{field}\" is a further text field of this index, and its text is \
+                     written by a writer over the index's own",
+                    if schema.text_field.is_empty() {
+                        "none yet"
+                    } else {
+                        schema.text_field.as_str()
+                    }
+                ),
+                got: field.to_owned(),
+            });
         }
         if !schema.text_field.is_empty()
             && let Some(field) = self.text_of(doc)
@@ -2775,6 +2924,10 @@ impl<S: BlobStore> Engine<S> {
     /// writer could not store was written as nothing and reported as durable. The refusal this
     /// keeps is `try_finish`'s **index-budget** one, which `check_storable` at the write door
     /// knows nothing about.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an index's schema, field by field, as the fold and the merge hold it"
+    )]
     async fn seal(
         &self,
         names: &mut Names,
@@ -2782,11 +2935,13 @@ impl<S: BlobStore> Engine<S> {
         docs: &[Document],
         text_field: Option<&str>,
         fts: &FullText,
+        texts: &BTreeMap<String, FullText>,
         trigram: &[String],
     ) -> Result<(Key, Dicts, u64), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
         let text_field = text_field.filter(|f| docs.iter().any(|d| has_text(d, f)));
+        let fields = text_fields(text_field, fts, texts, docs);
         // ⚠️ **The `replicas: 0` clamp is gone (M3c).** It was a correctness clamp, not a
         // tuning choice: rows were written in list order, so a replicated vector was written
         // to the segment TWICE — 400 documents folded and merged came back as 431 rows, and
@@ -2798,13 +2953,12 @@ impl<S: BlobStore> Engine<S> {
         // at the default probe width of 8 replication buys **0.0000** recall and costs bytes
         // (0.841 MB against 0.769). What it buys is query bytes at small `p` — 0.9610 @ 0.288
         // MB at p=2 — and lowering `p` is a decision with its own measurement.
-        let built = pstore_index::vec_index::try_build_all_with(
+        let built = pstore_index::vec_index::try_build_all_fields(
             docs,
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
-            text_field,
-            &fts.analyzer,
+            &fields,
             trigram,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
@@ -3000,6 +3154,7 @@ impl<S: BlobStore> Engine<S> {
         let declared = Declared {
             fts: Some(*fts),
             trigram: None,
+            texts: None,
         };
         self.write_marked(index, docs, metric, Marks::None, &declared)
             .await
@@ -3267,6 +3422,14 @@ impl<S: BlobStore> Engine<S> {
                 "\"id\" cannot be declared regex: it is not sketched".to_owned(),
             ));
         }
+        // M152: what further text fields cannot mean, from this writer.
+        if let Some(why) = declared
+            .texts
+            .as_ref()
+            .and_then(|t| texts_refusal(t, &self.text_field))
+        {
+            return Err(EngineError::Refused(why));
+        }
         let mut docs = docs;
         for (i, d) in docs.iter_mut().enumerate() {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
@@ -3343,6 +3506,17 @@ impl<S: BlobStore> Engine<S> {
                     TRGM_ATTR.to_owned(),
                     pstore_format::Value::Array(
                         t.iter().cloned().map(pstore_format::Value::Str).collect(),
+                    ),
+                );
+            }
+            if let Some(t) = &declared.texts {
+                d.attrs.insert(
+                    TEXTS_ATTR.to_owned(),
+                    pstore_format::Value::Array(
+                        t.iter()
+                            .flat_map(|(n, f)| [n.clone(), f.encode()])
+                            .map(pstore_format::Value::Str)
+                            .collect(),
                     ),
                 );
             }
@@ -3488,6 +3662,20 @@ impl<S: BlobStore> Engine<S> {
             && let Some(t) = docs.iter().filter_map(trgm_of).find(|t| *t != k)
         {
             return Some(trgm_conflict(index, &k, &t));
+        }
+        // M152: and one set of further text fields, the same way.
+        let declared = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .chain(docs.iter())
+            .find_map(texts_of);
+        if let Some(k) = declared
+            && let Some(t) = docs.iter().filter_map(texts_of).find(|t| *t != k)
+        {
+            return Some(texts_conflict(index, &k, &t));
         }
         // ⚠️ And one metric (M9d), on the same rung: cosine and dot have one width.
         if let Some((known_metric, _)) = known
@@ -4904,6 +5092,7 @@ impl<S: BlobStore> Engine<S> {
                     if let Some(c) = created.get(idx) {
                         schema.fts = c.fts;
                         schema.trigram.clone_from(&c.trigram);
+                        schema.texts.clone_from(&c.texts);
                     }
                     // M36: and the text field it was judged against, as above.
                     if let Some(f) = judged.get(idx) {
@@ -4922,9 +5111,14 @@ impl<S: BlobStore> Engine<S> {
                 // ⚠️ **By the rows' own field** (M36), never this engine's, which a row written
                 // under another field does not carry its text under. The reject pass already
                 // filled it from every row with text, so only a patch reaches here.
+                // ⚠️ M152: never with a further field's name: a patch is rowless, so
+                // `row_conflict` never saw the text it set.
                 if let Some(s) = next.schemas.get_mut(idx)
                     && s.text_field.is_empty()
-                    && let Some(f) = docs.iter().find_map(|d| self.text_of(d))
+                    && let Some(f) = docs
+                        .iter()
+                        .filter_map(|d| self.text_of(d))
+                        .find(|f| !s.texts.contains_key(*f))
                 {
                     s.text_field = f.to_owned();
                 }
@@ -4939,6 +5133,7 @@ impl<S: BlobStore> Engine<S> {
                         // text must not be indexed as text behind the schema's back.
                         Some(schema.text_field.as_str()).filter(|f| !f.is_empty()),
                         &schema.fts,
+                        &schema.texts,
                         &schema.trigram,
                     )
                     .await?;
@@ -5794,9 +5989,17 @@ impl<S: BlobStore> Engine<S> {
         // other's rows over an attribute they do not carry, which is the same silent
         // destruction one segment at a time. Nothing can produce disagreeing inputs today;
         // that is what makes now the cheap time to shut the door.
+        // M152: the schema's further fields are not the primary, and never disagree with it.
+        let further: BTreeMap<String, FullText> = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.texts.clone())
+            .unwrap_or_default();
         let mut named: Vec<&str> = opened
             .iter()
             .flat_map(|s| s.text_fields().iter().map(String::as_str))
+            .filter(|f| !further.contains_key(*f))
             .collect();
         named.sort_unstable();
         named.dedup();
@@ -5831,7 +6034,7 @@ impl<S: BlobStore> Engine<S> {
 
         // M14: a merge re-analyzes, so under the index's analyzer -- never the default.
         let schema = at.head.schemas.get(index).cloned().unwrap_or_default();
-        let (fts, trigram) = (schema.fts, schema.trigram);
+        let (fts, trigram, texts) = (schema.fts, schema.trigram, schema.texts);
         let mut sealed_at = at.head.epoch.next();
         let mut out_key = self.compacted_key(sealed_at, index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
@@ -5844,7 +6047,7 @@ impl<S: BlobStore> Engine<S> {
         if !empty {
             let len;
             (out_key, out_dicts, len) = self
-                .seal(names, &out_key, &rows, text_field, &fts, &trigram)
+                .seal(names, &out_key, &rows, text_field, &fts, &texts, &trigram)
                 .await?;
             out_len = Some(len);
         }
@@ -5871,6 +6074,7 @@ impl<S: BlobStore> Engine<S> {
                         &rows,
                         text_field,
                         &fts,
+                        &texts,
                         &trigram,
                     )
                     .await?;
@@ -6052,7 +6256,7 @@ impl<S: BlobStore> Engine<S> {
         // copies none of them: the copy below is a miss's only. `mem` is a `std` mutex never
         // held across an await, so it is never held while this one is awaited.
         let mut slots = self.fresh.lock().await;
-        let (generation, ops, fts, trigram) = {
+        let (generation, ops, fts, trigram, texts) = {
             let mut m = self.mem();
             if !m.prune(watermark) {
                 return Ok(None);
@@ -6074,17 +6278,23 @@ impl<S: BlobStore> Engine<S> {
                 .map(|s| s.trigram.clone())
                 .or_else(|| visible().find_map(trgm_of))
                 .unwrap_or_default();
+            // M152: by the same rule.
+            let texts = schema
+                .map(|s| s.texts.clone())
+                .or_else(|| visible().find_map(texts_of))
+                .unwrap_or_default();
             if let Some(f) = slots.get(index)
                 && f.generation == m.generation
                 && f.index == index
                 && f.fts == fts
                 && f.trigram == trigram
+                && f.texts == texts
                 && f.text_field == text_field
             {
                 return Ok(Some(Some(f.view())));
             }
             let ops: Vec<Document> = visible().cloned().collect();
-            (m.generation, ops, fts, trigram)
+            (m.generation, ops, fts, trigram, texts)
         };
         // A miss: every entry another generation built is stale, and goes.
         slots.retain(|_, f| f.generation == generation);
@@ -6115,6 +6325,7 @@ impl<S: BlobStore> Engine<S> {
                 metric,
                 fts,
                 trigram,
+                texts,
                 text_field,
             };
             let view = fresh.view();
@@ -6127,14 +6338,16 @@ impl<S: BlobStore> Engine<S> {
         // The same builder a fold uses, so the fresh half and the folded half are scored by
         // the same code rather than by two that must agree.
         let sparse = sparse_field_of(&rows);
-        let wants_text = rows.iter().any(|d| has_text(d, text_field.as_str()));
-        let built = pstore_index::vec_index::try_build_all_with(
+        // ⚠️ M152: a primary naming a further field is left out. Its primary may be this
+        // engine's own field while the schema has none, and no name is both.
+        let primary = Some(text_field.as_str()).filter(|f| !texts.contains_key(*f));
+        let fields = text_fields(primary, &fts, &texts, &rows);
+        let built = pstore_index::vec_index::try_build_all_fields(
             &rows,
             self.params,
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
-            wants_text.then_some(text_field.as_str()),
-            &fts.analyzer,
+            &fields,
             &trigram,
         )
         .map_err(|e| EngineError::Format(e.to_string()))?;
@@ -6199,6 +6412,7 @@ impl<S: BlobStore> Engine<S> {
             metric,
             fts,
             trigram,
+            texts,
             text_field,
         };
         let view = fresh.view();
@@ -6528,12 +6742,19 @@ impl<S: BlobStore> Engine<S> {
 
         // ⚠️ Every id with an unfolded operation hides its older rows in the segments (M9c.2) --
         // even when every such operation was a delete and there is no fresh segment at all.
-        let (unfolded, fresh_store, shadow, fresh_metric, fresh_fts) = match fresh {
+        let (unfolded, fresh_store, shadow, fresh_metric, fresh_fts, fresh_texts) = match fresh {
             Some(v) => {
                 targets.extend(v.target);
-                (v.rows, Some(v.store), v.shadow, v.metric, Some(v.fts))
+                (
+                    v.rows,
+                    Some(v.store),
+                    v.shadow,
+                    v.metric,
+                    Some(v.fts),
+                    Some(v.texts),
+                )
             }
-            None => (Arc::default(), None, Arc::default(), None, None),
+            None => (Arc::default(), None, Arc::default(), None, None, None),
         };
         // M14: the same rule as the metric's, and the fresh segment was built by it.
         let fts = at
@@ -6556,6 +6777,16 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_default();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let prefetch = prefetch.as_slice();
+        // M152: the text legs score under the queried field's `FullText`; the filter stays
+        // bound by the index's, above.
+        let texts = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.texts.clone())
+            .or(fresh_texts)
+            .unwrap_or_default();
+        let scored = scoring(fts, &texts, prefetch);
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -6581,6 +6812,9 @@ impl<S: BlobStore> Engine<S> {
             fresh: fresh_store,
         };
         // M54: the folded segments only; the fresh one is this process's alone.
+        // ⚠️ M152: never a query scored under another `FullText` than the index's: a share's
+        // `Part` carries one, which binds the filter and scores alike (M154 lifts it).
+        let peers = peers.filter(|_| scored == fts);
         let elsewhere = peers.map_or_else(Vec::new, |p| {
             let durable = targets.get(..unfolded_at).unwrap_or_default();
             shares(
@@ -6596,7 +6830,7 @@ impl<S: BlobStore> Engine<S> {
             )
         });
         let resolved = pstore_query::query_rows_split(
-            &store, &targets, prefetch, &fts, filter, &shadow, fusion, top_k, elsewhere, vectors,
+            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere, vectors,
         )
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;
@@ -6920,7 +7154,8 @@ impl<S: BlobStore> Engine<S> {
             &self.store,
             &targets,
             &prefetch,
-            &schema.fts,
+            // M152: that epoch's further fields.
+            &scoring(schema.fts, &schema.texts, &prefetch),
             filter,
             &std::collections::HashSet::new(),
             fusion,

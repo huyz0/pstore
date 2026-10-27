@@ -1762,6 +1762,7 @@ async fn write_documents<S: BlobStore + 'static>(
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
+        texts: None,
     };
     let patches = patches_of(
         std::mem::take(&mut req.patch_rows),
