@@ -110,7 +110,7 @@ fn each_carried_field_is_its_own_one_field_build() {
     );
     let raw = bytes::Bytes::from(built.dictionary.clone());
     let dicts = Dictionaries::decode(&raw, 3).expect("the container decodes");
-    assert_eq!(dicts.len(), 3);
+    assert_eq!(dicts.fields(), 3);
     let n = docs.len();
     assert_eq!(built.fieldnorms.len(), 3 * n);
     let mut end = 0;

@@ -674,19 +674,14 @@ impl Dictionaries {
             |d| d.fields.iter().map(|(_, t, _)| t.heap()).sum(),
             |b| Self::decode(b, n),
         )
-        .filter(|d| d.len() == n)
+        .filter(|d| d.fields() == n)
     }
 
-    /// Fields decoded.
+    /// Fields decoded: never none, since `decode` refuses a count of 0. Named
+    /// `fields` rather than `len`, which would ask for an `is_empty` that is always false.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn fields(&self) -> usize {
         self.fields.len()
-    }
-
-    /// Whether none were.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
     }
 
     /// Field `i`'s dictionary bytes: a slice of the buffer decoded.
