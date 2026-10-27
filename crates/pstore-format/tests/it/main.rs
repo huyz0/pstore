@@ -17,6 +17,7 @@ mod ids_at;
 mod index_rows;
 mod lance;
 mod lance21;
+mod multi_text;
 mod parquet;
 mod search;
 mod sections;

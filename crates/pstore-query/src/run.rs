@@ -154,21 +154,53 @@ struct Opened {
 }
 
 impl Opened {
-    /// The segment's text index: decoded once at open, or again here to fail as it does.
-    fn text_index(&self, raw: &[u8]) -> Result<Arc<TextIndex>, FormatError> {
+    /// The segment's text index over `field`, the query's one text field (M151): decoded once
+    /// at open, or again here to fail as it does.
+    fn text_index(&self, field: &str, raw: &bytes::Bytes) -> Result<Arc<TextIndex>, FormatError> {
         match &self.text {
             Some(idx) => Ok(Arc::clone(idx)),
-            None => TextIndex::from_segment(&self.segment, raw).map(Arc::new),
+            None => TextIndex::for_field(&self.segment, raw, field).map(Arc::new),
         }
     }
 
-    /// This segment's BM25 statistics for `terms`, or `None` with no readable dictionary.
-    fn summary_for(&self, terms: &[String]) -> Option<Stats> {
+    /// Whether this segment carries the text field `field` (M151).
+    fn carries(&self, field: &str) -> bool {
+        self.segment.text_fields().iter().any(|f| f == field)
+    }
+
+    /// This segment's BM25 statistics over `field` for `terms`, or `None` when it does not
+    /// carry the field or has no readable dictionary.
+    fn summary_for(&self, field: &str, terms: &[String]) -> Option<Stats> {
+        if !self.carries(field) {
+            return None;
+        }
         let raw = self.terms.as_ref()?;
-        self.text_index(raw.as_ref())
+        self.text_index(field, raw)
             .ok()
             .map(|idx| idx.summary_for(terms))
     }
+}
+
+/// The one text field a query's legs read (M151), or `None` when it has no text leg.
+///
+/// ⚠️ **Refused, before any I/O, when the legs name different fields.** One `Stats` is merged
+/// for all of a query's text legs and one analyzer scores them, so a second field would be
+/// scored against the first field's corpus. Several fields per query is M153's.
+fn text_field_of<'a>(
+    legs: impl IntoIterator<Item = &'a Prefetch>,
+) -> Result<Option<&'a str>, QueryError> {
+    let mut out: Option<&str> = None;
+    for p in legs {
+        if let Prefetch::Text { field, .. } = p {
+            match out {
+                Some(f) if f != field => {
+                    return Err(QueryError::Unimplemented("text legs over different fields"));
+                }
+                _ => out = Some(field),
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Runs every leg over one segment and fuses the answers.
@@ -338,20 +370,22 @@ pub async fn open_part<S: BlobStore + Clone>(
     legs: &[(usize, Prefetch)],
     terms: &[String],
 ) -> Result<(OpenPart, Stats), QueryError> {
+    let field = text_field_of(legs.iter().map(|(_, p)| p))?;
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
         .join()
         .await?;
-    let wants_text = legs.iter().any(|(_, p)| matches!(p, Prefetch::Text { .. }));
     let mut parts = Vec::new();
+    // ⚠️ A segment without the field adds nothing, and is never refused here (M151): the field
+    // may live in another share's segments, and only the coordinator sees them all.
     for ((_, t), o) in targets.iter().zip(&opened) {
-        if !wants_text || !t.text_dict || o.segment.text_fields().is_empty() {
+        let Some(field) = field.filter(|f| t.text_dict && o.carries(f)) else {
             continue;
-        }
+        };
         let raw = o.terms.as_ref().ok_or(FormatError::Corrupt(
             "a share's segment with text and no term dictionary",
         ))?;
-        parts.push(o.text_index(raw.as_ref())?.summary_for(terms));
+        parts.push(o.text_index(field, raw)?.summary_for(terms));
     }
     // Already `terms` alone, each summary built for them (M119); `only` keeps it so.
     let stats = only(Stats::merge(parts), terms);
@@ -496,6 +530,9 @@ pub async fn part<S: BlobStore + Clone>(
     text: &FullText,
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
+    // M151: before the open round. `scan_part` needs no check of its own: its `OpenPart` comes
+    // from `open_part`, which refuses first, or from here.
+    text_field_of(legs.iter().map(|(_, p)| p))?;
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
         .join()
@@ -674,6 +711,7 @@ async fn run<S: BlobStore + Clone>(
         .iter()
         .map(Runnable::try_from)
         .collect::<Result<Vec<_>, _>>()?;
+    let text_field = text_field_of(prefetch)?;
 
     // ⚠️ Every segment and every sidecar in ONE round. `Engine::scan`'s comment already made
     // this argument with a measurement: a loop over segment refs "turns a ten-segment index
@@ -766,6 +804,15 @@ async fn run<S: BlobStore + Clone>(
         {
             return Err(FormatError::UnknownField.into());
         }
+        // M151: so is a text field no segment carries, when some segment carries text: today's
+        // wrong-field refusal, kept across segments that each carry some of the index's fields.
+        // From the footers of every target, phased shares' included -- never a peer's answer.
+        if let Some(field) = text_field
+            && opened.iter().any(|o| !o.segment.text_fields().is_empty())
+            && !opened.iter().any(|o| o.carries(field))
+        {
+            return Err(FormatError::UnknownField.into());
+        }
 
         // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the
         // summaries ride in the term dictionaries the open round already fetched. That is what
@@ -801,7 +848,12 @@ async fn run<S: BlobStore + Clone>(
             t.dedup();
             t
         };
-        let mut stats = Stats::merge(opened.iter().filter_map(|o| o.summary_for(&text_terms)));
+        let field = text_field.unwrap_or_default();
+        let mut stats = Stats::merge(
+            opened
+                .iter()
+                .filter_map(|o| o.summary_for(field, &text_terms)),
+        );
         // M55: each phased share's statistics, or -- for a share whose phase 1 failed -- its
         // segments opened here, one more round, so the sum is never a share short.
         let mut scan_here: Vec<(usize, Target)> = Vec::new();
@@ -827,7 +879,7 @@ async fn run<S: BlobStore + Clone>(
             std::iter::once(stats).chain(summed_parts).chain(
                 opened_here
                     .iter()
-                    .filter_map(|o| o.summary_for(&text_terms)),
+                    .filter_map(|o| o.summary_for(field, &text_terms)),
             ),
         );
         // Shared by every leg task (M59), and built once.
@@ -1655,8 +1707,13 @@ async fn open<S: BlobStore>(
     )
     .await;
     let segment = segment?;
-    let text = terms.as_ref().and_then(|raw| {
-        TextIndex::from_segment_shared(&segment, raw)
+    // M151: the query's one text field, `text_field_of` having refused two.
+    let field = prefetch.iter().find_map(|p| match p {
+        Prefetch::Text { field, .. } => Some(field.as_str()),
+        _ => None,
+    });
+    let text = terms.as_ref().zip(field).and_then(|(raw, field)| {
+        TextIndex::for_field(&segment, raw, field)
             .ok()
             .map(Arc::new)
     });
@@ -1808,13 +1865,16 @@ async fn leg<S: BlobStore>(
             if opened.segment.text_fields().is_empty() {
                 return Ok(Vec::new());
             }
-            if !opened.segment.text_fields().iter().any(|f| f == field) {
-                return Err(QueryError::Format(FormatError::UnknownField));
+            // ⚠️ M151: nor does a segment carrying other text fields and not this one. It was
+            // sealed while no row had text in it, which is a fact about its rows, not a typo:
+            // `run` refuses a field NO segment carries.
+            if !opened.carries(field) {
+                return Ok(Vec::new());
             }
             let raw = opened.terms.as_ref().ok_or(FormatError::Corrupt(
                 "a text leg over a segment with no term dictionary sidecar",
             ))?;
-            let idx = opened.text_index(raw.as_ref())?;
+            let idx = opened.text_index(field, raw)?;
             // ⚠️ The statistics are the CALLER's, summed across every segment in the query,
             // not this segment's own summary. That caller is what M5a, M5b and M5c each
             // handed forward by name, and scoring against a per-segment summary is wrong

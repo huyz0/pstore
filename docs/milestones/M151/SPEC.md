@@ -24,8 +24,10 @@ A field with no text in any row is written as no text at all: no `TextPostings`,
 statistics (M30).
 
 After:
-- **The fields a segment carries.** A segment carries a text field only if some row has text
-  in it, by M150's `has_text`. Asked for fields `[a, b, c]` where no row has text in `b`, it
+- **The fields a segment carries.** A segment carries a text field only if its postings are
+  non-empty: some row has a token in it. Text that analyzes to no token (a stopword alone) is
+  not enough, since a one-field segment records its name only beside its postings. Asked for
+  fields `[a, b, c]` where no row has a token in `b`, it
   carries `[a, c]`, in that order. This is today's one-field rule, applied per field.
 - **One carried field: unchanged, byte for byte.** Its postings, fieldnorms, `TextFields`
   section and dictionary bytes are what a one-field build writes today.
@@ -55,7 +57,7 @@ After:
   sidecar, as a one-field build of such a field writes no `TextPostings` today.
   `Built` and `build_with` are unchanged: `fieldnorms` stays one per row. A repeated name, or
   an empty list, is refused (`None`). `vec_index::try_build_all_fields` takes the field list
-  and refuses what `build_fields` refuses (`FormatError`). The existing builders pass a
+  and refuses a repeated name (`FormatError`); an empty list builds no text. The existing builders pass a
   one-element list and are otherwise unchanged.
 - **Read.**
   - `text::Dictionaries::decode(raw, n)` checks the sidecar on its own. For `n = 1` it is one
@@ -87,9 +89,9 @@ After:
   - The `FullText` a query is given (its analyzer, `k1`, `b`) is the queried field's. That
     holds because of the next rule.
   - **One field per query.** A query whose text legs name different fields is refused
-    (`QueryError`, named), before any I/O, over the whole leg list: in `run` and
-    `scan_part` beside the collect of runnable legs, and in `open_part` before it opens
-    anything, since a phased share's peer calls it with raw legs. A query over several fields
+    (`QueryError`, named), before any I/O, over the whole leg list: in `run` beside the collect of runnable legs, and in `open_part`
+    and `part` before they open anything, since a share's peer calls them with raw legs.
+    `scan_part` runs only an `OpenPart` one of those built. A query over several fields
     needs per-field statistics and analyzers: that is M153's.
   - **A segment that does not carry the field** answers that leg with nothing, and adds
     nothing to its statistics, as a segment with no text does today (M30). That is what a
@@ -102,7 +104,7 @@ After:
 
     `open_part` never refuses a field its own segments lack. It returns that field's empty
     statistics, because the field may live in another share's segments.
-  - `Opened` keeps the decoded index per field.
+  - `Opened` keeps the decoded index for the query's one field.
 
 Unchanged:
 - every request, round trip and depth (see RA budget);
@@ -146,10 +148,10 @@ Unchanged:
      for `c`, not an error. Through `query_rows_split`, a query whose phased share's segments
      carry `c`, beside local segments that do not, answers as in criterion 3.
 5. **Round trips.** A text query over field `b` of a three-field segment costs the same
-   number of sequential rounds and requests as one over a one-field segment. The extra bytes
-   it reads are the sidecar's directory and the two other dictionaries, inside the object
-   fetched anyway, and nothing else. This is asserted with `pstore-blob`'s request and byte
-   accounting.
+   number of sequential rounds and requests as one over a one-field segment of `b`. It reads
+   the same bytes of `b`'s postings and of `b`'s fieldnorms. The sidecar is read whole in both
+   cases, so the extra bytes are the directory and the other dictionaries it carries. This is
+   asserted with `pstore-blob`'s byte accounting and the testkit's depth counter.
 
 ## Test plan
 Red first against the parent:
@@ -159,7 +161,7 @@ Red first against the parent:
 
 A compile failure shows only that the API is new. So VERIFIED.md will rest each test's power
 to fail on the named mutations below, each observed red.
-- 1's first half, 2 and 4's decode: `pstore-format` integration tests (`tests/it/text.rs`).
+- 1's first half, 2 and 4's decode: `pstore-format` integration tests (`tests/it/multi_text.rs`).
   Mutations:
   - "the fieldnorms are not offset by field";
   - "postings starts are not shifted";
@@ -168,7 +170,7 @@ to fail on the named mutations below, each observed red.
   - "decode accepts `N != n`";
   - "decode accepts a gap between spans".
 - 1's second half, 3, 4's other refusals and 5: `pstore-query` integration tests
-  (`tests/it/`). Mutations:
+  (`tests/it/multi_text.rs`). Mutations:
   - "`for_field` opens field 0";
   - "the statistics are field 0's";
   - "text legs over different fields are accepted" (once each for `query` and `open_part`);

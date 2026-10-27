@@ -14,6 +14,7 @@ mod geo;
 mod hybrid;
 mod multi;
 mod multi_segment;
+mod multi_text;
 mod named_dense;
 mod parallel_legs;
 mod parallel_masks;
