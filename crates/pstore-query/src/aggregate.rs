@@ -68,7 +68,10 @@ pub enum Key {
 }
 
 impl Key {
-    fn of(v: Option<&Value>) -> Self {
+    /// A value's key, `None` being [`Key::Absent`] (public since M146, whose group limit keys
+    /// rows as `group_by` does).
+    #[must_use]
+    pub fn of(v: Option<&Value>) -> Self {
         match v {
             None => Self::Absent,
             Some(Value::Bool(b)) => Self::Bool(*b),

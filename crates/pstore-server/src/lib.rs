@@ -35,6 +35,7 @@ mod diversify;
 mod external;
 mod facets;
 mod highlight;
+mod limit_per;
 mod peer_http;
 pub use peer_http::PeerTransport;
 mod peer_tls;
@@ -2666,6 +2667,8 @@ enum Plan {
         Option<boost::Boost>,
         Option<highlight::Highlight>,
         Option<diversify::Diversify>,
+        // Boxed: the plan's largest variant, by far, without it.
+        Option<Box<limit_per::LimitPer>>,
     ),
 }
 
@@ -2732,6 +2735,23 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
             )));
         }
     }
+    // M146: a group limit cuts a relevance ranking; MMR would reorder what it cut.
+    if req.limit_per.is_some() {
+        let with = if req.rank_by.is_some() {
+            Some("rank_by")
+        } else if req.aggregate_by.is_some() {
+            Some("aggregate_by")
+        } else if req.diversify.is_some() {
+            Some("diversify")
+        } else {
+            None
+        };
+        if let Some(what) = with {
+            return Err(ApiError::bad_request(format!(
+                "limit_per cuts a relevance ranking: it cannot be combined with {what}"
+            )));
+        }
+    }
     // M62: a boost rescores a relevance ranking; an order or an aggregation has none.
     if req.boost.is_some() && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
         return Err(ApiError::bad_request(
@@ -2749,22 +2769,38 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     if let Some(by) = order_by(req)? {
         return Ok(Plan::Ordered(by, filter));
     }
+    // M146: a group limit names the window too (it never sits beside a diversify).
+    let named_limit = req.limit_per.as_ref().and_then(diversify::named_window);
     let boost = req
         .boost
         .as_ref()
-        .map(|b| boost::parse(b, req.top_k, named_diversify))
+        .map(|b| boost::parse(b, req.top_k, named_diversify.or(named_limit)))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
     // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
     // below `top_k` would otherwise never reach the fusion the boost rescores.
+    // M146: one window for a boost and a group limit, as for a boost and a diversify.
+    let limit_per = req
+        .limit_per
+        .as_ref()
+        .map(|p| limit_per::LimitPer::parse(p, req.top_k, named_boost))
+        .transpose()
+        .map_err(|why| ApiError::bad_request(format!("limit_per: {why}")))?;
     let window = boost
         .as_ref()
         .map(|b| b.window)
-        .or(diversify.map(|d| d.window));
+        .or(diversify.map(|d| d.window))
+        .or(limit_per.as_ref().map(|p| p.window));
     let legs = prefetch(req, window.unwrap_or(req.top_k))?;
     let fusion = fusion(req, legs.len())?;
     Ok(Plan::Ranked(
-        legs, filter, fusion, boost, highlight, diversify,
+        legs,
+        filter,
+        fusion,
+        boost,
+        highlight,
+        diversify,
+        limit_per.map(Box::new),
     ))
 }
 
@@ -2965,7 +3001,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
-    let (legs, filter, fusion, boost, highlight, diversify) = match plan {
+    let (legs, filter, fusion, boost, highlight, diversify, limit_per) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
             let group_by = spec.group_by.clone();
@@ -3052,8 +3088,8 @@ async fn run<E: BlobStore>(
                 consistency: level_name(level),
             });
         }
-        Plan::Ranked(legs, filter, fusion, boost, highlight, diversify) => {
-            (legs, filter, fusion, boost, highlight, diversify)
+        Plan::Ranked(legs, filter, fusion, boost, highlight, diversify, limit_per) => {
+            (legs, filter, fusion, boost, highlight, diversify, limit_per)
         }
     };
     // M62: the engine ranks the window, and the boost cuts it to `top_k`.
@@ -3061,6 +3097,7 @@ async fn run<E: BlobStore>(
         .as_ref()
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
+        .or(limit_per.as_ref().map(|p| p.window))
         .unwrap_or(req.top_k);
     let answer = match req.as_of {
         Some(e) => {
@@ -3135,9 +3172,13 @@ async fn run<E: BlobStore>(
             .filter_map(|i| slots.get_mut(i).and_then(Option::take))
             .collect();
     }
+    // M146: after the boost, on the stored attributes, whatever the query selects.
+    if let Some(p) = &limit_per {
+        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, req.top_k);
+    }
     paired.truncate(req.top_k);
     let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
-    let unfolded_hits = if boost.is_none() && diversify.is_none() {
+    let unfolded_hits = if boost.is_none() && diversify.is_none() && limit_per.is_none() {
         answer
             .hits
             .iter()

@@ -389,6 +389,10 @@ pub struct QueryRequest {
     /// A window of the ranking diversified by maximal marginal relevance (M64).
     #[serde(default)]
     pub diversify: Option<serde_json::Value>,
+    /// `{"attributes": [...], "limit": m, "window": w}`: at most `m` rows of each group of
+    /// the window's ranking (M146). Parsed by `limit_per.rs`.
+    #[serde(default)]
+    pub limit_per: Option<serde_json::Value>,
     /// An aggregation beside a ranked query, over its filter (M65).
     #[serde(default)]
     pub facets: Option<serde_json::Value>,

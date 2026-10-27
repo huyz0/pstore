@@ -1,5 +1,30 @@
 # Native API migration notes
 
+## M146: a hard per-group limit on a relevance ranking
+
+A relevance query may carry `limit_per`:
+
+```json
+{"vector": [...], "top_k": 10,
+ "limit_per": {"attributes": ["brand"], "limit": 2, "window": 200}}
+```
+
+- At most `limit` rows share one group: the tuple of the row's values for `attributes`
+  (1 to 8 names). An absent attribute is a group value; `1` and `1.0` are one value.
+- The engine ranks `window` candidates (default twice `top_k`, from 100 to 1,000, shared
+  with a boost's window). Rows past the window are never seen, so a few dominant groups
+  can leave fewer than `top_k` rows; widen the window up to 1,000.
+- The cut follows a boost's rescoring and reads stored attributes, whatever
+  `include_attributes` selects.
+- Refused beside `rank_by`, `aggregate_by` and `diversify`, and with `top_k` above 1,000.
+- In a multi-query each query is cut on its own; an outer `rerank_by` does not re-apply
+  the limit to the merged list.
+- Vendor differences: the field is a top-level `limit_per` rather than `limit.per`, and
+  `limit: 0` is refused.
+
+Queries without `limit_per` answer as before. The
+[M146 verification](milestones/M146/VERIFIED.md) records the evidence.
+
 ## M142: outer RRF over a multi-query
 
 A multi-query's root may carry `rerank_by`, `limit` and `offset` beside `queries`:

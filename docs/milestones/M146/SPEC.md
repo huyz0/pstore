@@ -107,3 +107,5 @@ Spec review round 1 (pass with minors, all taken): mutations for the two new win
 `unfolded_hits` stated, with tests and mutations for the last two; a hybrid case; the
 multi-query merge is not bounded per group; the vendor differences named; `Key`'s
 constructor described.
+Code review round 1 (pass with minors, both taken): a test and a mutation for a window
+only `limit_per` names; every refusal also tested through the API with blob counting.
