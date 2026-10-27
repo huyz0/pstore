@@ -943,7 +943,7 @@ async fn run<S: BlobStore + Clone>(
                         } if f == field => Some(query),
                         _ => None,
                     })
-                    .flat_map(|q| pstore_format::text::analyze(analyzer, q))
+                    .flat_map(|q| pstore_format::text::analyze_query(analyzer, q))
                     .collect();
                 t.sort();
                 t.dedup();
@@ -2072,7 +2072,7 @@ async fn leg<S: BlobStore>(
             let text = texts.of(field);
             let empty = Stats::default();
             let stats = stats.get(*field).unwrap_or(&empty);
-            let terms = pstore_format::text::analyze(&text.analyzer, query);
+            let terms = pstore_format::text::analyze_query(&text.analyzer, query);
             let hits = idx
                 .search_with(store, key, &terms, stats, *limit, text.k1, text.b)
                 .await?;

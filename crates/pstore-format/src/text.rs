@@ -149,7 +149,24 @@ pub struct Analyzer {
     pub case_sensitive: bool,
     /// NFKD, then drop combining marks: `é` becomes `e`.
     pub ascii_folding: bool,
+    /// How a string becomes tokens (M158).
+    pub tokenizer: Tokenizer,
 }
+
+/// How a string becomes tokens (M158): the vendor's `tokenizer` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tokenizer {
+    /// Maximal runs of alphanumeric characters, as every analyzer before M158.
+    #[default]
+    WordV1,
+    /// The client's own tokens: a document's string is one token, kept byte for byte, and a
+    /// query operand is its tokens joined by [`TOKEN_SEPARATOR`].
+    PreTokenizedArray,
+}
+
+/// What joins a `[]string` query operand's tokens into one string (M158): the ASCII unit
+/// separator, which no query token may hold.
+pub const TOKEN_SEPARATOR: char = '\u{1F}';
 
 /// Lucene's English stopword set.
 const STOPWORDS: [&str; 33] = [
@@ -199,7 +216,9 @@ impl FullText {
     #[must_use]
     pub fn encode(&self) -> String {
         let a = &self.analyzer;
-        format!(
+        // M158: today's line, byte for byte, for `word_v1`; a `v2` line, which a build before
+        // M158 refuses, for any other tokenizer.
+        let line = format!(
             "v1;{};{}{}{}{};{:08x};{:08x}",
             a.language.name(),
             u8::from(a.stemming),
@@ -208,16 +227,30 @@ impl FullText {
             u8::from(a.ascii_folding),
             self.k1.to_bits(),
             self.b.to_bits()
-        )
+        );
+        match a.tokenizer {
+            Tokenizer::WordV1 => line,
+            Tokenizer::PreTokenizedArray => {
+                format!(
+                    "v2{};pre_tokenized_array",
+                    line.get(2..).unwrap_or_default()
+                )
+            }
+        }
     }
 
     /// The full-text schema [`Self::encode`] wrote, or `None` for anything else.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
         let mut parts = s.split(';');
-        if parts.next()? != "v1" {
-            return None;
-        }
+        let tokenizer = match parts.next()? {
+            "v1" => Tokenizer::WordV1,
+            "v2" => match s.rsplit(';').next()? {
+                "pre_tokenized_array" => Tokenizer::PreTokenizedArray,
+                _ => return None,
+            },
+            _ => return None,
+        };
         let language = Language::parse(parts.next()?)?;
         let flags: Vec<bool> = parts
             .next()?
@@ -234,6 +267,10 @@ impl FullText {
         let bits = |p: Option<&str>| p.and_then(|h| u32::from_str_radix(h, 16).ok());
         let k1 = f32::from_bits(bits(parts.next())?);
         let b = f32::from_bits(bits(parts.next())?);
+        // A `v2` line names its tokenizer last, read above.
+        if tokenizer != Tokenizer::WordV1 {
+            parts.next()?;
+        }
         if parts.next().is_some() {
             return None;
         }
@@ -244,6 +281,7 @@ impl FullText {
                 remove_stopwords: *remove_stopwords,
                 case_sensitive: *case_sensitive,
                 ascii_folding: *ascii_folding,
+                tokenizer,
             },
             k1,
             b,
@@ -259,6 +297,38 @@ impl FullText {
 #[must_use]
 pub fn analyze(a: &Analyzer, s: &str) -> Vec<String> {
     tokens(a, s).into_iter().filter_map(|t| t.term).collect()
+}
+
+/// The terms a query operand `q` becomes under `a` (M158): [`analyze`], except that under
+/// `pre_tokenized_array` `q` is tokens joined by [`TOKEN_SEPARATOR`], each one term, whole.
+#[must_use]
+pub fn analyze_query(a: &Analyzer, q: &str) -> Vec<String> {
+    query_tokens(a, q)
+        .into_iter()
+        .filter_map(|t| t.term)
+        .collect()
+}
+
+/// [`tokens`] of a query operand (M158): under `pre_tokenized_array`, each non-empty piece
+/// between [`TOKEN_SEPARATOR`]s, with its span.
+#[must_use]
+pub fn query_tokens(a: &Analyzer, q: &str) -> Vec<Token> {
+    if a.tokenizer != Tokenizer::PreTokenizedArray {
+        return tokens(a, q);
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    for piece in q.split(TOKEN_SEPARATOR) {
+        let to = from + piece.len();
+        if !piece.is_empty() {
+            out.push(Token {
+                span: from..to,
+                term: Some(piece.to_owned()),
+            });
+        }
+        from = to + TOKEN_SEPARATOR.len_utf8();
+    }
+    out
 }
 
 /// One token of a text (M63): the byte span it came from, and the term the analyzer made of
@@ -278,6 +348,17 @@ pub struct Token {
 #[must_use]
 pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
     use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    // M158: a document's string is one token, whole -- U+001F included, so a stored token is
+    // never split, whichever write stored it.
+    if a.tokenizer == Tokenizer::PreTokenizedArray {
+        return (!s.is_empty())
+            .then(|| Token {
+                span: 0..s.len(),
+                term: Some(s.to_owned()),
+            })
+            .into_iter()
+            .collect();
+    }
     let stemmer = a
         .stemming
         .then(|| rust_stemmers::Stemmer::create(a.language.algorithm()));

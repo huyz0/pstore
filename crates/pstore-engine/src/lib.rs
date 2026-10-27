@@ -7887,7 +7887,7 @@ fn shares(
     let analyzer = &texts.of(field.unwrap_or_default()).analyzer;
     let mut terms: Vec<String> = text
         .iter()
-        .flat_map(|q| pstore_format::text::analyze(analyzer, q))
+        .flat_map(|q| pstore_format::text::analyze_query(analyzer, q))
         .collect();
     terms.sort();
     terms.dedup();

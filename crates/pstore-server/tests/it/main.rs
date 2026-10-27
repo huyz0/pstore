@@ -54,6 +54,7 @@ mod patterns;
 mod peer_fixture;
 mod peer_startup;
 mod peers;
+mod pre_tokenized;
 mod quarantine;
 mod read_cache;
 mod ref_new;

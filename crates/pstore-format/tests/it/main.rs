@@ -19,6 +19,7 @@ mod lance;
 mod lance21;
 mod multi_text;
 mod parquet;
+mod pre_tokenized;
 mod search;
 mod sections;
 mod segment;

@@ -311,6 +311,7 @@ fn tokens_spans_cover_what_analyze_returns() {
         remove_stopwords: true,
         case_sensitive: false,
         ascii_folding: true,
+        ..Analyzer::default()
     };
     let sensitive = Analyzer {
         case_sensitive: true,

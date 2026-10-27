@@ -534,13 +534,13 @@ impl TextIn {
     /// The legs, in request order: each one's field (`None` for the primary, as a string
     /// entry is) and its query. Refused when an entry is neither a string nor an object of
     /// exactly `field` and `query`, both strings.
-    pub fn legs(&self) -> Result<Vec<(Option<&str>, &str)>, String> {
+    pub fn legs(&self) -> Result<Vec<(Option<&str>, String)>, String> {
         match self {
-            Self::One(q) => Ok(vec![(None, q.as_str())]),
+            Self::One(q) => Ok(vec![(None, token_operand(&serde_json::json!(q))?)]),
             Self::Many(qs) => qs
                 .iter()
                 .map(|e| match e {
-                    serde_json::Value::String(q) => Ok((None, q.as_str())),
+                    serde_json::Value::String(_) => Ok((None, token_operand(e)?)),
                     serde_json::Value::Object(o) => {
                         if let Some(k) = o.keys().find(|k| *k != "field" && *k != "query") {
                             return Err(format!(
@@ -550,15 +550,50 @@ impl TextIn {
                         match (o.get("field"), o.get("query")) {
                             (
                                 Some(serde_json::Value::String(f)),
-                                Some(serde_json::Value::String(q)),
-                            ) => Ok((Some(f.as_str()), q.as_str())),
-                            _ => Err("text: a leg object's field and query are strings".to_owned()),
+                                Some(
+                                    q
+                                    @ (serde_json::Value::String(_) | serde_json::Value::Array(_)),
+                                ),
+                            ) => Ok((Some(f.as_str()), token_operand(q)?)),
+                            _ => Err("text: a leg object's field is a string, and its query a \
+                                      string or an array of strings"
+                                .to_owned()),
                         }
                     }
                     _ => Err("text: each entry is a string, or {\"field\", \"query\"}".to_owned()),
                 })
                 .collect(),
         }
+    }
+}
+
+/// A text operand as the analyzer reads it (M158): a string as it is, or an array of strings
+/// joined by [`pstore_format::text::TOKEN_SEPARATOR`] -- tokens, under `pre_tokenized_array`.
+/// Refused when it is neither, or when any string holds the separator, which would make one
+/// token two.
+pub(crate) fn token_operand(v: &serde_json::Value) -> Result<String, String> {
+    use pstore_format::text::TOKEN_SEPARATOR;
+    let one = |s: &str| {
+        if s.contains(TOKEN_SEPARATOR) {
+            Err("a text operand holds no U+001F".to_owned())
+        } else {
+            Ok(s.to_owned())
+        }
+    };
+    match v {
+        serde_json::Value::String(s) => one(s),
+        serde_json::Value::Array(items) => {
+            let tokens = items
+                .iter()
+                .map(|e| {
+                    e.as_str()
+                        .ok_or_else(|| "a text operand's array holds strings only".to_owned())
+                        .and_then(one)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(tokens.join(&TOKEN_SEPARATOR.to_string()))
+        }
+        _ => Err("a text operand is a string or an array of strings".to_owned()),
     }
 }
 

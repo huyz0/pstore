@@ -56,19 +56,20 @@ impl Bound {
     /// literal prefix, and analyzes the text before it (M138).
     #[must_use]
     pub fn new(analyzer: pstore_format::text::Analyzer, op: TokenOp, text: &str) -> Self {
-        use pstore_format::text::{analyze, tokens};
+        use pstore_format::text::{analyze, analyze_query, query_tokens};
+        // M158: an operand, read as one -- under `pre_tokenized_array`, tokens joined by U+001F.
         let last = matches!(op, TokenOp::AllPrefix | TokenOp::AnyPrefix)
-            .then(|| tokens(&analyzer, text).pop())
+            .then(|| query_tokens(&analyzer, text).pop())
             .flatten();
         match last {
             Some(t) => Self {
                 analyzer,
-                query: analyze(&analyzer, text.get(..t.span.start).unwrap_or_default()),
+                query: analyze_query(&analyzer, text.get(..t.span.start).unwrap_or_default()),
                 prefix: analyze(&plain(&analyzer), text.get(t.span).unwrap_or_default()).pop(),
             },
             None => Self {
                 analyzer,
-                query: analyze(&analyzer, text),
+                query: analyze_query(&analyzer, text),
                 prefix: None,
             },
         }
@@ -737,10 +738,15 @@ impl Predicate {
 
 /// Whether a row's string elements satisfy `op` against the bound query (M14.2, M138). An
 /// empty query is the vacuous reading: every string for `All` and `Sequence`, none for `Any`.
-/// `All` and `Any` look across the elements together; a sequence lies within one element.
+/// `All` and `Any` look across the elements together; a sequence lies within one element --
+/// except under `pre_tokenized_array` (M158), where each element is a token and a sequence
+/// runs across them.
 fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
-    use pstore_format::text::analyze;
-    let rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
+    use pstore_format::text::{Tokenizer, analyze};
+    let mut rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
+    if b.analyzer.tokenizer == Tokenizer::PreTokenizedArray {
+        rows = vec![rows.concat()];
+    }
     let has = |q: &String| rows.iter().any(|r| r.contains(q));
     // Only a prefix op analyzes the row a second time.
     let prefixed = || {
