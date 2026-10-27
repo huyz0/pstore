@@ -1225,7 +1225,7 @@ impl From<EngineError> for ApiError {
             EngineError::SchemaConflict { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
-            EngineError::DimensionMismatch { .. } => {
+            EngineError::DimensionMismatch { .. } | EngineError::NoVectors(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
             // M61: a `multi` leg's field that no segment holds; no retry mends it.
@@ -1658,7 +1658,7 @@ fn patch_of(
     // to say nothing.
     let as_doc = types::DocumentIn {
         id: id.clone(),
-        vector: Vec::new(),
+        vector: None,
         vectors: std::collections::BTreeMap::new(),
         text: None,
         attributes: set.into_iter().collect(),
@@ -1858,27 +1858,7 @@ async fn write_documents<S: BlobStore + 'static>(
             ))
         })?,
     };
-    // ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
-    // the segment layout cannot store. A zero-dimension vector is storable and meaningless,
-    // and a batch whose vectors disagree makes the *index's* dimension depend on which
-    // document happened to be first. `api-design.md`: all vector dimensions in a field must
-    // match — so the request that breaks that rule is the one that gets the error, rather
-    // than the query that meets the consequence later.
-    let dims = req.documents.first().map_or(0, |d| d.vector.len());
-    if dims == 0 && !req.documents.is_empty() {
-        return Err(ApiError::bad_request("a document with no vector"));
-    }
-    if let Some(odd) = req.documents.iter().find(|d| d.vector.len() != dims) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "schema_conflict",
-            format!(
-                "document {} has {} dimensions and the batch has {dims}",
-                odd.id,
-                odd.vector.len()
-            ),
-        ));
-    }
+    widths_agree(&req)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     admit(&engine, key.as_ref()).await?;
@@ -4164,6 +4144,67 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     })
 }
 
+/// Refuses a batch whose documents disagree on their vector width (M170: none is a width).
+///
+/// ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
+/// the segment layout cannot store. A zero-dimension vector is storable and meaningless,
+/// and a batch whose vectors disagree makes the *index's* dimension depend on which
+/// document happened to be first. `api-design.md`: all vector dimensions in a field must
+/// match — so the request that breaks that rule is the one that gets the error, rather
+/// than the query that meets the consequence later.
+fn widths_agree(req: &types::WriteRequest) -> Result<(), ApiError> {
+    let width = |d: &types::DocumentIn| d.vector.as_ref().map(Vec::len);
+    if let Some(d) = req.documents.iter().find(|d| width(d) == Some(0)) {
+        return Err(ApiError::bad_request(format!(
+            "document {}: an empty vector; a document of an index with no vectors omits `vector`",
+            d.id
+        )));
+    }
+    let Some(first) = req.documents.first() else {
+        return Ok(());
+    };
+    let dims = width(first);
+    if let Some(odd) = req.documents.iter().find(|d| width(d) != dims) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!(
+                "document {} has {} and the batch has {}",
+                odd.id,
+                dims_named(width(odd)),
+                dims_named(dims)
+            ),
+        ));
+    }
+    if dims.is_none() {
+        vector_free(req)?;
+    }
+    Ok(())
+}
+
+/// A width as a refusal names it.
+fn dims_named(dims: Option<usize>) -> String {
+    dims.map_or_else(|| "no vector".to_owned(), |n| format!("{n} dimensions"))
+}
+
+/// Refuses what a batch of documents with no vector cannot carry (M170): named vector
+/// fields, which need the dense field beside them, and a distance metric, which has nothing
+/// to measure.
+fn vector_free(req: &types::WriteRequest) -> Result<(), ApiError> {
+    if let Some(d) = req.documents.iter().find(|d| !d.vectors.is_empty()) {
+        return Err(ApiError::bad_request(format!(
+            "document {}: named vector fields need a `vector` beside them",
+            d.id
+        )));
+    }
+    if req.distance_metric.is_some() {
+        return Err(ApiError::bad_request(
+            "distance_metric on a write whose documents carry no vector",
+        ));
+    }
+    Ok(())
+}
+
 ///
 /// ⚠️ Takes the document by value (M119): its vectors move into the format's, where a borrow
 /// copied every one of them.
@@ -4179,7 +4220,7 @@ fn to_document(
         text,
         attributes,
     } = d;
-    let mut doc = Document::new(id.clone(), vector);
+    let mut doc = Document::new(id.clone(), vector.unwrap_or_default());
     let refuse = |name: &str, why: &str| {
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
