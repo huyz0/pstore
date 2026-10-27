@@ -147,17 +147,17 @@ struct Opened {
     fde: Option<bytes::Bytes>,
     /// Rows its delete vector excludes; empty when it has none.
     deleted: crate::deletes::Rows,
-    /// Its text index, decoded once from `terms` for every text leg and the statistics
-    /// (M119), or `None` where it does not decode -- where each reader decodes `terms` again
-    /// to report why, as it did before.
-    text: Option<Arc<TextIndex>>,
+    /// Its text index of each queried field it carries, decoded once from `terms` for every
+    /// text leg and the statistics (M119, M153); absent where it does not decode -- where each
+    /// reader decodes `terms` again to report why, as it did before.
+    text: std::collections::BTreeMap<String, Arc<TextIndex>>,
 }
 
 impl Opened {
-    /// The segment's text index over `field`, the query's one text field (M151): decoded once
+    /// The segment's text index over `field`, a queried text field (M151, M153): decoded once
     /// at open, or again here to fail as it does.
     fn text_index(&self, field: &str, raw: &bytes::Bytes) -> Result<Arc<TextIndex>, FormatError> {
-        match &self.text {
+        match self.text.get(field) {
             Some(idx) => Ok(Arc::clone(idx)),
             None => TextIndex::for_field(&self.segment, raw, field).map(Arc::new),
         }
@@ -203,6 +203,58 @@ fn text_field_of<'a>(
     Ok(out)
 }
 
+/// Every text field a query's legs read (M153), in name order, each once.
+fn text_fields_of<'a>(legs: impl IntoIterator<Item = &'a Prefetch>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = legs
+        .into_iter()
+        .filter_map(|p| match p {
+            Prefetch::Text { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// How each text field a query reads is analyzed and scored (M153): a field's own
+/// `FullText` when the index declares one, else the index's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Texts {
+    /// The index's full-text schema, for every field `fields` does not name.
+    pub default: FullText,
+    /// The further fields' own (M152).
+    pub fields: std::collections::BTreeMap<String, FullText>,
+}
+
+impl Texts {
+    /// `field`'s full-text schema.
+    #[must_use]
+    pub fn of(&self, field: &str) -> &FullText {
+        self.fields.get(field).unwrap_or(&self.default)
+    }
+}
+
+impl From<FullText> for Texts {
+    fn from(default: FullText) -> Self {
+        Self {
+            default,
+            fields: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Each queried text field's BM25 statistics, summed over the segments carrying it (M153).
+type FieldStats = std::collections::BTreeMap<String, Stats>;
+
+/// `stats` as the statistics of the one field `legs` read, if any (M153): a share's.
+fn one_field(legs: &[(usize, Prefetch)], stats: &Stats) -> FieldStats {
+    text_fields_of(legs.iter().map(|(_, p)| p))
+        .into_iter()
+        .map(|f| (f.to_owned(), stats.clone()))
+        .collect()
+}
+
 /// Runs every leg over one segment and fuses the answers.
 ///
 /// ⚠️ **One open, and the legs are joined.** Each leg opening the segment for itself is one
@@ -243,11 +295,29 @@ pub async fn query_with<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<Hit>, QueryError> {
+    // M153: one `FullText` describes one field.
+    text_field_of(prefetch)?;
+    query_with_texts(store, targets, prefetch, &Texts::from(*text), fusion, top_k).await
+}
+
+/// [`query_with`], each text leg analyzed and scored under its own field's full-text schema,
+/// against its own field's statistics (M153): legs may read several fields.
+///
+/// # Errors
+/// As [`query`].
+pub async fn query_with_texts<S: BlobStore + Clone>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    texts: &Texts,
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<Vec<Hit>, QueryError> {
     Ok(run(
         store,
         targets,
         prefetch,
-        text,
+        texts,
         None,
         &std::collections::HashSet::new(),
         fusion,
@@ -500,8 +570,8 @@ pub async fn scan_part<S: BlobStore + Clone>(
         filter,
         shadow,
         sum.is_some(),
-        &Arc::new(stats.clone()),
-        text,
+        &Arc::new(one_field(&part.legs, stats)),
+        &Texts::from(*text),
     )
     .await?;
     Ok(match sum {
@@ -560,8 +630,8 @@ async fn candidates<S: BlobStore + Clone>(
     filter: Option<&Predicate>,
     shadow: usize,
     whole: bool,
-    stats: &Arc<Stats>,
-    text: &FullText,
+    stats: &Arc<FieldStats>,
+    texts: &Texts,
 ) -> Result<PartHits, QueryError> {
     let runs = &runs;
     // ⚠️ N x R futures, still one round: no leg's ranges depend on another's contents.
@@ -610,13 +680,17 @@ async fn candidates<S: BlobStore + Clone>(
                 r.widened(hidden, o.segment.row_count())
             };
             let owned = r.owned();
-            let (store, key, stats, text) =
-                (store.clone(), t.segment.clone(), Arc::clone(stats), *text);
+            let (store, key, stats, texts) = (
+                store.clone(),
+                t.segment.clone(),
+                Arc::clone(stats),
+                texts.clone(),
+            );
             let opened = Arc::clone(&shared);
             tasks.0.push(tokio::spawn(async move {
                 // Cannot fail: `legs` holds only legs this build runs, refused before any I/O.
                 let r = Runnable::try_from(&owned)?;
-                leg(&store, &key, &opened, &r, i, &stats, &text)
+                leg(&store, &key, &opened, &r, i, &stats, &texts)
                     .await
                     .map(|hits| (i, j, hits))
             }));
@@ -691,7 +765,7 @@ async fn run<S: BlobStore + Clone>(
     store: &S,
     targets: &[Target],
     prefetch: &[Prefetch],
-    text: &FullText,
+    texts: &Texts,
     filter: Option<&Predicate>,
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
@@ -711,7 +785,21 @@ async fn run<S: BlobStore + Clone>(
         .iter()
         .map(Runnable::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    let text_field = text_field_of(prefetch)?;
+    // M153: every field the text legs read, each scored by its own statistics. A phased share
+    // carries one `Stats` and one `FullText`, so it serves a query of one field only.
+    let text_fields = text_fields_of(prefetch);
+    if text_fields.len() > 1
+        && elsewhere
+            .iter()
+            .any(|e| matches!(e.share, Share::Phased { .. }))
+    {
+        return Err(QueryError::Unimplemented(
+            "a phased share of several text fields",
+        ));
+    }
+    // The one field a phased share's statistics are for, and its full-text schema.
+    let shared_field = text_fields.first().copied().unwrap_or_default();
+    let shared_text = *texts.of(shared_field);
 
     // ⚠️ Every segment and every sidecar in ONE round. `Engine::scan`'s comment already made
     // this argument with a measurement: a loop over segment refs "turns a ten-segment index
@@ -807,9 +895,11 @@ async fn run<S: BlobStore + Clone>(
         // M151: so is a text field no segment carries, when some segment carries text: today's
         // wrong-field refusal, kept across segments that each carry some of the index's fields.
         // From the footers of every target, phased shares' included -- never a peer's answer.
-        if let Some(field) = text_field
-            && opened.iter().any(|o| !o.segment.text_fields().is_empty())
-            && !opened.iter().any(|o| o.carries(field))
+        // M153: each field the query reads.
+        if opened.iter().any(|o| !o.segment.text_fields().is_empty())
+            && text_fields
+                .iter()
+                .any(|field| !opened.iter().any(|o| o.carries(field)))
         {
             return Err(FormatError::UnknownField.into());
         }
@@ -835,25 +925,38 @@ async fn run<S: BlobStore + Clone>(
         // else, so merging every segment's whole vocabulary -- a `String` and a map insert per
         // term per segment, on the query's own task -- bought numbers no leg reads. A phased
         // share already sends only these (M55).
-        let text_terms: Vec<String> = {
-            let mut t: Vec<String> = prefetch
+        // ⚠️ M153: **per field** -- its own legs' terms, analyzed under its own schema, summed
+        // over the segments carrying it. Another field's corpus is not this one's.
+        let text_terms: std::collections::BTreeMap<&str, Vec<String>> = text_fields
+            .iter()
+            .map(|field| {
+                let analyzer = &texts.of(field).analyzer;
+                let mut t: Vec<String> = prefetch
+                    .iter()
+                    .filter_map(|p| match p {
+                        Prefetch::Text {
+                            field: f, query, ..
+                        } if f == field => Some(query),
+                        _ => None,
+                    })
+                    .flat_map(|q| pstore_format::text::analyze(analyzer, q))
+                    .collect();
+                t.sort();
+                t.dedup();
+                (*field, t)
+            })
+            .collect();
+        let field_stats = |opened: &[Opened]| -> FieldStats {
+            text_terms
                 .iter()
-                .filter_map(|p| match p {
-                    Prefetch::Text { query, .. } => Some(query),
-                    _ => None,
+                .map(|(field, terms)| {
+                    let stats =
+                        Stats::merge(opened.iter().filter_map(|o| o.summary_for(field, terms)));
+                    ((*field).to_owned(), stats)
                 })
-                .flat_map(|q| pstore_format::text::analyze(&text.analyzer, q))
-                .collect();
-            t.sort();
-            t.dedup();
-            t
+                .collect()
         };
-        let field = text_field.unwrap_or_default();
-        let mut stats = Stats::merge(
-            opened
-                .iter()
-                .filter_map(|o| o.summary_for(field, &text_terms)),
-        );
+        let mut stats = field_stats(&opened);
         // M55: each phased share's statistics, or -- for a share whose phase 1 failed -- its
         // segments opened here, one more round, so the sum is never a share short.
         let mut scan_here: Vec<(usize, Target)> = Vec::new();
@@ -875,13 +978,17 @@ async fn run<S: BlobStore + Clone>(
         let opened_here = open_all(store, scan_here.iter().map(|(_, t)| t), prefetch)
             .join()
             .await?;
-        stats = Stats::merge(
-            std::iter::once(stats).chain(summed_parts).chain(
-                opened_here
-                    .iter()
-                    .filter_map(|o| o.summary_for(field, &text_terms)),
-            ),
-        );
+        // A phased share's statistics are its one field's (refused above for several).
+        let here = field_stats(&opened_here);
+        for (field, s) in &mut stats {
+            let mut more: Vec<Stats> = here.get(field).cloned().into_iter().collect();
+            if field == shared_field {
+                more.extend(summed_parts.iter().cloned());
+            }
+            *s = Stats::merge(std::iter::once(std::mem::take(s)).chain(more));
+        }
+        // The share's one `Stats`: its field's, or the empty sum a query without text sends.
+        let shared_stats = stats.get(shared_field).cloned().unwrap_or_default();
         // Shared by every leg task (M59), and built once.
         let stats = &Arc::new(stats);
 
@@ -914,20 +1021,21 @@ async fn run<S: BlobStore + Clone>(
             shadow.len(),
             whole,
             stats,
-            text,
+            texts,
         );
         // Each scan's segments carried beside it (code review): never recovered by filtering,
         // which would shift every later share's hits if a share were ever empty.
         let (scanned_targets, scans): (Vec<&Vec<usize>>, Vec<_>) = to_scan.into_iter().unzip();
-        let phase_twos =
-            futures_util::future::join_all(scans.into_iter().map(|scan| scan((**stats).clone())));
+        let phase_twos = futures_util::future::join_all(
+            scans.into_iter().map(|scan| scan(shared_stats.clone())),
+        );
         let (local, seconds) = futures_util::future::join(local, phase_twos).await;
         Ok::<_, QueryError>((
             opened,
             local?,
             seconds,
             scanned_targets.into_iter().cloned().collect::<Vec<_>>(),
-            stats.clone(),
+            shared_stats,
         ))
     };
     // ⚠️ The one-exchange shares run beside ALL of it -- open, statistics and legs -- as M54's
@@ -974,7 +1082,7 @@ async fn run<S: BlobStore + Clone>(
                     filter,
                     shadow.len(),
                     stats,
-                    text,
+                    &shared_text,
                     // M58 (spec review): under `sum` it runs whole and is cut by sum, as the
                     // peer would have -- never cut leg by leg at its limit.
                     match fusion {
@@ -999,7 +1107,7 @@ async fn run<S: BlobStore + Clone>(
                     filter,
                     shadow.len(),
                     stats,
-                    text,
+                    &shared_text,
                     None,
                 )
                 .await
@@ -1178,11 +1286,44 @@ pub async fn query_rows_filtered<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
-    query_rows_split(
+    // M153: one `FullText` describes one field.
+    text_field_of(prefetch)?;
+    query_rows_filtered_texts(
         store,
         targets,
         prefetch,
-        text,
+        &Texts::from(*text),
+        filter,
+        shadow,
+        fusion,
+        top_k,
+    )
+    .await
+}
+
+/// [`query_rows_filtered`] over several text fields, as [`query_with_texts`] (M153).
+///
+/// # Errors
+/// As [`query_rows_filtered`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
+pub async fn query_rows_filtered_texts<S: BlobStore + Clone>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    texts: &Texts,
+    filter: Option<&Predicate>,
+    shadow: &std::collections::HashSet<String>,
+    fusion: Fusion,
+    top_k: usize,
+) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
+    query_rows_split_texts(
+        store,
+        targets,
+        prefetch,
+        texts,
         filter,
         shadow,
         fusion,
@@ -1215,11 +1356,49 @@ pub async fn query_rows_split<S: BlobStore + Clone>(
     elsewhere: Vec<Elsewhere<'_>>,
     with_vectors: bool,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
+    // M153: one `FullText` describes one field.
+    text_field_of(prefetch)?;
+    query_rows_split_texts(
+        store,
+        targets,
+        prefetch,
+        &Texts::from(*text),
+        filter,
+        shadow,
+        fusion,
+        top_k,
+        elsewhere,
+        with_vectors,
+    )
+    .await
+}
+
+/// [`query_rows_split`] over several text fields, as [`query_with_texts`] (M153). A phased
+/// share is refused beside legs over several fields: its exchange carries one field's.
+///
+/// # Errors
+/// As [`query_rows_split`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the query's parts, each needed by a leg"
+)]
+pub async fn query_rows_split_texts<S: BlobStore + Clone>(
+    store: &S,
+    targets: &[Target],
+    prefetch: &[Prefetch],
+    texts: &Texts,
+    filter: Option<&Predicate>,
+    shadow: &std::collections::HashSet<String>,
+    fusion: Fusion,
+    top_k: usize,
+    elsewhere: Vec<Elsewhere<'_>>,
+    with_vectors: bool,
+) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
     let (hits, opened, known, dense) = run(
         store,
         targets,
         prefetch,
-        text,
+        texts,
         filter,
         shadow,
         fusion,
@@ -1707,16 +1886,20 @@ async fn open<S: BlobStore>(
     )
     .await;
     let segment = segment?;
-    // M151: the query's one text field, `text_field_of` having refused two.
-    let field = prefetch.iter().find_map(|p| match p {
-        Prefetch::Text { field, .. } => Some(field.as_str()),
-        _ => None,
-    });
-    let text = terms.as_ref().zip(field).and_then(|(raw, field)| {
-        TextIndex::for_field(&segment, raw, field)
-            .ok()
-            .map(Arc::new)
-    });
+    // M153: each text field the query reads, decoded once.
+    let text = terms
+        .as_ref()
+        .map(|raw| {
+            text_fields_of(prefetch)
+                .into_iter()
+                .filter_map(|field| {
+                    TextIndex::for_field(&segment, raw, field)
+                        .ok()
+                        .map(|idx| (field.to_owned(), Arc::new(idx)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Opened {
         segment: Arc::new(segment),
         centroids: cen,
@@ -1846,8 +2029,8 @@ async fn leg<S: BlobStore>(
     opened: &Opened,
     r: &Runnable<'_>,
     segment: usize,
-    stats: &Stats,
-    text: &FullText,
+    stats: &FieldStats,
+    texts: &Texts,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
         Runnable::Text {
@@ -1880,7 +2063,11 @@ async fn leg<S: BlobStore>(
             // handed forward by name, and scoring against a per-segment summary is wrong
             // exactly when the query's discriminating term is the one whose frequency
             // differs between segments — which M5c measured.
-            // M14: under the index's analyzer, scored with its `k1` and `b`.
+            // M14: under the index's analyzer, scored with its `k1` and `b`. M153: the field's
+            // own, against the field's own statistics.
+            let text = texts.of(field);
+            let empty = Stats::default();
+            let stats = stats.get(*field).unwrap_or(&empty);
             let terms = pstore_format::text::analyze(&text.analyzer, query);
             let hits = idx
                 .search_with(store, key, &terms, stats, *limit, text.k1, text.b)

@@ -1498,20 +1498,24 @@ fn text_fields<'a>(
         .collect()
 }
 
-/// The `FullText` a query's text legs are scored under (M152): the queried field's own when
-/// it is a further field, else the index's.
-fn scoring(
-    fts: FullText,
-    texts: &BTreeMap<String, FullText>,
-    prefetch: &[pstore_query::Prefetch],
-) -> FullText {
-    prefetch
-        .iter()
-        .find_map(|p| match p {
-            pstore_query::Prefetch::Text { field, .. } => texts.get(field).copied(),
-            _ => None,
-        })
-        .unwrap_or(fts)
+/// How a query's text legs are scored (M152, M153): each under its field's own `FullText`
+/// when it is a further field, else the index's.
+fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::Texts {
+    pstore_query::Texts {
+        default: fts,
+        fields: texts.clone(),
+    }
+}
+
+/// Whether one share's `Part` describes a query (M152, M153): its text legs read at most one
+/// field, and that field scores under `fts`, which also binds the filter.
+fn one_part(texts: &pstore_query::Texts, prefetch: &[pstore_query::Prefetch]) -> bool {
+    let mut fields = prefetch.iter().filter_map(|p| match p {
+        pstore_query::Prefetch::Text { field, .. } => Some(field.as_str()),
+        _ => None,
+    });
+    let first = fields.next();
+    fields.all(|f| Some(f) == first) && first.is_none_or(|f| *texts.of(f) == texts.default)
 }
 
 /// Whether `doc` carries a non-empty string under `field`.
@@ -6786,7 +6790,7 @@ impl<S: BlobStore> Engine<S> {
             .map(|s| s.texts.clone())
             .or(fresh_texts)
             .unwrap_or_default();
-        let scored = scoring(fts, &texts, prefetch);
+        let scored = scoring(fts, &texts);
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -6813,8 +6817,9 @@ impl<S: BlobStore> Engine<S> {
         };
         // M54: the folded segments only; the fresh one is this process's alone.
         // ⚠️ M152: never a query scored under another `FullText` than the index's: a share's
-        // `Part` carries one, which binds the filter and scores alike (M154 lifts it).
-        let peers = peers.filter(|_| scored == fts);
+        // `Part` carries one, which binds the filter and scores alike (M154 lifts it). M153: nor
+        // one over several text fields, which a `Part` has one `Stats` for.
+        let peers = peers.filter(|_| one_part(&scored, prefetch));
         let elsewhere = peers.map_or_else(Vec::new, |p| {
             let durable = targets.get(..unfolded_at).unwrap_or_default();
             shares(
@@ -6829,7 +6834,7 @@ impl<S: BlobStore> Engine<S> {
                 MAX_PART_SEGMENTS,
             )
         });
-        let resolved = pstore_query::query_rows_split(
+        let resolved = pstore_query::query_rows_split_texts(
             &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere, vectors,
         )
         .await
@@ -7150,12 +7155,12 @@ impl<S: BlobStore> Engine<S> {
         let bound = filter.map(|f| f.bound(&schema.fts.analyzer));
         let filter = bound.as_ref();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
-        let resolved = pstore_query::query_rows_filtered(
+        let resolved = pstore_query::query_rows_filtered_texts(
             &self.store,
             &targets,
             &prefetch,
             // M152: that epoch's further fields.
-            &scoring(schema.fts, &schema.texts, &prefetch),
+            &scoring(schema.fts, &schema.texts),
             filter,
             &std::collections::HashSet::new(),
             fusion,

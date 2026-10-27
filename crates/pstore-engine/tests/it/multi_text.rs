@@ -14,7 +14,7 @@ use pstore_blob::MemoryStore;
 use pstore_engine::{Declared, Engine, EngineError, Head, Metric, Patch};
 use pstore_format::text::{Analyzer, FullText, Language};
 use pstore_format::{Document, Value};
-use pstore_query::{Fusion, Prefetch};
+use pstore_query::{Fusion, Prefetch, Weights};
 use pstore_types::{Epoch, LaneId, TenantId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -218,9 +218,11 @@ fn same(
         t.iter().map(|(id, _)| id).collect::<Vec<_>>(),
         "{point}: {legs:?} ranks other rows"
     );
+    // M153: to the bit, since one field is scored by the same code over the same postings.
     for ((_, x), (_, y)) in m.iter().zip(&t) {
-        assert!(
-            (x - y).abs() <= 1e-6,
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
             "{point}: {legs:?} scores {x} against {y}"
         );
     }
@@ -508,4 +510,141 @@ async fn a_further_field_is_never_the_primary() {
             .unwrap();
         assert_eq!(got.ids[0].as_deref(), Some("d0003"));
     }
+}
+
+/// Each leg's own ranking over its field's twin, as `(id, score)` by rank: unlimited, so a
+/// `Sum` or `Max` finds every leg score, and cut at the leg's limit for RRF.
+async fn own_ranking(w: &World, leg: &Prefetch, epoch: Option<Epoch>) -> Vec<(String, f32)> {
+    let Prefetch::Text { field, .. } = leg else {
+        panic!("a text leg");
+    };
+    let (_, twin, engine) = w.twins().into_iter().find(|(f, _, _)| f == field).unwrap();
+    let one = Fusion::Sum {
+        weights: Weights::of(&[1.0]).unwrap(),
+    };
+    let legs = std::slice::from_ref(leg);
+    let a = match epoch {
+        None => engine.query(twin, legs, one, 500).await.unwrap(),
+        Some(e) => engine.query_as_of(twin, e, legs, one, 500).await.unwrap(),
+    };
+    ranked(&a)
+        .into_iter()
+        .map(|(id, score)| (id.unwrap(), score))
+        .collect()
+}
+
+const LIMIT: usize = 12;
+
+fn fleg(field: &str, q: &str) -> Prefetch {
+    Prefetch::Text {
+        field: field.to_owned(),
+        query: q.to_owned(),
+        limit: LIMIT,
+    }
+}
+
+/// Criterion 1 (M153): a query over several fields of `multi` fuses each leg's own score --
+/// its twin's, over that field alone -- by `Sum`, `Max` and RRF, at every point.
+async fn several_agree(w: &World, epoch: Option<Epoch>, point: &str) {
+    let top_k = 10;
+    let pairs = [
+        vec![fleg("title", "running report"), fleg("text", "alpha gamma")],
+        vec![
+            fleg("text", "beta n3"),
+            fleg("title", "quarterly"),
+            fleg("tags", "Rust"),
+        ],
+    ];
+    for legs in &pairs {
+        let n = legs.len();
+        let ws: Vec<f32> = (0..n).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+        let weights = Weights::of(&ws).unwrap();
+        let mut own = Vec::new();
+        for leg in legs {
+            own.push(own_ranking(w, leg, epoch).await);
+        }
+        for (name, fusion) in [
+            ("sum", Fusion::Sum { weights }),
+            ("max", Fusion::Max { weights }),
+            ("rrf", Fusion::Rrf { k: 60.0 }),
+        ] {
+            let mut want: BTreeMap<String, f32> = BTreeMap::new();
+            for (j, ranking) in own.iter().enumerate() {
+                let cut = if name == "sum" { ranking.len() } else { LIMIT };
+                for (rank, (id, score)) in ranking.iter().take(cut).enumerate() {
+                    let v = match name {
+                        "rrf" => 1.0 / (60.0 + (rank + 1) as f32),
+                        _ => ws[j] * score,
+                    };
+                    let e = want.entry(id.clone()).or_insert(0.0);
+                    *e = if name == "max" { e.max(v) } else { *e + v };
+                }
+            }
+            let got = match epoch {
+                None => w.a.query("multi", legs, fusion, top_k).await.unwrap(),
+                Some(e) => {
+                    w.a.query_as_of("multi", e, legs, fusion, top_k)
+                        .await
+                        .unwrap()
+                }
+            };
+            let got = ranked(&got);
+            let mut best: Vec<f32> = want.values().copied().collect();
+            best.sort_by(|a, b| b.total_cmp(a));
+            let what = format!("{point}: {name} over {legs:?}");
+            assert_eq!(got.len(), top_k.min(best.len()), "{what}");
+            let floor = best[got.len() - 1];
+            for (k, (id, score)) in got.iter().enumerate() {
+                let id = id.as_deref().unwrap();
+                let w = want[id];
+                assert!(
+                    (score - w).abs() <= 1e-5,
+                    "{what}: {id} scored {score}, not {w}"
+                );
+                assert!(
+                    w >= floor - 1e-5,
+                    "{what}: {id} ({w}) is not in the top {top_k}"
+                );
+                if let Some((_, next)) = got.get(k + 1) {
+                    assert!(score >= next, "{what}: not in order");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn several_fields_fuse_as_their_own_rankings_do() {
+    let w = World::new(TenantId(15203));
+    w.write(0..40).await;
+    several_agree(&w, None, "before the first fold").await;
+    let first = w.fold().await;
+    several_agree(&w, None, "after the fold").await;
+    w.write(30..60).await;
+    several_agree(&w, None, "beside a segment").await;
+    w.fold().await;
+    for index in ["multi", "twin_text", "twin_title", "twin_tags"] {
+        w.a.compact(index).await.unwrap();
+    }
+    several_agree(&w, None, "after a compaction").await;
+    several_agree(&w, Some(first), "as_of the first fold").await;
+}
+
+/// Criterion 3 (M153), through the engine: a query naming a field no segment carries, beside
+/// one that is, is the segment's unknown field -- not an answer that leaves its legs out.
+#[tokio::test]
+async fn an_unknown_field_beside_a_known_one_is_refused() {
+    let w = World::new(TenantId(15303));
+    w.write(0..20).await;
+    w.fold().await;
+    let legs = [fleg("title", "quarterly"), fleg("nosuch", "quarterly")];
+    let sum = Fusion::Sum {
+        weights: Weights::of(&[1.0, 1.0]).unwrap(),
+    };
+    let e = w.a.query("multi", &legs, sum, 10).await.unwrap_err();
+    let unknown = pstore_format::FormatError::UnknownField.to_string();
+    assert!(
+        matches!(e, EngineError::Query(ref m) if m.contains(&unknown)),
+        "{e:?}"
+    );
 }

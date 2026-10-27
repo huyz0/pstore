@@ -82,15 +82,18 @@ wire, and the server. The server sends one field's legs until M155.
    - A query over one field gives the same ids, order and score bits as over the field's twin
      (M152 compared them to 1e-6).
 2. **Statistics per field.**
-   - Two segments differ in which fields they carry: the first carries `a` and `b`, and the
-     second `a` alone. Some row of the first segment has no `b` text.
+   - Three segments differ in which fields they carry: the first and third carry `a` and `b`,
+     and the second `a` alone. Some row of the first segment has no `b` text. (Amended during
+     M153.2: with `b` in one segment only, its statistics equal that segment's own, which a
+     df lookup falls back to, so two mutations below survived. See VERIFIED.md.)
    - `b` has a non-default `FullText`: English stemming, and `k1` and `b` other than the
      default. The query over `b` is "Running", against rows holding "run".
    - A `Sum` query over `a` and `b` scores each leg with exactly the statistics a query over
-     that field alone computes. `b`'s `doc_count` is the first segment's row count, since a
-     dictionary counts every row of its segment, and `a`'s is both segments' row counts.
-   - This is checked through `pstore_query` directly, against single-field queries, score bits
-     equal.
+     that field alone computes over the segments carrying it. `b`'s `doc_count` is the first
+     and third segments' row counts, since a dictionary counts every row of its segment, and
+     `a`'s is all three segments' row counts.
+   - This is checked through `pstore_query` directly, against single-field queries over the
+     segments carrying the field, score bits equal.
 3. **Refused.**
    - A query naming a field no segment carries, beside a field some segment carries, is
      `UnknownField`, through `query_rows_filtered_texts` and through the engine. Through
@@ -130,14 +133,14 @@ VERIFIED.md rests each test's power on these mutations, each observed red:
   - "every leg reads the first field's statistics";
   - "the fresh view's texts are not passed";
   - "`as_of` passes no texts".
-- 2, 3: `crates/pstore-query/tests/it/multi_text.rs`. Mutations:
+- 2, 3: `crates/pstore-query/tests/it/several_fields.rs`. Mutations:
   - "the statistics are summed over every segment, carried or not";
   - "a field's terms are analyzed under `default`";
   - "a field no segment carries answers nothing";
   - "`run` accepts a phased share beside several fields".
 - 4: `split.rs`. Mutations: "a multi-field query is split" (several fields under `fts` are
   split), "a primary query is not split".
-- 5: `crates/pstore-query/tests/it/multi_text.rs`. Mutation: "each field reopens the sidecar".
+- 5: `crates/pstore-query/tests/it/several_fields.rs`. Mutation: "each field reopens the sidecar".
 
 ## RA budget
 Unchanged in rounds and requests:

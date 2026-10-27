@@ -1508,3 +1508,76 @@ async fn a_query_over_a_further_text_field_is_not_split() {
         "a query over the primary was not split"
     );
 }
+
+/// M153 criterion 4: a query over the primary and a further field is never split -- whether
+/// the further field's `FullText` differs from the primary's or equals it -- and answers
+/// exactly as unsplit. A query over the primary alone still is.
+#[tokio::test]
+async fn a_query_over_several_text_fields_is_not_split() {
+    use pstore_format::text::FullText;
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    let title = FullText {
+        k1: 2.0,
+        b: 0.3,
+        ..FullText::default()
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([
+            ("title".to_owned(), title),
+            ("plain".to_owned(), FullText::default()),
+        ])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                for f in ["title", "plain"] {
+                    d.attrs.insert(
+                        f.to_owned(),
+                        Value::Str(format!("headline{} story tag{}", i % 4, i % 3)),
+                    );
+                }
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let sum = Fusion::Sum {
+        weights: pstore_query::Weights::of(&[1.0, 1.0]).unwrap(),
+    };
+    for further in ["title", "plain"] {
+        let peers = trio(&store);
+        let legs = vec![
+            text(),
+            Prefetch::Text {
+                field: further.to_owned(),
+                query: "headline2 story".to_owned(),
+                limit: 10,
+            },
+        ];
+        split_equals_unsplit(&coordinator, &peers, &legs, sum).await;
+        let calls = peers.parts.load(Ordering::SeqCst)
+            + peers.opens.load(Ordering::SeqCst)
+            + peers.scans.load(Ordering::SeqCst);
+        assert_eq!(calls, 0, "a query over text and {further} was split");
+    }
+    let peers = trio(&store);
+    split_equals_unsplit(&coordinator, &peers, &[text()], Fusion::default()).await;
+    assert!(
+        peers.opens.load(Ordering::SeqCst) > 0,
+        "a query over the primary was not split"
+    );
+}
