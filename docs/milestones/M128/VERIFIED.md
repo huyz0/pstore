@@ -21,13 +21,25 @@ running the `ingress::` integration tests. All six were killed: "the body may be
 over" (criterion 1), "a permit's drop releases nothing" (criteria 3 and 4), "content
 encoding is ignored" (criterion 2), "the ingress layer is outside the scope layer"
 (criterion 2), "one counter for every identity" (criterion 3), and "limits are read after
-the store configuration" (criterion 5). No `cargo mutants` run is claimed.
+the store configuration" (criterion 5).
+
+CI's `cargo mutants` sweep on the PR then reported 12 TIMEOUTs. Locally the whole
+workspace suite took ~300 s against the sweep's 300 s timeout (provisional), so survivors
+were cut off rather than reported, and the limit mutants in `collect` could read the old
+endless test body forever. Fixed by killing or removing each: every `serve` now asserts
+`request_limits()` returns what the `Api` was given; a configuration of exactly 4096 bytes
+is read; `key_of` reads only `x-pstore-tenant`, which authentication already rewrites to
+the verified tenant, so its `Principal` arm was an equivalent mutant; `collect` is
+`http_body_util::Limited` under one timeout, removing single-chunk bookkeeping whose guards
+were equivalent; and the over-limit body is finite. Six of those mutants, applied one at a
+time against the `pstore-server` lib and integration tests (.harness/m128-mutations-r2.log),
+were all killed. The CI sweep is the full check; no local `cargo mutants` run is claimed.
 
 1. PASS: `ingress_byte_limits_precede_engine_access`. A write of exactly the limit
    succeeds; one byte over is `413 request_too_large` as one chunk, as one-byte fragments
    without a length, and under a lying `Content-Length: 10`. A declared length over the
-   limit refuses without polling the body. An endless body is read at most one chunk past
-   the limit. No refusal changes the store's request counts.
+   limit refuses without polling the body. A finite body many times the limit is read at
+   most one chunk past the limit. No refusal changes the store's request counts.
 2. PASS: `authorization_precedes_body_polling_and_admission`,
    `unsupported_encoding_never_reaches_json`. Missing, invalid and wrong-scope bearers are
    401/401/403 with the body never polled and nothing admitted. The verified tenant is the
