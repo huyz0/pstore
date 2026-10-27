@@ -30,6 +30,7 @@ run "scripts/selftest-review.sh"   ./scripts/selftest-review.sh
 run "scripts/selftest-check-verified.sh" ./scripts/selftest-check-verified.sh
 run "scripts/selftest-check-slos.sh" ./scripts/selftest-check-slos.sh
 run "scripts/selftest-coverage-scope.sh" ./scripts/selftest-coverage-scope.sh
+run "scripts/selftest-coverage-mismatch.sh" ./scripts/selftest-coverage-mismatch.sh
 run "scripts/check-poison.sh --selftest" ./scripts/check-poison.sh --selftest
 run "scripts/check-portable.sh"     ./scripts/check-portable.sh
 run "scripts/check-portable.sh --selftest" ./scripts/check-portable.sh --selftest

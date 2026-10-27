@@ -6,7 +6,7 @@ gates cannot disagree about what the codebase is -- they did, twice (M8b, M8d).
   py scripts/lib/scope.py llvm-cov  the --ignore-filename-regex llvm-cov takes
   py scripts/lib/scope.py mutants   one `cargo mutants --exclude` glob per line -- entry
                                     points only; see the note in main()
-  py scripts/lib/scope.py changed <path>...
+  py scripts/lib/scope.py changed <file of paths, one per line>
                                     the shipping crates those paths touch, then the
                                     llvm-cov ignore regex for everything else
 
@@ -78,9 +78,10 @@ def main():
         # `coverage.sh --changed`: the shipping crates owning a changed path (line 1, the
         # packages to test), and the llvm-cov ignore regex for every crate NOT run plus what
         # the full run already leaves out (line 2). Paths are relative to the root, as git
-        # prints them. A crate is named by its manifest's directory, so a change to its
+        # prints them, one per line in the file named. A crate is named by its manifest's directory, so a change to its
         # Cargo.toml or tests selects it too.
-        changed = sys.argv[2:]
+        with open(sys.argv[2], encoding="utf-8") as f:
+            changed = [line.strip() for line in f if line.strip()]
         shipping = sorted(
             (p for p in md["packages"] if p not in test_only), key=lambda p: p["name"])
         picked, others = [], []

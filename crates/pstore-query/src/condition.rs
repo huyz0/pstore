@@ -170,6 +170,8 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
                 TokenOp::All => 0,
                 TokenOp::Any => 1,
                 TokenOp::Sequence => 2,
+                TokenOp::AllPrefix => 3,
+                TokenOp::AnyPrefix => 4,
             });
             put_str(b, text);
             match analyzer {
@@ -322,6 +324,8 @@ impl Reader<'_> {
                     0 => TokenOp::All,
                     1 => TokenOp::Any,
                     2 => TokenOp::Sequence,
+                    3 => TokenOp::AllPrefix,
+                    4 => TokenOp::AnyPrefix,
                     _ => return None,
                 };
                 let text = self.string()?;
@@ -329,6 +333,7 @@ impl Reader<'_> {
                     0 => None,
                     1 => Some(Bound::new(
                         pstore_format::text::FullText::decode(&self.string()?)?.analyzer,
+                        op,
                         &text,
                     )),
                     _ => return None,
@@ -381,7 +386,24 @@ mod tests {
                         stemming: true,
                         ..pstore_format::text::Analyzer::default()
                     },
+                    TokenOp::Sequence,
                     "Häuser",
+                )),
+            ),
+            // M138: the prefix ops, unbound and bound -- a bound one carries its prefix.
+            Predicate::Tokens(a(), TokenOp::AllPrefix, "quick br".into(), None),
+            Predicate::Tokens(
+                a(),
+                TokenOp::AnyPrefix,
+                "the Häu".into(),
+                Some(Bound::new(
+                    pstore_format::text::Analyzer {
+                        stemming: true,
+                        remove_stopwords: true,
+                        ..pstore_format::text::Analyzer::default()
+                    },
+                    TokenOp::AnyPrefix,
+                    "the Häu",
                 )),
             ),
         ])
@@ -427,7 +449,7 @@ mod tests {
             format!("00{s1}0006"),
             format!("00{s1}05"),
             format!("08{s1}03"),
-            format!("07{s1}03"),
+            format!("07{s1}05"),
             format!("07{s1}000000000002"),
             // A regex `Pattern::new` refuses: `(`.
             format!("08{s1}020100000028"),

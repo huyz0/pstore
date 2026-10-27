@@ -15,7 +15,9 @@ MD='{"workspace_root":"/w","packages":[
  {"name":"pstore-kit","manifest_path":"/w/crates/pstore-kit/Cargo.toml",
   "metadata":{"pstore":{"ships":false}},
   "targets":[{"kind":["lib"],"src_path":"/w/crates/pstore-kit/src/lib.rs"}]}]}'
-changed() { printf '%s' "$MD" | py scripts/lib/scope.py changed "$@"; }
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+changed() { printf '%s\n' "$@" > "$list"; printf '%s' "$MD" | py scripts/lib/scope.py changed "$list"; }
 
 out=$(changed crates/pstore-b/src/x.rs crates/pstore-b/tests/it/y.rs docs/z.md)
 [ "$(printf '%s\n' "$out" | sed -n 1p)" = "pstore-b" ] \

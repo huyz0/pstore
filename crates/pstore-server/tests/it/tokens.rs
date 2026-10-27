@@ -8,7 +8,8 @@
 )]
 
 //! Token predicates (M14.2): `ContainsAllTokens`, `ContainsAnyToken` and
-//! `ContainsTokenSequence`, analyzed by the index's analyzer wherever a filter is evaluated.
+//! `ContainsTokenSequence`, analyzed by the index's analyzer wherever a filter is evaluated --
+//! and, M138, over string arrays and with `last_as_prefix`.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -127,13 +128,27 @@ async fn seeded(a: &A, rows: std::ops::Range<usize>, folded: bool) {
     }
 }
 
-/// `op`'s truth for a row's value of `attr` under `an`, as M14.2 defines it.
-fn holds(an: &Analyzer, op: &str, query: &str, value: Option<&str>) -> bool {
+/// `op`'s truth for a row's value of `attr` under `an`, as M14.2 defines it, and M138 for a
+/// prefix: the last raw token, neither stemmed nor dropped, starts some row token.
+fn holds(an: &Analyzer, op: &str, prefix: bool, query: &str, value: Option<&str>) -> bool {
     let Some(v) = value else { return false };
-    let (q, r) = (analyze(an, query), analyze(an, v));
+    let plain = Analyzer {
+        stemming: false,
+        remove_stopwords: false,
+        ..*an
+    };
+    let (q, p) = match (prefix, pstore_format::text::tokens(an, query).last()) {
+        (true, Some(t)) => (
+            analyze(an, &query[..t.span.start]),
+            analyze(&plain, &query[t.span.clone()]).pop(),
+        ),
+        _ => (analyze(an, query), None),
+    };
+    let r = analyze(an, v);
+    let pre = |p: &String| analyze(&plain, v).iter().any(|f| f.starts_with(p.as_str()));
     match op {
-        "ContainsAllTokens" => q.iter().all(|t| r.contains(t)),
-        "ContainsAnyToken" => q.iter().any(|t| r.contains(t)),
+        "ContainsAllTokens" => q.iter().all(|t| r.contains(t)) && p.as_ref().is_none_or(pre),
+        "ContainsAnyToken" => q.iter().any(|t| r.contains(t)) || p.as_ref().is_some_and(pre),
         _ => q.is_empty() || r.windows(q.len()).any(|w| w == q.as_slice()),
     }
 }
@@ -141,10 +156,12 @@ fn holds(an: &Analyzer, op: &str, query: &str, value: Option<&str>) -> bool {
 /// Every filter the tests run, with its brute-force answer over `rows` under `an`.
 fn cases(an: &Analyzer, rows: std::ops::Range<usize>) -> Vec<(Value, BTreeSet<String>)> {
     let mut out = Vec::new();
-    for op in [
-        "ContainsAllTokens",
-        "ContainsAnyToken",
-        "ContainsTokenSequence",
+    for (op, prefix) in [
+        ("ContainsAllTokens", false),
+        ("ContainsAnyToken", false),
+        ("ContainsTokenSequence", false),
+        ("ContainsAllTokens", true),
+        ("ContainsAnyToken", true),
     ] {
         for text in [
             "running dogs",
@@ -153,17 +170,25 @@ fn cases(an: &Analyzer, rows: std::ops::Range<usize>) -> Vec<(Value, BTreeSet<St
             "jumped fox",
             "brown",
             "",
+            "jum",
+            "quick ru",
         ] {
             for attr in ["text", "title", "tags", "missing"] {
-                let leaf = json!([attr, op, text]);
+                let leaf = if prefix {
+                    json!([attr, op, text, {"last_as_prefix": true}])
+                } else {
+                    json!([attr, op, text])
+                };
                 let admitted = |i: usize| {
-                    let (t, ti, _) = row(i);
+                    let (t, ti, tag) = row(i);
+                    // `tags` is a one-string array: since M138, matched as that string.
                     let v = match attr {
                         "text" => Some(t),
                         "title" => Some(ti),
+                        "tags" => Some(tag),
                         _ => None,
                     };
-                    holds(an, op, text, v.as_deref())
+                    holds(an, op, prefix, text, v.as_deref())
                 };
                 for (wrap, f) in [
                     ("plain", leaf.clone()),
@@ -342,5 +367,116 @@ async fn what_a_token_predicate_cannot_mean_is_refused() {
             b["error"]["message"].as_str().unwrap().contains("string"),
             "{f}: {b}"
         );
+    }
+}
+
+#[tokio::test]
+async fn string_arrays_and_prefixes_through_the_api() {
+    // M138 criterion 3: across elements for `All`, within one for a sequence, a prefix whose
+    // answer differs from the whole token's, and the same filters deleting at the fold.
+    let rows = [
+        ("a", json!(["quick", "brown fox"])),
+        ("b", json!(["the quick brown", "dog"])),
+        ("c", json!(["jumping", 5])),
+        ("e", json!([])),
+        ("n", json!([5])),
+        ("s", json!("quick brown fox")),
+    ];
+    let filters = [
+        (
+            json!(["tags", "ContainsAllTokens", "quick fox"]),
+            vec!["a", "s"],
+        ),
+        (
+            json!(["tags", "ContainsTokenSequence", "quick brown"]),
+            vec!["b", "s"],
+        ),
+        (
+            json!(["tags", "ContainsTokenSequence", "brown fox"]),
+            vec!["a", "s"],
+        ),
+        (
+            json!(["tags", "ContainsTokenSequence", "quick fox"]),
+            vec![],
+        ),
+        (json!(["tags", "ContainsAnyToken", "dog jum"]), vec!["b"]),
+        (
+            json!(["tags", "ContainsAnyToken", "dog jum", {"last_as_prefix": true}]),
+            vec!["b", "c"],
+        ),
+        (
+            json!(["tags", "ContainsAllTokens", "quick bro", {"last_as_prefix": true}]),
+            vec!["a", "b", "s"],
+        ),
+        (
+            json!(["tags", "ContainsAllTokens", "quick bro", {"last_as_prefix": false}]),
+            vec![],
+        ),
+        (
+            json!(["tags", "ContainsAllTokens", "quick bro", {}]),
+            vec![],
+        ),
+        (
+            json!(["Not", ["tags", "ContainsAllTokens", ""]]),
+            vec!["e", "n"],
+        ),
+    ];
+    for folded in [false, true] {
+        for (f, want) in &filters {
+            let (_, w) = world(&[1]);
+            let a = &w[0];
+            let docs: Vec<Value> = rows
+                .iter()
+                .map(|(id, v)| json!({"id": id, "vector": [1.0, 0.5], "attributes": {"tags": v}}))
+                .collect();
+            write(a, json!({"schema": stemming(), "documents": docs})).await;
+            if folded {
+                fold(a).await;
+            }
+            let want: BTreeSet<String> = want.iter().map(|s| (*s).to_owned()).collect();
+            let q = json!({"rank_by": ["id", "asc"], "top_k": 100, "filters": f});
+            assert_eq!(ids_of(&query(a, &q).await), want, "folded {folded}: {f}");
+            write(a, json!({"delete_by_filter": f})).await;
+            fold(a).await;
+            let all = json!({"rank_by": ["id", "asc"], "top_k": 100});
+            let left: BTreeSet<String> = rows
+                .iter()
+                .map(|(id, _)| (*id).to_owned())
+                .filter(|id| !want.contains(id))
+                .collect();
+            assert_eq!(
+                ids_of(&query(a, &all).await),
+                left,
+                "deleted, folded {folded}: {f}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn what_a_prefix_option_cannot_mean_is_refused() {
+    // M138 criterion 4.
+    let (_, w) = world(&[1]);
+    let a = &w[0];
+    seeded(a, 0..10, true).await;
+    for f in [
+        json!(["text", "ContainsAllTokens", "a", null]),
+        json!(["text", "ContainsAllTokens", "a", true]),
+        json!(["text", "ContainsAnyToken", "a", {"last_as_prefix": 1}]),
+        json!(["text", "ContainsAnyToken", "a", {"last_as_prefix": true, "x": 1}]),
+        json!(["text", "ContainsAnyToken", "a", {"prefix": true}]),
+        json!(["text", "ContainsTokenSequence", "a", {"last_as_prefix": true}]),
+        json!(["text", "ContainsTokenSequence", "a", {}]),
+        json!(["text", "ContainsAllTokens", "a", {}, {}]),
+        json!(["text", "Eq", "a", {}]),
+    ] {
+        let (s, b) = send(
+            a,
+            "POST",
+            "/v1/indexes/docs/query",
+            &json!({"rank_by": ["id", "asc"], "filters": f}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{f}: {b}");
     }
 }
