@@ -46,7 +46,8 @@ pub struct Outcome {
     /// Operations that changed nothing: a refused condition, a patch of nothing or of no
     /// change, a delete of nothing, a filter that admitted no row.
     pub skipped: u64,
-    /// Operations a reject, width, replica or drop pass discarded.
+    /// Operations a reject, width, replica or drop pass discarded, and by-filter operations
+    /// past their row bound (M136).
     pub rejected: u64,
 }
 

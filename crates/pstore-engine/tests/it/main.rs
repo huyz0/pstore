@@ -32,6 +32,7 @@ mod external_index;
 mod external_retry;
 mod failures;
 mod fde_skip;
+mod filter_rows;
 mod filters;
 mod fold_overtaken;
 mod fresh_query;

@@ -344,7 +344,8 @@ pub struct AppliedOut {
     pub patched: u64,
     /// Operations that changed nothing.
     pub skipped: u64,
-    /// Operations a reject, width, replica or drop pass discarded.
+    /// Operations a reject, width, replica or drop pass discarded, and by-filter operations
+    /// past their row bound (M136).
     pub rejected: u64,
     /// The distinct ids each kind changed, sorted, when the write asked (M130).
     #[serde(skip_serializing_if = "Option::is_none")]

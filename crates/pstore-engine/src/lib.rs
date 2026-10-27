@@ -4,6 +4,7 @@
 mod applied;
 mod bundle;
 mod external;
+mod filter_rows;
 mod head;
 pub mod lanes;
 mod replica;
@@ -982,18 +983,29 @@ fn merged(mut base: Document, patch: &Document) -> Document {
 /// nothing: the id's segment row and delete vector stay as they are.
 ///
 /// M129: each stamped operation's decision goes into `tally`.
+///
+/// M136: `bound` says, per by-filter operation in arrival order, whether the scan found it
+/// past the bound.
 fn resolve(
     ops: Vec<Document>,
     base: &std::collections::HashMap<String, Document>,
     cx: &mut Conditions<'_>,
     tally: &mut applied::Tally,
+    bound: &filter_rows::Bound<'_>,
 ) -> (Vec<String>, Vec<Document>) {
     let mut state: std::collections::HashMap<String, Option<Document>> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    let mut nth = 0;
     for op in ops {
         if is_by_filter(&op) {
-            by_filter(&op, base, &mut state, &mut order, cx, tally);
+            let over = bound.over.get(nth).copied().unwrap_or(false);
+            nth += 1;
+            if over {
+                tally.rejected(&op);
+                continue;
+            }
+            by_filter(&op, base, &mut state, &mut order, cx, tally, bound.rows);
             continue;
         }
         let id = op.id.clone();
@@ -1106,6 +1118,12 @@ fn by_filter_op(
 /// Applies one by-filter operation (M13.2) to every id whose current version -- this fold's
 /// state, else `base` -- its filter admits, in id order. A filter that cannot be read admits
 /// nothing; a patch that changes nothing touches nothing, as a per-id one does.
+///
+/// M136: one admitting more than `rows` at its place in fold order is refused whole.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fold's state, threaded through as `resolve` holds it"
+)]
 fn by_filter(
     op: &Document,
     base: &std::collections::HashMap<String, Document>,
@@ -1113,6 +1131,7 @@ fn by_filter(
     order: &mut Vec<String>,
     cx: &mut Conditions<'_>,
     tally: &mut applied::Tally,
+    rows: usize,
 ) {
     let Some(Some(filter)) = cx.of(op) else {
         tally.skipped(applied::req_of(op));
@@ -1123,18 +1142,27 @@ fn by_filter(
     } else {
         applied::Kind::Patched
     };
-    let mut changed = false;
     let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
     ids.sort_unstable();
     ids.dedup();
-    for id in ids {
-        let current = match state.get(&id) {
-            Some(v) => v.clone(),
-            None => base.get(&id).cloned(),
-        };
-        let Some(c) = current.filter(|c| filter.admits(&c.id, &c.attrs)) else {
-            continue;
-        };
+    // Collected no further than one past the bound, so a refused operation clones no more.
+    let admitted: Vec<Document> = ids
+        .iter()
+        .filter_map(|id| match state.get(id) {
+            Some(v) => v.as_ref(),
+            None => base.get(id),
+        })
+        .filter(|c| filter.admits(&c.id, &c.attrs))
+        .take(rows.saturating_add(1))
+        .cloned()
+        .collect();
+    if admitted.len() > rows {
+        tally.rejected(op);
+        return;
+    }
+    let mut changed = false;
+    for c in admitted {
+        let id = c.id.clone();
         let next = if op_code(op) == Some(OP_DELETE_BY_FILTER) {
             None
         } else {
@@ -1778,6 +1806,11 @@ pub struct Engine<S> {
     /// How stale this engine's last fresh read of its lane may grow before a flush reads HEAD
     /// again (M39), and when that read was made -- the instant before its GET.
     lane_recheck: Option<std::time::Duration>,
+    /// The most rows one by-filter operation may admit (M136): `filter_rows::FILTER_ROWS`.
+    filter_rows: usize,
+    /// How many whole rows the last fold's scans kept for deferred operations (M136), for a
+    /// test to read.
+    kept: std::sync::atomic::AtomicUsize,
     lane_read: Mutex<Option<tokio::time::Instant>>,
     /// Whether a flush refused a schema conflict and no bundle has landed since (M35). The
     /// next flush waives every conflict the fold quarantines, so rows accepted before the
@@ -1948,6 +1981,8 @@ impl<S: BlobStore> Engine<S> {
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             lane_recheck: None,
+            filter_rows: filter_rows::FILTER_ROWS,
+            kept: std::sync::atomic::AtomicUsize::new(0),
             lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
             uncertain: Mutex::new(None),
@@ -2011,6 +2046,15 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn with_lane_recheck(mut self, within: std::time::Duration) -> Self {
         self.lane_recheck = Some(within);
+        self
+    }
+
+    /// The most rows one by-filter operation may admit (M136); above it, the fold refuses the
+    /// operation whole. Counted over the index the fold read, and again at the operation's
+    /// place in fold order. What a fold holds for by-filter operations is bounded by it.
+    #[must_use]
+    pub fn with_filter_rows(mut self, rows: usize) -> Self {
+        self.filter_rows = rows;
         self
     }
 
@@ -4564,6 +4608,7 @@ impl<S: BlobStore> Engine<S> {
             // supersede below reuses rather than reading again. Inside the commit loop, so a
             // retry re-reads against the HEAD it read -- never a base cached across attempts.
             let mut prepared_for: BTreeMap<String, Vec<Prepared>> = BTreeMap::new();
+            let mut kept = 0;
             for idx in deferred {
                 let docs = by_index.remove(&idx).unwrap_or_default();
                 // M14.2: conditions bind to the index's analyzer -- the one this fold records,
@@ -4583,17 +4628,25 @@ impl<S: BlobStore> Engine<S> {
                 let mut cx = Conditions::new(&fts.analyzer);
                 // M13.2: and every row a by-filter operation's filter admits. A filter that
                 // cannot be read admits nothing, as `resolve` reads it.
-                let filters: Vec<pstore_query::Predicate> = docs
-                    .iter()
-                    .filter(|d| is_by_filter(d))
-                    .filter_map(|d| cx.of(d).flatten())
-                    .collect();
+                //
+                // ⚠️ M136: counted per operation as the scan goes, and a row is retained for an
+                // operation only while it is within the bound, so a fold holds at most one row
+                // past it for each. Counted on every attempt, since the counts live here.
+                let retention = filter_rows::Retention::new(
+                    docs.iter()
+                        .filter(|d| is_by_filter(d))
+                        .map(|d| cx.of(d).flatten())
+                        .collect(),
+                    self.filter_rows,
+                );
                 let keep = |d: &Document| {
-                    needed.contains(d.id.as_str())
-                        || filters.iter().any(|f| f.admits(&d.id, &d.attrs))
+                    // Counted first, so a row an operation names still counts for a filter.
+                    let admitted = retention.admit(d);
+                    needed.contains(d.id.as_str()) || admitted
                 };
-                let prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
-                let mut prepared = prepared;
+                let mut prepared = self.prepare(&at.head, &idx, Some(&keep)).await?;
+                let over = retention.over();
+                kept += prepared.iter().map(|p| p.kept.len()).sum::<usize>();
                 // ⚠️ **A sealed row is stamped with the field its segment indexed** (M37 code
                 // review): the seal strips `$text`, and an absent stamp means the default, so a
                 // `body` row patched after its fold would read its ordinary `text` attribute as
@@ -4618,7 +4671,11 @@ impl<S: BlobStore> Engine<S> {
                     })
                     .collect();
                 tally.next_index();
-                let (changed, sealed) = resolve(docs, &base, &mut cx, &mut tally);
+                let bound = filter_rows::Bound {
+                    over: &over,
+                    rows: self.filter_rows,
+                };
+                let (changed, sealed) = resolve(docs, &base, &mut cx, &mut tally, &bound);
                 // ⚠️ **And the widths again, over what is sealed** (M61 code review): a patch
                 // merges into its base row here, after the width pass, and the base row keeps
                 // its folded fields. A row that disagrees with this fold's first of a field, in
@@ -4651,6 +4708,7 @@ impl<S: BlobStore> Engine<S> {
                 by_index.insert(idx.clone(), sealed);
                 prepared_for.insert(idx, prepared);
             }
+            self.kept.store(kept, std::sync::atomic::Ordering::Relaxed);
 
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
@@ -5063,6 +5121,13 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn reapable_len_for_test(&self) -> usize {
         self.reapable().len()
+    }
+
+    /// How many whole rows the last fold's scans kept for deferred operations (M136).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn kept_for_test(&self) -> usize {
+        self.kept.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reaps graveyard entries buried at or below `horizon` (M18), and then forgets the commits

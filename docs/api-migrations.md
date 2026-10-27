@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M136: a by-filter operation is bounded
+
+⚠️ **Behaviour change.** A `delete_by_filter` or `patch_by_filter` whose filter admits
+more than 100,000 rows is now refused whole when it is folded: it changes no row. Before,
+it applied to every row.
+
+- The rows are counted over the index as the fold reads it, and again at the operation's
+  place in its fold, after the operations folded before it. More than 100,000 in either
+  count refuses it.
+- Sent with `durability: "applied"`, the refusal shows as `rejected: 1` in `applied`.
+  Sent `durable` or `batched`, **nobody is told**, and the fold moves past it.
+- To change more rows, split the write by narrower filters, or wait for M137's
+  `allow_partial`, which applies the first rows and says what remains.
+
+Other operations of the same write apply as before. Nothing new is stored, and the
+request shape is unchanged. Rolling back restores the unbounded behaviour.
+
 ## M133: `$ref_new` in write conditions
 
 In `upsert_condition` and `patch_condition`, the value of `Eq`, `NotEq`, `Lt`, `Lte`, `Gt`
@@ -89,7 +106,8 @@ A write may ask for `"applied"`: it is made durable, then answered only once a c
 folded every operation in it, with what the fold decided. The response adds
 `completion: "applied"`, `operation` (32 hex digits) and `applied` with `upserted`,
 `deleted` and `patched` (rows changed), `skipped` (operations that changed nothing) and
-`rejected` (operations a schema or width pass set aside). If an outcome can no longer be
+`rejected` (operations a schema or width pass set aside, or, since M136, a by-filter
+operation past its row bound). If an outcome can no longer be
 read, `applied` is `null` and `outcome_unavailable` is `true`; counts are never invented.
 
 It is refused with `unsupported_durability` unless every node runs this release and the
