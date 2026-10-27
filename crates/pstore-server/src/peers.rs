@@ -1190,6 +1190,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
 fn part_error(e: &pstore_query::QueryError) -> ApiError {
     match e {
         pstore_query::QueryError::Unimplemented(_)
+        | pstore_query::QueryError::UnknownTextField(_)
         | pstore_query::QueryError::Format(
             pstore_format::FormatError::UnknownField
             | pstore_format::FormatError::DimensionMismatch { .. },

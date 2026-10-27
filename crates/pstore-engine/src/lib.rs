@@ -416,6 +416,11 @@ pub enum EngineError {
     /// reason: as a string it was `500 internal`, retryable, for a request no retry mends.
     #[error("no segment of the index holds a vector field `{0}`")]
     UnknownField(String),
+    /// A text leg names a field no segment holds, when some segment holds text (M155): a
+    /// typo, a field never declared, or the primary of an index whose rows hold only further
+    /// fields. The client's to fix, typed as [`Self::UnknownField`] is.
+    #[error("no segment of the index holds a text field `{0}`")]
+    UnknownTextField(String),
     /// The rows contradict the index's recorded schema.
     ///
     /// ⚠️ Raised at the **door** and at the **flush**, never at the fold: a fold is
@@ -8098,6 +8103,10 @@ fn query_error(
         _ => None,
     });
     match (e, multi) {
+        // M155: the query layer names the text field itself.
+        (pstore_query::QueryError::UnknownTextField(field), _) => {
+            EngineError::UnknownTextField(field)
+        }
         (
             pstore_query::QueryError::Format(pstore_format::FormatError::UnknownField),
             Some(field),
@@ -8171,8 +8180,13 @@ mod query_error_tests {
             EngineError::UnknownField(f) if f == "late"
         ));
         assert!(matches!(
-            query_error(m, &[fde], unknown()),
+            query_error(m, &[fde.clone()], unknown()),
             EngineError::UnknownField(f) if f == "later"
+        ));
+        // M155: a text field the query layer named is that field, even beside a `multi` leg.
+        assert!(matches!(
+            query_error(m, &[fde], QueryError::UnknownTextField("zzz".to_owned())),
+            EngineError::UnknownTextField(f) if f == "zzz"
         ));
         // ... and a leg-less query has no field to blame.
         assert!(matches!(

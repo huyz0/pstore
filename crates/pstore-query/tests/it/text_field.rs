@@ -15,7 +15,7 @@
 //! written to prevent. The check has to ask the segment.
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
-use pstore_format::{Document, FormatError, Value, text};
+use pstore_format::{Document, Value, text};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
 use pstore_query::{Fusion, Prefetch, QueryError, Target, query};
@@ -117,8 +117,9 @@ async fn a_query_naming_the_wrong_text_field_is_refused() {
     let s = MemoryStore::new();
     let (seg, cen) = put(&s, text::DEFAULT_TEXT_FIELD).await;
     let e = run(&s, &seg, &cen, "body").await.unwrap_err();
+    // M155: the refusal names the field.
     assert!(
-        matches!(e, QueryError::Format(FormatError::UnknownField)),
+        matches!(e, QueryError::UnknownTextField(ref f) if f == "body"),
         "a query for `body` against a `text` segment was not refused: {e:?}"
     );
 
@@ -128,7 +129,7 @@ async fn a_query_naming_the_wrong_text_field_is_refused() {
         .await
         .unwrap_err();
     assert!(
-        matches!(e, QueryError::Format(FormatError::UnknownField)),
+        matches!(e, QueryError::UnknownTextField(ref f) if f == text::DEFAULT_TEXT_FIELD),
         "a query for `text` against a `body` segment was not refused: {e:?}"
     );
 }

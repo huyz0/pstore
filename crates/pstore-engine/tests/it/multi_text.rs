@@ -642,9 +642,9 @@ async fn an_unknown_field_beside_a_known_one_is_refused() {
         weights: Weights::of(&[1.0, 1.0]).unwrap(),
     };
     let e = w.a.query("multi", &legs, sum, 10).await.unwrap_err();
-    let unknown = pstore_format::FormatError::UnknownField.to_string();
+    // M155: typed, and naming the field no segment holds.
     assert!(
-        matches!(e, EngineError::Query(ref m) if m.contains(&unknown)),
+        matches!(e, EngineError::UnknownTextField(ref f) if f == "nosuch"),
         "{e:?}"
     );
 }

@@ -12,7 +12,7 @@
 
 use pstore_blob::{Accounted, BlobStore, Key, MemoryStore};
 use pstore_format::text::{self, Analyzer, FullText, Language};
-use pstore_format::{Document, FormatError, Value};
+use pstore_format::{Document, Value};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
 use pstore_query::{
@@ -219,8 +219,9 @@ async fn what_several_fields_cannot_mean_is_refused() {
     )
     .await
     .unwrap_err();
+    // M155: naming the field no segment carries, not the one beside it.
     assert!(
-        matches!(e, QueryError::Format(FormatError::UnknownField)),
+        matches!(e, QueryError::UnknownTextField(ref f) if f == "d"),
         "{e:?}"
     );
     let two = [leg("a", "growth"), leg("b", "run")];

@@ -92,22 +92,25 @@ the primary's analyzer (M152's risk), which [M156](../M156/SPEC.md) resolves.
    - Twin index `twin_title` holds the same ids, each with `text` set to its `title`, and
      declares `text` with `title`'s options. `twin_tags` does the same for `tags`.
    - A query `{"text": [{"field": "title", "query": q}]}` on `multi` answers the same ids, in
-     the same order, with the same score bits, as `{"text": q}` on `twin_title`. The same holds
+     the same order, with the same score bits, as `{"text": q}` on `twin_title`. Both name
+     `"fusion": {"sum": {"weights": [1]}}`, so a score is the leg's BM25 and not RRF's rank. The same holds
      for `tags` against `twin_tags`, and for `{"field": "text"}` against the string form on
      `multi` itself.
    - Each holds before the first fold and after it, for at least two queries per field, one
      of which relies on `title`'s stemming ("Running" against rows holding "run").
 2. **Several fields fuse.** On the same indexes, a query whose `text` is `[{"field": "title",
-   ...}, {"field": "tags", ...}, q3]` with `"fusion": {"sum": {"weights": [1, 0.5, 2]}}` and
-   `top_k` 10 is checked against three twin queries, each with `top_k` 10, the limit each leg
-   runs at: `title`'s on `twin_title`, `tags`'s on `twin_tags`, and `q3` as a string on
-   `multi` itself.
-   - Each hit's score is the weighted sum of its scores in the twin answers, a row absent from
-     a twin's answer counting 0 there, to 1e-5. The ranking is the 10 best of those sums,
-     descending.
-   - The same with `max`, each score the largest weighted twin score.
-   - The queries are chosen so that no two expected scores among the top 11 are within 1e-5
-     of each other, and the test asserts that before comparing.
+   ...}, {"field": "tags", ...}, q3]` with `top_k` 10 is checked against three twin queries:
+   `title`'s on `twin_title`, `tags`'s on `twin_tags`, and `q3` as a string on `multi` itself,
+   each under `Sum` with weight 1.
+   - Under `"fusion": {"sum": {"weights": [1, 0.5, 2]}}`, each hit's score is the weighted
+     sum of its scores in the twin answers, to 1e-5. `Sum`'s legs are whole, not cut at their
+     limit (M9g.2), so the twins are unlimited, and a row a twin does not return adds
+     nothing. The ranking is the 10 best of those sums, descending.
+   - Under `max` with the same weights, each score is the largest weighted twin score. `Max`'s
+     legs keep their limit, `top_k`, so the twins are cut at 10.
+   - Rows are padded with words no query names, by different moduli, so that no two expected
+     scores among the top 11 are within 1e-5 of each other. The test asserts that before
+     comparing.
    - Before and after the first fold.
 3. **The door.** Each of these is refused `400` before anything is stored, the message naming
    what the test names. A follow-up `GET /v1/indexes/multi2` answers `404`.
@@ -126,8 +129,9 @@ the primary's analyzer (M152's risk), which [M156](../M156/SPEC.md) resolves.
    - `{"field": "title"}` with no `query`, `{"field": "title", "query": 5}`,
      `{"field": "title", "query": "a", "limit": 3}`, and `[]` are refused `400`.
    - On `multi`, before and after the fold, legs `[{"field": "title", ...}, {"field":
-     "nosuch", ...}]` are refused `400 unknown_field`, the message holding "text field
-     `nosuch`" and not `title`. So are `[{"field": "nosuch"}]` beside a `multi` vector leg, and
+     "zzz", ...}]` are refused `400 unknown_field`, the message holding "text field `zzz`" and
+     not `title`. (`zzz` sorts after `title`, so a refusal naming the first queried field
+     would name `title`.) So are `[{"field": "nosuch"}]` beside a dense vector leg, and
      a leg over `$x`.
    - On an index whose rows hold `title` and never `text`, a string leg is refused `400
      unknown_field`, naming `text`, and a `title` leg answers.
@@ -135,13 +139,15 @@ the primary's analyzer (M152's risk), which [M156](../M156/SPEC.md) resolves.
      `{"field": "text"}` leg it marks as today.
 6. **Reported.** `GET /v1/indexes/multi` after the fold reports `text_fields` as an object
    keyed by field name, each value the object `full_text_search` reports for the primary:
-   `title`'s options as declared and `tags`'s defaults. An index with no further field reports no
+   `title`'s options as declared and `tags`'s defaults, each equal to what its twin reports as
+   `full_text_search`. An index with no further field reports no
    `text_fields` key.
-7. **Unchanged.** Every existing HTTP test passes unmodified but one case, reversed on
-   purpose: `sketch.rs`'s `a_declaration_that_cannot_mean_anything_is_refused_by_name` refuses
-   `{"title": {"full_text_search": true}}` as "full_text_search is on the text field". That
-   case becomes `{"title": {"type": "int", "full_text_search": true}}`, refused for its type,
-   and its comment names this milestone.
+7. **Unchanged.** Every existing HTTP test passes unmodified but two cases, reversed on
+   purpose. `sketch.rs`'s `a_declaration_that_cannot_mean_anything_is_refused_by_name` and
+   `analyzer.rs`'s `what_an_analyzer_cannot_mean_is_refused` each refuse `full_text_search` on
+   `title` as "on the text field". Each case becomes `{"title": {"type": "int",
+   "full_text_search": true}}`, refused for its type, and its comment names this milestone.
+   (The spec named only `sketch.rs`'s until the workspace run found `analyzer.rs`'s.)
 
 ## Test plan
 Red first against the parent:

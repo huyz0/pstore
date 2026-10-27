@@ -102,6 +102,10 @@ pub enum QueryError {
     /// The segment, the dictionary or a field.
     #[error(transparent)]
     Format(#[from] FormatError),
+    /// A text leg names a field no segment carries, when some segment carries text (M155):
+    /// the first such field by name. A typo, or a field never declared.
+    #[error("no segment carries the text field `{0}`")]
+    UnknownTextField(String),
 }
 
 /// One segment and the centroid table that belongs to it.
@@ -896,12 +900,13 @@ async fn run<S: BlobStore + Clone>(
         // wrong-field refusal, kept across segments that each carry some of the index's fields.
         // From the footers of every target, phased shares' included -- never a peer's answer.
         // M153: each field the query reads.
+        // M155: naming the field, so the engine can answer the client which one.
         if opened.iter().any(|o| !o.segment.text_fields().is_empty())
-            && text_fields
+            && let Some(field) = text_fields
                 .iter()
-                .any(|field| !opened.iter().any(|o| o.carries(field)))
+                .find(|field| !opened.iter().any(|o| o.carries(field)))
         {
-            return Err(FormatError::UnknownField.into());
+            return Err(QueryError::UnknownTextField((*field).to_owned()));
         }
 
         // ⚠️ Global statistics, gathered before any leg runs and costing no round trip: the

@@ -307,7 +307,7 @@ async fn what_one_field_per_query_cannot_answer_is_refused() {
         .await
         .unwrap_err();
     assert!(
-        matches!(e, QueryError::Format(FormatError::UnknownField)),
+        matches!(e, QueryError::UnknownTextField(ref f) if f == "d"),
         "{e:?}"
     );
 }

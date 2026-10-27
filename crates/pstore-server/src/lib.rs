@@ -1228,7 +1228,8 @@ impl From<EngineError> for ApiError {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
             // M61: a `multi` leg's field that no segment holds; no retry mends it.
-            EngineError::UnknownField(_) => {
+            // M155: a text leg's field that no segment holds.
+            EngineError::UnknownField(_) | EngineError::UnknownTextField(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "unknown_field", e.to_string())
             }
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
@@ -1762,7 +1763,7 @@ async fn write_documents<S: BlobStore + 'static>(
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
-        texts: None,
+        texts: declared_further(&req)?,
     };
     let patches = patches_of(
         std::mem::take(&mut req.patch_rows),
@@ -1890,6 +1891,7 @@ async fn write_documents<S: BlobStore + 'static>(
         .into_iter()
         .map(|d| to_document(d, &dated))
         .collect::<Result<_, _>>()?;
+    check_further(&docs, declared.texts.as_ref())?;
     // M133: every reference resolved, and refused, before anything is buffered.
     let ops: Vec<_> = docs.iter().map(|d| (d.id.as_str(), &d.attrs)).collect();
     let upsert_if = ref_new::conds("upsert_condition", upsert_if, &ops)?;
@@ -2697,6 +2699,20 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
                 "highlight marks a text leg's terms: the query has none",
             ));
         }
+        // M155: M63 marks the primary's terms in one attribute; marking several fields is a
+        // later milestone's structured highlights.
+        let legs = req.text.as_ref().map(TextIn::legs).transpose();
+        let legs = legs.map_err(ApiError::bad_request)?.unwrap_or_default();
+        if let Some(f) = legs
+            .iter()
+            .filter_map(|(f, _)| *f)
+            .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD)
+        {
+            return Err(ApiError::bad_request(format!(
+                "highlight marks the text field's terms: it cannot mark the further text \
+                 field `{f}`"
+            )));
+        }
     }
     // M64: checked at the top too, so every refusal names it. One window governs a boost and
     // a diversify: either names it, and both naming different ones is refused.
@@ -3164,10 +3180,10 @@ async fn run<E: BlobStore>(
         let terms: std::collections::HashSet<String> = req
             .text
             .as_ref()
-            .map(TextIn::queries)
+            .and_then(|t| t.legs().ok())
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|q| pstore_format::text::analyze(&answer.fts.analyzer, q))
+            .flat_map(|(_, q)| pstore_format::text::analyze(&answer.fts.analyzer, q))
             .collect();
         (h, terms)
     });
@@ -3330,6 +3346,11 @@ async fn index_summary<S: BlobStore + 'static>(
             distance_metric: sc.metric.name(),
             text_field: sc.text_field,
             full_text_search: fts_json(&sc.fts),
+            text_fields: sc
+                .texts
+                .iter()
+                .map(|(n, f)| (n.clone(), fts_json(f)))
+                .collect(),
             regex: sc.trigram,
             vectors: sc
                 .fields
@@ -3778,16 +3799,21 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
             });
         }
     }
-    let texts = req.text.as_ref().map(TextIn::queries).unwrap_or_default();
+    let texts = req.text.as_ref().map(TextIn::legs).transpose();
+    let texts = texts.map_err(ApiError::bad_request)?.unwrap_or_default();
     if req.text.is_some() && !(1..pstore_query::MAX_LEGS).contains(&texts.len()) {
         return Err(ApiError::bad_request(format!(
-            "text is a string or an array of 1 to {} strings",
+            "text is a string or an array of 1 to {} strings or {{\"field\", \"query\"}} \
+             objects",
             pstore_query::MAX_LEGS - 1
         )));
     }
-    for t in texts {
+    // M155: an object names its field; a string is the primary's.
+    for (field, t) in texts {
         legs.push(pstore_query::Prefetch::Text {
-            field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
+            field: field
+                .unwrap_or(pstore_format::text::DEFAULT_TEXT_FIELD)
+                .to_owned(),
             query: t.to_owned(),
             limit,
         });
@@ -3972,12 +3998,21 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
 /// The full-text schema a write declares (M14): `{"<text field>": {"type": "string",
 /// "full_text_search": true | {options}}}` in its `schema` map, or `None`.
 fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullText>, ApiError> {
-    use pstore_format::text::{FullText, Language};
+    Ok(declared_texts(req)?.remove(pstore_format::text::DEFAULT_TEXT_FIELD))
+}
+
+/// Every attribute a write declares `full_text_search` on, with its `FullText` (M14, M155).
+///
+/// ⚠️ **One parser for the primary and every further field**, so a further field's options are
+/// refused exactly as the primary's are. Which name is the primary is the caller's split.
+fn declared_texts(
+    req: &WriteRequest,
+) -> Result<std::collections::BTreeMap<String, pstore_format::text::FullText>, ApiError> {
+    let mut out = std::collections::BTreeMap::new();
     let Some(schema) = req.schema.as_ref().and_then(serde_json::Value::as_object) else {
-        return Ok(None);
+        return Ok(out);
     };
     let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
-    let mut out = None;
     for (name, decl) in schema {
         let Some(decl) = decl.as_object() else {
             continue;
@@ -3989,90 +4024,122 @@ fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullTe
             return Err(bad(format!("{name:?}: unknown key {k:?}")));
         }
         // M15.2: a `regex` declaration alone is `declared_trigram`'s.
-        if decl.get("full_text_search").is_none() {
+        let Some(opts) = decl.get("full_text_search") else {
             continue;
-        }
-        if name != pstore_format::text::DEFAULT_TEXT_FIELD {
-            return Err(bad(format!(
-                "{name:?}: full_text_search is on the text field `{}` only",
-                pstore_format::text::DEFAULT_TEXT_FIELD
-            )));
-        }
+        };
         if decl
             .get("type")
             .is_some_and(|t| t != "string" && t != "[]string")
         {
-            return Err(bad(format!(
-                "{name:?}: the text field's type is string or []string"
-            )));
+            return Err(bad(if name == pstore_format::text::DEFAULT_TEXT_FIELD {
+                format!("{name:?}: the text field's type is string or []string")
+            } else {
+                format!("{name:?}: a text field's type is string or []string")
+            }));
         }
-        let mut fts = FullText::default();
-        match decl.get("full_text_search") {
-            Some(serde_json::Value::Bool(true)) => {}
-            Some(serde_json::Value::Object(opts)) => {
-                let flag = |v: &serde_json::Value, k: &str| {
-                    v.as_bool()
-                        .ok_or_else(|| bad(format!("full_text_search: {k} is true or false")))
-                };
-                let param = |v: &serde_json::Value, k: &str, hi: f64| {
-                    v.as_f64()
-                        .filter(|x| (0.0..=hi).contains(x))
-                        // `+ 0.0` so `-0.0` is stored, and compared, as `0`.
-                        .map(|x| x as f32 + 0.0)
-                        .ok_or_else(|| {
-                            bad(format!(
-                                "full_text_search: {k} must be a number in [0, {hi}]"
-                            ))
-                        })
-                };
-                for (k, v) in opts {
-                    let a = &mut fts.analyzer;
-                    match k.as_str() {
-                        "tokenizer" => {
-                            if v != "word_v1" {
-                                return Err(bad(format!(
-                                    "full_text_search: tokenizer {v} is not word_v1, the one \
-                                     tokenizer"
-                                )));
-                            }
-                        }
-                        "language" => {
-                            a.language = v.as_str().and_then(Language::parse).ok_or_else(|| {
-                                bad(format!(
-                                    "full_text_search: language {v} is not one of {}",
-                                    Language::ALL.map(Language::name).join(", ")
-                                ))
-                            })?;
-                        }
-                        "stemming" => a.stemming = flag(v, k)?,
-                        "remove_stopwords" => a.remove_stopwords = flag(v, k)?,
-                        "case_sensitive" => a.case_sensitive = flag(v, k)?,
-                        "ascii_folding" => a.ascii_folding = flag(v, k)?,
-                        "k1" => fts.k1 = param(v, k, 3.0)?,
-                        "b" => fts.b = param(v, k, 1.0)?,
-                        _ => return Err(bad(format!("full_text_search: unknown option {k:?}"))),
-                    }
-                }
-                if fts.analyzer.remove_stopwords && fts.analyzer.language != Language::English {
-                    return Err(bad(
-                        "full_text_search: remove_stopwords is English only".to_owned()
-                    ));
-                }
-            }
-            _ => {
-                return Err(bad(
-                    "full_text_search is true, or an object of options".to_owned()
-                ));
-            }
-        }
+        let fts = full_text_options(opts).map_err(bad)?;
         if req.documents.is_empty() {
             return Err(bad(
                 "full_text_search is declared and the write has no documents".to_owned(),
             ));
         }
-        out = Some(fts);
+        out.insert(name.clone(), fts);
     }
     Ok(out)
+}
+
+/// A `full_text_search` value (M14): `true`, or an object of options, each checked.
+fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullText, String> {
+    use pstore_format::text::{FullText, Language};
+    let mut fts = FullText::default();
+    match v {
+        serde_json::Value::Bool(true) => {}
+        serde_json::Value::Object(opts) => {
+            let flag = |v: &serde_json::Value, k: &str| {
+                v.as_bool()
+                    .ok_or_else(|| format!("full_text_search: {k} is true or false"))
+            };
+            let param = |v: &serde_json::Value, k: &str, hi: f64| {
+                v.as_f64()
+                    .filter(|x| (0.0..=hi).contains(x))
+                    // `+ 0.0` so `-0.0` is stored, and compared, as `0`.
+                    .map(|x| x as f32 + 0.0)
+                    .ok_or_else(|| format!("full_text_search: {k} must be a number in [0, {hi}]"))
+            };
+            for (k, v) in opts {
+                let a = &mut fts.analyzer;
+                match k.as_str() {
+                    "tokenizer" => {
+                        if v != "word_v1" {
+                            return Err(format!(
+                                "full_text_search: tokenizer {v} is not word_v1, the one tokenizer"
+                            ));
+                        }
+                    }
+                    "language" => {
+                        a.language = v.as_str().and_then(Language::parse).ok_or_else(|| {
+                            format!(
+                                "full_text_search: language {v} is not one of {}",
+                                Language::ALL.map(Language::name).join(", ")
+                            )
+                        })?;
+                    }
+                    "stemming" => a.stemming = flag(v, k)?,
+                    "remove_stopwords" => a.remove_stopwords = flag(v, k)?,
+                    "case_sensitive" => a.case_sensitive = flag(v, k)?,
+                    "ascii_folding" => a.ascii_folding = flag(v, k)?,
+                    "k1" => fts.k1 = param(v, k, 3.0)?,
+                    "b" => fts.b = param(v, k, 1.0)?,
+                    _ => return Err(format!("full_text_search: unknown option {k:?}")),
+                }
+            }
+            if fts.analyzer.remove_stopwords && fts.analyzer.language != Language::English {
+                return Err("full_text_search: remove_stopwords is English only".to_owned());
+            }
+        }
+        _ => return Err("full_text_search is true, or an object of options".to_owned()),
+    }
+    Ok(fts)
+}
+
+/// The further text fields a write declares (M155): every `full_text_search` but the
+/// primary's, or `None` when it declares none.
+fn declared_further(
+    req: &WriteRequest,
+) -> Result<Option<std::collections::BTreeMap<String, pstore_format::text::FullText>>, ApiError> {
+    let mut all = declared_texts(req)?;
+    all.remove(pstore_format::text::DEFAULT_TEXT_FIELD);
+    Ok((!all.is_empty()).then_some(all))
+}
+
+/// Refuses a document of the declaring write whose further text field holds something other
+/// than a string or an array of strings (M155), as `to_document` refuses the primary's (M150).
+fn check_further(
+    docs: &[Document],
+    texts: Option<&std::collections::BTreeMap<String, pstore_format::text::FullText>>,
+) -> Result<(), ApiError> {
+    let Some(texts) = texts else {
+        return Ok(());
+    };
+    for d in docs {
+        for name in texts.keys() {
+            let text = match d.attrs.get(name) {
+                None | Some(pstore_format::Value::Str(_)) => true,
+                Some(pstore_format::Value::Array(items)) => items
+                    .iter()
+                    .all(|e| matches!(e, pstore_format::Value::Str(_))),
+                Some(_) => false,
+            };
+            if !text {
+                return Err(ApiError::bad_request(format!(
+                    "document {}: attribute `{name}` is a text field and must be a string or \
+                     an array of strings",
+                    d.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The attributes a write declares `"regex": true` on (M15.2), sorted, or `None` for none.
