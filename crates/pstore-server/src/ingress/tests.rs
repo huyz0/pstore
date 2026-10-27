@@ -27,6 +27,10 @@ fn version_one_defaults_are_the_documented_contract() {
     assert_eq!(d.body_read_timeout(), Duration::from_secs(30));
     assert_eq!(d.tenant_flush_bytes(), 8 * 1024 * 1024);
     assert_eq!(d.tenant_buffered_bytes(), 64 * 1024 * 1024);
+    assert_eq!(d.json_depth(), 128);
+    assert_eq!(d.array_elements(), 16_384);
+    assert_eq!(d.object_members(), 1024);
+    assert_eq!(d.string_bytes(), 256 * 1024);
     assert_eq!(read(None), Ok(d));
     assert_eq!(read(Some(r#"{"version":1}"#)), Ok(d));
     assert_eq!(RequestLimits::builder().build(), Ok(d));
@@ -37,7 +41,8 @@ fn configuration_lowers_each_limit() {
     let got = read(Some(
         r#"{"version":1,"body_bytes":100,"active_requests":4,"tenant_active_requests":2,
             "reserved_body_bytes":300,"body_read_timeout_ms":250,
-            "tenant_flush_bytes":1000,"tenant_buffered_bytes":5000}"#,
+            "tenant_flush_bytes":1000,"tenant_buffered_bytes":5000,
+            "json_depth":3,"array_elements":10,"object_members":20,"string_bytes":30}"#,
     ))
     .unwrap();
     assert_eq!(got.body_bytes(), 100);
@@ -47,6 +52,10 @@ fn configuration_lowers_each_limit() {
     assert_eq!(got.body_read_timeout(), Duration::from_millis(250));
     assert_eq!(got.tenant_flush_bytes(), 1000);
     assert_eq!(got.tenant_buffered_bytes(), 5000);
+    assert_eq!(got.json_depth(), 3);
+    assert_eq!(got.array_elements(), 10);
+    assert_eq!(got.object_members(), 20);
+    assert_eq!(got.string_bytes(), 30);
     let same = RequestLimits::builder()
         .tenant_flush_bytes(7)
         .tenant_buffered_bytes(7)
@@ -74,6 +83,7 @@ fn unsafe_or_malformed_configuration_is_refused() {
         r#"{"version":2}"#,
         r#"{"version":"1"}"#,
         r#"{"version":1,"body_byte":10}"#,
+        r#"{"version":1,"array_element":10}"#,
         r#"{"version":1,"body_bytes":-1}"#,
         r#"{"version":1,"body_bytes":1.5}"#,
         r#"{"version":1,"body_bytes":18446744073709551616}"#,
@@ -163,6 +173,38 @@ fn unsafe_or_malformed_configuration_is_refused() {
         (
             r#"{"version":1,"tenant_flush_bytes":100,"tenant_buffered_bytes":99}"#,
             LimitsError::BufferBelowFlush,
+        ),
+        (
+            r#"{"version":1,"json_depth":0}"#,
+            LimitsError::Zero("json_depth"),
+        ),
+        (
+            r#"{"version":1,"array_elements":0}"#,
+            LimitsError::Zero("array_elements"),
+        ),
+        (
+            r#"{"version":1,"object_members":0}"#,
+            LimitsError::Zero("object_members"),
+        ),
+        (
+            r#"{"version":1,"string_bytes":0}"#,
+            LimitsError::Zero("string_bytes"),
+        ),
+        (
+            r#"{"version":1,"json_depth":129}"#,
+            LimitsError::AboveDefault("json_depth"),
+        ),
+        (
+            r#"{"version":1,"array_elements":16385}"#,
+            LimitsError::AboveDefault("array_elements"),
+        ),
+        (
+            r#"{"version":1,"object_members":1025}"#,
+            LimitsError::AboveDefault("object_members"),
+        ),
+        (
+            r#"{"version":1,"string_bytes":262145}"#,
+            LimitsError::AboveDefault("string_bytes"),
         ),
     ] {
         assert_eq!(read(Some(raw)), Err(want), "{raw}");

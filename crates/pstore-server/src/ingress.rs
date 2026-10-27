@@ -24,6 +24,8 @@ use std::time::Duration;
 
 use crate::ApiError;
 
+pub(crate) mod shape;
+
 /// The one configuration version this release reads.
 const VERSION: u64 = 1;
 /// `PSTORE_REQUEST_LIMITS_CONFIG` is refused past this many bytes.
@@ -41,12 +43,15 @@ pub struct RequestLimits {
     body_read_timeout: Duration,
     tenant_flush_bytes: u64,
     tenant_buffered_bytes: u64,
+    shape: shape::Shape,
 }
 
 impl Default for RequestLimits {
     /// Version 1: 2 MiB bodies, 64 active requests, 8 per tenant, a 128 MiB body pool and a
     /// 30 s body-read deadline; and (M141) a tenant's batched rows flushed past 8 MiB and its
-    /// buffered rows bounded at 64 MiB.
+    /// buffered rows bounded at 64 MiB; and (M143) a body's JSON nested at most 128 deep, with
+    /// at most 16,384 elements in one array, 1,024 members in one object and 256 KiB in one
+    /// string.
     fn default() -> Self {
         Self {
             body_bytes: 2 << 20,
@@ -56,6 +61,12 @@ impl Default for RequestLimits {
             body_read_timeout: Duration::from_secs(30),
             tenant_flush_bytes: 8 << 20,
             tenant_buffered_bytes: 64 << 20,
+            shape: shape::Shape {
+                depth: shape::DEPTH,
+                elements: 16_384,
+                members: 1024,
+                string_bytes: 256 << 10,
+            },
         }
     }
 }
@@ -137,6 +148,34 @@ impl RequestLimitsBuilder {
         self
     }
 
+    /// Arrays and objects a public body may nest at once (M143).
+    #[must_use]
+    pub fn json_depth(mut self, n: usize) -> Self {
+        self.0.shape.depth = n;
+        self
+    }
+
+    /// Elements one JSON array of a public body may hold (M143).
+    #[must_use]
+    pub fn array_elements(mut self, n: usize) -> Self {
+        self.0.shape.elements = n;
+        self
+    }
+
+    /// Members one JSON object of a public body may hold (M143).
+    #[must_use]
+    pub fn object_members(mut self, n: usize) -> Self {
+        self.0.shape.members = n;
+        self
+    }
+
+    /// Bytes between one JSON string's quotes in a public body (M143).
+    #[must_use]
+    pub fn string_bytes(mut self, n: usize) -> Self {
+        self.0.shape.string_bytes = n;
+        self
+    }
+
     /// The limits, or why they are unsafe.
     ///
     /// # Errors
@@ -154,6 +193,10 @@ impl RequestLimitsBuilder {
                 l.reserved_body_bytes,
                 d.reserved_body_bytes,
             ),
+            ("json_depth", l.shape.depth, d.shape.depth),
+            ("array_elements", l.shape.elements, d.shape.elements),
+            ("object_members", l.shape.members, d.shape.members),
+            ("string_bytes", l.shape.string_bytes, d.shape.string_bytes),
         ] {
             if got == 0 {
                 return Err(LimitsError::Zero(name));
@@ -212,6 +255,10 @@ struct Config {
     body_read_timeout_ms: Option<u64>,
     tenant_flush_bytes: Option<u64>,
     tenant_buffered_bytes: Option<u64>,
+    json_depth: Option<u64>,
+    array_elements: Option<u64>,
+    object_members: Option<u64>,
+    string_bytes: Option<u64>,
 }
 
 impl RequestLimits {
@@ -262,7 +309,35 @@ impl RequestLimits {
             .body_read_timeout(timeout)
             .tenant_flush_bytes(c.tenant_flush_bytes.unwrap_or(d.tenant_flush_bytes))
             .tenant_buffered_bytes(c.tenant_buffered_bytes.unwrap_or(d.tenant_buffered_bytes))
+            .json_depth(size("json_depth", c.json_depth, d.shape.depth)?)
+            .array_elements(size("array_elements", c.array_elements, d.shape.elements)?)
+            .object_members(size("object_members", c.object_members, d.shape.members)?)
+            .string_bytes(size("string_bytes", c.string_bytes, d.shape.string_bytes)?)
             .build()
+    }
+
+    /// Arrays and objects a public body may nest at once (M143).
+    #[must_use]
+    pub fn json_depth(&self) -> usize {
+        self.shape.depth
+    }
+
+    /// Elements one JSON array of a public body may hold (M143).
+    #[must_use]
+    pub fn array_elements(&self) -> usize {
+        self.shape.elements
+    }
+
+    /// Members one JSON object of a public body may hold (M143).
+    #[must_use]
+    pub fn object_members(&self) -> usize {
+        self.shape.members
+    }
+
+    /// Bytes between one JSON string's quotes in a public body (M143).
+    #[must_use]
+    pub fn string_bytes(&self) -> usize {
+        self.shape.string_bytes
     }
 
     /// The largest encoded body admitted, in bytes.
@@ -435,6 +510,32 @@ pub(crate) fn overloaded() -> ApiError {
     }
 }
 
+/// The refusal of a body whose shape passes one of `shape`'s bounds (M143).
+fn misshapen(breach: shape::Breach, shape: &shape::Shape) -> ApiError {
+    let message = match breach {
+        shape::Breach::Depth => format!(
+            "the body nests arrays and objects more than {} deep (json_depth)",
+            shape.depth
+        ),
+        shape::Breach::Elements { depth } => format!(
+            "an array at depth {depth} has more than {} elements (array_elements)",
+            shape.elements
+        ),
+        shape::Breach::Members { depth } => format!(
+            "an object at depth {depth} has more than {} members (object_members)",
+            shape.members
+        ),
+        shape::Breach::String { depth } => format!(
+            "a string at depth {depth} is longer than {} bytes (string_bytes)",
+            shape.string_bytes
+        ),
+    };
+    ApiError {
+        message,
+        ..too_large()
+    }
+}
+
 fn timed_out() -> ApiError {
     ApiError::new(
         StatusCode::REQUEST_TIMEOUT,
@@ -513,6 +614,10 @@ pub(crate) async fn admit(
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
+    // M143: the body's shape, before any parser sees it.
+    if let Err(breach) = shape::scan(&bytes, &limits.shape) {
+        return misshapen(breach, &limits.shape).into_response();
+    }
     parts.headers.remove(header::CONTENT_LENGTH);
     parts
         .headers
