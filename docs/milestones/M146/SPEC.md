@@ -27,6 +27,17 @@ After, a relevance query (one with `vector`, `text`, `field` or `exact`) may car
   quota share: a boost naming another window is refused, as a diversify's is (M64).
 - Rows past the window are never seen: the quota is exact over the window, as a boost is.
   The vendor's own `limit.per` has the same depth question; this states its answer.
+- A group reads the row's stored attributes from the row round, as a boost does, whatever
+  `include_attributes` selects. A highlight marks the kept rows only. `unfolded_hits`
+  counts the kept rows an unfolded row answers, as for a boost.
+- Accepted with `as_of` (a boost is) and with any legs and fusion a relevance query
+  takes; `offset` stays refused on a relevance query, as today. A `top_k` above 1,000
+  cannot have a window, so it is refused with `limit_per`.
+- In a multi-query each query carries its own; an outer `rerank_by` (M142) merges the
+  cut answers, and the merged list is not itself bounded per group.
+- Differences from the vendor, named in the migration notes: the field is a top-level
+  `limit_per` beside `top_k` rather than `limit.per` inside `limit`, and `limit` 0 is
+  refused (a group that may hold no row is a filter).
 
 Refused with `bad_request`: `limit_per` that is not that object (an unknown key, missing
 `attributes` or `limit`, no attribute or more than 8, a name twice, a non-string name,
@@ -35,7 +46,8 @@ integer); `limit_per` beside `rank_by`, `aggregate_by` or `diversify` (MMR would
 what the quota cut, and the plan says it cannot substitute for it); a boost naming
 another window. Each before any blob request.
 
-How: `pstore_query::Key` gains a public constructor from a value; the server parses
+How: `pstore_query::Key` gains a public constructor from an optional value, the private
+`Key::of` itself (floats normalized, absent as `Absent`, arrays element by element); the server parses
 `limit_per` in `plan`, widens the legs to the window as for a boost, and cuts the final
 rows in `run` with a pure function, `per_group`. Its `unfolded_hits` counts the kept rows,
 as a boost's does.
@@ -54,7 +66,10 @@ own; ordered queries and aggregations, which refuse it.
    same query run plain with `top_k` equal to the window; no group appears more than `m`
    times; `1` and `1.0` are one group, and absent is a group.
 3. With a boost, the cut is applied to the boosted order: equals the reference cut of the
-   boosted plain query at the window.
+   boosted plain query at the window. A hybrid query (vector and text, RRF) is cut the
+   same way, and a query without `g` in `include_attributes` is cut by `g` all the same.
+   With unfolded rows, `unfolded_hits` equals the kept rows whose ids were written
+   unfolded.
 4. Every refusal in the Delta answers `bad_request` and makes no blob request.
 5. Depth: a query with `limit_per` is as deep as the same query with a boost of the same
    window, and makes no more blob requests, by `DepthCounting`.
@@ -70,7 +85,10 @@ their red is the mutations named below and the rest are guards; 6 is a guard. Mu
 - groups by the first attribute only (1); `1.0` a group apart from `1` (1, 2);
 - the cut applied before the boost (3);
 - `limit` of 0 accepted; 9 attributes accepted; a repeated name accepted; `limit_per`
-  beside `diversify` or `rank_by` accepted (4).
+  beside `diversify` or `rank_by` accepted; a window below `top_k` accepted; a boost's
+  other window accepted (4);
+- groups read from the selected attributes (3); `unfolded_hits` taken from the engine's
+  hits with `limit_per` alone (3).
 
 ## RA budget
 Unchanged: the window is a boost's, so the depth and requests are a boost's (M62). CPU:
@@ -82,3 +100,10 @@ one key per window row.
 
 ## Tasks
 - M146.1: `Key`'s constructor, `per_group`, the parsing, docs.
+
+## Review
+Spec review round 1 (pass with minors, all taken): mutations for the two new window rules;
+`as_of`, `offset`, `top_k` above 1,000, the attributes a group reads, highlight and
+`unfolded_hits` stated, with tests and mutations for the last two; a hybrid case; the
+multi-query merge is not bounded per group; the vendor differences named; `Key`'s
+constructor described.
