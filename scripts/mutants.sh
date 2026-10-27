@@ -194,8 +194,15 @@ echo "# jobs=$JOBS cargo-build-jobs=$CARGO_BUILD_JOBS tmpdir=$TMPDIR linker=${fl
 # ⚠️ Headroom over the baseline, not a multiple of it. A genuinely hung mutant -- `put_varint`
 # with its loop condition flipped is one -- takes the full 300 s and is still caught; a
 # survivor finishes in the baseline's 20 s and is reported honestly as MISSED.
+# ⚠️ `MUTANTS_TIMEOUT` raises it where 300 s is too little to MEASURE. CI's PR shards run two
+# mutants per 4-core runner, and a mutant in `pstore-query` is caught only when its own
+# crate's tests come up, after `pstore-engine`'s and `pstore-index`'s. PR #8 had 17 such
+# timeouts in one shard; the one checked locally fails `pstore-query`'s own tests after
+# about 182 s of the workspace's (one job, `provisional`), and took over 325 s on a runner.
+# A longer limit costs only the mutants that reach it.
 # Not `exec`, which would discard the cleanup trap above; and in the background, for `stop`.
-cargo mutants -j "$JOBS" --minimum-test-timeout 300 --no-shuffle "${args[@]}" "$@" &
+cargo mutants -j "$JOBS" --minimum-test-timeout "${MUTANTS_TIMEOUT:-300}" --no-shuffle \
+    "${args[@]}" "$@" &
 child=$!
 status=0
 wait "$child" || status=$?
