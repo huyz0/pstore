@@ -1,5 +1,32 @@
 # Native API migration notes
 
+## M137: `allow_partial` by-filter writes
+
+A write may set `delete_by_filter_allow_partial: true` or
+`patch_by_filter_allow_partial: true` beside its `delete_by_filter` or
+`patch_by_filter`. Past M136's bound of 100,000 rows the operation is no longer refused:
+it changes at most 100,000 rows, and the applied answer says `"rows_remaining": true`.
+**Send the same write again to resume**; repeat until `rows_remaining` is absent.
+
+- A partial patch counts only rows it would change, so rows an earlier pass already
+  patched are not taken again. Which rows a pass takes is not specified.
+- Progress is promised only when the write's other operations do not make rows match the
+  filter. A write that also upserts more than the bound of matching rows each time can
+  re-change the same rows; split it.
+- A patched row whose new value a width check sets aside counts in `rejected`, and stays
+  for the next pass to take again. **A pass that changes nothing and rejects rows will do
+  so again**: stop and read the rejected rows (the index's quarantine) rather than loop.
+- `rows_remaining` is per write: a write with both partial operations gets one flag.
+- Needs `durability: "applied"` (else `bad_request`), its by-filter operation (else
+  `bad_request`), and `PSTORE_APPLIED_WRITES=4` on every node (else
+  `unsupported_durability`). Levels 1 to 3 keep their meaning; 4 includes them.
+- Under an idempotency key a resend is a replay of the first pass, with its
+  `rows_remaining`: each pass needs a new key. On `outcome_unavailable` or
+  `idempotency_partial`, whether rows remain is unknown; send it again.
+- Rolling back: a node older than M137 cannot read an outcome object with the new
+  remaining section, and its folds of keyed writes fail while one is listed. Lower the
+  level below 4 everywhere, wait for 32 commits that tally outcomes, then roll back.
+
 ## M136: a by-filter operation is bounded
 
 ⚠️ **Behaviour change.** A `delete_by_filter` or `patch_by_filter` whose filter admits

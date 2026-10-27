@@ -218,6 +218,7 @@ async fn applied_counts_are_what_the_fold_decided() {
             patched: 1,
             skipped: 4,
             rejected: 0,
+            rows_remaining: false,
         }
     );
     // And by filter: every row with n >= 10 (a and b) is patched, then deleted.
@@ -242,6 +243,7 @@ async fn applied_counts_are_what_the_fold_decided() {
             patched: 2,
             skipped: 1,
             rejected: 0,
+            rows_remaining: false,
         }
     );
 }
@@ -708,6 +710,7 @@ async fn affected_ids_are_what_the_fold_decided() {
             patched: 1,
             skipped: 4,
             rejected: 0,
+            rows_remaining: false,
         }
     );
     assert_eq!(

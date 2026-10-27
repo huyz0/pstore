@@ -184,6 +184,11 @@ struct Registry {
     affected_ids: bool,
     /// `PSTORE_APPLIED_WRITES=3` (M132): every node decides idempotency keys.
     idempotency: bool,
+    /// `PSTORE_APPLIED_WRITES=4` (M137): every node reads an outcome's remaining section, so
+    /// `allow_partial` by-filter writes are served.
+    partial_filters: bool,
+    /// The bound on one by-filter operation (M136), when not the engine's default.
+    filter_rows: Option<usize>,
     /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
     lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
@@ -706,9 +711,9 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
-        let (recheck, keys) = {
+        let (recheck, keys, filter_rows) = {
             let r = self.registry_mut();
-            (r.lane_recheck, r.idempotency)
+            (r.lane_recheck, r.idempotency, r.filter_rows)
         };
         let params = *self
             .index_params
@@ -732,6 +737,10 @@ impl<S: BlobStore + 'static> Api<S> {
             );
             let engine = match params {
                 Some(p) => engine.with_index_params(p),
+                None => engine,
+            };
+            let engine = match filter_rows {
+                Some(rows) => engine.with_filter_rows(rows),
                 None => engine,
             };
             engine.set_idempotency(keys);
@@ -952,6 +961,21 @@ impl<S: BlobStore + 'static> Api<S> {
     /// outcome object with a keys section.
     pub fn set_idempotency(&self, on: bool) {
         self.registry_mut().idempotency = on;
+    }
+
+    /// Serves `delete_by_filter_allow_partial` and `patch_by_filter_allow_partial` (M137):
+    /// `PSTORE_APPLIED_WRITES=4`. ⚠️ **An operator's statement that every node runs M137**:
+    /// an M136 node refuses an outcome object with a remaining section, and so does its
+    /// fold whenever it decides a key.
+    pub fn set_partial_filters(&self, on: bool) {
+        self.registry_mut().partial_filters = on;
+    }
+
+    /// Builds every engine from now on with by-filter operations bounded at `rows` (M136's
+    /// tests, and M137's).
+    #[doc(hidden)]
+    pub fn set_filter_rows_for_test(&self, rows: usize) {
+        self.registry_mut().filter_rows = Some(rows);
     }
 
     /// Engines the registry holds.
@@ -1719,6 +1743,7 @@ async fn write_documents<S: BlobStore + 'static>(
         ));
     }
     let key = idempotency_key_of(&api, req.idempotency_key.as_deref(), applied)?;
+    allow_partial(&api, &req, applied)?;
     if let Some(src) = branch_source(&req, keys)? {
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
@@ -1733,6 +1758,10 @@ async fn write_documents<S: BlobStore + 'static>(
         req.patch_columns.take(),
         &dated,
     )?;
+    let (delete_partial, patch_partial) = (
+        req.delete_by_filter_allow_partial,
+        req.patch_by_filter_allow_partial,
+    );
     let delete_by = req
         .delete_by_filter
         .as_ref()
@@ -1876,11 +1905,22 @@ async fn write_documents<S: BlobStore + 'static>(
         }
         // Then the by-filter operations (M13.2), each one deferred operation: a patch, then a
         // delete, so a request that does both deletes what it patched into matching.
+        // M137: either may allow partial application.
         if let Some((filter, patch)) = patch_by {
-            engine.patch_by_filter(&index, &filter, patch).await?;
+            if patch_partial {
+                engine
+                    .patch_by_filter_partial(&index, &filter, patch)
+                    .await?;
+            } else {
+                engine.patch_by_filter(&index, &filter, patch).await?;
+            }
         }
         if let Some(filter) = &delete_by {
-            engine.delete_by_filter(&index, filter).await?;
+            if delete_partial {
+                engine.delete_by_filter_partial(&index, filter).await?;
+            } else {
+                engine.delete_by_filter(&index, filter).await?;
+            }
         }
         Ok::<_, ApiError>((written, patched, deleted))
     };
@@ -1978,6 +2018,7 @@ fn applied_answer(
             patched: o.patched,
             skipped: o.skipped,
             rejected: o.rejected,
+            rows_remaining: o.rows_remaining.then_some(true),
             ids: ids_wanted
                 .then(|| ids.unwrap_or_default())
                 .map(|i| types::AffectedIds {
@@ -1997,6 +2038,49 @@ fn applied_answer(
         outcome_unavailable,
         replayed,
     })
+}
+
+/// Refuses `allow_partial` (M137) beside any durability but `applied`, which alone can say
+/// `rows_remaining`; without its by-filter operation; and below `PSTORE_APPLIED_WRITES=4`.
+fn allow_partial<S: BlobStore>(
+    api: &Api<S>,
+    req: &types::WriteRequest,
+    applied: bool,
+) -> Result<(), ApiError> {
+    let flags = [
+        (
+            "delete_by_filter_allow_partial",
+            req.delete_by_filter_allow_partial,
+            req.delete_by_filter.is_some(),
+        ),
+        (
+            "patch_by_filter_allow_partial",
+            req.patch_by_filter_allow_partial,
+            req.patch_by_filter.is_some(),
+        ),
+    ];
+    for (name, set, has_op) in flags {
+        if !set {
+            continue;
+        }
+        if !has_op {
+            let op = name.trim_end_matches("_allow_partial");
+            return Err(ApiError::bad_request(format!("{name} needs a {op}")));
+        }
+        if !applied {
+            return Err(ApiError::bad_request(format!(
+                "{name} needs durability \"applied\": only an applied answer can say rows remain"
+            )));
+        }
+        if !api.registry_mut().partial_filters {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_durability",
+                format!("{name} is not enabled on this deployment (PSTORE_APPLIED_WRITES=4)"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The write's idempotency key, if it carries one (M132): refused beside any durability but

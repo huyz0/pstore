@@ -767,6 +767,29 @@ const OP_COND_DELETE: i64 = 3;
 const OP_DELETE_BY_FILTER: i64 = 4;
 /// A patch of every row whose current version admits the filter in `$cond` (M13.2).
 const OP_PATCH_BY_FILTER: i64 = 5;
+/// A by-filter operation that allows partial application (M137): past the bound it applies
+/// to the bound's rows and says rows remain, rather than being refused. A fold that predates
+/// it ignores it, as `merged` ignores every `$` attribute.
+const PARTIAL_ATTR: &str = "$partial";
+
+/// `attrs`, marked partial when `partial` (M137).
+fn partially(
+    mut attrs: BTreeMap<String, pstore_format::Value>,
+    partial: bool,
+) -> BTreeMap<String, pstore_format::Value> {
+    if partial {
+        attrs.insert(PARTIAL_ATTR.to_owned(), pstore_format::Value::Bool(true));
+    }
+    attrs
+}
+
+/// Whether a by-filter operation allows partial application (M137).
+fn is_partial(d: &Document) -> bool {
+    matches!(
+        d.attrs.get(PARTIAL_ATTR),
+        Some(pstore_format::Value::Bool(true))
+    )
+}
 
 /// The `$cond` each operation of one call carries: none, one for all (M13), or one each
 /// (M133).
@@ -1001,11 +1024,16 @@ fn resolve(
         if is_by_filter(&op) {
             let over = bound.over.get(nth).copied().unwrap_or(false);
             nth += 1;
-            if over {
+            // M137: a partial operation is never refused for its size.
+            if over && !is_partial(&op) {
                 tally.rejected(&op);
                 continue;
             }
-            by_filter(&op, base, &mut state, &mut order, cx, tally, bound.rows);
+            let limit = filter_rows::Limit {
+                rows: bound.rows,
+                over,
+            };
+            by_filter(&op, base, &mut state, &mut order, cx, tally, limit);
             continue;
         }
         let id = op.id.clone();
@@ -1119,7 +1147,9 @@ fn by_filter_op(
 /// state, else `base` -- its filter admits, in id order. A filter that cannot be read admits
 /// nothing; a patch that changes nothing touches nothing, as a per-id one does.
 ///
-/// M136: one admitting more than `rows` at its place in fold order is refused whole.
+/// M136: one admitting more than the bound at its place in fold order is refused whole.
+/// M137: unless it is partial, when it takes, in id order, the bound's rows it would change,
+/// and says rows remain when the scan found more (`limit.over`) or more would change here.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fold's state, threaded through as `resolve` holds it"
@@ -1131,8 +1161,9 @@ fn by_filter(
     order: &mut Vec<String>,
     cx: &mut Conditions<'_>,
     tally: &mut applied::Tally,
-    rows: usize,
+    limit: filter_rows::Limit,
 ) {
+    let rows = limit.rows;
     let Some(Some(filter)) = cx.of(op) else {
         tally.skipped(applied::req_of(op));
         return;
@@ -1145,20 +1176,29 @@ fn by_filter(
     let mut ids: Vec<String> = base.keys().chain(state.keys()).cloned().collect();
     ids.sort_unstable();
     ids.dedup();
+    let partial = is_partial(op);
+    // M137: a partial operation passes over a row it would leave as it is.
+    let changes = |c: &Document| {
+        !partial || kind == applied::Kind::Deleted || !same_row(&merged(c.clone(), op), c)
+    };
     // Collected no further than one past the bound, so a refused operation clones no more.
-    let admitted: Vec<Document> = ids
+    let mut admitted: Vec<Document> = ids
         .iter()
         .filter_map(|id| match state.get(id) {
             Some(v) => v.as_ref(),
             None => base.get(id),
         })
-        .filter(|c| filter.admits(&c.id, &c.attrs))
+        .filter(|c| filter.admits(&c.id, &c.attrs) && changes(c))
         .take(rows.saturating_add(1))
         .cloned()
         .collect();
-    if admitted.len() > rows {
-        tally.rejected(op);
-        return;
+    if admitted.len() > rows || (partial && limit.over) {
+        if !partial {
+            tally.rejected(op);
+            return;
+        }
+        admitted.truncate(rows);
+        tally.remaining(applied::req_of(op));
     }
     let mut changed = false;
     for c in admitted {
@@ -3077,8 +3117,35 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         filter: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
+        self.delete_by_filter_with(index, filter, false).await
+    }
+
+    /// As [`Self::delete_by_filter`], allowing partial application (M137): past the bound it
+    /// deletes at most the bound's rows, and its outcome says `rows_remaining`. Sending it
+    /// again resumes.
+    ///
+    /// # Errors
+    /// As [`Self::delete_by_filter`].
+    pub async fn delete_by_filter_partial(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+    ) -> Result<(), EngineError> {
+        self.delete_by_filter_with(index, filter, true).await
+    }
+
+    async fn delete_by_filter_with(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+        partial: bool,
+    ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
-        let op = by_filter_op(OP_DELETE_BY_FILTER, encoded(filter)?, BTreeMap::new());
+        let op = by_filter_op(
+            OP_DELETE_BY_FILTER,
+            encoded(filter)?,
+            partially(BTreeMap::new(), partial),
+        );
         self.mem().buffer(index, vec![op]);
         Ok(())
     }
@@ -3095,11 +3162,37 @@ impl<S: BlobStore> Engine<S> {
         filter: &pstore_query::Predicate,
         patch: Patch,
     ) -> Result<(), EngineError> {
+        self.patch_by_filter_with(index, filter, patch, false).await
+    }
+
+    /// As [`Self::patch_by_filter`], allowing partial application (M137): past the bound it
+    /// patches at most the bound's rows it would change, and its outcome says
+    /// `rows_remaining`. Sending it again resumes.
+    ///
+    /// # Errors
+    /// As [`Self::patch`].
+    pub async fn patch_by_filter_partial(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+        patch: Patch,
+    ) -> Result<(), EngineError> {
+        self.patch_by_filter_with(index, filter, patch, true).await
+    }
+
+    async fn patch_by_filter_with(
+        &self,
+        index: &str,
+        filter: &pstore_query::Predicate,
+        patch: Patch,
+        partial: bool,
+    ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
         let mark = encoded(filter)?;
         let mut attrs = patch_attrs(patch)?;
         attrs.remove(OP_ATTR);
         self.stamp(&mut attrs);
+        let attrs = partially(attrs, partial);
         self.mem()
             .buffer(index, vec![by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)]);
         Ok(())
@@ -4632,10 +4725,18 @@ impl<S: BlobStore> Engine<S> {
                 // ⚠️ M136: counted per operation as the scan goes, and a row is retained for an
                 // operation only while it is within the bound, so a fold holds at most one row
                 // past it for each. Counted on every attempt, since the counts live here.
+                //
+                // M137: a partial patch counts, and is retained for, only rows it would change.
                 let retention = filter_rows::Retention::new(
                     docs.iter()
                         .filter(|d| is_by_filter(d))
-                        .map(|d| cx.of(d).flatten())
+                        .map(|d| {
+                            cx.of(d).flatten().map(|filter| filter_rows::Counted {
+                                filter,
+                                changes: (is_partial(d) && op_code(d) == Some(OP_PATCH_BY_FILTER))
+                                    .then(|| d.clone()),
+                            })
+                        })
                         .collect(),
                     self.filter_rows,
                 );

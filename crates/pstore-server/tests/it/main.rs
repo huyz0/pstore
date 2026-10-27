@@ -7,6 +7,7 @@
 //! separate binaries beside this directory.
 
 mod aggregate;
+mod allow_partial;
 mod analyzer;
 mod applied_writes;
 mod arrays;

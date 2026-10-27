@@ -128,9 +128,9 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | `branch_from_namespace` | Same-tenant source string, alone in request, folded state | Partial source/visibility/inheritance contract; G |
 | `copy_from_namespace` | Same branch operation | Missing isolated copy; H |
 | `delete_by_filter` | Deferred predicate; executed after other operations | Partial with different ordering/completion; C |
-| `delete_by_filter_allow_partial` | No partial-progress option | Missing; C |
+| `delete_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
 | `patch_by_filter` | `{filters, attributes}` instead of `{filters, patch}` | Partial, after explicit deletes, before filter delete; C |
-| `patch_by_filter_allow_partial` | No partial-progress option | Missing; C |
+| `patch_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
 | `return_affected_ids` | No actual affected-ID result | Missing; C |
 | `encryption` | Deployment bucket encryption only | Missing namespace `{mode, key_name}` contract; I |
 | `sharding` | Segment distribution, no initial `num_shards` setting | Missing persistent namespace shard contract; I |

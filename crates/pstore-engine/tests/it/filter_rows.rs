@@ -1,5 +1,7 @@
 //! A by-filter operation is bounded (M136): above `with_filter_rows`, counted over the
 //! index the fold read or at the operation's place in fold order, it is refused whole.
+//! M137: unless it allows partial application, when it applies up to the bound and its
+//! outcome says rows remain.
 
 #![allow(
     clippy::unwrap_used,
@@ -81,6 +83,25 @@ fn outcome(upserted: u64, deleted: u64, patched: u64, rejected: u64) -> Outcome 
         patched,
         skipped: 0,
         rejected,
+        rows_remaining: false,
+    }
+}
+
+/// What a pass of an `allow_partial` operation changed, and whether rows remain.
+fn pass(deleted: u64, patched: u64, rows_remaining: bool) -> Outcome {
+    Outcome {
+        deleted,
+        patched,
+        rows_remaining,
+        ..Outcome::default()
+    }
+}
+
+fn set(name: &str, n: i64) -> Patch {
+    Patch {
+        id: String::new(),
+        set: BTreeMap::from([(name.to_owned(), Value::Int(n))]),
+        unset: vec![],
     }
 }
 
@@ -179,4 +200,132 @@ async fn each_operation_reads_its_own_scan_count() {
     .await;
     assert_eq!(got, outcome(0, 1, 1, 1));
     assert_eq!(rows(&e).await.len(), BOUND + 1);
+}
+
+#[tokio::test]
+async fn a_partial_delete_resumes_until_nothing_remains() {
+    let e = engine();
+    seeded(&e, 7).await;
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(
+            applied(&e, async {
+                e.delete_by_filter_partial("idx", &n_is(1)).await.unwrap();
+            })
+            .await,
+        );
+    }
+    assert_eq!(got, [pass(3, 0, true), pass(3, 0, true), pass(1, 0, false)]);
+    assert_eq!(rows(&e).await, [("two".to_owned(), Some(Value::Int(2)))]);
+}
+
+#[tokio::test]
+async fn a_partial_patch_counts_only_rows_it_would_change() {
+    // Seven rows the filter admits, two of which already hold the patched value.
+    let e = engine();
+    seeded(&e, 7).await;
+    e.patch(
+        "idx",
+        vec![
+            Patch {
+                id: "r0".to_owned(),
+                ..set("m", 9)
+            },
+            Patch {
+                id: "r1".to_owned(),
+                ..set("m", 9)
+            },
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        got.push(
+            applied(&e, async {
+                e.patch_by_filter_partial("idx", &n_is(1), set("m", 9))
+                    .await
+                    .unwrap();
+            })
+            .await,
+        );
+    }
+    assert_eq!(got, [pass(0, 3, true), pass(0, 2, false)]);
+    let m = e.scan("idx", None).await.unwrap();
+    assert!(
+        m.iter()
+            .filter(|d| d.id != "two")
+            .all(|d| d.attrs.get("m") == Some(&Value::Int(9)))
+    );
+}
+
+#[tokio::test]
+async fn a_partial_operation_at_the_bound_leaves_nothing() {
+    let e = engine();
+    seeded(&e, BOUND).await;
+    let got = applied(&e, async {
+        e.delete_by_filter_partial("idx", &n_is(1)).await.unwrap();
+    })
+    .await;
+    assert_eq!(got, pass(BOUND as u64, 0, false));
+}
+
+#[tokio::test]
+async fn a_partial_operation_counts_in_fold_order() {
+    // The index admits the bound; an earlier patch by filter makes a fourth match.
+    let e = engine();
+    seeded(&e, BOUND).await;
+    let got = applied(&e, async {
+        e.patch_by_filter("idx", &n_is(2), set_n(1)).await.unwrap();
+        e.delete_by_filter_partial("idx", &n_is(1)).await.unwrap();
+    })
+    .await;
+    assert_eq!(got, pass(BOUND as u64, 1, true));
+    assert_eq!(rows(&e).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_partial_operation_takes_only_rows_it_would_change() {
+    // r0 already holds the value, and a per-id patch of another attribute in the same
+    // write names it, so the fold retains it; the partial patch must pass over it.
+    let e = engine();
+    seeded(&e, BOUND + 1).await;
+    e.patch(
+        "idx",
+        vec![Patch {
+            id: "r0".to_owned(),
+            ..set("m", 9)
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    let got = applied(&e, async {
+        e.patch(
+            "idx",
+            vec![Patch {
+                id: "r0".to_owned(),
+                ..set("k", 5)
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        e.patch_by_filter_partial("idx", &n_is(1), set("m", 9))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(got, pass(0, BOUND as u64 + 1, false));
+    let all = e.scan("idx", None).await.unwrap();
+    assert!(
+        all.iter()
+            .filter(|d| d.id != "two")
+            .all(|d| d.attrs.get("m") == Some(&Value::Int(9)))
+    );
 }

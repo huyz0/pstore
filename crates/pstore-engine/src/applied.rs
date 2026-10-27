@@ -49,6 +49,9 @@ pub struct Outcome {
     /// Operations a reject, width, replica or drop pass discarded, and by-filter operations
     /// past their row bound (M136).
     pub rejected: u64,
+    /// An `allow_partial` by-filter operation left rows it would change (M137): send the
+    /// write again to resume.
+    pub rows_remaining: bool,
 }
 
 impl Outcome {
@@ -58,6 +61,7 @@ impl Outcome {
         self.patched += o.patched;
         self.skipped += o.skipped;
         self.rejected += o.rejected;
+        self.rows_remaining |= o.rows_remaining;
     }
 }
 
@@ -340,6 +344,13 @@ impl Tally {
         }
     }
 
+    /// An `allow_partial` operation of `req` left rows it would change (M137).
+    pub(crate) fn remaining(&mut self, req: Option<&str>) {
+        if let Some(stamp) = req {
+            self.entry(stamp).rows_remaining = true;
+        }
+    }
+
     /// `d` was discarded before it could change anything.
     pub(crate) fn rejected(&mut self, d: &Document) {
         if let Some(stamp) = req_of(d) {
@@ -544,6 +555,8 @@ pub(crate) fn replay(
 /// a trailing ids section (M130) an M129 decoder never meets -- ids need every node at M130.
 /// Then, only if the commit decided a key, a keys section (M132), which forces the ids
 /// section, empty if need be; an M130 decoder refuses it, so keys need every node at M132.
+/// Then, only if a request has rows remaining, a remaining section (M137), which forces the
+/// ids and keys sections; an M136 decoder refuses it, so it needs every node at M137.
 pub(crate) fn encode(d: &Decided) -> Vec<u8> {
     fn str(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -557,7 +570,13 @@ pub(crate) fn encode(d: &Decided) -> Vec<u8> {
             out.extend_from_slice(&n.to_le_bytes());
         }
     }
-    if !d.ids.is_empty() || !d.keys.is_empty() {
+    let remaining: Vec<&String> = d
+        .counts
+        .iter()
+        .filter(|(_, o)| o.rows_remaining)
+        .map(|(req, _)| req)
+        .collect();
+    if !d.ids.is_empty() || !d.keys.is_empty() || !remaining.is_empty() {
         out.extend_from_slice(&(d.ids.len() as u32).to_le_bytes());
         for (req, a) in &d.ids {
             str(&mut out, req);
@@ -569,7 +588,7 @@ pub(crate) fn encode(d: &Decided) -> Vec<u8> {
             }
         }
     }
-    if !d.keys.is_empty() {
+    if !d.keys.is_empty() || !remaining.is_empty() {
         out.extend_from_slice(&(d.keys.len() as u32).to_le_bytes());
         for (attempt, (key, v)) in &d.keys {
             str(&mut out, attempt);
@@ -582,6 +601,12 @@ pub(crate) fn encode(d: &Decided) -> Vec<u8> {
                 }
                 Verdict::Expired => out.push(2),
             }
+        }
+    }
+    if !remaining.is_empty() {
+        out.extend_from_slice(&(remaining.len() as u32).to_le_bytes());
+        for req in remaining {
+            str(&mut out, req);
         }
     }
     out
@@ -605,6 +630,7 @@ pub(crate) fn decode(body: &[u8]) -> Result<Decided, EngineError> {
             patched: word()?,
             skipped: word()?,
             rejected: word()?,
+            rows_remaining: false,
         };
         out.counts.insert(req, o);
     }
@@ -638,6 +664,14 @@ pub(crate) fn decode(body: &[u8]) -> Result<Decided, EngineError> {
                 _ => return Err(bad()),
             };
             out.keys.insert(attempt, (key, v));
+        }
+    }
+    // M137: and here, no request has rows remaining. One that does has counts.
+    if !c.0.is_empty() {
+        let n = c.u32().ok_or_else(bad)?;
+        for _ in 0..n {
+            let req = c.str().ok_or_else(bad)?;
+            out.counts.get_mut(&req).ok_or_else(bad)?.rows_remaining = true;
         }
     }
     if !c.0.is_empty() {
@@ -718,6 +752,7 @@ mod tests {
                 patched: 3,
                 skipped: 4,
                 rejected: 5,
+                rows_remaining: false,
             },
         )])
     }
@@ -856,6 +891,39 @@ mod tests {
             *bad.last_mut().unwrap() = 3;
             assert!(decode(&bad).is_err());
         }
+    }
+
+    /// M137: the remaining section forces empty ids and keys sections, and names only a
+    /// request with counts.
+    #[test]
+    fn rows_remaining_round_trips_after_the_m132_bytes() {
+        let mut d = Decided {
+            counts: counts(),
+            ..Decided::default()
+        };
+        let before = encode(&d);
+        d.counts.values_mut().for_each(|o| o.rows_remaining = true);
+        let body = encode(&d);
+        assert_eq!(decode(&body).unwrap(), d);
+        // M129's bytes, then two empty sections, then one request named.
+        let mut want = before.clone();
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"ab");
+        assert_eq!(body, want);
+        assert!(
+            decode(&before)
+                .unwrap()
+                .counts
+                .values()
+                .all(|o| !o.rows_remaining)
+        );
+        // A request with no counts cannot have rows remaining.
+        let mut bad = body[..body.len() - 2].to_vec();
+        bad.extend_from_slice(b"zz");
+        assert!(decode(&bad).is_err());
     }
 
     #[test]

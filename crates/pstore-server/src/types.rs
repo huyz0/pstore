@@ -113,6 +113,13 @@ pub struct WriteRequest {
     /// fold admits the filter (M13.2), before `delete_by_filter`.
     #[serde(default)]
     pub patch_by_filter: Option<serde_json::Value>,
+    /// `delete_by_filter` may apply to the bound's rows and say `rows_remaining`, rather than
+    /// be refused past the bound (M137). Needs `durability: "applied"`.
+    #[serde(default)]
+    pub delete_by_filter_allow_partial: bool,
+    /// The same for `patch_by_filter` (M137), counting only rows it would change.
+    #[serde(default)]
+    pub patch_by_filter_allow_partial: bool,
     /// Makes this index a branch of the one named (M16): its folded state at the commit, sharing
     /// every segment. **Alone** in its request.
     #[serde(default)]
@@ -347,6 +354,11 @@ pub struct AppliedOut {
     /// Operations a reject, width, replica or drop pass discarded, and by-filter operations
     /// past their row bound (M136).
     pub rejected: u64,
+    /// An `allow_partial` by-filter operation left rows it would change (M137): send the
+    /// write again, with a new idempotency key if it carries one, to resume. Absent when
+    /// none did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_remaining: Option<bool>,
     /// The distinct ids each kind changed, sorted, when the write asked (M130).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ids: Option<AffectedIds>,

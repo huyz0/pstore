@@ -8,6 +8,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// The most rows one by-filter operation may admit, by default.
 pub(crate) const FILTER_ROWS: usize = 100_000;
 
+/// What one by-filter operation counts: the rows its filter admits, or, for a partial patch
+/// (M137), only those of them it would change.
+pub(crate) struct Counted {
+    pub(crate) filter: Predicate,
+    /// The partial patch, when it is one.
+    pub(crate) changes: Option<Document>,
+}
+
+impl Counted {
+    fn counts(&self, d: &Document) -> bool {
+        self.filter.admits(&d.id, &d.attrs)
+            && self
+                .changes
+                .as_ref()
+                .is_none_or(|op| !crate::same_row(&crate::merged(d.clone(), op), d))
+    }
+}
+
 /// Counts, per by-filter operation, the current rows its filter admits as a fold scans the
 /// index, and says which of them to retain.
 ///
@@ -16,13 +34,13 @@ pub(crate) const FILTER_ROWS: usize = 100_000;
 pub(crate) struct Retention {
     /// Each by-filter operation's filter, in arrival order; `None` for one the fold cannot
     /// read, which admits nothing and counts nothing.
-    filters: Vec<Option<Predicate>>,
+    filters: Vec<Option<Counted>>,
     counts: Vec<AtomicUsize>,
     bound: usize,
 }
 
 impl Retention {
-    pub(crate) fn new(filters: Vec<Option<Predicate>>, bound: usize) -> Self {
+    pub(crate) fn new(filters: Vec<Option<Counted>>, bound: usize) -> Self {
         let counts = filters.iter().map(|_| AtomicUsize::new(0)).collect();
         Self {
             filters,
@@ -36,7 +54,7 @@ impl Retention {
     pub(crate) fn admit(&self, d: &Document) -> bool {
         let mut keep = false;
         for (f, n) in self.filters.iter().zip(&self.counts) {
-            if f.as_ref().is_some_and(|f| f.admits(&d.id, &d.attrs)) {
+            if f.as_ref().is_some_and(|f| f.counts(d)) {
                 keep |= n.fetch_add(1, Ordering::Relaxed) < self.bound;
             }
         }
@@ -50,6 +68,14 @@ impl Retention {
             .map(|n| n.load(Ordering::Relaxed) > self.bound)
             .collect()
     }
+}
+
+/// What `by_filter` needs of the bound (M137): the bound, and whether the scan found the
+/// operation past it.
+#[derive(Clone, Copy)]
+pub(crate) struct Limit {
+    pub(crate) rows: usize,
+    pub(crate) over: bool,
 }
 
 /// What `resolve` needs of the bound: per by-filter operation in arrival order, whether the
@@ -72,8 +98,11 @@ mod tests {
         d
     }
 
-    fn n_is(n: i64) -> Option<Predicate> {
-        Some(Predicate::Cmp("n".to_owned(), Op::Eq, Value::Int(n)))
+    fn n_is(n: i64) -> Option<Counted> {
+        Some(Counted {
+            filter: Predicate::Cmp("n".to_owned(), Op::Eq, Value::Int(n)),
+            changes: None,
+        })
     }
 
     #[test]
