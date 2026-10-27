@@ -136,10 +136,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
+      - uses: taiki-e/install-action@nextest
       # MUTANTS_TIMEOUT: a mutant caught late, two to a runner, needs more than 300 s to be
-      # measured as caught rather than reported as a timeout (scripts/mutants.sh).
+      # measured as caught rather than reported as a timeout. MUTANTS_TEST_TOOL: stop at a
+      # mutant's first failing test, not at the end of its test binary (scripts/mutants.sh).
       - run: ./scripts/mutants.sh
-        env: { MUTANTS_SHARD: "${{ matrix.shard }}/12", MUTANTS_TIMEOUT: "600" }
+        env:
+          MUTANTS_SHARD: "${{ matrix.shard }}/12"
+          MUTANTS_TIMEOUT: "600"
+          MUTANTS_TEST_TOOL: nextest
 
   mutants:
     needs: mutants-shard
