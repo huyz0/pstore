@@ -80,6 +80,10 @@ fn unsafe_or_malformed_configuration_is_refused() {
         ))),
         Err(LimitsError::Malformed(_))
     ));
+    // Exactly the maximum length is still read.
+    let longest = format!(r#"{{"version":1{}}}"#, " ".repeat(MAX_CONFIG - 13));
+    assert_eq!(longest.len(), MAX_CONFIG);
+    assert_eq!(read(Some(&longest)), Ok(RequestLimits::default()));
     for (raw, want) in [
         (
             r#"{"version":1,"body_bytes":0}"#,

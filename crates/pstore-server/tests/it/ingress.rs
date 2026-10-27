@@ -43,6 +43,11 @@ fn limits(body: usize, active: usize, tenant: usize, pool: usize) -> RequestLimi
 fn serve(auth: Auth, limits: RequestLimits) -> (Arc<Api<MemoryStore>>, Accounted<MemoryStore>) {
     let store = Accounted::new(MemoryStore::new());
     let api = Api::with_limits(store.clone(), LaneId(1), None, auth, limits).unwrap();
+    assert_eq!(
+        api.request_limits(),
+        limits,
+        "the Api admits under what it was given"
+    );
     (api, store)
 }
 
@@ -167,13 +172,17 @@ async fn ingress_byte_limits_precede_engine_access() {
     .await;
     refused(&got, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large");
     assert!(!polled.load(Ordering::SeqCst));
-    // An endless body is read no further than the limit's next chunk.
+    // A body many times the limit is read no further than the limit's next chunk. It is
+    // finite, so a broken limit reads it all and fails the assertions rather than hanging.
     let sent = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&sent);
-    let endless = Body::from_stream(futures_util::stream::repeat_with(move || {
-        counter.fetch_add(8, Ordering::SeqCst);
-        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"        "))
-    }));
+    let endless = Body::from_stream(futures_util::StreamExt::take(
+        futures_util::stream::repeat_with(move || {
+            counter.fetch_add(8, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"        "))
+        }),
+        MAX,
+    ));
     let got = call(
         api.clone().router(),
         put(Some("1"), None).body(endless).unwrap(),

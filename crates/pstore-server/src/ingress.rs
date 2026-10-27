@@ -15,7 +15,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use pstore_types::TenantId;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::ApiError;
-use crate::auth::Principal;
 
 /// The one configuration version this release reads.
 const VERSION: u64 = 1;
@@ -406,53 +405,26 @@ fn declared_over(headers: &HeaderMap, max: usize) -> bool {
     })
 }
 
-/// Who `req` is counted against, from what authentication already decided.
+/// Who `req` is counted against. Authentication has already rewritten `x-pstore-tenant`
+/// to a bearer's verified tenant (and refused one that claimed another), so the header is
+/// the identity in both modes; headerless private requests share one cohort.
 fn key_of(req: &Request) -> Key {
-    match req.extensions().get::<Principal>() {
-        Some(Principal::Verified { tenant, .. }) => Key::Tenant(*tenant),
-        _ => req
-            .headers()
-            .get("x-pstore-tenant")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u128>().ok())
-            .map_or(Key::Private, |t| Key::Tenant(TenantId(t))),
-    }
+    req.headers()
+        .get("x-pstore-tenant")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u128>().ok())
+        .map_or(Key::Private, |t| Key::Tenant(TenantId(t)))
 }
 
-/// Reads `body` whole, refusing past `max` bytes or `timeout`.
+/// Reads `body` whole, refusing past `max` bytes or `timeout`. `Limited` counts the bytes
+/// that arrive and refuses at the first chunk past `max`; one chunk is kept uncopied.
 async fn collect(body: Body, max: usize, timeout: Duration) -> Result<bytes::Bytes, ApiError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut body = body;
-    let mut first: Option<bytes::Bytes> = None;
-    let mut rest: Vec<u8> = Vec::new();
-    let mut len = 0usize;
-    loop {
-        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
-            Err(_) => return Err(timed_out()),
-            Ok(None) => break,
-            Ok(Some(Err(_))) => {
-                return Err(ApiError::bad_request("the request body could not be read"));
-            }
-            Ok(Some(Ok(frame))) => frame,
-        };
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        len += data.len();
-        if len > max {
-            return Err(too_large());
-        }
-        // One chunk, the common case, is kept as it arrived rather than copied.
-        match first.take() {
-            None if rest.is_empty() => first = Some(data),
-            None => rest.extend_from_slice(&data),
-            Some(f) => {
-                rest.extend_from_slice(&f);
-                rest.extend_from_slice(&data);
-            }
-        }
+    match tokio::time::timeout(timeout, Limited::new(body, max).collect()).await {
+        Err(_) => Err(timed_out()),
+        Ok(Ok(collected)) => Ok(collected.to_bytes()),
+        Ok(Err(e)) if e.is::<LengthLimitError>() => Err(too_large()),
+        Ok(Err(_)) => Err(ApiError::bad_request("the request body could not be read")),
     }
-    Ok(first.unwrap_or_else(|| bytes::Bytes::from(rest)))
 }
 
 /// The ingress layer: after authentication and the route's scope, before the handler.
