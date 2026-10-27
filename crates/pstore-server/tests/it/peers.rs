@@ -37,6 +37,13 @@ fn peer_addresses() -> &'static Mutex<std::collections::HashMap<usize, String>> 
     ADDRESSES.get_or_init(Mutex::default)
 }
 
+/// The wait injected before every read when a test bounds a query's rounds by the clock: long
+/// enough that the query's own work fits in the margin below a fifth round. ⚠️ Not longer: at
+/// 1 s a peer's two rounds outlast the peer timeout and the coordinator runs the share itself,
+/// six rounds in all. Measured locally, four rounds took four waits plus 20 ms at 100 to 500 ms.
+const ROUND_MS: u64 = 500;
+const ROUND: Duration = Duration::from_millis(ROUND_MS);
+
 /// One server's view of the shared store: what it read, and whether it fails or waits.
 #[derive(Debug, Clone)]
 struct View {
@@ -530,17 +537,19 @@ async fn each_segment_is_scanned_once_by_its_server() {
 
 #[tokio::test]
 async fn a_split_query_keeps_the_round_trip_budget() {
-    // ⚠️ Wall clock under an injected wait per request: four rounds of 250 ms is a second,
-    // and a chain of five -- the peers called only after the coordinator's own open -- is at
-    // least 1.25 s. A per-store round counter cannot tell the two apart: each store sees its
-    // own rounds, not the chain.
+    // ⚠️ Wall clock under an injected wait per request: four rounds take four waits, and a
+    // chain of five -- the peers called only after the coordinator's own open -- at least five,
+    // because a sleep never ends early. A per-store round counter cannot tell the two apart:
+    // each store sees its own rounds, not the chain. So the bound is just under five waits,
+    // and the wait is long enough that the rest of the query fits in the margin: at 250 ms and
+    // a bound of 4.5 waits, macOS CI took 1.2 s with every server test in one binary.
     let (store, servers, _) = cluster(&[]).await;
     fill(&store, &servers[0].api, &urls(&servers), 8).await;
     let q = json!({"vector": Q, "top_k": 10});
     // Warm nothing; but make sure the query itself is sound first.
     let sent = metric(&servers[0].api, "pstore_peer_parts_sent").await;
     for s in &servers {
-        s.view.delay_ms.store(250, Ordering::SeqCst);
+        s.view.delay_ms.store(ROUND_MS, Ordering::SeqCst);
     }
     let started = std::time::Instant::now();
     let (status, body) = query(&servers[0].api, &q).await;
@@ -554,8 +563,8 @@ async fn a_split_query_keeps_the_round_trip_budget() {
         sent + 2
     );
     assert!(
-        took < Duration::from_millis(1_125),
-        "a split query took {took:?}: more than four rounds of 250 ms"
+        took < 5 * ROUND,
+        "a split query took {took:?}: five rounds of {ROUND:?} or more"
     );
 }
 
@@ -1077,13 +1086,13 @@ async fn each_text_segment_is_scanned_once_by_its_server() {
 #[tokio::test]
 async fn a_split_text_query_keeps_the_round_trip_budget() {
     // As M54's, for a hybrid query in two phases: the statistics exchange between them is a
-    // round trip between servers, never a blob round.
+    // round trip between servers, never a blob round. The bound is as M54's, for its reason.
     let (store, servers, _) = cluster(&[]).await;
     fill(&store, &servers[0].api, &urls(&servers), 8).await;
     let q = json!({"vector": Q, "text": "word2 tag1", "top_k": 10});
     let sent = metric(&servers[0].api, "pstore_peer_parts_sent").await;
     for s in &servers {
-        s.view.delay_ms.store(250, Ordering::SeqCst);
+        s.view.delay_ms.store(ROUND_MS, Ordering::SeqCst);
     }
     let started = std::time::Instant::now();
     let (status, body) = query(&servers[0].api, &q).await;
@@ -1097,8 +1106,8 @@ async fn a_split_text_query_keeps_the_round_trip_budget() {
         sent + 2
     );
     assert!(
-        took < Duration::from_millis(1_125),
-        "a split text query took {took:?}: more than four rounds of 250 ms"
+        took < 5 * ROUND,
+        "a split text query took {took:?}: five rounds of {ROUND:?} or more"
     );
 }
 
