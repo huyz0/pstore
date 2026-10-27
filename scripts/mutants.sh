@@ -163,6 +163,11 @@ case "${1:-}" in
             exit 0
         fi
         args+=(--in-diff "$diff")
+        # One shard of the diff's mutants, for CI's PR matrix. ⚠️ A branch of several
+        # milestones is hundreds of mutants at about three minutes each on a CI runner -- 84
+        # took over four hours in one job, and GitHub stops a job at six -- so the PR gate is
+        # sharded as the nightly sweep is. Every shard filters the same enumeration.
+        [[ -n "${MUTANTS_SHARD:-}" ]] && args+=(--shard "$MUTANTS_SHARD")
         ;;
 esac
 
