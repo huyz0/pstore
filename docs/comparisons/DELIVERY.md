@@ -29,7 +29,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | E | Exact scoring expressions and computed distance/clause signals | Pending |
 | E | Structured highlights with fragment/offset contracts | Pending |
 | F | Atomic multi-query, outer RRF, candidate merging and global windows | Pending |
-| F | Multi-key sorting, relevance pagination, group quotas and expanded grouping | Pending |
+| F | Multi-key sorting, relevance pagination, group quotas and expanded grouping | Partial: sorting by up to 8 keys verified in [M140](../milestones/M140/VERIFIED.md); relevance pagination, group quotas and expanded grouping pending |
 | G | Empty creation, schema/metadata reads, bytes/timestamps/index progress and generic read-only | Pending |
 | G | Controlled schema evolution, backfill and migration | Pending |
 | H | Separate branch/isolated-copy/replication products and cross-store authorization | Pending |

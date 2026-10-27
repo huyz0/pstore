@@ -6957,7 +6957,8 @@ impl<S: BlobStore> Engine<S> {
         })
     }
 
-    /// Every document `filter` admits, in `by`'s order, from `offset` for `limit` (M9e).
+    /// Every document `filter` admits, in `by`'s order, from `offset` for `limit` (M9e). `by`
+    /// is one key or an [`pstore_query::Order`] of up to eight (M140).
     ///
     /// **Three round trips** -- HEAD, the segments opened with their delete vectors, their
     /// admitted blocks -- and no resolve round: a block carries ids and attributes. Rows are
@@ -6970,7 +6971,7 @@ impl<S: BlobStore> Engine<S> {
     pub async fn ordered(
         &self,
         index: &str,
-        by: &pstore_query::OrderBy,
+        by: impl Into<pstore_query::Order>,
         filter: Option<&pstore_query::Predicate>,
         offset: usize,
         limit: usize,
@@ -7000,7 +7001,7 @@ impl<S: BlobStore> Engine<S> {
     pub async fn ordered_as(
         &self,
         index: &str,
-        by: &pstore_query::OrderBy,
+        by: impl Into<pstore_query::Order>,
         filter: Option<&pstore_query::Predicate>,
         offset: usize,
         limit: usize,
@@ -7014,6 +7015,7 @@ impl<S: BlobStore> Engine<S> {
             ));
         }
         // As `query_filtered_as`: a failed read from the `bounded` cache retries fresh (M11.2).
+        let by = &by.into();
         let mut hit = false;
         let first = self
             .ordered_once(
@@ -7054,7 +7056,7 @@ impl<S: BlobStore> Engine<S> {
     async fn ordered_once(
         &self,
         index: &str,
-        by: &pstore_query::OrderBy,
+        by: &pstore_query::Order,
         filter: Option<&pstore_query::Predicate>,
         offset: usize,
         limit: usize,

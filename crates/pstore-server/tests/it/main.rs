@@ -46,6 +46,7 @@ mod multi;
 mod multi_fde;
 mod named_dense;
 mod order;
+mod order_keys;
 mod patch;
 mod patch_by_filter;
 mod patterns;

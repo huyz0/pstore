@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M140: order by up to eight attributes
+
+`rank_by` also accepts a list of 1 to 8 `[attribute, "asc" | "desc"]` pairs:
+`[["a", "asc"], ["b", "desc"]]`. Rows are ordered by the first pair; rows it ties, by the
+second; and so on; rows every pair ties, by id ascending. Each pair keeps the one-key
+rules: types in their groups, absent last in both directions, arrays tied.
+
+- `id` may be a key, but only the last one.
+- Refused with `bad_request`: an empty list, more than 8 pairs, an attribute named twice,
+  a pair after `id`, and a malformed pair.
+- The one-pair form `["a", "asc"]` and every one-key answer are unchanged. A list of one
+  pair answers as that pair does.
+- A multi-key order pages by `offset`, within the 10,000 bound; there is no cursor for it.
+
+No stored-data migration is needed. The [M140 verification](milestones/M140/VERIFIED.md)
+records the evidence.
+
 ## M139: affected ids for by-filter operations
 
 At `PSTORE_APPLIED_WRITES=5` (every node at M139; it includes levels 1 to 4),

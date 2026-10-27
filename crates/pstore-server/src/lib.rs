@@ -2623,7 +2623,7 @@ enum Plan {
     /// Counts and sums, optionally grouped (M12).
     Aggregate(pstore_query::AggregateSpec, Option<pstore_query::Predicate>),
     /// A `rank_by` order (M9e).
-    Ordered(pstore_query::OrderBy, Option<pstore_query::Predicate>),
+    Ordered(pstore_query::Order, Option<pstore_query::Predicate>),
     /// A relevance ranking: its legs, filter and fusion, and its boost (M62).
     Ranked(
         Vec<pstore_query::Prefetch>,
@@ -2984,7 +2984,7 @@ async fn run<E: BlobStore>(
             let got = engine
                 .ordered_as(
                     index,
-                    &by,
+                    by,
                     filter.as_ref(),
                     req.offset.unwrap_or(0),
                     req.top_k,
@@ -3620,7 +3620,10 @@ const MAX_ORDERED: usize = 10_000;
 /// ⚠️ **Refused, never combined.** An ordered answer and a relevance answer are different
 /// questions, so `rank_by` beside `vector`, `text`, `field` or `exact: true` is a request that
 /// means nothing -- and answering one of them would silently drop the other.
-fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiError> {
+///
+/// `rank_by` is one `[attribute, "asc" | "desc"]` pair, or a list of 1 to 8 of them (M140): an
+/// array whose first element is itself an array is the list.
+fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError> {
     let Some(raw) = &req.rank_by else {
         if req.offset.is_some() {
             return Err(ApiError::bad_request(
@@ -3629,32 +3632,12 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
         }
         return Ok(None);
     };
-    let by = match raw.as_array().map(Vec::as_slice) {
-        Some(
-            [
-                serde_json::Value::String(attr),
-                serde_json::Value::String(dir),
-            ],
-        ) => {
-            let desc = match dir.as_str() {
-                "asc" => false,
-                "desc" => true,
-                other => {
-                    return Err(ApiError::bad_request(format!(
-                        "rank_by direction {other:?} is not \"asc\" or \"desc\""
-                    )));
-                }
-            };
-            pstore_query::OrderBy {
-                attr: attr.clone(),
-                desc,
-            }
+    let by = match raw.as_array() {
+        Some(list) if list.is_empty() || list.first().is_some_and(serde_json::Value::is_array) => {
+            pstore_query::Order::new(list.iter().map(order_key).collect::<Result<_, _>>()?)
+                .map_err(ApiError::bad_request)?
         }
-        _ => {
-            return Err(ApiError::bad_request(
-                "rank_by is [attribute, \"asc\" | \"desc\"]",
-            ));
-        }
+        _ => order_key(raw)?.into(),
     };
     if req.vector.is_some()
         || req.multi.is_some()
@@ -3674,6 +3657,35 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::OrderBy>, ApiErro
         )));
     }
     Ok(Some(by))
+}
+
+/// One `[attribute, "asc" | "desc"]` pair of `rank_by`.
+fn order_key(pair: &serde_json::Value) -> Result<pstore_query::OrderBy, ApiError> {
+    let Some(
+        [
+            serde_json::Value::String(attr),
+            serde_json::Value::String(dir),
+        ],
+    ) = pair.as_array().map(Vec::as_slice)
+    else {
+        return Err(ApiError::bad_request(format!(
+            "rank_by is [attribute, \"asc\" | \"desc\"], or a list of 1 to {} of them",
+            pstore_query::MAX_KEYS
+        )));
+    };
+    let desc = match dir.as_str() {
+        "asc" => false,
+        "desc" => true,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "rank_by direction {other:?} is not \"asc\" or \"desc\""
+            )));
+        }
+    };
+    Ok(pstore_query::OrderBy {
+        attr: attr.clone(),
+        desc,
+    })
 }
 
 /// The legs a query asks for. A query with none is a request nobody meant to make.

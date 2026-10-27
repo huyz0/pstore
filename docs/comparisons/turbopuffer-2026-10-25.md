@@ -211,7 +211,7 @@ contract fixtures, rather than assuming identical validation.
 | `Decay(midpoint, exponent)` | Boost decay uses origin/scale/shape | Different function, not a field rename; E |
 | `Dist(expression, origin)` | Limited numeric/geo boost mechanisms | No equivalent general expression; E |
 | One attribute `asc`/`desc` | Supported | Ties/type/null behavior require conformance fixtures |
-| Up to 8 attribute sort keys | One key only | F |
+| Up to 8 attribute sort keys | Up to 8 keys as a list of pairs ([M140](../milestones/M140/VERIFIED.md)) | Paged by `offset` only, no cursor; F |
 | Outer `RRF(rank_constant, weights)` | RRF across retrieval legs (`k`, nonnegative weights) | Not outer multi-query; vendor requires positive weights and integer constant; F |
 | Model reranking | None | Optional service integration; J |
 | `VectorDist` computed output | Dense `$dist` only for scored dense leg | No arbitrary extra distance expression; F |

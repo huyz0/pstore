@@ -1,5 +1,6 @@
-//! Order by attribute (M9e): every admitted row of every segment, ranked by one attribute and
-//! **selected** -- never sorted whole -- into the `offset + limit` the caller asked for.
+//! Order by attribute (M9e): every admitted row of every segment, ranked by one attribute --
+//! or up to [`MAX_KEYS`] of them (M140) -- and **selected**, never sorted whole, into the
+//! `offset + limit` the caller asked for.
 
 use crate::filter::Predicate;
 use crate::run::{QueryError, Target};
@@ -17,33 +18,129 @@ pub struct OrderBy {
     pub desc: bool,
 }
 
+/// The most keys an [`Order`] holds (M140).
+pub const MAX_KEYS: usize = 8;
+
+/// An order of 1 to [`MAX_KEYS`] keys (M140): rows the first ties are ordered by the second,
+/// and so on, and rows every key ties by the id, ascending.
+///
+/// ⚠️ **Valid by construction**: its keys are private, so an `Order` is one key converted or
+/// a list [`Order::new`] checked -- never an empty list, a repeated attribute, or a key after
+/// the id, which no row could ever be ordered by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Order(Vec<OrderBy>);
+
+impl Order {
+    /// An order of `keys`, first to last.
+    ///
+    /// # Errors
+    /// Why `keys` cannot be an order, as a refusal's message: none, more than [`MAX_KEYS`], an
+    /// attribute named twice, or a key after the id.
+    pub fn new(keys: Vec<OrderBy>) -> Result<Self, String> {
+        if keys.is_empty() {
+            return Err("rank_by names no key".to_owned());
+        }
+        if keys.len() > MAX_KEYS {
+            return Err(format!("rank_by may name at most {MAX_KEYS} keys"));
+        }
+        for (i, by) in keys.iter().enumerate() {
+            if keys.iter().take(i).any(|b| b.attr == by.attr) {
+                return Err(format!("rank_by names {:?} twice", by.attr));
+            }
+            if by.attr == crate::ID_ATTRIBUTE && i + 1 < keys.len() {
+                return Err(
+                    "rank_by may name id only as its last key: ids are unique, so a key after \
+                     it is never read"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(Self(keys))
+    }
+
+    /// Its keys, first to last.
+    #[must_use]
+    pub fn keys(&self) -> &[OrderBy] {
+        &self.0
+    }
+}
+
+impl From<OrderBy> for Order {
+    fn from(by: OrderBy) -> Self {
+        Self(vec![by])
+    }
+}
+
+impl From<&OrderBy> for Order {
+    fn from(by: &OrderBy) -> Self {
+        Self(vec![by.clone()])
+    }
+}
+
+/// What a rank is computed over: an order's keys, borrowed, whether one key or several.
+trait Keys {
+    fn keys(&self) -> &[OrderBy];
+}
+
+impl Keys for Order {
+    fn keys(&self) -> &[OrderBy] {
+        &self.0
+    }
+}
+
+impl Keys for OrderBy {
+    fn keys(&self) -> &[OrderBy] {
+        std::slice::from_ref(self)
+    }
+}
+
+/// A row's place under one key: its group, and its value unless an array's, which never
+/// compares by content (M9h.2) and so is never kept.
+#[derive(Debug, Clone)]
+struct Key {
+    desc: bool,
+    group: u8,
+    value: Option<Value>,
+}
+
 /// A row's place in the order, computed once.
 ///
 /// ⚠️ **Not `Value`'s own order reversed for `desc`.** The absent group sorts last in BOTH
 /// directions, and ties break on the id ascending in both: `asc` is bools, numbers,
 /// datetimes, strings, arrays, absent; `desc` is arrays, strings, datetimes, numbers, bools,
-/// absent, each group's values reversed. Arrays are never compared by content (M9h.2): among themselves they tie, and the
-/// id decides.
+/// absent, each group's values reversed. Arrays are never compared by content (M9h.2): among
+/// themselves they tie, and the next key, or the id, decides.
 ///
 /// ⚠️ **Numbers are one group** (M9h.1): an int and a float interleave by exact value, and
-/// equal ones (`1` and `1.0`) tie, broken by the id. Equality is the order's, never `Value`'s.
+/// equal ones (`1` and `1.0`) tie, broken by the next key or the id. Equality is the order's,
+/// never `Value`'s.
+///
+/// ⚠️ **The id breaks ties once, after the last key** (M140), never within a key.
 #[derive(Debug, Clone)]
 struct Rank {
-    desc: bool,
-    group: u8,
-    value: Option<Value>,
+    keys: Vec<Key>,
     id: String,
 }
 
 impl Rank {
-    /// A row's rank, owned: what [`Selector::offer`] keeps, built here for a test.
-    #[cfg(test)]
-    fn of(by: &OrderBy, doc: &Document) -> Self {
-        let value = value_of(by, doc).map(std::borrow::Cow::into_owned);
+    /// A row's rank, owned: what [`Selector::offer`] keeps.
+    fn of(order: &impl Keys, doc: &Document) -> Self {
         Self {
-            desc: by.desc,
-            group: group_of(by, value.as_ref()),
-            value,
+            keys: order
+                .keys()
+                .iter()
+                .map(|by| {
+                    let value = value_of(by, doc);
+                    let group = group_of(by, value.as_deref());
+                    Key {
+                        desc: by.desc,
+                        group,
+                        value: value
+                            .filter(|v| !matches!(**v, Value::Array(_)))
+                            .map(std::borrow::Cow::into_owned),
+                    }
+                })
+                .collect(),
             id: doc.id.clone(),
         }
     }
@@ -77,11 +174,12 @@ fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
     }
 }
 
-/// [`Rank`]'s order over its parts, borrowed: so a row can be compared before it is owned.
-fn order(
+/// One key's order over its parts, borrowed: so a row can be compared before it is owned. Ties
+/// are left to the next key, or the id.
+fn key_order(
     desc: bool,
-    (group, value, id): (u8, Option<&Value>, &str),
-    (other_group, other_value, other_id): (u8, Option<&Value>, &str),
+    (group, value): (u8, Option<&Value>),
+    (other_group, other_value): (u8, Option<&Value>),
 ) -> Ordering {
     let values = match (value, other_value) {
         // Bytewise, as the `Gt` cursor compares (`filter.rs`).
@@ -99,16 +197,23 @@ fn order(
     group
         .cmp(&other_group)
         .then(if desc { values.reverse() } else { values })
-        .then_with(|| id.as_bytes().cmp(other_id.as_bytes()))
 }
 
 impl Ord for Rank {
     fn cmp(&self, other: &Self) -> Ordering {
-        order(
-            self.desc,
-            (self.group, self.value.as_ref(), &self.id),
-            (other.group, other.value.as_ref(), &other.id),
-        )
+        self.keys
+            .iter()
+            .zip(&other.keys)
+            .map(|(a, b)| {
+                key_order(
+                    a.desc,
+                    (a.group, a.value.as_ref()),
+                    (b.group, b.value.as_ref()),
+                )
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.id.as_bytes().cmp(other.id.as_bytes()))
     }
 }
 
@@ -147,13 +252,13 @@ impl PartialOrd for Ranked {
     }
 }
 
-/// The first `cap` rows in `by`'s order, from rows offered one at a time.
+/// The first `cap` rows in an [`Order`], from rows offered one at a time.
 ///
 /// ⚠️ **Bounded, and that is the point** (spec review of M9e): a sort holds every row it is
 /// given, and an unfiltered order-by is given the whole index. This holds at most `cap`.
 #[derive(Debug)]
 pub struct Selector {
-    by: OrderBy,
+    by: Order,
     cap: usize,
     /// A max-heap: its top is the worst row kept, the one a better row evicts.
     kept: BinaryHeap<Ranked>,
@@ -162,9 +267,9 @@ pub struct Selector {
 impl Selector {
     /// A selector keeping the first `cap` rows.
     #[must_use]
-    pub fn new(by: OrderBy, cap: usize) -> Self {
+    pub fn new(by: impl Into<Order>, cap: usize) -> Self {
         Self {
-            by,
+            by: by.into(),
             cap,
             kept: BinaryHeap::new(),
         }
@@ -178,30 +283,34 @@ impl Selector {
         }
         // ⚠️ Compared borrowed, and owned only once kept (M119): a full selector rejects almost
         // every row it is offered, and building the rank first cloned the id and the value of
-        // each.
-        let value = value_of(&self.by, &doc);
-        let group = group_of(&self.by, value.as_deref());
+        // each. Key by key (M140), reading a later key's value only when the earlier ones tie.
         if self.kept.len() == self.cap {
             match self.kept.peek() {
                 Some(worst)
-                    if order(
-                        self.by.desc,
-                        (group, value.as_deref(), &doc.id),
-                        (worst.0.group, worst.0.value.as_ref(), &worst.0.id),
-                    )
-                    .is_lt() =>
+                    if self
+                        .by
+                        .keys()
+                        .iter()
+                        .zip(&worst.0.keys)
+                        .map(|(by, k)| {
+                            let value = value_of(by, &doc);
+                            key_order(
+                                by.desc,
+                                (group_of(by, value.as_deref()), value.as_deref()),
+                                (k.group, k.value.as_ref()),
+                            )
+                        })
+                        .find(|o| o.is_ne())
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| doc.id.as_bytes().cmp(worst.0.id.as_bytes()))
+                        .is_lt() =>
                 {
                     self.kept.pop();
                 }
                 _ => return,
             }
         }
-        let rank = Rank {
-            desc: self.by.desc,
-            group,
-            value: value.map(std::borrow::Cow::into_owned),
-            id: doc.id.clone(),
-        };
+        let rank = Rank::of(&self.by, &doc);
         self.kept.push(Ranked(rank, doc));
     }
 
@@ -468,5 +577,141 @@ mod tests {
         }
         let got: Vec<String> = s.into_sorted().into_iter().map(|d| d.id).collect();
         assert_eq!(got, ["B", "a", "ab", "b"]);
+    }
+
+    // M140: an order of several keys.
+
+    /// A pseudo-random value of every type, absent included, drawn from few values so rows tie.
+    fn any_value(state: u64) -> Option<Value> {
+        let pick = (state >> 8) as usize;
+        match state % 8 {
+            0 => None,
+            1 => Some(Value::Int(pick as i64 % 3)),
+            2 => Some(Value::Float([0.5, 1.0, 2.0][pick % 3])),
+            3 => Some(Value::Str(["a", "B", ""][pick % 3].to_owned())),
+            4 => Some(Value::Bool(pick.is_multiple_of(2))),
+            5 => Some(Value::DateTime(pick as i64 % 2)),
+            6 => Some(Value::Array(vec![Value::Int(pick as i64 % 2)])),
+            _ => Some(Value::Int(1)),
+        }
+    }
+
+    /// Rows with attributes `k0`, `k1`, `k2`, ids in no order.
+    fn keyed(n: usize) -> Vec<Document> {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n)
+            .map(|i| {
+                let mut d = Document::new(
+                    format!("d{:04}", (next() % 9000) * 1000 + i as u64),
+                    vec![1.0],
+                );
+                for k in 0..3 {
+                    if let Some(v) = any_value(next()) {
+                        d.attrs.insert(format!("k{k}"), v);
+                    }
+                }
+                d
+            })
+            .collect()
+    }
+
+    /// The reference: key by key with M9e's one-key rule, the id left out, then the id.
+    fn reference(keys: &[OrderBy], a: &Document, b: &Document) -> Ordering {
+        keys.iter()
+            .map(|by| {
+                let (va, vb) = (value_of(by, a), value_of(by, b));
+                key_order(
+                    by.desc,
+                    (group_of(by, va.as_deref()), va.as_deref()),
+                    (group_of(by, vb.as_deref()), vb.as_deref()),
+                )
+            })
+            .fold(Ordering::Equal, Ordering::then)
+            .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+    }
+
+    #[test]
+    fn several_keys_keep_exactly_a_reference_sorts_prefix() {
+        let docs = keyed(400);
+        let key = |k: usize, desc: bool| OrderBy {
+            attr: format!("k{k}"),
+            desc,
+        };
+        for n in 1..=3 {
+            for dirs in 0..(1u32 << n) {
+                let keys: Vec<OrderBy> = (0..n).map(|k| key(k, dirs & (1 << k) != 0)).collect();
+                let mut sorted = docs.clone();
+                sorted.sort_by(|a, b| reference(&keys, a, b));
+                for cap in [0, 1, 9, 200, 400, 450] {
+                    let mut s = Selector::new(Order::new(keys.clone()).unwrap(), cap);
+                    for d in docs.iter().cloned() {
+                        s.offer(d);
+                        assert!(s.len() <= cap, "cap {cap} exceeded");
+                    }
+                    let got: Vec<String> = s.into_sorted().into_iter().map(|d| d.id).collect();
+                    let want: Vec<String> = sorted.iter().take(cap).map(|d| d.id.clone()).collect();
+                    assert_eq!(got, want, "{keys:?}, cap {cap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_second_key_decides_only_what_the_first_ties() {
+        let row = |id: &str, a: i64, b: i64| {
+            let mut d = doc(id, None);
+            d.attrs.insert("a".to_owned(), Value::Int(a));
+            d.attrs.insert("b".to_owned(), Value::Int(b));
+            d
+        };
+        let keys = vec![
+            OrderBy {
+                attr: "a".to_owned(),
+                desc: false,
+            },
+            OrderBy {
+                attr: "b".to_owned(),
+                desc: true,
+            },
+        ];
+        let mut s = Selector::new(Order::new(keys).unwrap(), 10);
+        for d in [
+            row("p", 2, 9),
+            row("q", 1, 1),
+            row("r", 1, 5),
+            row("s", 1, 5),
+        ] {
+            s.offer(d);
+        }
+        let got: Vec<String> = s.into_sorted().into_iter().map(|d| d.id).collect();
+        assert_eq!(got, ["r", "s", "q", "p"]);
+    }
+
+    #[test]
+    fn an_order_is_one_to_eight_distinct_keys_and_none_after_the_id() {
+        let key = |attr: &str| OrderBy {
+            attr: attr.to_owned(),
+            desc: false,
+        };
+        let keys = |n: usize| (0..n).map(|i| key(&format!("k{i}"))).collect::<Vec<_>>();
+        assert!(Order::new(Vec::new()).is_err());
+        assert!(Order::new(keys(1)).is_ok());
+        assert!(Order::new(keys(8)).is_ok());
+        assert!(Order::new(keys(9)).is_err());
+        assert!(Order::new(vec![key("a"), key("b"), key("a")]).is_err());
+        assert!(Order::new(vec![key(crate::ID_ATTRIBUTE), key("a")]).is_err());
+        assert!(Order::new(vec![key("a"), key(crate::ID_ATTRIBUTE)]).is_ok());
+        assert_eq!(
+            Order::new(vec![key("a")]).unwrap(),
+            Order::from(key("a")),
+            "one key checked is one key converted"
+        );
+        assert_eq!(Order::from(&key("a")), Order::from(key("a")));
     }
 }

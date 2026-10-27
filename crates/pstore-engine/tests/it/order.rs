@@ -140,3 +140,67 @@ async fn an_ordered_query_is_three_round_trips_however_many_segments() {
         assert_eq!(store.depth(), 3, "{segments} segments, as_of");
     }
 }
+
+/// M140: a row with `a` and `b`, either absent when `None`.
+fn keyed(id: &str, a: Option<i64>, b: Option<&str>) -> Document {
+    let mut d = Document::new(id, vec![1.0, 0.5]);
+    if let Some(a) = a {
+        d.attrs.insert("a".to_owned(), Value::Int(a));
+    }
+    if let Some(b) = b {
+        d.attrs.insert("b".to_owned(), Value::Str(b.to_owned()));
+    }
+    d
+}
+
+#[tokio::test]
+async fn two_keys_order_across_segments_a_delete_vector_and_unfolded_rows() {
+    let e = Engine::new(Arc::new(MemoryStore::new()), TenantId(42), LaneId(1));
+    let folded = |docs: Vec<Document>| {
+        let e = &e;
+        async move {
+            e.write("idx", docs).await.unwrap();
+            e.flush().await.unwrap();
+            e.fold().await.unwrap();
+        }
+    };
+    folded(vec![
+        keyed("r1", Some(1), Some("x")),
+        keyed("r2", Some(1), Some("y")),
+        keyed("r3", Some(2), None),
+        keyed("r7", Some(0), Some("x")),
+    ])
+    .await;
+    folded(vec![
+        keyed("r4", Some(2), Some("x")),
+        keyed("r5", None, Some("z")),
+    ])
+    .await;
+    // A delete vector on the first segment, then an unfolded row and an unfolded delete.
+    e.delete("idx", vec!["r7".to_owned()]).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.write("idx", vec![keyed("r6", Some(1), None)])
+        .await
+        .unwrap();
+    e.delete("idx", vec!["r2".to_owned()]).await.unwrap();
+    let order = pstore_query::Order::new(vec![
+        OrderBy {
+            attr: "a".to_owned(),
+            desc: false,
+        },
+        OrderBy {
+            attr: "b".to_owned(),
+            desc: true,
+        },
+    ])
+    .unwrap();
+    let ids = |rows: Vec<Document>| rows.into_iter().map(|d| d.id).collect::<Vec<_>>();
+    let all = e
+        .ordered("idx", order.clone(), None, 0, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(all.rows), ["r1", "r6", "r4", "r3", "r5"]);
+    let page = e.ordered("idx", order, None, 1, 3, None).await.unwrap();
+    assert_eq!(ids(page.rows), ["r6", "r4", "r3"]);
+}

@@ -432,6 +432,8 @@ pub struct QueryRequest {
     pub exact: bool,
     /// `[attr, "asc" | "desc"]`: every admitted document in that order, instead of a relevance
     /// ranking (M9e). `attr` may be `id`, which is how an index is exported, a page at a time.
+    /// Or a list of 1 to 8 such pairs (M140), ordered key by key, then by id; `id` may only
+    /// be the last.
     #[serde(default)]
     pub rank_by: Option<serde_json::Value>,
     /// `{label: ["Count" | "Sum", attr]}`: counts and sums instead of rows (M12). Parsed by

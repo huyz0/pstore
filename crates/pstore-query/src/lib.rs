@@ -25,7 +25,7 @@ pub use filter::{
     Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Needle, Op, Pattern, PatternKind, Predicate, TokenOp,
 };
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
-pub use order::{OrderBy, Selector, select};
+pub use order::{MAX_KEYS, Order, OrderBy, Selector, select};
 pub use run::{
     Elsewhere, OpenPart, PartHits, Prefetch, QueryError, Share, SumCut, Target, only, open_part,
     part, query, query_rows_filtered, query_rows_split, query_with, scan_part, splittable,
