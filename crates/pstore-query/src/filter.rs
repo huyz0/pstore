@@ -35,6 +35,10 @@ pub enum TokenOp {
     Any,
     /// They appear consecutively and in order: `ContainsTokenSequence`.
     Sequence,
+    /// [`Self::All`], the last raw token a prefix: `last_as_prefix` (M138).
+    AllPrefix,
+    /// [`Self::Any`], the last raw token a prefix: `last_as_prefix` (M138).
+    AnyPrefix,
 }
 
 /// A token predicate's analyzer, and its text already analyzed by it (M14.2): analyzed once
@@ -43,15 +47,30 @@ pub enum TokenOp {
 pub struct Bound {
     analyzer: pstore_format::text::Analyzer,
     query: Vec<String>,
+    /// The literal prefix of a `*Prefix` op (M138): the last raw token as [`plain`] makes it.
+    prefix: Option<String>,
 }
 
 impl Bound {
-    /// `text` analyzed by `analyzer`.
+    /// `text` analyzed by `analyzer` for `op`. A prefix op splits off the last raw token as a
+    /// literal prefix, and analyzes the text before it (M138).
     #[must_use]
-    pub fn new(analyzer: pstore_format::text::Analyzer, text: &str) -> Self {
-        Self {
-            analyzer,
-            query: pstore_format::text::analyze(&analyzer, text),
+    pub fn new(analyzer: pstore_format::text::Analyzer, op: TokenOp, text: &str) -> Self {
+        use pstore_format::text::{analyze, tokens};
+        let last = matches!(op, TokenOp::AllPrefix | TokenOp::AnyPrefix)
+            .then(|| tokens(&analyzer, text).pop())
+            .flatten();
+        match last {
+            Some(t) => Self {
+                analyzer,
+                query: analyze(&analyzer, text.get(..t.span.start).unwrap_or_default()),
+                prefix: analyze(&plain(&analyzer), text.get(t.span).unwrap_or_default()).pop(),
+            },
+            None => Self {
+                analyzer,
+                query: analyze(&analyzer, text),
+                prefix: None,
+            },
         }
     }
 
@@ -59,6 +78,16 @@ impl Bound {
     #[must_use]
     pub fn analyzer(&self) -> &pstore_format::text::Analyzer {
         &self.analyzer
+    }
+}
+
+/// `a` with neither stemming nor stopword removal (M138): what a literal prefix, and the row
+/// tokens it is matched against, are made with. Case and folding stay the index's.
+fn plain(a: &pstore_format::text::Analyzer) -> pstore_format::text::Analyzer {
+    pstore_format::text::Analyzer {
+        stemming: false,
+        remove_stopwords: false,
+        ..*a
     }
 }
 
@@ -363,6 +392,11 @@ pub enum Predicate {
     /// An array holding an element equal to one of these (M9h.2). `Contains x` is
     /// `ContainsAny [x]`. A scalar or absent attribute is false; an empty list admits nothing.
     ContainsAny(String, Vec<Value>),
+    /// An array holding an element `e` with `e op value`, compared as [`Self::Cmp`] compares
+    /// (M135): `AnyLt`, `AnyLte`, `AnyGt`, `AnyGte`. An element of another type is false for
+    /// that element; a scalar, absent or empty attribute is false. The operator is never
+    /// [`Op::Eq`]: that is [`Self::ContainsAny`].
+    AnyCmp(String, Op, Value),
     /// Every clause; `And []` is true.
     And(Vec<Predicate>),
     /// Any clause; `Or []` is false.
@@ -421,6 +455,7 @@ impl Predicate {
             | Self::Absent(name)
             | Self::In(name, _)
             | Self::ContainsAny(name, _)
+            | Self::AnyCmp(name, ..)
             | Self::Tokens(name, ..)
             | Self::Pattern(name, _)
             | Self::Fuzzy(name, ..)
@@ -447,7 +482,7 @@ impl Predicate {
                 name.clone(),
                 *op,
                 text.clone(),
-                Some(Bound::new(*analyzer, text)),
+                Some(Bound::new(*analyzer, *op, text)),
             ),
             Self::And(all) => Self::And(all.iter().map(|p| p.bound(analyzer)).collect()),
             Self::Or(any) => Self::Or(any.iter().map(|p| p.bound(analyzer)).collect()),
@@ -482,13 +517,27 @@ impl Predicate {
                     .any(|have| set.iter().any(|w| compare(have, Op::Eq, w))),
                 _ => false,
             },
+            Self::AnyCmp(name, op, want) => match get(name).as_deref() {
+                Some(Value::Array(items)) => items.iter().any(|have| compare(have, *op, want)),
+                _ => false,
+            },
             Self::And(all) => all.iter().all(|p| p.holds(id, attrs)),
             Self::Or(any) => any.iter().any(|p| p.holds(id, attrs)),
             Self::Not(p) => !p.holds(id, attrs),
             // Unbound never reaches here: `admits` checked first.
+            // M138: a string array is its string elements, each analyzed alone; one with none
+            // admits nothing, as a number does.
             Self::Tokens(name, op, _, bound) => match (get(name).as_deref(), bound) {
-                (Some(Value::Str(s)), Some(b)) => {
-                    tokens_match(*op, &b.query, &pstore_format::text::analyze(&b.analyzer, s))
+                (Some(Value::Str(s)), Some(b)) => tokens_match(*op, b, &[s.as_str()]),
+                (Some(Value::Array(items)), Some(b)) => {
+                    let elems: Vec<&str> = items
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Str(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    !elems.is_empty() && tokens_match(*op, b, &elems)
                 }
                 _ => false,
             },
@@ -570,7 +619,7 @@ impl Predicate {
             Self::Or(any) => any.iter().any(|p| p.could_admit(zones)),
             // An array has no zone (M9h.2), and a zone of the name's scalars says nothing of
             // the arrays beside them.
-            Self::ContainsAny(..) | Self::Absent(_) | Self::Not(_) => true,
+            Self::ContainsAny(..) | Self::AnyCmp(..) | Self::Absent(_) | Self::Not(_) => true,
             // Tokens have no zone: every block could hold a match (M14.2). Nor has a
             // location, an array of two numbers (M66).
             Self::Tokens(..) | Self::GeoRadius(..) | Self::GeoBox(..) => true,
@@ -595,13 +644,35 @@ impl Predicate {
     }
 }
 
-/// Whether a row's tokens satisfy `op` against the query's (M14.2). An empty query is the
-/// vacuous reading: every string for `All` and `Sequence`, none for `Any`.
-fn tokens_match(op: TokenOp, query: &[String], row: &[String]) -> bool {
+/// Whether a row's string elements satisfy `op` against the bound query (M14.2, M138). An
+/// empty query is the vacuous reading: every string for `All` and `Sequence`, none for `Any`.
+/// `All` and `Any` look across the elements together; a sequence lies within one element.
+fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
+    use pstore_format::text::analyze;
+    let rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
+    let has = |q: &String| rows.iter().any(|r| r.contains(q));
+    // Only a prefix op analyzes the row a second time.
+    let prefixed = || {
+        b.prefix.as_ref().is_some_and(|p| {
+            elems.iter().any(|e| {
+                analyze(&plain(&b.analyzer), e)
+                    .iter()
+                    .any(|f| f.starts_with(p.as_str()))
+            })
+        })
+    };
+    let query = &b.query;
     match op {
-        TokenOp::All => query.iter().all(|q| row.contains(q)),
-        TokenOp::Any => query.iter().any(|q| row.contains(q)),
-        TokenOp::Sequence => query.is_empty() || row.windows(query.len()).any(|w| w == query),
+        TokenOp::All => query.iter().all(has),
+        TokenOp::Any => query.iter().any(has),
+        TokenOp::Sequence => {
+            query.is_empty()
+                || rows
+                    .iter()
+                    .any(|r| r.windows(query.len()).any(|w| w == query))
+        }
+        TokenOp::AllPrefix => query.iter().all(has) && (b.prefix.is_none() || prefixed()),
+        TokenOp::AnyPrefix => query.iter().any(has) || prefixed(),
     }
 }
 
@@ -1006,9 +1077,10 @@ mod tests {
         assert!(yes(tok(TokenOp::All, "")));
         assert!(yes(tok(TokenOp::Sequence, "!!")));
         assert!(!yes(tok(TokenOp::Any, "")));
-        // An array of strings, or a missing attribute, admits nothing.
+        // An array of strings is matched element by element (M138, reversing M14.2); a missing
+        // attribute admits nothing.
         let arr = Predicate::Tokens("arr".to_owned(), TokenOp::Any, "fox".to_owned(), None);
-        assert!(!yes(arr));
+        assert!(yes(arr));
         assert!(!yes(Predicate::Tokens(
             "no".to_owned(),
             TokenOp::All,
@@ -1032,5 +1104,271 @@ mod tests {
             );
         }
         assert!(tok(TokenOp::All, "x").could_admit(&Zones::default()));
+    }
+
+    #[test]
+    fn any_comparisons_match_the_reference() {
+        // M135 criterion 1: every row shape against every literal, each operator, and the
+        // compositions a client writes. The reference is the scalar comparison applied to each
+        // element of an array, and false for anything that is not an array.
+        let scalars = [
+            Value::Int(-1),
+            Value::Int(2),
+            Value::Float(1.5),
+            Value::Float(2.0),
+            Value::Str("b".to_owned()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::DateTime(1_000_000),
+        ];
+        let mut rows: Vec<Option<Value>> = vec![None, Some(Value::Array(vec![]))];
+        for a in &scalars {
+            rows.push(Some(a.clone()));
+            rows.push(Some(Value::Array(vec![a.clone()])));
+            for b in &scalars {
+                rows.push(Some(Value::Array(vec![a.clone(), b.clone()])));
+            }
+        }
+        let literals = [
+            Value::Int(-2),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Float(1.5),
+            Value::Float(1.75),
+            Value::Str("a".to_owned()),
+            Value::Str("b".to_owned()),
+            Value::Str("c".to_owned()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::DateTime(999_999),
+            Value::DateTime(1_000_000),
+            Value::Str("1970-01-01T00:00:01Z".to_owned()),
+            Value::Str("1970-01-01T00:00:02Z".to_owned()),
+        ];
+        let at = |v: &Option<Value>| -> BTreeMap<String, Value> {
+            v.iter().map(|v| ("a".to_owned(), v.clone())).collect()
+        };
+        let reference = |op: Op, want: &Value, v: &Option<Value>| match v {
+            Some(Value::Array(items)) => items.iter().any(|e| {
+                Predicate::Cmp("a".to_owned(), op, want.clone()).admits("x", &at(&Some(e.clone())))
+            }),
+            _ => false,
+        };
+        let mut admitted = 0;
+        for op in [Op::Lt, Op::Lte, Op::Gt, Op::Gte] {
+            for want in &literals {
+                let any = Predicate::AnyCmp("a".to_owned(), op, want.clone());
+                let not = |p: Predicate| Predicate::Not(Box::new(p));
+                let has = Predicate::ContainsAny("a".to_owned(), vec![want.clone()]);
+                for v in &rows {
+                    let r = reference(op, want, v);
+                    let c = has.admits("x", &at(v));
+                    let row = at(v);
+                    let case = format!("{op:?} {want:?} over {v:?}");
+                    assert_eq!(any.admits("x", &row), r, "{case}");
+                    assert_eq!(not(any.clone()).admits("x", &row), !r, "Not {case}");
+                    assert_eq!(not(not(any.clone())).admits("x", &row), r, "Not Not {case}");
+                    let and = Predicate::And(vec![any.clone(), has.clone()]);
+                    assert_eq!(and.admits("x", &row), r && c, "And {case}");
+                    let or = Predicate::Or(vec![any.clone(), has.clone()]);
+                    assert_eq!(or.admits("x", &row), r || c, "Or {case}");
+                    admitted += usize::from(r);
+                }
+                // An array has no zone: a block is never ruled out.
+                assert!(any.could_admit(&zones(&[("a", 100, 200)])));
+                assert_eq!(any.names(), vec!["a"]);
+            }
+        }
+        // The corpus is not vacuous: both outcomes occur.
+        assert!(admitted > 0 && admitted < 4 * literals.len() * rows.len());
+    }
+
+    /// M138's reference for a token predicate, written from the spec rather than the code:
+    /// per string element, the analyzer's terms and the `plain` forms (no stemming, no
+    /// stopwords); the prefix the last `plain` form of the query.
+    fn token_reference(
+        op: TokenOp,
+        a: &pstore_format::text::Analyzer,
+        q: &str,
+        v: Option<&Value>,
+    ) -> bool {
+        use pstore_format::text::{Analyzer, analyze, tokens};
+        let elems: Vec<&str> = match v {
+            Some(Value::Str(s)) => vec![s.as_str()],
+            Some(Value::Array(xs)) => xs
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        if elems.is_empty() {
+            return false;
+        }
+        let plain = Analyzer {
+            stemming: false,
+            remove_stopwords: false,
+            ..*a
+        };
+        let prefixed = matches!(op, TokenOp::AllPrefix | TokenOp::AnyPrefix);
+        let raw = analyze(&plain, q);
+        let (terms, prefix) = match (prefixed, raw.last(), tokens(a, q).last()) {
+            (true, Some(last), Some(t)) => (analyze(a, &q[..t.span.start]), Some(last.clone())),
+            _ => (analyze(a, q), None),
+        };
+        let rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(a, e)).collect();
+        let forms: Vec<Vec<String>> = elems.iter().map(|e| analyze(&plain, e)).collect();
+        let has = |t: &String| rows.iter().any(|r| r.contains(t));
+        let pre = |p: &String| forms.iter().flatten().any(|f| f.starts_with(p.as_str()));
+        match op {
+            TokenOp::All | TokenOp::AllPrefix => {
+                terms.iter().all(has) && prefix.as_ref().is_none_or(pre)
+            }
+            TokenOp::Any | TokenOp::AnyPrefix => {
+                terms.iter().any(has) || prefix.as_ref().is_some_and(pre)
+            }
+            TokenOp::Sequence => {
+                terms.is_empty()
+                    || rows
+                        .iter()
+                        .any(|r| r.windows(terms.len()).any(|w| w == terms))
+            }
+        }
+    }
+
+    fn analyzers() -> Vec<pstore_format::text::Analyzer> {
+        use pstore_format::text::Analyzer;
+        vec![
+            Analyzer::default(),
+            Analyzer {
+                stemming: true,
+                remove_stopwords: true,
+                ..Analyzer::default()
+            },
+            Analyzer {
+                case_sensitive: true,
+                ..Analyzer::default()
+            },
+            Analyzer {
+                ascii_folding: true,
+                ..Analyzer::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn token_predicates_over_arrays_and_prefixes_match_the_reference() {
+        // M138 criterion 1.
+        let s = |x: &str| Value::Str(x.to_owned());
+        let arr = |xs: &[&str]| Value::Array(xs.iter().map(|x| s(x)).collect());
+        let rows: Vec<Option<Value>> = vec![
+            None,
+            Some(s("")),
+            Some(s("The quick brown Fox")),
+            Some(s("running theories café")),
+            Some(Value::Array(vec![])),
+            Some(Value::Array(vec![Value::Int(5)])),
+            Some(arr(&["quick"])),
+            Some(arr(&["quick", "brown fox"])),
+            Some(arr(&["the quick", "the quick"])),
+            Some(arr(&["Runs", "Café theory"])),
+            Some(Value::Array(vec![
+                Value::Int(5),
+                s("brown"),
+                Value::Bool(true),
+            ])),
+            Some(Value::Int(7)),
+        ];
+        let queries = [
+            "",
+            "!!",
+            "fox",
+            "the",
+            "qu",
+            "quick brown",
+            "brown fox",
+            "quick fox",
+            "run",
+            "running",
+            "theory",
+            "cafe",
+            "Caf",
+            "the quick br",
+            "FOX the",
+        ];
+        let ops = [
+            TokenOp::All,
+            TokenOp::Any,
+            TokenOp::Sequence,
+            TokenOp::AllPrefix,
+            TokenOp::AnyPrefix,
+        ];
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        for a in analyzers() {
+            for op in ops {
+                for q in queries {
+                    let p = Predicate::Tokens("t".to_owned(), op, q.to_owned(), None).bound(&a);
+                    for v in &rows {
+                        let row: BTreeMap<String, Value> =
+                            v.iter().map(|v| ("t".to_owned(), v.clone())).collect();
+                        let want = token_reference(op, &a, q, v.as_ref());
+                        let case = format!("{op:?} {q:?} over {v:?} with {a:?}");
+                        assert_eq!(p.admits("x", &row), want, "{case}");
+                        let not = Predicate::Not(Box::new(p.clone()));
+                        assert_eq!(not.admits("x", &row), !want, "Not {case}");
+                        let not2 = Predicate::Not(Box::new(not));
+                        assert_eq!(not2.admits("x", &row), want, "Not Not {case}");
+                        if want {
+                            admitted += 1;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 0 && refused > 0,
+            "{admitted} admitted, {refused} refused"
+        );
+    }
+
+    #[test]
+    fn a_prefix_is_neither_stemmed_nor_dropped() {
+        // M138 criterion 2, English stemming and stopwords on; each case a scalar string.
+        use pstore_format::text::Analyzer;
+        let en = Analyzer {
+            stemming: true,
+            remove_stopwords: true,
+            ..Analyzer::default()
+        };
+        let folded = Analyzer {
+            ascii_folding: true,
+            ..en
+        };
+        let yes = |a: &Analyzer, q: &str, row: &str| {
+            let p =
+                Predicate::Tokens("t".to_owned(), TokenOp::AllPrefix, q.to_owned(), None).bound(a);
+            p.admits(
+                "x",
+                &BTreeMap::from([("t".to_owned(), Value::Str(row.to_owned()))]),
+            )
+        };
+        assert!(yes(&en, "run", "running"));
+        // Stemmed, both pairs would match: run/run and theori/theori.
+        assert!(!yes(&en, "running", "runs"));
+        assert!(!yes(&en, "theory", "theories"));
+        // A stopword as the prefix, and against a row the analyzer would drop it from.
+        assert!(yes(&en, "the", "theory"));
+        assert!(yes(&en, "quick the", "the quick"));
+        assert!(!yes(&en, "quick the", "a quick"));
+        // Never a shorter token.
+        assert!(!yes(&en, "runner", "run"));
+        assert!(yes(&folded, "cafe", "Café"));
+        assert!(!yes(&en, "cafe", "Café"));
     }
 }

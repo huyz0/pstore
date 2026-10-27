@@ -134,6 +134,8 @@ is amended: the analyzer is part of the schema, and segments are built under it.
   - `Any` admits a row whose tokens include at least one;
   - `Sequence` admits a row whose tokens hold the query's consecutively, in order.
   - A missing attribute, a non-string one, or **an array of strings** admits nothing.
+    ⚠️ **Corrected by [M138](../M138/SPEC.md):** an array holding a string is matched element by
+    element, as the vendor does; only an array with no string element admits nothing.
   - A query with no tokens admits every string for `All` and `Sequence`, and none for `Any`.
   - ⚠️ With stopwords removed, `bank of america` matches `bank in america`, because no
     positions are kept.

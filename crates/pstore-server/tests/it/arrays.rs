@@ -7,7 +7,8 @@
     reason = "assertions in tests are the reporting mechanism"
 )]
 
-//! Array attributes and `Contains`/`ContainsAny` through the API — M9h.2.
+//! Array attributes and `Contains`/`ContainsAny` through the API — M9h.2 -- and the ordered
+//! `AnyLt`/`AnyLte`/`AnyGt`/`AnyGte`, M135.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -173,6 +174,69 @@ async fn contains_finds_an_element_by_value() {
 }
 
 #[tokio::test]
+async fn any_comparisons_find_an_element_by_order() {
+    let pairs = [
+        ("a", json!([1, 5])),
+        ("b", json!([3])),
+        ("c", json!([2.5, "z"])),
+        ("w", json!(["apple", "pear"])),
+        ("e", json!([])),
+        ("s", json!(0)),
+        ("x", Value::Null),
+    ];
+    for folded in [false, true] {
+        let api = seeded(&pairs, folded).await;
+        let is = |f: Value, want: &[&str]| {
+            let api = Arc::clone(&api);
+            let want = set(want);
+            async move {
+                assert_eq!(
+                    admitted(&api, f.clone()).await,
+                    want,
+                    "folded {folded}: {f}"
+                );
+            }
+        };
+        is(json!(["n", "AnyLt", 3]), &["a", "c"]).await;
+        is(json!(["n", "AnyLte", 3]), &["a", "b", "c"]).await;
+        is(json!(["n", "AnyGt", 3]), &["a"]).await;
+        is(json!(["n", "AnyGte", 3]), &["a", "b"]).await;
+        is(json!(["n", "AnyGte", 5.0]), &["a"]).await;
+        is(json!(["n", "AnyLt", 1]), &[]).await;
+        // Strings by bytes, and only against string elements.
+        is(json!(["n", "AnyLt", "b"]), &["w"]).await;
+        is(json!(["n", "AnyGte", "pear"]), &["c", "w"]).await;
+        // A scalar, an empty array and an absent attribute are never an element.
+        is(json!(["Not", ["n", "AnyGt", -100]]), &["e", "s", "w", "x"]).await;
+        is(json!(["n", "Lt", 3]), &["s"]).await;
+    }
+}
+
+#[tokio::test]
+async fn delete_by_filter_takes_any_comparisons() {
+    // A by-filter delete is evaluated at the fold, over rows written before it, folded or not.
+    for folded in [false, true] {
+        let api = seeded(
+            &[("a", json!([1, 5])), ("b", json!([3])), ("s", json!(9))],
+            folded,
+        )
+        .await;
+        let (s, b) = put(
+            &api,
+            &json!({"durability": "durable", "delete_by_filter": ["n", "AnyGte", 5]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        fold(&api).await;
+        assert_eq!(
+            admitted(&api, json!(["id", "NotEq", ""])).await,
+            set(&["b", "s"]),
+            "folded {folded}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn what_an_array_cannot_hold_is_refused() {
     for attrs in [
         json!({"n": [[1]]}),
@@ -197,10 +261,15 @@ async fn what_an_array_cannot_hold_is_refused() {
         json!(["n", "ContainsAny", 1]),
         json!(["n", "ContainsAny", [[1]]]),
         json!(["n", "ContainsAny", [null]]),
+        json!(["n", "AnyLt", [1]]),
+        json!(["n", "AnyGte", null]),
+        json!(["n", "AnyGt", {"k": 1}]),
     ] {
         let q = json!({"vector": [1.0, 0.5], "filters": f});
         let (s, b) = query(&api, &q).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{f} was accepted: {b}");
+        // M135: refused for its literal, not as an operator nobody knows.
+        assert!(!b.to_string().contains("unknown operator"), "{f}: {b}");
     }
 }
 

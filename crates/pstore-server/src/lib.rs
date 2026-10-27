@@ -42,6 +42,7 @@ pub use peer_http::PeerTransport;
 mod peer_tls;
 mod peer_wire;
 mod ref_new;
+mod rerank;
 #[cfg(test)]
 #[path = "../tests/support/tls.rs"]
 mod tls_for_tests;
@@ -2449,7 +2450,7 @@ async fn query_index<S: BlobStore + 'static>(
             &session,
         ));
     }
-    let reqs = multi_query(raw)?;
+    let (reqs, outer) = multi_query(raw)?;
     reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
@@ -2490,7 +2491,14 @@ async fn query_index<S: BlobStore + 'static>(
                 session: session.clone(),
                 staleness_ms: got.iter().map(|g| g.staleness_ms).collect(),
             },
-            results: got.into_iter().map(|g| g.results).collect(),
+            results: {
+                let lists = got.into_iter().map(|g| g.results).collect();
+                match &outer {
+                    // M142: one list, the fused one.
+                    Some(outer) => vec![rerank::fuse_outer(lists, outer)],
+                    None => lists,
+                }
+            },
         }),
         &session,
     ))
@@ -2524,19 +2532,43 @@ fn checked_query(req: QueryRequest) -> Result<QueryRequest, ApiError> {
     Ok(req)
 }
 
-/// `{"queries": [...]}`'s sub-queries (M9g): 1 to 16, alone in the body, none nested.
+/// The root keys a multi-query may carry besides `queries` (M142): its outer fusion.
+const OUTER_KEYS: [&str; 3] = ["rerank_by", "limit", "offset"];
+
+/// `{"queries": [...]}`'s sub-queries (M9g): 1 to 16, none nested -- and its outer fusion,
+/// when the root names `rerank_by` (M142). Every other root key is refused.
 ///
 /// ⚠️ Takes the body by value (M119): each sub-query was deep-copied, vector and all, only to
 /// hand `parse_query` one it could own.
-fn multi_query(raw: serde_json::Value) -> Result<Vec<QueryRequest>, ApiError> {
-    if raw.as_object().is_some_and(|o| o.len() > 1) {
+fn multi_query(
+    raw: serde_json::Value,
+) -> Result<(Vec<QueryRequest>, Option<rerank::Outer>), ApiError> {
+    if raw.as_object().is_some_and(|o| {
+        o.keys()
+            .any(|k| k != "queries" && !OUTER_KEYS.contains(&k.as_str()))
+    }) {
         return Err(ApiError::bad_request(
-            "queries is the whole request: each query carries its own fields",
+            "queries is the whole request, beside rerank_by, limit and offset: each query \
+             carries its own fields",
         ));
     }
-    let subs = match raw {
+    let (subs, outer) = match raw {
         serde_json::Value::Object(mut o) => match o.remove("queries") {
-            Some(serde_json::Value::Array(a)) if (1..=MAX_QUERIES).contains(&a.len()) => Some(a),
+            Some(serde_json::Value::Array(a)) if (1..=MAX_QUERIES).contains(&a.len()) => {
+                let outer = match o.get("rerank_by") {
+                    Some(r) => Some(
+                        rerank::Outer::parse(r, o.get("limit"), o.get("offset"), a.len())
+                            .map_err(ApiError::bad_request)?,
+                    ),
+                    None if o.is_empty() => None,
+                    None => {
+                        return Err(ApiError::bad_request(
+                            "limit and offset apply only beside rerank_by",
+                        ));
+                    }
+                };
+                Some((a, outer))
+            }
             _ => None,
         },
         _ => None,
@@ -2544,7 +2576,8 @@ fn multi_query(raw: serde_json::Value) -> Result<Vec<QueryRequest>, ApiError> {
     .ok_or_else(|| {
         ApiError::bad_request(format!("queries is an array of 1 to {MAX_QUERIES} queries"))
     })?;
-    subs.into_iter()
+    let subs = subs
+        .into_iter()
         .map(|q| {
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
@@ -2562,7 +2595,8 @@ fn multi_query(raw: serde_json::Value) -> Result<Vec<QueryRequest>, ApiError> {
             }
             parse_query(q)
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((subs, outer))
 }
 
 /// An aggregation's labels, groups and bound (M12), or `None` for a query that asks for rows.
@@ -4266,6 +4300,36 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             })
         }
         [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(clause(inner)?))),
+        // M138: the vendor's options element, on the two token operators that take one. Its
+        // only key is `last_as_prefix`; `{}` and `false` mean the three-element clause.
+        [attr, op, value, opts] => {
+            if op != "ContainsAllTokens" && op != "ContainsAnyToken" {
+                return Err(bad(format!(
+                    "{op} takes no options: only ContainsAllTokens and ContainsAnyToken do"
+                )));
+            }
+            let o = opts
+                .as_object()
+                .filter(|o| o.keys().all(|k| k == "last_as_prefix"))
+                .ok_or_else(|| bad(format!("{op}'s options are {{\"last_as_prefix\": bool}}")))?;
+            let prefix = match o.get("last_as_prefix") {
+                None => false,
+                Some(b) => b
+                    .as_bool()
+                    .ok_or_else(|| bad("last_as_prefix is true or false".to_owned()))?,
+            };
+            let p = clause(&serde_json::json!([attr, op, value]))?;
+            Ok(match p {
+                Predicate::Tokens(a, how, text, b) if prefix => {
+                    let how = match how {
+                        pstore_query::TokenOp::All => pstore_query::TokenOp::AllPrefix,
+                        _ => pstore_query::TokenOp::AnyPrefix,
+                    };
+                    Predicate::Tokens(a, how, text, b)
+                }
+                p => p,
+            })
+        }
         [attr, op, value] => {
             let attr = attr
                 .as_str()
@@ -4296,6 +4360,11 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
                 "Lte" => cmp(Op::Lte),
                 "Gt" => cmp(Op::Gt),
                 "Gte" => cmp(Op::Gte),
+                // M135: an array holding an element in that order to the literal.
+                "AnyLt" => Ok(Predicate::AnyCmp(attr, Op::Lt, scalar(value)?)),
+                "AnyLte" => Ok(Predicate::AnyCmp(attr, Op::Lte, scalar(value)?)),
+                "AnyGt" => Ok(Predicate::AnyCmp(attr, Op::Gt, scalar(value)?)),
+                "AnyGte" => Ok(Predicate::AnyCmp(attr, Op::Gte, scalar(value)?)),
                 // M9h.2: `Contains x` is `ContainsAny [x]`, over an array attribute's elements.
                 "Contains" | "NotContains" => {
                     let p = Predicate::ContainsAny(attr, vec![scalar(value)?]);
