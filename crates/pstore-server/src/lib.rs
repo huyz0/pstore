@@ -1771,6 +1771,95 @@ fn patch_by_filter_of(
     Ok((filter, patch))
 }
 
+/// What a write's operations will hold in its tenant's buffer (M141), by
+/// [`pstore_format::Document::footprint`]'s rules: documents, each patch's id and
+/// attributes, each delete's tombstone, each by-filter operation's encoded filter, and an
+/// applied request's `stamp` on every row. An estimate: the engine trues it up to the
+/// stored rows as they are buffered.
+fn write_footprint(
+    docs: &[Document],
+    patches: &[pstore_engine::Patch],
+    deletes: &[String],
+    delete_by: Option<&pstore_query::Predicate>,
+    patch_by: Option<&(pstore_query::Predicate, pstore_engine::Patch)>,
+    stamp: u64,
+) -> u64 {
+    let patch = |p: &pstore_engine::Patch| {
+        p.id.len() as u64
+            + p.set
+                .iter()
+                .map(|(k, v)| k.len() as u64 + v.footprint())
+                .sum::<u64>()
+            + p.unset.iter().map(|k| k.len() as u64).sum::<u64>()
+    };
+    let filter = |f: &pstore_query::Predicate| pstore_query::condition::encode(f).len() as u64;
+    // A delete is stored as a tombstone: its id and an 8-byte mark under an empty name.
+    let rows = docs.len()
+        + patches.len()
+        + deletes.len()
+        + usize::from(delete_by.is_some())
+        + usize::from(patch_by.is_some());
+    docs.iter().map(Document::footprint).sum::<u64>()
+        + patches.iter().map(patch).sum::<u64>()
+        + deletes.iter().map(|d| d.len() as u64 + 8).sum::<u64>()
+        + delete_by.map_or(0, filter)
+        + patch_by.map_or(0, |(f, p)| filter(f) + patch(p))
+        + rows as u64 * stamp
+}
+
+/// Reserves `bytes` of `tenant`'s buffer for one write (M141), flushing first when a
+/// batched write would pass the flush bound, or refuses.
+///
+/// ⚠️ **The flush bound is soft**: one flush, then the reservation is retried without it,
+/// so writes racing this one can pass it by their own size. The buffer bound is hard.
+async fn reserve_buffer<'e, S: BlobStore + 'static>(
+    api: &Api<S>,
+    tenant: TenantId,
+    engine: &'e Tenant<S>,
+    bytes: u64,
+    batched: bool,
+) -> Result<pstore_engine::BufferReservation<'e>, ApiError> {
+    let limits = api.ingress.limits();
+    if bytes > limits.tenant_buffered_bytes() {
+        return Err(ApiError {
+            message: "the write's rows are larger than a tenant's buffer bound".to_owned(),
+            ..ingress::too_large()
+        });
+    }
+    let bounds = pstore_engine::BufferBounds {
+        flush_at: batched.then_some(limits.tenant_flush_bytes()),
+        cap: limits.tenant_buffered_bytes(),
+    };
+    let refused = match engine.reserve_buffer(bytes, bounds) {
+        Ok(r) => return Ok(r),
+        Err(pstore_engine::BufferRefusal::Flush) => {
+            engine.flush().await?;
+            match engine.reserve_buffer(
+                bytes,
+                pstore_engine::BufferBounds {
+                    flush_at: None,
+                    ..bounds
+                },
+            ) {
+                Ok(r) => return Ok(r),
+                Err(e) => e,
+            }
+        }
+        Err(e) => e,
+    };
+    debug_assert_eq!(refused, pstore_engine::BufferRefusal::Full);
+    api.requested
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(tenant);
+    Err(ApiError {
+        message: "this tenant's buffered rows are at their bound; a fold has been requested, \
+                  retry once it commits (with scheduled folds off, POST /v1/admin/fold)"
+            .to_owned(),
+        ..ingress::overloaded()
+    })
+}
+
 /// `PUT /v1/indexes/{index}/documents`.
 async fn write_documents<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -1937,6 +2026,17 @@ async fn write_documents<S: BlobStore + 'static>(
         None => None,
     };
     let deletes = std::mem::take(&mut req.deletes);
+    // M141: the whole request's share of the tenant's buffer, before anything is buffered.
+    let need = write_footprint(
+        &docs,
+        &patches,
+        &deletes,
+        delete_by.as_ref(),
+        patch_by.as_ref(),
+        pstore_engine::stamp_footprint(op, ids_wanted, key.as_ref()),
+    );
+    let batched = matches!(req.durability, types::Durability::Batched);
+    let reserved = reserve_buffer(&api, tenant, &engine, need, batched).await?;
     let buffer = async {
         let written = docs.len();
         if !docs.is_empty() {
@@ -1973,8 +2073,9 @@ async fn write_documents<S: BlobStore + 'static>(
         }
         Ok::<_, ApiError>((written, patched, deleted))
     };
-    let (written, patched, deleted) =
-        pstore_engine::stamped(op, ids_wanted, key.as_ref(), buffer).await?;
+    let (written, patched, deleted) = reserved
+        .scope(pstore_engine::stamped(op, ids_wanted, key.as_ref(), buffer))
+        .await?;
     let durable = matches!(
         req.durability,
         types::Durability::Durable | types::Durability::Applied

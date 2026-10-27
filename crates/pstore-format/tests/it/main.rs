@@ -11,6 +11,7 @@ mod corrupt;
 mod external;
 mod fde;
 mod fields;
+mod footprint;
 mod geo;
 mod guards;
 mod ids_at;

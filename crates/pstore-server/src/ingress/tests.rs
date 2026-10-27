@@ -25,6 +25,8 @@ fn version_one_defaults_are_the_documented_contract() {
     assert_eq!(d.tenant_active_requests(), 8);
     assert_eq!(d.reserved_body_bytes(), 128 * 1024 * 1024);
     assert_eq!(d.body_read_timeout(), Duration::from_secs(30));
+    assert_eq!(d.tenant_flush_bytes(), 8 * 1024 * 1024);
+    assert_eq!(d.tenant_buffered_bytes(), 64 * 1024 * 1024);
     assert_eq!(read(None), Ok(d));
     assert_eq!(read(Some(r#"{"version":1}"#)), Ok(d));
     assert_eq!(RequestLimits::builder().build(), Ok(d));
@@ -34,7 +36,8 @@ fn version_one_defaults_are_the_documented_contract() {
 fn configuration_lowers_each_limit() {
     let got = read(Some(
         r#"{"version":1,"body_bytes":100,"active_requests":4,"tenant_active_requests":2,
-            "reserved_body_bytes":300,"body_read_timeout_ms":250}"#,
+            "reserved_body_bytes":300,"body_read_timeout_ms":250,
+            "tenant_flush_bytes":1000,"tenant_buffered_bytes":5000}"#,
     ))
     .unwrap();
     assert_eq!(got.body_bytes(), 100);
@@ -42,6 +45,14 @@ fn configuration_lowers_each_limit() {
     assert_eq!(got.tenant_active_requests(), 2);
     assert_eq!(got.reserved_body_bytes(), 300);
     assert_eq!(got.body_read_timeout(), Duration::from_millis(250));
+    assert_eq!(got.tenant_flush_bytes(), 1000);
+    assert_eq!(got.tenant_buffered_bytes(), 5000);
+    let same = RequestLimits::builder()
+        .tenant_flush_bytes(7)
+        .tenant_buffered_bytes(7)
+        .build()
+        .unwrap();
+    assert_eq!(same.tenant_buffered_bytes(), same.tenant_flush_bytes());
     // The tenant may hold every global slot, and the pool exactly one body.
     let edge = RequestLimits::builder()
         .active_requests(3)
@@ -132,6 +143,26 @@ fn unsafe_or_malformed_configuration_is_refused() {
         (
             r#"{"version":1,"body_bytes":100,"reserved_body_bytes":99}"#,
             LimitsError::PoolBelowBody,
+        ),
+        (
+            r#"{"version":1,"tenant_flush_bytes":0}"#,
+            LimitsError::Zero("tenant_flush_bytes"),
+        ),
+        (
+            r#"{"version":1,"tenant_buffered_bytes":0}"#,
+            LimitsError::Zero("tenant_buffered_bytes"),
+        ),
+        (
+            r#"{"version":1,"tenant_flush_bytes":8388609}"#,
+            LimitsError::AboveDefault("tenant_flush_bytes"),
+        ),
+        (
+            r#"{"version":1,"tenant_buffered_bytes":67108865}"#,
+            LimitsError::AboveDefault("tenant_buffered_bytes"),
+        ),
+        (
+            r#"{"version":1,"tenant_flush_bytes":100,"tenant_buffered_bytes":99}"#,
+            LimitsError::BufferBelowFlush,
         ),
     ] {
         assert_eq!(read(Some(raw)), Err(want), "{raw}");

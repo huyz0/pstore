@@ -215,14 +215,17 @@ impl Kind {
     }
 }
 
-/// Stamps `docs` when the current task is applying (M129): each carries the request's id,
-/// and an unconditional upsert or delete becomes the deferred kind with no condition, so
-/// the fold resolves it against the current version. That is what makes `deleted` mean a
-/// version existed.
-pub(crate) fn stamp(docs: &mut [Document], tombstone: impl Fn(&Document) -> bool) {
-    let Ok((op, ids, key)) = APPLYING.try_with(|a| *a) else {
-        return;
-    };
+/// The bytes [`stamp`] adds to each row of a request stamped as `op`'s (M141).
+#[must_use]
+pub fn stamp_footprint(op: Option<OperationId>, ids: bool, key: Option<&IdempotencyKey>) -> u64 {
+    op.map_or(0, |op| {
+        let mark = crate::OP_ATTR.len() + 8;
+        (mark + REQ_ATTR.len() + request(op, ids, key.copied()).len()) as u64
+    })
+}
+
+/// What `$req` holds for `op`'s request.
+fn request(op: OperationId, ids: bool, key: Option<IdempotencyKey>) -> String {
     let mut id = op.hex();
     if ids {
         id.push_str(IDS);
@@ -231,7 +234,18 @@ pub(crate) fn stamp(docs: &mut [Document], tombstone: impl Fn(&Document) -> bool
         id.push(KEY);
         id.push_str(&k.to_string());
     }
-    let id = Value::Str(id);
+    id
+}
+
+/// Stamps `docs` when the current task is applying (M129): each carries the request's id,
+/// and an unconditional upsert or delete becomes the deferred kind with no condition, so
+/// the fold resolves it against the current version. That is what makes `deleted` mean a
+/// version existed.
+pub(crate) fn stamp(docs: &mut [Document], tombstone: impl Fn(&Document) -> bool) {
+    let Ok((op, ids, key)) = APPLYING.try_with(|a| *a) else {
+        return;
+    };
+    let id = Value::Str(request(op, ids, key));
     for d in docs {
         if !d.attrs.contains_key(crate::OP_ATTR) {
             let code = if tombstone(d) {

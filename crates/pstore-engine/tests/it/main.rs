@@ -13,6 +13,7 @@ mod analyzer;
 mod applied;
 mod arithmetic;
 mod branch;
+mod buffered;
 mod bundle_errors;
 mod centroid_skip;
 mod cold_depth;
