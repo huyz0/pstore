@@ -106,9 +106,12 @@ if [[ "${1:-}" == "--changed" ]]; then
             || { echo "# --changed: no origin/main to diff against; pass BASE" >&2; exit 2; }
     fi
     # Committed since BASE, staged, unstaged and untracked: the change as it stands.
-    paths=$( { git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
-    # shellcheck disable=SC2086 # the paths are git's, one word each
-    picked=$(printf '%s' "$metadata" | py scripts/lib/scope.py changed $paths)
+    # ⚠️ Through a file, never as arguments: from the empty tree they are 48 KB, and Windows
+    # refuses a command line over 32 KB, so `--changed` failed there before measuring anything.
+    paths=$(mktemp)
+    { git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u > "$paths"
+    picked=$(printf '%s' "$metadata" | py scripts/lib/scope.py changed "$paths")
+    rm -f "$paths"
     crates=$(printf '%s\n' "$picked" | sed -n 1p)
     ignore=$(printf '%s\n' "$picked" | sed -n 2p)
     if [[ -z "$crates" ]]; then
