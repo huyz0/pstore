@@ -340,6 +340,48 @@ fn within(a_len: usize, a: impl Iterator<Item = char>, b: &[char], k: usize) -> 
     prev.last().is_some_and(|d| *d <= k)
 }
 
+/// Whether some substring of `value`, possibly empty, is within `k` edits of `q`, in
+/// characters (M145): Sellers' table, the edit-distance table with a free start and end in
+/// the value, one row per character of the value and out at the first row that reaches `k`.
+/// Case-insensitive compares [folded](pstore_format::trigram::fold) characters, one to one.
+fn near(value: &str, q: &[char], k: usize, case_sensitive: bool) -> bool {
+    let key = |c: char| {
+        if case_sensitive {
+            c
+        } else {
+            pstore_format::trigram::fold(c)
+        }
+    };
+    let q: Vec<char> = q.iter().map(|&c| key(c)).collect();
+    // `prev[j]`: the fewest edits taking some suffix of the value read so far to `q[..j]`.
+    let mut prev: Vec<usize> = (0..=q.len()).collect();
+    let mut row = prev.clone();
+    if prev.last().is_some_and(|d| *d <= k) {
+        return true;
+    }
+    for c in value.chars().map(key) {
+        let mut left = 0;
+        if let Some(first) = row.first_mut() {
+            *first = 0;
+        }
+        for (j, want) in q.iter().enumerate() {
+            let (Some(&diag), Some(&up)) = (prev.get(j), prev.get(j + 1)) else {
+                break;
+            };
+            let d = (diag + usize::from(c != *want)).min(up + 1).min(left + 1);
+            if let Some(cell) = row.get_mut(j + 1) {
+                *cell = d;
+            }
+            left = d;
+        }
+        if row.last().is_some_and(|d| *d <= k) {
+            return true;
+        }
+        std::mem::swap(&mut prev, &mut row);
+    }
+    false
+}
+
 /// A fuzzy predicate's value, with what every row and every block compares it by, taken once
 /// (M120): its characters, and its distinct folded trigrams.
 #[derive(Debug, Clone)]
@@ -416,6 +458,13 @@ pub enum Predicate {
     Pattern(String, Pattern),
     /// A scalar string attribute within `k` edits of the value (M15). Anything else is false.
     Fuzzy(String, Needle, u8),
+    /// The vendor's `Fuzzy` (M145): some substring of a string, or of one string element of
+    /// an array, within `k` edits of the value, comparing [folded](pstore_format::trigram::fold)
+    /// characters when the flag (case-sensitive) is false. Anything else is false.
+    ///
+    /// ⚠️ **It never prunes**: the M15.2 sketch holds only scalar strings, so a block of arrays
+    /// would read as holding none of the value's trigrams.
+    FuzzySubstring(String, Needle, u8, bool),
     /// A location within `meters` of `(lat, lon)`, inclusive (M66). An attribute that is not a
     /// location (see [`pstore_format::geo::location`]) is false.
     GeoRadius(String, f64, f64, f64),
@@ -459,6 +508,7 @@ impl Predicate {
             | Self::Tokens(name, ..)
             | Self::Pattern(name, _)
             | Self::Fuzzy(name, ..)
+            | Self::FuzzySubstring(name, ..)
             | Self::GeoRadius(name, ..)
             | Self::GeoBox(name, ..) => out.push(name),
         }
@@ -567,6 +617,16 @@ impl Predicate {
                 }
                 _ => false,
             },
+            Self::FuzzySubstring(name, v, k, case) => {
+                let hit = |s: &str| near(s, &v.chars, usize::from(*k), *case);
+                match get(name).as_deref() {
+                    Some(Value::Str(s)) => hit(s),
+                    Some(Value::Array(items)) => {
+                        items.iter().any(|e| matches!(e, Value::Str(s) if hit(s)))
+                    }
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -574,7 +634,7 @@ impl Predicate {
     #[must_use]
     pub fn patterns(&self) -> usize {
         match self {
-            Self::Pattern(..) | Self::Fuzzy(..) => 1,
+            Self::Pattern(..) | Self::Fuzzy(..) | Self::FuzzySubstring(..) => 1,
             Self::And(ps) | Self::Or(ps) => ps.iter().map(Self::patterns).sum(),
             Self::Not(p) => p.patterns(),
             _ => 0,
@@ -623,6 +683,8 @@ impl Predicate {
             // Tokens have no zone: every block could hold a match (M14.2). Nor has a
             // location, an array of two numbers (M66).
             Self::Tokens(..) | Self::GeoRadius(..) | Self::GeoBox(..) => true,
+            // M145: the sketch never saw an array's strings.
+            Self::FuzzySubstring(..) => true,
             // M15.2: a block whose sketch lacks a required trigram holds no match. No sketch,
             // or no filter for the attribute, rules nothing out.
             Self::Pattern(name, p) => zones
@@ -1104,6 +1166,137 @@ mod tests {
             );
         }
         assert!(tok(TokenOp::All, "x").could_admit(&Zones::default()));
+    }
+
+    /// M145's reference: some substring of some string element within `k` edits of `q`, by
+    /// the whole table over every start and end, on folded characters when case-insensitive.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the reference indexes its own tables"
+    )]
+    fn fuzzy_substring_reference(q: &str, k: usize, case: bool, v: Option<&Value>) -> bool {
+        let key = |s: &str| -> Vec<char> {
+            s.chars()
+                .map(|c| {
+                    if case {
+                        c
+                    } else {
+                        pstore_format::trigram::fold(c)
+                    }
+                })
+                .collect()
+        };
+        let lev = |a: &[char], b: &[char]| -> usize {
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, ca) in a.iter().enumerate() {
+                let mut row = vec![i + 1];
+                for (j, cb) in b.iter().enumerate() {
+                    let best = (prev[j] + usize::from(ca != cb))
+                        .min(prev[j + 1] + 1)
+                        .min(row[j] + 1);
+                    row.push(best);
+                }
+                prev = row;
+            }
+            prev[b.len()]
+        };
+        let q = key(q);
+        let hit = |s: &str| {
+            let s = key(s);
+            (0..=s.len()).any(|a| (a..=s.len()).any(|b| lev(&s[a..b], &q) <= k))
+        };
+        match v {
+            Some(Value::Str(s)) => hit(s),
+            Some(Value::Array(items)) => items.iter().any(|e| matches!(e, Value::Str(s) if hit(s))),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn fuzzy_substrings_match_the_reference() {
+        // M145 criterion 1.
+        let alphabet = ['a', 'A', 'é', 'É'];
+        let mut strings: Vec<String> = vec![String::new()];
+        let mut last: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            last = last
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            strings.extend(last.iter().cloned());
+        }
+        let mut rows: Vec<Option<Value>> = vec![
+            None,
+            Some(Value::Int(5)),
+            Some(Value::Array(vec![])),
+            Some(Value::Array(vec![Value::Int(5)])),
+        ];
+        rows.extend(strings.iter().map(|s| Some(Value::Str(s.clone()))));
+        for s in strings.iter().filter(|s| s.chars().count() == 4) {
+            let s = Value::Str(s.clone());
+            rows.push(Some(Value::Array(vec![
+                Value::Str(String::new()),
+                s.clone(),
+            ])));
+            rows.push(Some(Value::Array(vec![s, Value::Int(5)])));
+        }
+        let mut queries: Vec<String> = strings
+            .iter()
+            .filter(|s| s.chars().count() == 3)
+            .cloned()
+            .collect();
+        queries.extend(["aAéÉ", "ééaaA", "AAAAA"].map(str::to_owned));
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        for q in &queries {
+            for k in 0..=2u8 {
+                for case in [true, false] {
+                    let p = Predicate::FuzzySubstring("a".to_owned(), q.as_str().into(), k, case);
+                    let not = Predicate::Not(Box::new(p.clone()));
+                    let not2 = Predicate::Not(Box::new(not.clone()));
+                    for v in &rows {
+                        let row: BTreeMap<String, Value> =
+                            v.iter().map(|v| ("a".to_owned(), v.clone())).collect();
+                        let want = fuzzy_substring_reference(q, usize::from(k), case, v.as_ref());
+                        let case = format!("{q:?} k={k} case={case} over {v:?}");
+                        assert_eq!(p.admits("x", &row), want, "{case}");
+                        assert_eq!(not.admits("x", &row), !want, "Not {case}");
+                        assert_eq!(not2.admits("x", &row), want, "Not Not {case}");
+                        if want {
+                            admitted += 1;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 0 && refused > 0,
+            "{admitted} admitted, {refused} refused"
+        );
+    }
+
+    #[test]
+    fn a_fuzzy_substring_never_prunes_on_the_sketch() {
+        // M145 criterion 6: the block's scalar strings hold none of the value's trigrams, and
+        // its arrays may hold a match the sketch never saw.
+        let sketch = pstore_format::trigram::Sketch::build(&["s".to_owned()], 1, 256, |_, _| {
+            vec!["zzzz".to_owned()]
+        });
+        let zones = pstore_format::Zones {
+            sketch: Some((std::sync::Arc::new(sketch), 0)),
+            ..pstore_format::Zones::default()
+        };
+        let m15 = Predicate::Fuzzy("s".to_owned(), "abcdef".into(), 1);
+        assert!(
+            !m15.could_admit(&zones),
+            "the fixture must be one that prunes"
+        );
+        for case in [true, false] {
+            let p = Predicate::FuzzySubstring("s".to_owned(), "abcdef".into(), 1, case);
+            assert!(p.could_admit(&zones));
+            assert!(Predicate::Not(Box::new(p)).could_admit(&zones));
+        }
     }
 
     #[test]

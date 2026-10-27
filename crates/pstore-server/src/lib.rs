@@ -4246,12 +4246,87 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             })
         }
         [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(clause(inner)?))),
+        // M145: the vendor's `Fuzzy`: a query string and its options, the distance chosen here
+        // by the query's length in characters. Below every threshold it matches nothing.
+        [attr, op, value, opts] if op == "Fuzzy" => {
+            let q = value
+                .as_str()
+                .filter(|q| q.chars().count() <= 256)
+                .ok_or_else(|| {
+                    bad("Fuzzy's query is a string of at most 256 characters".to_owned())
+                })?;
+            let o =
+                opts.as_object()
+                    .filter(|o| {
+                        o.keys()
+                            .all(|k| k == "max_edit_distance" || k == "case_sensitive")
+                    })
+                    .ok_or_else(|| {
+                        bad("Fuzzy's options are {\"max_edit_distance\": [..], \"case_sensitive\": \
+                         bool}"
+                        .to_owned())
+                    })?;
+            let case = match o.get("case_sensitive") {
+                None => true,
+                Some(b) => b
+                    .as_bool()
+                    .ok_or_else(|| bad("case_sensitive is true or false".to_owned()))?,
+            };
+            let steps = o
+                .get("max_edit_distance")
+                .and_then(serde_json::Value::as_array)
+                .filter(|s| (1..=8).contains(&s.len()))
+                .ok_or_else(|| {
+                    bad("Fuzzy's max_edit_distance is a list of 1 to 8 entries".to_owned())
+                })?;
+            let n = q.chars().count() as u64;
+            let (mut k, mut floor) = (None, None);
+            for e in steps {
+                let field = |name: &str| {
+                    e.as_object()
+                        .filter(|e| e.len() == 2)
+                        .and_then(|e| e.get(name))
+                        .and_then(serde_json::Value::as_u64)
+                };
+                let (Some(m), Some(d)) = (field("min_query_chars"), field("distance")) else {
+                    return Err(bad(format!(
+                        "{e}: an entry is {{\"min_query_chars\": n, \"distance\": d}}"
+                    )));
+                };
+                let d = u8::try_from(d)
+                    .ok()
+                    .filter(|d| *d <= 2 && m >= 3 * (u64::from(*d) + 1));
+                let Some(d) = d else {
+                    return Err(bad(format!(
+                        "{e}: a distance is 0, 1 or 2, with min_query_chars at least \
+                         3 * (distance + 1)"
+                    )));
+                };
+                if floor.is_some_and(|f| m <= f) {
+                    return Err(bad(
+                        "max_edit_distance's min_query_chars strictly increase".to_owned()
+                    ));
+                }
+                floor = Some(m);
+                if m <= n {
+                    k = Some(d);
+                }
+            }
+            // The attribute is checked as every clause's is, reserved names included.
+            let p = clause(&serde_json::json!([attr, op, {"value": q, "max_edits": 0}]))?;
+            let Predicate::Fuzzy(a, v, _) = p else {
+                return Err(bad("Fuzzy takes a query string".to_owned()));
+            };
+            Ok(k.map_or(Predicate::Or(Vec::new()), |k| {
+                Predicate::FuzzySubstring(a, v, k, case)
+            }))
+        }
         // M138: the vendor's options element, on the two token operators that take one. Its
         // only key is `last_as_prefix`; `{}` and `false` mean the three-element clause.
         [attr, op, value, opts] => {
             if op != "ContainsAllTokens" && op != "ContainsAnyToken" {
                 return Err(bad(format!(
-                    "{op} takes no options: only ContainsAllTokens and ContainsAnyToken do"
+                    "{op} takes no options: only ContainsAllTokens, ContainsAnyToken and Fuzzy do"
                 )));
             }
             let o = opts
