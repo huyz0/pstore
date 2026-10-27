@@ -18,6 +18,8 @@ what the primary costs in distribution.
   `serve_open` and `serve_scan` accept the new numbers.
 - A peer that does not know a number answers 409, and the coordinator runs that part itself,
   as today.
+- A query over several text fields ([M153](../M153/SPEC.md)) needs a `FullText` and a `Stats`
+  per field in a `Part` and in phase 2's sum.
 - A query over the primary keeps today's protocol numbers and bytes.
 
 ## Acceptance criteria (to be made checkable)
@@ -25,6 +27,8 @@ what the primary costs in distribution.
    engine with no peers.
 2. The same with a token filter over the primary.
 3. The same through summed shares.
-4. Against a peer that answers the new protocol with 409, the query still answers exactly, run
+4. A query over two text fields, through phased shares, is split and answers exactly as
+   unsplit.
+5. Against a peer that answers the new protocol with 409, the query still answers exactly, run
    by the coordinator.
-5. A query over the primary sends today's protocol numbers and bytes.
+6. A query over the primary sends today's protocol numbers and bytes.

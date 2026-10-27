@@ -4,8 +4,8 @@
 Workstream E of [the delivery plan](../../comparisons/turbopuffer-next-plan.md) ("multiple
 string/string-array BM25 fields"). This is the second of three steps; [M151](../M151/SPEC.md)
 made a segment able to carry several text fields, and a query read one of them. Here the
-engine declares, records, seals, merges and queries them. M153 adds the HTTP declaration and
-the vendor's ranking expressions. No D- or OQ- id covers it.
+engine declares, records, seals, merges and queries them. M153 lets one query read several,
+and M155 adds the HTTP declaration. No D- or OQ- id covers it.
 
 ## Delta
 Today an index has one text field:
@@ -95,7 +95,7 @@ two `FullText`s:
 **Unchanged:**
 - the primary's fill, stamp (M36, M37) and conflict for rows under the primary;
 - the segment format (M151), the query layer, requests and round trips;
-- the server's requests. It declares no further field until M153, and its `Declared` literals
+- the server's requests. It declares no further field until M155, and its `Declared` literals
   gain `texts: None`;
 - the peer wire and every query over the primary, split as today.
 
@@ -204,17 +204,17 @@ The cap of 8 fields bounds all three.
 ## Risks
 - **Readers first.** The parent's decoder refuses any byte after `keys_since`, so a node of an
   older build cannot read a tenant whose HEAD carries the new section. Nothing declares
-  further fields before M153's server does, and M153 must not until every node runs M152.
+  further fields before M155's server does, and M155 must not until every node runs M152.
   The delivery plan requires readers-first deployment.
 - **Fixed at creation.** Further fields are recorded once, as the analyzer and the trigram
   set are. An index created before M152 has none and can never gain one. Adding a field
   means copying the rows into a new index, the migration path the refusals of `fts` and
   `trigram` already name. This is deliberate: a field added later would leave every earlier
-  segment without its postings until a rewrite. M153 inherits it, and refuses a vendor schema
+  segment without its postings until a rewrite. M155 inherits it, and refuses a vendor schema
   update that adds `full_text_search` to an existing index, with that path named.
 - **The filter analyzer is the primary's.** A token filter over a further field analyzes with
   `fts`, so M138's token filters may tokenize a further field differently from its BM25.
-  M153 owns per-attribute declarations and resolves it.
+  M155 owns per-attribute declarations and resolves it.
 
 ## Tasks
 - M152.1: `Declared.texts`, `IndexSchema.texts`, the HEAD section, the door, `door_conflict`
