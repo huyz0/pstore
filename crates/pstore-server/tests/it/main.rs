@@ -39,6 +39,7 @@ mod geo;
 mod highlight;
 mod idempotency;
 mod idle;
+mod ingress;
 mod lane_taken;
 mod lifecycle;
 mod metrics;

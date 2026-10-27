@@ -176,6 +176,32 @@ unchanged, and their `documents_*` counters still count what was submitted. An a
 write waits for a fold, so it is slower; it is not exactly-once, and a retry after a lost
 response may apply again (M132's idempotency keys close that). See the [proof](research/11-design/mutation-completion.md).
 
+## M128: public request bodies and active requests are bounded
+
+⚠️ **Behaviour change.** Every public route now admits a request before its handler runs,
+after authentication and the route's scope check:
+
+- A body larger than 2 MiB is refused with `413 request_too_large`, whether or not it
+  declares a `Content-Length`. Before, axum's own 2 MB ceiling answered with an untyped
+  plain-text body.
+- A body that has not fully arrived 30 s after admission is refused with
+  `408 request_timeout`. **This deadline is new**: a client that streamed a slow body
+  must send it faster or split the request.
+- A declared `Content-Encoding` other than `identity` is refused with
+  `415 unsupported_content_encoding`. Decompression is unsupported; send bodies plain.
+- At 64 active public requests in the process, 8 for one tenant, or 128 MiB of reserved
+  body bytes, a request is refused with `429 overloaded` and `Retry-After: 1`. It is refused
+  before dispatch, so it changed nothing; retrying it is safe. The hint is local to this
+  server, not a fleet reservation.
+
+A tenant is the verified bearer's. In private mode (`PSTORE_ALLOW_UNAUTHENTICATED=1`) it is
+the `X-Pstore-Tenant` header, and requests without one share one private allowance.
+`PSTORE_REQUEST_LIMITS_CONFIG` (strict JSON, `{"version":1, ...}`, fields `body_bytes`,
+`active_requests`, `tenant_active_requests`, `reserved_body_bytes`,
+`body_read_timeout_ms`) can lower any of these, never raise them; an invalid value refuses
+startup. Peer traffic keeps its own admission (M127). Nothing stored changes, and rolling
+back restores the old ceilings. Evidence is in [M128 verification](milestones/M128/VERIFIED.md).
+
 ## M127: explicit authentication and encrypted peers
 
 Standalone startup now requires `PSTORE_AUTH_CONFIG`, or the explicit

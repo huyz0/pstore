@@ -12,8 +12,8 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | Plan workstream | Improvement | Status / evidence |
 |---|---|---|
 | A | Close native write/query/document envelopes without mutation or I/O on refusal | Verified: [M126 spec](../milestones/M126/SPEC.md), [verification](../milestones/M126/VERIFIED.md) |
-| A | Authenticated tenant identity and admin/internal authorization | In progress: [M127 spec](../milestones/M127/SPEC.md), [verification](../milestones/M127/VERIFIED.md) |
-| A | Bounded decoding, memory/concurrency admission, overload responses | Pending |
+| A | Authenticated tenant identity and admin/internal authorization | Verified: [M127 spec](../milestones/M127/SPEC.md), [verification](../milestones/M127/VERIFIED.md) |
+| A | Bounded decoding, memory/concurrency admission, overload responses | Partial: body bytes, active requests per process and tenant, a body-read deadline and typed 408/413/415/429 refusals verified in [M128](../milestones/M128/VERIFIED.md); decoded-structure limits, query plan reservations and buffered tenant bytes pending |
 | B | Native OpenAPI, generated SDKs and semantic fixtures | Pending |
 | B | Versioned compatibility facade with durable/strong defaults and correct envelopes | Pending |
 | C | Applied mutation completion, actual affected counts/IDs, mixed-operation ordering | Partial: applied completion and exact counts verified in [M129](../milestones/M129/VERIFIED.md) ([proof](../research/11-design/mutation-completion.md)); affected ids and the order inside one request verified in [M130](../milestones/M130/VERIFIED.md); ids for by-filter operations, bounded at 10,000 less the named ids and paged by `allow_partial`, in [M139](../milestones/M139/VERIFIED.md) |

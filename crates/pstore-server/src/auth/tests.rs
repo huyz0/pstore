@@ -149,7 +149,11 @@ async fn scoped_routes_refuse_missing_principals_before_dispatch() {
         observed.fetch_add(1, Ordering::SeqCst);
         async { "permitted" }
     }));
-    let router = ScopedRouter::<()>::new().route("/", route).finish();
+    let router = ScopedRouter::<()>::new(Arc::new(crate::ingress::Ingress::new(
+        crate::ingress::RequestLimits::default(),
+    )))
+    .route("/", route)
+    .finish();
     for (principal, expected) in [
         (None, StatusCode::FORBIDDEN),
         (
