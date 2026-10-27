@@ -1,5 +1,21 @@
 # Native API migration notes
 
+## M139: affected ids for by-filter operations
+
+At `PSTORE_APPLIED_WRITES=5` (every node at M139; it includes levels 1 to 4),
+`affected_ids` is served beside `delete_by_filter` and `patch_by_filter`. The ids are the
+rows each changed, in `applied.ids`, as for per-id operations.
+
+- Each by-filter operation of such a write is bounded at 10,000 minus the distinct ids
+  the write names, below M136's 100,000. Past it a plain operation is refused whole
+  (`rejected`); with `allow_partial` (M137) each pass lists the ids it changed, and the
+  passes together list every row.
+- A write naming 10,000 ids beside a by-filter operation is refused with `bad_request`.
+- Below level 5 `affected_ids` beside a by-filter operation is refused with
+  `bad_request`, as before.
+- Rolling back: lower the level below 5 first; an older fold ignores the bound and could
+  list up to 100,000 ids.
+
 ## M137: `allow_partial` by-filter writes
 
 A write may set `delete_by_filter_allow_partial: true` or

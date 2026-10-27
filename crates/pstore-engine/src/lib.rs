@@ -771,6 +771,19 @@ const OP_PATCH_BY_FILTER: i64 = 5;
 /// to the bound's rows and says rows remain, rather than being refused. A fold that predates
 /// it ignores it, as `merged` ignores every `$` attribute.
 const PARTIAL_ATTR: &str = "$partial";
+/// A by-filter operation's own row bound (M139), below the engine's: what an `affected_ids`
+/// write leaves it. A fold that predates it ignores it.
+const ROWS_ATTR: &str = "$rows";
+
+/// How a by-filter operation is bounded: whether it allows partial application (M137),
+/// and its own bound, below the engine's (M139).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByFilter {
+    /// Past its bound it applies to the bound's rows and says rows remain.
+    pub partial: bool,
+    /// Its own bound; the smaller of this and the engine's applies.
+    pub rows: Option<usize>,
+}
 
 /// `attrs`, marked partial when `partial` (M137).
 fn partially(
@@ -781,6 +794,29 @@ fn partially(
         attrs.insert(PARTIAL_ATTR.to_owned(), pstore_format::Value::Bool(true));
     }
     attrs
+}
+
+/// `attrs`, marked as `how` bounds them (M137, M139).
+fn bounded(
+    attrs: BTreeMap<String, pstore_format::Value>,
+    how: ByFilter,
+) -> BTreeMap<String, pstore_format::Value> {
+    let mut attrs = partially(attrs, how.partial);
+    if let Some(rows) = how.rows {
+        attrs.insert(
+            ROWS_ATTR.to_owned(),
+            pstore_format::Value::Int(i64::try_from(rows).unwrap_or(i64::MAX)),
+        );
+    }
+    attrs
+}
+
+/// A by-filter operation's own bound (M139), if it carries one.
+fn own_rows(d: &Document) -> Option<usize> {
+    match d.attrs.get(ROWS_ATTR) {
+        Some(pstore_format::Value::Int(n)) => usize::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 /// Whether a by-filter operation allows partial application (M137).
@@ -1030,7 +1066,7 @@ fn resolve(
                 continue;
             }
             let limit = filter_rows::Limit {
-                rows: bound.rows,
+                rows: own_rows(&op).map_or(bound.rows, |r| r.min(bound.rows)),
                 over,
             };
             by_filter(&op, base, &mut state, &mut order, cx, tally, limit);
@@ -3117,7 +3153,8 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         filter: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
-        self.delete_by_filter_with(index, filter, false).await
+        self.delete_by_filter_bounded(index, filter, ByFilter::default())
+            .await
     }
 
     /// As [`Self::delete_by_filter`], allowing partial application (M137): past the bound it
@@ -3131,20 +3168,29 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         filter: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
-        self.delete_by_filter_with(index, filter, true).await
+        let how = ByFilter {
+            partial: true,
+            rows: None,
+        };
+        self.delete_by_filter_bounded(index, filter, how).await
     }
 
-    async fn delete_by_filter_with(
+    /// As [`Self::delete_by_filter`], bounded as `how` says (M137, M139): partial
+    /// application, and an own bound below the engine's.
+    ///
+    /// # Errors
+    /// As [`Self::delete_by_filter`].
+    pub async fn delete_by_filter_bounded(
         &self,
         index: &str,
         filter: &pstore_query::Predicate,
-        partial: bool,
+        how: ByFilter,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
         let op = by_filter_op(
             OP_DELETE_BY_FILTER,
             encoded(filter)?,
-            partially(BTreeMap::new(), partial),
+            bounded(BTreeMap::new(), how),
         );
         self.mem().buffer(index, vec![op]);
         Ok(())
@@ -3162,7 +3208,8 @@ impl<S: BlobStore> Engine<S> {
         filter: &pstore_query::Predicate,
         patch: Patch,
     ) -> Result<(), EngineError> {
-        self.patch_by_filter_with(index, filter, patch, false).await
+        self.patch_by_filter_bounded(index, filter, patch, ByFilter::default())
+            .await
     }
 
     /// As [`Self::patch_by_filter`], allowing partial application (M137): past the bound it
@@ -3177,22 +3224,31 @@ impl<S: BlobStore> Engine<S> {
         filter: &pstore_query::Predicate,
         patch: Patch,
     ) -> Result<(), EngineError> {
-        self.patch_by_filter_with(index, filter, patch, true).await
+        let how = ByFilter {
+            partial: true,
+            rows: None,
+        };
+        self.patch_by_filter_bounded(index, filter, patch, how)
+            .await
     }
 
-    async fn patch_by_filter_with(
+    /// As [`Self::patch_by_filter`], bounded as `how` says (M137, M139).
+    ///
+    /// # Errors
+    /// As [`Self::patch`].
+    pub async fn patch_by_filter_bounded(
         &self,
         index: &str,
         filter: &pstore_query::Predicate,
         patch: Patch,
-        partial: bool,
+        how: ByFilter,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
         let mark = encoded(filter)?;
         let mut attrs = patch_attrs(patch)?;
         attrs.remove(OP_ATTR);
         self.stamp(&mut attrs);
-        let attrs = partially(attrs, partial);
+        let attrs = bounded(attrs, how);
         self.mem()
             .buffer(index, vec![by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)]);
         Ok(())
@@ -4735,6 +4791,7 @@ impl<S: BlobStore> Engine<S> {
                                 filter,
                                 changes: (is_partial(d) && op_code(d) == Some(OP_PATCH_BY_FILTER))
                                     .then(|| d.clone()),
+                                rows: own_rows(d),
                             })
                         })
                         .collect(),

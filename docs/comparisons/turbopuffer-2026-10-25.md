@@ -131,7 +131,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | `delete_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
 | `patch_by_filter` | `{filters, attributes}` instead of `{filters, patch}` | Partial, after explicit deletes, before filter delete; C |
 | `patch_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
-| `return_affected_ids` | No actual affected-ID result | Missing; C |
+| `return_affected_ids` | `affected_ids` on applied writes ([M130](../milestones/M130/SPEC.md)), by-filter operations bounded at 10,000 less the named ids ([M139](../milestones/M139/SPEC.md)) | Partial (applied only); C |
 | `encryption` | Deployment bucket encryption only | Missing namespace `{mode, key_name}` contract; I |
 | `sharding` | Segment distribution, no initial `num_shards` setting | Missing persistent namespace shard contract; I |
 | `disable_backpressure` | No compatible ingestion/backlog mode | Missing; A/C |

@@ -14,6 +14,8 @@ pub(crate) struct Counted {
     pub(crate) filter: Predicate,
     /// The partial patch, when it is one.
     pub(crate) changes: Option<Document>,
+    /// Its own bound, when it carries one (M139); the smaller of it and the engine's applies.
+    pub(crate) rows: Option<usize>,
 }
 
 impl Counted {
@@ -49,13 +51,18 @@ impl Retention {
         }
     }
 
+    /// An operation's bound: the engine's, or its own when smaller (M139).
+    fn bound_of(&self, f: &Counted) -> usize {
+        f.rows.map_or(self.bound, |r| r.min(self.bound))
+    }
+
     /// Counts `d` against every filter that admits it, and whether to retain it for them:
     /// one of them is still within its bound. Every filter is counted, never short-circuited.
     pub(crate) fn admit(&self, d: &Document) -> bool {
         let mut keep = false;
         for (f, n) in self.filters.iter().zip(&self.counts) {
-            if f.as_ref().is_some_and(|f| f.counts(d)) {
-                keep |= n.fetch_add(1, Ordering::Relaxed) < self.bound;
+            if let Some(f) = f.as_ref().filter(|f| f.counts(d)) {
+                keep |= n.fetch_add(1, Ordering::Relaxed) < self.bound_of(f);
             }
         }
         keep
@@ -63,9 +70,13 @@ impl Retention {
 
     /// Per operation, in arrival order, whether its filter admitted more than the bound.
     pub(crate) fn over(&self) -> Vec<bool> {
-        self.counts
+        self.filters
             .iter()
-            .map(|n| n.load(Ordering::Relaxed) > self.bound)
+            .zip(&self.counts)
+            .map(|(f, n)| {
+                f.as_ref()
+                    .is_some_and(|f| n.load(Ordering::Relaxed) > self.bound_of(f))
+            })
             .collect()
     }
 }
@@ -102,6 +113,7 @@ mod tests {
         Some(Counted {
             filter: Predicate::Cmp("n".to_owned(), Op::Eq, Value::Int(n)),
             changes: None,
+            rows: None,
         })
     }
 

@@ -189,6 +189,8 @@ struct Registry {
     partial_filters: bool,
     /// The bound on one by-filter operation (M136), when not the engine's default.
     filter_rows: Option<usize>,
+    /// `PSTORE_APPLIED_WRITES=5` (M139): `affected_ids` beside a by-filter operation.
+    filter_ids: bool,
     /// How stale an engine's read of its lane may grow before a flush reads HEAD again (M39).
     lane_recheck: Option<std::time::Duration>,
     /// No scan before this, after one that freed nothing; and how long it waited.
@@ -969,6 +971,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// fold whenever it decides a key.
     pub fn set_partial_filters(&self, on: bool) {
         self.registry_mut().partial_filters = on;
+    }
+
+    /// Serves `affected_ids` beside a by-filter operation (M139): `PSTORE_APPLIED_WRITES=5`.
+    /// ⚠️ **An operator's statement that every node runs M139**: an older fold ignores the
+    /// operation's own bound, and would list up to the engine's bound of ids.
+    pub fn set_filter_ids(&self, on: bool) {
+        self.registry_mut().filter_ids = on;
     }
 
     /// Builds every engine from now on with by-filter operations bounded at `rows` (M136's
@@ -1809,9 +1818,14 @@ async fn write_documents<S: BlobStore + 'static>(
     )?
     .map(|v| write_filter("delete_condition", &v))
     .transpose()?;
-    if ids_wanted {
-        affected_ids_bounded(&req, &patches, delete_by.is_some() || patch_by.is_some())?;
-    }
+    // M139: what an `affected_ids` write leaves each of its by-filter operations.
+    let filter_rows = if ids_wanted {
+        let by_filter = delete_by.is_some() || patch_by.is_some();
+        let served = api.registry_mut().filter_ids;
+        affected_ids_bounded(&req, &patches, by_filter, served)?
+    } else {
+        None
+    };
     // ⚠️ **Deferred operations are durable only** (M13, spec review M4): a batched one would sit
     // where no fold reads it and no probe finds it, so a strong read here could miss it.
     let deferred = !patches.is_empty()
@@ -1905,22 +1919,21 @@ async fn write_documents<S: BlobStore + 'static>(
         }
         // Then the by-filter operations (M13.2), each one deferred operation: a patch, then a
         // delete, so a request that does both deletes what it patched into matching.
-        // M137: either may allow partial application.
+        // M137: either may allow partial application. M139: and with `affected_ids`, each is
+        // bounded by what the write's named ids leave.
+        let how = |partial| pstore_engine::ByFilter {
+            partial,
+            rows: filter_rows,
+        };
         if let Some((filter, patch)) = patch_by {
-            if patch_partial {
-                engine
-                    .patch_by_filter_partial(&index, &filter, patch)
-                    .await?;
-            } else {
-                engine.patch_by_filter(&index, &filter, patch).await?;
-            }
+            engine
+                .patch_by_filter_bounded(&index, &filter, patch, how(patch_partial))
+                .await?;
         }
         if let Some(filter) = &delete_by {
-            if delete_partial {
-                engine.delete_by_filter_partial(&index, filter).await?;
-            } else {
-                engine.delete_by_filter(&index, filter).await?;
-            }
+            engine
+                .delete_by_filter_bounded(&index, filter, how(delete_partial))
+                .await?;
         }
         Ok::<_, ApiError>((written, patched, deleted))
     };
@@ -2193,15 +2206,19 @@ async fn issue_idempotency_key<S: BlobStore + 'static>(
 /// what it names, so its response and its outcome object are too.
 const AFFECTED_IDS_MAX: usize = 10_000;
 
-/// Refuses an `affected_ids` write whose lists could be unbounded (M130): one with a
-/// by-filter operation, whose ids are whatever its filter admits at the fold, or one naming
-/// more than [`AFFECTED_IDS_MAX`] distinct ids.
+/// Refuses an `affected_ids` write whose lists could be unbounded (M130): one naming more
+/// than [`AFFECTED_IDS_MAX`] distinct ids, or one with a by-filter operation, whose ids are
+/// whatever its filter admits at the fold, below `PSTORE_APPLIED_WRITES=5`.
+///
+/// M139: at 5, a by-filter operation's bound is what the named ids leave of
+/// [`AFFECTED_IDS_MAX`], returned; a write naming all of them leaves none, and is refused.
 fn affected_ids_bounded(
     req: &WriteRequest,
     patches: &[pstore_engine::Patch],
     by_filter: bool,
-) -> Result<(), ApiError> {
-    if by_filter {
+    served: bool,
+) -> Result<Option<usize>, ApiError> {
+    if by_filter && !served {
         return Err(ApiError::bad_request(
             "affected_ids beside a by-filter operation is not served: its ids are unbounded",
         ));
@@ -2219,7 +2236,16 @@ fn affected_ids_bounded(
             named.len()
         )));
     }
-    Ok(())
+    if !by_filter {
+        return Ok(None);
+    }
+    match AFFECTED_IDS_MAX - named.len() {
+        0 => Err(ApiError::bad_request(format!(
+            "affected_ids names {AFFECTED_IDS_MAX} distinct ids, leaving none for a by-filter \
+             operation's; name fewer"
+        ))),
+        left => Ok(Some(left)),
+    }
 }
 
 /// A fresh applied operation's id (M129): 128 random bits.

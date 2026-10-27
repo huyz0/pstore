@@ -11,7 +11,7 @@
 )]
 
 use pstore_blob::MemoryStore;
-use pstore_engine::{Applied, Engine, OperationId, Outcome, Patch, applying};
+use pstore_engine::{Applied, ByFilter, Engine, OperationId, Outcome, Patch, applying};
 use pstore_format::{Document, Value};
 use pstore_query::{Op, Predicate};
 use pstore_types::{LaneId, TenantId};
@@ -328,4 +328,67 @@ async fn a_partial_operation_takes_only_rows_it_would_change() {
             .filter(|d| d.id != "two")
             .all(|d| d.attrs.get("m") == Some(&Value::Int(9)))
     );
+}
+
+#[tokio::test]
+async fn an_operations_own_bound_applies() {
+    // M139: an operation bounded at 2, under an engine bound of 3.
+    let two = |partial| ByFilter {
+        partial,
+        rows: Some(2),
+    };
+    let e = engine();
+    seeded(&e, BOUND).await;
+    let got = applied(&e, async {
+        e.delete_by_filter_bounded("idx", &n_is(1), two(false))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(got, outcome(0, 0, 0, 1));
+    assert_eq!(e.kept_for_test(), 2);
+    let got = applied(&e, async {
+        e.delete_by_filter_bounded("idx", &n_is(1), two(true))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(got, pass(2, 0, true));
+    assert_eq!(rows(&e).await.len(), 2);
+}
+
+#[tokio::test]
+async fn the_smaller_bound_wins() {
+    let e = engine();
+    seeded(&e, BOUND + 1).await;
+    let got = applied(&e, async {
+        e.patch_by_filter_bounded(
+            "idx",
+            &n_is(1),
+            set_n(5),
+            ByFilter {
+                partial: false,
+                rows: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    assert_eq!(got, outcome(0, 0, 0, 1));
+    // And in fold order: the index admits the bound, an earlier patch adds a fourth.
+    let e = engine();
+    seeded(&e, BOUND).await;
+    let five = ByFilter {
+        partial: false,
+        rows: Some(5),
+    };
+    let got = applied(&e, async {
+        e.patch_by_filter("idx", &n_is(2), set_n(1)).await.unwrap();
+        e.delete_by_filter_bounded("idx", &n_is(1), five)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(got, outcome(0, 0, 1, 1));
 }
