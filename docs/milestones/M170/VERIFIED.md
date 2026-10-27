@@ -41,3 +41,9 @@ The mutations were applied one at a time by a script and reverted, each run agai
    serialization_failures_never_send_partial_requests_or_responses`: 2,279 passed, 0
    failed; lines 95.75%, regions 96.64% (`provisional`: a 4-core cloud container). The two
    skipped tests need IPv6, which the container lacks; CI runs them.
+
+CI's `mutants` job on the PR timed out on two mutants of `widths_agree` (`==` to `!=` on the
+empty-vector check, `!=` to `==` on the width check): each refuses every write, and the
+integration tests then wait rather than fail. `widths_agree_takes_one_width_or_none_and_refuses_the_rest`,
+a unit test in `pstore-server`'s lib, now fails on both in under a second (both mutations
+applied by hand and observed red), so the lib's tests stop the run first.

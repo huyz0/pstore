@@ -5708,4 +5708,28 @@ mod tests {
         assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
         assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
     }
+
+    /// M170: the door's width checks, here so that a mutation breaking every write fails
+    /// in this crate's unit tests rather than hanging its integration tests.
+    #[test]
+    fn widths_agree_takes_one_width_or_none_and_refuses_the_rest() {
+        let req = |docs: serde_json::Value| -> WriteRequest {
+            serde_json::from_value(serde_json::json!({ "documents": docs })).unwrap()
+        };
+        let agree = |docs| widths_agree(&req(docs)).is_ok();
+        assert!(agree(serde_json::json!([])));
+        assert!(agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [2.0]}])
+        ));
+        assert!(agree(
+            serde_json::json!([{"id": "a"}, {"id": "b", "text": "x"}])
+        ));
+        assert!(!agree(serde_json::json!([{"id": "a", "vector": []}])));
+        assert!(!agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b"}])
+        ));
+        assert!(!agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [1.0, 2.0]}])
+        ));
+    }
 }
