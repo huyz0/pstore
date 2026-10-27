@@ -7,6 +7,13 @@ This revision checks shape before any parser runs, generically, so every field a
 is covered by the same four numbers. Round 2 passed with minors; three factual ones are
 fixed here.
 
+⚠️ **Amended during implementation: `json_depth` defaults to 128, not 32.** At 32 the
+workspace suite failed two fixtures (`patch::what_a_patch_cannot_mean_is_refused`,
+`ref_new::malformed_templates_are_refused`) that nest a condition 80 deep to reach the
+condition parser's own 64-level cap and its 400; at 32 that cap could never be reached.
+128 is `serde_json`'s recursion limit, so no body admitted today is refused for depth;
+what changes is that the bound is typed, lowerable, and checked before any parse.
+
 ## Serves
 D-55 in [memory management](../../research/09-rust-stack/memory-management.md).
 Workstream A ("bound compressed and decoded bytes, JSON nesting, documents, attributes,
@@ -29,7 +36,7 @@ refuse what they refuse today with today's messages.
 
 | Field | Default | Bounds |
 |---|---|---|
-| `json_depth` | 32 | arrays and objects open at once (`{}` is depth 1, a scalar body 0) |
+| `json_depth` | 128 | arrays and objects open at once (`{}` is depth 1, a scalar body 0) |
 | `array_elements` | 16,384 | elements of any one JSON array: a write's documents, deletes or patches, a vector's components, a filter's `In` list or `And`/`Or` children, an array attribute |
 | `object_members` | 1,024 | members of any one JSON object: a document's attributes, a patch, named vector fields, a schema |
 | `string_bytes` | 262,144 | the raw bytes between one string's quotes: an id, a text field, an attribute value or name, a base64 vector |
@@ -103,8 +110,8 @@ runs before the handler, so a refusal constructs no engine and reads nothing.
 
 ## Risks
 A body with arrays of more than 16,384 elements, objects of more than 1,024 members,
-strings over 256 KiB or nesting deeper than 32 now gets 413 and must change; a malformed
-body that is also too deep changes from 400 to 413; a query leg asking for more than
+or strings over 256 KiB now gets 413 and must change; a body nested deeper than 128,
+malformed or not, changes from 400 to 413; a query leg asking for more than
 10,000 rows gets 400. All of these need a migration entry. The counts bound structure, not
 RSS, and nothing here is called a memory bound.
 
