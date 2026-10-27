@@ -22,9 +22,11 @@ chmod +x "$fake/cargo"
 # CI checkout too.
 empty=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 for mode in "" "--fast" "--changed $empty"; do
+  # Refused for that reason, named: any other failure would pass a bare exit-status check.
   # shellcheck disable=SC2086 # the mode is words
-  if FAKE_MISMATCH=1 PATH="$fake:$PATH" ./scripts/coverage.sh $mode >/dev/null 2>&1; then
-    echo "FAIL coverage.sh ${mode:-(full)} reported a run whose counts did not match"
+  if out=$(FAKE_MISMATCH=1 PATH="$fake:$PATH" ./scripts/coverage.sh $mode 2>&1) \
+      || ! printf '%s' "$out" | grep -q "FAIL coverage: llvm-cov dropped"; then
+    echo "FAIL coverage.sh ${mode:-(full)} did not refuse a run whose counts did not match"
     exit 1
   fi
 done

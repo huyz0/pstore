@@ -130,13 +130,15 @@ if [[ "${1:-}" == "--fast" ]]; then shift; fi
 
 # Anything else is passed straight through, so the gate is the same command a developer
 # runs with one more flag -- not a second, differently-scoped measurement.
+# ⚠️ Expanded as `${extra[@]+...}`: macOS's bash 3.2 calls an empty array unbound under
+# `set -u`, so the bare `coverage.sh` died there before measuring anything.
 extra=("$@")
 
 if [[ -z "$shipped_filter" ]]; then
     echo "# no test-only crates; measuring the whole workspace"
-    report ${fast[@]+"${fast[@]}"} --workspace --summary-only "${extra[@]}"
+    report ${fast[@]+"${fast[@]}"} --workspace --summary-only ${extra[@]+"${extra[@]}"}
 fi
 
 echo "# excluding test-only crates and binary entry points: $test_only_names"
 report ${fast[@]+"${fast[@]}"} --workspace --summary-only \
-    --ignore-filename-regex "$shipped_filter" "${extra[@]}"
+    --ignore-filename-regex "$shipped_filter" ${extra[@]+"${extra[@]}"}
