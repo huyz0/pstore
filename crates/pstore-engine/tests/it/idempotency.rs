@@ -184,15 +184,27 @@ async fn at_most_once_under_contention() {
     let commits = engines[0].head_for_test().await.epoch.0 - before.0;
     println!("{commits} commits for 100 attempts");
     assert_eq!(rows(&engines[0]).await.len(), 1);
+    // ⚠️ Exactly one answer is not a replay (spec). The winner's own may be `Unavailable`:
+    // its window can fall off the list when 32 commits land before it is answered, which
+    // happened once under coverage instrumentation.
     let winners: Vec<&Applied> = answers
         .iter()
-        .filter(|a| matches!(a, Applied::Known(..)))
+        .filter(|a| matches!(a, Applied::Known(..) | Applied::Unavailable))
         .collect();
     assert_eq!(winners.len(), 1, "{answers:?}");
-    let won = own(winners[0]);
+    let won = Outcome {
+        upserted: 1,
+        ..Outcome::default()
+    };
     for a in &answers {
         match a {
             Applied::Known(o, _) => assert_eq!(*o, won),
+            Applied::Unavailable => {
+                assert!(
+                    commits >= OUTCOMES_KEPT as u64,
+                    "unavailable after {commits}"
+                );
+            }
             Applied::Replayed(Some((o, _))) => assert_eq!(*o, won),
             Applied::Replayed(None) => {
                 assert!(

@@ -23,6 +23,12 @@ them.
 3. `at_most_once_under_contention` (engine, 100 attempts on 4 engines): green after. The
    run reported 5 commits for 100 attempts, so every replay had counts. Killed by "rule 1
    ignores listed records" and "the waiter sums its own attempt".
+   - ⚠️ Corrected after M132: the test required the one non-replayed answer to be
+     `Known`, which is stricter than this criterion. Under coverage instrumentation it
+     once answered `Unavailable`: 32 commits landed before the winner was answered, so its
+     window fell off the list, which §9.4 allows. The test now accepts `Unavailable` for
+     that answer only when HEAD advanced at least 32 commits, as it already did for
+     a replay without counts, and checks the winner's counts as exactly one upsert.
 4. `a_retry_is_answered_not_applied` covers this criterion: its last retry is served by a
    new engine with empty caches.
 5. `expiry_is_a_refusal_at_the_boundary` (engine) and `an_expired_retry_is_refused`
