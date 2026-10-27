@@ -1402,10 +1402,10 @@ fn same_row(a: &Document, b: &Document) -> bool {
 
 /// Whether `doc` carries a non-empty string under `field`.
 fn has_text(doc: &Document, field: &str) -> bool {
-    matches!(
-        doc.attrs.get(field),
-        Some(pstore_format::Value::Str(s)) if !s.is_empty()
-    )
+    // M150: a string, or an array of strings, one of them non-empty.
+    doc.attrs
+        .get(field)
+        .is_some_and(pstore_format::text::has_text)
 }
 
 /// The reserved attribute a row carries its writer's text field in (M36), stamped at the
@@ -2786,14 +2786,7 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<(Key, Dicts, u64), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
-        let text_field = text_field.filter(|f| {
-            docs.iter().any(|d| {
-                matches!(
-                    d.attrs.get(*f),
-                    Some(pstore_format::Value::Str(s)) if !s.is_empty()
-                )
-            })
-        });
+        let text_field = text_field.filter(|f| docs.iter().any(|d| has_text(d, f)));
         // ⚠️ **The `replicas: 0` clamp is gone (M3c).** It was a correctness clamp, not a
         // tuning choice: rows were written in list order, so a replicated vector was written
         // to the segment TWICE — 400 documents folded and merged came back as 431 rows, and
@@ -6134,12 +6127,7 @@ impl<S: BlobStore> Engine<S> {
         // The same builder a fold uses, so the fresh half and the folded half are scored by
         // the same code rather than by two that must agree.
         let sparse = sparse_field_of(&rows);
-        let wants_text = rows.iter().any(|d| {
-            matches!(
-                d.attrs.get(text_field.as_str()),
-                Some(pstore_format::Value::Str(s)) if !s.is_empty()
-            )
-        });
+        let wants_text = rows.iter().any(|d| has_text(d, text_field.as_str()));
         let built = pstore_index::vec_index::try_build_all_with(
             &rows,
             self.params,

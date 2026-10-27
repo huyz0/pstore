@@ -3997,8 +3997,13 @@ fn declared_fts(req: &WriteRequest) -> Result<Option<pstore_format::text::FullTe
                 pstore_format::text::DEFAULT_TEXT_FIELD
             )));
         }
-        if decl.get("type").is_some_and(|t| t != "string") {
-            return Err(bad(format!("{name:?}: the text field's type is string")));
+        if decl
+            .get("type")
+            .is_some_and(|t| t != "string" && t != "[]string")
+        {
+            return Err(bad(format!(
+                "{name:?}: the text field's type is string or []string"
+            )));
         }
         let mut fts = FullText::default();
         match decl.get("full_text_search") {
@@ -4171,8 +4176,19 @@ fn to_document(
             Ok(v) => v,
             Err(why) => return Err(refuse(name, &why)),
         };
-        if name == text_field && !matches!(v, pstore_format::Value::Str(_)) {
-            return Err(refuse(name, "is the text field and must be a string"));
+        // M150: a string, or an array of strings, every element one.
+        let text = match &v {
+            pstore_format::Value::Str(_) => true,
+            pstore_format::Value::Array(items) => items
+                .iter()
+                .all(|e| matches!(e, pstore_format::Value::Str(_))),
+            _ => false,
+        };
+        if name == text_field && !text {
+            return Err(refuse(
+                name,
+                "is the text field and must be a string or an array of strings",
+            ));
         }
         doc.attrs.insert(name.clone(), v);
     }

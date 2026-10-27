@@ -444,3 +444,77 @@ fn a_dictionary_is_decoded_once_a_buffer() {
     assert!(TermDict::decode_shared(&cut).is_none());
     assert!(TermDict::decode_shared(&cut).is_none());
 }
+
+#[test]
+fn a_string_array_indexes_as_its_strings_joined_by_a_space() {
+    // M150 criterion 1: every analyzer, and rows whose arrays mix strings with other values.
+    let analyzers = [
+        text::Analyzer::default(),
+        text::Analyzer {
+            stemming: true,
+            remove_stopwords: true,
+            ..text::Analyzer::default()
+        },
+        text::Analyzer {
+            case_sensitive: true,
+            ..text::Analyzer::default()
+        },
+        text::Analyzer {
+            ascii_folding: true,
+            ..text::Analyzer::default()
+        },
+    ];
+    let pool = ["the Quick fox", "", "Café-au-lait", "running dogs", "fox"];
+    let s = |x: &str| Value::Str(x.to_owned());
+    let mut values: Vec<Option<Value>> = vec![
+        None,
+        Some(Value::Int(5)),
+        Some(s("")),
+        Some(s("quick brown FOX")),
+        Some(Value::Array(vec![])),
+        Some(Value::Array(vec![s("")])),
+        Some(Value::Array(vec![Value::Int(5)])),
+        Some(Value::Array(vec![s("a b"), Value::Int(5), s("c")])),
+    ];
+    for a in pool {
+        values.push(Some(Value::Array(vec![s(a)])));
+        for b in pool {
+            values.push(Some(Value::Array(vec![s(a), s(b)])));
+            values.push(Some(Value::Array(vec![s(b), s(a), s(a)])));
+        }
+    }
+    let rows = |joined: bool| -> Vec<Document> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut d = Document::new(format!("d{i:05}"), vec![1.0, 0.0]);
+                let v = match (v, joined) {
+                    (Some(Value::Array(items)), true) => Some(Value::Str(
+                        items
+                            .iter()
+                            .filter_map(|e| match e {
+                                Value::Str(x) => Some(x.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )),
+                    (v, _) => v.clone(),
+                };
+                if let Some(v) = v {
+                    d.attrs.insert(text::DEFAULT_TEXT_FIELD.to_owned(), v);
+                }
+                d
+            })
+            .collect()
+    };
+    for a in &analyzers {
+        let arrays = text::build_with(&rows(false), text::DEFAULT_TEXT_FIELD, a);
+        let joined = text::build_with(&rows(true), text::DEFAULT_TEXT_FIELD, a);
+        assert_eq!(arrays.fieldnorms, joined.fieldnorms, "{a:?}");
+        assert_eq!(arrays.postings, joined.postings, "{a:?}");
+        assert_eq!(arrays.dictionary, joined.dictionary, "{a:?}");
+        assert!(joined.fieldnorms.iter().filter(|n| **n > 0).count() > values.len() / 2);
+    }
+}

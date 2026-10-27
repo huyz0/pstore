@@ -388,6 +388,30 @@ pub fn dict_key(segment: &pstore_blob::Key) -> pstore_blob::Key {
     pstore_blob::Key::new(format!("{}.tdict", segment.as_str()))
 }
 
+/// The strings a text field holds (M150): a string's one, an array's string elements in order,
+/// and nothing for anything else. An array's other elements are skipped: the door refuses
+/// them, but a row written below it may hold one.
+///
+/// ⚠️ Every place that asks whether a row has text, or what its tokens are, reads this, so the
+/// segment build, the fresh view and the M36 stamp cannot disagree about an array.
+pub fn strings(v: &Value) -> impl Iterator<Item = &str> {
+    let (one, many): (Option<&str>, &[Value]) = match v {
+        Value::Str(s) => (Some(s.as_str()), &[]),
+        Value::Array(items) => (None, items.as_slice()),
+        _ => (None, &[]),
+    };
+    one.into_iter().chain(many.iter().filter_map(|e| match e {
+        Value::Str(s) => Some(s.as_str()),
+        _ => None,
+    }))
+}
+
+/// Whether a text field's value holds text (M150): some string of it is non-empty.
+#[must_use]
+pub fn has_text(v: &Value) -> bool {
+    strings(v).any(|s| !s.is_empty())
+}
+
 /// Builds the postings, the dictionary and the fieldnorms for one text attribute.
 ///
 /// ⚠️ `docs` is taken in **segment row order**, and a document with no text still occupies a
@@ -405,10 +429,15 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
         std::collections::BTreeMap::new();
     let mut fieldnorms = Vec::with_capacity(docs.len());
     for (row, d) in docs.iter().enumerate() {
-        let tokens = match d.attrs.get(field) {
-            Some(Value::Str(s)) => analyze(analyzer, s),
-            _ => Vec::new(),
-        };
+        // M150: an array's strings, each analyzed alone and in order: what the same strings
+        // joined by a space would give, since a space ends a token under every analyzer.
+        let tokens: Vec<String> = d
+            .attrs
+            .get(field)
+            .into_iter()
+            .flat_map(strings)
+            .flat_map(|s| analyze(analyzer, s))
+            .collect();
         fieldnorms.push(tokens.len() as u32);
         let mut tf: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for t in &tokens {

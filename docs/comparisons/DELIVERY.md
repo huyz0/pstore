@@ -24,7 +24,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | D | Public string-key sparse vectors and named-field ANN contracts | Pending |
 | D/H | Stored-vector projection, float/base64 response encoding and reconstructable export | Pending |
 | D | f16/i8 and multi-vector schema/precision contracts | Pending |
-| E | Multi-field/array BM25, tokenizer versions, language configuration, token/prefix queries | Partial: token filters over string arrays and `last_as_prefix` verified in [M138](../milestones/M138/VERIFIED.md); BM25 over arrays and several fields, tokenizer versions, language configuration and prefix ranking pending |
+| E | Multi-field/array BM25, tokenizer versions, language configuration, token/prefix queries | Partial: token filters over string arrays and `last_as_prefix` verified in [M138](../milestones/M138/VERIFIED.md); BM25 over a string-array text field in [M150](../milestones/M150/VERIFIED.md); several text fields, tokenizer versions, language configuration and prefix ranking pending |
 | E | Missing array predicates and compatible fuzzy semantics | Done: `AnyLt`/`AnyLte`/`AnyGt`/`AnyGte` verified in [M135](../milestones/M135/VERIFIED.md), the vendor's `Fuzzy` (substring match, `max_edit_distance` thresholds, `case_sensitive`, string arrays) in [M145](../milestones/M145/VERIFIED.md) |
 | E | Exact scoring expressions and computed distance/clause signals | Pending |
 | E | Structured highlights with fragment/offset contracts | Pending |

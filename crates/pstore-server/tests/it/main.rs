@@ -79,6 +79,7 @@ mod socket;
 )]
 #[path = "../support/mod.rs"]
 mod support;
+mod text_arrays;
 mod time_travel;
 #[allow(
     dead_code,
