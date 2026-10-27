@@ -256,6 +256,13 @@ itself fell off the list, which is today's `outcome_unavailable`.
 | expired, beside applied operations | refused, `409 idempotency_partial` (§9.5) |
 | expired, and the window fell off the list | refused, `409 idempotency_partial`: it may be partly applied, and what fell off is exactly what would say |
 
+> ⚠️ **Corrected by [M134](../../milestones/M134/SPEC.md).** "Without a refusing record,
+> a fallen window still answers `outcome_unavailable`" below said "applied" to a loser or an
+> expired attempt whose own records fell off. Now a waiter with none of its own records
+> listed reads who won from every listed record: itself, `outcome_unavailable`; another
+> attempt, a replay; nobody named, `409 idempotency_partial`, even for a sole winner,
+> which it cannot tell from an expired attempt.
+
 ⚠️ **A keyed waiter whose window fell off still reads its own records** in the commits
 still listed after its mark (round-2 spec review). Its refusing commit is listed unless 32
 more tallying commits land before the waiter reads, which would need them inside one

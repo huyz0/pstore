@@ -471,8 +471,13 @@ pub(crate) enum Own {
 /// A keyed waiter's answer from its own window (`mutation-completion.md` §9.4): `own` are the
 /// listed commits after its mark, `None` where one was reaped, and `fallen` whether the window
 /// reaches past the list. ⚠️ Read even when the window fell (round-2 spec review): the
-/// refusing commit is the newest, so it is still listed.
-pub(crate) fn own_answer(me: &str, fallen: bool, own: Vec<Option<std::sync::Arc<Decided>>>) -> Own {
+/// refusing commit is the newest, so it is still listed. `None` when the window is lost and
+/// holds none of its records (M134): see [`named`].
+pub(crate) fn own_answer(
+    me: &str,
+    fallen: bool,
+    own: Vec<Option<std::sync::Arc<Decided>>>,
+) -> Option<Own> {
     let lost = fallen || own.iter().any(Option::is_none);
     let own: Vec<std::sync::Arc<Decided>> = own.into_iter().flatten().collect();
     let verdicts: Vec<&Verdict> = own
@@ -482,23 +487,40 @@ pub(crate) fn own_answer(me: &str, fallen: bool, own: Vec<Option<std::sync::Arc<
     if verdicts.contains(&&Verdict::Expired) {
         let (o, _) = sum(me, own.iter().map(|c| &**c));
         let applied = o.upserted + o.deleted + o.patched + o.skipped;
-        return Own::Answer(if lost || applied > 0 {
+        return Some(Own::Answer(if lost || applied > 0 {
             Applied::Partial
         } else {
             Applied::Expired
-        });
+        }));
     }
-    if let Some(Verdict::Duplicate(w)) = verdicts
-        .into_iter()
-        .find(|v| matches!(v, Verdict::Duplicate(_)))
+    if let Some(Verdict::Duplicate(w)) =
+        verdicts.iter().find(|v| matches!(v, Verdict::Duplicate(_)))
     {
-        return Own::Replay(w.clone());
+        return Some(Own::Replay(w.clone()));
     }
     if lost {
-        return Own::Answer(Applied::Unavailable);
+        // ⚠️ M134: `Unavailable` says "applied". Without one of its own records, that is
+        // known only if a listed record names this attempt the winner.
+        return (!verdicts.is_empty()).then_some(Own::Answer(Applied::Unavailable));
     }
     let (outcome, ids) = sum(me, own.iter().map(|c| &**c));
-    Own::Answer(Applied::Known(outcome, ids))
+    Some(Own::Answer(Applied::Known(outcome, ids)))
+}
+
+/// A keyed waiter's answer when none of its own records are listed (M134): `listed` are all
+/// of HEAD's outcome objects. The attempt a record names as `key`'s winner tells: this one
+/// (`Unavailable`: applied, not readable), another (replayed), or none (`Partial`: was, or
+/// may have been, applied).
+pub(crate) fn named(me: &str, key: &str, listed: &[Option<std::sync::Arc<Decided>>]) -> Own {
+    let winner = listed
+        .iter()
+        .flatten()
+        .find_map(|d| d.winners().find(|(k, _)| *k == key).map(|(_, w)| w));
+    match winner {
+        Some(w) if w == me => Own::Answer(Applied::Unavailable),
+        Some(w) => Own::Replay(w.to_owned()),
+        None => Own::Answer(Applied::Partial),
+    }
 }
 
 /// The winner `w`'s outcome, summed over `theirs` (the listed commits after the key's `e0`),

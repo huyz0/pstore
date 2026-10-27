@@ -1955,8 +1955,8 @@ fn applied_answer(
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "idempotency_partial",
-                "part of this write was refused as expired, and part was or may have been \
-                 applied; read the rows before sending it again",
+                "this write was, or may have been, applied, in whole or in part, and what \
+                 would say which is no longer listed; read the rows before sending it again",
             ));
         }
         _ => {}

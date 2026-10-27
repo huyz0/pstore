@@ -15,8 +15,8 @@ use pstore_blob::{
     BlobError, BlobStore, Capabilities, CasError, Class, Key, MemoryStore, Precondition, PutOutcome,
 };
 use pstore_engine::{
-    Applied, Consistency, Engine, IdempotencyKey, OUTCOMES_KEPT, OperationId, Outcome, applying,
-    keyed,
+    Applied, Consistency, Engine, IdempotencyKey, Mark, OUTCOMES_KEPT, OperationId, Outcome,
+    applying, keyed,
 };
 use pstore_format::{Document, Value};
 use pstore_query::OrderBy;
@@ -489,4 +489,88 @@ async fn a_vanished_outcome_is_read_again_not_ignored() {
     assert_eq!(replayed(&retry).upserted, 1, "{retry:?}");
     assert!(!store.armed.load(Ordering::SeqCst), "nothing vanished");
     assert!(!rows(&fresh).await.contains_key("late"));
+}
+
+/// One keyed attempt on `e`, folded at once but not yet answered: its mark.
+async fn folded<S: BlobStore>(e: &Engine<S>, key: &IdempotencyKey, op: u128, id: &str) -> Mark {
+    let mark = e.mark().await.unwrap();
+    keyed(
+        OperationId(op),
+        key,
+        false,
+        e.write("idx", vec![doc(id, 1)]),
+    )
+    .await
+    .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    mark
+}
+
+/// `n` tallying commits on `e`, which `e` observes.
+async fn fill<S: BlobStore>(e: &Engine<S>, n: usize) {
+    for i in 0..n {
+        tallying(e, 7000 + i as u128, &format!("f{i}")).await;
+    }
+}
+
+/// M134 criterion 1: a loser whose own record fell off, with a later duplicate's record
+/// still listed naming the winner, is replayed, never told it applied.
+#[tokio::test]
+async fn a_fallen_loser_is_replayed_not_applied() {
+    let store = Arc::new(MemoryStore::new());
+    let [a, b, c] = [1, 2, 3].map(|l| engine(&store, l));
+    let key = a.idempotency_key(1).await.unwrap();
+    folded(&a, &key, 1, "a").await;
+    let mark = folded(&b, &key, 2, "b").await;
+    folded(&c, &key, 3, "c").await;
+    // C's commit and 31 fillers are newer than B's, so A's and B's fall off and only C's
+    // record names the winner.
+    fill(&b, OUTCOMES_KEPT - 1).await;
+    let got = b.await_keyed(mark, OperationId(2), &key).await.unwrap();
+    assert_eq!(got, Applied::Replayed(None), "{got:?}");
+    assert!(!rows(&b).await.contains_key("b"));
+}
+
+/// M134 criterion 2: a loser whose own record fell off, with nothing listed naming the
+/// key, answers partial: was, or may have been, applied.
+#[tokio::test]
+async fn a_fallen_loser_with_no_record_is_partial() {
+    let store = Arc::new(MemoryStore::new());
+    let [a, b] = [1, 2].map(|l| engine(&store, l));
+    let key = a.idempotency_key(1).await.unwrap();
+    folded(&a, &key, 1, "a").await;
+    let mark = folded(&b, &key, 2, "b").await;
+    fill(&b, OUTCOMES_KEPT).await;
+    let got = b.await_keyed(mark, OperationId(2), &key).await.unwrap();
+    assert_eq!(got, Applied::Partial, "{got:?}");
+}
+
+/// M134 criterion 3: the winner whose own record fell off, named by a listed duplicate,
+/// answers that it applied and its counts cannot be read.
+#[tokio::test]
+async fn a_fallen_winner_is_unavailable() {
+    let store = Arc::new(MemoryStore::new());
+    let [a, b, c] = [1, 2, 3].map(|l| engine(&store, l));
+    let key = a.idempotency_key(1).await.unwrap();
+    let mark = folded(&a, &key, 1, "a").await;
+    folded(&b, &key, 2, "b").await;
+    folded(&c, &key, 3, "c").await;
+    fill(&a, OUTCOMES_KEPT - 1).await;
+    let got = a.await_keyed(mark, OperationId(1), &key).await.unwrap();
+    assert_eq!(got, Applied::Unavailable, "{got:?}");
+}
+
+/// M134 criterion 4: a sole winner whose own record fell off cannot be told from an
+/// expired attempt, so it answers partial, never a guess; its row exists.
+#[tokio::test]
+async fn a_fallen_sole_winner_is_partial() {
+    let store = Arc::new(MemoryStore::new());
+    let a = engine(&store, 1);
+    let key = a.idempotency_key(1).await.unwrap();
+    let mark = folded(&a, &key, 1, "a").await;
+    fill(&a, OUTCOMES_KEPT).await;
+    let got = a.await_keyed(mark, OperationId(1), &key).await.unwrap();
+    assert_eq!(got, Applied::Partial, "{got:?}");
+    assert!(rows(&a).await.contains_key("a"));
 }

@@ -34,9 +34,11 @@ issued them. Send the same key again, with the same body, when a response is los
 - `409 idempotency_expired`: the fold could not prove that no earlier attempt applied,
   because HEAD's list of the last 32 commits that decided applied writes no longer reaches
   back to the key. Nothing of this write applied. Get a new key and send it again;
-- `409 idempotency_partial`: part of the write was refused as expired, and part was, or
-  may have been, applied. That happens when its window fell off the list, for example
-  after 32 other commits on a busy tenant. Read the rows before sending it again.
+- `409 idempotency_partial`: the write was, or may have been, applied, in whole or in
+  part, and the records that would say which are no longer listed. That happens when part
+  of it was refused as expired, or when 32 other commits landed on a busy tenant before
+  its answer was read (M134: even when it applied in full). Read the rows before sending
+  it again.
 
 Retention is 32 commits that decided applied writes on the tenant, not a duration, so a
 key can expire within seconds on a busy tenant. It is refused with `bad_request` beside

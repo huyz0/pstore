@@ -2451,8 +2451,15 @@ impl<S: BlobStore> Engine<S> {
         };
         // ⚠️ M132: a keyed waiter reads its own records even when its window fell off (round-2
         // spec review): its refusing commit is the newest, so it is still listed.
+        let me = op.hex();
         let own = self.window(&seen, mark.0).await?;
-        match applied::own_answer(&op.hex(), fallen(&seen, mark), own) {
+        let own = match applied::own_answer(&me, fallen(&seen, mark), own) {
+            Some(own) => own,
+            // M134: its own records fell off. Who won is read from every listed record, so a
+            // losing attempt is never told it applied.
+            None => applied::named(&me, &key.to_string(), &self.window(&seen, 0).await?),
+        };
+        match own {
             applied::Own::Answer(a) => Ok(a),
             applied::Own::Replay(w) => {
                 // Every commit of the winner is after `e0`, and listed while HEAD covers it.
