@@ -501,6 +501,20 @@ async fn sections_that_disagree_with_the_sidecar_are_refused() {
     for f in ["a", "b"] {
         assert!(TextIndex::for_field(&ok, &raw, f).is_ok(), "{f}");
     }
+    // Each field's postings are its own span of the section, in order, and together they are
+    // the section: `a`'s ends where `b`'s starts, and `b`'s where the section does.
+    let section = ok.section(Section::TextPostings).unwrap();
+    let span = |f| TextIndex::for_field(&ok, &raw, f).unwrap().span();
+    let (sa, sb) = (span("a"), span("b"));
+    assert!(
+        sa.start == section.start && sa.start < sa.end,
+        "a: {sa:?} in {section:?}"
+    );
+    assert!(
+        sa.end == sb.start && sb.start < sb.end,
+        "a: {sa:?}, b: {sb:?}"
+    );
+    assert_eq!(sb.end, section.end, "b: {sb:?} in {section:?}");
     let corrupt = |r: Result<TextIndex, FormatError>, what: &str| {
         assert!(matches!(r, Err(FormatError::Corrupt(_))), "{what}: {r:?}");
     };
