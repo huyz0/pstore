@@ -185,8 +185,8 @@ vector and BM25 searches use separate fields.
 | `consistency.level` | Different shape: string modes; default eventual; session/bounded are extra | B, C |
 | single-query `rerank_by` | Windowed hand-written boosting/MMR, no model configuration `{model,attribute,query}` | F, J |
 | multi-query `queries` | 1..16 queries, entire root body; independent snapshots; no nested multi/aggregate/facets | F |
-| multi-query `rerank_by` | No outer fusion/reranking over multi-query results | F, J |
-| multi-query `limit`, `offset` | No outer result window | F |
+| multi-query `rerank_by` | `["RRF", {rank_constant, weights}]` over the queries' answers ([M142](../milestones/M142/VERIFIED.md)); no model reranker | J |
+| multi-query `limit`, `offset` | Outer window beside `rerank_by`, `limit` as `n` or `{total}` ([M142](../milestones/M142/VERIFIED.md)) | Refused without `rerank_by` |
 
 Projection also differs: pstore accepts `include_attributes` together with
 `exclude_attributes` and applies exclusion to the selected attributes. Vendor query
@@ -212,7 +212,7 @@ contract fixtures, rather than assuming identical validation.
 | `Dist(expression, origin)` | Limited numeric/geo boost mechanisms | No equivalent general expression; E |
 | One attribute `asc`/`desc` | Supported | Ties/type/null behavior require conformance fixtures |
 | Up to 8 attribute sort keys | Up to 8 keys as a list of pairs ([M140](../milestones/M140/VERIFIED.md)) | Paged by `offset` only, no cursor; F |
-| Outer `RRF(rank_constant, weights)` | RRF across retrieval legs (`k`, nonnegative weights) | Not outer multi-query; vendor requires positive weights and integer constant; F |
+| Outer `RRF(rank_constant, weights)` | Multi-query `rerank_by` ([M142](../milestones/M142/VERIFIED.md)): integer constant, positive weights; also RRF across one query's legs | Weights capped at 1,000,000 |
 | Model reranking | None | Optional service integration; J |
 | `VectorDist` computed output | Dense `$dist` only for scored dense leg | No arbitrary extra distance expression; F |
 | Computed BM25/ranking scores | No computed output map | F |

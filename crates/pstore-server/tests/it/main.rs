@@ -60,6 +60,7 @@ mod ref_new;
 mod registry;
 mod replication;
 mod replication_races;
+mod rerank;
 mod restart;
 mod scheduled_fold;
 mod scheduled_reap;

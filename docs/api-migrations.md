@@ -1,5 +1,30 @@
 # Native API migration notes
 
+## M142: outer RRF over a multi-query
+
+A multi-query's root may carry `rerank_by`, `limit` and `offset` beside `queries`:
+
+```json
+{"queries": [...], "rerank_by": ["RRF", {"rank_constant": 60, "weights": [1, 2]}],
+ "limit": 10, "offset": 0}
+```
+
+- Each query runs as before. A document's fused score is the sum of
+  `weight / (rank_constant + rank)` over the queries that returned it, with ranks counted
+  from 1 in each query's answer. A document appears once.
+- Rows are ordered by fused score, descending, then by id, ascending. Then `offset` rows
+  are skipped and `limit` kept. `limit` may also be `{"total": n}`.
+- `rank_constant` is an integer of at least 1, default 60. `weights` gives one number per
+  query, each greater than 0 and at most 1,000,000, default 1.
+- The answer's `results` holds one list, the fused one. Each row carries `id`, `score`,
+  and the attributes of the first query that returned it with attributes. `meta` keeps one
+  entry per query.
+- Refused with `bad_request`: a model reranker object (not offered), malformed RRF
+  parameters, and `limit` or `offset` without `rerank_by`.
+
+A multi-query without `rerank_by` answers as before. No stored-data migration is needed.
+The [M142 verification](milestones/M142/VERIFIED.md) records the evidence.
+
 ## M140: order by up to eight attributes
 
 `rank_by` also accepts a list of 1 to 8 `[attribute, "asc" | "desc"]` pairs:

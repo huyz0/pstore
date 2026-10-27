@@ -39,7 +39,8 @@ or one reads `as_of` (M131 pins only the others); fusion takes each answer as it
 The answer keeps the multi-query shape: `results` holds one list, the fused one, and
 `meta` is unchanged, one entry per query. A fused row carries `id`, `score` (the fused
 score), and `attributes` from the first query, in request order, whose results hold it
-with attributes (so a row two queries return at different epochs carries the first's);
+with attributes, an empty object counting as attributes (so a row two queries return at
+different epochs carries the first's);
 no `$dist`, and no `$highlight`.
 
 Refused with `bad_request`, before any query runs: `rerank_by` that is not one of the two
@@ -107,7 +108,7 @@ holds today; no new bound is claimed, as a dense or text query's `top_k` has non
   `top_k` cannot be fused. That is the vendor's "each leg's requested global prefix".
 
 ## Tasks
-- M141.1: the root's parsing, `fuse_outer`, the answer, docs.
+- M142.1: the root's parsing, `fuse_outer`, the answer, docs.
 
 ## Review
 Spec review round 1 (block on one major, amended): the arithmetic is `f64` in query order,
@@ -115,3 +116,6 @@ ties compare the `f64`, and the cast to `f32` is at output; weights bounded at 1
 Minors taken: a sub-query's own `offset`; legs at different epochs; integers and the
 `limit` object stated; unnamed refusals declared guards; the memory claim corrected; AC2's
 legs named.
+Code review round 1 (pass with minors): the depth test measures each run on a cold server
+and asserts it measured something; an empty attributes object counts as attributes, now
+stated.
