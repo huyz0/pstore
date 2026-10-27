@@ -232,3 +232,17 @@ fn a_poisoned_count_is_recovered() {
     assert_eq!(ingress.counts(), IngressCounts::default());
     assert!(ingress.admit(Key::Private).is_some());
 }
+
+/// Unit tests for what M128's integration tests also see, so a mutant here fails in the
+/// first test binary cargo runs (see `an_api_reports_the_limits_it_was_given`).
+#[test]
+fn an_ingress_keeps_its_limits_and_overload_says_when_to_retry() {
+    let limits = RequestLimits::builder()
+        .tenant_active_requests(2)
+        .build()
+        .unwrap();
+    assert_eq!(Ingress::new(limits).limits(), &limits);
+    let e = overloaded();
+    assert_eq!(e.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(e.retry_after, Some(1));
+}

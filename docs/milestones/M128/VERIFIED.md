@@ -35,6 +35,16 @@ were equivalent; and the over-limit body is finite. Six of those mutants, applie
 time against the `pstore-server` lib and integration tests (.harness/m128-mutations-r2.log),
 were all killed. The CI sweep is the full check; no local `cargo mutants` run is claimed.
 
+The next sweep (92 mutants, 4 h) caught 49 and still timed out 3 at 490 s: `request_limits`
+and `Ingress::limits` returning defaults, and `overloaded` without its `Retry-After`. All
+three were killed only by integration tests, so a sweep had to wait for the whole `it`
+binary, which ran 139 s here with the mutant in place and no test hanging (provisional);
+on CI's two jobs per runner that crossed the limit. Two unit tests,
+`an_api_reports_the_limits_it_was_given` and
+`an_ingress_keeps_its_limits_and_overload_says_when_to_retry`, now kill each of them in
+the lib tests cargo runs first, observed one mutant at a time
+(.harness/m128-mutations-r3.log).
+
 1. PASS: `ingress_byte_limits_precede_engine_access`. A write of exactly the limit
    succeeds; one byte over is `413 request_too_large` as one chunk, as one-byte fragments
    without a length, and under a lying `Content-Length: 10`. A declared length over the

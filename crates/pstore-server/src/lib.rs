@@ -5680,4 +5680,24 @@ mod tests {
         assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
         assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
     }
+
+    /// Read by the binary's startup log and by M128's tests. A unit test, so a mutant that
+    /// forgets the configured limits fails in the first test binary cargo runs, rather than
+    /// in the integration binary a CI mutation sweep can time out waiting for.
+    #[test]
+    fn an_api_reports_the_limits_it_was_given() {
+        let limits = RequestLimits::builder()
+            .active_requests(32)
+            .build()
+            .unwrap();
+        let api = Api::with_limits(
+            Accounted::new(pstore_blob::MemoryStore::new()),
+            LaneId(1),
+            None,
+            Auth::unsecured(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(api.request_limits(), limits);
+    }
 }
