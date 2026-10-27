@@ -527,17 +527,46 @@ impl Predicate {
     /// This predicate with every token predicate in it bound to `analyzer` (M14.2).
     #[must_use]
     pub fn bound(&self, analyzer: &pstore_format::text::Analyzer) -> Self {
+        self.bound_texts(analyzer, &BTreeMap::new())
+    }
+
+    /// This predicate with every token predicate in it bound (M156): one over a field named in
+    /// `texts`, the index's further text fields, to that field's analyzer; any other to
+    /// `primary`, the analyzer [`Self::bound`] takes.
+    #[must_use]
+    pub fn bound_texts(
+        &self,
+        primary: &pstore_format::text::Analyzer,
+        texts: &BTreeMap<String, pstore_format::text::FullText>,
+    ) -> Self {
         match self {
-            Self::Tokens(name, op, text, _) => Self::Tokens(
-                name.clone(),
-                *op,
-                text.clone(),
-                Some(Bound::new(*analyzer, *op, text)),
-            ),
-            Self::And(all) => Self::And(all.iter().map(|p| p.bound(analyzer)).collect()),
-            Self::Or(any) => Self::Or(any.iter().map(|p| p.bound(analyzer)).collect()),
-            Self::Not(p) => Self::Not(Box::new(p.bound(analyzer))),
+            Self::Tokens(name, op, text, _) => {
+                let analyzer = texts.get(name).map_or(primary, |f| &f.analyzer);
+                Self::Tokens(
+                    name.clone(),
+                    *op,
+                    text.clone(),
+                    Some(Bound::new(*analyzer, *op, text)),
+                )
+            }
+            Self::And(all) => {
+                Self::And(all.iter().map(|p| p.bound_texts(primary, texts)).collect())
+            }
+            Self::Or(any) => Self::Or(any.iter().map(|p| p.bound_texts(primary, texts)).collect()),
+            Self::Not(p) => Self::Not(Box::new(p.bound_texts(primary, texts))),
             other => other.clone(),
+        }
+    }
+
+    /// The attribute of every token predicate in it, through `And`, `Or` and `Not` (M156): the
+    /// fields whose analyzer its bind reads.
+    #[must_use]
+    pub fn token_fields(&self) -> Vec<&str> {
+        match self {
+            Self::Tokens(name, ..) => vec![name.as_str()],
+            Self::And(ps) | Self::Or(ps) => ps.iter().flat_map(Self::token_fields).collect(),
+            Self::Not(p) => p.token_fields(),
+            _ => Vec::new(),
         }
     }
 
@@ -1563,5 +1592,67 @@ mod tests {
         assert!(!yes(&en, "runner", "run"));
         assert!(yes(&folded, "cafe", "Café"));
         assert!(!yes(&en, "cafe", "Café"));
+    }
+
+    /// M156: a token predicate over a further field binds to that field's analyzer, through
+    /// `And`, `Or` and `Not`; any other to the primary's. `token_fields` sees every one.
+    #[test]
+    fn a_further_fields_token_predicate_binds_to_its_own_analyzer() {
+        use pstore_format::text::{Analyzer, FullText, Language};
+        let stem = Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        };
+        let texts = BTreeMap::from([(
+            "title".to_owned(),
+            FullText {
+                analyzer: stem,
+                ..FullText::default()
+            },
+        )]);
+        let tok =
+            |f: &str| Predicate::Tokens(f.to_owned(), TokenOp::Any, "Running".to_owned(), None);
+        let p = Predicate::And(vec![
+            tok("title"),
+            Predicate::Not(Box::new(Predicate::Or(vec![tok("text"), tok("title")]))),
+        ]);
+        let mut seen = Vec::new();
+        fn walk<'a>(p: &'a Predicate, out: &mut Vec<(&'a str, Analyzer)>) {
+            match p {
+                Predicate::Tokens(f, _, _, Some(b)) => out.push((f, *b.analyzer())),
+                Predicate::And(ps) | Predicate::Or(ps) => ps.iter().for_each(|p| walk(p, out)),
+                Predicate::Not(p) => walk(p, out),
+                _ => {}
+            }
+        }
+        let bound = p.bound_texts(&Analyzer::default(), &texts);
+        walk(&bound, &mut seen);
+        assert_eq!(
+            seen,
+            vec![
+                ("title", stem),
+                ("text", Analyzer::default()),
+                ("title", stem)
+            ]
+        );
+        // `bound` is `bound_texts` with no further field.
+        assert_eq!(p.bound(&stem), p.bound_texts(&stem, &BTreeMap::new()));
+        let run = BTreeMap::from([("title".to_owned(), Value::Str("run".to_owned()))]);
+        let alone = tok("title");
+        assert!(
+            alone
+                .bound_texts(&Analyzer::default(), &texts)
+                .admits("x", &run)
+        );
+        assert!(!alone.bound(&Analyzer::default()).admits("x", &run));
+        let mut fields = p.token_fields();
+        fields.sort_unstable();
+        assert_eq!(fields, ["text", "title", "title"]);
+        assert!(
+            Predicate::Cmp("n".to_owned(), Op::Eq, Value::Int(1))
+                .token_fields()
+                .is_empty()
+        );
     }
 }

@@ -960,13 +960,19 @@ fn encoded(cond: &pstore_query::Predicate) -> Result<String, EngineError> {
 /// refuses patterns beside a reference, and each of those decodes stays a short walk.
 struct Conditions<'a> {
     analyzer: &'a pstore_format::text::Analyzer,
+    /// The index's further text fields, whose token predicates bind to their own (M156).
+    texts: &'a BTreeMap<String, FullText>,
     decoded: std::collections::HashMap<String, Option<pstore_query::Predicate>>,
 }
 
 impl<'a> Conditions<'a> {
-    fn new(analyzer: &'a pstore_format::text::Analyzer) -> Self {
+    fn new(
+        analyzer: &'a pstore_format::text::Analyzer,
+        texts: &'a BTreeMap<String, FullText>,
+    ) -> Self {
         Self {
             analyzer,
+            texts,
             decoded: std::collections::HashMap::new(),
         }
     }
@@ -980,11 +986,11 @@ impl<'a> Conditions<'a> {
         match d.attrs.get(COND_ATTR) {
             None => Some(None),
             Some(pstore_format::Value::Str(s)) => {
-                let analyzer = self.analyzer;
+                let (analyzer, texts) = (self.analyzer, self.texts);
                 self.decoded
                     .entry(s.clone())
                     .or_insert_with(|| {
-                        pstore_query::condition::decode(s).map(|p| p.bound(analyzer))
+                        pstore_query::condition::decode(s).map(|p| p.bound_texts(analyzer, texts))
                     })
                     .clone()
                     .map(Some)
@@ -1513,14 +1519,25 @@ fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::T
 }
 
 /// Whether one share's `Part` describes a query (M152, M153): its text legs read at most one
-/// field, and that field scores under `fts`, which also binds the filter.
-fn one_part(texts: &pstore_query::Texts, prefetch: &[pstore_query::Prefetch]) -> bool {
+/// field, and that field scores under `fts`, which also binds the filter. M156: and no token
+/// predicate in its filter is over a further field, which binds to that field's analyzer.
+fn one_part(
+    texts: &pstore_query::Texts,
+    prefetch: &[pstore_query::Prefetch],
+    filter: Option<&pstore_query::Predicate>,
+) -> bool {
     let mut fields = prefetch.iter().filter_map(|p| match p {
         pstore_query::Prefetch::Text { field, .. } => Some(field.as_str()),
         _ => None,
     });
     let first = fields.next();
-    fields.all(|f| Some(f) == first) && first.is_none_or(|f| *texts.of(f) == texts.default)
+    fields.all(|f| Some(f) == first)
+        && first.is_none_or(|f| *texts.of(f) == texts.default)
+        && filter.is_none_or(|p| {
+            p.token_fields()
+                .iter()
+                .all(|f| !texts.fields.contains_key(*f))
+        })
 }
 
 /// Whether `doc` carries a non-empty string under `field`.
@@ -1890,6 +1907,9 @@ struct Scope {
     /// The full-text schema its filters bind to (M14.2), by the rule a relevance query's
     /// view uses.
     fts: FullText,
+    /// The further text fields whose token predicates bind to their own analyzers (M156), by
+    /// the same rule.
+    texts: BTreeMap<String, FullText>,
 }
 
 /// What [`Engine::warm`] did (M21).
@@ -4952,19 +4972,16 @@ impl<S: BlobStore> Engine<S> {
                 let docs = by_index.remove(&idx).unwrap_or_default();
                 // M14.2: conditions bind to the index's analyzer -- the one this fold records,
                 // when it creates the index.
-                let fts = at
-                    .head
-                    .schemas
-                    .get(&idx)
-                    .or_else(|| created.get(&idx))
-                    .map(|s| s.fts)
-                    .unwrap_or_default();
+                let schema = at.head.schemas.get(&idx).or_else(|| created.get(&idx));
+                let fts = schema.map(|s| s.fts).unwrap_or_default();
+                // M156: the further fields' analyzers bind their token predicates.
+                let texts = schema.map(|s| s.texts.clone()).unwrap_or_default();
                 let needed: std::collections::HashSet<&str> = docs
                     .iter()
                     .filter(|d| is_deferred(d) && !is_by_filter(d))
                     .map(|d| d.id.as_str())
                     .collect();
-                let mut cx = Conditions::new(&fts.analyzer);
+                let mut cx = Conditions::new(&fts.analyzer, &texts);
                 // M13.2: and every row a by-filter operation's filter admits. A filter that
                 // cannot be read admits nothing, as `resolve` reads it.
                 //
@@ -6773,8 +6790,17 @@ impl<S: BlobStore> Engine<S> {
             .map(|s| s.fts)
             .or(fresh_fts)
             .unwrap_or_default();
+        // M152: the text legs score under the queried field's `FullText`. M156: and a token
+        // predicate over a further field binds to its analyzer.
+        let texts = at
+            .head
+            .schemas
+            .get(index)
+            .map(|s| s.texts.clone())
+            .or(fresh_texts)
+            .unwrap_or_default();
         // M14.2: a read's one bind, where its view is resolved.
-        let bound = filter.map(|f| f.bound(&fts.analyzer));
+        let bound = filter.map(|f| f.bound_texts(&fts.analyzer, &texts));
         let filter = bound.as_ref();
         // From the HEAD already read, or -- an index not yet folded -- from its unfolded rows.
         let metric = at
@@ -6786,15 +6812,6 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_default();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let prefetch = prefetch.as_slice();
-        // M152: the text legs score under the queried field's `FullText`; the filter stays
-        // bound by the index's, above.
-        let texts = at
-            .head
-            .schemas
-            .get(index)
-            .map(|s| s.texts.clone())
-            .or(fresh_texts)
-            .unwrap_or_default();
         let scored = scoring(fts, &texts);
         if targets.is_empty() {
             return Ok(Answer {
@@ -6824,7 +6841,8 @@ impl<S: BlobStore> Engine<S> {
         // ⚠️ M152: never a query scored under another `FullText` than the index's: a share's
         // `Part` carries one, which binds the filter and scores alike (M154 lifts it). M153: nor
         // one over several text fields, which a `Part` has one `Stats` for.
-        let peers = peers.filter(|_| one_part(&scored, prefetch));
+        // M156: nor one whose filter binds a token predicate to a further field's analyzer.
+        let peers = peers.filter(|_| one_part(&scored, prefetch, filter));
         let elsewhere = peers.map_or_else(Vec::new, |p| {
             let durable = targets.get(..unfolded_at).unwrap_or_default();
             shares(
@@ -7157,7 +7175,7 @@ impl<S: BlobStore> Engine<S> {
         let unfolded_at = refs.len();
         let metric = schema.metric;
         // M14.2: bound to that epoch's analyzer.
-        let bound = filter.map(|f| f.bound(&schema.fts.analyzer));
+        let bound = filter.map(|f| f.bound_texts(&schema.fts.analyzer, &schema.texts));
         let filter = bound.as_ref();
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered_texts(
@@ -7308,12 +7326,13 @@ impl<S: BlobStore> Engine<S> {
             staleness,
             settle,
             fts,
+            texts,
             ..
         } = self
             .scope(index, as_of, consistency, allow_hit, hit)
             .await?;
-        // M14.2: a read's one bind, where its view is resolved.
-        let bound = filter.map(|f| f.bound(&fts.analyzer));
+        // M14.2: a read's one bind, where its view is resolved. M156: with its further fields.
+        let bound = filter.map(|f| f.bound_texts(&fts.analyzer, &texts));
         let filter = bound.as_ref();
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
         let (selected, settled) = futures_util::future::join(
@@ -7372,7 +7391,8 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
     ) -> Result<Scope, EngineError> {
-        let (head, epoch, settle, staleness, unfolded, shadow, shadowed, fts) = match as_of {
+        let (head, epoch, settle, staleness, unfolded, shadow, shadowed, (fts, texts)) = match as_of
+        {
             Some(epoch) => {
                 let at = head::read(&*self.store, self.tenant).await?;
                 self.remember_schemas(&at.head);
@@ -7382,7 +7402,8 @@ impl<S: BlobStore> Engine<S> {
                     )));
                 }
                 let then = at.head.as_of(epoch)?;
-                let fts = schema_at(&at.head, index, epoch).fts;
+                let schema = schema_at(&at.head, index, epoch);
+                let fts = (schema.fts, schema.texts);
                 (
                     Read::Owned(Box::new(then)),
                     epoch,
@@ -7407,13 +7428,13 @@ impl<S: BlobStore> Engine<S> {
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
                 let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
                     || (Arc::default(), Arc::default(), None),
-                    |v| (v.rows, v.shadow, Some(v.fts)),
+                    |v| (v.rows, v.shadow, Some((v.fts, v.texts))),
                 );
                 let fts = at
                     .head
                     .schemas
                     .get(index)
-                    .map(|s| s.fts)
+                    .map(|s| (s.fts, s.texts.clone()))
                     .or(fresh_fts)
                     .unwrap_or_default();
                 let epoch = at.head.epoch;
@@ -7461,6 +7482,7 @@ impl<S: BlobStore> Engine<S> {
             settle,
             live,
             fts,
+            texts,
         })
     }
 
@@ -7529,7 +7551,7 @@ impl<S: BlobStore> Engine<S> {
             .scope(index, as_of, consistency, allow_hit, hit)
             .await?;
         // M14.2: a read's one bind, where its view is resolved.
-        let bound = filter.map(|f| f.bound(&scope.fts.analyzer));
+        let bound = filter.map(|f| f.bound_texts(&scope.fts.analyzer, &scope.texts));
         let filter = bound.as_ref();
         // ⚠️ **Live reads only** (code review, B1): `Head::as_of` rebuilds a buried segment and a
         // buried delete vector with a count of 0, so a past epoch's arithmetic is wrong after a

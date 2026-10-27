@@ -1581,3 +1581,119 @@ async fn a_query_over_several_text_fields_is_not_split() {
         "a query over the primary was not split"
     );
 }
+
+/// M156 criterion 3: a token filter over a further field binds to that field's analyzer, which
+/// a share's `Part` cannot carry, so such a query is not split -- through one-exchange shares
+/// (a vector-only query) or phased ones (a text leg over the primary), at the top level and
+/// under `Not`. The same filters over the primary are split, as before.
+#[tokio::test]
+async fn a_token_filter_over_a_further_field_is_not_split() {
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    let title = FullText {
+        analyzer: Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        },
+        ..FullText::default()
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([(
+            "title".to_owned(),
+            title,
+        )])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                let t = ["run fast", "running late", "walk slowly"][(i % 3) as usize];
+                d.attrs.insert("title".to_owned(), Value::Str(t.to_owned()));
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let tokens = |field: &str, q: &str| {
+        Predicate::Tokens(
+            field.to_owned(),
+            pstore_query::TokenOp::Any,
+            q.to_owned(),
+            None,
+        )
+    };
+    let vector = vec![dense(
+        pstore_format::DEFAULT_FIELD,
+        vec![0.3, 0.9, -0.2, 1.0],
+    )];
+    let primary = vec![text()];
+    let run = |peers: &Three| {
+        peers.parts.load(Ordering::SeqCst)
+            + peers.opens.load(Ordering::SeqCst)
+            + peers.scans.load(Ordering::SeqCst)
+    };
+    for (field, q, split) in [("title", "Running", false), ("text", "word2", true)] {
+        for f in [tokens(field, q), Predicate::Not(Box::new(tokens(field, q)))] {
+            for (legs, kind) in [(&vector, "vector-only"), (&primary, "primary text")] {
+                let peers = Three::new(
+                    vec![
+                        Arc::new(engine(&store, 10)),
+                        Arc::new(engine(&store, 11)),
+                        Arc::new(engine(&store, 12)),
+                    ],
+                    Some(f.clone()),
+                );
+                let fused = coordinator
+                    .query_split_as(
+                        "idx",
+                        legs,
+                        Some(&f),
+                        Fusion::default(),
+                        10,
+                        pstore_engine::Consistency::Eventual,
+                        Some(&peers),
+                    )
+                    .await
+                    .unwrap();
+                let whole = coordinator
+                    .query_split_as(
+                        "idx",
+                        legs,
+                        Some(&f),
+                        Fusion::default(),
+                        10,
+                        pstore_engine::Consistency::Eventual,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!whole.hits.is_empty(), "{kind} {f:?}: the control is empty");
+                assert_eq!(exactly(&fused), exactly(&whole), "{kind} {f:?}");
+                if split {
+                    let (calls, which) = if kind == "vector-only" {
+                        (peers.parts.load(Ordering::SeqCst), "part")
+                    } else {
+                        (peers.opens.load(Ordering::SeqCst), "open")
+                    };
+                    assert!(calls > 0, "{kind} {f:?}: no {which} call; not split");
+                } else {
+                    assert_eq!(run(&peers), 0, "{kind} {f:?} was split");
+                }
+            }
+        }
+    }
+}

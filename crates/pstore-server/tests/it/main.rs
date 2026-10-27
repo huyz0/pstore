@@ -81,6 +81,7 @@ mod socket;
 mod support;
 mod text_arrays;
 mod text_fields;
+mod text_filters;
 mod time_travel;
 #[allow(
     dead_code,
