@@ -187,6 +187,7 @@ jobs:
       - run: ./scripts/check-slos.py
       - run: ./scripts/selftest-check-slos.sh
       - run: ./scripts/selftest-coverage-scope.sh
+      - run: ./scripts/selftest-coverage-mismatch.sh
       - run: ./scripts/check-milestone-ids.py
       - run: ./scripts/check-milestone-ids.py --self-test
       - run: ./scripts/check-poison.sh --selftest
