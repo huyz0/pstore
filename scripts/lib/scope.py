@@ -6,6 +6,9 @@ gates cannot disagree about what the codebase is -- they did, twice (M8b, M8d).
   py scripts/lib/scope.py llvm-cov  the --ignore-filename-regex llvm-cov takes
   py scripts/lib/scope.py mutants   one `cargo mutants --exclude` glob per line -- entry
                                     points only; see the note in main()
+  py scripts/lib/scope.py changed <path>...
+                                    the shipping crates those paths touch, then the
+                                    llvm-cov ignore regex for everything else
 
 Reads `cargo metadata --no-deps --format-version 1` on stdin.
 
@@ -71,8 +74,28 @@ def main():
         # containing `/` against exactly that path, so any other form excludes nothing.
         for b in bins:
             print(rel(root, b))
+    elif mode == "changed":
+        # `coverage.sh --changed`: the shipping crates owning a changed path (line 1, the
+        # packages to test), and the llvm-cov ignore regex for every crate NOT run plus what
+        # the full run already leaves out (line 2). Paths are relative to the root, as git
+        # prints them. A crate is named by its manifest's directory, so a change to its
+        # Cargo.toml or tests selects it too.
+        changed = sys.argv[2:]
+        shipping = sorted(
+            (p for p in md["packages"] if p not in test_only), key=lambda p: p["name"])
+        picked, others = [], []
+        for p in shipping:
+            d = rel(root, pathlib.Path(p["manifest_path"]).parent) + "/"
+            (picked if any(c.startswith(d) for c in changed) else others).append(d)
+        names = [p["name"] for p in shipping
+                 if rel(root, pathlib.Path(p["manifest_path"]).parent) + "/" in picked]
+        pats = [p["name"].replace("-", "[-_]") for p in test_only]
+        pats += ["/".join(b.parts[-3:]) for b in bins]
+        pats += [d for d in others]
+        print(" ".join(names))
+        print("|".join(pats))
     else:
-        print(f"unknown mode {mode!r}: names | llvm-cov | mutants", file=sys.stderr)
+        print(f"unknown mode {mode!r}: names | llvm-cov | mutants | changed", file=sys.stderr)
         return 2
     return 0
 

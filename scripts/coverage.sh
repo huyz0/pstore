@@ -11,6 +11,9 @@
 #   scripts/coverage.sh                          summary for shipped crates
 #   scripts/coverage.sh --all                    include test-only crates, for comparison
 #   scripts/coverage.sh --fail-under-regions 95  the gate
+#   scripts/coverage.sh --fast [args]            the same measure, reusing the last build
+#   scripts/coverage.sh --changed [BASE] [args]  only the crates changed since BASE
+#                                                (default: the merge-base with origin/main)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/py.sh
@@ -47,15 +50,63 @@ if [[ "${1:-}" == "--all" ]]; then
     exec cargo llvm-cov --workspace --summary-only
 fi
 
+# ⚠️ **The two fast modes are for the inner loop; the floor is the full run, in CI.** Each full
+# run took about 20 minutes on a 4-core container (M131), because `cargo llvm-cov` cleans the
+# workspace's build before every run, and the agent sat idle through it.
+#
+# `--fast` keeps the instrumented build and deletes only the old profile counts, so cargo
+# rebuilds what changed and every count is from this run. CI keeps the clean build.
+#
+# `--changed` also runs only the tests of the shipping crates the change touches, and
+# reports only those crates. ⚠️ It can read LOW, never high: a crate's code exercised only by
+# another crate's tests (pstore-blob's decorators by pstore-testkit's conformance suite) is
+# counted uncovered here. So a red `--changed` is a question and a green one is a hint; the
+# 95% floors are only ever decided by the full run.
+#
+# Measured after the test-binary merge, `provisional` (a 4-core cloud container): full 603 s,
+# `--fast` after touching pstore-engine 556 s, `--changed` on pstore-engine 242 s. Running the
+# instrumented tests is most of the cost now, so `--fast` saves little; `--changed` saves by
+# running fewer of them, and pstore-engine is the slowest crate to pick.
+fast=()
+if [[ "${1:-}" == "--fast" || "${1:-}" == "--changed" ]]; then
+    fast=(--no-clean)
+    cargo llvm-cov clean --profraw-only
+fi
+if [[ "${1:-}" == "--changed" ]]; then
+    shift
+    base=""
+    if [[ $# -gt 0 && "$1" != -* ]]; then base=$1; shift; fi
+    if [[ -z "$base" ]]; then
+        base=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD)
+    fi
+    # Committed since BASE, staged, unstaged and untracked: the change as it stands.
+    paths=$( { git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
+    # shellcheck disable=SC2086 # the paths are git's, one word each
+    picked=$(printf '%s' "$metadata" | py scripts/lib/scope.py changed $paths)
+    crates=$(printf '%s\n' "$picked" | sed -n 1p)
+    ignore=$(printf '%s\n' "$picked" | sed -n 2p)
+    if [[ -z "$crates" ]]; then
+        echo "# --changed: no shipping crate changed since $base; nothing to measure"
+        exit 0
+    fi
+    pkgs=()
+    for c in $crates; do pkgs+=(-p "$c"); done
+    echo "# --changed since $(git rev-parse --short "$base"): $crates -- their own tests only;" \
+        "a proxy, the floor is the full run"
+    exec cargo llvm-cov ${fast[@]+"${fast[@]}"} "${pkgs[@]}" --summary-only \
+        --ignore-filename-regex "$ignore" "$@"
+fi
+if [[ "${1:-}" == "--fast" ]]; then shift; fi
+
 # Anything else is passed straight through, so the gate is the same command a developer
 # runs with one more flag -- not a second, differently-scoped measurement.
 extra=("$@")
 
 if [[ -z "$shipped_filter" ]]; then
     echo "# no test-only crates; measuring the whole workspace"
-    exec cargo llvm-cov --workspace --summary-only "${extra[@]}"
+    exec cargo llvm-cov ${fast[@]+"${fast[@]}"} --workspace --summary-only "${extra[@]}"
 fi
 
 echo "# excluding test-only crates and binary entry points: $test_only_names"
-exec cargo llvm-cov --workspace --summary-only \
+exec cargo llvm-cov ${fast[@]+"${fast[@]}"} --workspace --summary-only \
     --ignore-filename-regex "$shipped_filter" "${extra[@]}"
