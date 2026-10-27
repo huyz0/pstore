@@ -1,5 +1,23 @@
 # Native API migration notes
 
+## M133: `$ref_new` in write conditions
+
+In `upsert_condition` and `patch_condition`, the value of `Eq`, `NotEq`, `Lt`, `Lte`, `Gt`
+or `Gte` may be `{"$ref_new": "<attribute>"}`: that attribute's value in the operation's
+own new row. "Newer version wins" is `["v", "Lt", {"$ref_new": "v"}]`.
+
+- An upsert's reference is its document's attribute; a patch's is the value it sets. An
+  attribute the patch unsets or does not name is absent. `{"$ref_new": "id"}` is the id.
+- An absent reference: `Eq` means the row lacks the attribute, `NotEq` that it has it, and
+  `Lt`, `Lte`, `Gt` and `Gte` are false. An upsert of a missing id still applies (M13).
+- Refused with `bad_request`: a reference in `delete_condition`, in a by-filter operation
+  or a query filter, under any other operator, beside a `Glob`, `IGlob`, `Regex`, `Fuzzy`
+  or token clause, naming a reserved attribute, or resolving to an array.
+
+Nothing new is stored: each operation carries its own resolved condition, as M13's
+operations already carried theirs. Rolling back is safe at any time; an older server
+refuses `$ref_new` with `bad_request`, and folds what this one buffered.
+
 ## M132: idempotency keys for applied writes
 
 An applied write may carry `"idempotency_key"`. Of all the attempts that carry one key,

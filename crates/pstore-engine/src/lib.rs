@@ -767,6 +767,39 @@ const OP_DELETE_BY_FILTER: i64 = 4;
 /// A patch of every row whose current version admits the filter in `$cond` (M13.2).
 const OP_PATCH_BY_FILTER: i64 = 5;
 
+/// The `$cond` each operation of one call carries: none, one for all (M13), or one each
+/// (M133).
+enum Marks {
+    None,
+    All(String),
+    Each(Vec<String>),
+}
+
+impl Marks {
+    /// One encoded condition per operation, refused unless there are exactly `n`.
+    fn each(n: usize, conds: &[pstore_query::Predicate]) -> Result<Self, EngineError> {
+        if conds.len() != n {
+            return Err(EngineError::Format(format!(
+                "{} conditions for {n} operations: one each is required",
+                conds.len()
+            )));
+        }
+        conds
+            .iter()
+            .map(encoded)
+            .collect::<Result<_, _>>()
+            .map(Self::Each)
+    }
+
+    fn get(&self, i: usize) -> Option<&String> {
+        match self {
+            Self::None => None,
+            Self::All(c) => Some(c),
+            Self::Each(cs) => cs.get(i),
+        }
+    }
+}
+
 /// Whether an operation applies by filter rather than to its id (M13.2). Its id is empty,
 /// and means nothing.
 fn is_by_filter(d: &Document) -> bool {
@@ -856,6 +889,8 @@ fn encoded(cond: &pstore_query::Predicate) -> Result<String, EngineError> {
 
 /// One fold's deferred conditions, each decoded once (code review, M15 M1): a write stamps
 /// one condition on every document it carries, and decoding compiles its patterns.
+/// ⚠️ M133: a write with `$ref_new` stamps one condition per operation, so the server
+/// refuses patterns beside a reference, and each of those decodes stays a short walk.
 struct Conditions<'a> {
     analyzer: &'a pstore_format::text::Analyzer,
     decoded: std::collections::HashMap<String, Option<pstore_query::Predicate>>,
@@ -2803,7 +2838,7 @@ impl<S: BlobStore> Engine<S> {
         docs: Vec<Document>,
         metric: Metric,
     ) -> Result<(), EngineError> {
-        self.write_marked(index, docs, metric, None, &Declared::default())
+        self.write_marked(index, docs, metric, Marks::None, &Declared::default())
             .await
     }
 
@@ -2821,8 +2856,12 @@ impl<S: BlobStore> Engine<S> {
         cond: Option<&pstore_query::Predicate>,
         declared: &Declared,
     ) -> Result<(), EngineError> {
-        let mark = cond.map(encoded).transpose()?;
-        self.write_marked(index, docs, metric, mark, declared).await
+        let marks = cond
+            .map(encoded)
+            .transpose()?
+            .map_or(Marks::None, Marks::All);
+        self.write_marked(index, docs, metric, marks, declared)
+            .await
     }
 
     /// [`Self::write_as`], declaring the index's full-text schema (M14): it becomes the
@@ -2842,7 +2881,7 @@ impl<S: BlobStore> Engine<S> {
             fts: Some(*fts),
             trigram: None,
         };
-        self.write_marked(index, docs, metric, None, &declared)
+        self.write_marked(index, docs, metric, Marks::None, &declared)
             .await
     }
 
@@ -2860,7 +2899,7 @@ impl<S: BlobStore> Engine<S> {
         cond: &pstore_query::Predicate,
     ) -> Result<(), EngineError> {
         let mark = encoded(cond)?;
-        self.write_marked(index, docs, metric, Some(mark), &Declared::default())
+        self.write_marked(index, docs, metric, Marks::All(mark), &Declared::default())
             .await
     }
 
@@ -2878,14 +2917,61 @@ impl<S: BlobStore> Engine<S> {
         patches: Vec<Patch>,
         cond: Option<&pstore_query::Predicate>,
     ) -> Result<(), EngineError> {
+        let marks = cond
+            .map(encoded)
+            .transpose()?
+            .map_or(Marks::None, Marks::All);
+        self.patch_marked(index, patches, marks).await
+    }
+
+    /// [`Self::write_declared`] with one condition per document, `conds[i]` for `docs[i]`
+    /// (M133): each upsert applies only if its row's current version, when it has one, admits
+    /// its own condition.
+    ///
+    /// # Errors
+    /// As [`Self::write_declared`]; and as many conditions as documents not given, when
+    /// nothing is buffered.
+    pub async fn write_conditioned(
+        &self,
+        index: &str,
+        docs: Vec<Document>,
+        conds: Vec<pstore_query::Predicate>,
+        metric: Metric,
+        declared: &Declared,
+    ) -> Result<(), EngineError> {
+        let marks = Marks::each(docs.len(), &conds)?;
+        self.write_marked(index, docs, metric, marks, declared)
+            .await
+    }
+
+    /// [`Self::patch`] with one condition per patch, `conds[i]` for `patches[i]` (M133).
+    ///
+    /// # Errors
+    /// As [`Self::patch`]; and as many conditions as patches not given, when nothing is
+    /// buffered.
+    pub async fn patch_conditioned(
+        &self,
+        index: &str,
+        patches: Vec<Patch>,
+        conds: Vec<pstore_query::Predicate>,
+    ) -> Result<(), EngineError> {
+        let marks = Marks::each(patches.len(), &conds)?;
+        self.patch_marked(index, patches, marks).await
+    }
+
+    async fn patch_marked(
+        &self,
+        index: &str,
+        patches: Vec<Patch>,
+        marks: Marks,
+    ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
-        let cond = cond.map(encoded).transpose()?;
         let mut ops = Vec::with_capacity(patches.len());
-        for p in patches {
+        for (i, p) in patches.into_iter().enumerate() {
             let id = p.id.clone();
             let mut attrs = patch_attrs(p)?;
             self.stamp(&mut attrs);
-            if let Some(c) = &cond {
+            if let Some(c) = marks.get(i) {
                 attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
             }
             ops.push(Document {
@@ -2973,7 +3059,7 @@ impl<S: BlobStore> Engine<S> {
         index: &str,
         docs: Vec<Document>,
         metric: Metric,
-        mark: Option<String>,
+        marks: Marks,
         declared: &Declared,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
@@ -2989,7 +3075,7 @@ impl<S: BlobStore> Engine<S> {
             ));
         }
         let mut docs = docs;
-        for d in &mut docs {
+        for (i, d) in docs.iter_mut().enumerate() {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
                 return Err(EngineError::Format(format!(
                     "document {}: attribute `{name}` is reserved: names beginning `$` are",
@@ -3067,7 +3153,7 @@ impl<S: BlobStore> Engine<S> {
                     ),
                 );
             }
-            if let Some(c) = &mark {
+            if let Some(c) = marks.get(i) {
                 d.attrs.insert(
                     OP_ATTR.to_owned(),
                     pstore_format::Value::Int(OP_COND_UPSERT),

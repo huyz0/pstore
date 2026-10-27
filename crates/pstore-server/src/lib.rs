@@ -39,6 +39,7 @@ mod peer_http;
 pub use peer_http::PeerTransport;
 mod peer_tls;
 mod peer_wire;
+mod ref_new;
 #[cfg(test)]
 #[path = "../tests/support/tls.rs"]
 mod tls_for_tests;
@@ -1753,32 +1754,32 @@ async fn write_documents<S: BlobStore + 'static>(
         ));
     }
     // M13: each condition guards its own kind of operation, and must have some to guard.
-    let condition = |name: &str, v: &Option<serde_json::Value>, any: bool| {
-        v.as_ref()
-            .map(|v| {
-                if any {
-                    // A condition travels to the fold encoded; one the fold could not decode
-                    // would admit nothing there, so it is refused here (code review, M13.1).
-                    write_filter(name, v)
-                } else {
-                    Err(ApiError::bad_request(format!(
-                        "{name} with no operations of its kind to apply to"
-                    )))
-                }
-            })
-            .transpose()
+    // A condition travels to the fold encoded; one the fold could not decode would admit
+    // nothing there, so it is refused here (code review, M13.1). M133: an upsert's or a
+    // patch's may hold `$ref_new`, resolved per operation below.
+    let condition = |name: &str, v: &Option<serde_json::Value>, any: bool| match v {
+        Some(_) if !any => Err(ApiError::bad_request(format!(
+            "{name} with no operations of its kind to apply to"
+        ))),
+        _ => Ok(v.clone()),
     };
     let upsert_if = condition(
         "upsert_condition",
         &req.upsert_condition,
         !req.documents.is_empty(),
-    )?;
-    let patch_if = condition("patch_condition", &req.patch_condition, !patches.is_empty())?;
+    )?
+    .map(|v| ref_new::write_cond("upsert_condition", &v))
+    .transpose()?;
+    let patch_if = condition("patch_condition", &req.patch_condition, !patches.is_empty())?
+        .map(|v| ref_new::write_cond("patch_condition", &v))
+        .transpose()?;
     let delete_if = condition(
         "delete_condition",
         &req.delete_condition,
         !req.deletes.is_empty(),
-    )?;
+    )?
+    .map(|v| write_filter("delete_condition", &v))
+    .transpose()?;
     if ids_wanted {
         affected_ids_bounded(&req, &patches, delete_by.is_some() || patch_by.is_some())?;
     }
@@ -1844,6 +1845,11 @@ async fn write_documents<S: BlobStore + 'static>(
         .into_iter()
         .map(|d| to_document(d, &dated))
         .collect::<Result<_, _>>()?;
+    // M133: every reference resolved, and refused, before anything is buffered.
+    let ops: Vec<_> = docs.iter().map(|d| (d.id.as_str(), &d.attrs)).collect();
+    let upsert_if = ref_new::conds("upsert_condition", upsert_if, &ops)?;
+    let ops: Vec<_> = patches.iter().map(|p| (p.id.as_str(), &p.set)).collect();
+    let patch_if = ref_new::conds("patch_condition", patch_if, &ops)?;
     // M129: an applied write's window starts at the HEAD this engine knew BEFORE its
     // operations are buffered, and every one of them carries its id to the fold.
     let op = applied.then(operation_id).transpose()?;
@@ -1855,14 +1861,12 @@ async fn write_documents<S: BlobStore + 'static>(
     let buffer = async {
         let written = docs.len();
         if !docs.is_empty() {
-            engine
-                .write_declared(&index, docs, metric, upsert_if.as_ref(), &declared)
-                .await?;
+            upsert(&engine, &index, docs, metric, upsert_if, &declared).await?;
         }
         // Then the patches, then the deletes (M13): a later operation on an id wins.
         let patched = patches.len();
         if !patches.is_empty() {
-            engine.patch(&index, patches, patch_if.as_ref()).await?;
+            patch_with(&engine, &index, patches, patch_if).await?;
         }
         // After the documents: a request that writes and deletes an id deletes it.
         let deleted = deletes.len();
@@ -2021,6 +2025,42 @@ fn idempotency_key_of<S: BlobStore + 'static>(
                 "idempotency_key {key:?} is not one this API issues: <epoch>-<32 lowercase hex>"
             ))
         })
+}
+
+/// Buffers `docs` under `conds` (M133: one each, when the condition held `$ref_new`).
+async fn upsert<S: BlobStore + 'static>(
+    engine: &Engine<S>,
+    index: &str,
+    docs: Vec<Document>,
+    metric: pstore_engine::Metric,
+    conds: ref_new::Conds,
+    declared: &pstore_engine::Declared,
+) -> Result<(), EngineError> {
+    match conds {
+        ref_new::Conds::One(c) => {
+            engine
+                .write_declared(index, docs, metric, c.as_ref(), declared)
+                .await
+        }
+        ref_new::Conds::Each(cs) => {
+            engine
+                .write_conditioned(index, docs, cs, metric, declared)
+                .await
+        }
+    }
+}
+
+/// Buffers `patches` under `conds`, as [`upsert`] does.
+async fn patch_with<S: BlobStore + 'static>(
+    engine: &Engine<S>,
+    index: &str,
+    patches: Vec<pstore_engine::Patch>,
+    conds: ref_new::Conds,
+) -> Result<(), EngineError> {
+    match conds {
+        ref_new::Conds::One(c) => engine.patch(index, patches, c.as_ref()).await,
+        ref_new::Conds::Each(cs) => engine.patch_conditioned(index, patches, cs).await,
+    }
 }
 
 /// M132: refuses a key from ahead of HEAD, which would let a commit at or below its `e0`
