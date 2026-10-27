@@ -77,7 +77,10 @@ if [[ "${1:-}" == "--changed" ]]; then
     base=""
     if [[ $# -gt 0 && "$1" != -* ]]; then base=$1; shift; fi
     if [[ -z "$base" ]]; then
-        base=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD)
+        # No silent fallback: a base of HEAD would count only uncommitted work and report a
+        # committed change as "nothing to measure".
+        base=$(git merge-base HEAD origin/main 2>/dev/null) \
+            || { echo "# --changed: no origin/main to diff against; pass BASE" >&2; exit 2; }
     fi
     # Committed since BASE, staged, unstaged and untracked: the change as it stands.
     paths=$( { git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
@@ -93,6 +96,10 @@ if [[ "${1:-}" == "--changed" ]]; then
     for c in $crates; do pkgs+=(-p "$c"); done
     echo "# --changed since $(git rev-parse --short "$base"): $crates -- their own tests only;" \
         "a proxy, the floor is the full run"
+    # An empty regex would ignore every file, as the full run's guard below says.
+    if [[ -z "$ignore" ]]; then
+        exec cargo llvm-cov ${fast[@]+"${fast[@]}"} "${pkgs[@]}" --summary-only "$@"
+    fi
     exec cargo llvm-cov ${fast[@]+"${fast[@]}"} "${pkgs[@]}" --summary-only \
         --ignore-filename-regex "$ignore" "$@"
 fi
