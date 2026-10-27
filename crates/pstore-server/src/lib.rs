@@ -4212,6 +4212,36 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             })
         }
         [op, inner] if op == "Not" => Ok(Predicate::Not(Box::new(clause(inner)?))),
+        // M138: the vendor's options element, on the two token operators that take one. Its
+        // only key is `last_as_prefix`; `{}` and `false` mean the three-element clause.
+        [attr, op, value, opts] => {
+            if op != "ContainsAllTokens" && op != "ContainsAnyToken" {
+                return Err(bad(format!(
+                    "{op} takes no options: only ContainsAllTokens and ContainsAnyToken do"
+                )));
+            }
+            let o = opts
+                .as_object()
+                .filter(|o| o.keys().all(|k| k == "last_as_prefix"))
+                .ok_or_else(|| bad(format!("{op}'s options are {{\"last_as_prefix\": bool}}")))?;
+            let prefix = match o.get("last_as_prefix") {
+                None => false,
+                Some(b) => b
+                    .as_bool()
+                    .ok_or_else(|| bad("last_as_prefix is true or false".to_owned()))?,
+            };
+            let p = clause(&serde_json::json!([attr, op, value]))?;
+            Ok(match p {
+                Predicate::Tokens(a, how, text, b) if prefix => {
+                    let how = match how {
+                        pstore_query::TokenOp::All => pstore_query::TokenOp::AllPrefix,
+                        _ => pstore_query::TokenOp::AnyPrefix,
+                    };
+                    Predicate::Tokens(a, how, text, b)
+                }
+                p => p,
+            })
+        }
         [attr, op, value] => {
             let attr = attr
                 .as_str()
