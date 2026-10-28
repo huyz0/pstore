@@ -180,7 +180,7 @@ vector and BM25 searches use separate fields.
 | `group_by` | Up to 8 attribute names, no named expression or `ForEachUnique` | F |
 | `compute_attributes` | No general computation map; separate single-string highlight feature | E, F |
 | `distance_metric` | Metric selected on write/index, no per-query wire override | B, D |
-| `limit` | No integer/object alias; `Limit.total` and `Limit.per.{attributes,limit}` absent | B, F |
+| `limit` | No integer/object alias on a single query (`top_k`); `Limit.per` is served as a top-level `limit_per` over a relevance window ([M146](../milestones/M146/VERIFIED.md)) | B |
 | `vector_encoding` | No float/base64 response option | B, D |
 | `consistency.level` | Different shape: string modes; default eventual; session/bounded are extra | B, C |
 | single-query `rerank_by` | Windowed hand-written boosting/MMR, no model configuration `{model,attribute,query}` | F, J |
@@ -225,7 +225,8 @@ contract fixtures, rather than assuming identical validation.
 Highlight offset units in the spec are UTF-8, UTF-16, and codepoints; fragment modes
 are none, sentence, paragraph, and word. pstore's current highlight limits Unicode
 characters, not these offset contracts. MMR chooses diversity by result similarity;
-it does not enforce the hard group quota represented by `limit.per`.
+it does not enforce the hard group quota represented by `limit.per`; `limit_per` does
+([M146](../milestones/M146/VERIFIED.md)), exactly over a window of at most 1,000.
 
 Sources: [query planning](../../crates/pstore-server/src/lib.rs),
 [boost](../../crates/pstore-server/src/boost.rs), [diversify](../../crates/pstore-server/src/diversify.rs),

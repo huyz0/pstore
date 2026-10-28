@@ -42,6 +42,7 @@ mod idle;
 mod ingress;
 mod lane_taken;
 mod lifecycle;
+mod limit_per;
 mod metrics;
 mod multi;
 mod multi_fde;
@@ -80,6 +81,7 @@ mod socket;
 )]
 #[path = "../support/mod.rs"]
 mod support;
+mod text_only;
 mod time_travel;
 #[allow(
     dead_code,
