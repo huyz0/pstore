@@ -244,7 +244,9 @@ async fn rank_by_refuses_what_it_cannot_mean() {
         json!({"rank_by": ["k", "asc"], "text": "x"}),
         json!({"rank_by": ["k", "asc"], "field": "vector"}),
         json!({"rank_by": ["k", "asc"], "exact": true}),
-        json!({"vector": [1.0, 0.5], "offset": 1}),
+        // M163: a relevance `offset` is served (`relevance_offset::`); beside `diversify` it
+        // is still refused.
+        json!({"vector": [1.0, 0.5], "offset": 1, "diversify": {"lambda": 0.5}}),
         json!({"rank_by": ["k", "up"]}),
         json!({"rank_by": ["k"]}),
         json!({"rank_by": "k"}),

@@ -132,6 +132,12 @@ impl<'a> Dec<'a> {
     pub(crate) fn raw(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
         self.take(n)
     }
+    /// A UUID's 16 bytes (M171).
+    pub(crate) fn uuid(&mut self) -> Result<[u8; 16], FormatError> {
+        self.take(16)?
+            .try_into()
+            .map_err(|_| FormatError::Truncated)
+    }
 }
 
 /// FNV-1a over the index section, so tampering is caught before it is served as data.

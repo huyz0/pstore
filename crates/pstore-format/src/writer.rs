@@ -238,7 +238,11 @@ impl SegmentWriter {
                                 zones.datetimes.insert(k.clone(), (*t, *t, false));
                             }
                         }
-                        Value::Str(_) | Value::Bool(_) | Value::Array(_) => {}
+                        Value::Str(_)
+                        | Value::Bool(_)
+                        | Value::Array(_)
+                        | Value::Uuid(_)
+                        | Value::Bytes(_) => {}
                     }
                 }
             }
@@ -246,7 +250,10 @@ impl SegmentWriter {
             // fact that lets a string literal rule the block out.
             for d in rows {
                 for (k, v) in &d.attrs {
-                    if let (Value::Str(_), Some(e)) = (v, zones.datetimes.get_mut(k)) {
+                    // M171: and a UUID or bytes, which a string literal is read as too.
+                    if let (Value::Str(_) | Value::Uuid(_) | Value::Bytes(_), Some(e)) =
+                        (v, zones.datetimes.get_mut(k))
+                    {
                         e.2 = true;
                     }
                 }
@@ -382,7 +389,12 @@ impl SegmentWriter {
             d.attrs.values().any(|v| {
                 matches!(
                     v,
-                    Value::Float(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_)
+                    Value::Float(_)
+                        | Value::Bool(_)
+                        | Value::Array(_)
+                        | Value::DateTime(_)
+                        | Value::Uuid(_)
+                        | Value::Bytes(_)
                 )
             })
         });

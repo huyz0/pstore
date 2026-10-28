@@ -28,6 +28,7 @@ mod shared;
 pub mod sparse;
 pub mod text;
 pub mod trigram;
+pub mod typed;
 mod writer;
 
 pub use docs::{
@@ -217,6 +218,11 @@ pub enum Value {
     /// An instant: microseconds since 1970-01-01T00:00:00Z, within
     /// [`datetime::MIN`]`..=`[`datetime::MAX`] (M9h.3). A scalar, so an array may hold one.
     DateTime(i64),
+    /// A UUID's 16 bytes, in their written order (M171). Compared by those bytes, which is
+    /// the order of the lowercase hyphenated form.
+    Uuid([u8; 16]),
+    /// Bytes (M171), compared bytewise. At most 4,096 a value, which the server bounds.
+    Bytes(Vec<u8>),
 }
 
 impl Value {
@@ -239,6 +245,8 @@ impl Value {
             Self::Bool(_) => 3,
             Self::Array(_) => 4,
             Self::DateTime(_) => 5,
+            Self::Uuid(_) => 6,
+            Self::Bytes(_) => 7,
         }
     }
 }
@@ -266,6 +274,8 @@ impl Ord for Value {
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
             (Self::Array(a), Self::Array(b)) => a.cmp(b),
             (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
+            (Self::Uuid(a), Self::Uuid(b)) => a.cmp(b),
+            (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -287,7 +297,12 @@ impl Number {
         match v {
             Value::Int(n) => Some(Self::Int(*n)),
             Value::Float(f) => Some(Self::Float(*f)),
-            Value::Str(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_) => None,
+            Value::Str(_)
+            | Value::Bool(_)
+            | Value::Array(_)
+            | Value::DateTime(_)
+            | Value::Uuid(_)
+            | Value::Bytes(_) => None,
         }
     }
 }
@@ -710,7 +725,9 @@ impl Filter {
                 | Value::Float(_)
                 | Value::Bool(_)
                 | Value::Array(_)
-                | Value::DateTime(_),
+                | Value::DateTime(_)
+                | Value::Uuid(_)
+                | Value::Bytes(_),
             ) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,

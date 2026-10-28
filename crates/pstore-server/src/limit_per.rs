@@ -145,6 +145,8 @@ mod tests {
             Some(Value::Str(s)) => format!("s{s:?}"),
             Some(Value::Bool(b)) => format!("b{b}"),
             Some(Value::DateTime(t)) => format!("t{t}"),
+            Some(Value::Uuid(u)) => format!("u{u:?}"),
+            Some(Value::Bytes(b)) => format!("y{b:?}"),
             Some(Value::Array(a)) => format!(
                 "[{}]",
                 a.iter()

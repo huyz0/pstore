@@ -262,3 +262,15 @@ async fn a_datetime_round_trips_and_its_range_is_enforced() {
     assert!(Value::Array(vec![]) < Value::DateTime(datetime::MIN));
     assert!(Value::DateTime(0) < Value::DateTime(1));
 }
+
+#[test]
+fn uuids_and_bytes_order_structurally_after_datetimes_and_by_their_bytes() {
+    // M171: their own variants, after a datetime, a UUID before bytes; within each, by bytes.
+    assert!(Value::DateTime(pstore_format::datetime::MAX) < Value::Uuid([0; 16]));
+    assert!(Value::Uuid([255; 16]) < Value::Bytes(Vec::new()));
+    assert!(Value::Uuid([1; 16]) < Value::Uuid([2; 16]));
+    assert!(Value::Bytes(vec![1, 9]) < Value::Bytes(vec![2]));
+    assert_ne!(Value::Uuid([1; 16]), Value::Uuid([2; 16]));
+    assert_ne!(Value::Bytes(vec![1]), Value::Bytes(vec![1, 0]));
+    assert_eq!(Value::Bytes(vec![1]), Value::Bytes(vec![1]));
+}

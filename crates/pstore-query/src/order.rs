@@ -157,18 +157,20 @@ fn value_of<'a>(by: &OrderBy, doc: &'a Document) -> Option<std::borrow::Cow<'a, 
 
 /// A value's group in `by`'s direction.
 fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
-    // Ascending: bools, numbers, datetimes (M9h.3), strings, arrays; descending reverses
-    // the groups. Absent is last both ways.
+    // Ascending: bools, numbers, datetimes (M9h.3), strings, UUIDs and bytes (M171), arrays;
+    // descending reverses the groups. Absent is last both ways.
     let group = match value {
         Some(Value::Bool(_)) => 0,
         Some(Value::Int(_) | Value::Float(_)) => 1,
         Some(Value::DateTime(_)) => 2,
         Some(Value::Str(_)) => 3,
-        Some(Value::Array(_)) => 4,
-        None => 5,
+        Some(Value::Uuid(_)) => 4,
+        Some(Value::Bytes(_)) => 5,
+        Some(Value::Array(_)) => 6,
+        None => 7,
     };
-    if by.desc && group < 5 {
-        4 - group
+    if by.desc && group < 7 {
+        6 - group
     } else {
         group
     }
@@ -186,6 +188,8 @@ fn key_order(
         (Some(Value::Str(a)), Some(Value::Str(b))) => a.as_bytes().cmp(b.as_bytes()),
         (Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
         (Some(Value::DateTime(a)), Some(Value::DateTime(b))) => a.cmp(b),
+        (Some(Value::Uuid(a)), Some(Value::Uuid(b))) => a.cmp(b),
+        (Some(Value::Bytes(a)), Some(Value::Bytes(b))) => a.cmp(b),
         (Some(a), Some(b)) => match (Number::of(a), Number::of(b)) {
             // A NaN never reaches storage (`check_storable`), so `None` is unreachable.
             (Some(a), Some(b)) => cmp_numbers(a, b).unwrap_or(Ordering::Equal),

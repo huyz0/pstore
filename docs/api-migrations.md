@@ -1,5 +1,28 @@
 # Native API migration notes
 
+## M171: UUID and bytes attributes
+
+A write's `schema` may declare an attribute `"uuid"` or `"bytes"` beside `"datetime"`:
+
+```json
+{"schema": {"owner": "uuid", "thumb": "bytes"},
+ "documents": [{"id": "a", "attributes": {"owner": "6F1C2A3B-4D5E-4F60-8A7B-9C8D7E6F5A4B",
+                                          "thumb": "AAE="}}]}
+```
+
+- A UUID is 8-4-4-4-12 hex digits of either case, stored as 16 bytes and answered
+  lowercase. Bytes are standard padded base64, at most 4,096 bytes, answered the same way.
+  An array of either is declared the same way. A malformed value is refused, nothing stored.
+- Filters, boosts and `$ref_new` conditions read a string literal as the row's type: a
+  literal that does not parse matches no such row (and its negation every one). UUIDs
+  compare by their bytes, bytes bytewise. `rank_by` orders the groups bool, number,
+  datetime, string, UUID, bytes, array, absent.
+- Segments holding these values carry two new value tags. A reader older than M171
+  refuses such a segment rather than misreading it: upgrade readers first.
+
+A write without these declarations is unchanged. No stored-data migration is needed.
+The [M171 verification](milestones/M171/VERIFIED.md) records the evidence.
+
 ## M170: documents with no vector
 
 A document may omit `vector` (or send `null`): `{"id": "a", "text": "...", "attributes": {...}}`.
@@ -16,6 +39,24 @@ paged exactly as documents with vectors are.
 
 Every request valid before answers as before. No stored-data migration is needed.
 The [M170 verification](milestones/M170/VERIFIED.md) records the evidence.
+
+## M163: `offset` on a relevance ranking
+
+A relevance query (`vector`, `multi`, `text`, `field` or `exact`) may carry `offset`. The
+answer is rows `offset` to `offset + top_k` of the same query at `top_k = offset + top_k`.
+
+- `top_k + offset` is at most 10,000 when `offset` is given, `offset: 0` included.
+- A boost's or `limit_per`'s window must reach `top_k + offset`; its default is twice
+  that, from 100 to 1,000. The boost and the group cut run before the skip.
+- Each page is ranked at its own depth. With an approximate ranking, two pages at
+  different depths can disagree (a row can repeat or be missed). Use `exact: true` or
+  `rank_by` for stable paging.
+- Refused beside `diversify` and `aggregate_by`.
+- ⚠️ A multi-vector leg with `rerank: "exact"` whose depth passes 1,000 is now refused
+  with `bad_request`. Before, a `top_k` past 1,000 on such a leg failed the request.
+
+No stored-data migration is needed. The [M163 verification](milestones/M163/VERIFIED.md)
+records the evidence.
 
 ## M146: a hard per-group limit on a relevance ranking
 

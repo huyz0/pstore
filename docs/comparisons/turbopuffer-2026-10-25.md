@@ -172,7 +172,7 @@ vector and BM25 searches use separate fields.
 |---|---|---|
 | `rank_by` | `vector`, `field`, `exact`, `multi`, `text`, `fusion`, or scalar attribute `rank_by`; no common expression AST | B, E, F |
 | `top_k` | Supported, default 10; zero refused | B |
-| `offset` | Attribute ordering only; relevance pagination missing | F |
+| `offset` | Attribute orders and relevance rankings ([M163](../milestones/M163/VERIFIED.md)), `top_k + offset` at most 10,000; an approximate ranking's pages are slices at their own depth, not a cursor | F |
 | `filters` | Many matching operator names; exact gaps below | D, E |
 | `include_attributes` | Boolean/list projection, nested result attributes | B |
 | `exclude_attributes` | Projection exists | B |

@@ -20,7 +20,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | C | Conditions with new-value references, partial filter progress and retry/idempotency policy | Partial: idempotency keys for applied writes (at most once, or an explicit refusal; retention is 32 tallying commits) verified in [M132](../milestones/M132/VERIFIED.md); `$ref_new` in upsert and patch conditions, resolved per operation at the door, verified in [M133](../milestones/M133/VERIFIED.md); a by-filter operation bounded at 100,000 rows and refused whole above it in [M136](../milestones/M136/VERIFIED.md); `allow_partial` progress and resume (`rows_remaining`, send again) in [M137](../milestones/M137/VERIFIED.md) |
 | C/F | Shared durable snapshots for query legs, aggregates and facets | Partial: a multi-query's legs and a query's facets share one snapshot, verified in [M131](../milestones/M131/VERIFIED.md); lane tails are still probed per leg, and legs at mixed levels or `as_of` run apart |
 | D | Text-only documents and persistent typed schemas | Partial: documents with no vector, an index of them recording width 0, and vector queries against it refused, verified in [M170](../milestones/M170/VERIFIED.md); persistent typed schemas pending |
-| D | Typed IDs, uint64/UUID/bytes/datetime/nullable arrays and column upserts | Pending |
+| D | Typed IDs, uint64/UUID/bytes/datetime/nullable arrays and column upserts | Partial: request-declared `uuid` and `bytes` attributes verified in [M171](../milestones/M171/VERIFIED.md); typed IDs, uint64, nullable arrays and column upserts pending |
 | D | Public string-key sparse vectors and named-field ANN contracts | Pending |
 | D/H | Stored-vector projection, float/base64 response encoding and reconstructable export | Pending |
 | D | f16/i8 and multi-vector schema/precision contracts | Pending |
@@ -29,7 +29,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | E | Exact scoring expressions and computed distance/clause signals | Pending |
 | E | Structured highlights with fragment/offset contracts | Pending |
 | F | Atomic multi-query, outer RRF, candidate merging and global windows | Partial: one snapshot for legs at one level in [M131](../milestones/M131/VERIFIED.md); outer RRF with `rank_constant`, `weights`, `limit` and `offset` in [M142](../milestones/M142/VERIFIED.md); model reranking is J |
-| F | Multi-key sorting, relevance pagination, group quotas and expanded grouping | Partial: sorting by up to 8 keys verified in [M140](../milestones/M140/VERIFIED.md); a hard per-group limit over a relevance window in [M146](../milestones/M146/VERIFIED.md); relevance pagination and expanded grouping pending |
+| F | Multi-key sorting, relevance pagination, group quotas and expanded grouping | Partial: sorting by up to 8 keys verified in [M140](../milestones/M140/VERIFIED.md); a hard per-group limit over a relevance window in [M146](../milestones/M146/VERIFIED.md); relevance `offset` in [M163](../milestones/M163/VERIFIED.md); expanded grouping pending |
 | G | Empty creation, schema/metadata reads, bytes/timestamps/index progress and generic read-only | Pending |
 | G | Controlled schema evolution, backfill and migration | Pending |
 | H | Separate branch/isolated-copy/replication products and cross-store authorization | Pending |
