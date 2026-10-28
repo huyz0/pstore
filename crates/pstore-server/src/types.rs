@@ -917,6 +917,17 @@ pub struct IndexList {
     pub indexes: Vec<String>,
     /// The cursor for the next page -- the last name on this one -- or `null` on the last.
     pub next_cursor: Option<String>,
+    /// The epoch of the HEAD this page was read from, 0 when the tenant has none (M161).
+    ///
+    /// ⚠️ **A page is a keyset page by name, not a snapshot.** Each page reads HEAD again.
+    /// Over a walk (the pages from no cursor until `next_cursor` is null, with one
+    /// `prefix`): no name is listed twice; a name present at every page's read is listed
+    /// exactly once; a name that appears or vanishes during the walk is listed at most
+    /// once; and a cursor whose index is gone is still a position. When every page
+    /// reports the same epoch, the walk's HEAD names are that HEAD's. The serving
+    /// process's unfolded names are in no HEAD and are not marked, so pages served by
+    /// different processes may differ in them. `docs/deploy.md` states the same model.
+    pub epoch: u64,
     /// What the enumeration cost. Zero LISTs, which is the claim worth reporting.
     pub cost: Cost,
 }

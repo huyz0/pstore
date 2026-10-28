@@ -4334,6 +4334,15 @@ impl<S: BlobStore> Engine<S> {
     /// If HEAD cannot be read. An absent HEAD is an empty list, not an error: a tenant that
     /// has never committed owns no indexes, which is a fact rather than a failure.
     pub async fn indexes(&self) -> Result<Vec<String>, EngineError> {
+        Ok(self.indexes_at().await?.1)
+    }
+
+    /// [`Self::indexes`] with the epoch of the HEAD they were read from, 0 when there is
+    /// none (M161): what a list page reports so a walk can tell its pages' HEADs apart.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn indexes_at(&self) -> Result<(Epoch, Vec<String>), EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         // Every path that reads HEAD warms the door's schema cache, so the check costs a
         // request only for a process that has never read one.
@@ -4345,7 +4354,7 @@ impl<S: BlobStore> Engine<S> {
         names.extend(at.head.quarantine.into_keys());
         names.sort_unstable();
         names.dedup();
-        Ok(names)
+        Ok((at.head.epoch, names))
     }
 
     /// Segment count, document count and epoch for one index, or `None` if HEAD does not

@@ -85,7 +85,7 @@ write into branch/copy and query into multi-query.
 
 | Vendor method and route | pstore counterpart | Status and consequential difference | Plan |
 |---|---|---|---|
-| `GET /v1/namespaces` | `GET /v1/indexes` | Equivalent pagination/prefix; response is strings under `indexes`, not objects under `namespaces`; union includes local unfolded indexes | B |
+| `GET /v1/namespaces` | `GET /v1/indexes` | Equivalent pagination/prefix; response is strings under `indexes`, not objects under `namespaces`; union includes local unfolded indexes; each page reports its HEAD `epoch` and the walk's concurrent-update model is documented ([M161](../milestones/M161/VERIFIED.md)) | B |
 | `GET /v1/namespaces/{namespace}/schema` | Summary's `schema` | Partial: no standalone schema read; not a general typed attribute schema | D |
 | `POST /v1/namespaces/{namespace}/schema` | `PATCH /v1/indexes/{index}/schema` | Missing evolution: current PATCH always returns `schema_immutable` | D, G |
 | `GET /v2/namespaces/{namespace}/metadata` | `GET /v1/indexes/{index}` | Partial metadata; see route conflict above | G |
@@ -284,7 +284,7 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | `ErrorResponse.status`, `error` | Native nested `error` has code/message/retryable; not vendor error shape |
 | Warm `status`, `message` | Native warm metadata/cost; synchronous semantics |
 | Delete `status` | Native epoch/cost response |
-| List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `cost` |
+| List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `epoch`, `cost` |
 | Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | Offline recall output only |
 | Explain `plan_text` | Missing |
 | Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Missing general copy job contract |

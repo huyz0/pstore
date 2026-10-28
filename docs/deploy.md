@@ -439,6 +439,30 @@ a minute. `pstore_engines` and `pstore_engines_evicted_total` in `/metrics` show
 churn. A dropped tenant's next request costs what a restart costs it: a HEAD read, and on its
 first flush the lane probes.
 
+## Listing indexes while they change
+
+`GET /v1/indexes?prefix=&cursor=&page_size=` answers one page from one HEAD read: the
+stored indexes (and names known only by their rejected or quarantined rows, not external
+indexes) with the answering server's unfolded ones, in byte order, strictly after
+`cursor`. `next_cursor` is the last name on the page, and `epoch` the HEAD's epoch (M161).
+Each page reads HEAD again, so a walk (the pages from no cursor until `next_cursor` is
+null, with one `prefix`) is not a snapshot. What a walk does guarantee:
+
+1. **No name twice.** Pages are disjoint and in increasing order.
+2. **Stable names exactly once.** A name present at every page's read is on exactly one
+   page.
+3. **Changing names at most once.** A name that appears or vanishes during the walk (by a
+   create, a drop, a quarantine discarded, or a fold of a server's unfolded rows) is
+   listed at most once: one that appeared behind the walk's position is missed, and one
+   that vanished after its page stays on that page. A name dropped and created again is
+   still listed at most once.
+4. **A cursor is a position.** The walk continues correctly when the cursor's own index
+   was dropped.
+5. **Equal epochs are a snapshot of the stored names.** When every page reports the same
+   `epoch`, the stored names the walk listed are exactly that HEAD's names matching the `prefix`. A server's unfolded
+   names are in no HEAD and are not marked, so pages answered by different servers may
+   differ in them.
+
 ## Quarantined rows
 
 A fold refuses a row that contradicts its index's schema, and keeps going: a race between two

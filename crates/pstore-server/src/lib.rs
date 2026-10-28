@@ -4110,7 +4110,7 @@ async fn list_indexes<S: BlobStore + 'static>(
     let before = api.spend(tenant);
     // ⚠️ **One read, never a LIST.** A LIST over the tenant's prefix is the obvious
     // implementation, is correct, and is priced like a PUT while returning at most 1000 keys.
-    let mut names = engine.indexes().await?;
+    let (epoch, mut names) = engine.indexes_at().await?;
     names.extend(engine.pending_indexes().await);
     names.sort_unstable();
     names.dedup();
@@ -4131,6 +4131,7 @@ async fn list_indexes<S: BlobStore + 'static>(
     Ok(axum::Json(IndexList {
         indexes: page,
         next_cursor,
+        epoch: epoch.0,
         cost: api.spend(tenant).since(before),
     }))
 }
