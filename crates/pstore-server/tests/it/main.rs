@@ -41,6 +41,7 @@ mod idempotency;
 mod idle;
 mod lane_taken;
 mod lifecycle;
+mod limit_per;
 mod metrics;
 mod multi;
 mod multi_fde;
@@ -83,6 +84,7 @@ mod support;
 mod text_arrays;
 mod text_fields;
 mod text_filters;
+mod text_only;
 mod time_travel;
 #[allow(
     dead_code,

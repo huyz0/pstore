@@ -35,6 +35,7 @@ mod diversify;
 mod external;
 mod facets;
 mod highlight;
+mod limit_per;
 mod peer_http;
 pub use peer_http::PeerTransport;
 mod peer_tls;
@@ -1224,7 +1225,7 @@ impl From<EngineError> for ApiError {
             EngineError::SchemaConflict { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
-            EngineError::DimensionMismatch { .. } => {
+            EngineError::DimensionMismatch { .. } | EngineError::NoVectors(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "schema_conflict", e.to_string())
             }
             // M61: a `multi` leg's field that no segment holds; no retry mends it.
@@ -1658,7 +1659,7 @@ fn patch_of(
     // to say nothing.
     let as_doc = types::DocumentIn {
         id: id.clone(),
-        vector: Vec::new(),
+        vector: None,
         vectors: std::collections::BTreeMap::new(),
         text: None,
         attributes: set.into_iter().collect(),
@@ -1859,27 +1860,7 @@ async fn write_documents<S: BlobStore + 'static>(
             ))
         })?,
     };
-    // ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
-    // the segment layout cannot store. A zero-dimension vector is storable and meaningless,
-    // and a batch whose vectors disagree makes the *index's* dimension depend on which
-    // document happened to be first. `api-design.md`: all vector dimensions in a field must
-    // match — so the request that breaks that rule is the one that gets the error, rather
-    // than the query that meets the consequence later.
-    let dims = req.documents.first().map_or(0, |d| d.vector.len());
-    if dims == 0 && !req.documents.is_empty() {
-        return Err(ApiError::bad_request("a document with no vector"));
-    }
-    if let Some(odd) = req.documents.iter().find(|d| d.vector.len() != dims) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "schema_conflict",
-            format!(
-                "document {} has {} dimensions and the batch has {dims}",
-                odd.id,
-                odd.vector.len()
-            ),
-        ));
-    }
+    widths_agree(&req)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     admit(&engine, key.as_ref()).await?;
@@ -2670,6 +2651,8 @@ enum Plan {
         Option<boost::Boost>,
         Option<highlight::Highlight>,
         Option<diversify::Diversify>,
+        // Boxed: the plan's largest variant, by far, without it.
+        Option<Box<limit_per::LimitPer>>,
     ),
 }
 
@@ -2750,6 +2733,23 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
             )));
         }
     }
+    // M146: a group limit cuts a relevance ranking; MMR would reorder what it cut.
+    if req.limit_per.is_some() {
+        let with = if req.rank_by.is_some() {
+            Some("rank_by")
+        } else if req.aggregate_by.is_some() {
+            Some("aggregate_by")
+        } else if req.diversify.is_some() {
+            Some("diversify")
+        } else {
+            None
+        };
+        if let Some(what) = with {
+            return Err(ApiError::bad_request(format!(
+                "limit_per cuts a relevance ranking: it cannot be combined with {what}"
+            )));
+        }
+    }
     // M62: a boost rescores a relevance ranking; an order or an aggregation has none.
     if req.boost.is_some() && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
         return Err(ApiError::bad_request(
@@ -2767,22 +2767,38 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     if let Some(by) = order_by(req)? {
         return Ok(Plan::Ordered(by, filter));
     }
+    // M146: a group limit names the window too (it never sits beside a diversify).
+    let named_limit = req.limit_per.as_ref().and_then(diversify::named_window);
     let boost = req
         .boost
         .as_ref()
-        .map(|b| boost::parse(b, req.top_k, named_diversify))
+        .map(|b| boost::parse(b, req.top_k, named_diversify.or(named_limit)))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
     // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
     // below `top_k` would otherwise never reach the fusion the boost rescores.
+    // M146: one window for a boost and a group limit, as for a boost and a diversify.
+    let limit_per = req
+        .limit_per
+        .as_ref()
+        .map(|p| limit_per::LimitPer::parse(p, req.top_k, named_boost))
+        .transpose()
+        .map_err(|why| ApiError::bad_request(format!("limit_per: {why}")))?;
     let window = boost
         .as_ref()
         .map(|b| b.window)
-        .or(diversify.map(|d| d.window));
+        .or(diversify.map(|d| d.window))
+        .or(limit_per.as_ref().map(|p| p.window));
     let legs = prefetch(req, window.unwrap_or(req.top_k))?;
     let fusion = fusion(req, legs.len())?;
     Ok(Plan::Ranked(
-        legs, filter, fusion, boost, highlight, diversify,
+        legs,
+        filter,
+        fusion,
+        boost,
+        highlight,
+        diversify,
+        limit_per.map(Box::new),
     ))
 }
 
@@ -2983,7 +2999,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
-    let (legs, filter, fusion, boost, highlight, diversify) = match plan {
+    let (legs, filter, fusion, boost, highlight, diversify, limit_per) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
             let group_by = spec.group_by.clone();
@@ -3070,8 +3086,8 @@ async fn run<E: BlobStore>(
                 consistency: level_name(level),
             });
         }
-        Plan::Ranked(legs, filter, fusion, boost, highlight, diversify) => {
-            (legs, filter, fusion, boost, highlight, diversify)
+        Plan::Ranked(legs, filter, fusion, boost, highlight, diversify, limit_per) => {
+            (legs, filter, fusion, boost, highlight, diversify, limit_per)
         }
     };
     // M62: the engine ranks the window, and the boost cuts it to `top_k`.
@@ -3079,6 +3095,7 @@ async fn run<E: BlobStore>(
         .as_ref()
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
+        .or(limit_per.as_ref().map(|p| p.window))
         .unwrap_or(req.top_k);
     let answer = match req.as_of {
         Some(e) => {
@@ -3153,9 +3170,13 @@ async fn run<E: BlobStore>(
             .filter_map(|i| slots.get_mut(i).and_then(Option::take))
             .collect();
     }
+    // M146: after the boost, on the stored attributes, whatever the query selects.
+    if let Some(p) = &limit_per {
+        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, req.top_k);
+    }
     paired.truncate(req.top_k);
     let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
-    let unfolded_hits = if boost.is_none() && diversify.is_none() {
+    let unfolded_hits = if boost.is_none() && diversify.is_none() && limit_per.is_none() {
         answer
             .hits
             .iter()
@@ -4284,6 +4305,67 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     })
 }
 
+/// Refuses a batch whose documents disagree on their vector width (M170: none is a width).
+///
+/// ⚠️ **Refused at the door**, which is where `Engine::write` already refuses a document
+/// the segment layout cannot store. A zero-dimension vector is storable and meaningless,
+/// and a batch whose vectors disagree makes the *index's* dimension depend on which
+/// document happened to be first. `api-design.md`: all vector dimensions in a field must
+/// match — so the request that breaks that rule is the one that gets the error, rather
+/// than the query that meets the consequence later.
+fn widths_agree(req: &types::WriteRequest) -> Result<(), ApiError> {
+    let width = |d: &types::DocumentIn| d.vector.as_ref().map(Vec::len);
+    if let Some(d) = req.documents.iter().find(|d| width(d) == Some(0)) {
+        return Err(ApiError::bad_request(format!(
+            "document {}: an empty vector; a document of an index with no vectors omits `vector`",
+            d.id
+        )));
+    }
+    let Some(first) = req.documents.first() else {
+        return Ok(());
+    };
+    let dims = width(first);
+    if let Some(odd) = req.documents.iter().find(|d| width(d) != dims) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!(
+                "document {} has {} and the batch has {}",
+                odd.id,
+                dims_named(width(odd)),
+                dims_named(dims)
+            ),
+        ));
+    }
+    if dims.is_none() {
+        vector_free(req)?;
+    }
+    Ok(())
+}
+
+/// A width as a refusal names it.
+fn dims_named(dims: Option<usize>) -> String {
+    dims.map_or_else(|| "no vector".to_owned(), |n| format!("{n} dimensions"))
+}
+
+/// Refuses what a batch of documents with no vector cannot carry (M170): named vector
+/// fields, which need the dense field beside them, and a distance metric, which has nothing
+/// to measure.
+fn vector_free(req: &types::WriteRequest) -> Result<(), ApiError> {
+    if let Some(d) = req.documents.iter().find(|d| !d.vectors.is_empty()) {
+        return Err(ApiError::bad_request(format!(
+            "document {}: named vector fields need a `vector` beside them",
+            d.id
+        )));
+    }
+    if req.distance_metric.is_some() {
+        return Err(ApiError::bad_request(
+            "distance_metric on a write whose documents carry no vector",
+        ));
+    }
+    Ok(())
+}
+
 ///
 /// ⚠️ Takes the document by value (M119): its vectors move into the format's, where a borrow
 /// copied every one of them.
@@ -4299,7 +4381,7 @@ fn to_document(
         text,
         attributes,
     } = d;
-    let mut doc = Document::new(id.clone(), vector);
+    let mut doc = Document::new(id.clone(), vector.unwrap_or_default());
     let refuse = |name: &str, why: &str| {
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
@@ -5872,5 +5954,29 @@ mod tests {
         // API test can tell a dropped `exact` from a forwarded one.
         assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
         assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
+    }
+
+    /// M170: the door's width checks, here so that a mutation breaking every write fails
+    /// in this crate's unit tests rather than hanging its integration tests.
+    #[test]
+    fn widths_agree_takes_one_width_or_none_and_refuses_the_rest() {
+        let req = |docs: serde_json::Value| -> WriteRequest {
+            serde_json::from_value(serde_json::json!({ "documents": docs })).unwrap()
+        };
+        let agree = |docs| widths_agree(&req(docs)).is_ok();
+        assert!(agree(serde_json::json!([])));
+        assert!(agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [2.0]}])
+        ));
+        assert!(agree(
+            serde_json::json!([{"id": "a"}, {"id": "b", "text": "x"}])
+        ));
+        assert!(!agree(serde_json::json!([{"id": "a", "vector": []}])));
+        assert!(!agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b"}])
+        ));
+        assert!(!agree(
+            serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [1.0, 2.0]}])
+        ));
     }
 }
