@@ -176,6 +176,13 @@ async fn buffered_rows_refuse_at_the_tenant_bound() {
     let (s, b, retry) = write(&api, 1, "d03", "durable").await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{b}");
     assert_eq!(b["error"]["code"], "overloaded");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("a fold has been requested"),
+        "{b}"
+    );
     assert_eq!(retry.as_deref(), Some("1"));
     assert_eq!(totals(&store), at, "a refusal costs no request");
     assert_eq!(
@@ -238,8 +245,32 @@ async fn a_write_larger_than_the_bound_is_too_large_not_overloaded() {
     let (s, b, retry) = write(&api, 1, "d01", "batched").await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
     assert_eq!(b["error"]["code"], "request_too_large");
+    assert_eq!(
+        b["error"]["message"],
+        "the write's rows are larger than a tenant's buffer bound"
+    );
     assert_eq!(retry, None);
     assert_eq!(totals(&store), [0; 4]);
+}
+
+#[tokio::test]
+async fn a_write_exactly_the_bound_fits() {
+    let (api, _store) = serve(MemoryStore::new(), limits(f(), f()));
+    let (s, b, _) = write(&api, 1, "d01", "batched").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(buffered(&api, 1).await.pending, f());
+}
+
+#[tokio::test]
+async fn a_batched_write_past_the_flush_bound_alone_is_buffered_after_one_flush() {
+    // Two rows, twice the flush bound and well under the cap: the flush leaves nothing to
+    // flush, and the retry must not ask for the flush bound again.
+    let (api, _store) = serve(MemoryStore::new(), limits(f(), 64 << 20));
+    let body = json!({"durability": "batched", "documents": [
+        {"id": "d01", "vector": [1.0, 0.5]}, {"id": "d02", "vector": [1.0, 0.5]}]});
+    let (s, b, _) = send(&api, 1, "PUT", "/v1/indexes/docs/documents", &body).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(buffered(&api, 1).await.pending, 2 * f());
 }
 
 #[tokio::test]
@@ -338,8 +369,15 @@ impl Held {
             .armed
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Waits for the held PUT, and fails rather than hangs when none comes: a write the
+    /// code under test refused never reaches the store.
     async fn arrived(&self) {
-        self.gate.arrived.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.gate.arrived.notified(),
+        )
+        .await
+        .expect("no bundle PUT reached the store");
     }
     fn release(&self) {
         self.gate.release.add_permits(1);
@@ -444,7 +482,14 @@ async fn concurrent_reservations_admit_one() {
     };
     let (first, second) = (racer("r01"), racer("r02"));
     // The admitted one is held at its PUT, so the other settles first, refused.
-    let (settled, admitted) = match futures_util::future::select(first, second).await {
+    // Bounded: were both admitted, both would wait at their PUTs for ever.
+    let raced = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        futures_util::future::select(first, second),
+    )
+    .await
+    .expect("neither write settled while the other was held");
+    let (settled, admitted) = match raced {
         futures_util::future::Either::Left((done, other))
         | futures_util::future::Either::Right((done, other)) => (done.unwrap(), other),
     };

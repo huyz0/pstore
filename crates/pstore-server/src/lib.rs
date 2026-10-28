@@ -5857,6 +5857,46 @@ mod tests {
     }
 
     #[test]
+    fn a_writes_footprint_counts_every_operation_once() {
+        // M141: each part a distinct size, so a term dropped, doubled or combined the wrong
+        // way changes the sum.
+        let doc = Document::new("d00", vec![1.0, 0.5]);
+        let patch = pstore_engine::Patch {
+            id: "pp".to_owned(),
+            set: [("ab".to_owned(), pstore_format::Value::Str("xyz".to_owned()))].into(),
+            unset: vec!["u".to_owned()],
+        };
+        let by = pstore_engine::Patch {
+            id: String::new(),
+            set: [("kk".to_owned(), pstore_format::Value::Int(1))].into(),
+            unset: Vec::new(),
+        };
+        let gone = pstore_query::Predicate::Absent("owner".to_owned());
+        let even = pstore_query::Predicate::Cmp(
+            "n".to_owned(),
+            pstore_query::Op::Eq,
+            pstore_format::Value::Int(2),
+        );
+        let (e1, e2) = (
+            pstore_query::condition::encode(&gone).len() as u64,
+            pstore_query::condition::encode(&even).len() as u64,
+        );
+        assert!(e1 > 0 && e2 > 0 && e1 != e2);
+        let got = write_footprint(
+            std::slice::from_ref(&doc),
+            std::slice::from_ref(&patch),
+            &["del".to_owned()],
+            Some(&gone),
+            Some(&(even, by)),
+            7,
+        );
+        // The row, the patch (2 + 2 + 3 + 1), the tombstone (3 + 8), the two filters, the
+        // patch by filter's patch (2 + 8), and the stamp on each of five operations.
+        assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
+        assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
+    }
+
+    #[test]
     fn exact_reaches_the_dense_leg() {
         // Code review of M9d: every server corpus is below the exact-scan threshold, so no
         // API test can tell a dropped `exact` from a forwarded one.
