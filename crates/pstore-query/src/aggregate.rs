@@ -511,12 +511,14 @@ mod tests {
             Key::of(Some(&Value::Int(5))),
             Key::of(Some(&Value::DateTime(5)))
         );
-        // Within a group, by value: two datetimes, bools or strings are not one key.
+        // Within a group, by value: two datetimes, bools, strings, UUIDs or bytes are not one key.
         for (lo, hi) in [
             (Value::DateTime(1), Value::DateTime(5)),
             (Value::Bool(false), Value::Bool(true)),
             (Value::Str("a".into()), Value::Str("b".into())),
             (Value::Int(1), Value::Float(1.5)),
+            (Value::Uuid([1; 16]), Value::Uuid([2; 16])),
+            (Value::Bytes(vec![1, 9]), Value::Bytes(vec![2])),
         ] {
             assert!(Key::of(Some(&lo)) < Key::of(Some(&hi)), "{lo:?} < {hi:?}");
         }

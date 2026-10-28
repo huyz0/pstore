@@ -17,22 +17,20 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     if b.len() != 36 {
         return None;
     }
+    if [8, 13, 18, 23].iter().any(|&i| b.get(i) != Some(&b'-')) {
+        return None;
+    }
+    let digits: Vec<u8> = b
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !matches!(i, 8 | 13 | 18 | 23))
+        .map(|(_, c)| *c)
+        .collect();
     let mut out = [0u8; 16];
-    let mut n = 0;
-    let mut i = 0;
-    while i < 36 {
-        if matches!(i, 8 | 13 | 18 | 23) {
-            if b.get(i) != Some(&b'-') {
-                return None;
-            }
-            i += 1;
-            continue;
-        }
-        let hi = hex(*b.get(i)?)?;
-        let lo = hex(*b.get(i + 1)?)?;
-        *out.get_mut(n)? = (hi << 4) | lo;
-        n += 1;
-        i += 2;
+    for (o, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        *o = pair
+            .iter()
+            .try_fold(0, |acc, &c| Some(acc * 16 + hex(c)?))?;
     }
     Some(out)
 }
