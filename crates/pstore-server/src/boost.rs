@@ -200,9 +200,11 @@ fn term(raw: &serde_json::Value) -> Result<Term, String> {
         "eq" => Function::Eq(match o.get("value") {
             Some(serde_json::Value::String(s)) => Value::Str(s.clone()),
             Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
-            Some(serde_json::Value::Number(n)) => match n.as_i64() {
-                Some(i) => Value::Int(i),
-                None => Value::Float(
+            Some(serde_json::Value::Number(n)) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => Value::Int(i),
+                // M172: above i64, the unsigned number it is, as a filter reads it.
+                (None, Some(u)) => Value::Uint(u),
+                (None, None) => Value::Float(
                     n.as_f64()
                         .ok_or(format!("attr {attr}: eq's value is out of range"))?,
                 ),
@@ -231,6 +233,11 @@ fn number(v: &Value) -> Option<f64> {
         )]
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a boost scores in f64; an integer beyond 2^53 is ranked, not counted"
+        )]
+        Value::Uint(u) => Some(*u as f64),
         _ => None,
     }
 }

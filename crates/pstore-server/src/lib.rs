@@ -2683,6 +2683,7 @@ const MAX_GROUP_BY: usize = 8;
 fn total_json(t: pstore_query::Total) -> serde_json::Value {
     match t {
         pstore_query::Total::Int(n) => serde_json::Value::from(n),
+        pstore_query::Total::Uint(n) => serde_json::Value::from(n),
         pstore_query::Total::Float(f) => serde_json::Value::from(f),
         pstore_query::Total::Null => serde_json::Value::Null,
     }
@@ -4042,7 +4043,7 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         }
         let Some(declared) = typed::Declared::named(ty) else {
             return Err(bad(format!(
-                "{name:?} is declared {ty}; a write declares datetime, uuid or bytes"
+                "{name:?} is declared {ty}; a write declares datetime, uuid, bytes or uint64"
             )));
         };
         if name == pstore_format::text::DEFAULT_TEXT_FIELD {
@@ -4445,7 +4446,8 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             let op = op
                 .as_str()
                 .ok_or_else(|| bad("the operator is a string".to_owned()))?;
-            let scalar = |x: &serde_json::Value| scalar(x).map_err(|why| bad(format!("{x} {why}")));
+            let scalar =
+                |x: &serde_json::Value| literal(x).map_err(|why| bad(format!("{x} {why}")));
             let cmp = |o: Op| -> Result<Predicate, ApiError> {
                 Ok(Predicate::Cmp(attr.clone(), o, scalar(value)?))
             };
@@ -4630,10 +4632,20 @@ fn scalar(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
                     .map(Value::Float)
                     .ok_or_else(|| "is not a finite number".to_owned())
             } else {
-                Err("is an integer beyond i64; integers must fit i64".to_owned())
+                Err("is an integer beyond i64; declare the attribute uint64 in `schema` to store it"
+                    .to_owned())
             }
         }
         _ => Err("is not an integer, a float, a string or a bool, the attribute types".to_owned()),
+    }
+}
+
+/// A filter's literal (M172): a write's [`scalar`], or an integer in `(i64::MAX, u64::MAX]`
+/// as the unsigned number it is, which compares with every number exactly.
+fn literal(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
+    match x.as_u64() {
+        Some(u) if x.as_i64().is_none() => Ok(pstore_format::Value::Uint(u)),
+        _ => scalar(x),
     }
 }
 
@@ -4655,6 +4667,7 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
         pstore_format::Value::Bytes(b) => {
             serde_json::Value::from(pstore_format::typed::format_bytes(b))
         }
+        pstore_format::Value::Uint(n) => serde_json::Value::from(*n),
     }
 }
 

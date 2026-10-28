@@ -161,7 +161,7 @@ fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
     // descending reverses the groups. Absent is last both ways.
     let group = match value {
         Some(Value::Bool(_)) => 0,
-        Some(Value::Int(_) | Value::Float(_)) => 1,
+        Some(Value::Int(_) | Value::Float(_) | Value::Uint(_)) => 1,
         Some(Value::DateTime(_)) => 2,
         Some(Value::Str(_)) => 3,
         Some(Value::Uuid(_)) => 4,

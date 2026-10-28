@@ -157,6 +157,71 @@ fn numbers_compare_exactly_across_int_and_float() {
     assert_eq!(c(i(i64::MIN), f(-1e19)), Some(Greater));
     assert_eq!(c(i(1), f(f64::NAN)), None);
     assert_eq!(c(i(1), i(2)), Some(Less));
+    // M172: a uint64 against an int and a float, exactly, on both sides of i64::MAX and up
+    // to 2^64 -- where `u64::MAX` as an f64 would equal 2^64, and as an i64 would be -1.
+    let u = Number::Uint;
+    assert_eq!(c(u(1 << 63), i(i64::MAX)), Some(Greater));
+    assert_eq!(c(i(i64::MAX), u(1 << 63)), Some(Less));
+    assert_eq!(c(u(5), i(5)), Some(Equal));
+    assert_eq!(c(i(-1), u(0)), Some(Less));
+    assert_eq!(c(u(u64::MAX), i(i64::MIN)), Some(Greater));
+    assert_eq!(c(u(u64::MAX), f(18_446_744_073_709_551_616.0)), Some(Less));
+    assert_eq!(
+        c(f(18_446_744_073_709_551_616.0), u(u64::MAX)),
+        Some(Greater)
+    );
+    assert_eq!(
+        c(u(u64::MAX), f(18_446_744_073_709_549_568.0)),
+        Some(Greater)
+    );
+    assert_eq!(c(u(1 << 63), f(9_223_372_036_854_775_808.0)), Some(Equal));
+    assert_eq!(
+        c(u((1 << 63) + 1), f(9_223_372_036_854_775_808.0)),
+        Some(Greater)
+    );
+    assert_eq!(c(u(5), f(5.5)), Some(Less));
+    assert_eq!(c(u(0), f(-0.0)), Some(Equal));
+    assert_eq!(c(u(0), f(-1e300)), Some(Greater));
+    assert_eq!(c(u(u64::MAX), f(f64::MAX)), Some(Less));
+    assert_eq!(c(i(i64::MIN), f(f64::MIN)), Some(Greater));
+    assert_eq!(c(u(1), f(f64::NAN)), None);
+    assert_eq!(c(u(u64::MAX - 1), u(u64::MAX)), Some(Less));
+}
+
+#[tokio::test]
+async fn uint64s_round_trip_and_make_a_segment_typed() {
+    // M172: a segment of ints and uint64s alone is version 2, so it carries a flag and zones.
+    use pstore_blob::{BlobStore, Key, MemoryStore};
+    let mut w = SegmentWriter::new(2);
+    let want = [Value::Uint(u64::MAX), Value::Int(-1), Value::Uint(0)];
+    for (i, v) in want.iter().enumerate() {
+        let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
+        d.attrs.insert("v".to_owned(), v.clone());
+        w.push(d);
+    }
+    let bytes = w.finish();
+    assert_eq!(version(&bytes), 2);
+    let store = MemoryStore::new();
+    let key = Key::new("seg");
+    store.put(&key, bytes).await.unwrap();
+    let seg = pstore_format::Segment::open(&store, &key).await.unwrap();
+    let zones = std::sync::Mutex::new(Vec::new());
+    let got: Vec<Value> = seg
+        .rows_where(&store, &key, |z| {
+            zones.lock().unwrap().push(z.uints.clone());
+            true
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, d)| d.attrs["v"].clone())
+        .collect();
+    assert_eq!(got, want);
+    let one = |lo, hi| std::collections::BTreeMap::from([("v".to_owned(), (lo, hi))]);
+    assert_eq!(
+        zones.into_inner().unwrap(),
+        [one(u64::MAX, u64::MAX), one(0, 0)]
+    );
 }
 
 #[test]
@@ -216,6 +281,29 @@ fn a_typed_segment_without_datetimes_keeps_its_bytes() {
     // byte, so a datetime table is never written for a segment that holds no datetime.
     let b = typed_segment();
     assert_eq!(fnv(&b), 3_636_883_691_723_148_763, "len {}", b.len());
+}
+
+#[test]
+fn a_dated_segment_without_uint64s_keeps_its_bytes() {
+    // Recorded on 95b292f, the commit before M172: flag 2 and its float and datetime tables,
+    // byte for byte, so a uint64 table is never written for a segment that holds none.
+    let mut w = SegmentWriter::new(2);
+    for (i, v) in [
+        Value::DateTime(-5),
+        Value::Float(2.5),
+        Value::Int(3),
+        Value::DateTime(7),
+        Value::Str("x".to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
+        d.attrs.insert("v".to_owned(), v);
+        w.push(d);
+    }
+    let b = w.finish();
+    assert_eq!(fnv(&b), 10_395_392_378_955_738_272, "len {}", b.len());
 }
 
 #[tokio::test]
