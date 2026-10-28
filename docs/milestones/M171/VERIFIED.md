@@ -47,7 +47,7 @@ after code review. No `cargo mutants` run is claimed for them.
    The extended tests lose no case: the condition codec's unknown-tag case moved from tag
    6, now a UUID, to 8. `uuids_and_bytes_order_structurally_after_datetimes_and_by_their_bytes`
    and `keys_order_and_unify_as_stated` cover the structural and group orders.
-7. CI's `scripts/mutants.sh` on the first push: 116 mutants, 60 caught, 52 unviable, 3
+   CI's `scripts/mutants.sh` on the first push: 116 mutants, 60 caught, 52 unviable, 3
    missed and 1 timeout. Fixed: the two `Key` arms for UUIDs and bytes survived because
    `Key`'s equality is its order, so the sorted-list assertion could not see a tie; the
    in-group loop now asserts a strict `<` for two UUIDs and two bytes, and deleting either
