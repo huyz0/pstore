@@ -22,6 +22,9 @@ fn every_value_kind_is_counted() {
             10,
         ),
         (Value::Array(vec![]), 0),
+        (Value::Uuid([7; 16]), 16),
+        (Value::Bytes(vec![1, 2, 3]), 3),
+        (Value::Bytes(vec![]), 0),
     ] {
         assert_eq!(v.footprint(), want, "{v:?}");
     }

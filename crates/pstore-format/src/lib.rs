@@ -227,13 +227,16 @@ pub enum Value {
 
 impl Value {
     /// The bytes [`Document::footprint`] counts for this value: 8 for a number, bool or
-    /// instant, a string's bytes, and an array's elements summed.
+    /// instant, 16 for a UUID, a string's or byte string's bytes, and an array's elements
+    /// summed.
     #[must_use]
     pub fn footprint(&self) -> u64 {
         match self {
             Self::Int(_) | Self::Float(_) | Self::Bool(_) | Self::DateTime(_) => 8,
             Self::Str(s) => s.len() as u64,
             Self::Array(vs) => vs.iter().map(Self::footprint).sum(),
+            Self::Uuid(_) => 16,
+            Self::Bytes(b) => b.len() as u64,
         }
     }
 
