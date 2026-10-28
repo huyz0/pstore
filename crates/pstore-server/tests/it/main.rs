@@ -67,6 +67,7 @@ mod progress;
 mod quarantine;
 mod read_cache;
 mod read_only;
+mod recall;
 mod ref_new;
 mod registry;
 mod relevance_offset;
