@@ -4,7 +4,7 @@
 //! returns fewer than `k` whenever it is selective, and nothing says so. `run` therefore
 //! builds each segment's [`Mask`] from its blocks and applies it to exhaustive legs.
 
-use pstore_format::{Number, Value, Zones, cmp_numbers, datetime};
+use pstore_format::{Number, Value, Zones, cmp_numbers, datetime, typed};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -710,6 +710,11 @@ fn compare(have: &Value, op: Op, want: &Value) -> bool {
         (Value::Str(a), Value::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
         (Value::DateTime(a), Value::DateTime(b)) => Some(a.cmp(b)),
         (Value::DateTime(a), Value::Str(b)) => datetime::parse(b).map(|b| a.cmp(&b)),
+        // M171: a string literal read as the row's type, as a datetime row reads one.
+        (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+        (Value::Uuid(a), Value::Str(b)) => typed::parse_uuid(b).map(|b| a.cmp(&b)),
+        (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+        (Value::Bytes(a), Value::Str(b)) => typed::parse_bytes(b).map(|b| a.as_slice().cmp(&b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         _ => match (Number::of(have), Number::of(want)) {
             (Some(a), Some(b)) => cmp_numbers(a, b),
@@ -1022,6 +1027,30 @@ mod tests {
             ..Zones::default()
         };
         assert!(Predicate::Cmp(ID.to_owned(), Op::Eq, lit(hi + 1)).could_admit(&id));
+    }
+
+    /// M171: a UUID or bytes row against its own type's literal (a `$ref_new` resolves to
+    /// one) and against a string spelling one; never against the other type or a string row.
+    #[test]
+    fn uuid_and_bytes_rows_compare_by_their_bytes() {
+        let u = |n: u8| Value::Uuid([n; 16]);
+        let y = |b: &[u8]| Value::Bytes(b.to_vec());
+        let s = |x: &str| Value::Str(x.to_owned());
+        let at = |row: Value, op, lit: Value| {
+            let row = BTreeMap::from([("a".to_owned(), row)]);
+            Predicate::Cmp("a".to_owned(), op, lit).admits("x", &row)
+        };
+        assert!(at(u(1), Op::Eq, u(1)) && !at(u(1), Op::Eq, u(2)));
+        assert!(at(u(1), Op::Lt, u(2)) && !at(u(2), Op::Lt, u(1)));
+        assert!(at(y(&[0, 1]), Op::Eq, y(&[0, 1])) && !at(y(&[0, 1]), Op::Eq, y(&[0])));
+        assert!(at(y(&[0, 1]), Op::Gt, y(&[0])) && !at(y(&[0]), Op::Gt, y(&[0, 1])));
+        let one = "01010101-0101-0101-0101-010101010101";
+        assert!(at(u(1), Op::Eq, s(one)) && at(u(1), Op::Gte, s(one)));
+        assert!(at(y(&[0, 1]), Op::Eq, s("AAE=")) && at(y(&[0, 2]), Op::Gt, s("AAE=")));
+        // Never across types, and an unparseable literal compares with nothing.
+        assert!(!at(u(1), Op::Eq, y(&[1; 16])) && !at(y(&[1; 16]), Op::Eq, u(1)));
+        assert!(!at(s(one), Op::Eq, u(1)));
+        assert!(!at(u(1), Op::Lt, s("zzz")) && !at(y(&[0]), Op::Lt, s("!!")));
     }
 
     #[test]

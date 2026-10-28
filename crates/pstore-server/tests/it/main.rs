@@ -92,4 +92,5 @@ mod tls_fixture;
 mod tokens;
 mod typed_values;
 mod upsert;
+mod uuid_bytes;
 mod warm;
