@@ -80,3 +80,9 @@ is committed. Its minors:
 
 The whole workspace's tests pass, except the two IPv6 `peer_http::response_tests`, which fail
 in this container on the parent too.
+
+Amendment after merge, from CI's mutation shard 10 on PR #8: `> MAX_TEXTS` in `guard`
+survived `> -> >=`, since no test sent exactly eight further fields.
+`a_part_with_further_fields_is_judged_at_the_door` now also requires eight to be accepted;
+with the mutation applied it fails ("at most 8 further text fields a part"), and passes
+without it.

@@ -2034,6 +2034,11 @@ async fn a_part_with_further_fields_is_judged_at_the_door() {
     }
     let (status, got) = post(part(4, None, &texts, &none)).await;
     assert_eq!(status, 200, "whole at 4: {got}");
+    // The bound itself: eight further fields are accepted (CI's mutation shard 10 on PR #8).
+    let eight: serde_json::Map<String, Value> =
+        (0..8).map(|i| (format!("f{i}"), json!(fts))).collect();
+    let (status, got) = post(part(4, None, &Value::Object(eight), &none)).await;
+    assert_eq!(status, 200, "whole at 4 with eight texts: {got}");
     // A scan speaks its part's protocol; each scan takes its part, so each opens its own.
     let opened_at = |protocol: u64| {
         let (t, c) = match protocol {
