@@ -46,9 +46,10 @@ pub enum Durability {
 pub struct DocumentIn {
     /// The client's identifier.
     pub id: String,
-    /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d).
-    #[serde(deserialize_with = "vector")]
-    pub vector: Vec<f32>,
+    /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d). Absent for a
+    /// document of an index with no vectors (M170).
+    #[serde(default, deserialize_with = "some_vector")]
+    pub vector: Option<Vec<f32>>,
     /// Named fields of several vectors each (M61): `{"late": [vector, …]}`, each vector
     /// spelled as `vector` is. Searched by a query's `multi` leg.
     #[serde(default, deserialize_with = "named_vectors")]
@@ -236,10 +237,6 @@ fn decode_vector<E: serde::de::Error>(raw: VectorIn) -> Result<Vec<f32>, E> {
         return Err(E::custom("a vector with a non-finite component"));
     }
     Ok(v)
-}
-
-fn vector<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
-    decode_vector(VectorIn::deserialize(d)?)
 }
 
 fn many_vectors<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {

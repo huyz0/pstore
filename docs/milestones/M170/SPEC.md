@@ -29,10 +29,11 @@ Refused, `bad_request`, at the door: `"vector": []` (an empty vector is not "no 
 `vectors` (named fields) on a document with no `vector`; `distance_metric` on a write
 whose documents carry no vector.
 
-A query with `vector` or `multi` against an index whose schema records width 0 is
-refused with `schema_conflict` ("index t has no vectors"), whatever else it carries,
-rather than answered by an internal error or an empty list. A query against an index
-with no schema yet (nothing folded) is unchanged.
+A query with `vector` or `multi` against an index whose schema records width 0, or,
+before any fold, whose unfolded rows have width 0, is refused with `schema_conflict`
+("index t has no vectors"), whatever else it carries, rather than answered by an internal
+error or an empty list. A query against an index with no known width (no schema and no
+unfolded row, or a HEAD older than M7d, which records no schema) is unchanged.
 
 Unchanged: every dense index's IDs, distances, recall and refusals; text, filters,
 `rank_by`, projection, patches and aggregations, which never read a vector; the peer
@@ -44,14 +45,16 @@ protocol, which carries what the engine stores.
 2. After a durable patch, a fold and a restart on the same store, paging the index by
    `rank_by: id` with an `id Gt` cursor returns all three rows with the patched value and
    their attributes, and BM25 still ranks the matching row.
-3. Against that index, a query with `vector`, with `vector` and `text`, and with `multi`
-   each answer `400 schema_conflict`.
+3. Against that index, a query with `vector`, with `vector` and `text`, with `multi`, with
+   `vector` and `exact`, and with `vector` at `as_of` each answer `400 schema_conflict`; so
+   does a `vector` query against unfolded vector-free rows, which BM25 still ranks.
 4. A vector into the vector-free index, a vector-free document into a folded dense index,
-   and a mixed batch each answer `400 schema_conflict`.
-5. `"vector": []`, `vectors` without `vector`, and `distance_metric` on a vector-free
-   write each answer `400`.
-6. Existing dense tests pass unedited, except `errors::` whose refusal of `"vector": []`
-   still answers 400.
+   and a mixed batch each answer `400 schema_conflict`, the last refused at the door by
+   name.
+5. `"vector": []`, `vectors` without `vector`, and `distance_metric` (each of the three)
+   on a vector-free write each answer `400`.
+6. Existing dense tests pass unedited, `errors::`'s refusal of `"vector": []` included;
+   and an index whose first fold held deletes alone still takes vectors.
 
 ## Test plan
 `crates/pstore-server/tests/it/text_only.rs`, one test a criterion 1 to 5. Red before:
@@ -60,9 +63,10 @@ vector`), and 5 passes on the parent, which refuses every case, so its red is th
 mutations below. Mutations, each to be killed:
 - the door's mixed-batch check removed (4); the empty-vector check removed (5);
 - the named-fields check removed, the metric check removed (5);
-- the engine's width-0 query refusal removed (3);
-- the width-0 schema recorded as "no schema" (2, 4).
-6 is a guard: the workspace suite.
+- the engine's width-0 query refusal removed, on the live path and on the `as_of` path,
+  and a `multi` leg not counted as a vector leg; the unfolded rows' width not inferred (3).
+- A missing schema read as width 0 on the `as_of` path: a unit test beside `query_error`.
+6 is a guard: the workspace suite, and `an_index_first_folded_with_deletes_alone_still_takes_vectors`.
 
 ## RA budget
 Unchanged: no request is added or removed. A vector-free row's segment has no vector
@@ -76,3 +80,14 @@ section, which the writer already skips for a width of 0.
 
 ## Tasks
 - M170.1: the optional `vector`, the door's checks, the engine's query refusal, docs.
+
+## Review
+Amended while implementing: criterion 3 also names `exact` and `as_of`, which reach the
+engine by another path; criterion 5 names all three metrics, since `euclidean_squared`
+would widen an empty vector to one component and record a width of 1; criterion 6 adds the
+guard for an index first folded from deletes; the "width 0 recorded as no schema" mutation
+was dropped, as no code reads it that way to mutate.
+Code review round 1 (block, two majors, both taken): a dense query against unfolded
+vector-free rows answered `500 internal`, now refused by the unfolded rows' width; the
+ledger named no evidence. Minors taken: the `as_of` path reads a missing schema as no
+width, not 0; criterion 4 asserts the door's message, which kills the mixed-batch mutation.

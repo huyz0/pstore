@@ -80,6 +80,7 @@ mod socket;
 )]
 #[path = "../support/mod.rs"]
 mod support;
+mod text_only;
 mod time_travel;
 #[allow(
     dead_code,

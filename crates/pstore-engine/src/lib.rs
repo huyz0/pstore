@@ -416,6 +416,10 @@ pub enum EngineError {
     /// reason: as a string it was `500 internal`, retryable, for a request no retry mends.
     #[error("no segment of the index holds a vector field `{0}`")]
     UnknownField(String),
+    /// A query asks for vectors of an index whose schema records none (M170): its rows were
+    /// written without one. The client's to fix, as a width mismatch is.
+    #[error("index {0} has no vectors: its documents were written without one")]
+    NoVectors(String),
     /// The rows contradict the index's recorded schema.
     ///
     /// ⚠️ Raised at the **door** and at the **flush**, never at the fold: a fold is
@@ -6566,6 +6570,14 @@ impl<S: BlobStore> Engine<S> {
             .map(|s| s.metric)
             .or(fresh_metric)
             .unwrap_or_default();
+        // M170: an index not yet folded has its width in its unfolded rows, as its metric.
+        let dims = at.head.schemas.get(index).map(|s| s.dims).or_else(|| {
+            unfolded
+                .iter()
+                .find(|d| !is_rowless(d))
+                .map(|d| d.vector().len() as u32)
+        });
+        vectors_recorded(dims, index, prefetch)?;
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let prefetch = prefetch.as_slice();
         if targets.is_empty() {
@@ -6899,7 +6911,8 @@ impl<S: BlobStore> Engine<S> {
         );
         // A schema is immutable while its index lives (M9d); across a drop, the dropped one
         // (M9f.2). Read before the empty return, which reports its analyzer too (M63).
-        let schema = schema_at(&at.head, index, epoch);
+        let recorded = schema_recorded_at(&at.head, index, epoch);
+        let schema = recorded.clone().unwrap_or_default();
         if targets.is_empty() {
             return Ok(Answer {
                 hits: Vec::new(),
@@ -6927,6 +6940,7 @@ impl<S: BlobStore> Engine<S> {
         // M14.2: bound to that epoch's analyzer.
         let bound = filter.map(|f| f.bound(&schema.fts.analyzer));
         let filter = bound.as_ref();
+        vectors_recorded(recorded.map(|s| s.dims), index, prefetch)?;
         let (prefetch, q2) = scored_by(metric, prefetch)?;
         let resolved = pstore_query::query_rows_filtered(
             &self.store,
@@ -7768,6 +7782,12 @@ fn split_rows(
 /// and otherwise the present one. Whole: its metric, and its full-text schema (M14), which a
 /// past query analyzes and scores by.
 fn schema_at(head: &Head, index: &str, epoch: Epoch) -> head::IndexSchema {
+    schema_recorded_at(head, index, epoch).unwrap_or_default()
+}
+
+/// The schema `index` had at `epoch`, if one was recorded (M170: a HEAD older than M7d
+/// records none, and that is not a width of 0).
+fn schema_recorded_at(head: &Head, index: &str, epoch: Epoch) -> Option<head::IndexSchema> {
     head.dropped
         .iter()
         // `>` and `>=` agree: `as_of` the drop's own epoch finds no segment of the index to
@@ -7776,7 +7796,29 @@ fn schema_at(head: &Head, index: &str, epoch: Epoch) -> head::IndexSchema {
         .min_by_key(|(_, dropped, _)| *dropped)
         .map(|(_, _, schema)| schema.clone())
         .or_else(|| head.schemas.get(index).cloned())
-        .unwrap_or_default()
+}
+
+/// Refuses a vector leg against an index whose schema records no vectors (M170).
+///
+/// ⚠️ **Only a known width of 0**: recorded, or of an index's unfolded rows. An index with
+/// neither answers as before.
+fn vectors_recorded(
+    dims: Option<u32>,
+    index: &str,
+    prefetch: &[pstore_query::Prefetch],
+) -> Result<(), EngineError> {
+    let vector_leg = |p: &pstore_query::Prefetch| {
+        matches!(
+            p,
+            pstore_query::Prefetch::Dense { .. }
+                | pstore_query::Prefetch::Multi { .. }
+                | pstore_query::Prefetch::MultiFde { .. }
+        )
+    };
+    match dims {
+        Some(0) if prefetch.iter().any(vector_leg) => Err(EngineError::NoVectors(index.to_owned())),
+        _ => Ok(()),
+    }
 }
 
 /// The legs as `metric` scores them (M9d): each dense query transformed. With the squared
@@ -7908,6 +7950,26 @@ mod query_error_tests {
             limit: 1,
             tune: pstore_index::vec_index::Query::default(),
         }
+    }
+
+    /// M170: only a known width of 0 refuses, and only a vector leg; an unknown width is
+    /// not one, and a pre-M7d HEAD's index, with no schema recorded, answers as before.
+    #[test]
+    fn only_a_known_width_of_zero_refuses_a_vector_leg() {
+        let text = Prefetch::Sparse {
+            field: "t".to_owned(),
+            query: vec![(1, 1.0)],
+            limit: 1,
+        };
+        assert!(matches!(
+            vectors_recorded(Some(0), "i", &[text.clone(), dense("vector")]),
+            Err(EngineError::NoVectors(i)) if i == "i"
+        ));
+        assert!(vectors_recorded(Some(0), "i", &[text]).is_ok());
+        assert!(vectors_recorded(None, "i", &[dense("vector")]).is_ok());
+        assert!(vectors_recorded(Some(2), "i", &[dense("vector")]).is_ok());
+        let head = Head::default();
+        assert!(schema_recorded_at(&head, "i", Epoch(0)).is_none());
     }
 
     /// M77: which unknown-field and unimplemented errors are the client's to fix.

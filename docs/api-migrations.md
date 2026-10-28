@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M170: documents with no vector
+
+A document may omit `vector` (or send `null`): `{"id": "a", "text": "...", "attributes": {...}}`.
+Such documents are filtered, ranked by `text`, ordered by `rank_by`, projected, patched and
+paged exactly as documents with vectors are.
+
+- An index holds documents with vectors or documents without, never both: the first fold
+  decides, as it decides the width today. The other kind answers `400 schema_conflict`, and
+  so does a batch that mixes them.
+- A query with `vector` or `multi` against an index of vector-free documents answers
+  `400 schema_conflict` ("index t has no vectors").
+- Refused with `bad_request`: `"vector": []`, `vectors` (named fields) on a document with
+  no `vector`, and `distance_metric` on a write whose documents carry no vector.
+
+Every request valid before answers as before. No stored-data migration is needed.
+The [M170 verification](milestones/M170/VERIFIED.md) records the evidence.
+
 ## M146: a hard per-group limit on a relevance ranking
 
 A relevance query may carry `limit_per`:
