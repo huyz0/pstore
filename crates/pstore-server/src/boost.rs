@@ -235,12 +235,17 @@ fn number(v: &Value) -> Option<f64> {
     }
 }
 
-/// A filter's `Eq`: numbers exactly across int and float, a datetime against the instant a
-/// string parses to, anything else structurally.
+/// A filter's `Eq`: numbers exactly across int and float, a datetime, UUID or bytes against
+/// what a string parses to, anything else structurally.
 fn equal(a: &Value, want: &Value) -> bool {
     use pstore_format::{Number, cmp_numbers};
     match (a, want) {
         (Value::DateTime(t), Value::Str(s)) => pstore_format::datetime::parse(s) == Some(*t),
+        // M171: and a UUID or bytes against what the string reads as.
+        (Value::Uuid(u), Value::Str(s)) => pstore_format::typed::parse_uuid(s) == Some(*u),
+        (Value::Bytes(b), Value::Str(s)) => {
+            pstore_format::typed::parse_bytes(s).as_deref() == Some(b.as_slice())
+        }
         _ => match (Number::of(a), Number::of(want)) {
             (Some(x), Some(y)) => cmp_numbers(x, y) == Some(std::cmp::Ordering::Equal),
             _ => a == want,

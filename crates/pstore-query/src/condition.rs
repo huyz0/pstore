@@ -63,6 +63,16 @@ fn put_value(b: &mut Vec<u8>, v: &Value) {
             b.push(4);
             b.extend(t.to_le_bytes());
         }
+        // M171: after the array's tag, which the decoder reads first.
+        Value::Uuid(u) => {
+            b.push(6);
+            b.extend(u);
+        }
+        Value::Bytes(x) => {
+            b.push(7);
+            b.extend((x.len() as u32).to_le_bytes());
+            b.extend(x);
+        }
         Value::Array(items) => {
             b.push(5);
             b.extend((items.len() as u32).to_le_bytes());
@@ -233,6 +243,11 @@ impl Reader<'_> {
             3 => Value::Bool(self.u8()? != 0),
             #[allow(clippy::cast_possible_wrap, reason = "the bits are an i64's")]
             4 => Value::DateTime(self.u64()? as i64),
+            6 => Value::Uuid(self.take(16)?.try_into().ok()?),
+            7 => {
+                let n = self.u32()?;
+                Value::Bytes(self.take(n)?.to_vec())
+            }
             5 if array => {
                 let n = self.u32()?;
                 let mut items = Vec::with_capacity(n.min(1024));
@@ -368,6 +383,12 @@ mod tests {
             Predicate::AnyCmp(a(), Op::Lte, Value::Str("é".into())),
             Predicate::AnyCmp(a(), Op::Gt, Value::Bool(false)),
             Predicate::AnyCmp(a(), Op::Gte, Value::DateTime(-1)),
+            // M171: a `$ref_new` resolves to whatever the row stores.
+            Predicate::Cmp(a(), Op::Eq, Value::Uuid([0xab; 16])),
+            Predicate::In(
+                a(),
+                vec![Value::Bytes(vec![0, 255]), Value::Bytes(Vec::new())],
+            ),
             Predicate::Or(vec![]),
             Predicate::Not(Box::new(Predicate::And(vec![]))),
             Predicate::Tokens(a(), TokenOp::All, "x y".into(), None),
@@ -446,7 +467,7 @@ mod tests {
         for bad in [
             "0d".to_owned(),
             format!("0c{s1}05"),
-            format!("00{s1}0006"),
+            format!("00{s1}0008"),
             format!("00{s1}05"),
             format!("08{s1}03"),
             format!("07{s1}05"),

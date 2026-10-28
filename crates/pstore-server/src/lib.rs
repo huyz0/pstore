@@ -51,6 +51,7 @@ pub use peer_tls::{PeerListenerConfig, PeerTls};
 mod peers;
 mod replication;
 mod session;
+mod typed;
 mod types;
 pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
@@ -1621,7 +1622,7 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
 fn patches_of(
     patch_rows: Vec<serde_json::Value>,
     patch_columns: Option<serde_json::Value>,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<Vec<pstore_engine::Patch>, ApiError> {
     let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
     for mut raw in patch_rows {
@@ -1697,7 +1698,7 @@ fn patch_of(
     id: String,
     who: &str,
     attrs: serde_json::Map<String, serde_json::Value>,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<pstore_engine::Patch, ApiError> {
     let unset: Vec<String> = attrs
         .iter()
@@ -1744,7 +1745,7 @@ fn write_filter(name: &str, v: &serde_json::Value) -> Result<pstore_query::Predi
 /// `patch_by_filter` (M13.2): `{"filters": .., "attributes": {..}}`, both required.
 fn patch_by_filter_of(
     v: &serde_json::Value,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<(pstore_query::Predicate, pstore_engine::Patch), ApiError> {
     let bad = || {
         ApiError::bad_request(
@@ -1813,7 +1814,7 @@ async fn write_documents<S: BlobStore + 'static>(
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
     }
-    let dated = declared_datetimes(&req)?;
+    let dated = declared_types(&req)?;
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
@@ -4001,31 +4002,31 @@ fn many(vs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String> {
 /// finite floats and bools; turning `1.5` into `1`, `true` into `"true"`, or `null` into an
 /// absent attribute would store a value the client did not write, and nothing downstream
 /// could tell.
-/// The attribute names a write declares datetimes (M9h.3), or why its `schema` is refused.
+/// The attribute types a write declares (M9h.3, M171), or why its `schema` is refused.
 ///
 /// ⚠️ A declaration that would do nothing is refused rather than ignored: another type, a
 /// name no document uses, or the text field -- which is always a string -- would each
 /// answer 200 and store something other than what the client meant.
-fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<String>, ApiError> {
+fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
     let Some(schema) = &req.schema else {
-        return Ok(std::collections::BTreeSet::new());
+        return Ok(typed::Declarations::new());
     };
     let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
     let schema = schema
         .as_object()
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = typed::Declarations::new();
     for (name, ty) in schema {
         // An object naming `full_text_search` is a full-text declaration (M14), which
         // `declared_fts` reads; any other object is refused below, with a datetime's message.
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
-        if ty.as_str() != Some("datetime") {
+        let Some(declared) = typed::Declared::named(ty) else {
             return Err(bad(format!(
-                "{name:?} is declared {ty}; datetime is the one type a write declares"
+                "{name:?} is declared {ty}; a write declares datetime, uuid or bytes"
             )));
-        }
+        };
         if name == pstore_format::text::DEFAULT_TEXT_FIELD {
             return Err(bad(format!("{name:?} is the text field, always a string")));
         }
@@ -4038,7 +4039,7 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
                 "{name:?} is declared and no document carries it"
             )));
         }
-        out.insert(name.clone());
+        out.insert(name.clone(), declared);
     }
     Ok(out)
 }
@@ -4262,10 +4263,7 @@ fn vector_free(req: &types::WriteRequest) -> Result<(), ApiError> {
 ///
 /// ⚠️ Takes the document by value (M119): its vectors move into the format's, where a borrow
 /// copied every one of them.
-fn to_document(
-    d: types::DocumentIn,
-    dated: &std::collections::BTreeSet<String>,
-) -> Result<Document, ApiError> {
+fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Document, ApiError> {
     let text_field = pstore_format::text::DEFAULT_TEXT_FIELD;
     let types::DocumentIn {
         id,
@@ -4292,16 +4290,16 @@ fn to_document(
         if name == pstore_query::ID_ATTRIBUTE {
             return Err(refuse(name, "is reserved: `id` is the document id"));
         }
-        let v = match value {
-            // M9h.3: a declared datetime is an RFC 3339 string, or an array of them.
-            _ if dated.contains(name) => declared_datetime(value),
+        let v = match (dated.get(name), value) {
+            // M9h.3, M171: a declared type is read from a string, or an array of them.
+            (Some(d), _) => d.read(value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
-            serde_json::Value::Array(items) => items
+            (None, serde_json::Value::Array(items)) => items
                 .iter()
                 .map(|i| scalar(i).map_err(|why| format!("holds an element that {why}")))
                 .collect::<Result<Vec<_>, _>>()
                 .map(pstore_format::Value::Array),
-            _ => scalar(value),
+            (None, _) => scalar(value),
         };
         let v = match v {
             Ok(v) => v,
@@ -4621,29 +4619,6 @@ fn scalar(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
     }
 }
 
-/// A value under a name the write declared a datetime (M9h.3).
-fn declared_datetime(value: &serde_json::Value) -> Result<pstore_format::Value, String> {
-    let one = |x: &serde_json::Value| {
-        x.as_str()
-            .and_then(pstore_format::datetime::parse)
-            .map(pstore_format::Value::DateTime)
-            .ok_or_else(|| {
-                format!(
-                    "is declared a datetime and {x} is not one: RFC 3339, \
-                     YYYY-MM-DDTHH:MM:SS[.ffffff] and Z or ±HH:MM, years 0000 to 9999 in UTC"
-                )
-            })
-    };
-    match value {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(one)
-            .collect::<Result<Vec<_>, _>>()
-            .map(pstore_format::Value::Array),
-        _ => one(value),
-    }
-}
-
 /// One attribute as JSON.
 fn to_json(v: &pstore_format::Value) -> serde_json::Value {
     match v {
@@ -4655,6 +4630,12 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
         pstore_format::Value::Array(items) => items.iter().map(to_json).collect(),
         pstore_format::Value::DateTime(t) => {
             serde_json::Value::from(pstore_format::datetime::format(*t))
+        }
+        pstore_format::Value::Uuid(u) => {
+            serde_json::Value::from(pstore_format::typed::format_uuid(u))
+        }
+        pstore_format::Value::Bytes(b) => {
+            serde_json::Value::from(pstore_format::typed::format_bytes(b))
         }
     }
 }

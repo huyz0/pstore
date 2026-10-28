@@ -61,6 +61,10 @@ pub enum Key {
     DateTime(i64),
     /// A string, compared bytewise.
     Str(String),
+    /// A UUID, by its bytes (M171).
+    Uuid([u8; 16]),
+    /// Bytes, bytewise (M171).
+    Bytes(Vec<u8>),
     /// An array, lexicographically, a proper prefix first.
     Array(Vec<Key>),
     /// No value.
@@ -79,6 +83,8 @@ impl Key {
             Some(Value::Float(f)) => Self::Num(normalized(*f)),
             Some(Value::DateTime(t)) => Self::DateTime(*t),
             Some(Value::Str(s)) => Self::Str(s.clone()),
+            Some(Value::Uuid(u)) => Self::Uuid(*u),
+            Some(Value::Bytes(b)) => Self::Bytes(b.clone()),
             Some(Value::Array(a)) => Self::Array(a.iter().map(|v| Self::of(Some(v))).collect()),
         }
     }
@@ -89,8 +95,10 @@ impl Key {
             Self::Num(_) => 1,
             Self::DateTime(_) => 2,
             Self::Str(_) => 3,
-            Self::Array(_) => 4,
-            Self::Absent => 5,
+            Self::Uuid(_) => 4,
+            Self::Bytes(_) => 5,
+            Self::Array(_) => 6,
+            Self::Absent => 7,
         }
     }
 
@@ -103,6 +111,8 @@ impl Key {
             Self::Num(Number::Float(f)) => Some(Value::Float(*f)),
             Self::DateTime(t) => Some(Value::DateTime(*t)),
             Self::Str(s) => Some(Value::Str(s.clone())),
+            Self::Uuid(u) => Some(Value::Uuid(*u)),
+            Self::Bytes(b) => Some(Value::Bytes(b.clone())),
             Self::Array(a) => Some(Value::Array(a.iter().filter_map(Self::value).collect())),
             Self::Absent => None,
         }
@@ -132,6 +142,8 @@ impl Ord for Key {
             (Self::Num(a), Self::Num(b)) => cmp_numbers(*a, *b).unwrap_or(Ordering::Equal),
             (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
             (Self::Str(a), Self::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
+            (Self::Uuid(a), Self::Uuid(b)) => a.cmp(b),
+            (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
             (Self::Array(a), Self::Array(b)) => a.cmp(b),
             _ => self.group().cmp(&other.group()),
         }
@@ -466,6 +478,11 @@ mod tests {
             Key::of(None),
             Key::of(Some(&Value::Array(vec![Value::Int(1), Value::Int(2)]))),
             Key::of(Some(&Value::Array(vec![Value::Float(1.0)]))),
+            // M171: UUIDs then bytes, after strings and before arrays.
+            Key::of(Some(&Value::Bytes(vec![2]))),
+            Key::of(Some(&Value::Bytes(vec![1, 9]))),
+            Key::of(Some(&Value::Uuid([2; 16]))),
+            Key::of(Some(&Value::Uuid([1; 16]))),
             Key::of(Some(&Value::Str("b".into()))),
             Key::of(Some(&Value::Str("a".into()))),
             Key::of(Some(&Value::DateTime(5))),
@@ -494,14 +511,20 @@ mod tests {
             Key::of(Some(&Value::Int(5))),
             Key::of(Some(&Value::DateTime(5)))
         );
-        // Within a group, by value: two datetimes, bools or strings are not one key.
+        // Within a group, by value: two datetimes, bools, strings, UUIDs or bytes are not one key.
         for (lo, hi) in [
             (Value::DateTime(1), Value::DateTime(5)),
             (Value::Bool(false), Value::Bool(true)),
             (Value::Str("a".into()), Value::Str("b".into())),
             (Value::Int(1), Value::Float(1.5)),
+            (Value::Uuid([1; 16]), Value::Uuid([2; 16])),
+            (Value::Bytes(vec![1, 9]), Value::Bytes(vec![2])),
         ] {
             assert!(Key::of(Some(&lo)) < Key::of(Some(&hi)), "{lo:?} < {hi:?}");
+        }
+        // M171: a key reports the value it holds.
+        for v in [Value::Uuid([3; 16]), Value::Bytes(vec![0, 255])] {
+            assert_eq!(Key::of(Some(&v)).value(), Some(v));
         }
         // 2^60 as a float is integral and inside i64: reported as the integer, exactly.
         let big = 2f64.powi(60);

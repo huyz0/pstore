@@ -27,6 +27,8 @@ rust-stemmers         = "1.2"
 unicode-normalization = "0.1"
 # M15: simple case folding for the trigram sketch -- the tables `(?i)` itself uses.
 regex-syntax          = { version = "0.8", default-features = false, features = ["std", "unicode-case"] }
+# M171: a bytes attribute's spelling, standard padded base64. Already in the lockfile.
+base64                = "0.22"
 
 [dev-dependencies]
 pstore-testkit = { path = "../pstore-testkit" }
