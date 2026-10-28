@@ -2066,3 +2066,421 @@ async fn a_part_with_further_fields_is_judged_at_the_door() {
         );
     }
 }
+
+/// M157's rows: [`titled`]'s, each with `tags`, an array whose "word" shares a word with
+/// `text` at another `df`.
+fn fielded(i: usize) -> Value {
+    let mut d = titled(i);
+    let tag = ["alpha", "beta", "gamma"][i % 3];
+    d["attributes"]["tags"] = json!([tag, format!("word{}", i % 4)]);
+    d
+}
+
+fn fielded_schema() -> Value {
+    let mut s = title_schema();
+    s["tags"] = json!({"type": "[]string", "full_text_search": true});
+    s
+}
+
+/// M157 criterion 3's queries, each with the protocol its parts are sent at (criterion 4).
+fn fielded_queries() -> Vec<(&'static str, Value, u64)> {
+    let two = json!([{"field": "text", "query": "word2 tag1"},
+                     {"field": "title", "query": "running stories"}]);
+    vec![
+        ("text and title", json!({"text": two, "top_k": 10}), 7),
+        (
+            "sum over three fields",
+            json!({"text": [{"field": "text", "query": "word2 tag1"},
+                            {"field": "title", "query": "running"},
+                            {"field": "tags", "query": "word2 alpha"}],
+                   "top_k": 10, "fusion": {"sum": {"weights": [1.0, 0.5, 2.0]}}}),
+            8,
+        ),
+        (
+            "text and title, title filter",
+            json!({"text": two, "top_k": 10,
+                   "filters": ["title", "ContainsAnyToken", "Running"]}),
+            7,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_query_over_several_text_fields_is_split_as_one_server_answers() {
+    // M157 criterion 3: each field scored by its own statistics on every peer.
+    let (store, servers, alone) = cluster(&[]).await;
+    fill_declared(
+        &store,
+        &servers[0].api,
+        &urls(&servers),
+        8,
+        fielded,
+        &fielded_schema(),
+    )
+    .await;
+    for (name, q, _) in fielded_queries() {
+        let (s0, want) = query(&alone.api, &q).await;
+        assert_eq!(s0, 200, "{name}: {want}");
+        assert!(!want["results"].as_array().unwrap().is_empty(), "{name}");
+        for (i, server) in servers.iter().enumerate() {
+            let sent = metric(&server.api, "pstore_peer_parts_sent").await;
+            let (s, got) = query(&server.api, &q).await;
+            assert_eq!(s, 200, "{name} at {i}: {got}");
+            assert_eq!(answer(&got), answer(&want), "{name} at {i}");
+            assert!(
+                metric(&server.api, "pstore_peer_parts_sent").await > sent,
+                "{name} at {i} was not split"
+            );
+        }
+    }
+    for s in &servers {
+        assert_eq!(metric(&s.api, "pstore_peer_parts_failed").await, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_part_over_several_fields_is_its_own_protocol() {
+    // M157 criterion 4: a peer that records each part's protocol, and whether it carries
+    // `field_terms` and `terms`, and refuses everything, as a server of an earlier build
+    // refuses 7 and 8.
+    let seen: Arc<Mutex<Vec<(u64, usize, bool)>>> = Arc::default();
+    let fake = {
+        let seen = Arc::clone(&seen);
+        axum::Router::new().route(
+            "/peer/v1/part",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().push((
+                        v["protocol"].as_u64().unwrap_or(0),
+                        v.get("field_terms")
+                            .and_then(Value::as_object)
+                            .map_or(0, serde_json::Map::len),
+                        v.get("terms").is_some(),
+                    ));
+                    (axum::http::StatusCode::CONFLICT, "protocol_mismatch")
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
+    let (store, servers, alone) = cluster(std::slice::from_ref(&old)).await;
+    let mut all = urls(&servers);
+    all.push(old);
+    fill_declared(&store, &servers[0].api, &all, 8, fielded, &fielded_schema()).await;
+    let one_field = vec![
+        (
+            "title alone",
+            json!({"text": [{"field": "title", "query": "running stories"}], "top_k": 10}),
+            5,
+        ),
+        ("text alone", json!({"text": "word2 tag1", "top_k": 10}), 2),
+    ];
+    for (name, q, protocol) in fielded_queries().into_iter().chain(one_field) {
+        let (_, want) = query(&alone.api, &q).await;
+        let failed = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+        seen.lock().unwrap().clear();
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(s, 200, "{name}: {got}");
+        assert_eq!(answer(&got), answer(&want), "{name}");
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            failed + 1,
+            "{name}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{name}: {seen:?}");
+        let (p, fields, terms) = seen[0];
+        assert_eq!(p, protocol, "{name}: sent at the wrong protocol");
+        if protocol >= 7 {
+            assert!(fields >= 2 && !terms, "{name}: {seen:?}");
+        } else {
+            assert!(fields == 0 && terms, "{name}: {seen:?}");
+        }
+    }
+    // A query over the primary and a field the index never declared sends no part: its
+    // refusal is the footers', not a peer's.
+    seen.lock().unwrap().clear();
+    let q = json!({"text": [{"field": "text", "query": "word2"},
+                            {"field": "nosuch", "query": "word2"}], "top_k": 10});
+    let (s, got) = query(&servers[0].api, &q).await;
+    assert_eq!(s, 400, "{got}");
+    assert_eq!(got["error"]["code"], "unknown_field", "{got}");
+    assert!(seen.lock().unwrap().is_empty(), "a part was sent");
+}
+
+#[tokio::test]
+async fn a_phase_one_reply_short_of_a_field_is_a_failed_share() {
+    // M157 criterion 4: a peer that forwards each part to a real server and answers with its
+    // reply, but for one field left out of `field_stats` -- or, at 5, no `stats`.
+    let real: Arc<std::sync::OnceLock<String>> = Arc::default();
+    let fake = {
+        let real = Arc::clone(&real);
+        axum::Router::new().route(
+            "/peer/v1/part",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let real = Arc::clone(&real);
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let (status, mut reply) =
+                        peer_fixture::call(real.get().unwrap(), "7", v.clone()).await;
+                    if v["phase"] == "open" && status == 200 {
+                        if let Some(f) = reply.get_mut("field_stats").and_then(Value::as_object_mut)
+                        {
+                            let first = f.keys().next().unwrap().clone();
+                            f.remove(&first);
+                        } else if v["protocol"] == 5 {
+                            reply.as_object_mut().unwrap().remove("stats");
+                        }
+                    }
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(reply),
+                    )
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let short = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(peer_fixture::serve_fake(listener, fake));
+    let (store, servers, alone) = cluster(std::slice::from_ref(&short)).await;
+    real.set(
+        peer_addresses()
+            .lock()
+            .unwrap()
+            .get(&(Arc::as_ptr(&servers[1].api) as usize))
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let mut all = urls(&servers);
+    all.push(short);
+    fill_declared(&store, &servers[0].api, &all, 8, fielded, &fielded_schema()).await;
+    let cases = [
+        fielded_queries().swap_remove(0).1,
+        json!({"text": [{"field": "title", "query": "running stories"}], "top_k": 10}),
+    ];
+    for q in cases {
+        let (_, want) = query(&alone.api, &q).await;
+        let failed = metric(&servers[0].api, "pstore_peer_parts_failed").await;
+        let (s, got) = query(&servers[0].api, &q).await;
+        assert_eq!(s, 200, "{q}: {got}");
+        assert_eq!(answer(&got), answer(&want), "{q}");
+        assert_eq!(
+            metric(&servers[0].api, "pstore_peer_parts_failed").await,
+            failed + 1,
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_part_over_several_fields_is_judged_at_the_door() {
+    // M157 criterion 5, against a real server.
+    let (_, servers, _) = cluster(&[]).await;
+    let api = &servers[1].api;
+    let fts = pstore_format::text::FullText::default().encode();
+    let cut = json!({"weights": [1.0f32.to_bits(), 1.0f32.to_bits()], "keep": 10});
+    let leg = |j: usize, field: &str| json!({"kind": "text", "j": j, "field": field, "query": "word2", "limit": 10});
+    let legs_over = |fields: &[&str]| -> Value {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(j, f)| leg(j, f))
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let terms_of = |fields: &[&str]| -> Value {
+        fields
+            .iter()
+            .map(|f| ((*f).to_owned(), json!(["word2"])))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    let texts = json!({"title": fts});
+    let two = ["text", "title"];
+    // A part at `protocol`, its legs over `legs`, with each optional key set when not null.
+    let part = |protocol: u64, phase: Option<&str>, legs: &[&str], keys: &[(&str, Value)]| {
+        let mut p = json!({"protocol": protocol, "index": "docs", "fts": fts,
+                           "filters": null, "shadow": 0, "legs": legs_over(legs),
+                           "targets": []});
+        if let Some(phase) = phase {
+            p["phase"] = json!(phase);
+        }
+        for (k, v) in keys {
+            p[*k] = v.clone();
+        }
+        p
+    };
+    let post = |body: Value| send(api, "POST", "/peer/v1/part", body);
+    let ten: Vec<String> = (0..10).map(|i| format!("f{i}")).collect();
+    let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
+    let open7 = |legs: &[&str], keys: &[(&str, Value)]| part(7, Some("open"), legs, keys);
+    let well = |fields: &[&str]| vec![("field_terms", terms_of(fields)), ("texts", texts.clone())];
+    let refused = [
+        (
+            "7 with terms",
+            open7(
+                &two,
+                &[
+                    ("field_terms", terms_of(&two)),
+                    ("texts", texts.clone()),
+                    ("terms", json!(["word2"])),
+                ],
+            ),
+        ),
+        (
+            "7 without field_terms",
+            open7(
+                &two,
+                &[("texts", texts.clone()), ("terms", json!(["word2"]))],
+            ),
+        ),
+        ("7 with one field", open7(&["title"], &well(&["title"]))),
+        ("7 with ten fields", open7(&ten, &well(&ten))),
+        (
+            "7 without texts",
+            open7(&two, &[("field_terms", terms_of(&two))]),
+        ),
+        (
+            "7, a field no leg reads",
+            open7(&two, &well(&["tags", "text", "title"])),
+        ),
+        (
+            "7, a leg over a field not named",
+            open7(&["tags", "text", "title"], &well(&two)),
+        ),
+        ("7 with a sum", {
+            let mut k = well(&two);
+            k.push(("sum", cut.clone()));
+            open7(&two, &k)
+        }),
+        ("8 without a sum", part(8, Some("open"), &two, &well(&two))),
+        (
+            "2 with field_terms",
+            part(
+                2,
+                Some("open"),
+                &["text"],
+                &[("terms", json!(["word2"])), ("field_terms", terms_of(&two))],
+            ),
+        ),
+        (
+            "1 with field_terms",
+            part(1, None, &[], &[("field_terms", terms_of(&two))]),
+        ),
+        (
+            "5 over two fields",
+            part(
+                5,
+                Some("open"),
+                &two,
+                &[("terms", json!(["word2"])), ("texts", texts.clone())],
+            ),
+        ),
+    ];
+    for (name, body) in refused {
+        let (status, got) = post(body).await;
+        assert_eq!(status, 400, "{name}: {got}");
+    }
+    let opened_at = |protocol: u64| match protocol {
+        2 => part(2, Some("open"), &["text"], &[("terms", json!(["word2"]))]),
+        5 => part(
+            5,
+            Some("open"),
+            &["title"],
+            &[("terms", json!(["word2"])), ("texts", texts.clone())],
+        ),
+        6 => part(
+            6,
+            Some("open"),
+            &["title", "title"],
+            &[
+                ("terms", json!(["word2"])),
+                ("texts", texts.clone()),
+                ("sum", cut.clone()),
+            ],
+        ),
+        7 => open7(&two, &well(&two)),
+        _ => {
+            let mut k = well(&two);
+            k.push(("sum", cut.clone()));
+            part(8, Some("open"), &two, &k)
+        }
+    };
+    let stats = json!({"doc_count": 0, "total_tokens": 0, "df": []});
+    let per_field = |fields: &[&str]| -> Value {
+        fields
+            .iter()
+            .map(|f| ((*f).to_owned(), stats.clone()))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    let scan = |protocol: u64, id: &Value, keys: &[(&str, Value)]| {
+        let mut s = json!({"protocol": protocol, "phase": "scan", "id": id, "index": "docs"});
+        for (k, v) in keys {
+            s[*k] = v.clone();
+        }
+        s
+    };
+    let fields = |p: u64| -> Vec<(&str, Value)> {
+        if p >= 7 {
+            vec![("field_stats", per_field(&two))]
+        } else {
+            vec![("stats", stats.clone())]
+        }
+    };
+    // Opened at, scanned at, the scan's statistics, and the status it is answered.
+    type Case<'a> = (u64, u64, Vec<(&'a str, Value)>, u16);
+    let mut cases: Vec<Case<'_>> = Vec::new();
+    for (opened, scanned) in [(8, 7), (7, 8), (5, 7), (6, 8), (7, 5), (8, 6)] {
+        cases.push((opened, scanned, fields(scanned), 400));
+    }
+    cases.extend([
+        (
+            7,
+            7,
+            vec![("field_stats", per_field(&["tags", "text"]))],
+            400,
+        ),
+        (7, 7, vec![("field_stats", per_field(&["title"]))], 400),
+        (
+            7,
+            7,
+            vec![("field_stats", per_field(&two)), ("stats", stats.clone())],
+            400,
+        ),
+        (
+            2,
+            2,
+            vec![
+                ("stats", stats.clone()),
+                ("field_stats", per_field(&["text"])),
+            ],
+            400,
+        ),
+        (2, 2, vec![], 400),
+        (7, 7, fields(7), 200),
+        (8, 8, fields(8), 200),
+        (2, 2, fields(2), 200),
+    ]);
+    for (opened, scanned, keys, want) in cases {
+        let (status, got) = post(opened_at(opened)).await;
+        assert_eq!(status, 200, "open at {opened}: {got}");
+        if opened >= 7 {
+            assert_eq!(
+                got["field_stats"].as_object().map(serde_json::Map::len),
+                Some(2),
+                "open at {opened}: {got}"
+            );
+            assert!(got.get("stats").is_none(), "open at {opened}: {got}");
+        }
+        let body = scan(scanned, &got["id"], &keys);
+        let (status, got) = post(body.clone()).await;
+        assert_eq!(status, want, "opened at {opened}: {body} -> {got}");
+    }
+}

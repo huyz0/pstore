@@ -1518,20 +1518,26 @@ fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::T
     }
 }
 
-/// The one text field a query's text legs read, if any (M153): a share's `Part` carries one
-/// `Stats`, so a query over two or more fields is never split (M157 lifts it). `Err` for such
-/// a query.
-fn one_text_field(prefetch: &[pstore_query::Prefetch]) -> Result<Option<&str>, ()> {
-    let mut fields = prefetch.iter().filter_map(|p| match p {
-        pstore_query::Prefetch::Text { field, .. } => Some(field.as_str()),
-        _ => None,
-    });
-    let first = fields.next();
-    if fields.all(|f| Some(f) == first) {
-        Ok(first)
-    } else {
-        Err(())
-    }
+/// The text fields a query's text legs read, in name order, each once -- when its shares can
+/// carry them (M157): none, one, or several each of which is the primary or a declared further
+/// field. `None` for several with one the index never declared: such a query is refused from
+/// the footers, so splitting it would only cost a failed share first.
+fn shareable_fields<'a>(
+    prefetch: &'a [pstore_query::Prefetch],
+    texts: &pstore_query::Texts,
+) -> Option<Vec<&'a str>> {
+    let mut fields: Vec<&str> = prefetch
+        .iter()
+        .filter_map(|p| match p {
+            pstore_query::Prefetch::Text { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+    let declared =
+        |f: &&str| *f == pstore_format::text::DEFAULT_TEXT_FIELD || texts.fields.contains_key(*f);
+    (fields.len() < 2 || fields.iter().all(declared)).then_some(fields)
 }
 
 /// Whether a share must carry the index's further fields (M154): its text legs read one, or
@@ -1539,10 +1545,10 @@ fn one_text_field(prefetch: &[pstore_query::Prefetch]) -> Result<Option<&str>, (
 /// for byte.
 fn needs_texts(
     texts: &pstore_query::Texts,
-    field: Option<&str>,
+    fields: &[&str],
     filter: Option<&pstore_query::Predicate>,
 ) -> bool {
-    field.is_some_and(|f| texts.fields.contains_key(f))
+    fields.iter().any(|f| texts.fields.contains_key(*f))
         || filter.is_some_and(|p| {
             p.token_fields()
                 .iter()
@@ -6701,7 +6707,7 @@ impl<S: BlobStore> Engine<S> {
             &part.legs,
             bound.as_ref(),
             part.shadow,
-            &pstore_index::text::Stats::default(),
+            &pstore_query::FieldStats::new(),
             &scoring(part.fts, &part.texts),
             part.sum,
         )
@@ -6709,7 +6715,7 @@ impl<S: BlobStore> Engine<S> {
     }
 
     /// Phase 1 of a share of another server's query (M55): `part`'s segments opened for its
-    /// legs, and their statistics for `part.terms`. Whole or nothing: see
+    /// legs, and their statistics for `part.terms`, a field each (M157). Whole or nothing: see
     /// [`pstore_query::open_part`].
     ///
     /// # Errors
@@ -6717,12 +6723,12 @@ impl<S: BlobStore> Engine<S> {
     pub async fn open_part(
         &self,
         part: &Part,
-    ) -> Result<(pstore_query::OpenPart, pstore_index::text::Stats), pstore_query::QueryError> {
+    ) -> Result<(pstore_query::OpenPart, pstore_query::FieldStats), pstore_query::QueryError> {
         pstore_query::open_part(&self.store, &part.targets, &part.legs, &part.terms).await
     }
 
     /// Phase 2 (M55): every leg over `held`, scored against `stats`, the sum over every segment
-    /// of the query, and masked by `filter` bound to `part`'s schema.
+    /// of the query a field each (M157), and masked by `filter` bound to `part`'s schema.
     ///
     /// # Errors
     /// As [`Self::part`].
@@ -6731,7 +6737,7 @@ impl<S: BlobStore> Engine<S> {
         part: &Part,
         held: &pstore_query::OpenPart,
         filter: Option<&pstore_query::Predicate>,
-        stats: &pstore_index::text::Stats,
+        stats: &pstore_query::FieldStats,
     ) -> Result<pstore_query::PartHits, pstore_query::QueryError> {
         let bound = filter.map(|f| f.bound_texts(&part.fts.analyzer, &part.texts));
         pstore_query::scan_part(
@@ -6848,9 +6854,9 @@ impl<S: BlobStore> Engine<S> {
             fresh: fresh_store,
         };
         // M54: the folded segments only; the fresh one is this process's alone.
-        // ⚠️ M153: never a query over several text fields, which a `Part` has one `Stats` for.
-        let elsewhere = match (peers, one_text_field(prefetch)) {
-            (Some(p), Ok(field)) => {
+        // M157: a query over several text fields too, a `Stats` a field.
+        let elsewhere = match (peers, shareable_fields(prefetch, &scored)) {
+            (Some(p), Some(fields)) => {
                 let durable = targets.get(..unfolded_at).unwrap_or_default();
                 shares(
                     p,
@@ -6858,8 +6864,8 @@ impl<S: BlobStore> Engine<S> {
                     durable,
                     prefetch,
                     &scored,
-                    needs_texts(&scored, field, filter),
-                    field,
+                    needs_texts(&scored, &fields, filter),
+                    &fields,
                     shadow.len(),
                     fusion,
                     top_k,
@@ -7749,8 +7755,9 @@ pub trait Peers: Send + Sync {
         server: usize,
         part: Part,
     ) -> futures_util::future::BoxFuture<'static, Result<pstore_query::PartHits, String>>;
-    /// Runs `part` on `server` in two phases (M55): its statistics for `part.terms`, then its
-    /// hits scored against the sum the coordinator adds up from every share's. An error in
+    /// Runs `part` on `server` in two phases (M55): its statistics for `part.terms`, a field
+    /// each (M157), then its hits scored against the sum the coordinator adds up from every
+    /// share's. An error in
     /// either is the coordinator's cue to run it itself.
     fn phased(&self, server: usize, part: Part) -> Phased;
 }
@@ -7758,12 +7765,12 @@ pub trait Peers: Send + Sync {
 /// A share's two phases (M55), as [`Peers::phased`] hands them to the coordinator: the first
 /// running from the moment it is made, the second only once called with the sum.
 pub struct Phased {
-    /// Phase 1: the share's statistics for the query's terms.
-    pub stats: futures_util::future::BoxFuture<'static, Result<pstore_index::text::Stats, String>>,
-    /// Phase 2: its hits, scored against the global sum.
+    /// Phase 1: the share's statistics for the query's terms, a field each (M157).
+    pub stats: futures_util::future::BoxFuture<'static, Result<pstore_query::FieldStats, String>>,
+    /// Phase 2: its hits, scored against the global sum of every field.
     pub scan: Box<
         dyn FnOnce(
-                pstore_index::text::Stats,
+                pstore_query::FieldStats,
             ) -> futures_util::future::BoxFuture<
                 'static,
                 Result<pstore_query::PartHits, String>,
@@ -7792,9 +7799,9 @@ pub struct Part {
     /// How many ids the query's shadow holds: what each segment's candidates are cut to
     /// leave room for.
     pub shadow: usize,
-    /// Every text leg's terms, analysed by its field's analyzer (M55, M154): the `df` a share's statistics carry.
-    /// Empty for a share in one exchange.
-    pub terms: Vec<String>,
+    /// Each text field's legs' terms, analysed by that field's analyzer (M55, M154, M157): the
+    /// `df` a share's statistics carry, a field each. Empty for a share in one exchange.
+    pub terms: BTreeMap<String, Vec<String>>,
     /// Under `sum` fusion, how the share is cut (M58); `None` otherwise.
     pub sum: Option<pstore_query::SumCut>,
 }
@@ -7863,34 +7870,39 @@ fn shares(
     prefetch: &[pstore_query::Prefetch],
     texts: &pstore_query::Texts,
     carry: bool,
-    field: Option<&str>,
+    fields: &[&str],
     shadow: usize,
     fusion: pstore_query::Fusion,
     top_k: usize,
     cap: usize,
 ) -> Vec<pstore_query::Elsewhere<'static>> {
-    let text: Vec<&String> = prefetch
-        .iter()
-        .filter_map(|p| match p {
-            pstore_query::Prefetch::Text { query, .. } => Some(query),
-            _ => None,
-        })
-        .collect();
-    let two = !text.is_empty();
+    let two = !fields.is_empty();
     let legs: Vec<(usize, pstore_query::Prefetch)> = prefetch
         .iter()
         .enumerate()
         .filter(|(_, p)| two || pstore_query::splittable(p))
         .map(|(j, p)| (j, p.clone()))
         .collect();
-    // M154: under the analyzer of the field the legs read, as the coordinator's own are.
-    let analyzer = &texts.of(field.unwrap_or_default()).analyzer;
-    let mut terms: Vec<String> = text
+    // M154, M157: each field's terms under that field's analyzer, as the coordinator's own are.
+    let terms: BTreeMap<String, Vec<String>> = fields
         .iter()
-        .flat_map(|q| pstore_format::text::analyze_query(analyzer, q))
+        .map(|field| {
+            let analyzer = &texts.of(field).analyzer;
+            let mut t: Vec<String> = prefetch
+                .iter()
+                .filter_map(|p| match p {
+                    pstore_query::Prefetch::Text {
+                        field: f, query, ..
+                    } if f == field => Some(query),
+                    _ => None,
+                })
+                .flat_map(|q| pstore_format::text::analyze_query(analyzer, q))
+                .collect();
+            t.sort();
+            t.dedup();
+            ((*field).to_owned(), t)
+        })
         .collect();
-    terms.sort();
-    terms.dedup();
     let servers = peers.servers();
     // M58: `sum` splits in two phases, cut by sum -- so only with a text leg. The server
     // refuses `sum` without one; the engine does not, and never splits it (spec review).
@@ -7938,11 +7950,22 @@ fn shares(
                 share: if two {
                     let Phased { stats, scan } = peers.phased(server, part);
                     // The sum carries the query's terms only (code review): the coordinator's
-                    // own statistics hold its whole vocabulary, which grows with records.
+                    // own statistics hold its whole vocabulary, which grows with records. Each
+                    // field's, its own terms' (M157).
                     let terms = terms.clone();
                     pstore_query::Share::Phased {
                         stats,
-                        scan: Box::new(move |sum| scan(pstore_query::only(sum, &terms))),
+                        scan: Box::new(move |sum: pstore_query::FieldStats| {
+                            scan(
+                                sum.into_iter()
+                                    .map(|(f, s)| {
+                                        let own = terms.get(&f).map_or(&[][..], Vec::as_slice);
+                                        let s = pstore_query::only(s, own);
+                                        (f, s)
+                                    })
+                                    .collect(),
+                            )
+                        }),
                     }
                 } else {
                     pstore_query::Share::Hits(peers.part(server, part))
@@ -8331,7 +8354,17 @@ mod split_tests {
         let rrf = pstore_query::Fusion::default();
         let split = |t: &[pstore_query::Target], legs, fusion, cap| {
             shares(
-                &peers, "x", t, legs, &texts, false, None, 0, fusion, 10, cap,
+                &peers,
+                "x",
+                t,
+                legs,
+                &texts,
+                false,
+                &shareable_fields(legs, &texts).unwrap(),
+                0,
+                fusion,
+                10,
+                cap,
             )
             .into_iter()
             .map(|e| e.targets)
@@ -8366,7 +8399,7 @@ mod split_tests {
                 legs,
                 &texts,
                 false,
-                None,
+                &shareable_fields(legs, &texts).unwrap(),
                 0,
                 fusion,
                 10,
@@ -8390,7 +8423,7 @@ mod split_tests {
             &dense,
             &texts,
             false,
-            None,
+            &[],
             0,
             rrf,
             10,

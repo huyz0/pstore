@@ -16,8 +16,8 @@ use pstore_format::{Document, Value};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
 use pstore_query::{
-    Elsewhere, Fusion, Hit, Prefetch, QueryError, Share, Target, Texts, Weights,
-    query_rows_filtered_texts, query_rows_split_texts, query_with, query_with_texts,
+    Fusion, Hit, Prefetch, QueryError, Target, Texts, Weights, query_rows_filtered_texts,
+    query_with, query_with_texts,
 };
 use pstore_testkit::depth::DepthCounting;
 use pstore_types::TenantId;
@@ -198,7 +198,8 @@ async fn each_field_is_scored_by_its_own_statistics() {
 }
 
 /// Criterion 3: a field no segment carries is refused beside one that is; the old entry
-/// points keep M151's refusal; a phased share of several fields is refused before a request.
+/// points keep M151's refusal. (Its third point, a phased share of several fields refused,
+/// M157 reverses.)
 #[tokio::test]
 async fn what_several_fields_cannot_mean_is_refused() {
     let counting = DepthCounting::new(MemoryStore::new());
@@ -235,36 +236,8 @@ async fn what_several_fields_cannot_mean_is_refused() {
         ),
         "{e:?}"
     );
-    counting.reset();
-    let elsewhere = vec![Elsewhere {
-        targets: vec![1],
-        share: Share::Phased {
-            stats: Box::pin(async { Ok(pstore_index::text::Stats::default()) }),
-            scan: Box::new(|_| Box::pin(async { Ok(Vec::new()) })),
-        },
-    }];
-    let e = query_rows_split_texts(
-        &counting,
-        &targets,
-        &two,
-        &texts(),
-        None,
-        &HashSet::new(),
-        sum(2),
-        10,
-        elsewhere,
-        false,
-    )
-    .await
-    .expect_err("a phased share took several fields");
-    assert!(
-        matches!(
-            e,
-            QueryError::Unimplemented("a phased share of several text fields")
-        ),
-        "{e:?}"
-    );
-    assert_eq!(counting.requests(), 0, "refused after a request");
+    // M157: a phased share beside several fields is taken, a `Stats` a field; its refusal,
+    // this test's third point until then, is reversed.
 }
 
 /// Criterion 5: two fields cost one field's rounds, and their requests add but for one open;

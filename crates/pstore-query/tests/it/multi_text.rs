@@ -296,12 +296,8 @@ async fn what_one_field_per_query_cannot_answer_is_refused() {
         .await
         .unwrap_err();
     assert!(matches!(e, QueryError::Unimplemented(_)), "{e:?}");
-    let legs: Vec<(usize, Prefetch)> = two.iter().cloned().enumerate().collect();
-    let e = open_part(&s, &[(0, three.clone())], &legs, &[])
-        .await
-        .err()
-        .expect("open_part took two fields");
-    assert!(matches!(e, QueryError::Unimplemented(_)), "{e:?}");
+    // M157: `open_part` takes legs over several fields, a `Stats` a field; its refusal, here
+    // until then, is reversed.
     // A field no segment carries is a typo, never an empty answer.
     let e = query_with(&s, &targets, &[text_leg("d", "x")], &fts("a"), sum1(), 10)
         .await
@@ -325,19 +321,20 @@ async fn a_share_without_the_field_adds_nothing_and_refuses_nothing() {
     let q = "revenue growth";
     let legs = [text_leg("c", q)];
     let indexed: Vec<(usize, Prefetch)> = legs.iter().cloned().enumerate().collect();
-    let terms = text::analyze(&analyzer("c"), q);
+    let terms =
+        std::collections::BTreeMap::from([("c".to_owned(), text::analyze(&analyzer("c"), q))]);
     let (_, none) = open_part(&s, &[(0, targets[0].clone())], &indexed, &terms)
         .await
         .unwrap();
     assert_eq!(
-        none.doc_count, 0,
+        none["c"].doc_count, 0,
         "a share without `c` added to its statistics"
     );
 
     let (part, stats) = open_part(&s, &[(1, targets[1].clone())], &indexed, &terms)
         .await
         .unwrap();
-    assert!(stats.doc_count > 0);
+    assert!(stats["c"].doc_count > 0);
     let store = s.clone();
     let ft = fts("c");
     let elsewhere = vec![Elsewhere {
@@ -578,7 +575,7 @@ async fn two_fields_are_refused_before_any_request_on_every_path() {
     let elsewhere = vec![Elsewhere {
         targets: vec![1],
         share: Share::Phased {
-            stats: Box::pin(async { Ok(pstore_index::text::Stats::default()) }),
+            stats: Box::pin(async { Ok(pstore_query::FieldStats::new()) }),
             scan: Box::new(|_| Box::pin(async { Ok(Vec::new()) })),
         },
     }];
@@ -597,19 +594,7 @@ async fn two_fields_are_refused_before_any_request_on_every_path() {
     .await
     .expect_err("a phased query took two fields");
     assert!(matches!(e, QueryError::Unimplemented(_)), "{e:?}");
-    let legs: Vec<(usize, Prefetch)> = two.iter().cloned().enumerate().collect();
-    let e = pstore_query::part(
-        &counting,
-        &[(0, targets[0].clone())],
-        &legs,
-        None,
-        0,
-        &pstore_index::text::Stats::default(),
-        &fts("a").into(),
-        None,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(e, QueryError::Unimplemented(_)), "{e:?}");
+    // M157: `part` takes legs over several fields, scored a field each; its refusal, here
+    // until then, is reversed.
     assert_eq!(counting.requests(), 0, "refused after a request");
 }

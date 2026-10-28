@@ -248,16 +248,9 @@ impl From<FullText> for Texts {
     }
 }
 
-/// Each queried text field's BM25 statistics, summed over the segments carrying it (M153).
-type FieldStats = std::collections::BTreeMap<String, Stats>;
-
-/// `stats` as the statistics of the one field `legs` read, if any (M153): a share's.
-fn one_field(legs: &[(usize, Prefetch)], stats: &Stats) -> FieldStats {
-    text_fields_of(legs.iter().map(|(_, p)| p))
-        .into_iter()
-        .map(|f| (f.to_owned(), stats.clone()))
-        .collect()
-}
+/// Each queried text field's BM25 statistics, summed over the segments carrying it (M153),
+/// keyed by the field a text leg names. A phased share's, both ways (M157).
+pub type FieldStats = std::collections::BTreeMap<String, Stats>;
 
 /// Runs every leg over one segment and fuses the answers.
 ///
@@ -356,11 +349,11 @@ pub enum Share<'a> {
     /// then its hits scored against the sum over every segment, which only the coordinator can
     /// add up.
     Phased {
-        /// Phase 1: the share's statistics.
-        stats: futures_util::future::BoxFuture<'a, Result<Stats, String>>,
-        /// Phase 2: its hits, given the global sum.
+        /// Phase 1: the share's statistics, a field each (M157).
+        stats: futures_util::future::BoxFuture<'a, Result<FieldStats, String>>,
+        /// Phase 2: its hits, given the global sum of every field.
         scan: Box<
-            dyn FnOnce(Stats) -> futures_util::future::BoxFuture<'a, Result<PartHits, String>>
+            dyn FnOnce(FieldStats) -> futures_util::future::BoxFuture<'a, Result<PartHits, String>>
                 + Send
                 + 'a,
         >,
@@ -427,8 +420,8 @@ mod held_tests {
     }
 }
 
-/// Phase 1 of a share (M55): `legs` over `targets` opened, and their BM25 statistics for
-/// `terms`.
+/// Phase 1 of a share (M55): `legs` over `targets` opened, and their BM25 statistics -- a
+/// field each (M157), for that field's entry of `terms`.
 ///
 /// ⚠️ **Whole or nothing** (spec review): a segment whose footer has a text field and which
 /// HEAD says has a term dictionary must yield a summary. The coordinator's own path drops an
@@ -442,27 +435,31 @@ pub async fn open_part<S: BlobStore + Clone>(
     store: &S,
     targets: &[(usize, Target)],
     legs: &[(usize, Prefetch)],
-    terms: &[String],
-) -> Result<(OpenPart, Stats), QueryError> {
-    let field = text_field_of(legs.iter().map(|(_, p)| p))?;
+    terms: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(OpenPart, FieldStats), QueryError> {
+    let fields = text_fields_of(legs.iter().map(|(_, p)| p));
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
         .join()
         .await?;
-    let mut parts = Vec::new();
-    // ⚠️ A segment without the field adds nothing, and is never refused here (M151): the field
-    // may live in another share's segments, and only the coordinator sees them all.
-    for ((_, t), o) in targets.iter().zip(&opened) {
-        let Some(field) = field.filter(|f| t.text_dict && o.carries(f)) else {
-            continue;
-        };
-        let raw = o.terms.as_ref().ok_or(FormatError::Corrupt(
-            "a share's segment with text and no term dictionary",
-        ))?;
-        parts.push(o.text_index(field, raw)?.summary_for(terms));
+    let mut stats = FieldStats::new();
+    for field in fields {
+        let terms = terms.get(field).map_or(&[][..], Vec::as_slice);
+        let mut parts = Vec::new();
+        // ⚠️ A segment without the field adds nothing, and is never refused here (M151): the
+        // field may live in another share's segments, and only the coordinator sees them all.
+        for ((_, t), o) in targets.iter().zip(&opened) {
+            if !(t.text_dict && o.carries(field)) {
+                continue;
+            }
+            let raw = o.terms.as_ref().ok_or(FormatError::Corrupt(
+                "a share's segment with text and no term dictionary",
+            ))?;
+            parts.push(o.text_index(field, raw)?.summary_for(terms));
+        }
+        // Already `terms` alone, each summary built for them (M119); `only` keeps it so.
+        stats.insert(field.to_owned(), only(Stats::merge(parts), terms));
     }
-    // Already `terms` alone, each summary built for them (M119); `only` keeps it so.
-    let stats = only(Stats::merge(parts), terms);
     Ok((
         OpenPart {
             targets: targets.to_vec(),
@@ -550,7 +547,7 @@ pub async fn scan_part<S: BlobStore + Clone>(
     part: &OpenPart,
     filter: Option<&Predicate>,
     shadow: usize,
-    stats: &Stats,
+    stats: &FieldStats,
     texts: &Texts,
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
@@ -574,7 +571,7 @@ pub async fn scan_part<S: BlobStore + Clone>(
         filter,
         shadow,
         sum.is_some(),
-        &Arc::new(one_field(&part.legs, stats)),
+        &Arc::new(stats.clone()),
         texts,
     )
     .await?;
@@ -600,13 +597,11 @@ pub async fn part<S: BlobStore + Clone>(
     legs: &[(usize, Prefetch)],
     filter: Option<&Predicate>,
     shadow: usize,
-    stats: &Stats,
+    stats: &FieldStats,
     texts: &Texts,
     sum: Option<SumCut>,
 ) -> Result<PartHits, QueryError> {
-    // M151: before the open round. `scan_part` needs no check of its own: its `OpenPart` comes
-    // from `open_part`, which refuses first, or from here.
-    text_field_of(legs.iter().map(|(_, p)| p))?;
+    // M157: legs over several fields, each scored by its own entry of `stats`.
     let prefetch: Vec<Prefetch> = legs.iter().map(|(_, p)| p.clone()).collect();
     let opened = open_all(store, targets.iter().map(|(_, t)| t), &prefetch)
         .join()
@@ -789,20 +784,9 @@ async fn run<S: BlobStore + Clone>(
         .iter()
         .map(Runnable::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    // M153: every field the text legs read, each scored by its own statistics. A phased share
-    // carries one `Stats` and one `FullText`, so it serves a query of one field only.
+    // M153: every field the text legs read, each scored by its own statistics -- which a
+    // phased share answers a field each (M157).
     let text_fields = text_fields_of(prefetch);
-    if text_fields.len() > 1
-        && elsewhere
-            .iter()
-            .any(|e| matches!(e.share, Share::Phased { .. }))
-    {
-        return Err(QueryError::Unimplemented(
-            "a phased share of several text fields",
-        ));
-    }
-    // The one field a phased share's statistics are for.
-    let shared_field = text_fields.first().copied().unwrap_or_default();
 
     // ⚠️ Every segment and every sidecar in ONE round. `Engine::scan`'s comment already made
     // this argument with a measurement: a loop over segment refs "turns a ten-segment index
@@ -982,17 +966,22 @@ async fn run<S: BlobStore + Clone>(
         let opened_here = open_all(store, scan_here.iter().map(|(_, t)| t), prefetch)
             .join()
             .await?;
-        // A phased share's statistics are its one field's (refused above for several).
+        // M157: each field's sum is its own entry of every share's statistics.
         let here = field_stats(&opened_here);
         for (field, s) in &mut stats {
-            let mut more: Vec<Stats> = here.get(field).cloned().into_iter().collect();
-            if field == shared_field {
-                more.extend(summed_parts.iter().cloned());
-            }
+            let more = here
+                .get(field)
+                .into_iter()
+                .chain(
+                    summed_parts
+                        .iter()
+                        .filter_map(|p: &FieldStats| p.get(field)),
+                )
+                .cloned();
             *s = Stats::merge(std::iter::once(std::mem::take(s)).chain(more));
         }
-        // The share's one `Stats`: its field's, or the empty sum a query without text sends.
-        let shared_stats = stats.get(shared_field).cloned().unwrap_or_default();
+        // What every phase 2 is sent: the global sum of every field.
+        let shared_stats = stats.clone();
         // Shared by every leg task (M59), and built once.
         let stats = &Arc::new(stats);
 

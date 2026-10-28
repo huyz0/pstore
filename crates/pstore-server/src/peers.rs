@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use pstore_blob::{BlobStore, Key};
 use pstore_engine::{Part, Peers, Phased};
 use pstore_index::text::Stats;
+use pstore_query::FieldStats;
 use pstore_query::{Hit, PartHits, Prefetch, Target};
 use pstore_types::TenantId;
 use serde::{Deserialize, Serialize};
@@ -48,20 +49,64 @@ pub(crate) const PHASED_TEXTS: u32 = 5;
 /// [`SUMMED`]'s, for a part that carries `texts` (M154).
 pub(crate) const SUMMED_TEXTS: u32 = 6;
 
+/// [`PHASED_TEXTS`]'s, for a part whose text legs read two or more fields (M157): its terms
+/// and statistics travel a field each, in `field_terms` and `field_stats`. A peer of an
+/// earlier build would score every field against one `Stats`, so it must refuse this.
+pub(crate) const PHASED_FIELDS: u32 = 7;
+/// [`SUMMED_TEXTS`]'s, for a part whose text legs read two or more fields (M157).
+pub(crate) const SUMMED_FIELDS: u32 = 8;
+
 /// The protocol a phased part, and each of its phases, speaks: by whether it is cut by sum
-/// (M58) and whether it carries `texts` (M154).
-fn phased_protocol(sum: bool, texts: bool) -> u32 {
-    match (sum, texts) {
-        (false, false) => PHASED,
-        (true, false) => SUMMED,
-        (false, true) => PHASED_TEXTS,
-        (true, true) => SUMMED_TEXTS,
+/// (M58), whether it carries `texts` (M154), and whether its text legs read several fields
+/// (M157) -- which always carries `texts`.
+fn phased_protocol(sum: bool, texts: bool, fields: bool) -> u32 {
+    match (sum, texts, fields) {
+        (false, _, true) => PHASED_FIELDS,
+        (true, _, true) => SUMMED_FIELDS,
+        (false, false, false) => PHASED,
+        (true, false, false) => SUMMED,
+        (false, true, false) => PHASED_TEXTS,
+        (true, true, false) => SUMMED_TEXTS,
     }
+}
+
+/// The protocol `part`'s phases speak.
+fn part_protocol(part: &Part) -> u32 {
+    phased_protocol(
+        part.sum.is_some(),
+        !part.texts.is_empty(),
+        part.terms.len() > 1,
+    )
 }
 
 /// Whether `protocol` is one whose parts carry `texts` (M154).
 fn carries_texts(protocol: u32) -> bool {
-    matches!(protocol, WHOLE_TEXTS | PHASED_TEXTS | SUMMED_TEXTS)
+    matches!(
+        protocol,
+        WHOLE_TEXTS | PHASED_TEXTS | SUMMED_TEXTS | PHASED_FIELDS | SUMMED_FIELDS
+    )
+}
+
+/// Whether `protocol` is one whose terms and statistics travel a field each (M157).
+fn per_field(protocol: u32) -> bool {
+    matches!(protocol, PHASED_FIELDS | SUMMED_FIELDS)
+}
+
+/// The one field a part's text legs read, under which its one `terms` and `stats` are keyed
+/// (M157); `None` for a part without a text leg.
+fn one_field(legs: &[(usize, Prefetch)]) -> Option<&str> {
+    legs.iter().find_map(|(_, p)| match p {
+        Prefetch::Text { field, .. } => Some(field.as_str()),
+        _ => None,
+    })
+}
+
+/// `stats` as a one-field part's statistics: keyed by its one field, or none without one.
+fn keyed(legs: &[(usize, Prefetch)], stats: Stats) -> FieldStats {
+    one_field(legs)
+        .map(|f| (f.to_owned(), stats))
+        .into_iter()
+        .collect()
 }
 
 /// How long a part is held between its phases (M55).
@@ -524,7 +569,7 @@ impl Peers for QueryPeers {
         let body = Command::Open(WirePart::opening(&part, self.filters.clone()));
         let tenant = self.tenant;
         let index = part.index.clone();
-        let protocol = phased_protocol(part.sum.is_some(), !part.texts.is_empty());
+        let protocol = part_protocol(&part);
         // The id phase 1 returns, for phase 2; and whether this part's failure is counted yet:
         // once per part, whichever phase fails (spec rule 11).
         let held: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
@@ -544,9 +589,10 @@ impl Peers for QueryPeers {
                 fail.clone(),
                 url.clone(),
             );
+            let (legs, fields) = (part.legs.clone(), part.terms.clone());
             Box::pin(async move {
                 cluster.sent.fetch_add(1, Ordering::Relaxed);
-                let got = open(&cluster, url, body, tenant).await;
+                let got = open(&cluster, url, body, tenant, protocol, &legs, &fields).await;
                 match got {
                     Ok((id, stats)) => {
                         *held
@@ -561,7 +607,7 @@ impl Peers for QueryPeers {
                 }
             }) as futures_util::future::BoxFuture<'static, _>
         };
-        let scan = Box::new(move |sum: Stats| {
+        let scan = Box::new(move |sum: FieldStats| {
             Box::pin(async move {
                 let id = held
                     .lock()
@@ -569,12 +615,14 @@ impl Peers for QueryPeers {
                     .take();
                 let got = match id {
                     Some(id) => {
+                        let (stats, field_stats) = wire_stats(protocol, &sum);
                         let body = Command::Scan(WireScan {
                             protocol,
                             phase: "scan".to_owned(),
                             id,
                             index,
-                            stats: WireStats::of(&sum),
+                            stats,
+                            field_stats,
                         });
                         send(&cluster, url, body, tenant, &part).await
                     }
@@ -598,13 +646,18 @@ impl Failure {
     }
 }
 
-/// Phase 1 of a part (M55): the id it is held under, and the share's statistics.
+/// Phase 1 of a part (M55): the id it is held under, and the share's statistics -- a field
+/// each, exactly the part's fields, or the reply is a failure (M157): a share's statistics
+/// short of a field would leave its segments out of that field's corpus.
 async fn open(
     cluster: &Cluster,
     url: Option<String>,
     body: Command,
     tenant: TenantId,
-) -> Result<(String, Stats), Failure> {
+    protocol: u32,
+    legs: &[(usize, Prefetch)],
+    fields: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(String, FieldStats), Failure> {
     let url = url.ok_or_else(|| Failure::Counted("no such server".to_owned()))?;
     let res: crate::peer_wire::Reply<Outcome> = cluster
         .pool
@@ -612,7 +665,13 @@ async fn open(
         .await
         .map_err(|e| Failure::Counted(e.to_string()))?;
     match (res.status, res.body) {
-        (200, Outcome::Opened(wire)) => Ok((wire.id, wire.stats.stats())),
+        (200, Outcome::Opened(wire)) => {
+            read_stats(protocol, legs, fields, wire.stats, wire.field_stats)
+                .map(|stats| (wire.id, stats))
+                .ok_or_else(|| {
+                    Failure::Counted("an open reply's statistics are not its part's".to_owned())
+                })
+        }
         (422, Outcome::Error { message, .. }) => Err(Failure::Query(message)),
         (_, Outcome::Error { message, .. }) => Err(Failure::Counted(message)),
         _ => Err(Failure::Counted("invalid open reply".to_owned())),
@@ -684,9 +743,12 @@ pub(crate) struct WirePart {
     shadow: usize,
     legs: Vec<WireLeg>,
     targets: Vec<WireTarget>,
-    /// The text legs' analysed terms (M55).
+    /// The text legs' analysed terms (M55), for a part over one field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     terms: Vec<String>,
+    /// Each field's analysed terms (M157), for a part over two or more: at 7 and 8 only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    field_terms: std::collections::BTreeMap<String, Vec<String>>,
     /// The index's further text fields, each as `FullText::encode` writes it (M154); at
     /// protocols 4, 5 and 6 only.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -727,7 +789,12 @@ pub(crate) struct WireScan {
     phase: String,
     id: String,
     index: String,
-    stats: WireStats,
+    /// The global sum, for a part over one field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats: Option<WireStats>,
+    /// Each field's global sum (M157), at 7 and 8 only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    field_stats: std::collections::BTreeMap<String, WireStats>,
 }
 
 /// BM25's statistics on the wire (M55): counts are integers, so they travel as they are.
@@ -760,7 +827,64 @@ impl WireStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WireOpened {
     id: String,
-    stats: WireStats,
+    /// The share's statistics, for a part over one field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats: Option<WireStats>,
+    /// Each field's (M157), at 7 and 8 only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    field_stats: std::collections::BTreeMap<String, WireStats>,
+}
+
+/// Statistics on the wire as a protocol carries them (M157): a field each at 7 and 8, one
+/// `stats` otherwise.
+fn wire_stats(
+    protocol: u32,
+    stats: &FieldStats,
+) -> (
+    Option<WireStats>,
+    std::collections::BTreeMap<String, WireStats>,
+) {
+    if per_field(protocol) {
+        (
+            None,
+            stats
+                .iter()
+                .map(|(f, s)| (f.clone(), WireStats::of(s)))
+                .collect(),
+        )
+    } else {
+        (
+            Some(WireStats::of(
+                &stats.values().next().cloned().unwrap_or_default(),
+            )),
+            std::collections::BTreeMap::new(),
+        )
+    }
+}
+
+/// Statistics read off the wire for a part at `protocol` over `legs` whose terms name
+/// `fields`, or `None` when they are not what that protocol carries (M157): at 7 and 8 a
+/// field each, exactly `fields`, and no `stats`; otherwise one `stats` and no field's.
+fn read_stats(
+    protocol: u32,
+    legs: &[(usize, Prefetch)],
+    fields: &std::collections::BTreeMap<String, Vec<String>>,
+    stats: Option<WireStats>,
+    field_stats: std::collections::BTreeMap<String, WireStats>,
+) -> Option<FieldStats> {
+    if per_field(protocol) {
+        (stats.is_none() && field_stats.keys().eq(fields.keys())).then(|| {
+            field_stats
+                .into_iter()
+                .map(|(f, s)| (f, s.stats()))
+                .collect()
+        })
+    } else {
+        match (stats, field_stats.is_empty()) {
+            (Some(s), true) => Some(keyed(legs, s.stats())),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -868,10 +992,21 @@ fn rerank_of(name: &str) -> Option<pstore_index::vec_index::Rerank> {
 impl WirePart {
     /// Phase 1 of a phased part (M55): every leg, and the text legs' terms.
     fn opening(part: &Part, filters: Option<serde_json::Value>) -> Self {
+        let protocol = part_protocol(part);
+        // M157: a field's terms each at 7 and 8; the one field's, as M55 sent them, otherwise.
+        let (terms, field_terms) = if per_field(protocol) {
+            (Vec::new(), part.terms.clone())
+        } else {
+            (
+                part.terms.values().next().cloned().unwrap_or_default(),
+                std::collections::BTreeMap::new(),
+            )
+        };
         Self {
-            protocol: phased_protocol(part.sum.is_some(), !part.texts.is_empty()),
+            protocol,
             phase: Some("open".to_owned()),
-            terms: part.terms.clone(),
+            terms,
+            field_terms,
             sum: part.sum.map(WireSum::of),
             ..Self::of(part, filters)
         }
@@ -886,6 +1021,7 @@ impl WirePart {
             },
             phase: None,
             terms: Vec::new(),
+            field_terms: std::collections::BTreeMap::new(),
             sum: None,
             texts: part
                 .texts
@@ -1057,6 +1193,46 @@ fn guard(tenant: TenantId, wire: &WirePart) -> Result<(), ApiError> {
             pstore_engine::MAX_TEXTS
         )));
     }
+    // M157: terms a field each at 7 and 8, and only there, for exactly the fields its text
+    // legs read -- two or more, and at most the primary and every further field. Elsewhere one
+    // field at most, whose one `terms` is keyed by it.
+    let read: std::collections::BTreeSet<&str> = wire
+        .legs
+        .iter()
+        .filter_map(|l| match l {
+            WireLeg::Text { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    if per_field(wire.protocol) {
+        if wire.field_terms.len() < 2 || wire.field_terms.len() > pstore_engine::MAX_TEXTS + 1 {
+            return Err(refuse(format!(
+                "a part at 7 or 8 carries terms for 2 to {} fields",
+                pstore_engine::MAX_TEXTS + 1
+            )));
+        }
+        if !wire.terms.is_empty() {
+            return Err(refuse(
+                "a part at 7 or 8 carries its terms a field each, never one `terms`".to_owned(),
+            ));
+        }
+        if !wire
+            .field_terms
+            .keys()
+            .map(String::as_str)
+            .eq(read.iter().copied())
+        {
+            return Err(refuse(
+                "a part's `field_terms` name exactly the fields its text legs read".to_owned(),
+            ));
+        }
+    } else if !wire.field_terms.is_empty() || read.len() > 1 {
+        return Err(refuse(
+            "a part over several text fields is protocol 7 or 8, and only those carry \
+             `field_terms`"
+                .to_owned(),
+        ));
+    }
     // ⚠️ A leg's number is a query position, under `MAX_LEGS` and named once (code review,
     // M58): a cut by sum sizes its legs by it, so an unbounded one was an allocation the
     // caller chose.
@@ -1224,6 +1400,15 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
             )
         })
         .collect();
+    // M157: a field's terms each at 7 and 8; the one field's, keyed by it, otherwise.
+    let terms = if per_field(wire.protocol) {
+        wire.field_terms
+    } else {
+        one_field(&legs)
+            .map(|f| (f.to_owned(), wire.terms))
+            .into_iter()
+            .collect()
+    };
     let sum = match &wire.sum {
         None => None,
         Some(s) => Some(
@@ -1239,7 +1424,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
             legs,
             targets,
             shadow: wire.shadow,
-            terms: wire.terms,
+            terms,
             sum,
         },
         wire.filters,
@@ -1280,14 +1465,18 @@ pub(crate) async fn execute<S: BlobStore + 'static>(
             serve_whole(api, tenant, wire).await.map(Outcome::Hits)
         }
         Command::Open(wire)
-            if matches!(wire.protocol, PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS)
-                && wire.phase.as_deref() == Some("open") =>
+            if matches!(
+                wire.protocol,
+                PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS | PHASED_FIELDS | SUMMED_FIELDS
+            ) && wire.phase.as_deref() == Some("open") =>
         {
             serve_open(api, tenant, wire).await.map(Outcome::Opened)
         }
         Command::Scan(wire)
-            if matches!(wire.protocol, PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS)
-                && wire.phase == "scan" =>
+            if matches!(
+                wire.protocol,
+                PHASED | SUMMED | PHASED_TEXTS | SUMMED_TEXTS | PHASED_FIELDS | SUMMED_FIELDS
+            ) && wire.phase == "scan" =>
         {
             serve_scan(api, tenant, wire).await.map(Outcome::Hits)
         }
@@ -1373,13 +1562,15 @@ async fn serve_open<S: BlobStore + 'static>(
     guard(tenant, &wire)?;
     // M58: a cut by sum is protocol 3's, and protocol 3 is a cut by sum. `WirePart` ignores a
     // field it does not know, so nothing else would refuse a `sum` sent at 2. M154: and 6's.
-    if matches!(wire.protocol, SUMMED | SUMMED_TEXTS) != wire.sum.is_some() {
+    // M157: and 8's.
+    if matches!(wire.protocol, SUMMED | SUMMED_TEXTS | SUMMED_FIELDS) != wire.sum.is_some() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "bad_part",
-            "a part cut by sum is protocol 3 or 6, and those are cut by sum",
+            "a part cut by sum is protocol 3, 6 or 8, and those are cut by sum",
         ));
     }
+    let protocol = wire.protocol;
     let (part, filters) = decode(wire)?;
     // Parsed now, so a filter that cannot be is refused before anything is held.
     filters.as_ref().map(predicate).transpose()?;
@@ -1406,9 +1597,11 @@ async fn serve_open<S: BlobStore + 'static>(
                 "this part is larger than the bytes a server holds between phases",
             )
         })?;
+    let (stats, field_stats) = wire_stats(protocol, &stats);
     Ok(WireOpened {
         id,
-        stats: WireStats::of(&stats),
+        stats,
+        field_stats,
     })
 }
 
@@ -1429,19 +1622,36 @@ async fn serve_scan<S: BlobStore + 'static>(
             )
         })?;
     // M58 (code review): a scan speaks its part's protocol, 3 for a cut by sum and 2 else.
-    // M154: 6 and 5 for a part that carries `texts`.
-    if wire.protocol != phased_protocol(held.part.sum.is_some(), !held.part.texts.is_empty()) {
+    // M154: 6 and 5 for a part that carries `texts`. M157: 8 and 7 for one over several.
+    if wire.protocol != part_protocol(&held.part) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "bad_part",
             "a scan's protocol is its part's: 3 for a part cut by sum, 2 otherwise, \
-             and 6 and 5 for one that carries further text fields",
+             6 and 5 for one that carries further text fields, and 8 and 7 for one over \
+             several",
         ));
     }
+    // M157: the statistics its protocol carries, for exactly its part's fields.
+    let stats = read_stats(
+        wire.protocol,
+        &held.part.legs,
+        &held.part.terms,
+        wire.stats,
+        wire.field_stats,
+    )
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_part",
+            "a scan's statistics are one `stats`, or at 7 and 8 a field each for exactly its \
+             part's fields",
+        )
+    })?;
     let filter = held.filters.as_ref().map(predicate).transpose()?;
     let engine = api.engine(tenant).await;
     engine
-        .scan_part(&held.part, &held.open, filter.as_ref(), &wire.stats.stats())
+        .scan_part(&held.part, &held.open, filter.as_ref(), &stats)
         .await
         .map(|hits| WireHits::of(&hits))
         .map_err(|e| part_error(&e))
@@ -1588,6 +1798,7 @@ impl Holder {
 )]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn the_fast_part_is_the_tree_part() {
@@ -1602,11 +1813,12 @@ mod tests {
             phase: "scan".to_owned(),
             id: "x".to_owned(),
             index: "docs".to_owned(),
-            stats: WireStats::of(&Stats {
+            stats: Some(WireStats::of(&Stats {
                 doc_count: 7,
                 total_tokens: 91,
                 df: [("alpha".to_owned(), 3)].into(),
-            }),
+            })),
+            field_stats: BTreeMap::new(),
         };
         let mut fast = 0;
         bodies.push(serde_json::to_vec(&scan).unwrap());
@@ -1712,7 +1924,11 @@ mod tests {
                 },
             )],
             shadow: 6,
-            terms: vec!["alpha".to_owned(), "zeta".to_owned()],
+            terms: [(
+                "text".to_owned(),
+                vec!["alpha".to_owned(), "zeta".to_owned()],
+            )]
+            .into(),
             sum: None,
         };
         let filters = Some(serde_json::json!(["k", "Eq", 1]));
@@ -1829,7 +2045,7 @@ mod tests {
             ],
             targets: Vec::new(),
             shadow: 0,
-            terms: Vec::new(),
+            terms: BTreeMap::new(),
             sum: None,
         };
         let wire = WirePart::of(&part, None);
@@ -1875,6 +2091,7 @@ mod tests {
             protocol: PROTOCOL,
             phase: None,
             terms: vec![],
+            field_terms: BTreeMap::new(),
             texts: std::collections::BTreeMap::new(),
             sum: None,
             index: "docs".to_owned(),
@@ -1893,9 +2110,10 @@ mod tests {
 
     /// A held part of `tenant`'s `index` with nothing opened.
     async fn held(tenant: u128, index: &str) -> Held {
-        let (open, _) = pstore_query::open_part(&pstore_blob::MemoryStore::new(), &[], &[], &[])
-            .await
-            .unwrap();
+        let (open, _) =
+            pstore_query::open_part(&pstore_blob::MemoryStore::new(), &[], &[], &BTreeMap::new())
+                .await
+                .unwrap();
         Held {
             tenant: TenantId(tenant),
             part: Part {
@@ -1905,7 +2123,7 @@ mod tests {
                 legs: vec![],
                 targets: vec![],
                 shadow: 0,
-                terms: vec![],
+                terms: BTreeMap::new(),
                 sum: None,
             },
             filters: None,
@@ -1960,13 +2178,13 @@ mod tests {
             legs: vec![],
             targets: vec![],
             shadow: 0,
-            terms: vec![],
+            terms: BTreeMap::new(),
             sum: None,
         };
         let Phased { stats, scan } = peers.phased(5, part());
         assert_eq!(stats.await.unwrap_err(), "no such server");
         assert_eq!(
-            scan(Stats::default()).await.unwrap_err(),
+            scan(FieldStats::new()).await.unwrap_err(),
             "no part was held"
         );
         // Each phase's failure counted once for the part.
