@@ -138,6 +138,7 @@ mod tests {
         match v {
             None => "-".to_owned(),
             Some(Value::Int(n)) => format!("n{n}"),
+            Some(Value::Uint(n)) => format!("n{n}"),
             Some(Value::Float(f)) if f.fract() == 0.0 && f.abs() < 1e15 => {
                 format!("n{}", *f as i64)
             }

@@ -716,9 +716,9 @@ impl Segment {
         // per block follows, and every block's zones are complete.
         if version == crate::VERSION_TYPED {
             let flag = d.u8()?;
-            if flag > 2 {
+            if flag > 3 {
                 return Err(FormatError::Corrupt(
-                    "a zone-map flag that is not 0, 1 or 2",
+                    "a zone-map flag that is not 0, 1, 2 or 3",
                 ));
             }
             if flag >= 1 {
@@ -732,7 +732,7 @@ impl Segment {
                 }
             }
             // M9h.3: the datetime table, per block, after the float tables.
-            if flag == 2 {
+            if flag >= 2 {
                 for b in &mut blocks {
                     let n = d.u32()? as usize;
                     for _ in 0..n {
@@ -744,6 +744,16 @@ impl Segment {
                             _ => return Err(FormatError::Corrupt("a string mark neither 0 nor 1")),
                         };
                         b.zones.datetimes.insert(k, (lo, hi, strings));
+                    }
+                }
+            }
+            // M172: the uint64 table, per block, after the datetime tables.
+            if flag == 3 {
+                for b in &mut blocks {
+                    let n = d.u32()? as usize;
+                    for _ in 0..n {
+                        let k = d.string()?;
+                        b.zones.uints.insert(k, (d.u64()?, d.u64()?));
                     }
                 }
             }
@@ -1314,6 +1324,37 @@ mod tests {
         }
     }
 
+    /// A flag-3 tail (M172): flag 2's tables, then one uint64 zone.
+    fn unsigned(trailing: &[u8]) -> Vec<u8> {
+        let mut e = Enc::default();
+        e.raw(&dated(0, &[])[..]);
+        // `dated` wrote flag 2 at a fixed offset: one block of 4 + 8 + 4 + 4 + 4 bytes.
+        e.0[24] = 3;
+        e.u32(1);
+        e.bytes(b"n");
+        e.u64(3);
+        e.u64(u64::MAX);
+        e.raw(trailing);
+        e.0
+    }
+
+    #[test]
+    fn an_unsigned_index_is_framed_exactly() {
+        let b = Segment::decode_index(&unsigned(&[]), crate::VERSION_TYPED).unwrap();
+        assert!(b[0].zones.complete);
+        assert_eq!(b[0].zones.floats.get("x"), Some(&(-1.5, 2.0)));
+        assert_eq!(b[0].zones.datetimes.get("t"), Some(&(-5, 7, false)));
+        assert_eq!(b[0].zones.uints.get("n"), Some(&(3, u64::MAX)));
+        // Flag 2 carries no uint64 table.
+        let d = Segment::decode_index(&dated(0, &[]), crate::VERSION_TYPED).unwrap();
+        assert!(d[0].zones.uints.is_empty());
+        let mut short = unsigned(&[]);
+        short.pop();
+        for bad in [unsigned(&[0]), short] {
+            assert!(Segment::decode_index(&bad, crate::VERSION_TYPED).is_err());
+        }
+    }
+
     #[test]
     fn a_typed_index_is_framed_exactly() {
         // Spec review, m3: a flag that is neither 0 nor 1, or bytes after the tables, are
@@ -1323,7 +1364,8 @@ mod tests {
         assert_eq!(zoned[0].zones.floats.get("x"), Some(&(-1.5, 2.0)));
         let free = Segment::decode_index(&index(0, &[]), crate::VERSION_TYPED).unwrap();
         assert!(!free[0].zones.complete && free[0].zones.floats.is_empty());
-        for bad in [index(3, &[]), index(1, &[0]), index(0, &[0])] {
+        // M172: 3 is now a flag (below), so 4 is the first unknown one.
+        for bad in [index(4, &[]), index(1, &[0]), index(0, &[0])] {
             assert!(matches!(
                 Segment::decode_index(&bad, crate::VERSION_TYPED),
                 Err(FormatError::Corrupt(_))

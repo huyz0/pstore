@@ -78,6 +78,15 @@ mod tests {
     )]
     use super::*;
 
+    /// M172: two uint64s order by value, and after every other type structurally.
+    #[test]
+    fn uint64s_order_by_value() {
+        use crate::Value;
+        assert!(Value::Uint(1) < Value::Uint(2));
+        assert_ne!(Value::Uint(1), Value::Uint(2));
+        assert!(Value::Bytes(vec![255]) < Value::Uint(0));
+    }
+
     #[test]
     fn a_uuid_reads_either_case_and_answers_lowercase() {
         let u = parse_uuid("123E4567-e89b-12d3-A456-426614174000").unwrap();

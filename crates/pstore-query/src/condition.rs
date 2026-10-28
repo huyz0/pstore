@@ -73,6 +73,11 @@ fn put_value(b: &mut Vec<u8>, v: &Value) {
             b.extend((x.len() as u32).to_le_bytes());
             b.extend(x);
         }
+        // M172.
+        Value::Uint(n) => {
+            b.push(8);
+            b.extend(n.to_le_bytes());
+        }
         Value::Array(items) => {
             b.push(5);
             b.extend((items.len() as u32).to_le_bytes());
@@ -248,6 +253,7 @@ impl Reader<'_> {
                 let n = self.u32()?;
                 Value::Bytes(self.take(n)?.to_vec())
             }
+            8 => Value::Uint(self.u64()?),
             5 if array => {
                 let n = self.u32()?;
                 let mut items = Vec::with_capacity(n.min(1024));
@@ -389,6 +395,8 @@ mod tests {
                 a(),
                 vec![Value::Bytes(vec![0, 255]), Value::Bytes(Vec::new())],
             ),
+            // M172: and a uint64.
+            Predicate::Cmp(a(), Op::Gt, Value::Uint(u64::MAX)),
             Predicate::Or(vec![]),
             Predicate::Not(Box::new(Predicate::And(vec![]))),
             Predicate::Tokens(a(), TokenOp::All, "x y".into(), None),
@@ -467,7 +475,7 @@ mod tests {
         for bad in [
             "0d".to_owned(),
             format!("0c{s1}05"),
-            format!("00{s1}0008"),
+            format!("00{s1}0009"),
             format!("00{s1}05"),
             format!("08{s1}03"),
             format!("07{s1}05"),
