@@ -216,15 +216,16 @@ contract fixtures, rather than assuming identical validation.
 | Model reranking | None | Optional service integration; J |
 | `VectorDist` computed output | Dense `$dist` only for scored dense leg | No arbitrary extra distance expression; F |
 | Computed BM25/ranking scores | No computed output map | F |
-| `Highlight` | One marked-up fragment string | Missing fragment objects, ranks, offsets, and array handling; E |
-| `HighlightConfigParams` | Marker strings and character limit only | No `rank_fragments_by`, `fragment_by`, `fragment_limit`, `include_offsets` |
-| `HighlightMatch` | `$highlight` string | No `text`, `fragment_range`, `match_ranges`, `array_index` structure |
+| `Highlight` | One marked-up fragment string, or, structured ([M159](../milestones/M159/VERIFIED.md)), a ranked list of fragments over a string or `[]string` | On `highlight`, not a computed attribute (no compute map; F) |
+| `HighlightConfigParams` | Markers, character limit, `fragment_by`, `fragment_limit` (0 to 16) and `include_offsets` ([M159](../milestones/M159/VERIFIED.md)) | `rank_fragments_by` refused (no published shape); defaults are pstore's (`word`, 1); a sentence ends at `. ` and `。`, not by Unicode segmentation |
+| `HighlightMatch` | `$highlights`: `text`, `fragment_range`, `match_ranges`, `array_index` ([M159](../milestones/M159/VERIFIED.md)) | Ranges into the value, not the marked text; `$highlight` is absent when structured |
 | `ForEachUnique` grouping | None | F |
 | `Count` / `Sum` aggregates | Attribute count and sum | Unary Count missing; distinct/min/max are vendor roadmap, not a current gap |
 
 Highlight offset units in the spec are UTF-8, UTF-16, and codepoints; fragment modes
-are none, sentence, paragraph, and word. pstore's current highlight limits Unicode
-characters, not these offset contracts. MMR chooses diversity by result similarity;
+are none, sentence, paragraph, and word. pstore accepts all of them from
+[M159](../milestones/M159/VERIFIED.md); its `max_chars` still counts Unicode scalar
+values. MMR chooses diversity by result similarity;
 it does not enforce the hard group quota represented by `limit.per`; `limit_per` does
 ([M146](../milestones/M146/VERIFIED.md)), exactly over a window of at most 1,000.
 

@@ -491,6 +491,27 @@ pub struct ResultRow {
     /// string (M63). The query's terms are wrapped in `pre` and `post`, and nothing is escaped.
     #[serde(rename = "$highlight", skip_serializing_if = "Option::is_none")]
     pub highlight: Option<String>,
+    /// The highlighted fragments, when the query's `highlight` is structured (M159): it names
+    /// `fragment_by`, `fragment_limit` or `include_offsets`. Then `$highlight` is absent.
+    #[serde(rename = "$highlights", skip_serializing_if = "Option::is_none")]
+    pub highlights: Option<Vec<HighlightMatch>>,
+}
+
+/// One fragment of a structured highlight (M159). Ranges are `[start, end)` into the
+/// attribute's value (its element, for an array), never into `text`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HighlightMatch {
+    /// The fragment, its marked tokens wrapped in `pre` and `post`; no ellipsis.
+    pub text: String,
+    /// Where the fragment sits, under `include_offsets`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_range: Option<[usize; 2]>,
+    /// Where its marks sit, under `include_offsets`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_ranges: Option<Vec<[usize; 2]>>,
+    /// The element it came from, when the attribute is an array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub array_index: Option<usize>,
 }
 
 /// What the answer cost and how fresh it is.

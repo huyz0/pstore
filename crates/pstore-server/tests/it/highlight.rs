@@ -465,3 +465,350 @@ fn the_docs_say_marks_are_not_escaped() {
     let section = &section[..section.find("\n## ").unwrap_or(section.len())];
     assert!(section.contains("not escaped"), "{section}");
 }
+
+// ---- M159: structured highlights. Every expected value is counted by hand. ----
+
+/// The one result's `$highlights`, from a fresh index holding `docs`, queried by a dense leg
+/// (so the row is found whatever the text) and a text leg `q`.
+async fn structured_of(docs: Value, q: &str, h: Value) -> Value {
+    let a = api();
+    let (s, b) = send(
+        &a,
+        "PUT",
+        "/v1/indexes/docs/documents",
+        Some(&json!({"durability": "durable", "documents": docs})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let b = query(
+        &a,
+        &json!({"vector": [1.0, 0.5], "text": q, "top_k": 5, "highlight": h}),
+    )
+    .await;
+    let r = &b["results"][0];
+    assert!(
+        r.get("$highlight").is_none(),
+        "no $highlight beside $highlights: {b}"
+    );
+    r.get("$highlights")
+        .unwrap_or_else(|| panic!("no $highlights: {b}"))
+        .clone()
+}
+
+/// [`structured_of`] over one row whose `text` is `text`.
+async fn structured(text: &str, q: &str, h: Value) -> Value {
+    structured_of(
+        json!([{"id": "r", "vector": [1.0, 0.5], "text": text}]),
+        q,
+        h,
+    )
+    .await
+}
+
+/// `{"text": t}` for each of `ts`: matches with no offsets and no array index.
+fn texts(ts: &[&str]) -> Value {
+    Value::Array(ts.iter().map(|t| json!({"text": t})).collect())
+}
+
+#[tokio::test]
+async fn structured_word_fragments_are_ranked_and_disjoint() {
+    // Tokens 0..=14, one character each, one space apart: with max_chars 5 a window is three
+    // tokens. Scores by starting token: 0:1 1:0 2:1 3:2 4:2 5:1 6:0 7:0 8:1 9:2 10:3 11:2
+    // 12:1 13:0 14:0. Ranked: 10, then 3 (before 4, 9, 11, which overlap a taken window),
+    // then 0. The best window comes after two weaker scored ones; the list is in rank order.
+    let v = "q a b c q q d e f g q q q h i";
+    let h = |limit: Value| json!({"max_chars": 5, "fragment_limit": limit});
+    assert_eq!(
+        structured(v, "q", h(json!(3))).await,
+        texts(&[
+            "<em>q</em> <em>q</em> <em>q</em>",
+            "c <em>q</em> <em>q</em>",
+            "<em>q</em> a b"
+        ])
+    );
+    // The default limit is 1, and `fragment_by: "word"` alone is structured.
+    assert_eq!(
+        structured(v, "q", json!({"max_chars": 5, "fragment_by": "word"})).await,
+        texts(&["<em>q</em> <em>q</em> <em>q</em>"])
+    );
+    // Limit 0: an empty list.
+    assert_eq!(structured(v, "q", h(json!(0))).await, json!([]));
+    // One scored window among disjoint ones: one match, though the limit is 3. Windows 0, 1
+    // and 2 each hold the one `q`; 0 is the earliest and the others overlap it.
+    assert_eq!(
+        structured("a b q c d e f g", "q", h(json!(3))).await,
+        texts(&["a b <em>q</em>"])
+    );
+    // Nothing marked: the first window alone.
+    assert_eq!(
+        structured("a b c d e f g", "q", h(json!(3))).await,
+        texts(&["a b c"])
+    );
+}
+
+#[tokio::test]
+async fn structured_sentences_and_paragraphs_are_units() {
+    let all = |by: &str| json!({"fragment_by": by, "fragment_limit": 16});
+    // Units "x q." "q y!" "z q?" "w。" "q q": the last scores 2, three score 1 in text order,
+    // and `w。` scores nothing. `。` splits with no whitespace after it.
+    assert_eq!(
+        structured("x q. q y! z q? w。q q", "q", all("sentence")).await,
+        texts(&[
+            "<em>q</em> <em>q</em>",
+            "x <em>q</em>.",
+            "<em>q</em> y!",
+            "z <em>q</em>?"
+        ])
+    );
+    // `3.5`: a terminator with no whitespace after it does not split.
+    assert_eq!(
+        structured("a 3.5 q. b", "q", all("sentence")).await,
+        texts(&["a 3.5 <em>q</em>."])
+    );
+    // A line break ends a sentence.
+    assert_eq!(
+        structured("q a\nb q", "q", all("sentence")).await,
+        texts(&["<em>q</em> a", "b <em>q</em>"])
+    );
+    // Paragraphs keep `. ` and split at `\n` and `\r\n`; every unit is trimmed.
+    assert_eq!(
+        structured("q. q\r\nq  \n  b", "q", all("paragraph")).await,
+        texts(&["<em>q</em>. <em>q</em>", "<em>q</em>"])
+    );
+    // A whole value is trimmed too.
+    assert_eq!(
+        structured(" q a\n", "q", all("word")).await,
+        texts(&["<em>q</em> a"])
+    );
+    // A unit longer than max_chars gives its best window, which ends at a token's end.
+    assert_eq!(
+        structured(
+            "a b c q q. d",
+            "q",
+            json!({"fragment_by": "sentence", "fragment_limit": 16, "max_chars": 5})
+        )
+        .await,
+        texts(&["c <em>q</em> <em>q</em>"])
+    );
+    // A long unit with no token: its first max_chars characters.
+    assert_eq!(
+        structured(
+            "--------",
+            "q",
+            json!({"fragment_by": "word", "max_chars": 5})
+        )
+        .await,
+        texts(&["-----"])
+    );
+    // `none`: the first max_chars characters, though the marks lie beyond them; whole when
+    // they fit; a token the cut splits is marked over what is kept.
+    let none = |n: u64| json!({"fragment_by": "none", "max_chars": n});
+    assert_eq!(
+        structured("a b c d q", "q", none(5)).await,
+        texts(&["a b c"])
+    );
+    assert_eq!(
+        structured("a b c d q", "q", none(9)).await,
+        texts(&["a b c d <em>q</em>"])
+    );
+    assert_eq!(
+        structured("a qqq b", "qqq", none(4)).await,
+        texts(&["a <em>qq</em>"])
+    );
+}
+
+#[tokio::test]
+async fn structured_offsets_count_in_the_asked_unit() {
+    // 😀 is 4 bytes, 2 UTF-16 units, 1 scalar; the accent U+0301 is 2, 1, 1; 中 is 3, 1, 1.
+    // Bytes:  😀 0..4, `cafe` 5..9, accent 9..11, 中 12..15, q 16..17.
+    // UTF-16: 😀 0..2, `cafe` 3..7, accent 7..8,  中 9..10,  q 11..12.
+    // Scalars: 😀 0..1, `cafe` 2..6, accent 6..7, 中 8..9,   q 10..11.
+    // The marked span holds the accent; the ranges are into the value, not into `text`.
+    let v = "😀 cafe\u{301} 中 q";
+    let text = "😀 <em>cafe\u{301}</em> 中 <em>q</em>";
+    for (unit, fragment, marks) in [
+        ("utf-8", json!([0, 17]), json!([[5, 11], [16, 17]])),
+        ("utf-16", json!([0, 12]), json!([[3, 8], [11, 12]])),
+        ("codepoints", json!([0, 11]), json!([[2, 7], [10, 11]])),
+    ] {
+        assert_eq!(
+            structured(v, "cafe q", json!({"include_offsets": unit})).await,
+            json!([{"text": text, "fragment_range": fragment, "match_ranges": marks}]),
+            "{unit}"
+        );
+    }
+    // No offsets without include_offsets.
+    assert_eq!(
+        structured(v, "cafe q", json!({"fragment_limit": 1})).await,
+        texts(&[text])
+    );
+    // A trimmed unit's range starts after the whitespace it lost.
+    assert_eq!(
+        structured("\n q", "q", json!({"include_offsets": "utf-8"})).await,
+        json!([{"text": "<em>q</em>", "fragment_range": [2, 3], "match_ranges": [[2, 3]]}])
+    );
+    // A token longer than max_chars is cut, and its range ends at the cut. No ellipsis.
+    assert_eq!(
+        structured(
+            "a qqqqqq",
+            "qqqqqq",
+            json!({"include_offsets": "utf-8", "max_chars": 4})
+        )
+        .await,
+        json!([{"text": "<em>qqqq</em>", "fragment_range": [2, 6], "match_ranges": [[2, 6]]}])
+    );
+}
+
+#[tokio::test]
+async fn structured_highlights_read_string_arrays() {
+    // Element 1 is a number, skipped. Element 2 scores 2 and ranks first; element 3 scores 1;
+    // element 0 scores nothing. Offsets restart in each element.
+    let docs = json!([{"id": "r", "vector": [1.0, 0.5], "text": "z",
+                       "attributes": {"tags": ["a b", 7, "q q", "q x"]}}]);
+    let h = json!({"attr": "tags", "fragment_limit": 16, "include_offsets": "codepoints"});
+    assert_eq!(
+        structured_of(docs, "q", h).await,
+        json!([
+            {"text": "<em>q</em> <em>q</em>", "array_index": 2,
+             "fragment_range": [0, 3], "match_ranges": [[0, 1], [2, 3]]},
+            {"text": "<em>q</em> x", "array_index": 3,
+             "fragment_range": [0, 3], "match_ranges": [[0, 1]]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn structured_highlights_replace_the_string() {
+    let a = api();
+    let (s, b) = send(
+        &a,
+        "PUT",
+        "/v1/indexes/docs/documents",
+        Some(&json!({"durability": "durable", "documents": [
+            {"id": "r", "vector": [1.0, 0.5], "text": "run far", "attributes": {"label": 7}}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    // Each of the three keys alone makes it structured.
+    for h in [
+        json!({"fragment_by": "word"}),
+        json!({"fragment_limit": 1}),
+        json!({"include_offsets": "utf-8"}),
+    ] {
+        let b = query(&a, &json!({"text": "run", "top_k": 5, "highlight": h})).await;
+        let r = &b["results"][0];
+        assert!(r.get("$highlight").is_none(), "{h}: {b}");
+        assert_eq!(r["$highlights"][0]["text"], "<em>run</em> far", "{h}: {b}");
+    }
+    // Unstructured: M63's string, and no list.
+    let b = query(&a, &json!({"text": "run", "top_k": 5, "highlight": {}})).await;
+    assert_eq!(b["results"][0]["$highlight"], "<em>run</em> far", "{b}");
+    assert!(b["results"][0].get("$highlights").is_none(), "{b}");
+    // A missing or numeric attribute gives neither.
+    for attr in ["label", "nothing"] {
+        let h = json!({"attr": attr, "fragment_limit": 2});
+        let b = query(&a, &json!({"text": "run", "top_k": 5, "highlight": h})).await;
+        let r = &b["results"][0];
+        assert!(
+            r.get("$highlight").is_none() && r.get("$highlights").is_none(),
+            "{b}"
+        );
+    }
+    // Per sub-query in a multi-query.
+    let multi = json!({"queries": [
+        {"text": "run", "top_k": 5, "highlight": {"fragment_limit": 1}},
+        {"text": "run", "top_k": 5, "highlight": {}}]});
+    let b = query(&a, &multi).await;
+    let subs = b["results"].as_array().unwrap();
+    assert_eq!(
+        subs[0][0]["$highlights"],
+        texts(&["<em>run</em> far"]),
+        "{b}"
+    );
+    assert!(subs[0][0].get("$highlight").is_none(), "{b}");
+    assert_eq!(subs[1][0]["$highlight"], "<em>run</em> far", "{b}");
+    assert!(subs[1][0].get("$highlights").is_none(), "{b}");
+}
+
+#[tokio::test]
+async fn structured_highlights_are_refused_at_the_door() {
+    let a = api();
+    put(&a, &[("r", "run")], None).await;
+    let q = |h: Value| json!({"text": "run", "top_k": 5, "highlight": h});
+    for (what, h) in [
+        ("an unknown fragment_by", json!({"fragment_by": "line"})),
+        ("a null fragment_by", json!({"fragment_by": null})),
+        (
+            "an unknown include_offsets",
+            json!({"include_offsets": "utf-32"}),
+        ),
+        ("a null include_offsets", json!({"include_offsets": null})),
+        ("fragment_limit 17", json!({"fragment_limit": 17})),
+        ("fragment_limit -1", json!({"fragment_limit": -1})),
+        (
+            "a fractional fragment_limit",
+            json!({"fragment_limit": 1.0}),
+        ),
+        ("a null fragment_limit", json!({"fragment_limit": null})),
+        ("rank_fragments_by", json!({"rank_fragments_by": "score"})),
+    ] {
+        let (s, b) = send(&a, "POST", "/v1/indexes/docs/query", Some(&q(h))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {b}");
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("highlight"),
+            "{what}: the message names highlight: {b}"
+        );
+    }
+    for h in [
+        json!({"fragment_limit": 0}),
+        json!({"fragment_limit": 16}),
+        json!({"fragment_by": "none"}),
+        json!({"fragment_by": "sentence"}),
+        json!({"fragment_by": "paragraph"}),
+        json!({"fragment_by": "word"}),
+        json!({"include_offsets": "utf-8"}),
+        json!({"include_offsets": "utf-16"}),
+        json!({"include_offsets": "codepoints"}),
+    ] {
+        let r = query(&a, &q(h.clone())).await;
+        assert!(r["results"][0]["$highlights"].is_array(), "{h}: {r}");
+    }
+}
+
+#[tokio::test]
+async fn a_structured_highlight_costs_nothing() {
+    use pstore_testkit::depth::DepthCounting;
+    let store = DepthCounting::new(MemoryStore::new());
+    let cold = || Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    let writer = cold();
+    for k in 0..4 {
+        let rows: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("d{k}{i}"), format!("common word{i}. run tail{k}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        put(&writer, &refs, None).await;
+        fold(&writer).await;
+    }
+    let mut seen = Vec::new();
+    for body in [
+        json!({"text": "common run", "top_k": 20}),
+        json!({"text": "common run", "top_k": 20, "highlight": {
+            "fragment_by": "sentence", "fragment_limit": 16, "include_offsets": "utf-16"}}),
+    ] {
+        let api = cold();
+        store.reset();
+        let b = query(&api, &body).await;
+        assert_eq!(b["results"].as_array().unwrap().len(), 20);
+        let cost = &b["meta"]["cost"];
+        seen.push((
+            store.depth(),
+            cost["blob_reads"].clone(),
+            cost["bytes_read"].clone(),
+        ));
+    }
+    assert!(seen[0].0 > 0, "{seen:?}");
+    assert_eq!(seen[0], seen[1], "plain, then structured: {seen:?}");
+}

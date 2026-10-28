@@ -293,6 +293,20 @@ wrapped in `pre` and `post`, and `…` where it was cut.
   attribute whatever `include_attributes` and `exclude_attributes` say.
 - Phrase and proximity are not considered: each term is marked wherever it appears.
 
+**Structured highlights** ([M159](milestones/M159/SPEC.md)). Naming `fragment_by` (`word`,
+the default, `sentence`, `paragraph` or `none`), `fragment_limit` (0 to 16, default 1; 0 gives an empty list) or
+`include_offsets` (`utf-8`, `utf-16` or `codepoints`) makes the highlight structured: each
+result gets `$highlights`, a list of `{text, fragment_range, match_ranges, array_index}`, and
+**no `$highlight`**. A client reading `$highlight` gets nothing once it names one of the three.
+
+- Fragments are ranked by how many marked tokens they hold, the earliest first among equals,
+  and carry no ellipsis. A value with no mark gives its first fragment alone.
+- Ranges are `[start, end)` into the attribute's value (the element, for an array), never into
+  `text`, so the marks do not shift them. A match range covers what `pre` and `post` wrap.
+- A `[]string` attribute is highlighted element by element, with `array_index`.
+- Sentences end after `.`, `!` or `?` followed by whitespace, after `。`, `！` or `？`, and at
+  any whitespace holding a line feed: an abbreviation such as `e.g. this` splits.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

@@ -3147,6 +3147,7 @@ async fn run<E: BlobStore>(
                         score: None,
                         dist: None,
                         highlight: None,
+                        highlights: None,
                     })
                     .collect(),
                 epoch: got.epoch.0,
@@ -3295,12 +3296,17 @@ async fn run<E: BlobStore>(
             .map(|(id, score, attrs, dist)| ResultRow {
                 highlight: marks
                     .as_ref()
+                    .filter(|(h, _)| h.structure.is_none())
                     .and_then(|(h, terms)| match attrs.get(&h.attr) {
                         Some(pstore_format::Value::Str(text)) => {
                             Some(h.render(text, &answer.fts.analyzer, terms))
                         }
                         _ => None,
                     }),
+                highlights: marks.as_ref().and_then(|(h, terms)| {
+                    h.fragments(attrs.get(&h.attr)?, &answer.fts.analyzer, terms)
+                        .map(|f| f.into_iter().map(types::HighlightMatch::from).collect())
+                }),
                 attributes: selected(req, &attrs),
                 id,
                 score: Some(score),
