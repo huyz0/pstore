@@ -692,7 +692,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
                 "/v1/indexes/{index}",
-                Write.on(axum::routing::delete(delete_index::<S>)),
+                Write.on(axum::routing::delete(delete_index::<S>).put(create_index::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/documents",
@@ -1291,6 +1291,9 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            EngineError::IndexExists(_) => {
+                Self::new(StatusCode::CONFLICT, "index_exists", e.to_string())
+            }
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
                 use pstore_engine::ReplicaRefusal as R;
@@ -3366,7 +3369,8 @@ async fn run<E: BlobStore>(
         }
     };
     let token = checked(answer.epoch.0, &answer.watermarks)?;
-    if answer.segments.is_empty() && answer.unfolded.is_empty() {
+    // M147: a HEAD that names the index with no segment is an empty index, not a missing one.
+    if !answer.named && answer.unfolded.is_empty() {
         return Err(missing());
     }
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
@@ -3891,6 +3895,53 @@ async fn delete_index<S: BlobStore + 'static>(
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// `PUT /v1/indexes/{index}` (M147): creates the index with no rows, its width and metric
+/// declared. One HEAD read and one HEAD CAS.
+async fn create_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<FoldResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let req: CreateRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed create request: {e}")))?;
+    let most = api.ingress.limits().array_elements();
+    let dims = u32::try_from(req.dims)
+        .ok()
+        .filter(|d| *d >= 1 && (*d as usize) <= most)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "dims must be from 1 to {most}, the longest array this server admits, not {}",
+                req.dims
+            ))
+        })?;
+    let metric = match req.distance_metric.as_deref() {
+        None => pstore_engine::Metric::DotProduct,
+        Some(name) => pstore_engine::Metric::parse(name).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "distance_metric {name:?} is not one of cosine_distance, euclidean_squared, \
+                 dot_product"
+            ))
+        })?,
+    };
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let epoch = engine.create_index(&index, dims, metric).await?;
+    Ok(axum::Json(FoldResponse {
+        epoch: epoch.0,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRequest {
+    dims: u64,
+    distance_metric: Option<String>,
 }
 
 /// A write body, with the durability level refused by name rather than by serde's message.

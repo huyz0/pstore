@@ -22,6 +22,7 @@ POST   /v1/indexes/{id}/delete           delete by id or by filter
 POST   /v1/indexes/{id}/query            search
 POST   /v1/indexes/{id}/multi_query      several queries, one round trip
 GET    /v1/indexes/{id}                  metadata, schema, stats
+PUT    /v1/indexes/{id}                  create empty: dims and metric (M147)
 PATCH  /v1/indexes/{id}/schema           schema evolution
 DELETE /v1/indexes/{id}                  tombstone + async reap
 POST   /v1/indexes/{id}/branch           copy-on-write fork  (1 PUT internally)
