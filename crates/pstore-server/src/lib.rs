@@ -35,6 +35,8 @@ mod diversify;
 mod external;
 mod facets;
 mod highlight;
+mod ingress;
+pub use ingress::{IngressCounts, LimitsError, RequestLimits, RequestLimitsBuilder};
 mod limit_per;
 mod peer_http;
 pub use peer_http::PeerTransport;
@@ -124,6 +126,8 @@ type Tenant<S> = Engine<Caching<TenantView<S>>>;
 #[derive(Debug)]
 pub struct Api<S> {
     auth: Auth,
+    /// Public request admission (M128): one per `Api`, shared by every router it builds.
+    ingress: Arc<ingress::Ingress>,
     store: Accounted<S>,
     lane: LaneId,
     /// The read cache every tenant's view shares, or `None` for an uncached server (M20).
@@ -304,7 +308,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// is anything but `Supported`. **Zero requests**: it reads the profile the store already
     /// carries and probes nothing.
     pub fn new(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, Auth::closed())
+        Self::build(store, lane, None, Auth::closed(), RequestLimits::default())
     }
 
     /// [`Api::new`], reading every tenant's segments through `cache` (M20).
@@ -319,7 +323,13 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Arc<CacheCore>,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), Auth::closed())
+        Self::build(
+            store,
+            lane,
+            Some(cache),
+            Auth::closed(),
+            RequestLimits::default(),
+        )
     }
 
     /// Builds an HTTP server with an explicit authentication policy.
@@ -331,7 +341,7 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         auth: Auth,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, auth)
+        Self::build(store, lane, None, auth, RequestLimits::default())
     }
 
     /// [`Api::with_auth`] with a shared read cache.
@@ -344,7 +354,7 @@ impl<S: BlobStore + 'static> Api<S> {
         cache: Arc<CacheCore>,
         auth: Auth,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), auth)
+        Self::build(store, lane, Some(cache), auth, RequestLimits::default())
     }
 
     /// Explicitly anonymous HTTP for private embeddings and test fixtures.
@@ -352,7 +362,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// # Errors
     /// As [`Api::new`].
     pub fn unsecured(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, Auth::unsecured())
+        Self::build(
+            store,
+            lane,
+            None,
+            Auth::unsecured(),
+            RequestLimits::default(),
+        )
     }
 
     /// [`Api::unsecured`] with a shared read cache.
@@ -364,7 +380,39 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Arc<CacheCore>,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), Auth::unsecured())
+        Self::build(
+            store,
+            lane,
+            Some(cache),
+            Auth::unsecured(),
+            RequestLimits::default(),
+        )
+    }
+
+    /// An HTTP server with an explicit authentication policy, an optional read cache, and
+    /// public request limits other than the defaults (M128).
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_limits(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Option<Arc<CacheCore>>,
+        auth: Auth,
+        limits: RequestLimits,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, cache, auth, limits)
+    }
+
+    /// The public request limits every router of this server admits under (M128).
+    pub fn request_limits(&self) -> RequestLimits {
+        *self.ingress.limits()
+    }
+
+    /// What public admission holds right now (M128's tests and measurements).
+    #[doc(hidden)]
+    pub fn ingress_counts(&self) -> IngressCounts {
+        self.ingress.counts()
     }
 
     fn build(
@@ -372,6 +420,7 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Option<Arc<CacheCore>>,
         auth: Auth,
+        limits: RequestLimits,
     ) -> Result<Arc<Self>, StartupError> {
         // ⚠️ `Accounted` is not itself a `BlobStore` — a tenant view is — so the profile is
         // read through one. It is the same underlying backend's, and reading it costs nothing.
@@ -386,6 +435,7 @@ impl<S: BlobStore + 'static> Api<S> {
         }
         Ok(Arc::new(Self {
             auth,
+            ingress: Arc::new(ingress::Ingress::new(limits)),
             store,
             lane,
             cache,
@@ -636,7 +686,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.
     pub fn router(self: Arc<Self>) -> Router {
         use auth::Scope::{Admin, List, Read, Write};
-        auth::ScopedRouter::new()
+        auth::ScopedRouter::new(Arc::clone(&self.ingress))
             .route("/v1/indexes", List.on(get(list_indexes::<S>)))
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
@@ -702,6 +752,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/admin/duties", Admin.on(get(duties)))
             .route("/metrics", Admin.on(get(metrics::<S>)))
             .finish()
+            // M128: the ceiling axum's own extractors held implicitly, now the typed limit.
+            .layer(axum::extract::DefaultBodyLimit::max(
+                self.ingress.limits().body_bytes(),
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 self.auth.clone(),
                 auth::authenticate,
@@ -5707,6 +5761,26 @@ mod tests {
         // API test can tell a dropped `exact` from a forwarded one.
         assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
         assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
+    }
+
+    /// Read by the binary's startup log and by M128's tests. A unit test, so a mutant that
+    /// forgets the configured limits fails in the first test binary cargo runs, rather than
+    /// in the integration binary a CI mutation sweep can time out waiting for.
+    #[test]
+    fn an_api_reports_the_limits_it_was_given() {
+        let limits = RequestLimits::builder()
+            .active_requests(32)
+            .build()
+            .unwrap();
+        let api = Api::with_limits(
+            Accounted::new(pstore_blob::MemoryStore::new()),
+            LaneId(1),
+            None,
+            Auth::unsecured(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(api.request_limits(), limits);
     }
 
     /// M170: the door's width checks, here so that a mutation breaking every write fails

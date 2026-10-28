@@ -374,26 +374,36 @@ async fn require_scope(State(scope): State<Scope>, req: Request, next: Next) -> 
 }
 
 /// A route must carry authority before it can enter the serving router.
-pub(crate) struct ScopedRoute<S>(MethodRouter<S>);
+pub(crate) struct ScopedRoute<S>(MethodRouter<S>, Scope);
 
 impl Scope {
     pub(crate) fn on<S: Clone + Send + Sync + 'static>(
         self,
         route: MethodRouter<S>,
     ) -> ScopedRoute<S> {
-        ScopedRoute(route.route_layer(axum::middleware::from_fn_with_state(self, require_scope)))
+        ScopedRoute(route, self)
     }
 }
 
-pub(crate) struct ScopedRouter<S>(axum::Router<S>);
+/// Routes that are authorized, then admitted (M128), before their handler runs.
+pub(crate) struct ScopedRouter<S>(axum::Router<S>, Arc<crate::ingress::Ingress>);
 
 impl<S: Clone + Send + Sync + 'static> ScopedRouter<S> {
-    pub(crate) fn new() -> Self {
-        Self(axum::Router::new())
+    pub(crate) fn new(ingress: Arc<crate::ingress::Ingress>) -> Self {
+        Self(axum::Router::new(), ingress)
     }
 
+    /// ⚠️ **The scope layer is outermost**, so a request is refused for its authority before
+    /// it holds any admission capacity or has its body polled.
     pub(crate) fn route(self, path: &str, route: ScopedRoute<S>) -> Self {
-        Self(self.0.route(path, route.0))
+        let ScopedRoute(method, scope) = route;
+        let method = method
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self.1),
+                crate::ingress::admit,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(scope, require_scope));
+        Self(self.0.route(path, method), self.1)
     }
 
     pub(crate) fn finish(self) -> axum::Router<S> {

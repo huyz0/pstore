@@ -21,6 +21,14 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // M128: before any backend, cache or listener exists.
+    let limits = match pstore_server::RequestLimits::from_vars(|k| std::env::var(k).ok()) {
+        Ok(limits) => limits,
+        Err(e) => {
+            eprintln!("pstore-server: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let config = match Config::from_vars(|k| std::env::var(k).ok()) {
         Ok(c) => c,
         Err(e) => {
@@ -43,9 +51,18 @@ async fn main() -> std::process::ExitCode {
         None => auth,
     };
     match config.backend {
-        Backend::Memory => run(Accounted::new(MemoryStore::new()), &config, auth, peer).await,
+        Backend::Memory => {
+            run(
+                Accounted::new(MemoryStore::new()),
+                &config,
+                auth,
+                limits,
+                peer,
+            )
+            .await
+        }
         Backend::S3 => match s3(&config) {
-            Ok(store) => run(Accounted::new(store), &config, auth, peer).await,
+            Ok(store) => run(Accounted::new(store), &config, auth, limits, peer).await,
             Err(e) => {
                 eprintln!("pstore-server: cannot open {}: {e}", config.endpoint);
                 std::process::ExitCode::FAILURE
@@ -56,7 +73,7 @@ async fn main() -> std::process::ExitCode {
             .as_ref()
             .map(|a| azure_store(a, config.profile))
         {
-            Some(Ok(store)) => run(Accounted::new(store), &config, auth, peer).await,
+            Some(Ok(store)) => run(Accounted::new(store), &config, auth, limits, peer).await,
             Some(Err(e)) => {
                 eprintln!("pstore-server: cannot open the Azure container: {e}");
                 std::process::ExitCode::FAILURE
@@ -137,6 +154,7 @@ async fn run<S: BlobStore + 'static>(
     store: Accounted<S>,
     config: &Config,
     auth: pstore_server::Auth,
+    limits: pstore_server::RequestLimits,
     peer: Option<pstore_server::PeerListenerConfig>,
 ) -> std::process::ExitCode {
     let cache = match open_cache(&store, config).await {
@@ -146,11 +164,7 @@ async fn run<S: BlobStore + 'static>(
             return std::process::ExitCode::FAILURE;
         }
     };
-    let built = match &cache {
-        Some(c) => Api::with_cache_and_auth(store, config.lane, Arc::clone(c), auth),
-        None => Api::with_auth(store, config.lane, auth),
-    };
-    let api = match built {
+    let api = match Api::with_limits(store, config.lane, cache.clone(), auth, limits) {
         Ok(a) => a,
         Err(e) => {
             // ⚠️ The refusal criterion 3 rests on. An operator who has not run the

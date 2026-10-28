@@ -405,17 +405,25 @@ async fn each_of_many_concurrent_durable_writes_is_required_of_another_process()
         tokio::spawn(async move {
             let body = json!({"durability": "durable",
                 "documents": [{"id": format!("d{i:02}"), "vector": [1.0, 0.5]}]});
-            let res = a
-                .router()
-                .oneshot(request(
-                    TENANT,
-                    "PUT",
-                    "/v1/indexes/docs/documents",
-                    &body,
-                    None,
-                ))
-                .await
-                .unwrap();
+            // ⚠️ M128: twelve writes of one tenant exceed one server's eight active; a
+            // `429` is refused before dispatch, so it is retried and every write still races.
+            let res = loop {
+                let res = Arc::clone(&a)
+                    .router()
+                    .oneshot(request(
+                        TENANT,
+                        "PUT",
+                        "/v1/indexes/docs/documents",
+                        &body,
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                if res.status() != StatusCode::TOO_MANY_REQUESTS {
+                    break res;
+                }
+                tokio::task::yield_now().await;
+            };
             assert_eq!(res.status(), StatusCode::OK);
             (
                 format!("d{i:02}"),
