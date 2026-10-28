@@ -60,3 +60,12 @@ claimed for them.
    stays a float. After review, `int_vs_float` lost its range checks, which the `i128`
    cast's saturation makes redundant; CI's coverage and mutants runs on the PR are the
    evidence for the code as pushed.
+   CI's `scripts/mutants.sh` on the first push: 96 mutants, 35 caught, 55 unviable, 1
+   missed and 5 timeouts. Each now fails a unit test in its own crate, so the suite stops
+   early: the `Uint` arm of `Value`'s order (`uint64s_order_by_value`); `normalized`'s lower
+   bound as `==` or `<=` (`keys_order_and_unify_as_stated`, with `-2^63` and `-1e19`
+   added); an `eq` term's number arm deleted (`an_eq_terms_number_is_read_by_its_range`).
+   `literal`'s guard, missed as `true` because an int literal and the same uint64 compare
+   alike, is gone: `literal` is now `scalar` with a `u64` fallback on its refusal
+   (`a_literal_beyond_i64_is_unsigned_and_the_rest_are_read_as_written`). Each of these
+   mutations was applied by hand and failed its test; CI's run on the fix is the evidence.

@@ -4643,10 +4643,9 @@ fn scalar(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
 /// A filter's literal (M172): a write's [`scalar`], or an integer in `(i64::MAX, u64::MAX]`
 /// as the unsigned number it is, which compares with every number exactly.
 fn literal(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
-    match x.as_u64() {
-        Some(u) if x.as_i64().is_none() => Ok(pstore_format::Value::Uint(u)),
-        _ => scalar(x),
-    }
+    // `scalar` refuses only such an integer and what no type holds, and only the integer
+    // has a `u64`, so the refusal stands for everything else.
+    scalar(x).or_else(|why| x.as_u64().map(pstore_format::Value::Uint).ok_or(why))
 }
 
 /// One attribute as JSON.
@@ -5614,6 +5613,21 @@ pub async fn store_identity<S: BlobStore>(
 )]
 mod tests {
     use super::*;
+
+    /// M172: a filter literal above `i64` is a uint64, one within it an int, and what no type
+    /// holds is refused as before.
+    #[test]
+    fn a_literal_beyond_i64_is_unsigned_and_the_rest_are_read_as_written() {
+        use pstore_format::Value;
+        assert_eq!(
+            literal(&serde_json::json!(u64::MAX)),
+            Ok(Value::Uint(u64::MAX))
+        );
+        assert_eq!(literal(&serde_json::json!(5)), Ok(Value::Int(5)));
+        assert_eq!(literal(&serde_json::json!(-5)), Ok(Value::Int(-5)));
+        assert!(literal(&serde_json::json!({"k": 1})).is_err());
+        assert!(scalar(&serde_json::json!(u64::MAX)).is_err());
+    }
 
     /// Bodies the fast parse must answer exactly as the tree does (M120): valid ones of every
     /// shape, and each way a typed parse and a tree disagree.

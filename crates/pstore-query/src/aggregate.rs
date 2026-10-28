@@ -575,6 +575,16 @@ mod tests {
             Key::of(Some(&Value::Float(past))).value(),
             Some(Value::Float(past))
         );
+        // -2^63 is inside i64 and reported as the integer; below it, a float stays one.
+        let low = -(2f64.powi(63));
+        assert_eq!(
+            Key::of(Some(&Value::Float(low))).value(),
+            Some(Value::Int(i64::MIN))
+        );
+        assert_eq!(
+            Key::of(Some(&Value::Float(-1e19))).value(),
+            Some(Value::Float(-1e19))
+        );
         // M172: a uint64 within i64 reports as the int it equals; above, as itself.
         assert_eq!(Key::of(Some(&Value::Uint(5))).value(), Some(Value::Int(5)));
         assert_eq!(

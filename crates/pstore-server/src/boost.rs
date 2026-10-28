@@ -333,3 +333,33 @@ impl Boost {
         total
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    /// M172: an `eq` term's number is read as a filter reads it: an int within `i64`, a
+    /// uint64 above it, a float otherwise.
+    #[test]
+    fn an_eq_terms_number_is_read_by_its_range() {
+        let eq = |v: serde_json::Value| {
+            term(&serde_json::json!({"attr": "n", "fn": "eq", "weight": 1.0, "value": v}))
+                .unwrap()
+                .f
+        };
+        assert_eq!(eq(serde_json::json!(5)), Function::Eq(Value::Int(5)));
+        assert_eq!(
+            eq(serde_json::json!(u64::MAX)),
+            Function::Eq(Value::Uint(u64::MAX))
+        );
+        assert_eq!(eq(serde_json::json!(2.5)), Function::Eq(Value::Float(2.5)));
+        assert_eq!(
+            number(&Value::Uint(1 << 63)),
+            Some(9_223_372_036_854_775_808.0)
+        );
+    }
+}
