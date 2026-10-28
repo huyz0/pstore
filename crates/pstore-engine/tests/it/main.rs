@@ -75,6 +75,7 @@ mod sparse;
 mod split;
 mod text_field;
 mod time_travel;
+mod times;
 mod updated_epoch;
 mod upsert;
 mod vectors;

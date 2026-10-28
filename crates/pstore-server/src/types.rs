@@ -751,6 +751,18 @@ pub struct IndexSummary {
     pub updated_epoch: Option<u64>,
     /// `documents`, under turbopuffer's name (M9f).
     pub approx_row_count: u64,
+    /// When it came into being (M148), RFC 3339 UTC, or `null` when not recorded: an index
+    /// made before M148.
+    pub created_at: Option<String>,
+    /// When a commit last wrote its rows (M148): its fold, create, branch or sync, never a
+    /// compaction, so up to a fold interval after a write was acknowledged. `null` when not
+    /// recorded.
+    pub updated_at: Option<String>,
+    /// The summed lengths of its segment objects (M148): rows, index structures and
+    /// dictionaries, deleted rows until a compaction, and a branch's shared segments in each
+    /// index naming them; not delete vectors or the quarantine. `null` when a segment's
+    /// length is not recorded.
+    pub approx_logical_bytes: Option<u64>,
     /// What the summary cost.
     pub cost: Cost,
 }

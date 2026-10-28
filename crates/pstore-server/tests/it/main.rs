@@ -94,6 +94,7 @@ mod text_filters;
 mod text_only;
 mod text_prefix;
 mod time_travel;
+mod times;
 #[allow(
     dead_code,
     clippy::duplicate_mod,

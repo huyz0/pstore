@@ -165,6 +165,34 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M148: an index reports its bytes and when it was created and last written
+
+`GET /v1/indexes/{index}` adds three fields, all read from the one HEAD the summary
+already reads:
+
+- `created_at`: when the index came into being (a create, a branch, the first fold of a
+  write, or the first sync of a replica), as RFC 3339 UTC with milliseconds, such as
+  `2026-10-28T00:50:30.832Z`. `null` for an index made before M148, which has no record.
+- `updated_at`: when a commit last wrote the index, in the same form. A fold of its rows
+  (deletes and rejected rows included), its create, its branch, and a replica's sync move
+  it; a compaction, GC and replication controls do not. It is when the write was folded,
+  not when it was acknowledged, so it lags an acknowledged write by up to a fold interval.
+  A node whose clock is behind the last writer's never moves it back. `null` for an
+  index made before M148 until its next write.
+- `approx_logical_bytes`: the sum of the index's segment object lengths. That covers rows,
+  index structures and dictionaries, not delete vectors or the quarantine. Deleted rows
+  count until a compaction, and a branch's shared segments count in each index that names
+  them. `0` for an index with no segment, `null` when a segment's length is not recorded
+  (written before M45).
+
+⚠️ **Mixed versions.** HEAD gains a trailing section. A node from M132 up to M148 refuses a
+HEAD carrying it as corrupt, so every node of a deployment runs M148 before any of them
+commits. Rollback after a commit is not supported. A node from M129 to M131 drops the
+section when it re-commits: `created_at` is then `null` for good, and `updated_at` until
+the next write.
+
+Evidence is in [M148 verification](milestones/M148/VERIFIED.md).
+
 ## M147: an index can be created empty
 
 `PUT /v1/indexes/{index}` (scope `write`) with `{"dims": n, "distance_metric": m}` creates
