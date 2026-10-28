@@ -1523,9 +1523,9 @@ fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::T
 }
 
 /// The text fields a query's text legs read, in name order, each once -- when its shares can
-/// carry them (M157): none, one, or several each of which is the primary or a declared further
-/// field. `None` for several with one the index never declared: such a query is refused from
-/// the footers, so splitting it would only cost a failed share first.
+/// carry them (M157): each is the primary or a declared further field. `None` when one is a
+/// field the index never declared: such a query is refused from the footers, so splitting it
+/// would only cost a failed share first.
 fn shareable_fields<'a>(
     prefetch: &'a [pstore_query::Prefetch],
     texts: &pstore_query::Texts,
@@ -1541,7 +1541,7 @@ fn shareable_fields<'a>(
     fields.dedup();
     let declared =
         |f: &&str| *f == pstore_format::text::DEFAULT_TEXT_FIELD || texts.fields.contains_key(*f);
-    (fields.len() < 2 || fields.iter().all(declared)).then_some(fields)
+    fields.iter().all(declared).then_some(fields)
 }
 
 /// Whether a share must carry the index's further fields (M154): its text legs read one, or

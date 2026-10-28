@@ -87,3 +87,11 @@ were observed red.
 
 The whole workspace's tests pass, except the two IPv6 `peer_http::response_tests`, which fail
 in this container on the parent too.
+
+Amendment after merge, from CI's mutation shard 0 on PR #8: `fields.len() < 2` in
+`shareable_fields` survived `< -> >`, because the only input it changes, one undeclared
+field, was untested. Such a query is refused from the footers as several undeclared fields
+are, so it is now not split either: the rule is "every field declared". The new
+`a_query_over_one_undeclared_field_is_not_split` failed on the old code (2 peer calls where
+0 were expected) and passes; `split::` and the pstore-engine and pstore-server suites pass,
+less the two IPv6 tests.

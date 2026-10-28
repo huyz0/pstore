@@ -2031,3 +2031,37 @@ async fn a_query_over_one_further_field_carries_its_terms_alone() {
         assert_eq!(f, ["title"]);
     }
 }
+
+/// M157, as CI's mutation sweep found it: a query over one field the index never declared is
+/// not split, as one over several such fields is not. Either is refused from the footers, so a
+/// share would only cost a failed request first.
+#[tokio::test]
+async fn a_query_over_one_undeclared_field_is_not_split() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = several(&store).await;
+    let peers = trio(&store);
+    let legs = [over("nope", "run")];
+    let mut answers = Vec::new();
+    let ours: &dyn Peers = &peers;
+    for with in [Some(ours), None] {
+        let got = coordinator
+            .query_split_as(
+                "idx",
+                &legs,
+                None,
+                Fusion::default(),
+                10,
+                pstore_engine::Consistency::Eventual,
+                with,
+            )
+            .await;
+        answers.push(format!("{:?}", got.map(|a| a.hits)));
+    }
+    assert_eq!(answers[0], answers[1], "split, then unsplit");
+    assert!(answers[1].contains("UnknownTextField"), "{answers:?}");
+    assert_eq!(
+        peers.opens.load(Ordering::SeqCst) + peers.scans.load(Ordering::SeqCst),
+        0,
+        "a query over one undeclared field was split"
+    );
+}
