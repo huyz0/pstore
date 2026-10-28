@@ -858,8 +858,28 @@ pub struct IndexSummary {
     pub approx_logical_bytes: Option<u64>,
     /// Whether it takes no writes (M149): its owner made it read-only, or it is a replica.
     pub read_only: bool,
+    /// Its indexing progress across every writer (M160), only when asked for with
+    /// `progress=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgress>,
     /// What the summary cost.
     pub cost: Cost,
+}
+
+/// An index's durable operations no fold has committed yet, across every writer (M160).
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexProgress {
+    /// `updating` while any such operation exists, else `up-to-date`.
+    pub status: &'static str,
+    /// The operations: upserts, patches, deletes and by-filter operations, not resulting
+    /// rows, so a delete of an absent id counts.
+    pub unindexed_rows: u64,
+    /// Their encoded bytes.
+    pub unindexed_bytes: u64,
+    /// Whether every unfolded bundle was read; when `false`, the counts are a lower bound.
+    pub exact: bool,
+    /// The HEAD epoch the counts are relative to.
+    pub as_of_epoch: u64,
 }
 
 /// What `PATCH /v1/indexes/{index}` answers (M149).

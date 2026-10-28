@@ -226,6 +226,30 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M160: an index reports its indexing progress across every writer
+
+`GET /v1/indexes/{index}?progress=true` adds a `progress` object:
+`{"status", "unindexed_rows", "unindexed_bytes", "exact", "as_of_epoch"}`. It counts
+the operations every server has made durable for the index and no fold has indexed yet,
+read from the write-ahead log's own bundles rather than from the answering server's
+memory. `status` is `updating` while there are any, else `up-to-date`.
+`unindexed_rows` counts operations (upserts, patches, deletes and by-filter
+operations), not resulting rows. `as_of_epoch` is the HEAD the counts are relative to.
+
+Without the parameter, or with `progress=false`, the summary is unchanged and costs one
+read. With it, the reads are bounded whatever the backlog: one probe per server that has
+ever written the tenant, at most 64 bundles read, and at most five round trips. Past 64
+unfolded bundles, `exact` is `false` and the counts are a lower bound. Rows a server
+holds only in memory are not durable and are not counted. `unfolded` still reports the
+answering server's own.
+
+With `progress=true`, an index no fold has created yet, whose operations are durable in
+another server's log, answers `200` as an empty index with `status` `updating`, where
+the plain summary is `404`. If those operations are all deletes it is `404` again after
+the fold. Any other value of `progress` is `400`.
+
+Nothing stored changes. Evidence is in [M160 verification](milestones/M160/VERIFIED.md).
+
 ## M149: an index can be made read-only
 
 `PATCH /v1/indexes/{index}` (scope `write`) with `{"read_only": true}` makes the index

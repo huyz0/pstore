@@ -57,9 +57,9 @@ pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
-    IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest,
-    QueryResponse, ReadOnlyResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse,
-    WriteRequest, WriteResponse,
+    IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta,
+    QueryRequest, QueryResponse, ReadOnlyResponse, ResultRow, Schema, TextIn, WarmMeta,
+    WarmResponse, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -3882,14 +3882,35 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
 async fn index_summary<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(index): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<axum::Json<IndexSummary>, ApiError> {
     let tenant = tenant_of(&headers)?;
+    // M160: opt-in, so the summary without it keeps its one read.
+    let progress = match params.get("progress").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "progress must be true or false, not {other:?}"
+            )));
+        }
+    };
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let (served, stats) = engine.index_stats_at(&index).await?;
+    // Beside the stats' HEAD read, not after it: no round added.
+    let ((served, stats), progress) =
+        futures_util::future::try_join(engine.index_stats_at(&index), async {
+            match progress {
+                true => engine.progress(&index).await.map(Some),
+                false => Ok(None),
+            }
+        })
+        .await?;
     let unfolded = engine.pending_indexes().await.iter().any(|i| i == &index);
-    if stats.is_none() && !unfolded {
+    // A name only unfolded bundles hold is durable, not yet indexed (M160).
+    let durable = progress.as_ref().is_some_and(|p| p.rows > 0);
+    if stats.is_none() && !unfolded && !durable {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "index_not_found",
@@ -3952,6 +3973,13 @@ async fn index_summary<S: BlobStore + 'static>(
         updated_at: s.written_ms.map(rfc3339_ms),
         approx_logical_bytes: s.bytes,
         read_only: s.read_only,
+        progress: progress.map(|p| IndexProgress {
+            status: if p.rows > 0 { "updating" } else { "up-to-date" },
+            unindexed_rows: p.rows,
+            unindexed_bytes: p.bytes,
+            exact: p.exact,
+            as_of_epoch: p.epoch.0,
+        }),
         cost: api.spend(tenant).since(before),
     }))
 }
