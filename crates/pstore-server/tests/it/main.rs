@@ -60,6 +60,7 @@ mod quarantine;
 mod read_cache;
 mod ref_new;
 mod registry;
+mod relevance_offset;
 mod replication;
 mod replication_races;
 mod rerank;

@@ -2707,6 +2707,11 @@ enum Plan {
     ),
 }
 
+/// Where a relevance query's page ends: `top_k` past its `offset` (M163).
+fn page_end(req: &QueryRequest) -> usize {
+    req.top_k.saturating_add(req.offset.unwrap_or(0))
+}
+
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
     // M63: checked first, before an aggregation or an order returns, so every refusal names it.
@@ -2805,11 +2810,18 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         return Ok(Plan::Ordered(by, filter));
     }
     // M146: a group limit names the window too (it never sits beside a diversify).
+    // M163: a page's end is the depth every path ranks to; `offset` bounds it as an order's.
+    let page_end = page_end(req);
+    if req.offset.is_some() && page_end > MAX_ORDERED {
+        return Err(ApiError::bad_request(format!(
+            "top_k + offset may be at most {MAX_ORDERED} for a relevance ranking"
+        )));
+    }
     let named_limit = req.limit_per.as_ref().and_then(diversify::named_window);
     let boost = req
         .boost
         .as_ref()
-        .map(|b| boost::parse(b, req.top_k, named_diversify.or(named_limit)))
+        .map(|b| boost::parse(b, page_end, named_diversify.or(named_limit)))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
     // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
@@ -2818,7 +2830,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     let limit_per = req
         .limit_per
         .as_ref()
-        .map(|p| limit_per::LimitPer::parse(p, req.top_k, named_boost))
+        .map(|p| limit_per::LimitPer::parse(p, page_end, named_boost))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("limit_per: {why}")))?;
     let window = boost
@@ -2826,7 +2838,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
         .or(limit_per.as_ref().map(|p| p.window));
-    let legs = prefetch(req, window.unwrap_or(req.top_k))?;
+    let legs = prefetch(req, window.unwrap_or(page_end))?;
     let fusion = fusion(req, legs.len())?;
     Ok(Plan::Ranked(
         legs,
@@ -3133,7 +3145,7 @@ async fn run<E: BlobStore>(
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
         .or(limit_per.as_ref().map(|p| p.window))
-        .unwrap_or(req.top_k);
+        .unwrap_or(page_end(req));
     let answer = match req.as_of {
         Some(e) => {
             engine
@@ -3209,30 +3221,33 @@ async fn run<E: BlobStore>(
     }
     // M146: after the boost, on the stored attributes, whatever the query selects.
     if let Some(p) = &limit_per {
-        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, req.top_k);
+        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, page_end(req));
     }
-    paired.truncate(req.top_k);
+    // M163: the page is cut at its end, then its first `offset` rows skipped.
+    paired.truncate(page_end(req));
+    paired.drain(..req.offset.unwrap_or(0).min(paired.len()));
     let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
-    let unfolded_hits = if boost.is_none() && diversify.is_none() && limit_per.is_none() {
-        answer
-            .hits
-            .iter()
-            .filter(|h| h.segment == answer.unfolded_at)
-            .count()
-    } else {
-        // The rows were reordered and cut: a hit on the unfolded rows is one whose id an
-        // unfolded row carries. Ids are unique in one answer, an id's newest version being the
-        // only one served.
-        let fresh: std::collections::HashSet<&str> = answer
-            .hits
-            .iter()
-            .filter(|h| h.segment == answer.unfolded_at)
-            .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
-            .collect();
-        rows.iter()
-            .filter(|(id, ..)| fresh.contains(id.as_str()))
-            .count()
-    };
+    let unfolded_hits =
+        if boost.is_none() && diversify.is_none() && limit_per.is_none() && req.offset.is_none() {
+            answer
+                .hits
+                .iter()
+                .filter(|h| h.segment == answer.unfolded_at)
+                .count()
+        } else {
+            // The rows were reordered and cut: a hit on the unfolded rows is one whose id an
+            // unfolded row carries. Ids are unique in one answer, an id's newest version being the
+            // only one served.
+            let fresh: std::collections::HashSet<&str> = answer
+                .hits
+                .iter()
+                .filter(|h| h.segment == answer.unfolded_at)
+                .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
+                .collect();
+            rows.iter()
+                .filter(|(id, ..)| fresh.contains(id.as_str()))
+                .count()
+        };
     // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
     // only, from the attributes the row round returned, whatever `include_attributes` asks.
     let marks = highlight.as_ref().map(|h| {
@@ -3734,12 +3749,8 @@ const MAX_ORDERED: usize = 10_000;
 /// `rank_by` is one `[attribute, "asc" | "desc"]` pair, or a list of 1 to 8 of them (M140): an
 /// array whose first element is itself an array is the list.
 fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError> {
+    // M163: a relevance ranking takes `offset` too; `plan` bounds its page.
     let Some(raw) = &req.rank_by else {
-        if req.offset.is_some() {
-            return Err(ApiError::bad_request(
-                "offset applies only to a rank_by order",
-            ));
-        }
         return Ok(None);
     };
     let by = match raw.as_array() {
@@ -3918,6 +3929,13 @@ fn multi_rerank(
     // then drops, and the survivors would carry the encoding's scores.
     if filtered {
         return Err(bad("rerank cannot be combined with filters"));
+    }
+    // ⚠️ Before the default's `clamp`, which panicked on a depth past the bound (M163).
+    if limit > boost::MAX_WINDOW {
+        return Err(bad(&format!(
+            "rerank reaches at most {} candidates; the leg's depth is {limit}",
+            boost::MAX_WINDOW
+        )));
     }
     let window = match m.rerank_window.as_ref() {
         None => limit.saturating_mul(4).clamp(limit, boost::MAX_WINDOW),

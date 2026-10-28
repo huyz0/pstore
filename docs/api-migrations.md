@@ -40,6 +40,24 @@ paged exactly as documents with vectors are.
 Every request valid before answers as before. No stored-data migration is needed.
 The [M170 verification](milestones/M170/VERIFIED.md) records the evidence.
 
+## M163: `offset` on a relevance ranking
+
+A relevance query (`vector`, `multi`, `text`, `field` or `exact`) may carry `offset`. The
+answer is rows `offset` to `offset + top_k` of the same query at `top_k = offset + top_k`.
+
+- `top_k + offset` is at most 10,000 when `offset` is given, `offset: 0` included.
+- A boost's or `limit_per`'s window must reach `top_k + offset`; its default is twice
+  that, from 100 to 1,000. The boost and the group cut run before the skip.
+- Each page is ranked at its own depth. With an approximate ranking, two pages at
+  different depths can disagree (a row can repeat or be missed). Use `exact: true` or
+  `rank_by` for stable paging.
+- Refused beside `diversify` and `aggregate_by`.
+- ⚠️ A multi-vector leg with `rerank: "exact"` whose depth passes 1,000 is now refused
+  with `bad_request`. Before, a `top_k` past 1,000 on such a leg failed the request.
+
+No stored-data migration is needed. The [M163 verification](milestones/M163/VERIFIED.md)
+records the evidence.
+
 ## M146: a hard per-group limit on a relevance ranking
 
 A relevance query may carry `limit_per`:
