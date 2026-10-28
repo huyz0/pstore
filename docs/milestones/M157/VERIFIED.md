@@ -95,3 +95,9 @@ are, so it is now not split either: the rule is "every field declared". The new
 `a_query_over_one_undeclared_field_is_not_split` failed on the old code (2 peer calls where
 0 were expected) and passes; `split::` and the pstore-engine and pstore-server suites pass,
 less the two IPv6 tests.
+
+Amendment after merge, from CI's mutation shard 11 on PR #8: the door's upper bound on
+`field_terms` (`> MAX_TEXTS + 1`) survived `>=`, `- 1` and `* 1`, since no test sent the
+largest legal part. `a_part_over_several_fields_is_judged_at_the_door` now requires a part
+at 7 over nine fields (the primary and eight further) to be accepted; each of the three
+mutations, applied in turn, fails it.

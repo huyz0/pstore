@@ -2392,6 +2392,25 @@ async fn a_part_over_several_fields_is_judged_at_the_door() {
         let (status, got) = post(body).await;
         assert_eq!(status, 400, "{name}: {got}");
     }
+    // The bound itself: the primary and eight further fields, nine in all, are accepted (CI's
+    // mutation shard 11 on PR #8).
+    let nine: Vec<String> = std::iter::once("text".to_owned())
+        .chain((0..8).map(|i| format!("f{i}")))
+        .collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    let eight: serde_json::Map<String, Value> = nine[1..]
+        .iter()
+        .map(|f| ((*f).to_owned(), json!(fts)))
+        .collect();
+    let (status, got) = post(open7(
+        &nine,
+        &[
+            ("field_terms", terms_of(&nine)),
+            ("texts", Value::Object(eight)),
+        ],
+    ))
+    .await;
+    assert_eq!(status, 200, "7 with nine fields: {got}");
     let opened_at = |protocol: u64| match protocol {
         2 => part(2, Some("open"), &["text"], &[("terms", json!(["word2"]))]),
         5 => part(
