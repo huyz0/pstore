@@ -56,7 +56,11 @@ run is claimed for them.
    serialization_failures_never_send_partial_requests_or_responses`, before code review:
    2,353 passed, none failed; lines 95.83%, regions 96.74% (`provisional`: a 4-core cloud
    container, without the two IPv6 tests, which need IPv6). CI's coverage and mutants runs
-   on the PR are the evidence for the code as pushed.
+   on the PR are the evidence for the code as pushed. CI's `scripts/mutants.sh` on the
+   first push: 90 mutants, 32 caught, 57 unviable, 1 missed: the guard that keeps a copy
+   of a write for the re-read, as `>=`, which re-read HEAD on a refusal by the request's own
+   type. `a_refusal_by_the_requests_own_type_reads_nothing` now fails on it, applied by
+   hand; CI's run on the fix is the evidence.
    Existing tests: the M171 and M172 server tests that wrote several types under one name
    (`datetime::datetimes_come_back_in_utc`,
    `datetime::a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes`,

@@ -439,3 +439,29 @@ async fn a_dropped_indexs_type_reads_no_later_write() {
     assert_eq!(meta["schema"]["attributes"], json!({}), "{meta}");
     assert_eq!(rows(&one, "m").await[0]["attributes"]["owner"], "plain");
 }
+
+#[tokio::test]
+async fn a_refusal_by_the_requests_own_type_reads_nothing() {
+    use pstore_blob::OpClass;
+    use pstore_types::TenantId;
+    let store = Accounted::new(MemoryStore::new());
+    let a = api(&store, 1);
+    // HEAD read once, and no type recorded for the index or held for it.
+    wrote(&a, "plain", json!([row("a", json!({"k": 1}))]), Value::Null).await;
+    let spent =
+        || [OpClass::Read, OpClass::Write, OpClass::List].map(|c| store.count(TenantId(23), c));
+    let before = spent();
+    let (s, b) = write(
+        &a,
+        "plain",
+        json!([row("b", json!({"x": "not-a-uuid"}))]),
+        json!({"x": "uuid"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(
+        spent(),
+        before,
+        "only a type the request did not declare re-reads HEAD"
+    );
+}
