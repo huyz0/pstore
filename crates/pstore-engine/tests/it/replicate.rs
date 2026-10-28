@@ -1697,3 +1697,24 @@ async fn a_sync_sets_the_replicas_times() {
     assert!(s.sync(&mut st).await.idle);
     assert_eq!(times(&s.dst).await, Some((2_000, 4_000)));
 }
+
+#[tokio::test]
+async fn a_replica_is_read_only_by_its_replication() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..10).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    assert!(s.dst.index_stats("dst").await.unwrap().unwrap().read_only);
+    // M149: its owner's flag neither sets nor clears it.
+    for on in [true, false] {
+        refused(
+            s.dst.set_read_only("dst", on).await,
+            &ReplicaRefusal::ReadOnly("dst".to_owned()),
+        );
+    }
+    // A read-only source still replicates.
+    s.src.set_read_only("src", true).await.unwrap().unwrap();
+    s.sync(&mut st).await;
+    s.same("from a read-only source").await;
+}

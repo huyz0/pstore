@@ -199,6 +199,37 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M149: an index can be made read-only
+
+`PATCH /v1/indexes/{index}` (scope `write`) with `{"read_only": true}` makes the index
+read-only, and `{"read_only": false}` makes it writable again. No other field is
+accepted. It answers `200 {"epoch", "read_only", "cost"}`: one HEAD read and one commit,
+or no commit when the index already has that value. It answers `404 index_not_found`
+for a name the store does not hold, `409 index_not_folded` for one this process holds
+only unfolded (retry after the fold), and `409 replica_read_only` for a replica, which
+is read-only by its replication. The summary adds `"read_only"`, true for a replica too.
+
+While the flag is set, every document write (upserts, patches, deletes, conditional and
+by-filter operations) and the index's drop answer `409 index_read_only` and write
+nothing. Queries, compaction, warming, quarantine export and discard, branching from
+it, and replicating from it are unchanged. A branch of a read-only index is writable.
+A dropped index's flag goes with it, so a name created again is writable.
+
+⚠️ **Rows already accepted are set aside, not indexed.** A server that has not yet read
+the flag accepts a write, and rows acknowledged before the flag and not yet folded are
+folded after it. In both cases the fold puts the rows in the index's quarantine, counts
+them in `rejected_rows`, and reports them rejected to an applied write. They are not
+replayed when the flag is cleared. Their export carries `reason: null` unless they also
+conflict with the schema. Until that fold, the server that accepted them still serves
+them as buffered rows.
+
+⚠️ **Mixed versions.** HEAD gains a trailing section, written only while some index is
+read-only. A node from M132 to M148 refuses such a HEAD as corrupt, so every node runs
+M149 before the first flag is set. A node from M129 to M131 drops the section when it
+re-commits, clearing every flag.
+
+Evidence is in [M149 verification](milestones/M149/VERIFIED.md).
+
 ## M148: an index reports its bytes and when it was created and last written
 
 `GET /v1/indexes/{index}` adds three fields, all read from the one HEAD the summary

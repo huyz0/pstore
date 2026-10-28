@@ -27,8 +27,9 @@ After:
 - **HEAD gains one trailing section**, `read_only`: a set of index names. It follows
   M148's `times` and forces every optional section before it. An empty set is never
   written, so a HEAD with no read-only index encodes byte for byte as M148's. When the set
-  is non-empty and `times` is empty, `times` is written in its marker form with a count of
-  0. The decoder reads the set if bytes remain after `times`, then the strict end check.
+  is non-empty and `times` is empty, `times` is written with a count of 0, and so is
+  everything it forces. The decoder reads the set if bytes remain after `times`, then the
+  strict end check.
   `Head::encode` writes only names that exist (a key of `indexes`, `schema_rejects` or
   `quarantine`, M148's rule), so the flag never outlives its index and a name created
   again is writable.

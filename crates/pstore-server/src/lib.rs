@@ -58,7 +58,8 @@ pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
     IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest,
-    QueryResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
+    QueryResponse, ReadOnlyResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse,
+    WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -692,7 +693,9 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
                 "/v1/indexes/{index}",
-                Write.on(axum::routing::delete(delete_index::<S>).put(create_index::<S>)),
+                Write.on(axum::routing::delete(delete_index::<S>)
+                    .put(create_index::<S>)
+                    .patch(patch_index::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/documents",
@@ -1293,6 +1296,9 @@ impl From<EngineError> for ApiError {
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
             EngineError::IndexExists(_) => {
                 Self::new(StatusCode::CONFLICT, "index_exists", e.to_string())
+            }
+            EngineError::IndexReadOnly(_) => {
+                Self::new(StatusCode::CONFLICT, "index_read_only", e.to_string())
             }
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
@@ -3787,6 +3793,7 @@ async fn index_summary<S: BlobStore + 'static>(
         created_ms: None,
         written_ms: None,
         bytes: Some(0),
+        read_only: false,
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -3819,6 +3826,7 @@ async fn index_summary<S: BlobStore + 'static>(
         created_at: s.created_ms.map(rfc3339_ms),
         updated_at: s.written_ms.map(rfc3339_ms),
         approx_logical_bytes: s.bytes,
+        read_only: s.read_only,
         cost: api.spend(tenant).since(before),
     }))
 }
@@ -4135,6 +4143,44 @@ async fn create_index<S: BlobStore + 'static>(
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// `PATCH /v1/indexes/{index}` (M149): makes the index read-only, or writable again.
+async fn patch_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<ReadOnlyResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let req: PatchIndexRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed index patch: {e}")))?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let Some(epoch) = engine.set_read_only(&index, req.read_only).await? else {
+        // HEAD does not hold it. One this process holds unfolded, which its summary
+        // reports, is not absent: it can be flagged once folded.
+        if engine.pending_indexes().await.iter().any(|i| i == &index) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "index_not_folded",
+                format!("the index {index} has rows not yet folded; retry after the fold"),
+            ));
+        }
+        return Err(no_index(&index));
+    };
+    Ok(axum::Json(ReadOnlyResponse {
+        epoch: epoch.0,
+        read_only: req.read_only,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// What `PATCH /v1/indexes/{index}` carries (M149). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchIndexRequest {
+    read_only: bool,
 }
 
 /// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.

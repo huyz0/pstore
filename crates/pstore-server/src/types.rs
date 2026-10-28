@@ -770,7 +770,21 @@ pub struct IndexSummary {
     /// index naming them; not delete vectors or the quarantine. `null` when a segment's
     /// length is not recorded.
     pub approx_logical_bytes: Option<u64>,
+    /// Whether it takes no writes (M149): its owner made it read-only, or it is a replica.
+    pub read_only: bool,
     /// What the summary cost.
+    pub cost: Cost,
+}
+
+/// What `PATCH /v1/indexes/{index}` answers (M149).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadOnlyResponse {
+    /// The HEAD that holds the flag: the commit that set it, or the HEAD read when it
+    /// already had that value.
+    pub epoch: u64,
+    /// The flag as it now is.
+    pub read_only: bool,
+    /// What it cost.
     pub cost: Cost,
 }
 
