@@ -174,6 +174,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
             fields: Default::default(),
+            types: Default::default(),
         },
     );
     h.schemas.insert(
@@ -185,6 +186,7 @@ fn a_schema_round_trips_with_its_reject_count() {
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
             fields: Default::default(),
+            types: Default::default(),
         },
     );
     h.schema_rejects.insert("alpha".to_owned(), 17);
@@ -246,6 +248,7 @@ fn a_head_without_a_reaped_marker_decodes_as_zero() {
             fts: pstore_format::text::FullText::default(),
             trigram: Vec::new(),
             fields: Default::default(),
+            types: Default::default(),
         },
     );
     h.reaped_before = 77;
@@ -299,6 +302,7 @@ fn a_dropped_schema_round_trips_and_is_reaped_at_its_epoch() {
         fts: pstore_format::text::FullText::default(),
         trigram: Vec::new(),
         fields: Default::default(),
+        types: Default::default(),
     };
     let mut h = populated();
     h.dropped.push((
@@ -345,6 +349,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             fts: FullText::default(),
             trigram: Vec::new(),
             fields: Default::default(),
+            types: Default::default(),
         },
     );
     h.dropped.push((
@@ -357,6 +362,7 @@ fn a_full_text_schema_round_trips_live_and_dropped() {
             fts: FullText::default(),
             trigram: Vec::new(),
             fields: Default::default(),
+            types: Default::default(),
         },
     ));
     let before = h.encode();
@@ -393,6 +399,7 @@ fn a_trigram_set_round_trips_with_and_without_full_text() {
         fts,
         trigram: trigram.iter().map(|s| (*s).to_owned()).collect(),
         fields: Default::default(),
+        types: Default::default(),
     };
     let stem = FullText {
         analyzer: pstore_format::text::Analyzer {
@@ -460,6 +467,7 @@ fn named_field_widths_round_trip() {
         fts: pstore_format::text::FullText::default(),
         trigram: Vec::new(),
         fields: fields.iter().map(|(n, w)| ((*n).to_owned(), *w)).collect(),
+        types: Default::default(),
     };
     let mut h = populated();
     h.schemas

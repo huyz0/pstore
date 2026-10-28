@@ -1,5 +1,29 @@
 # Native API migration notes
 
+## M173: attribute types persist
+
+A type a write declares in its `schema` is now recorded in the index's schema at the fold,
+and holds for every later write, from this process or any other:
+
+- A later write that declares nothing reads `owner` as a UUID, `seq` as a uint64, and so
+  on: a value that is not one is refused, nothing stored. Before, an undeclared write
+  stored such a value as a plain string or int.
+- Declaring a recorded name as another type is refused, HTTP 400, `schema_conflict`, naming
+  the attribute and both types. A process's own unfolded declarations count too.
+- Two writers that type one name two ways before a fold: the fold keeps the first
+  declaration in lane order, and quarantines the rows that contradict it, counted in
+  `quarantined_rows` as a wrong-width row is. So is a row holding a plain string under a
+  name another writer declared. Patches are typed at the door only, and rows already
+  sealed keep their values.
+- `GET /v1/indexes/{id}` answers `schema.attributes`: each recorded name to `"datetime"`,
+  `"uuid"`, `"bytes"` or `"uint64"`, `{}` when none.
+- HEAD gains a section for the recorded types. A reader older than M173 refuses such a
+  HEAD, and once one is written an older build cannot read the tenant: upgrade every reader
+  first, and there is no rollback after.
+
+A tenant whose writes declare no types is unchanged, and its HEAD keeps its bytes. The
+[M173 verification](milestones/M173/VERIFIED.md) records the evidence.
+
 ## M172: uint64 attributes
 
 A write's `schema` may declare an attribute `"uint64"`:

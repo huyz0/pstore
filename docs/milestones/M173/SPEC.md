@@ -34,6 +34,16 @@ for every later write:
   their values when a later fold, compaction or GC rewrites their segment. A later write
   may type a new name; its first fold adds it. A branch inherits its parent's types; an
   index created after a drop starts with none.
+- **One name, one type.** A name's values of another type are rows sealed before its type
+  was recorded, which keep them. M171's and M172's tests that wrote several types under one
+  name now write the untyped rows first and fold them before the declaring write, or, for
+  two declared types, write them as a build before M173 did: by an engine, with no
+  declaration. None loses a case.
+- **When the door reads.** The known types are read after a write's request-level checks,
+  before its values are read: a value refused costs, once per process, the HEAD read M35
+  already makes. A refusal by a type the request did not declare re-reads HEAD once before
+  it stands, as a width's does (M9f.2), and a drop this process makes, or reads after its
+  declaration, takes its unfolded declarations for that index.
 - **Answering.** The index summary's `schema` gains `attributes`: each recorded name to
   `"datetime"`, `"uuid"`, `"bytes"` or `"uint64"`; `{}` when none.
 
@@ -101,4 +111,6 @@ not judged; the risk is bounded by HEAD reads, not only races. Minors taken: the
 refusal and no rollback; branches and drops; `$types` stripped; the Delta shortened.
 Round 2 (two majors, both taken): rows merged from a patch are not judged; the recorded
 type evicts the unfolded map's entry, with a criterion for the process that lost. Minor
-taken: "through upserts". Round 3 (verify): resolved, nothing new.
+taken: "through upserts". Round 3 (verify): resolved, nothing new. The "One name, one
+type" and "When the door reads" bullets were added during implementation, and were
+reviewed with the code.

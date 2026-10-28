@@ -10,6 +10,62 @@ use base64::Engine as _;
 /// The most bytes one `bytes` value holds.
 pub const MAX_BYTES: usize = 4096;
 
+/// A type a write declares for an attribute (M9h.3, M171, M172), and an index records (M173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Kind {
+    /// RFC 3339, UTC: [`crate::Value::DateTime`].
+    DateTime,
+    /// 8-4-4-4-12 hex digits: [`crate::Value::Uuid`].
+    Uuid,
+    /// Standard padded base64: [`crate::Value::Bytes`].
+    Bytes,
+    /// A JSON integer in `0..=u64::MAX`: [`crate::Value::Uint`].
+    Uint64,
+}
+
+impl Kind {
+    /// Every kind, in code order.
+    pub const ALL: [Self; 4] = [Self::DateTime, Self::Uuid, Self::Bytes, Self::Uint64];
+
+    /// The name a write declares and a schema answers.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DateTime => "datetime",
+            Self::Uuid => "uuid",
+            Self::Bytes => "bytes",
+            Self::Uint64 => "uint64",
+        }
+    }
+
+    /// The kind a name declares, or `None`.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == name)
+    }
+
+    /// Whether `v` is a value of this kind, or an array of them: what a recorded type admits.
+    #[must_use]
+    pub fn holds(self, v: &crate::Value) -> bool {
+        use crate::Value;
+        match (self, v) {
+            (_, Value::Array(items)) => items.iter().all(|i| self.holds_scalar(i)),
+            _ => self.holds_scalar(v),
+        }
+    }
+
+    fn holds_scalar(self, v: &crate::Value) -> bool {
+        use crate::Value;
+        matches!(
+            (self, v),
+            (Self::DateTime, Value::DateTime(_))
+                | (Self::Uuid, Value::Uuid(_))
+                | (Self::Bytes, Value::Bytes(_))
+                | (Self::Uint64, Value::Uint(_))
+        )
+    }
+}
+
 /// A UUID's 16 bytes from its hyphenated form, or `None`.
 #[must_use]
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
@@ -77,6 +133,25 @@ mod tests {
         reason = "assertions in tests are the reporting mechanism"
     )]
     use super::*;
+
+    /// M173: a kind is named as a write declares it, and holds its own values only.
+    #[test]
+    fn a_kind_names_itself_and_holds_its_own_values() {
+        use crate::Value;
+        for k in Kind::ALL {
+            assert_eq!(Kind::named(k.name()), Some(k));
+        }
+        assert_eq!(Kind::named("int"), None);
+        assert!(Kind::Uuid.holds(&Value::Uuid([0; 16])));
+        assert!(Kind::Uuid.holds(&Value::Array(vec![Value::Uuid([0; 16])])));
+        assert!(Kind::Uuid.holds(&Value::Array(vec![])));
+        assert!(!Kind::Uuid.holds(&Value::Str("x".into())));
+        assert!(!Kind::Uuid.holds(&Value::Array(vec![Value::Uuid([0; 16]), Value::Int(1)])));
+        assert!(Kind::Uint64.holds(&Value::Uint(1)) && !Kind::Uint64.holds(&Value::Int(1)));
+        assert!(Kind::Bytes.holds(&Value::Bytes(vec![])) && !Kind::Bytes.holds(&Value::Uint(1)));
+        assert!(Kind::DateTime.holds(&Value::DateTime(0)));
+        assert!(!Kind::DateTime.holds(&Value::Int(0)));
+    }
 
     /// M172: two uint64s order by value, and after every other type structurally.
     #[test]
