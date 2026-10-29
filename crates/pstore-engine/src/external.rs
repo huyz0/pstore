@@ -389,6 +389,7 @@ mod tests {
                 fts: pstore_format::text::FullText::default(),
                 trigram: Vec::new(),
                 fields: Default::default(),
+                texts: Default::default(),
             },
         );
         assert!(taken(&h));

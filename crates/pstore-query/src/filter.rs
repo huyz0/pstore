@@ -56,19 +56,20 @@ impl Bound {
     /// literal prefix, and analyzes the text before it (M138).
     #[must_use]
     pub fn new(analyzer: pstore_format::text::Analyzer, op: TokenOp, text: &str) -> Self {
-        use pstore_format::text::{analyze, tokens};
+        use pstore_format::text::{analyze, analyze_query, query_tokens};
+        // M158: an operand, read as one -- under `pre_tokenized_array`, tokens joined by U+001F.
         let last = matches!(op, TokenOp::AllPrefix | TokenOp::AnyPrefix)
-            .then(|| tokens(&analyzer, text).pop())
+            .then(|| query_tokens(&analyzer, text).pop())
             .flatten();
         match last {
             Some(t) => Self {
                 analyzer,
-                query: analyze(&analyzer, text.get(..t.span.start).unwrap_or_default()),
+                query: analyze_query(&analyzer, text.get(..t.span.start).unwrap_or_default()),
                 prefix: analyze(&plain(&analyzer), text.get(t.span).unwrap_or_default()).pop(),
             },
             None => Self {
                 analyzer,
-                query: analyze(&analyzer, text),
+                query: analyze_query(&analyzer, text),
                 prefix: None,
             },
         }
@@ -340,6 +341,48 @@ fn within(a_len: usize, a: impl Iterator<Item = char>, b: &[char], k: usize) -> 
     prev.last().is_some_and(|d| *d <= k)
 }
 
+/// Whether some substring of `value`, possibly empty, is within `k` edits of `q`, in
+/// characters (M145): Sellers' table, the edit-distance table with a free start and end in
+/// the value, one row per character of the value and out at the first row that reaches `k`.
+/// Case-insensitive compares [folded](pstore_format::trigram::fold) characters, one to one.
+fn near(value: &str, q: &[char], k: usize, case_sensitive: bool) -> bool {
+    let key = |c: char| {
+        if case_sensitive {
+            c
+        } else {
+            pstore_format::trigram::fold(c)
+        }
+    };
+    let q: Vec<char> = q.iter().map(|&c| key(c)).collect();
+    // `prev[j]`: the fewest edits taking some suffix of the value read so far to `q[..j]`.
+    let mut prev: Vec<usize> = (0..=q.len()).collect();
+    let mut row = prev.clone();
+    if prev.last().is_some_and(|d| *d <= k) {
+        return true;
+    }
+    for c in value.chars().map(key) {
+        let mut left = 0;
+        if let Some(first) = row.first_mut() {
+            *first = 0;
+        }
+        for (j, want) in q.iter().enumerate() {
+            let (Some(&diag), Some(&up)) = (prev.get(j), prev.get(j + 1)) else {
+                break;
+            };
+            let d = (diag + usize::from(c != *want)).min(up + 1).min(left + 1);
+            if let Some(cell) = row.get_mut(j + 1) {
+                *cell = d;
+            }
+            left = d;
+        }
+        if row.last().is_some_and(|d| *d <= k) {
+            return true;
+        }
+        std::mem::swap(&mut prev, &mut row);
+    }
+    false
+}
+
 /// A fuzzy predicate's value, with what every row and every block compares it by, taken once
 /// (M120): its characters, and its distinct folded trigrams.
 #[derive(Debug, Clone)]
@@ -416,6 +459,13 @@ pub enum Predicate {
     Pattern(String, Pattern),
     /// A scalar string attribute within `k` edits of the value (M15). Anything else is false.
     Fuzzy(String, Needle, u8),
+    /// The vendor's `Fuzzy` (M145): some substring of a string, or of one string element of
+    /// an array, within `k` edits of the value, comparing [folded](pstore_format::trigram::fold)
+    /// characters when the flag (case-sensitive) is false. Anything else is false.
+    ///
+    /// ⚠️ **It never prunes**: the M15.2 sketch holds only scalar strings, so a block of arrays
+    /// would read as holding none of the value's trigrams.
+    FuzzySubstring(String, Needle, u8, bool),
     /// A location within `meters` of `(lat, lon)`, inclusive (M66). An attribute that is not a
     /// location (see [`pstore_format::geo::location`]) is false.
     GeoRadius(String, f64, f64, f64),
@@ -459,6 +509,7 @@ impl Predicate {
             | Self::Tokens(name, ..)
             | Self::Pattern(name, _)
             | Self::Fuzzy(name, ..)
+            | Self::FuzzySubstring(name, ..)
             | Self::GeoRadius(name, ..)
             | Self::GeoBox(name, ..) => out.push(name),
         }
@@ -477,17 +528,46 @@ impl Predicate {
     /// This predicate with every token predicate in it bound to `analyzer` (M14.2).
     #[must_use]
     pub fn bound(&self, analyzer: &pstore_format::text::Analyzer) -> Self {
+        self.bound_texts(analyzer, &BTreeMap::new())
+    }
+
+    /// This predicate with every token predicate in it bound (M156): one over a field named in
+    /// `texts`, the index's further text fields, to that field's analyzer; any other to
+    /// `primary`, the analyzer [`Self::bound`] takes.
+    #[must_use]
+    pub fn bound_texts(
+        &self,
+        primary: &pstore_format::text::Analyzer,
+        texts: &BTreeMap<String, pstore_format::text::FullText>,
+    ) -> Self {
         match self {
-            Self::Tokens(name, op, text, _) => Self::Tokens(
-                name.clone(),
-                *op,
-                text.clone(),
-                Some(Bound::new(*analyzer, *op, text)),
-            ),
-            Self::And(all) => Self::And(all.iter().map(|p| p.bound(analyzer)).collect()),
-            Self::Or(any) => Self::Or(any.iter().map(|p| p.bound(analyzer)).collect()),
-            Self::Not(p) => Self::Not(Box::new(p.bound(analyzer))),
+            Self::Tokens(name, op, text, _) => {
+                let analyzer = texts.get(name).map_or(primary, |f| &f.analyzer);
+                Self::Tokens(
+                    name.clone(),
+                    *op,
+                    text.clone(),
+                    Some(Bound::new(*analyzer, *op, text)),
+                )
+            }
+            Self::And(all) => {
+                Self::And(all.iter().map(|p| p.bound_texts(primary, texts)).collect())
+            }
+            Self::Or(any) => Self::Or(any.iter().map(|p| p.bound_texts(primary, texts)).collect()),
+            Self::Not(p) => Self::Not(Box::new(p.bound_texts(primary, texts))),
             other => other.clone(),
+        }
+    }
+
+    /// The attribute of every token predicate in it, through `And`, `Or` and `Not` (M156): the
+    /// fields whose analyzer its bind reads.
+    #[must_use]
+    pub fn token_fields(&self) -> Vec<&str> {
+        match self {
+            Self::Tokens(name, ..) => vec![name.as_str()],
+            Self::And(ps) | Self::Or(ps) => ps.iter().flat_map(Self::token_fields).collect(),
+            Self::Not(p) => p.token_fields(),
+            _ => Vec::new(),
         }
     }
 
@@ -567,6 +647,16 @@ impl Predicate {
                 }
                 _ => false,
             },
+            Self::FuzzySubstring(name, v, k, case) => {
+                let hit = |s: &str| near(s, &v.chars, usize::from(*k), *case);
+                match get(name).as_deref() {
+                    Some(Value::Str(s)) => hit(s),
+                    Some(Value::Array(items)) => {
+                        items.iter().any(|e| matches!(e, Value::Str(s) if hit(s)))
+                    }
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -574,7 +664,7 @@ impl Predicate {
     #[must_use]
     pub fn patterns(&self) -> usize {
         match self {
-            Self::Pattern(..) | Self::Fuzzy(..) => 1,
+            Self::Pattern(..) | Self::Fuzzy(..) | Self::FuzzySubstring(..) => 1,
             Self::And(ps) | Self::Or(ps) => ps.iter().map(Self::patterns).sum(),
             Self::Not(p) => p.patterns(),
             _ => 0,
@@ -623,6 +713,8 @@ impl Predicate {
             // Tokens have no zone: every block could hold a match (M14.2). Nor has a
             // location, an array of two numbers (M66).
             Self::Tokens(..) | Self::GeoRadius(..) | Self::GeoBox(..) => true,
+            // M145: the sketch never saw an array's strings.
+            Self::FuzzySubstring(..) => true,
             // M15.2: a block whose sketch lacks a required trigram holds no match. No sketch,
             // or no filter for the attribute, rules nothing out.
             Self::Pattern(name, p) => zones
@@ -646,10 +738,15 @@ impl Predicate {
 
 /// Whether a row's string elements satisfy `op` against the bound query (M14.2, M138). An
 /// empty query is the vacuous reading: every string for `All` and `Sequence`, none for `Any`.
-/// `All` and `Any` look across the elements together; a sequence lies within one element.
+/// `All` and `Any` look across the elements together; a sequence lies within one element --
+/// except under `pre_tokenized_array` (M158), where each element is a token and a sequence
+/// runs across them.
 fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
-    use pstore_format::text::analyze;
-    let rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
+    use pstore_format::text::{Tokenizer, analyze};
+    let mut rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
+    if b.analyzer.tokenizer == Tokenizer::PreTokenizedArray {
+        rows = vec![rows.concat()];
+    }
     let has = |q: &String| rows.iter().any(|r| r.contains(q));
     // Only a prefix op analyzes the row a second time.
     let prefixed = || {
@@ -1135,6 +1232,137 @@ mod tests {
         assert!(tok(TokenOp::All, "x").could_admit(&Zones::default()));
     }
 
+    /// M145's reference: some substring of some string element within `k` edits of `q`, by
+    /// the whole table over every start and end, on folded characters when case-insensitive.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the reference indexes its own tables"
+    )]
+    fn fuzzy_substring_reference(q: &str, k: usize, case: bool, v: Option<&Value>) -> bool {
+        let key = |s: &str| -> Vec<char> {
+            s.chars()
+                .map(|c| {
+                    if case {
+                        c
+                    } else {
+                        pstore_format::trigram::fold(c)
+                    }
+                })
+                .collect()
+        };
+        let lev = |a: &[char], b: &[char]| -> usize {
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, ca) in a.iter().enumerate() {
+                let mut row = vec![i + 1];
+                for (j, cb) in b.iter().enumerate() {
+                    let best = (prev[j] + usize::from(ca != cb))
+                        .min(prev[j + 1] + 1)
+                        .min(row[j] + 1);
+                    row.push(best);
+                }
+                prev = row;
+            }
+            prev[b.len()]
+        };
+        let q = key(q);
+        let hit = |s: &str| {
+            let s = key(s);
+            (0..=s.len()).any(|a| (a..=s.len()).any(|b| lev(&s[a..b], &q) <= k))
+        };
+        match v {
+            Some(Value::Str(s)) => hit(s),
+            Some(Value::Array(items)) => items.iter().any(|e| matches!(e, Value::Str(s) if hit(s))),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn fuzzy_substrings_match_the_reference() {
+        // M145 criterion 1.
+        let alphabet = ['a', 'A', 'é', 'É'];
+        let mut strings: Vec<String> = vec![String::new()];
+        let mut last: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            last = last
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            strings.extend(last.iter().cloned());
+        }
+        let mut rows: Vec<Option<Value>> = vec![
+            None,
+            Some(Value::Int(5)),
+            Some(Value::Array(vec![])),
+            Some(Value::Array(vec![Value::Int(5)])),
+        ];
+        rows.extend(strings.iter().map(|s| Some(Value::Str(s.clone()))));
+        for s in strings.iter().filter(|s| s.chars().count() == 4) {
+            let s = Value::Str(s.clone());
+            rows.push(Some(Value::Array(vec![
+                Value::Str(String::new()),
+                s.clone(),
+            ])));
+            rows.push(Some(Value::Array(vec![s, Value::Int(5)])));
+        }
+        let mut queries: Vec<String> = strings
+            .iter()
+            .filter(|s| s.chars().count() == 3)
+            .cloned()
+            .collect();
+        queries.extend(["aAéÉ", "ééaaA", "AAAAA"].map(str::to_owned));
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        for q in &queries {
+            for k in 0..=2u8 {
+                for case in [true, false] {
+                    let p = Predicate::FuzzySubstring("a".to_owned(), q.as_str().into(), k, case);
+                    let not = Predicate::Not(Box::new(p.clone()));
+                    let not2 = Predicate::Not(Box::new(not.clone()));
+                    for v in &rows {
+                        let row: BTreeMap<String, Value> =
+                            v.iter().map(|v| ("a".to_owned(), v.clone())).collect();
+                        let want = fuzzy_substring_reference(q, usize::from(k), case, v.as_ref());
+                        let case = format!("{q:?} k={k} case={case} over {v:?}");
+                        assert_eq!(p.admits("x", &row), want, "{case}");
+                        assert_eq!(not.admits("x", &row), !want, "Not {case}");
+                        assert_eq!(not2.admits("x", &row), want, "Not Not {case}");
+                        if want {
+                            admitted += 1;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 0 && refused > 0,
+            "{admitted} admitted, {refused} refused"
+        );
+    }
+
+    #[test]
+    fn a_fuzzy_substring_never_prunes_on_the_sketch() {
+        // M145 criterion 6: the block's scalar strings hold none of the value's trigrams, and
+        // its arrays may hold a match the sketch never saw.
+        let sketch = pstore_format::trigram::Sketch::build(&["s".to_owned()], 1, 256, |_, _| {
+            vec!["zzzz".to_owned()]
+        });
+        let zones = pstore_format::Zones {
+            sketch: Some((std::sync::Arc::new(sketch), 0)),
+            ..pstore_format::Zones::default()
+        };
+        let m15 = Predicate::Fuzzy("s".to_owned(), "abcdef".into(), 1);
+        assert!(
+            !m15.could_admit(&zones),
+            "the fixture must be one that prunes"
+        );
+        for case in [true, false] {
+            let p = Predicate::FuzzySubstring("s".to_owned(), "abcdef".into(), 1, case);
+            assert!(p.could_admit(&zones));
+            assert!(Predicate::Not(Box::new(p)).could_admit(&zones));
+        }
+    }
+
     #[test]
     fn any_comparisons_match_the_reference() {
         // M135 criterion 1: every row shape against every literal, each operator, and the
@@ -1399,5 +1627,67 @@ mod tests {
         assert!(!yes(&en, "runner", "run"));
         assert!(yes(&folded, "cafe", "Café"));
         assert!(!yes(&en, "cafe", "Café"));
+    }
+
+    /// M156: a token predicate over a further field binds to that field's analyzer, through
+    /// `And`, `Or` and `Not`; any other to the primary's. `token_fields` sees every one.
+    #[test]
+    fn a_further_fields_token_predicate_binds_to_its_own_analyzer() {
+        use pstore_format::text::{Analyzer, FullText, Language};
+        let stem = Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        };
+        let texts = BTreeMap::from([(
+            "title".to_owned(),
+            FullText {
+                analyzer: stem,
+                ..FullText::default()
+            },
+        )]);
+        let tok =
+            |f: &str| Predicate::Tokens(f.to_owned(), TokenOp::Any, "Running".to_owned(), None);
+        let p = Predicate::And(vec![
+            tok("title"),
+            Predicate::Not(Box::new(Predicate::Or(vec![tok("text"), tok("title")]))),
+        ]);
+        let mut seen = Vec::new();
+        fn walk<'a>(p: &'a Predicate, out: &mut Vec<(&'a str, Analyzer)>) {
+            match p {
+                Predicate::Tokens(f, _, _, Some(b)) => out.push((f, *b.analyzer())),
+                Predicate::And(ps) | Predicate::Or(ps) => ps.iter().for_each(|p| walk(p, out)),
+                Predicate::Not(p) => walk(p, out),
+                _ => {}
+            }
+        }
+        let bound = p.bound_texts(&Analyzer::default(), &texts);
+        walk(&bound, &mut seen);
+        assert_eq!(
+            seen,
+            vec![
+                ("title", stem),
+                ("text", Analyzer::default()),
+                ("title", stem)
+            ]
+        );
+        // `bound` is `bound_texts` with no further field.
+        assert_eq!(p.bound(&stem), p.bound_texts(&stem, &BTreeMap::new()));
+        let run = BTreeMap::from([("title".to_owned(), Value::Str("run".to_owned()))]);
+        let alone = tok("title");
+        assert!(
+            alone
+                .bound_texts(&Analyzer::default(), &texts)
+                .admits("x", &run)
+        );
+        assert!(!alone.bound(&Analyzer::default()).admits("x", &run));
+        let mut fields = p.token_fields();
+        fields.sort_unstable();
+        assert_eq!(fields, ["text", "title", "title"]);
+        assert!(
+            Predicate::Cmp("n".to_owned(), Op::Eq, Value::Int(1))
+                .token_fields()
+                .is_empty()
+        );
     }
 }

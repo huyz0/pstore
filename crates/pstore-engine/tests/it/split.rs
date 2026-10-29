@@ -83,6 +83,8 @@ struct Three {
     fails: u8,
     /// Targets that a one-exchange share was handed with a clustered multi-vector sidecar (M94).
     clustered: Arc<AtomicU64>,
+    /// Each phased part's `terms` keys, the fields it carries terms for (M157).
+    term_fields: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
 impl Three {
@@ -102,6 +104,7 @@ impl Three {
             given: Arc::default(),
             fails: 0,
             clustered: Arc::default(),
+            term_fields: Arc::default(),
         }
     }
 }
@@ -142,6 +145,10 @@ impl Peers for Three {
         let stray = Arc::clone(&self.stray);
         let sizes = Arc::clone(&self.held);
         self.cuts.lock().unwrap().push(part.sum.map(|c| c.keep));
+        self.term_fields
+            .lock()
+            .unwrap()
+            .push(part.terms.keys().cloned().collect());
         self.given
             .lock()
             .unwrap()
@@ -171,10 +178,17 @@ impl Peers for Three {
                 Ok(stats)
             }) as futures_util::future::BoxFuture<'static, _>
         };
-        let scan = Box::new(move |sum: pstore_index::text::Stats| {
+        let scan = Box::new(move |sum: pstore_query::FieldStats| {
             Box::pin(async move {
                 scans.fetch_add(1, Ordering::SeqCst);
-                let n = sum.df.keys().filter(|t| !part.terms.contains(*t)).count() as u64;
+                // M157: each field's entry against its own field's terms.
+                let n = sum
+                    .iter()
+                    .map(|(f, s)| {
+                        let own = part.terms.get(f).map_or(&[][..], Vec::as_slice);
+                        s.df.keys().filter(|t| !own.contains(*t)).count()
+                    })
+                    .sum::<usize>() as u64;
                 stray.fetch_max(n, Ordering::SeqCst);
                 if fails == 2 {
                     return Err("lost between phases".to_owned());
@@ -1055,23 +1069,24 @@ async fn a_share_sums_only_what_its_legs_and_head_ask_for() {
             })
             .collect()
     };
-    let alpha = vec!["alpha".to_owned()];
+    let alpha = std::collections::BTreeMap::from([("text".to_owned(), vec!["alpha".to_owned()])]);
     // No text leg: nothing summed, and no dictionary required.
     let dense_only = vec![(0, dense("vector", vec![0.3, 0.9, -0.2, 1.0]))];
     let (_, st) = pstore_query::open_part(&store.inner, &targets(true), &dense_only, &alpha)
         .await
         .unwrap();
-    assert_eq!(st.doc_count, 0);
+    assert!(st.is_empty(), "{st:?}");
     // A text leg, over segments HEAD says have none: nothing read, nothing required.
     let text = vec![(0, tquery("alpha"))];
     let (_, st) = pstore_query::open_part(&store.inner, &targets(false), &text, &alpha)
         .await
         .unwrap();
-    assert_eq!(st.doc_count, 0);
+    assert_eq!(st["text"].doc_count, 0);
     // And over segments that have them: every one summed.
     let (_, st) = pstore_query::open_part(&store.inner, &targets(true), &text, &alpha)
         .await
         .unwrap();
+    let st = &st["text"];
     assert!(st.doc_count > 0 && st.df.contains_key("alpha"), "{st:?}");
 }
 
@@ -1412,5 +1427,641 @@ async fn a_split_clustered_fde_query_equals_the_unsplit_one() {
     assert!(
         peers.clustered.load(Ordering::SeqCst) > 0,
         "the segments carry a clustered sidecar and the part says so"
+    );
+}
+
+/// An index whose further field `title` differs from the primary in its analyzer (English,
+/// stemming) and in BM25's `k1` and `b`, over four folded segments (M154). Its primary `text`
+/// holds "walking", "walk" or neither, and each `title` "run", "running", "runs" or "walk".
+async fn further(store: &Arc<MemoryStore>) -> Engine<MemoryStore> {
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let coordinator = engine(store, 1);
+    let title = FullText {
+        analyzer: Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        },
+        k1: 2.0,
+        b: 0.3,
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([(
+            "title".to_owned(),
+            title,
+        )])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                let primary = ["walking dogs", "walk dog", "cats sleep"][(i % 3) as usize];
+                d.attrs.insert(
+                    "text".to_owned(),
+                    Value::Str(format!("{primary} word{}", i % 5)),
+                );
+                let head = ["run fast", "running late", "walk slowly", "runs daily"];
+                let tail = ["stories", "story told twice", "news"];
+                d.attrs.insert(
+                    "title".to_owned(),
+                    Value::Str(format!(
+                        "{} {}",
+                        head[(i % 4) as usize],
+                        tail[(i % 3) as usize]
+                    )),
+                );
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    coordinator
+}
+
+fn over_title(q: &str) -> Prefetch {
+    Prefetch::Text {
+        field: "title".to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }
+}
+
+fn any_token(field: &str, q: &str) -> Predicate {
+    Predicate::Tokens(
+        field.to_owned(),
+        pstore_query::TokenOp::Any,
+        q.to_owned(),
+        None,
+    )
+}
+
+/// The ids `filter` admits on `further`'s index: every row a dense leg over all of them keeps.
+async fn admitted(coordinator: &Engine<MemoryStore>, filter: &Predicate) -> Vec<String> {
+    let all = Prefetch::Dense {
+        field: pstore_format::DEFAULT_FIELD.to_owned(),
+        query: vec![0.3, 0.9, -0.2, 1.0],
+        limit: 1000,
+        tune: pstore_index::vec_index::Query::default(),
+    };
+    let whole = coordinator
+        .query_split_as(
+            "idx",
+            &[all],
+            Some(filter),
+            Fusion::default(),
+            1000,
+            pstore_engine::Consistency::Eventual,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = whole.ids.into_iter().flatten().collect();
+    ids.sort();
+    ids
+}
+
+/// `legs` under `filter`, split over fresh peers and unsplit: equal, and not empty. The peers,
+/// for the caller to count their calls.
+async fn split_as_unsplit(
+    store: &Arc<MemoryStore>,
+    coordinator: &Engine<MemoryStore>,
+    legs: &[Prefetch],
+    filter: Option<&Predicate>,
+    fusion: Fusion,
+) -> Three {
+    let peers = Three::new(trio(store).engines, filter.cloned());
+    let split = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            filter,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            Some(&peers),
+        )
+        .await
+        .unwrap();
+    let whole = coordinator
+        .query_split_as(
+            "idx",
+            legs,
+            filter,
+            fusion,
+            10,
+            pstore_engine::Consistency::Eventual,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !whole.hits.is_empty(),
+        "{legs:?} {filter:?}: the control is empty"
+    );
+    assert_eq!(exactly(&split), exactly(&whole), "{legs:?} {filter:?}");
+    peers
+}
+
+/// M154 criterion 1 (reversing M152's criterion 4, the limit it named as M154's): a query
+/// that scores a further text field is split through phased shares, and answers exactly as
+/// unsplit -- scored under the field's own `FullText`, its terms analysed by the field's
+/// analyzer ("running" counts as "run" only under `title`'s).
+#[tokio::test]
+async fn a_query_over_a_further_text_field_is_split_as_unsplit() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = further(&store).await;
+    // Over the primary, bound by the primary's analyzer: "walking" admits the rows holding
+    // it; under `title`'s, it would be "walk" and admit others.
+    let walking = any_token("text", "walking");
+    let ids = admitted(&coordinator, &walking).await;
+    assert!(
+        !ids.is_empty() && ids.len() < 100,
+        "the primary filter admits {}",
+        ids.len()
+    );
+    let as_title = Predicate::Tokens(
+        "text".to_owned(),
+        pstore_query::TokenOp::Any,
+        "walk".to_owned(),
+        None,
+    );
+    assert_ne!(
+        ids,
+        admitted(&coordinator, &as_title).await,
+        "the filter's words analyse alike under both analyzers"
+    );
+    let sum = Fusion::Sum {
+        weights: pstore_query::Weights::of(&[1.0, 0.5]).unwrap(),
+    };
+    let dense_leg = dense(pstore_format::DEFAULT_FIELD, vec![0.3, 0.9, -0.2, 1.0]);
+    let cases: Vec<(&str, Vec<Prefetch>, Option<&Predicate>, Fusion)> = vec![
+        (
+            "rrf",
+            vec![over_title("running stories")],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "sum",
+            vec![over_title("running"), over_title("runs story")],
+            None,
+            sum,
+        ),
+        (
+            "with a dense leg",
+            vec![over_title("running late"), dense_leg],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "filtered over the primary",
+            // "twice" is in the titles of the rows holding "walk", which a bind under
+            // `title`'s analyzer would admit, and rank first.
+            vec![over_title("running twice")],
+            Some(&walking),
+            Fusion::default(),
+        ),
+    ];
+    for (name, legs, filter, fusion) in cases {
+        let peers = split_as_unsplit(&store, &coordinator, &legs, filter, fusion).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0,
+            "{name}: no open call"
+        );
+        assert!(
+            peers.scans.load(Ordering::SeqCst) > 0,
+            "{name}: no scan call"
+        );
+    }
+}
+
+/// M154 criterion 2 (reversing M156's criterion 3 for a further field): a token filter over a
+/// further field is split -- through one-exchange shares for a vector-only query, phased ones
+/// beside a text leg over the primary -- at the top level and under `Not`, and answers exactly
+/// as unsplit.
+#[tokio::test]
+async fn a_token_filter_over_a_further_field_is_split_as_unsplit() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = further(&store).await;
+    let running = any_token("title", "Running");
+    let ids = admitted(&coordinator, &running).await;
+    assert!(
+        !ids.is_empty() && ids.len() < 100,
+        "the title filter admits {}",
+        ids.len()
+    );
+    let vector = vec![dense(
+        pstore_format::DEFAULT_FIELD,
+        vec![0.3, 0.9, -0.2, 1.0],
+    )];
+    let primary = vec![Prefetch::Text {
+        field: "text".to_owned(),
+        query: "walking word2".to_owned(),
+        limit: 10,
+    }];
+    for f in [running.clone(), Predicate::Not(Box::new(running.clone()))] {
+        let peers =
+            split_as_unsplit(&store, &coordinator, &vector, Some(&f), Fusion::default()).await;
+        assert!(
+            peers.parts.load(Ordering::SeqCst) > 0,
+            "vector-only {f:?}: no part call"
+        );
+        let peers =
+            split_as_unsplit(&store, &coordinator, &primary, Some(&f), Fusion::default()).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0,
+            "primary text {f:?}: no open call"
+        );
+    }
+}
+
+/// M153 criterion 4, as M157 reverses it: a query over the primary and a further field is
+/// split -- whether the further field's `FullText` differs from the primary's or equals it --
+/// and answers exactly as unsplit. A query over the primary alone still is.
+#[tokio::test]
+async fn a_query_over_several_text_fields_is_not_split() {
+    use pstore_format::text::FullText;
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    let title = FullText {
+        k1: 2.0,
+        b: 0.3,
+        ..FullText::default()
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([
+            ("title".to_owned(), title),
+            ("plain".to_owned(), FullText::default()),
+        ])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                for f in ["title", "plain"] {
+                    d.attrs.insert(
+                        f.to_owned(),
+                        Value::Str(format!("headline{} story tag{}", i % 4, i % 3)),
+                    );
+                }
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let sum = Fusion::Sum {
+        weights: pstore_query::Weights::of(&[1.0, 1.0]).unwrap(),
+    };
+    for further in ["title", "plain"] {
+        let peers = trio(&store);
+        let legs = vec![
+            text(),
+            Prefetch::Text {
+                field: further.to_owned(),
+                query: "headline2 story".to_owned(),
+                limit: 10,
+            },
+        ];
+        split_equals_unsplit(&coordinator, &peers, &legs, sum).await;
+        // M157 reverses this half: a `Part` carries a `Stats` a field, so the query is split.
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0 && peers.scans.load(Ordering::SeqCst) > 0,
+            "a query over text and {further} was not split"
+        );
+    }
+    let peers = trio(&store);
+    split_equals_unsplit(&coordinator, &peers, &[text()], Fusion::default()).await;
+    assert!(
+        peers.opens.load(Ordering::SeqCst) > 0,
+        "a query over the primary was not split"
+    );
+}
+
+/// M156 criterion 3, as M154 reverses it: a token filter over a further field binds to that
+/// field's analyzer, which a share's `Part` now carries in `texts`, so such a query is split --
+/// through one-exchange shares (a vector-only query) or phased ones (a text leg over the
+/// primary), at the top level and under `Not` -- as the same filters over the primary are.
+#[tokio::test]
+async fn a_token_filter_over_a_further_field_is_not_split() {
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = engine(&store, 1);
+    let title = FullText {
+        analyzer: Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        },
+        ..FullText::default()
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([(
+            "title".to_owned(),
+            title,
+        )])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                let t = ["run fast", "running late", "walk slowly"][(i % 3) as usize];
+                d.attrs.insert("title".to_owned(), Value::Str(t.to_owned()));
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    let tokens = |field: &str, q: &str| {
+        Predicate::Tokens(
+            field.to_owned(),
+            pstore_query::TokenOp::Any,
+            q.to_owned(),
+            None,
+        )
+    };
+    let vector = vec![dense(
+        pstore_format::DEFAULT_FIELD,
+        vec![0.3, 0.9, -0.2, 1.0],
+    )];
+    let primary = vec![text()];
+    let run = |peers: &Three| {
+        peers.parts.load(Ordering::SeqCst)
+            + peers.opens.load(Ordering::SeqCst)
+            + peers.scans.load(Ordering::SeqCst)
+    };
+    // M154: the further-field half is split too, now that a `Part` carries `texts`.
+    for (field, q, split) in [("title", "Running", true), ("text", "word2", true)] {
+        for f in [tokens(field, q), Predicate::Not(Box::new(tokens(field, q)))] {
+            for (legs, kind) in [(&vector, "vector-only"), (&primary, "primary text")] {
+                let peers = Three::new(
+                    vec![
+                        Arc::new(engine(&store, 10)),
+                        Arc::new(engine(&store, 11)),
+                        Arc::new(engine(&store, 12)),
+                    ],
+                    Some(f.clone()),
+                );
+                let fused = coordinator
+                    .query_split_as(
+                        "idx",
+                        legs,
+                        Some(&f),
+                        Fusion::default(),
+                        10,
+                        pstore_engine::Consistency::Eventual,
+                        Some(&peers),
+                    )
+                    .await
+                    .unwrap();
+                let whole = coordinator
+                    .query_split_as(
+                        "idx",
+                        legs,
+                        Some(&f),
+                        Fusion::default(),
+                        10,
+                        pstore_engine::Consistency::Eventual,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!whole.hits.is_empty(), "{kind} {f:?}: the control is empty");
+                assert_eq!(exactly(&fused), exactly(&whole), "{kind} {f:?}");
+                if split {
+                    let (calls, which) = if kind == "vector-only" {
+                        (peers.parts.load(Ordering::SeqCst), "part")
+                    } else {
+                        (peers.opens.load(Ordering::SeqCst), "open")
+                    };
+                    assert!(calls > 0, "{kind} {f:?}: no {which} call; not split");
+                } else {
+                    assert_eq!(run(&peers), 0, "{kind} {f:?} was split");
+                }
+            }
+        }
+    }
+}
+
+/// An index of three text fields over four folded segments (M157): the primary `text`,
+/// `title` (English, stemming, its own `k1` and `b`) and `tags` (the default). "run" is in
+/// each, at a `df` that differs by field -- every other row's `text`, every fifth row's
+/// `title` (as "running" or "runs", which only `title`'s analyzer reads as "run"), every
+/// eighth row's `tags` -- so statistics mixed across fields would give a different answer.
+async fn several(store: &Arc<MemoryStore>) -> Engine<MemoryStore> {
+    use pstore_format::text::{Analyzer, FullText, Language};
+    let coordinator = engine(store, 1);
+    let title = FullText {
+        analyzer: Analyzer {
+            language: Language::English,
+            stemming: true,
+            ..Analyzer::default()
+        },
+        k1: 2.0,
+        b: 0.3,
+    };
+    let declared = pstore_engine::Declared {
+        texts: Some(std::collections::BTreeMap::from([
+            ("title".to_owned(), title),
+            ("tags".to_owned(), pstore_format::text::FullText::default()),
+        ])),
+        ..pstore_engine::Declared::default()
+    };
+    for k in 0..4u32 {
+        let rows = (k * 25..k * 25 + 25)
+            .map(|i| {
+                let mut d = doc(i);
+                let pad = |n: u32| (0..n).map(|w| format!(" pad{w}")).collect::<String>();
+                let text = if i % 2 == 0 { "run home" } else { "walk home" };
+                d.attrs.insert(
+                    "text".to_owned(),
+                    Value::Str(format!("{text}{}", pad(i % 7))),
+                );
+                let title = match i % 10 {
+                    0 => "running late",
+                    5 => "runs daily",
+                    _ => "quiet story",
+                };
+                d.attrs.insert(
+                    "title".to_owned(),
+                    Value::Str(format!("{title}{}", pad(i % 4))),
+                );
+                let tags = if i % 8 == 0 { "run news" } else { "other news" };
+                d.attrs.insert(
+                    "tags".to_owned(),
+                    Value::Str(format!("{tags}{}", pad(i % 5))),
+                );
+                d
+            })
+            .collect();
+        coordinator
+            .write_declared(
+                "idx",
+                rows,
+                pstore_engine::Metric::DotProduct,
+                None,
+                &declared,
+            )
+            .await
+            .unwrap();
+        coordinator.flush().await.unwrap();
+        coordinator.fold().await.unwrap();
+    }
+    coordinator
+}
+
+fn over(field: &str, q: &str) -> Prefetch {
+    Prefetch::Text {
+        field: field.to_owned(),
+        query: q.to_owned(),
+        limit: 10,
+    }
+}
+
+/// M157 criterion 1: a query whose text legs read several fields is split through phased
+/// shares, and answers exactly as unsplit -- each field scored by its own statistics.
+#[tokio::test]
+async fn a_query_over_several_text_fields_is_split_as_unsplit() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = several(&store).await;
+    let weights = |w: &[f32]| pstore_query::Weights::of(w).unwrap();
+    let dense_leg = dense(pstore_format::DEFAULT_FIELD, vec![0.3, 0.9, -0.2, 1.0]);
+    let running = any_token("title", "Running");
+    let cases: Vec<(&str, Vec<Prefetch>, Option<&Predicate>, Fusion)> = vec![
+        (
+            "rrf over text and title",
+            vec![over("text", "run"), over("title", "running")],
+            None,
+            Fusion::default(),
+        ),
+        (
+            "sum over three fields",
+            vec![
+                over("text", "run"),
+                over("title", "running"),
+                over("tags", "run"),
+            ],
+            None,
+            Fusion::Sum {
+                weights: weights(&[1.0, 0.5, 2.0]),
+            },
+        ),
+        (
+            "max over title and tags, with a dense leg",
+            vec![over("title", "runs"), over("tags", "run"), dense_leg],
+            None,
+            Fusion::Max {
+                weights: weights(&[1.0, 1.5, 0.25]),
+            },
+        ),
+        (
+            "sum filtered over title",
+            vec![over("text", "run"), over("title", "running")],
+            Some(&running),
+            Fusion::Sum {
+                weights: weights(&[1.0, 1.0]),
+            },
+        ),
+    ];
+    for (name, legs, filter, fusion) in cases {
+        let peers = split_as_unsplit(&store, &coordinator, &legs, filter, fusion).await;
+        assert!(
+            peers.opens.load(Ordering::SeqCst) > 0,
+            "{name}: no open call"
+        );
+        assert!(
+            peers.scans.load(Ordering::SeqCst) > 0,
+            "{name}: no scan call"
+        );
+    }
+}
+
+/// M157 criterion 2: a query over one field is M154's -- its parts carry that field's terms
+/// alone, keyed by it.
+#[tokio::test]
+async fn a_query_over_one_further_field_carries_its_terms_alone() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = several(&store).await;
+    let peers = split_as_unsplit(
+        &store,
+        &coordinator,
+        &[over("title", "running")],
+        None,
+        Fusion::default(),
+    )
+    .await;
+    let fields = peers.term_fields.lock().unwrap().clone();
+    assert!(!fields.is_empty(), "no phased part");
+    for f in fields {
+        assert_eq!(f, ["title"]);
+    }
+}
+
+/// M157, as CI's mutation sweep found it: a query over one field the index never declared is
+/// not split, as one over several such fields is not. Either is refused from the footers, so a
+/// share would only cost a failed request first.
+#[tokio::test]
+async fn a_query_over_one_undeclared_field_is_not_split() {
+    let store = Arc::new(MemoryStore::new());
+    let coordinator = several(&store).await;
+    let peers = trio(&store);
+    let legs = [over("nope", "run")];
+    let mut answers = Vec::new();
+    let ours: &dyn Peers = &peers;
+    for with in [Some(ours), None] {
+        let got = coordinator
+            .query_split_as(
+                "idx",
+                &legs,
+                None,
+                Fusion::default(),
+                10,
+                pstore_engine::Consistency::Eventual,
+                with,
+            )
+            .await;
+        answers.push(format!("{:?}", got.map(|a| a.hits)));
+    }
+    assert_eq!(answers[0], answers[1], "split, then unsplit");
+    assert!(answers[1].contains("UnknownTextField"), "{answers:?}");
+    assert_eq!(
+        peers.opens.load(Ordering::SeqCst) + peers.scans.load(Ordering::SeqCst),
+        0,
+        "a query over one undeclared field was split"
     );
 }

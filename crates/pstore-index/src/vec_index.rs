@@ -343,8 +343,33 @@ pub fn try_build_all_with(
     analyzer: &pstore_format::text::Analyzer,
     trigram: &[String],
 ) -> Result<Built, pstore_format::FormatError> {
+    let text: Vec<(&str, &pstore_format::text::Analyzer)> =
+        text_field.map(|f| (f, analyzer)).into_iter().collect();
+    try_build_all_fields(docs, params, field, sparse_field, &text, trigram)
+}
+
+/// [`try_build_all_with`] over several text fields, each under its own analyzer (M151). Only
+/// those some row has a token in are carried; one field is written as [`try_build_all_with`]
+/// writes it, and an empty list builds no text, as [`try_build_all_with`] with `None` does.
+///
+/// # Errors
+/// As [`try_build_all`], and `Unsupported` for a repeated text field name.
+pub fn try_build_all_fields(
+    docs: &[Document],
+    params: Params,
+    field: &str,
+    sparse_field: Option<&str>,
+    text: &[(&str, &pstore_format::text::Analyzer)],
+    trigram: &[String],
+) -> Result<Built, pstore_format::FormatError> {
+    let mut seen = std::collections::BTreeSet::new();
+    if !text.iter().all(|(n, _)| seen.insert(*n)) {
+        return Err(pstore_format::FormatError::Unsupported(
+            "a text field named twice",
+        ));
+    }
     let (w, centroids, order, dictionary, text_dictionary) =
-        assemble(docs, params, field, sparse_field, text_field, analyzer);
+        assemble(docs, params, field, sparse_field, text);
     let w = w.with_trigram_attrs(trigram);
     Ok(Built {
         segment: w.try_finish()?,
@@ -369,14 +394,11 @@ pub fn build_all(
     sparse_field: Option<&str>,
     text_field: Option<&str>,
 ) -> Built {
-    let (w, centroids, order, dictionary, text_dictionary) = assemble(
-        docs,
-        params,
-        field,
-        sparse_field,
-        text_field,
-        &pstore_format::text::Analyzer::default(),
-    );
+    let analyzer = pstore_format::text::Analyzer::default();
+    let text: Vec<(&str, &pstore_format::text::Analyzer)> =
+        text_field.map(|f| (f, &analyzer)).into_iter().collect();
+    let (w, centroids, order, dictionary, text_dictionary) =
+        assemble(docs, params, field, sparse_field, &text);
     Built {
         // ⚠️ `finish`, not `try_finish`, and deliberately: `build` has already read every
         // document through `d.vector()`, so anything the format cannot store was lost before
@@ -402,8 +424,7 @@ fn assemble(
     params: Params,
     field: &str,
     sparse_field: Option<&str>,
-    text_field: Option<&str>,
-    analyzer: &pstore_format::text::Analyzer,
+    text: &[(&str, &pstore_format::text::Analyzer)],
 ) -> (
     SegmentWriter,
     Option<Centroids>,
@@ -514,7 +535,21 @@ fn assemble(
     let sparse = sparse_field.map(|name| {
         pstore_format::sparse::build(&rows, name, pstore_format::sparse::DEFAULT_ENCODING)
     });
-    let text = text_field.map(|name| pstore_format::text::build_with(&rows, name, analyzer));
+    // M151: one field is built as it always was, whether or not a row has text in it; several
+    // carry those some row has text in, and nothing at all when none has.
+    let text: Option<pstore_format::text::Fields> = match text {
+        [] => None,
+        [(name, analyzer)] => {
+            let b = pstore_format::text::build_with(&rows, name, analyzer);
+            Some(pstore_format::text::Fields {
+                names: vec![(*name).to_owned()],
+                postings: b.postings,
+                dictionary: b.dictionary,
+                fieldnorms: b.fieldnorms,
+            })
+        }
+        many => pstore_format::text::build_fields(&rows, many).filter(|f| !f.names.is_empty()),
+    };
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
     let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
     // Moved in, never cloned again: `rows` is the blocks' documents, in their order.
@@ -544,9 +579,7 @@ fn assemble(
         // ⚠️ Recorded, not assumed. `build_all` is already told the attribute; a segment that
         // does not carry the name leaves every reader comparing against the constant, which
         // answers a `text` query with this field's ranking and says nothing.
-        if let Some(name) = text_field {
-            w = w.with_text_fields(&[name.to_owned()]);
-        }
+        w = w.with_text_fields(&t.names);
     }
 
     // `order` as the caller sees it is the DATA row order: what `scan` returns.

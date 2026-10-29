@@ -243,7 +243,8 @@ async fn what_an_array_cannot_hold_is_refused() {
         json!({"n": [1, null]}),
         json!({"n": [{"k": 1}]}),
         serde_json::from_str::<Value>(r#"{"n": [9223372036854775808]}"#).unwrap(),
-        json!({"text": ["a"]}),
+        // M150: an array of strings is text now; one holding anything else is not.
+        json!({"text": ["a", 5]}),
     ] {
         let api = api();
         let (s, b) = put(&api, &json!({"documents": [doc("a", attrs.clone())]})).await;

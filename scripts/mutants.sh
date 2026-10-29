@@ -163,6 +163,11 @@ case "${1:-}" in
             exit 0
         fi
         args+=(--in-diff "$diff")
+        # One shard of the diff's mutants, for CI's PR matrix. ⚠️ A branch of several
+        # milestones is hundreds of mutants at about three minutes each on a CI runner -- 84
+        # took over four hours in one job, and GitHub stops a job at six -- so the PR gate is
+        # sharded as the nightly sweep is. Every shard filters the same enumeration.
+        [[ -n "${MUTANTS_SHARD:-}" ]] && args+=(--shard "$MUTANTS_SHARD")
         ;;
 esac
 
@@ -189,8 +194,20 @@ echo "# jobs=$JOBS cargo-build-jobs=$CARGO_BUILD_JOBS tmpdir=$TMPDIR linker=${fl
 # ⚠️ Headroom over the baseline, not a multiple of it. A genuinely hung mutant -- `put_varint`
 # with its loop condition flipped is one -- takes the full 300 s and is still caught; a
 # survivor finishes in the baseline's 20 s and is reported honestly as MISSED.
+# ⚠️ `MUTANTS_TIMEOUT` raises it where 300 s is too little to MEASURE. CI's PR shards run two
+# mutants per 4-core runner, and a mutant in `pstore-query` is caught only when its own
+# crate's tests come up, after `pstore-engine`'s and `pstore-index`'s. PR #8 had 17 such
+# timeouts in one shard; the one checked locally fails `pstore-query`'s own tests after
+# about 182 s of the workspace's (one job, `provisional`), and took over 325 s on a runner.
+# A longer limit costs only the mutants that reach it.
+# ⚠️ `MUTANTS_TEST_TOOL=nextest` (CI's PR shards) stops a mutant's tests at its first failure.
+# Under `cargo test` a test binary runs to its end however early one test fails, and a mutant
+# that makes a fold fail forever leaves `pstore-engine`'s retrying tests to run out the clock:
+# PR #8's `try_build_all_fields` mutant, failing 0.1 s into that binary, timed out at 600 s.
+[[ -n "${MUTANTS_TEST_TOOL:-}" ]] && args+=(--test-tool "$MUTANTS_TEST_TOOL")
 # Not `exec`, which would discard the cleanup trap above; and in the background, for `stop`.
-cargo mutants -j "$JOBS" --minimum-test-timeout 300 --no-shuffle "${args[@]}" "$@" &
+cargo mutants -j "$JOBS" --minimum-test-timeout "${MUTANTS_TIMEOUT:-300}" --no-shuffle \
+    "${args[@]}" "$@" &
 child=$!
 status=0
 wait "$child" || status=$?

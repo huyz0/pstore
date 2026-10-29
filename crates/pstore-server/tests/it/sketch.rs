@@ -390,9 +390,11 @@ async fn a_declaration_that_cannot_mean_anything_is_refused_by_name() {
             json!({"schema": {"s": {"type": "string", "regex": true}}, "patch_rows": [{"id": "1", "attributes": {}}]}),
             "regex is declared and the write has no documents",
         ),
+        // M155 reversed this case on purpose: `full_text_search` on `title` now declares a
+        // further text field, so the refusal kept is of its type.
         (
-            json!({"schema": {"title": {"full_text_search": true}}, "documents": docs()}),
-            "full_text_search is on the text field",
+            json!({"schema": {"title": {"type": "int", "full_text_search": true}}, "documents": docs()}),
+            "a text field's type is string or []string",
         ),
         (
             json!({"schema": {"text": {"type": "int", "full_text_search": true}}, "documents": docs()}),
