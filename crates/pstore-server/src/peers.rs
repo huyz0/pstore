@@ -1062,10 +1062,13 @@ impl WirePart {
                         query: query.iter().map(|(d, x)| (*d, x.to_bits())).collect(),
                         limit: *limit,
                     }),
+                    // M180: a prefix leg is never split (`shareable_fields`), so the wire
+                    // carries no option for it.
                     Prefetch::Text {
                         field,
                         query,
                         limit,
+                        last_as_prefix: _,
                     } => Some(WireLeg::Text {
                         j: *j,
                         field: field.clone(),
@@ -1374,6 +1377,7 @@ fn decode(wire: WirePart) -> Result<(Part, Option<serde_json::Value>), ApiError>
                     field,
                     query,
                     limit,
+                    last_as_prefix: false,
                 },
             )),
         })
@@ -1940,6 +1944,7 @@ mod tests {
                 field: "text".to_owned(),
                 query: "Alpha zeta".to_owned(),
                 limit: 9,
+                last_as_prefix: false,
             },
         ));
         let raw = serde_json::to_vec(&WirePart::opening(&phased, filters.clone())).unwrap();

@@ -319,6 +319,7 @@ fn text_leg(q: &str, limit: usize) -> Vec<Prefetch> {
         field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
         query: q.to_owned(),
         limit,
+        last_as_prefix: false,
     }]
 }
 

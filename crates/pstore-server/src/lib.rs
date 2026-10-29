@@ -2909,7 +2909,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         let legs = legs.map_err(ApiError::bad_request)?.unwrap_or_default();
         if let Some(f) = legs
             .iter()
-            .filter_map(|(f, _)| *f)
+            .filter_map(|(f, _, _)| *f)
             .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD)
         {
             return Err(ApiError::bad_request(format!(
@@ -3306,6 +3306,7 @@ async fn run<E: BlobStore>(
                         score: None,
                         dist: None,
                         highlight: None,
+                        highlights: None,
                     })
                     .collect(),
                 epoch: got.epoch.0,
@@ -3444,7 +3445,8 @@ async fn run<E: BlobStore>(
             .and_then(|t| t.legs().ok())
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|(_, q)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
+            // M180: the whole query's terms, a prefix leg's last token's own included.
+            .flat_map(|(_, q, _)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
             .collect();
         (h, terms)
     });
@@ -3454,12 +3456,17 @@ async fn run<E: BlobStore>(
             .map(|(id, score, attrs, dist)| ResultRow {
                 highlight: marks
                     .as_ref()
+                    .filter(|(h, _)| h.structure.is_none())
                     .and_then(|(h, terms)| match attrs.get(&h.attr) {
                         Some(pstore_format::Value::Str(text)) => {
                             Some(h.render(text, &answer.fts.analyzer, terms))
                         }
                         _ => None,
                     }),
+                highlights: marks.as_ref().and_then(|(h, terms)| {
+                    h.fragments(attrs.get(&h.attr)?, &answer.fts.analyzer, terms)
+                        .map(|f| f.into_iter().map(types::HighlightMatch::from).collect())
+                }),
                 attributes: selected(req, &attrs),
                 id,
                 score: Some(score),
@@ -4066,13 +4073,14 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
         )));
     }
     // M155: an object names its field; a string is the primary's.
-    for (field, t) in texts {
+    for (field, t, last_as_prefix) in texts {
         legs.push(pstore_query::Prefetch::Text {
             field: field
                 .unwrap_or(pstore_format::text::DEFAULT_TEXT_FIELD)
                 .to_owned(),
             query: t,
             limit,
+            last_as_prefix,
         });
     }
     if legs.is_empty() {

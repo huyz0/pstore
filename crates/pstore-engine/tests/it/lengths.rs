@@ -204,6 +204,7 @@ fn legs() -> [Vec<Prefetch>; 3] {
             field: "text".to_owned(),
             query: "word2".to_owned(),
             limit: 5,
+            last_as_prefix: false,
         }],
         vec![Prefetch::Sparse {
             field: "s".to_owned(),

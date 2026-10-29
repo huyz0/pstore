@@ -271,6 +271,7 @@ async fn text_and_sparse_legs_are_widened_past_deleted_rows_too() {
             field: pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "zebra".to_owned(),
             limit: 5,
+            last_as_prefix: false,
         },
     )
     .await;

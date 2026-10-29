@@ -1613,11 +1613,23 @@ fn scoring(fts: FullText, texts: &BTreeMap<String, FullText>) -> pstore_query::T
 /// The text fields a query's text legs read, in name order, each once -- when its shares can
 /// carry them (M157): each is the primary or a declared further field. `None` when one is a
 /// field the index never declared: such a query is refused from the footers, so splitting it
-/// would only cost a failed share first.
+/// would only cost a failed share first. `None` too for a query with a prefix leg (M180),
+/// which the peer protocol does not carry: the coordinator answers it alone.
 fn shareable_fields<'a>(
     prefetch: &'a [pstore_query::Prefetch],
     texts: &pstore_query::Texts,
 ) -> Option<Vec<&'a str>> {
+    if prefetch.iter().any(|p| {
+        matches!(
+            p,
+            pstore_query::Prefetch::Text {
+                last_as_prefix: true,
+                ..
+            }
+        )
+    }) {
+        return None;
+    }
     let mut fields: Vec<&str> = prefetch
         .iter()
         .filter_map(|p| match p {
@@ -8550,6 +8562,7 @@ mod split_tests {
             field: "text".to_owned(),
             query: "a".to_owned(),
             limit: 10,
+            last_as_prefix: false,
         }];
         let texts = pstore_query::Texts::from(pstore_format::text::FullText::default());
         let rrf = pstore_query::Fusion::default();

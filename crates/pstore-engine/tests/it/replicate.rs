@@ -301,6 +301,7 @@ async fn answers(e: &E, index: &str) -> Option<String> {
         field: "text".to_owned(),
         query: "fox 3".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let gt = pstore_query::Predicate::Cmp("n".to_owned(), pstore_query::Op::Gt, Value::Int(20));
     for (p, f) in [

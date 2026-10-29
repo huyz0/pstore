@@ -180,6 +180,7 @@ fn hybrid(q: [f32; 4], exact: bool) -> Vec<Prefetch> {
         field: "text".to_owned(),
         query: "word2 tag1".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     });
     legs
 }
@@ -391,6 +392,7 @@ async fn a_query_with_no_dense_leg_reads_no_table() {
         field: "text".to_owned(),
         query: "word2".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let (a, _, cen) = cost(&s, r.query("idx", &text, Fusion::default(), 10)).await;
     assert_eq!(a.unwrap().hits.len(), 10);

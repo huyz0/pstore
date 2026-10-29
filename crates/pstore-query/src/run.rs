@@ -75,6 +75,9 @@ pub enum Prefetch {
         query: String,
         /// Rows this leg would contribute.
         limit: usize,
+        /// The last raw token a literal prefix (M180): it is not BM25-scored, and a row whose
+        /// dictionary terms start with it gains 1.0, once.
+        last_as_prefix: bool,
     },
     /// Trigram regex — **in the shape, not in the engine**.
     ///
@@ -183,6 +186,37 @@ impl Opened {
             .ok()
             .map(|idx| idx.summary_for(terms))
     }
+}
+
+/// A text leg's query under `a` (M180): the terms BM25 scores, and the forms of its literal
+/// prefix. Without `last_as_prefix`, or with no raw token, every term and no prefix.
+///
+/// The prefix is the last raw token, as [`crate::filter::plain`] makes it **and** as `a` makes
+/// it, when `a` keeps a term for it: dictionary terms are analyzed, so a complete word
+/// must meet its own stored stem. When one form starts with the other only the shorter is
+/// kept, since its run of terms holds the other's.
+fn leg_terms(
+    a: &pstore_format::text::Analyzer,
+    query: &str,
+    last_as_prefix: bool,
+) -> (Vec<String>, Vec<String>) {
+    use pstore_format::text::{analyze, analyze_query, query_tokens};
+    let mut tokens = query_tokens(a, query);
+    let last = last_as_prefix.then(|| tokens.pop()).flatten();
+    let Some(last) = last else {
+        return (analyze_query(a, query), Vec::new());
+    };
+    let raw = query.get(last.span.clone()).unwrap_or_default();
+    let mut forms: Vec<String> = analyze(&crate::filter::plain(a), raw);
+    forms.extend(last.term);
+    forms.sort_by_key(String::len);
+    let mut kept: Vec<String> = Vec::new();
+    for f in forms {
+        if !kept.iter().any(|k| f.starts_with(k.as_str())) {
+            kept.push(f);
+        }
+    }
+    (tokens.into_iter().filter_map(|t| t.term).collect(), kept)
 }
 
 /// The one text field a query's legs read (M151), or `None` when it has no text leg.
@@ -923,11 +957,15 @@ async fn run<S: BlobStore + Clone>(
                     .iter()
                     .filter_map(|p| match p {
                         Prefetch::Text {
-                            field: f, query, ..
-                        } if f == field => Some(query),
+                            field: f,
+                            query,
+                            last_as_prefix,
+                            ..
+                        } if f == field => Some((query, *last_as_prefix)),
                         _ => None,
                     })
-                    .flat_map(|q| pstore_format::text::analyze_query(analyzer, q))
+                    // M180: a prefix is not BM25's, and has no statistics.
+                    .flat_map(|(q, prefix)| leg_terms(analyzer, q, prefix).0)
                     .collect();
                 t.sort();
                 t.dedup();
@@ -1544,6 +1582,7 @@ enum Runnable<'a> {
         field: &'a str,
         query: &'a str,
         limit: usize,
+        last_as_prefix: bool,
     },
     Dense {
         field: &'a str,
@@ -1579,10 +1618,12 @@ impl Runnable<'_> {
                 field,
                 query,
                 limit,
+                last_as_prefix,
             } => Prefetch::Text {
                 field: field.to_owned(),
                 query: query.to_owned(),
                 limit,
+                last_as_prefix,
             },
             Self::Dense {
                 field,
@@ -1650,10 +1691,12 @@ impl Runnable<'_> {
                 field,
                 query,
                 limit,
+                last_as_prefix,
             } => Self::Text {
                 field,
                 query,
                 limit: limit + extra,
+                last_as_prefix,
             },
             Self::Sparse {
                 field,
@@ -1712,10 +1755,16 @@ impl Runnable<'_> {
     fn exhaustive(self, rows: usize) -> Self {
         let rows = rows.max(1);
         match self {
-            Self::Text { field, query, .. } => Self::Text {
+            Self::Text {
+                field,
+                query,
+                last_as_prefix,
+                ..
+            } => Self::Text {
                 field,
                 query,
                 limit: rows,
+                last_as_prefix,
             },
             Self::Sparse { field, query, .. } => Self::Sparse {
                 field,
@@ -1791,10 +1840,12 @@ impl<'a> TryFrom<&'a Prefetch> for Runnable<'a> {
                 field,
                 query,
                 limit,
+                last_as_prefix,
             } => Ok(Self::Text {
                 field,
                 query,
                 limit: *limit,
+                last_as_prefix: *last_as_prefix,
             }),
             Prefetch::Multi {
                 field,
@@ -2030,6 +2081,7 @@ async fn leg<S: BlobStore>(
             field,
             query,
             limit,
+            last_as_prefix,
         } => {
             // ⚠️ Refused, never answered from the wrong field. An empty result would be the
             // kinder-looking failure and the worse one: a caller cannot tell it from a term
@@ -2061,9 +2113,11 @@ async fn leg<S: BlobStore>(
             let text = texts.of(field);
             let empty = Stats::default();
             let stats = stats.get(*field).unwrap_or(&empty);
-            let terms = pstore_format::text::analyze_query(&text.analyzer, query);
+            let (terms, prefixes) = leg_terms(&text.analyzer, query, *last_as_prefix);
             let hits = idx
-                .search_with(store, key, &terms, stats, *limit, text.k1, text.b)
+                .search_prefixed(
+                    store, key, &terms, &prefixes, stats, *limit, text.k1, text.b,
+                )
                 .await?;
             Ok(hits
                 .into_iter()

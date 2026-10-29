@@ -84,6 +84,7 @@ fn text_leg(q: &str, limit: usize) -> Vec<Prefetch> {
         field: text::DEFAULT_TEXT_FIELD.to_owned(),
         query: q.to_owned(),
         limit,
+        last_as_prefix: false,
     }]
 }
 
@@ -226,11 +227,13 @@ async fn fusion_happens_once_over_the_union() {
             field: text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "gamma".to_owned(),
             limit: 20,
+            last_as_prefix: false,
         },
         Prefetch::Text {
             field: text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "delta".to_owned(),
             limit: 20,
+            last_as_prefix: false,
         },
     ];
     let hits = query(&s, &two, &both, Fusion::Rrf { k: 60.0 }, 8)

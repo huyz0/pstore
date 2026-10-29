@@ -84,7 +84,7 @@ impl Bound {
 
 /// `a` with neither stemming nor stopword removal (M138): what a literal prefix, and the row
 /// tokens it is matched against, are made with. Case and folding stay the index's.
-fn plain(a: &pstore_format::text::Analyzer) -> pstore_format::text::Analyzer {
+pub(crate) fn plain(a: &pstore_format::text::Analyzer) -> pstore_format::text::Analyzer {
     pstore_format::text::Analyzer {
         stemming: false,
         remove_stopwords: false,

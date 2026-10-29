@@ -239,6 +239,7 @@ fn text() -> Prefetch {
         field: "text".to_owned(),
         query: "word2 tag1".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }
 }
 
@@ -637,6 +638,7 @@ fn tquery(q: &str) -> Prefetch {
         field: "text".to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }
 }
 
@@ -1114,6 +1116,7 @@ async fn a_split_sum_query_equals_the_unsplit_one() {
         field: "text".to_owned(),
         query: q.to_owned(),
         limit: 1,
+        last_as_prefix: false,
     };
     let legs = vec![one("alpha word2"), one("tag1 n3")];
     let eventual = pstore_engine::Consistency::Eventual;
@@ -1495,6 +1498,7 @@ fn over_title(q: &str) -> Prefetch {
         field: "title".to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }
 }
 
@@ -1670,6 +1674,7 @@ async fn a_token_filter_over_a_further_field_is_split_as_unsplit() {
         field: "text".to_owned(),
         query: "walking word2".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     for f in [running.clone(), Predicate::Not(Box::new(running.clone()))] {
         let peers =
@@ -1744,6 +1749,7 @@ async fn a_query_over_several_text_fields_is_not_split() {
                 field: further.to_owned(),
                 query: "headline2 story".to_owned(),
                 limit: 10,
+                last_as_prefix: false,
             },
         ];
         split_equals_unsplit(&coordinator, &peers, &legs, sum).await;
@@ -1950,6 +1956,7 @@ fn over(field: &str, q: &str) -> Prefetch {
         field: field.to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }
 }
 

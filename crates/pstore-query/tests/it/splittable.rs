@@ -53,6 +53,7 @@ fn only_legs_that_score_a_row_alone_split_in_one_exchange() {
                 field: "text".to_owned(),
                 query: "a".to_owned(),
                 limit: 1,
+                last_as_prefix: false,
             },
             false,
         ),
