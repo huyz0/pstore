@@ -2673,6 +2673,12 @@ fn checked_query(req: QueryRequest) -> Result<QueryRequest, ApiError> {
     if req.top_k == 0 {
         return Err(ApiError::bad_request("top_k must be greater than zero"));
     }
+    // M143: as an aggregation's or a rank_by order's, which keep their own messages.
+    if req.top_k > MAX_ORDERED && req.rank_by.is_none() && req.aggregate_by.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "top_k may be at most {MAX_ORDERED} for a query leg"
+        )));
+    }
     Ok(req)
 }
 

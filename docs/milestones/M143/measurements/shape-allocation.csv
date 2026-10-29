@@ -1,0 +1,6 @@
+shape,status,body_bytes,allocated_bytes,allocated_per_body_byte
+wide_array,413,2097151,10498,0.0050
+wide_object,413,2097148,10498,0.0050
+long_string,413,2097152,10490,0.0050
+deep,413,2097152,10504,0.0050
+admitted_write,200,2096889,11140515,5.31

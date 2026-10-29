@@ -537,6 +537,7 @@ fn request_limit_configuration_precedes_store_and_bind() {
         (Some(r#"{"version":1,"active_requests":8}"#), true),
         (Some(r#"{"version":2}"#), false),
         (Some(r#"{"version":1,"body_bytes":0}"#), false),
+        (Some(r#"{"version":1,"json_depth":129}"#), false),
         (
             Some(r#"{"version":1,"active_requests":2,"tenant_active_requests":4}"#),
             false,

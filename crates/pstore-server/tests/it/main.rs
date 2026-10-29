@@ -73,6 +73,7 @@ mod scheduled_reap;
 mod schema;
 mod served_epoch;
 mod session;
+mod shape;
 mod sketch;
 mod snapshot;
 mod socket;
