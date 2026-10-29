@@ -60,3 +60,9 @@ earlier invocations of `scripts/review.sh context M181` aborted before any revie
 packet (the disk filled, then a timeout while it ran the gates); their packets were deleted
 so the counter counts reviews, and the packet was rebuilt with `REVIEW_SKIP_GATES=1` after the
 gates above were run by hand.
+
+CI on the PR: every job green except `mutants-shard (7)`, which missed two mutants in
+`raw_spans` (`+` to `-` on each bound of the offset that places the runs between two
+emoji). No test had text after a first emoji and before a second, where the offset is not
+0. `ideographs_before_an_emoji_are_split` gained `x👍東京y👍z`; both mutants, applied by hand,
+now fail it. `cargo deny check` passed in CI's `check` job.

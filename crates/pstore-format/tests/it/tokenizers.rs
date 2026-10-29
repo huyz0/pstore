@@ -109,7 +109,7 @@ fn word_tokenizers_split_as_specified() {
     }
 }
 
-/// Beyond the table: ideographs before an emoji are split as after one.
+/// Beyond the table: ideographs before an emoji, and between two, are split as after one.
 #[test]
 fn ideographs_before_an_emoji_are_split() {
     assert_eq!(
@@ -117,6 +117,11 @@ fn ideographs_before_an_emoji_are_split() {
         ["東", "京", "👍", "x"]
     );
     assert_eq!(raw(&with(Tokenizer::WordV1), "東京👍x"), ["東京", "x"]);
+    // And between two emoji, where the text starts past the first.
+    assert_eq!(
+        raw(&with(Tokenizer::WordV2), "x👍東京y👍z"),
+        ["x", "👍", "東", "京", "y", "👍", "z"]
+    );
 }
 
 #[test]
