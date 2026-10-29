@@ -2750,7 +2750,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         let legs = legs.map_err(ApiError::bad_request)?.unwrap_or_default();
         if let Some(f) = legs
             .iter()
-            .filter_map(|(f, _)| *f)
+            .filter_map(|(f, _, _)| *f)
             .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD)
         {
             return Err(ApiError::bad_request(format!(
@@ -3286,7 +3286,8 @@ async fn run<E: BlobStore>(
             .and_then(|t| t.legs().ok())
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|(_, q)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
+            // M180: the whole query's terms, a prefix leg's last token's own included.
+            .flat_map(|(_, q, _)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
             .collect();
         (h, terms)
     });
@@ -3913,13 +3914,14 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
         )));
     }
     // M155: an object names its field; a string is the primary's.
-    for (field, t) in texts {
+    for (field, t, last_as_prefix) in texts {
         legs.push(pstore_query::Prefetch::Text {
             field: field
                 .unwrap_or(pstore_format::text::DEFAULT_TEXT_FIELD)
                 .to_owned(),
             query: t,
             limit,
+            last_as_prefix,
         });
     }
     if legs.is_empty() {

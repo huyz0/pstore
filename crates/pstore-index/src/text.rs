@@ -298,8 +298,38 @@ impl TextIndex {
         k1: f32,
         b: f32,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
+        self.search_prefixed(store, key, terms, &[], stats, k, k1, b)
+            .await
+    }
+
+    /// [`Self::search_with`], and a row whose terms start with any of `prefixes` gains 1.0,
+    /// once (M180). Each prefix's terms are one contiguous span of postings, fetched as one
+    /// range in the same round: a prefix costs a range, never a round trip, however many
+    /// terms it matches.
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    #[allow(clippy::too_many_arguments, reason = "search_with's, and the prefixes")]
+    pub async fn search_prefixed<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        terms: &[String],
+        prefixes: &[String],
+        stats: &Stats,
+        k: usize,
+        k1: f32,
+        b: f32,
+    ) -> Result<Vec<(usize, f32)>, FormatError> {
         let entries = self.entries(terms);
-        if entries.is_empty() {
+        let runs: Vec<&[TermEntry]> = prefixes
+            .iter()
+            .map(|p| self.dict.prefixed(p))
+            .filter(|run| !run.is_empty())
+            .collect();
+        // ⚠️ Not before the prefixes are looked up: a segment holding none of the BM25 terms
+        // may still hold rows the prefix matches.
+        if entries.is_empty() && runs.is_empty() {
             return Ok(Vec::new());
         }
         let mut ranges: Vec<std::ops::Range<u64>> = entries
@@ -309,6 +339,24 @@ impl TextIndex {
                 lo..lo + u64::from(e.bytes)
             })
             .collect();
+        // One span a prefix, from its first term's postings to its last's end.
+        let spans: Vec<std::ops::Range<u64>> = runs
+            .iter()
+            .map(|run| {
+                let lo = run.iter().map(|e| e.offset).min().unwrap_or(0);
+                let hi = run
+                    .iter()
+                    .map(|e| e.offset + u64::from(e.bytes))
+                    .max()
+                    .unwrap_or(0);
+                lo..hi
+            })
+            .collect();
+        ranges.extend(
+            spans
+                .iter()
+                .map(|s| self.postings.start + s.start..self.postings.start + s.end),
+        );
         // ⚠️ The fieldnorms ride WITH the postings. They are a different section, their span
         // is known at open, and awaiting them separately would make BM25's length
         // normalisation cost a round trip that the formula does not.
@@ -354,6 +402,24 @@ impl TextIndex {
                     let tf = tf as f32;
                     scores.add(row, idf * (tf * (k1 + 1.0)) / (tf + norm));
                 }
+            }
+            // M180: 1.0 a row the prefixes match, once however many terms or forms match it.
+            let mut matched = std::collections::BTreeSet::new();
+            for (i, (run, span)) in runs.iter().zip(&spans).enumerate() {
+                let Some(buf) = bufs.get(entries.len() + i) else {
+                    continue;
+                };
+                for e in *run {
+                    let from = usize::try_from(e.offset - span.start).unwrap_or(usize::MAX);
+                    let to = from.saturating_add(e.bytes as usize);
+                    let Some(list) = buf.get(from..to) else {
+                        continue;
+                    };
+                    matched.extend(self.dict.decode_list(e, list).into_iter().map(|(r, _)| r));
+                }
+            }
+            for row in matched {
+                scores.add(row, 1.0);
             }
             let mut scored = scores.into_scored();
             crate::top::top_k_by(&mut scored, k, crate::top::best_first);

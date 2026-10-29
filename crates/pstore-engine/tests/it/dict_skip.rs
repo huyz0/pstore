@@ -182,6 +182,7 @@ fn text() -> Vec<Prefetch> {
         field: "text".to_owned(),
         query: "word2".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }]
 }
 

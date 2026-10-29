@@ -202,7 +202,7 @@ contract fixtures, rather than assuming identical validation.
 | ANN/kNN `Embed` expression, optional `model` | None | Model integration; J |
 | `SparseKNN` | Index/query library only | Expose string-key sparse vectors first; D |
 | `BM25` string | `text` query on default text field | Single-field only |
-| `BM25` token array and `last_as_prefix` | `text: [strings]` means separate query legs | Different meaning; no token-array/prefix clause; E |
+| `BM25` token array and `last_as_prefix` | A text leg object's `query` may be an array of tokens (M158) and carry `"last_as_prefix": true` (M180) | Equivalent, scored 1.0 once a row. The prefix meets analyzed terms, so under stemming a complete word also expands through its stem; a prefix query is not split across servers |
 | `Sum`, `Max` | Text-leg fusion exists | Limited composition, no recursive per-field expression tree; E |
 | `Product` in either argument order | Some weighting via fusion/boost | Not an arbitrary nested weighted scoring expression; E |
 | Filter as score | Windowed equality boost | Not whole-corpus filter scoring; E |

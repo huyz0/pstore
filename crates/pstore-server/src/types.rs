@@ -542,7 +542,8 @@ pub struct QueryMeta {
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g). An entry of several may
-/// instead be `{"field": <name>, "query": <string>}`, a leg over that text field (M155).
+/// instead be `{"field": <name>, "query": <string>}`, a leg over that text field (M155), and
+/// may carry `"last_as_prefix": true` (M180).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TextIn {
@@ -552,23 +553,41 @@ pub enum TextIn {
     Many(Vec<serde_json::Value>),
 }
 
+/// One text leg as a request names it (M180): its field (`None` for the primary), its query,
+/// and whether its last token is a prefix.
+pub(crate) type TextLeg<'a> = (Option<&'a str>, String, bool);
+
 impl TextIn {
     /// The legs, in request order: each one's field (`None` for the primary, as a string
-    /// entry is) and its query. Refused when an entry is neither a string nor an object of
-    /// exactly `field` and `query`, both strings.
-    pub fn legs(&self) -> Result<Vec<(Option<&str>, String)>, String> {
+    /// entry is), its query, and whether its last token is a prefix (M180). Refused when an
+    /// entry is neither a string nor an object of `field` and `query`, both strings, and
+    /// optionally `last_as_prefix`, a bool.
+    pub fn legs(&self) -> Result<Vec<TextLeg<'_>>, String> {
         match self {
-            Self::One(q) => Ok(vec![(None, token_operand(&serde_json::json!(q))?)]),
+            Self::One(q) => Ok(vec![(None, token_operand(&serde_json::json!(q))?, false)]),
             Self::Many(qs) => qs
                 .iter()
                 .map(|e| match e {
-                    serde_json::Value::String(_) => Ok((None, token_operand(e)?)),
+                    serde_json::Value::String(_) => Ok((None, token_operand(e)?, false)),
                     serde_json::Value::Object(o) => {
-                        if let Some(k) = o.keys().find(|k| *k != "field" && *k != "query") {
+                        if let Some(k) = o
+                            .keys()
+                            .find(|k| !["field", "query", "last_as_prefix"].contains(&k.as_str()))
+                        {
                             return Err(format!(
-                                "text: a leg object has field and query, not {k:?}"
+                                "text: a leg object has field, query and last_as_prefix, not \
+                                 {k:?}"
                             ));
                         }
+                        let prefix = match o.get("last_as_prefix") {
+                            None => false,
+                            Some(serde_json::Value::Bool(b)) => *b,
+                            Some(_) => {
+                                return Err(
+                                    "text: a leg object's last_as_prefix is a bool".to_owned()
+                                );
+                            }
+                        };
                         match (o.get("field"), o.get("query")) {
                             (
                                 Some(serde_json::Value::String(f)),
@@ -576,7 +595,7 @@ impl TextIn {
                                     q
                                     @ (serde_json::Value::String(_) | serde_json::Value::Array(_)),
                                 ),
-                            ) => Ok((Some(f.as_str()), token_operand(q)?)),
+                            ) => Ok((Some(f.as_str()), token_operand(q)?, prefix)),
                             _ => Err("text: a leg object's field is a string, and its query a \
                                       string or an array of strings"
                                 .to_owned()),

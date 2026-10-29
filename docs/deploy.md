@@ -307,6 +307,25 @@ result gets `$highlights`, a list of `{text, fragment_range, match_ranges, array
 - Sentences end after `.`, `!` or `?` followed by whitespace, after `。`, `！` or `？`, and at
   any whitespace holding a line feed: an abbreviation such as `e.g. this` splits.
 
+## Prefix ranking
+
+A text leg object may carry `"last_as_prefix": true`
+([M180](milestones/M180/SPEC.md)): `{"text": [{"field": "title", "query": "lazy wal",
+"last_as_prefix": true}]}`. The last token is a literal prefix: a row gains **1.0, once**, when
+any of its terms starts with it, however many do; the tokens before it are scored by BM25 as
+always. The primary takes it by naming `"field": "text"`, since a string leg has no option.
+
+- The prefix is matched against the index's **analyzed** terms, as typed (case and folding
+  applied) and as the analyzer makes the word. Under English stemming a complete word meets
+  its own stem: `running` matches `run`, and so also `rune` and `runway`. That is broader than
+  a literal prefix, and differs from the `*TokenPrefix` filters (M138), which match the row's
+  unstemmed tokens. Without stemming or stopwords the two agree.
+- Highlighting marks the query's terms as before; it does not mark the prefix's expansions.
+- A one-letter prefix reads the postings of every term it matches: bytes, never another round
+  trip, and no cap is applied.
+- A query with a prefix leg is answered by the server that received it, never split across
+  servers.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

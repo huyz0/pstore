@@ -140,6 +140,7 @@ fn text_leg(field: &str, q: &str) -> Prefetch {
         field: field.to_owned(),
         query: q.to_owned(),
         limit: 40,
+        last_as_prefix: false,
     }
 }
 
