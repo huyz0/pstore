@@ -5189,6 +5189,7 @@ impl<S: BlobStore> Engine<S> {
             fts: FullText::default(),
             trigram: Vec::new(),
             fields: BTreeMap::new(),
+            types: BTreeMap::new(),
             texts: BTreeMap::new(),
         };
         let mut interfere = interfere;
