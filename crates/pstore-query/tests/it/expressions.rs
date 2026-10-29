@@ -684,7 +684,12 @@ fn expressions_out_of_bounds_are_refused() {
     );
     // 1 + 16 * (1 + 3) = 65 nodes, at depth 3.
     let wide = Expr::Sum(vec![Expr::Sum(vec![leaf(); 3]); 16]);
-    assert!(wide.check().is_err(), "65 nodes");
+    let why = wide.check().unwrap_err();
+    assert!(why.contains("64 nodes"), "65 nodes: {why}");
+    // 1 + 15 * 4 + 3 = 64 nodes: the limit itself is accepted.
+    let mut at_limit = vec![Expr::Sum(vec![leaf(); 3]); 15];
+    at_limit.push(Expr::Sum(vec![leaf(); 2]));
+    assert!(Expr::Sum(at_limit).check().is_ok(), "64 nodes");
     let wide = Expr::Sum(vec![Expr::Sum(vec![leaf(); 2]); 16]);
     assert!(wide.check().is_ok(), "49 nodes");
 }

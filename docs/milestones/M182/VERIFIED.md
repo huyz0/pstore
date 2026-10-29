@@ -62,4 +62,7 @@ CI's mutation shards on the PR missed three mutants, each now killed, by hand as
 `>=` as `<` (pruning on every row, the same answer at a sort per row: killed by
 `top_prunes_when_full_and_never_holds_more`); and the BM25 params object's arm deleted (no
 test sent a valid one: `scoring_expressions_over_http` now sends `{"last_as_prefix": true}`
-and `{}`, and the deleted arm fails it).
+and `{}`, and the deleted arm fails it). A later shard missed `Expr::check_at`'s node limit as `==`
+and as `>=`: no tree had exactly 64 nodes. `expressions_out_of_bounds_are_refused` now
+accepts one and names the limit in the 65-node refusal; both mutants fail it, which is that
+test's first observed red.
