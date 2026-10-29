@@ -719,6 +719,9 @@ pub struct Schema {
     /// Each named dense field's width, as a client writes it (M98); absent when none is known.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vectors: std::collections::BTreeMap<String, u32>,
+    /// Each attribute's recorded type (M173): `datetime`, `uuid`, `bytes` or `uint64`; `{}`
+    /// when none is recorded.
+    pub attributes: std::collections::BTreeMap<String, &'static str>,
 }
 
 /// One index, as `GET /v1/indexes/{id}` reports it.

@@ -91,6 +91,9 @@ pub struct IndexSchema {
     /// parameters; empty for none. Recorded by the first fold, never changed. No name is both
     /// one of these and `text_field`.
     pub texts: BTreeMap<String, pstore_format::text::FullText>,
+    /// Each attribute's recorded type (M173): recorded by the fold that first reads one, then
+    /// never changed. A write reads its attributes by them.
+    pub types: BTreeMap<String, pstore_format::typed::Kind>,
 }
 
 /// The most further text fields an index may declare (M152).
@@ -556,7 +559,15 @@ impl Head {
         );
         // M129: the applied outcomes follow, and force the widths.
         // M132: `keys_since` follows, and forces the outcomes.
-        let since = self.keys_since.is_some() || !texts.is_empty();
+        // M173: the recorded types are last, and force the text fields' section (empty if
+        // none), which forces `keys_since`.
+        let typed: Vec<_> = all
+            .iter()
+            .filter(|(_, _, s, _)| !s.types.is_empty())
+            .collect();
+        let types = !typed.is_empty();
+        let texted = !texts.is_empty() || types;
+        let since = self.keys_since.is_some() || texted;
         let outs = !self.outcomes.is_empty() || since;
         let wide = !widths.is_empty() || outs;
         let ext = wide || !self.externals.is_empty();
@@ -674,7 +685,7 @@ impl Head {
         if since {
             out.extend_from_slice(&self.keys_since.unwrap_or(u64::MAX).to_le_bytes());
         }
-        if !texts.is_empty() {
+        if texted {
             out.extend_from_slice(&(texts.len() as u32).to_le_bytes());
             for (kind, at, s, name) in texts {
                 put_ref(&mut out, *kind, *at, *name);
@@ -682,6 +693,17 @@ impl Head {
                 for (field, fts) in &s.texts {
                     put_str(&mut out, field);
                     put_str(&mut out, &fts.encode());
+                }
+            }
+        }
+        if types {
+            out.extend_from_slice(&(typed.len() as u32).to_le_bytes());
+            for (kind, at, s, name) in typed {
+                put_ref(&mut out, *kind, *at, *name);
+                out.extend_from_slice(&(s.types.len() as u32).to_le_bytes());
+                for (attr, k) in &s.types {
+                    put_str(&mut out, attr);
+                    out.push(kind_code(*k));
                 }
             }
         }
@@ -759,6 +781,7 @@ impl Head {
                     fts: pstore_format::text::FullText::default(),
                     trigram: Vec::new(),
                     fields: Default::default(),
+                    types: Default::default(),
                     texts: BTreeMap::new(),
                 },
             );
@@ -816,6 +839,7 @@ impl Head {
                     fts: pstore_format::text::FullText::default(),
                     trigram: Vec::new(),
                     fields: Default::default(),
+                    types: Default::default(),
                     texts: BTreeMap::new(),
                 },
             ));
@@ -1057,6 +1081,34 @@ impl Head {
                 schema.texts.insert(field, fts);
             }
         }
+        // M173: end of buffer here is "no recorded types"; they follow the text fields, which
+        // they force.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let kind = c.u8()?;
+            let schema = match kind {
+                0 => {
+                    let name = c.string()?;
+                    h.schemas.get_mut(&name)
+                }
+                1 => {
+                    let at = c.u32()? as usize;
+                    h.dropped.get_mut(at).map(|(_, _, s)| s)
+                }
+                _ => None,
+            }
+            .ok_or(EngineError::CorruptHead)?;
+            for _ in 0..c.u32()? {
+                let attr = c.string()?;
+                let k = pstore_format::typed::Kind::ALL
+                    .get(c.u8()? as usize)
+                    .copied()
+                    .ok_or(EngineError::CorruptHead)?;
+                schema.types.insert(attr, k);
+            }
+        }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
         }
@@ -1216,6 +1268,14 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// A recorded type's byte in HEAD (M173): its place in [`pstore_format::typed::Kind::ALL`].
+fn kind_code(k: pstore_format::typed::Kind) -> u8 {
+    pstore_format::typed::Kind::ALL
+        .iter()
+        .position(|x| *x == k)
+        .unwrap_or_default() as u8
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -1742,6 +1802,62 @@ mod tests {
         Ok(())
     }
 
+    /// M173 criterion 6: the recorded types round-trip, live and dropped, beside an absent
+    /// `keys_since`, which reads back absent, after the text-field section (M152) they force;
+    /// bytes after the types are refused.
+    #[test]
+    fn recorded_types_round_trip_after_keys_since() -> Result<(), EngineError> {
+        use pstore_format::typed::Kind;
+        let h = every_section();
+        assert!(h.keys_since.is_none());
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back, h);
+        let types = |h: &Head| {
+            (
+                h.schemas.get("a").map(|s| s.types.clone()),
+                h.dropped.first().map(|(_, _, s)| s.types.clone()),
+            )
+        };
+        let want = BTreeMap::from([
+            ("owner".to_owned(), Kind::Uuid),
+            ("seq".to_owned(), Kind::Uint64),
+        ]);
+        assert_eq!(types(&back), (Some(want.clone()), Some(want)));
+        // Every kind, with `keys_since` present.
+        let mut all = h.clone();
+        all.keys_since = Some(7);
+        if let Some(s) = all.schemas.get_mut("a") {
+            s.types = Kind::ALL
+                .into_iter()
+                .map(|k| (k.name().to_owned(), k))
+                .collect();
+        }
+        assert_eq!(Head::decode(&all.encode())?, all);
+        // Without types, `keys_since` absent writes nothing, as before.
+        let mut none = h.clone();
+        for s in none.schemas.values_mut() {
+            s.types.clear();
+        }
+        for (_, _, s) in &mut none.dropped {
+            s.types.clear();
+        }
+        let bytes = none.encode();
+        assert_eq!(Head::decode(&bytes)?, none);
+        // The types force an empty text-field section (M152) before them; beside a text field
+        // they follow it.
+        let mut texted = h.clone();
+        if let Some(s) = texted.schemas.get_mut("a") {
+            s.texts
+                .insert("notes".to_owned(), pstore_format::text::FullText::default());
+        }
+        assert_eq!(Head::decode(&texted.encode())?, texted);
+        assert_eq!(types(&Head::decode(&texted.encode())?), types(&back));
+        let mut longer = all.encode();
+        longer.push(0);
+        assert!(Head::decode(&longer).is_err());
+        Ok(())
+    }
+
     /// M132 criterion 10: `keys_since` round-trips; without it a HEAD encodes as M131's, and
     /// with it the M131 bytes are a prefix, so M131's decoder -- which stopped after the
     /// outcome list without checking for the end -- reads it. A cut inside it is refused.
@@ -1832,6 +1948,10 @@ mod tests {
             },
             trigram: vec!["title".to_owned(), "url".to_owned()],
             fields: BTreeMap::from([("late".to_owned(), 5)]),
+            types: BTreeMap::from([
+                ("owner".to_owned(), pstore_format::typed::Kind::Uuid),
+                ("seq".to_owned(), pstore_format::typed::Kind::Uint64),
+            ]),
             texts: Default::default(),
         };
         h.schemas.insert("a".to_owned(), schema.clone());
@@ -1866,7 +1986,9 @@ mod tests {
         // makes -- and none inside a section: a `?` that read short as a default would add
         // one. (`a_truncated_head_is_refused_at_every_length_but_a_section_boundary` pins the
         // same for a HEAD whose later sections are empty.)
-        assert_eq!(decodable.len(), 15, "{decodable:?} of {}", bytes.len());
+        // M173: the recorded types force the outcomes, `keys_since` and M152's text fields,
+        // whose `at_end` checks now each find a cut inside the HEAD: 19.
+        assert_eq!(decodable.len(), 19, "{decodable:?} of {}", bytes.len());
         for cut in &decodable {
             assert_ne!(
                 Head::decode(&bytes[..*cut])?,

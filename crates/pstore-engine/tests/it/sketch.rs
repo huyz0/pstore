@@ -35,9 +35,8 @@ async fn a_compaction_keeps_the_sketch() {
     let store = Arc::new(Accounted::new(MemoryStore::new()));
     let e = Engine::new(Arc::new(store.as_tenant(T)), T, LaneId(1));
     let declared = Declared {
-        fts: None,
         trigram: Some(vec!["s".to_owned()]),
-        texts: None,
+        ..Declared::default()
     };
     for k in 0..3 {
         let docs = (k * 500..(k + 1) * 500).map(doc).collect();
@@ -78,9 +77,8 @@ async fn a_compaction_keeps_the_sketch() {
 async fn the_engine_refuses_to_sketch_id() {
     let e = Engine::new(Arc::new(MemoryStore::new()), T, LaneId(1));
     let declared = Declared {
-        fts: None,
         trigram: Some(vec!["id".to_owned()]),
-        texts: None,
+        ..Declared::default()
     };
     let got = e
         .write_declared("idx", vec![doc(1)], Metric::DotProduct, None, &declared)

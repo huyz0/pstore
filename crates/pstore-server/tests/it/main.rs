@@ -58,6 +58,7 @@ mod patterns;
 mod peer_fixture;
 mod peer_startup;
 mod peers;
+mod persistent_types;
 mod pre_tokenized;
 mod quarantine;
 mod read_cache;

@@ -192,6 +192,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                                 fts: pstore_format::text::FullText::default(),
                                 trigram: Vec::new(),
                                 fields: Default::default(),
+                                types: Default::default(),
                                 texts: Default::default(),
                             },
                         )
