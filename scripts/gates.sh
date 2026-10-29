@@ -26,6 +26,7 @@ run "scripts/check-verified.py"    py ./scripts/check-verified.py
 run "scripts/check-slos.py"        py ./scripts/check-slos.py
 run "scripts/check-milestone-ids.py" py ./scripts/check-milestone-ids.py
 run "scripts/check-milestone-ids.py --self-test" py ./scripts/check-milestone-ids.py --self-test
+run "scripts/ci-changes.py --self-test" py ./scripts/ci-changes.py --self-test
 run "scripts/selftest-review.sh"   ./scripts/selftest-review.sh
 run "scripts/selftest-check-verified.sh" ./scripts/selftest-check-verified.sh
 run "scripts/selftest-check-slos.sh" ./scripts/selftest-check-slos.sh

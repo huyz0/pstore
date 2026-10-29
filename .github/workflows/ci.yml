@@ -31,7 +31,29 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  # Does this change need the Rust jobs? A change that touches only documentation does not:
+  # it ran the full build, test, coverage, recall, mutation and three-OS matrix for a Markdown
+  # edit. `scripts/ci-changes.py` decides, and counts as code any document a Rust source reads
+  # (`docs/deploy.md`, `docs/research`). `harness` always runs. A job skipped by `if` reports
+  # as skipped, which a required check accepts, and any doubt in the script answers `true`.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: classify
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) ./scripts/ci-changes.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" ;;
+            push) ./scripts/ci-changes.py "${{ github.event.before }}" "${{ github.sha }}" ;;
+            *) echo code=true ;;
+          esac | tee -a "$GITHUB_OUTPUT"
+
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +68,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     services:
       # ⚠️ A service container cannot be given a command, so RustFS finds its data directory
@@ -74,6 +98,8 @@ jobs:
       - run: cargo nextest run --all-features
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +121,8 @@ jobs:
   # adds a round trip must fail the build. Release mode and its own job, because a
   # gate-scale corpus does not belong in the unit suite.
   recall:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +152,8 @@ jobs:
   # job limit. `mutants` itself only gathers the shards, so the check a merge waits on keeps
   # its name.
   mutants-shard:
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -180,6 +209,8 @@ jobs:
   # `unsafe_code = "forbid"` at the workspace root makes a stray unsafe block a
   # compile error, and miri checks the one crate that is allowed to have them.
   unsafe-audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -219,6 +250,7 @@ jobs:
       - run: ./scripts/selftest-coverage-mismatch.sh
       - run: ./scripts/check-milestone-ids.py
       - run: ./scripts/check-milestone-ids.py --self-test
+      - run: ./scripts/ci-changes.py --self-test
       - run: ./scripts/check-poison.sh --selftest
       # Every shell script the gates run is portable, or declares why not -- a grep, and
       # the `portable` job below is what catches what a grep cannot.
@@ -234,6 +266,8 @@ jobs:
   # so because nothing ran it there. Required, not `continue-on-error` -- a portability job
   # allowed to fail is a portability comment.
   portable:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
