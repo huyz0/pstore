@@ -217,7 +217,8 @@ pub async fn rank<S: BlobStore>(
     for d in unfolded {
         if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
             let s = node.score(fields, d, &mut vec![None; fields.0.len()]);
-            if s > 0.0 {
+            // Asked first, so a row it would refuse is never copied.
+            if top.wants(s) {
                 // As a block's rows are: attributes, no vectors.
                 top.offer(
                     s,
@@ -401,8 +402,13 @@ impl Top {
         }
     }
 
+    /// Whether a row scoring `s` is kept, for now: above 0, and room for it.
+    fn wants(&self, s: f64) -> bool {
+        self.cap > 0 && s > 0.0
+    }
+
     fn offer(&mut self, s: f64, d: Document) {
-        if self.cap == 0 || s <= 0.0 {
+        if !self.wants(s) {
             return;
         }
         self.kept.push((s, d));
@@ -420,5 +426,47 @@ impl Top {
     fn into_sorted(mut self) -> Vec<(f64, Document)> {
         self.prune();
         self.kept
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(i: usize) -> Document {
+        Document::new(format!("d{i:03}"), vec![0.0])
+    }
+
+    /// Pruned only when it fills, so a row costs a push and not a sort; held to the bound.
+    #[test]
+    fn top_prunes_when_full_and_never_holds_more() {
+        let mut top = Top::new(10);
+        for i in 0..63 {
+            top.offer(1.0 + i as f64, doc(i));
+        }
+        assert_eq!(top.kept.len(), 63, "not pruned before it fills");
+        top.offer(100.0, doc(63));
+        assert_eq!(top.kept.len(), 10, "pruned when it fills");
+        for i in 64..1_000 {
+            top.offer(i as f64, doc(i));
+            assert!(top.kept.len() < 64);
+        }
+        let ids: Vec<String> = top.into_sorted().into_iter().map(|(_, d)| d.id).collect();
+        assert_eq!(
+            ids,
+            (990..1_000)
+                .rev()
+                .map(|i| format!("d{i:03}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn top_refuses_zero_and_an_empty_cap() {
+        let mut top = Top::new(3);
+        top.offer(0.0, doc(0));
+        assert!(top.kept.is_empty());
+        assert!(!Top::new(0).wants(1.0));
+        assert!(Top::new(1).wants(f64::MIN_POSITIVE));
     }
 }

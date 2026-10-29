@@ -383,4 +383,32 @@ async fn scoring_expressions_over_http() {
     for w in [json!(0), json!(1e-3), json!(1000)] {
         ok(&api, &rank(&json!(["Product", w, bm]))).await;
     }
+
+    // The params object: `last_as_prefix` is the leg's, and `{}` is no option.
+    let prefixed = rows(
+        &ok(
+            &api,
+            &json!({"text": [{"field": "content", "query": "huge wha", "last_as_prefix": true}],
+                    "fusion": {"sum": {"weights": [1.0]}}, "top_k": 100}),
+        )
+        .await,
+    );
+    let mut want: BTreeMap<String, f64> = prefixed.into_iter().collect();
+    want.retain(|_, s| *s > 0.0);
+    let got = rows(
+        &ok(
+            &api,
+            &rank(&json!(["content", "BM25", "huge wha", {"last_as_prefix": true}])),
+        )
+        .await,
+    );
+    assert_defined(&got, &want, "last_as_prefix");
+    assert!(
+        got.iter().any(|(id, _)| id == "d5"),
+        "the prefix reaches `whale`: {got:?}"
+    );
+    let plain = ok(&api, &rank(&json!(["content", "BM25", "huge wha"]))).await;
+    let empty = ok(&api, &rank(&json!(["content", "BM25", "huge wha", {}]))).await;
+    assert_eq!(plain["results"], empty["results"]);
+    assert_ne!(rows(&plain), got, "the option changes the answer");
 }

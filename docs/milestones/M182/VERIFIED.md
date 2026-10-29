@@ -54,3 +54,12 @@ request's number, and `scoring_expressions_over_http` refuses `1e-50` (seen red 
 fix). Kept: a filter on an attribute named `Sum`, `Max` or `Product` reads as that operator
 inside `rank_by` (stated in `docs/deploy.md`); `expressions_out_of_bounds_are_refused` was
 not seen red, as item 4 says.
+
+CI's mutation shards on the PR missed three mutants, each now killed, by hand as above:
+`rank`'s `s > 0.0` before an unfolded row's copy (redundant with `Top::offer`'s own test, so
+`>=` changed nothing: the two now share `Top::wants`, and its mutants fail
+`zero_scores_are_dropped` and `top_refuses_zero_and_an_empty_cap`); `Top::offer`'s
+`>=` as `<` (pruning on every row, the same answer at a sort per row: killed by
+`top_prunes_when_full_and_never_holds_more`); and the BM25 params object's arm deleted (no
+test sent a valid one: `scoring_expressions_over_http` now sends `{"last_as_prefix": true}`
+and `{}`, and the deleted arm fails it).
