@@ -255,6 +255,25 @@ impl FdeClusters {
         probes: usize,
         limit: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
+        Ok(self
+            .search_vector_probed(store, segment_key, base, q, probes, limit)
+            .await?
+            .0)
+    }
+
+    /// [`Self::search_vector_at`], with the lists it probed (M165).
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    pub async fn search_vector_probed<S: BlobStore>(
+        &self,
+        store: &S,
+        segment_key: &Key,
+        base: u64,
+        q: &[f32],
+        probes: usize,
+        limit: usize,
+    ) -> Result<(Vec<(usize, f32)>, usize), FormatError> {
         let dim = self.centroids.first().map_or(0, Vec::len);
         let width = (dim * 4) as u64;
         let order = self.probe_order(q);
@@ -273,6 +292,7 @@ impl FdeClusters {
                 Some(lo..lo + self.lists.get(*i)?.len() as u64 * width)
             })
             .collect();
+        let probed = ranges.len();
         let bufs = store.get_ranges(&vectors_key(segment_key), &ranges).await?;
         // Indexed by row, first score kept, as the `BTreeMap`'s `or_insert` was (M119); a row
         // past any real segment's -- a corrupt sidecar's -- in a map beside it, as before.
@@ -311,7 +331,7 @@ impl FdeClusters {
             .chain(far)
             .collect();
         crate::top::top_k_by(&mut scored, limit, crate::top::best_first);
-        Ok(scored)
+        Ok((scored, probed))
     }
 }
 

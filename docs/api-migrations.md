@@ -275,6 +275,50 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M165: a query explains the plan it ran
+
+A ranked query (`POST /v1/indexes/{index}/query`) may carry `"explain": true`.
+
+**What it adds.** The response then carries `meta.explain`:
+
+```
+{"segments", "shadow", "remote_segments", "filter", "fusion",
+ "legs": [{"kind", "field", "limit", "mode", "requested", "candidates", "kept"}]}
+```
+
+The fields:
+
+- `segments`: the folded segments the query targeted.
+- `shadow`: the unfolded ids each folded segment was widened by.
+- `remote_segments`: the segments a peer server answered. A share that failed and ran
+  here counts as local.
+- `filter`: whether a filter applied.
+- `fusion`: `rrf`, `weighted_rrf`, `sum` or `max`.
+
+Each entry of `legs` covers the segments scored on this server, in request order:
+
+- `mode` is `limited`, `widened` (asked for more, to survive deleted and superseded
+  rows) or `exhaustive`. An exhaustive leg also carries `exhaustive_because`, which is
+  `filter` or `sum`.
+- `requested` is the rows asked of each segment, summed.
+- `candidates` is the hits the segments returned.
+- `kept` is the hits left after the filter, deletes and each segment's cut.
+- A `dense` leg also carries `approximate_segments`, `exact_segments` and `probes`, the
+  lists its approximate searches probed.
+
+**What it costs.** Nothing: the results and `meta.cost` are those of the same query
+without it. Without `explain`, or with `false`, the response is unchanged.
+
+**What it refuses.** `explain` answers `400` when:
+
+- it is not a boolean;
+- it is set with `rank_by` or `aggregate_by`;
+- it is set inside a multi-query's `queries`.
+
+**What it leaves out.** The rows of this process's own unfolded writes are in no figure.
+
+Nothing stored changes. Evidence is in [M165 verification](milestones/M165/VERIFIED.md).
+
 ## M162: an index measures its own recall, online, at one snapshot
 
 `POST /v1/indexes/{index}/recall` (scope `read`) with `{"num", "top_k", "filters",

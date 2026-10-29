@@ -578,6 +578,45 @@ async fn a_split_query_keeps_the_round_trip_budget() {
     );
 }
 
+/// M165: explain counts the segments a peer answered as remote, and a share that failed and
+/// ran here as local.
+#[tokio::test]
+async fn explain_counts_remote_segments() {
+    let (store, servers, _) = cluster(&[]).await;
+    let all = urls(&servers);
+    fill(&store, &servers[0].api, &all, 8).await;
+    let segs = segments(&store).await;
+    let remote = segs
+        .iter()
+        .filter(|s| pstore_engine::assign(s, &all) != 0)
+        .count();
+    assert!(
+        remote > 0 && remote < segs.len(),
+        "{remote} of {}",
+        segs.len()
+    );
+    let q = json!({"vector": Q, "top_k": 10, "explain": true});
+    let local = |x: &Value| {
+        x["legs"][0]["approximate_segments"].as_u64().unwrap()
+            + x["legs"][0]["exact_segments"].as_u64().unwrap()
+    };
+    let (s, got) = query(&servers[0].api, &q).await;
+    assert_eq!(s, 200, "{got}");
+    let x = &got["meta"]["explain"];
+    assert_eq!(x["segments"], json!(segs.len()), "{x}");
+    assert_eq!(x["remote_segments"], json!(remote), "{x}");
+    assert_eq!(local(x), (segs.len() - remote) as u64, "{x}");
+    // Both peers failing: every share runs here.
+    for s in &servers[1..] {
+        s.view.failing.store(true, Ordering::SeqCst);
+    }
+    let (s, got) = query(&servers[0].api, &q).await;
+    assert_eq!(s, 200, "{got}");
+    let x = &got["meta"]["explain"];
+    assert_eq!(x["remote_segments"], json!(0), "{x}");
+    assert_eq!(local(x), segs.len() as u64, "{x}");
+}
+
 #[tokio::test]
 async fn a_failed_peer_costs_rounds_not_answers() {
     // A server in the list that is not listening: its segments' parts fail to connect.
