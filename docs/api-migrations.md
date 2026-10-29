@@ -141,6 +141,31 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M143: a request body's JSON shape is bounded
+
+⚠️ **Behaviour change.** Every public JSON body is checked before it is parsed. A body is
+refused with `413 request_too_large` (not retryable), and the message names the limit, when:
+
+- arrays and objects nest more than 128 deep (`json_depth`). Today such a body was a
+  `400`, because the JSON parser's own limit is 128; a malformed body past that depth now
+  reports its depth;
+- one array has more than 16,384 elements (`array_elements`): a write's `documents`,
+  `deletes` or `patch_rows`, a vector's components, a filter's `In` list or `And`/`Or`
+  clauses, an array attribute;
+- one object has more than 1,024 members (`object_members`): a document's attributes, a
+  patch, named vector fields;
+- one string, between its quotes, is longer than 256 KiB (`string_bytes`): an id, a text
+  field, an attribute value or name, a base64 vector.
+
+Split a larger write into several. `PSTORE_REQUEST_LIMITS_CONFIG` takes the four names
+above to lower them; they cannot be raised.
+
+A vector, text or multi-query leg with `top_k` above 10,000 is now `400 bad_request`
+("top_k may be at most 10000 for a query leg"). Before, it had no bound. Aggregations,
+facets and `rank_by` orders keep their existing 10,000 bounds and messages.
+
+Nothing stored changes. Evidence is in [M143 verification](milestones/M143/VERIFIED.md).
+
 ## M142: outer RRF over a multi-query
 
 A multi-query's root may carry `rerank_by`, `limit` and `offset` beside `queries`:

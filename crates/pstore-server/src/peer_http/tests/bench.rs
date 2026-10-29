@@ -182,9 +182,8 @@ async fn peer_transport_microbench() {
         material.key.as_bytes(),
     )
     .unwrap();
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = super::tests::same_port().await;
     let address = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(address).unwrap();
     let calls = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let handler: Handler<Payload, Payload> = {
         let calls = calls.clone();
