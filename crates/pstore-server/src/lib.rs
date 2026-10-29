@@ -1671,9 +1671,8 @@ fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
             }
         }
         for id in ids {
-            let serde_json::Value::String(id) = id else {
-                return Err(bad("ids are strings".to_owned()));
-            };
+            // M176: a string or an integer, as a row's id is; the row reads it again.
+            let shown = types::Id::of(&id).map_err(bad)?;
             let mut attrs = serde_json::Map::new();
             let mut row = serde_json::Map::new();
             // Each column's cells in id order, one a row. A null cell is left to the row's
@@ -1690,9 +1689,9 @@ fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
                 to.insert(name.to_owned(), v);
             }
             row.insert("attributes".to_owned(), attrs.into());
-            row.insert("id".to_owned(), id.clone().into());
+            row.insert("id".to_owned(), id);
             let doc = serde_json::from_value(row.into())
-                .map_err(|e| bad(format!("document {id}: {e}")))?;
+                .map_err(|e| bad(format!("document {shown}: {e}")))?;
             req.documents.push(doc);
         }
     }
@@ -1730,9 +1729,9 @@ fn patch_rows_of(
             .ok_or_else(|| ApiError::bad_request("a patch is {\"id\", \"attributes\"}"))?;
         let id = o
             .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ApiError::bad_request("a patch needs a string id"))?
-            .to_owned();
+            .ok_or_else(|| "a patch needs an id".to_owned())
+            .and_then(types::Id::of)
+            .map_err(ApiError::bad_request)?;
         if let Some(k) = o.keys().find(|k| *k != "id" && *k != "attributes") {
             return Err(ApiError::bad_request(if k == "vector" {
                 format!("patch of {id}: a patch carries no vector; upsert the row to change it")
@@ -1774,16 +1773,91 @@ fn patch_rows_of(
             columns.push((name, col.into_iter()));
         }
         for id in &ids {
-            let id = id.as_str().ok_or_else(|| bad("ids are strings"))?;
+            let id = types::Id::of(id).map_err(|e| bad(&e))?;
             // Each column's cells in id order, one a row, moved.
             let attrs = columns
                 .iter_mut()
                 .filter_map(|(name, col)| col.next().map(|v| (name.clone(), v)))
                 .collect();
-            rows.push((id.to_owned(), attrs));
+            rows.push((id, attrs));
         }
     }
     Ok(rows)
+}
+
+/// Every id a write names read by the index's id kind (M176), `Some(None)` a string and
+/// `None` unknown: a string as a `uuid`'s form under `uuid`, refused when it spells none; an
+/// id of another kind refused as a conflict; and ids of two kinds refused. Under no known
+/// kind the engine judges the rows. Rewrites the ids only with `apply`, so a refusal by a
+/// stale kind can be judged again by a fresh one.
+fn typed_ids(
+    docs: &mut [types::DocumentIn],
+    patches: &mut [RawPatch],
+    deletes: &mut [types::Id],
+    kind: Option<Option<pstore_format::typed::Kind>>,
+    apply: bool,
+) -> Result<(), ApiError> {
+    use pstore_format::typed::Kind;
+    let name = |k: Option<Kind>| k.map_or("string", Kind::name);
+    // An id of another kind than the index's is a conflict with its schema, as the engine
+    // names one; a string spelling no uuid is malformed.
+    let conflict = |id: &types::Id, want: Option<Kind>| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!("id {id} is not a {0}; this index's ids are {0}", name(want)),
+        )
+    };
+    let ids = docs
+        .iter_mut()
+        .map(|d| &mut d.id)
+        .chain(patches.iter_mut().map(|(id, _)| id))
+        .chain(deletes.iter_mut());
+    let mut first = None;
+    for id in ids {
+        let held = pstore_format::id::kind(id.as_str());
+        let k = match kind {
+            Some(Some(Kind::Uuid)) if held.is_none() => {
+                let u = pstore_format::typed::parse_uuid(id.as_str())
+                    .ok_or_else(|| ApiError::bad_request(format!("id {id} is not a uuid")))?;
+                if apply {
+                    id.0 = pstore_format::id::uuid(&u);
+                }
+                Some(Kind::Uuid)
+            }
+            Some(want) if held != want => return Err(conflict(id, want)),
+            _ => held,
+        };
+        match first {
+            None => first = Some(k),
+            Some(f) if f != k => {
+                return Err(ApiError::bad_request(format!(
+                    "id {id} is of another kind than the write's first id: an index's ids are \
+                     all strings, all uint64 or all uuid"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The id kind a write reads its ids by (M176), from `dated` (the known kinds and the
+/// request's declarations) and whether the request declares `id: string`.
+fn id_kind(
+    dated: &typed::Declarations,
+    declared_string: bool,
+) -> Result<Option<Option<pstore_format::typed::Kind>>, ApiError> {
+    match (dated.get(pstore_engine::ID_KIND), declared_string) {
+        (Some(k), true) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!("id is declared string; this index's ids are {}", k.name()),
+        )),
+        (Some(k), false) => Ok(Some(Some(*k))),
+        (None, true) => Ok(Some(None)),
+        (None, false) => Ok(None),
+    }
 }
 
 /// A write's documents, patches and by-filter patch, their attributes read by `dated`.
@@ -1814,7 +1888,7 @@ fn typed_ops(
 }
 
 /// A patch as a request spells it: its id and its attributes, not yet read by any type.
-type RawPatch = (String, serde_json::Map<String, serde_json::Value>);
+type RawPatch = (types::Id, serde_json::Map<String, serde_json::Value>);
 
 /// The patches `rows` spell, their attributes read by `dated` (M173: the known types, so
 /// after the HEAD read a refusal of the request's shape never pays for).
@@ -1833,7 +1907,7 @@ fn patches_of(
 /// One patch of `id`: `attributes` converted as a document's are, `null` removing one.
 /// Refusals name `who`.
 fn patch_of(
-    id: String,
+    id: types::Id,
     who: &str,
     attrs: serde_json::Map<String, serde_json::Value>,
     dated: &typed::Declarations,
@@ -1865,7 +1939,7 @@ fn patch_of(
     }
     let doc = to_document(as_doc, dated)?;
     Ok(pstore_engine::Patch {
-        id,
+        id: id.0,
         set: doc.attrs,
         unset,
     })
@@ -1913,7 +1987,7 @@ fn patch_by_filter_attrs(
     dated: &typed::Declarations,
 ) -> Result<pstore_engine::Patch, ApiError> {
     // Refusals from the document conversion name no operation, so they are prefixed here.
-    patch_of(String::new(), "patch_by_filter", attrs, dated).map_err(|e| {
+    patch_of(types::Id(String::new()), "patch_by_filter", attrs, dated).map_err(|e| {
         if e.message.starts_with("patch_by_filter") {
             e
         } else {
@@ -2167,19 +2241,57 @@ async fn write_documents<S: BlobStore + 'static>(
         || patch_by
             .as_ref()
             .is_some_and(|(_, attrs)| !attrs.is_empty());
-    let mut dated = if valued {
+    // M176: and every id by the index's id kind -- needed only to read a string spelling a
+    // uuid as one, so a write naming none reads nothing more: any other id of the wrong kind
+    // is the engine's to refuse, at zero requests, as M141's bound needs.
+    let uuids = req
+        .documents
+        .iter()
+        .map(|d| &d.id)
+        .chain(patches.iter().map(|(id, _)| id))
+        .chain(req.deletes.iter())
+        .any(|id| pstore_format::typed::parse_uuid(id.as_str()).is_some());
+    let mut dated = if valued || uuids {
         engine.known_types(&index).await
     } else {
         pstore_engine::Types::new()
     };
     dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
+    let mut patches = patches;
+    let declared_string = req
+        .schema
+        .as_ref()
+        .and_then(|s| s.get(pstore_query::ID_ATTRIBUTE))
+        .is_some_and(|ty| ty == "string");
+    // A refusal by a kind the request did not declare re-reads HEAD once before it stands,
+    // as an attribute type's does (M173): the kind held may be a dropped index's.
+    if let Err(e) = id_kind(&dated, declared_string)
+        .and_then(|k| typed_ids(&mut req.documents, &mut patches, &mut req.deletes, k, false))
+    {
+        if !dated.contains_key(pstore_engine::ID_KIND) || types.contains_key(pstore_engine::ID_KIND)
+        {
+            return Err(e);
+        }
+        dated = engine.reread_types(&index).await?;
+        dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
+    }
+    typed_ids(
+        &mut req.documents,
+        &mut patches,
+        &mut req.deletes,
+        id_kind(&dated, declared_string)?,
+        true,
+    )?;
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
     // Moved, not copied (M119): the documents are not read again -- unless a type this
     // request did not declare reads them. A refusal by one re-reads HEAD once before it
     // stands (M9f.2), because the type held may be a dropped index's, and the read needs
     // the request as it came.
-    let kept = (dated.len() > types.len())
+    // The id's kind reads no attribute (M176), so it alone asks for no copy.
+    let kept = dated
+        .keys()
+        .any(|n| n != pstore_engine::ID_KIND && !types.contains_key(n))
         .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
     let (docs, patches, patch_by) = match (
         typed_ops(
@@ -2217,7 +2329,10 @@ async fn write_documents<S: BlobStore + 'static>(
         Some(_) => Some(engine.mark().await?),
         None => None,
     };
-    let deletes = std::mem::take(&mut req.deletes);
+    let deletes: Vec<String> = std::mem::take(&mut req.deletes)
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
     // M141: the whole request's share of the tenant's buffer, before anything is buffered.
     let need = write_footprint(
         &docs,
@@ -2556,7 +2671,7 @@ fn affected_ids_bounded(
         .documents
         .iter()
         .map(|d| d.id.as_str())
-        .chain(req.deletes.iter().map(String::as_str))
+        .chain(req.deletes.iter().map(types::Id::as_str))
         .chain(patches.iter().map(|(id, _)| id.as_str()))
         .collect();
     if named.len() > AFFECTED_IDS_MAX {
@@ -3817,7 +3932,17 @@ async fn index_summary<S: BlobStore + 'static>(
                 .into_iter()
                 .map(|(n, w)| (n, w.saturating_sub(sc.metric.extra() as u32)))
                 .collect(),
-            attributes: sc.types.into_iter().map(|(n, k)| (n, k.name())).collect(),
+            // M176: the id's kind is recorded among the types, under a name no attribute has.
+            id: sc
+                .types
+                .get(pstore_engine::ID_KIND)
+                .map_or("string", |k| k.name()),
+            attributes: sc
+                .types
+                .into_iter()
+                .filter(|(n, _)| n != pstore_engine::ID_KIND)
+                .map(|(n, k)| (n, k.name()))
+                .collect(),
         }),
         rejected_rows: s.rejected_rows,
         quarantined_rows: s.quarantined_rows,
@@ -3889,7 +4014,8 @@ async fn export_quarantine<S: BlobStore + 'static>(
                 .collect();
             serde_json::json!({
                 "document": {
-                    "id": r.document.id,
+                    // M176: a typed id answered as written.
+                    "id": to_json(&pstore_format::id::value(&r.document.id)),
                     "vector": r.document.vector(),
                     "attributes": attrs,
                 },
@@ -4531,6 +4657,22 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
     let mut out = typed::Declarations::new();
     for (name, ty) in schema {
+        // M176: the ids' kind, which no document carries as an attribute; `string` is the
+        // default, so it declares nothing to remember.
+        // An object (full text, regex) falls through, to be refused as any reserved name is.
+        if name == pstore_query::ID_ATTRIBUTE && !ty.is_object() {
+            match ty.as_str() {
+                Some("string") => {}
+                Some("uint64") => _ = out.insert(name.clone(), pstore_format::typed::Kind::Uint64),
+                Some("uuid") => _ = out.insert(name.clone(), pstore_format::typed::Kind::Uuid),
+                _ => {
+                    return Err(bad(format!(
+                        "\"id\" is declared {ty}; an id is string, uint64 or uuid"
+                    )));
+                }
+            }
+            continue;
+        }
         // An object naming `full_text_search` is a full-text declaration (M14), which
         // `declared_fts` reads; any other object is refused below, with a datetime's message.
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
@@ -4925,7 +5067,7 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         text,
         attributes,
     } = d;
-    let mut doc = Document::new(id.clone(), vector.unwrap_or_default());
+    let mut doc = Document::new(id.0.clone(), vector.unwrap_or_default());
     let refuse = |name: &str, why: &str| {
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };

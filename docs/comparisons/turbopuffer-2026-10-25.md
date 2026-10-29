@@ -143,7 +143,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 
 | Surface | turbopuffer contract | pstore implementation | Assessment |
 |---|---|---|---|
-| IDs | uint64, UUID, bounded string | JSON string only, no matching public 64-byte ID contract | Partial; D |
+| IDs | uint64, UUID, bounded string | String, `uint64` or `uuid` per index (M176); no 64-byte bound on a string id | Partial; D |
 | Row layout | ID plus attribute/vector columns on the row | Required default `vector`; attributes nested | Text-only documents are currently refused, including an empty default vector; D |
 | Scalar attributes | string, int, uint, float, uuid, datetime, bool, bytes | i64, finite float, string, bool, request-declared RFC3339 datetime | Missing uint64/UUID/bytes types and persistent declarations; D |
 | Arrays | Typed scalar arrays; `[]string` can be FTS | Arrays of accepted scalars; text field must be one string | No homogeneous schema contract or array FTS parity; D/E |
@@ -241,7 +241,7 @@ Sources: [query planning](../../crates/pstore-server/src/lib.rs),
 | Vendor operators | pstore support | Compatibility issue |
 |---|---|---|
 | `Eq`, `NotEq` | Present, null maps to absent/present | Mixed types, arrays, nulls and unknown attributes need conformance fixtures |
-| `In`, `NotIn` | Present | Typed IDs/UUID/uint limitations remain |
+| `In`, `NotIn` | Present | Present on `uint64` and `uuid` ids too (M176) |
 | `Contains`, `NotContains`, `ContainsAny`, `NotContainsAny` | Present | Same type limitations; do not infer array ordering predicates |
 | `Lt`, `Lte`, `Gt`, `Gte` | Present | Scalar semantics only for the compatible subset |
 | `AnyLt`, `AnyLte`, `AnyGt`, `AnyGte` | Missing from HTTP parser | E |
