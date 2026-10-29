@@ -109,6 +109,9 @@ pub enum QueryError {
     /// the first such field by name. A typo, or a field never declared.
     #[error("no segment carries the text field `{0}`")]
     UnknownTextField(String),
+    /// A scoring expression outside its limits (M182).
+    #[error("{0}")]
+    Expression(String),
 }
 
 /// One segment and the centroid table that belongs to it.
@@ -195,7 +198,7 @@ impl Opened {
 /// it, when `a` keeps a term for it: dictionary terms are analyzed, so a complete word
 /// must meet its own stored stem. When one form starts with the other only the shorter is
 /// kept, since its run of terms holds the other's.
-fn leg_terms(
+pub(crate) fn leg_terms(
     a: &pstore_format::text::Analyzer,
     query: &str,
     last_as_prefix: bool,

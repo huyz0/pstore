@@ -42,7 +42,8 @@ The vendor's [query reference](https://turbopuffer.com/docs/query), read 2026-10
      leg sums them. A row the leg does not hit scores 0. Those statistics count every sealed
      row of each segment whose dictionary carries the field: deleted rows, shadowed old
      versions, and rows lacking the field (a length of 0) included. A segment where no row
-     has a token of the field carries no dictionary for it and adds nothing. The unfolded
+     has text under the field (a non-empty string, M150) carries no dictionary for it and
+     adds nothing. The unfolded
      rows add their own by the same rule, as the fresh segment's dictionary does.
    - `tf` and the row's length come from re-analyzing the row's stored value of the field,
      with the function the segment builder uses (`build_with`). So `tf` and the length are

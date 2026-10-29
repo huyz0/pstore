@@ -387,45 +387,100 @@ where
     N: Fn() -> T,
     O: Fn(&mut T, Document),
 {
-    let opened = futures_util::future::try_join_all(targets.iter().map(|t| async move {
-        let (segment, deleted) =
-            futures_util::future::join(Segment::open_at(store, &t.segment, t.segment_len), async {
-                match &t.deleted {
-                    // As the ranked query reads it: an unreadable vector is an error, never
-                    // an answer that includes the rows it deletes.
-                    Some(k) => store
-                        .get_immutable(k, pstore_blob::Class::Pinned)
-                        .await
-                        .map(|raw| crate::deletes::Rows::decode(&raw))
-                        .map_err(|e| QueryError::Format(pstore_format::FormatError::from(e))),
-                    None => Ok(crate::deletes::Rows::default()),
-                }
-            })
-            .await;
-        Ok::<_, QueryError>((segment?, deleted?))
-    }))
-    .await?;
-    let (new, offer) = (&new, &offer);
-    futures_util::future::try_join_all(opened.iter().zip(targets).map(
-        |((segment, deleted), t)| async move {
-            let mut local = new();
-            segment
-                .visit_rows_where(
-                    store,
-                    &t.segment,
-                    |zones| filter.is_none_or(|f| f.could_admit(zones)),
-                    |row, doc| {
-                        let hidden =
-                            deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
-                        if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
-                            offer(&mut local, doc);
-                        }
-                    },
+    let opened = open(store, targets, false).await?;
+    visit_opened(store, targets, &opened, filter, shadow, new, offer).await
+}
+
+/// One target opened for a visit: its footer, its delete vector, and -- when asked for and
+/// HEAD says it has one -- its term-dictionary sidecar (M182).
+pub(crate) struct Opened {
+    pub(crate) segment: Segment,
+    deleted: crate::deletes::Rows,
+    pub(crate) dictionary: Option<bytes::Bytes>,
+}
+
+/// Every target opened, in one fan-out: a visit's first round. With `dictionaries`, each
+/// target's term dictionary rides the same round (M182).
+pub(crate) async fn open<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    dictionaries: bool,
+) -> Result<Vec<Opened>, QueryError> {
+    futures_util::future::try_join_all(targets.iter().map(|t| async move {
+        let deleted = async {
+            match &t.deleted {
+                // As the ranked query reads it: an unreadable vector is an error, never
+                // an answer that includes the rows it deletes.
+                Some(k) => store
+                    .get_immutable(k, pstore_blob::Class::Pinned)
+                    .await
+                    .map(|raw| crate::deletes::Rows::decode(&raw))
+                    .map_err(|e| QueryError::Format(pstore_format::FormatError::from(e))),
+                None => Ok(crate::deletes::Rows::default()),
+            }
+        };
+        let dictionary = async {
+            if !(dictionaries && t.text_dict) {
+                return Ok(None);
+            }
+            store
+                .get_immutable(
+                    &pstore_format::text::dict_key(&t.segment),
+                    pstore_blob::Class::Pinned,
                 )
-                .await?;
-            Ok::<_, QueryError>(local)
-        },
-    ))
+                .await
+                .map(Some)
+                .map_err(|e| QueryError::Format(pstore_format::FormatError::from(e)))
+        };
+        let (segment, deleted, dictionary) = futures_util::future::join3(
+            Segment::open_at(store, &t.segment, t.segment_len),
+            deleted,
+            dictionary,
+        )
+        .await;
+        Ok::<_, QueryError>(Opened {
+            segment: segment?,
+            deleted: deleted?,
+            dictionary: dictionary?,
+        })
+    }))
+    .await
+}
+
+/// [`visit`]'s second round, over targets already [`open`]ed.
+pub(crate) async fn visit_opened<S, T, N, O>(
+    store: &S,
+    targets: &[Target],
+    opened: &[Opened],
+    filter: Option<&Predicate>,
+    shadow: &HashSet<String>,
+    new: N,
+    offer: O,
+) -> Result<Vec<T>, QueryError>
+where
+    S: BlobStore,
+    N: Fn() -> T,
+    O: Fn(&mut T, Document),
+{
+    let (new, offer) = (&new, &offer);
+    futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
+        let mut local = new();
+        o.segment
+            .visit_rows_where(
+                store,
+                &t.segment,
+                |zones| filter.is_none_or(|f| f.could_admit(zones)),
+                |row, doc| {
+                    let hidden =
+                        o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
+                    if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
+                        offer(&mut local, doc);
+                    }
+                },
+            )
+            .await?;
+        Ok::<_, QueryError>(local)
+    }))
     .await
 }
 

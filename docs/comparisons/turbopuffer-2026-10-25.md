@@ -203,9 +203,9 @@ contract fixtures, rather than assuming identical validation.
 | `SparseKNN` | Index/query library only | Expose string-key sparse vectors first; D |
 | `BM25` string | `text` query on default text field | Single-field only |
 | `BM25` token array and `last_as_prefix` | A text leg object's `query` may be an array of tokens (M158) and carry `"last_as_prefix": true` (M180) | Equivalent, scored 1.0 once a row. The prefix meets analyzed terms, so under stemming a complete word also expands through its stem; a prefix query is not split across servers |
-| `Sum`, `Max` | Text-leg fusion exists | Limited composition, no recursive per-field expression tree; E |
-| `Product` in either argument order | Some weighting via fusion/boost | Not an arbitrary nested weighted scoring expression; E |
-| Filter as score | Windowed equality boost | Not whole-corpus filter scoring; E |
+| `Sum`, `Max` | `rank_by` expression (M182), nested, over any full-text field | Equivalent; a whole-corpus scan, limited to 16 clauses, 64 nodes and depth 8 |
+| `Product` in either argument order | Both forms in a `rank_by` expression (M182) | Equivalent; a weight is 0 or 0.001 to 1000 |
+| Filter as score | Any filter in a `rank_by` expression scores 1 or 0 (M182) | Equivalent, over the whole corpus |
 | `Attribute` | Windowed numeric boost | Not whole-corpus numeric ranking expression; E |
 | `Saturate(midpoint, exponent)` | Boost saturation uses pivot | Different parameterization/domain; E |
 | `Decay(midpoint, exponent)` | Boost decay uses origin/scale/shape | Different function, not a field rename; E |

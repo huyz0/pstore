@@ -659,6 +659,14 @@ pub fn strings(v: &Value) -> impl Iterator<Item = &str> {
     }))
 }
 
+/// The terms a row's value of a text field is indexed under (M182): each string analyzed
+/// alone, in order. What [`build_with`] posts and counts, so a scorer re-reading a row gets
+/// its postings' `tf` and its fieldnorm by construction.
+#[must_use]
+pub fn value_terms(v: &Value, analyzer: &Analyzer) -> Vec<String> {
+    strings(v).flat_map(|s| analyze(analyzer, s)).collect()
+}
+
 /// Whether a text field's value holds text (M150): some string of it is non-empty.
 #[must_use]
 pub fn has_text(v: &Value) -> bool {
@@ -687,10 +695,8 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
         let tokens: Vec<String> = d
             .attrs
             .get(field)
-            .into_iter()
-            .flat_map(strings)
-            .flat_map(|s| analyze(analyzer, s))
-            .collect();
+            .map(|v| value_terms(v, analyzer))
+            .unwrap_or_default();
         fieldnorms.push(tokens.len() as u32);
         let mut tf: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for t in &tokens {

@@ -2148,6 +2148,15 @@ pub struct Ordered {
     pub staleness: std::time::Duration,
 }
 
+/// What [`Engine::scored_as`] returns (M182): an order's answer, and each row's score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scored {
+    /// The rows, by score descending then id, as an order returns them.
+    pub ordered: Ordered,
+    /// Each row's score, in `ordered.rows` order: the `f64` they were ordered by.
+    pub scores: Vec<f64>,
+}
+
 /// What HEAD knows about one index, without reading a single segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStats {
@@ -7919,6 +7928,149 @@ impl<S: BlobStore> Engine<S> {
             epoch,
             watermarks,
             staleness,
+        })
+    }
+
+    /// Every document `filter` admits scored by `expr` (M182): those scoring above 0, by score
+    /// descending then id, from `offset` for `limit`, each with its score.
+    ///
+    /// **Three round trips**, as [`Self::ordered`]: HEAD; the segments opened with their delete
+    /// vectors and -- for a `BM25` clause -- their term dictionaries; their admitted blocks. The
+    /// unfolded rows are scored too, against statistics that count them as the fresh segment's
+    /// dictionary does. With `as_of`, that epoch's manifest, and no unfolded rows.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_as`]; [`EngineError::Refused`] for an expression outside its limits,
+    /// and [`EngineError::UnknownTextField`] for a `BM25` clause over a field that is not
+    /// full-text.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, and its level"
+    )]
+    pub async fn scored_as(
+        &self,
+        index: &str,
+        expr: &pstore_query::Expr,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+    ) -> Result<Scored, EngineError> {
+        if as_of.is_some() && consistency == Consistency::Strong {
+            return Err(EngineError::Query(
+                "strong with as_of: a past epoch is already exactly what it is".to_owned(),
+            ));
+        }
+        expr.check().map_err(EngineError::Refused)?;
+        // As `ordered_as`: a failed read from the `bounded` cache retries fresh (M11.2).
+        let mut hit = false;
+        let first = self
+            .scored_once(
+                index,
+                expr,
+                filter,
+                (offset, limit),
+                as_of,
+                consistency,
+                true,
+                &mut hit,
+            )
+            .await;
+        match first {
+            Err(_) if hit => {
+                self.scored_once(
+                    index,
+                    expr,
+                    filter,
+                    (offset, limit),
+                    as_of,
+                    consistency,
+                    false,
+                    &mut hit,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, its level, and the cache's say"
+    )]
+    async fn scored_once(
+        &self,
+        index: &str,
+        expr: &pstore_query::Expr,
+        filter: Option<&pstore_query::Predicate>,
+        (offset, limit): (usize, usize),
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        allow_hit: bool,
+        hit: &mut bool,
+    ) -> Result<Scored, EngineError> {
+        let Scope {
+            named,
+            targets,
+            unfolded,
+            shadow,
+            epoch,
+            watermarks,
+            staleness,
+            settle,
+            fts,
+            texts,
+            ..
+        } = self
+            .scope(index, as_of, consistency, allow_hit, hit)
+            .await?;
+        // A BM25 clause reads a full-text field: the primary, or a declared further one.
+        if let Some(f) = expr
+            .fields()
+            .into_iter()
+            .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD && !texts.contains_key(*f))
+        {
+            return Err(EngineError::UnknownTextField(f.to_owned()));
+        }
+        // M14.2, M156: the filters, and the expression's own, bound once.
+        let bound = filter.map(|f| f.bound_texts(&fts.analyzer, &texts));
+        let filter = bound.as_ref();
+        let expr = expr.bound_texts(&fts.analyzer, &texts);
+        let (ranked, settled) = futures_util::future::join(
+            pstore_query::rank(
+                &*self.store,
+                &targets,
+                filter,
+                &shadow,
+                &expr,
+                &scoring(fts, &texts),
+                &unfolded,
+                offset.saturating_add(limit),
+            ),
+            self.settled_scope(settle.as_ref()),
+        )
+        .await;
+        let ranked = ranked.map_err(|e| EngineError::Query(e.to_string()))?;
+        if !settled? {
+            return Err(EngineError::NotFolded);
+        }
+        // As an order decides it (M147).
+        let exists = named || !unfolded.is_empty();
+        let (rows, scores): (Vec<Document>, Vec<f64>) =
+            ranked.into_iter().skip(offset).take(limit).unzip();
+        // As an order counts them: a row is unfolded when its id has an unfolded operation.
+        let unfolded = rows.iter().filter(|d| shadow.contains(&d.id)).count();
+        Ok(Scored {
+            ordered: Ordered {
+                rows,
+                unfolded,
+                exists,
+                epoch,
+                watermarks,
+                staleness,
+            },
+            scores,
         })
     }
 

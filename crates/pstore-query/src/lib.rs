@@ -15,12 +15,17 @@
 mod aggregate;
 pub mod condition;
 pub mod deletes;
+mod expr;
 mod filter;
 mod fuse;
 mod order;
 mod run;
 
 pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
+pub use expr::{
+    Expr, MAX_CLAUSES as MAX_EXPR_CLAUSES, MAX_DEPTH as MAX_EXPR_DEPTH,
+    MAX_NODES as MAX_EXPR_NODES, MAX_WEIGHT, MIN_WEIGHT, rank,
+};
 pub use filter::{
     Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Needle, Op, Pattern, PatternKind, Predicate, TokenOp,
 };

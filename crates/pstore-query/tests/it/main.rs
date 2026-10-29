@@ -8,6 +8,7 @@
 
 mod datetime_pruning;
 mod dimension;
+mod expressions;
 mod fusion;
 mod fusion_identity;
 mod geo;
