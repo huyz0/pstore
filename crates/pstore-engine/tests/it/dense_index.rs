@@ -148,7 +148,7 @@ async fn a_hybrid_corpus_survives_the_reordering() {
             let mut d = doc(i);
             d.vectors.insert(
                 "body_sparse".into(),
-                VectorField::Sparse(vec![(i as u32 % 17, Impact::new(0.9))]),
+                VectorField::Sparse(vec![((i as u32 % 17).to_string(), Impact::new(0.9))]),
             );
             d.attrs.insert(
                 pstore_format::text::DEFAULT_TEXT_FIELD.to_owned(),

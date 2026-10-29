@@ -29,18 +29,21 @@ fn hybrid(i: usize) -> Document {
     d.vectors.insert(
         FIELD.into(),
         VectorField::Sparse(vec![
-            (i as u32 % 17, Impact::new(0.75)),
-            (100 + (i as u32 % 3), Impact::new(0.25)),
+            ((i as u32 % 17).to_string(), Impact::new(0.75)),
+            ((100 + (i as u32 % 3)).to_string(), Impact::new(0.25)),
         ]),
     );
     d
 }
 
-fn sparse_of(d: &Document) -> Vec<(u32, f32)> {
-    match d.vectors.get(FIELD) {
-        Some(VectorField::Sparse(p)) => p.iter().map(|(x, w)| (*x, w.get())).collect(),
+/// A document's pairs in key byte order, the order a scan answers them in (M177).
+fn sparse_of(d: &Document) -> Vec<(String, f32)> {
+    let mut pairs: Vec<(String, f32)> = match d.vectors.get(FIELD) {
+        Some(VectorField::Sparse(p)) => p.iter().map(|(x, w)| (x.clone(), w.get())).collect(),
         _ => Vec::new(),
-    }
+    };
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
 }
 
 #[tokio::test]
@@ -86,8 +89,8 @@ fn check(got: &[Document], want: &[Document], when: &str) {
             w.id
         );
         assert_eq!(
-            gs.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
-            ws.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            gs.iter().map(|(d, _)| d).collect::<Vec<_>>(),
+            ws.iter().map(|(d, _)| d).collect::<Vec<_>>(),
             "{when}: {}'s dimensions changed",
             w.id
         );
@@ -374,4 +377,122 @@ async fn a_sparse_leg_reaches_unfolded_rows() {
             .any(|h| h.segment == a.unfolded_at && a.unfolded[h.row].id == docs[3].id),
         "the unfolded row the sparse query names was not returned"
     );
+}
+
+/// M177: keys a mapping to numbers would merge, truncate or misorder: spellings of one number,
+/// both normal forms of one letter, long keys differing in their last byte, keys sharing their
+/// first 8 bytes, and one of the longest a key may be.
+fn adversarial_keys() -> Vec<String> {
+    let long = "k".repeat(199);
+    vec![
+        "1".to_owned(),
+        "01".to_owned(),
+        "1.0".to_owned(),
+        "\u{e9}".to_owned(),
+        "e\u{301}".to_owned(),
+        format!("{long}a"),
+        format!("{long}b"),
+        "prefix00-x".to_owned(),
+        "prefix00-y".to_owned(),
+        "z".repeat(pstore_format::SPARSE_KEY_MAX),
+    ]
+}
+
+/// Row `i` names two adjacent keys, in an order that depends on `flip`.
+fn keyed(i: usize, flip: bool) -> Document {
+    let keys = adversarial_keys();
+    let (a, b) = (&keys[i % keys.len()], &keys[(i + 1) % keys.len()]);
+    // One weight, so U8's per-key scale holds it exactly and `check`'s bound is the error's.
+    let mut pairs = vec![(a.clone(), Impact::new(0.5)), (b.clone(), Impact::new(0.5))];
+    if flip {
+        pairs.reverse();
+    }
+    let mut d = Document::new(format!("r{i:03}"), vec![1.0, 0.0, 0.0]);
+    d.vectors.insert(FIELD.into(), VectorField::Sparse(pairs));
+    d
+}
+
+/// The ids a sparse query for `key` answers, from `e`.
+async fn by_key(e: &Engine<MemoryStore>, index: &str, key: &str) -> Vec<String> {
+    let leg = vec![pstore_query::Prefetch::Sparse {
+        field: FIELD.to_owned(),
+        query: vec![(key.to_owned(), 1.0)],
+        limit: 1_000,
+    }];
+    let a = e
+        .query(index, &leg, pstore_query::Fusion::default(), 1_000)
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = e.resolve_rows(&a).into_iter().map(|r| r.0).collect();
+    ids.sort();
+    ids
+}
+
+/// The ids of `docs` naming `key`.
+fn naming(docs: &[Document], key: &str) -> Vec<String> {
+    let mut ids: Vec<String> = docs
+        .iter()
+        .filter(|d| sparse_of(d).iter().any(|(k, _)| k == key))
+        .map(|d| d.id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn string_keys_survive_the_bundle_the_fold_and_the_compaction_each_their_own() {
+    // M177 criterion 1, through the engine: each stage keeps every key whole and apart.
+    let store = Arc::new(MemoryStore::new());
+    let e = Engine::new(Arc::clone(&store), TenantId(503), LaneId(1));
+    let want: Vec<Document> = (0..30).map(|i| keyed(i, i % 2 == 0)).collect();
+    for batch in want.chunks(10) {
+        e.write("keys", batch.to_vec()).await.unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    check(
+        &e.scan("keys", None).await.unwrap(),
+        &want,
+        "after the folds",
+    );
+    e.compact("keys").await.unwrap();
+    check(
+        &e.scan("keys", None).await.unwrap(),
+        &want,
+        "after the compaction",
+    );
+    for key in adversarial_keys() {
+        assert_eq!(
+            by_key(&e, "keys", &key).await,
+            naming(&want, &key),
+            "{:?}",
+            key.get(..12)
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_writers_naming_one_key_write_one_dimension() {
+    // M177 criterion 3: no mapping to agree on. Two processes write rows naming the same keys
+    // in opposite orders and batches; after the folds and a restart one query finds both's.
+    let store = Arc::new(MemoryStore::new());
+    let t = TenantId(504);
+    let a = Engine::new(Arc::clone(&store), t, LaneId(1));
+    let b = Engine::new(Arc::clone(&store), t, LaneId(2));
+    let mine: Vec<Document> = (0..20).map(|i| keyed(i, false)).collect();
+    let theirs: Vec<Document> = (100..120).map(|i| keyed(i, true)).collect();
+    a.write("two", mine[..7].to_vec()).await.unwrap();
+    b.write("two", theirs.clone()).await.unwrap();
+    a.write("two", mine[7..].to_vec()).await.unwrap();
+    for e in [&a, &b] {
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+    }
+    let all: Vec<Document> = mine.iter().chain(&theirs).cloned().collect();
+    let restarted = Engine::new(Arc::clone(&store), t, LaneId(3));
+    for key in adversarial_keys() {
+        let got = by_key(&restarted, "two", &key).await;
+        assert_eq!(got, naming(&all, &key), "{:?}", key.get(..12));
+        assert!(got.iter().any(|id| id.starts_with("r1")));
+    }
 }

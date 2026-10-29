@@ -90,10 +90,12 @@ pub struct Postings {
 }
 
 /// Where one dimension's postings are, and what they are scaled by.
+///
+/// ⚠️ Names no dimension (M177): a key is a string, and an entry is `Copy` so a lookup's
+/// answer can be held while its list is fetched. [`Dictionary::key`] names the dimension of
+/// the entry at a position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Entry {
-    /// The dimension this list belongs to.
-    pub dim: u32,
     /// Byte offset into the `SparsePostings` section.
     pub offset: u64,
     /// Bytes the list occupies — its exact fetch range.
@@ -115,10 +117,20 @@ pub fn dict_key(segment: &pstore_blob::Key) -> pstore_blob::Key {
 }
 
 const MAGIC: &[u8; 8] = b"PSTORESD";
-const VERSION: u16 = 1;
-/// dim(4) offset(8) bytes(4) count(4) max(4).
-const ENTRY: usize = 24;
+/// M177: keys are strings. Version 1, `u32` dimensions, is still read.
+const VERSION: u16 = 2;
+const VERSION_U32: u16 = 1;
+/// v1: dim(4) offset(8) bytes(4) count(4) max(4).
+const ENTRY_U32: usize = 24;
+/// v2: key at(8) key len(2) offset(8) bytes(4) count(4) max(4); the keys follow the table.
+///
+/// ⚠️ The key offset is a `u64` (M178's review): no bound on a segment's vocabulary is
+/// enforced, because a refusal at fold would block every later fold of the index, so no
+/// vocabulary may overflow the offset either.
+const ENTRY: usize = 30;
 const HEADER: usize = 8 + 2 + 1 + 4;
+/// v2's header also holds the key area's length, a `u64`.
+const HEADER_KEYS: usize = HEADER + 8;
 
 /// Builds the postings and the dictionary for one sparse field.
 ///
@@ -128,48 +140,59 @@ const HEADER: usize = 8 + 2 + 1 + 4;
 /// wrong documents — which no round-trip of the list can see.
 #[must_use]
 pub fn build(docs: &[Document], field: &str, encoding: ImpactEncoding) -> Postings {
-    // Dimension -> (row, weight), ascending in both by construction: rows are visited in
-    // order and a BTreeMap orders the dimensions.
-    let mut by_dim: std::collections::BTreeMap<u32, Vec<(u32, f32)>> =
+    // Key -> (row, weight), ascending in both by construction: rows are visited in order and
+    // a BTreeMap orders the keys by their bytes, which is `str`'s order.
+    let mut by_key: std::collections::BTreeMap<&str, Vec<(u32, f32)>> =
         std::collections::BTreeMap::new();
     for (row, d) in docs.iter().enumerate() {
         let Some(VectorField::Sparse(pairs)) = d.vectors.get(field) else {
             continue;
         };
-        for (dim, impact) in pairs {
-            by_dim
-                .entry(*dim)
+        for (key, impact) in pairs {
+            by_key
+                .entry(key.as_str())
                 .or_default()
                 .push((row as u32, impact.get()));
         }
     }
 
     let mut section: Vec<u8> = Vec::new();
-    let mut entries: Vec<Entry> = Vec::with_capacity(by_dim.len());
-    for (dim, list) in by_dim {
+    let mut entries: Vec<(&str, Entry)> = Vec::with_capacity(by_key.len());
+    for (key, list) in by_key {
         let offset = section.len() as u64;
         let max_impact = list.iter().fold(0.0f32, |m, (_, w)| m.max(w.abs()));
         write_list(&mut section, &list, encoding, max_impact);
-        entries.push(Entry {
-            dim,
-            offset,
-            bytes: (section.len() as u64 - offset) as u32,
-            count: list.len() as u32,
-            max_impact,
-        });
+        entries.push((
+            key,
+            Entry {
+                offset,
+                bytes: (section.len() as u64 - offset) as u32,
+                count: list.len() as u32,
+                max_impact,
+            },
+        ));
     }
 
-    let mut dictionary = Vec::with_capacity(HEADER + entries.len() * ENTRY);
+    let keys_len: usize = entries.iter().map(|(k, _)| k.len()).sum();
+    let mut dictionary = Vec::with_capacity(HEADER_KEYS + entries.len() * ENTRY + keys_len);
     dictionary.extend_from_slice(MAGIC);
     dictionary.extend_from_slice(&VERSION.to_le_bytes());
     dictionary.push(encoding.tag());
     dictionary.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for e in &entries {
-        dictionary.extend_from_slice(&e.dim.to_le_bytes());
+    dictionary.extend_from_slice(&(keys_len as u64).to_le_bytes());
+    let mut at = 0u64;
+    for (k, e) in &entries {
+        dictionary.extend_from_slice(&at.to_le_bytes());
+        // `check_storable` bounds a key at `SPARSE_KEY_MAX`, which is `u16::MAX`.
+        dictionary.extend_from_slice(&(k.len() as u16).to_le_bytes());
         dictionary.extend_from_slice(&e.offset.to_le_bytes());
         dictionary.extend_from_slice(&e.bytes.to_le_bytes());
         dictionary.extend_from_slice(&e.count.to_le_bytes());
         dictionary.extend_from_slice(&e.max_impact.to_le_bytes());
+        at += k.len() as u64;
+    }
+    for (k, _) in &entries {
+        dictionary.extend_from_slice(k.as_bytes());
     }
     Postings {
         section,
@@ -177,90 +200,146 @@ pub fn build(docs: &[Document], field: &str, encoding: ImpactEncoding) -> Postin
     }
 }
 
-/// Every row's `(dimension, impact)` pairs, reconstructed from a whole postings section.
+/// Every row's `(key, impact)` pairs, reconstructed from a whole postings section.
 ///
 /// ⚠️ The inverted index turned back the right way up, which is what a compaction needs and
 /// **only** a compaction: it is `O(postings)` in time and bytes, against a query's
 /// `O(the query's own lists)`. Used by `Segment::scan`, never by a retriever.
 #[must_use]
-pub fn transpose(dict: &Dictionary, section: &[u8], rows: usize) -> Vec<Vec<(u32, crate::Impact)>> {
+pub fn transpose(
+    dict: &Dictionary,
+    section: &[u8],
+    rows: usize,
+) -> Vec<Vec<(String, crate::Impact)>> {
     let mut out = vec![Vec::new(); rows];
-    for i in 0..dict.len() {
-        let Some(e) = dict.at(i) else { continue };
+    for (i, e) in dict.entries.iter().enumerate() {
         let Some(raw) = section.get(e.offset as usize..e.offset as usize + e.bytes as usize) else {
             continue;
         };
-        for (row, impact) in dict.decode_list(&e, raw) {
+        let key = dict.key(i);
+        for (row, impact) in dict.decode_list(e, raw) {
             if let Some(slot) = out.get_mut(row as usize) {
-                slot.push((e.dim, crate::Impact::new(impact)));
+                slot.push((key.to_owned(), crate::Impact::new(impact)));
             }
         }
     }
-    // Ascending by dimension, which is how a document's pairs were written and what the
-    // round-trip is compared against. Entries are visited in dimension order, so each row's
-    // list is already sorted -- but a caller cannot see that, and a compaction that reorders
-    // a document's pairs would make the merge's output differ from its input for no reason.
-    for row in &mut out {
-        row.sort_by_key(|(d, _)| *d);
-    }
+    // Ascending by key bytes, as the entries are visited, so each row's pairs come out sorted
+    // without a sort here.
     out
 }
 
-/// The term dictionary: fixed-width entries, sorted by dimension.
+/// The term dictionary: fixed-width entries, sorted by key bytes.
 ///
 /// ⚠️ Fixed width is what makes a lookup a binary search. A variable-width entry would force
 /// a scan of the whole table per query term — 600 KB at 30,000 terms, per term, per query.
 #[derive(Debug, Clone)]
 pub struct Dictionary {
-    raw: bytes::Bytes,
     encoding: ImpactEncoding,
-    count: usize,
-    /// The dimensions, ascending, decoded once.
+    /// The key bytes, once, and each key's span in them, as M32's term dictionary holds
+    /// its terms (M119): a `String` a key was an allocation a key on every open.
     ///
-    /// ⚠️ Four bytes a term of duplication, deliberately, so the lookup is
-    /// `slice::binary_search` rather than a hand-written loop. Mutation testing found the
-    /// reason: `lo < hi` flipped to `lo <= hi` does not return a wrong answer, it **fails to
-    /// terminate** — on a query path — and the only test that could tell looks up a dimension
-    /// falling in a *gap* between two entries, which is not an obvious case to write. Rung 1
-    /// of the gate ladder: the condition that can be wrong no longer exists.
-    dims: Vec<u32>,
+    /// ⚠️ Decoded once, so the lookup is `slice::binary_search_by` rather than a
+    /// hand-written loop. Mutation testing found the reason: `lo < hi` flipped to `lo <= hi`
+    /// does not return a wrong answer, it **fails to terminate** — on a query path. Rung 1 of
+    /// the gate ladder: the condition that can be wrong no longer exists.
+    blob: Vec<u8>,
+    keys: Vec<(u64, u16)>,
+    entries: Vec<Entry>,
 }
 
 impl Dictionary {
     /// Decodes a dictionary, returning `None` for anything malformed.
     #[must_use]
     pub fn decode(raw: &[u8]) -> Option<Self> {
-        Self::decode_bytes(bytes::Bytes::copy_from_slice(raw))
-    }
-
-    /// [`Self::decode`] keeping `raw` itself, refcounted, rather than a copy (M119): a
-    /// caller holding the fetched `Bytes` copied the whole sidecar on every query.
-    #[must_use]
-    pub fn decode_bytes(raw: bytes::Bytes) -> Option<Self> {
-        if raw.get(..8)? != MAGIC || u16::from_le_bytes(raw.get(8..10)?.try_into().ok()?) != VERSION
-        {
+        if raw.get(..8)? != MAGIC {
             return None;
         }
         let encoding = ImpactEncoding::from_tag(*raw.get(10)?)?;
         let count = u32::from_le_bytes(raw.get(11..15)?.try_into().ok()?) as usize;
-        // ⚠️ Length checked here, not per lookup. A truncated table decoded lazily would
-        // answer some lookups and silently lose the terms past the cut.
-        if raw.len() != HEADER + count * ENTRY {
-            return None;
-        }
-        let mut me = Self {
-            raw,
-            encoding,
-            count,
-            dims: Vec::new(),
+        let me = match u16::from_le_bytes(raw.get(8..10)?.try_into().ok()?) {
+            VERSION => Self::decode_keys(raw, encoding, count)?,
+            VERSION_U32 => Self::decode_u32(raw, encoding, count)?,
+            _ => return None,
         };
-        me.dims = (0..count).filter_map(|i| me.at(i).map(|e| e.dim)).collect();
         // A table that is not sorted cannot be searched, and searching it anyway answers
         // "absent" for terms that are present — a silent recall loss rather than a failure.
-        if !me.dims.is_sorted_by(|a, b| a < b) {
+        // Strictly: a key twice is two lists for one dimension.
+        if !(1..me.keys.len()).all(|i| me.key(i - 1).as_bytes() < me.key(i).as_bytes()) {
             return None;
         }
         Some(me)
+    }
+
+    /// Version 2: each entry names its key's span in the key area after the table.
+    fn decode_keys(raw: &[u8], encoding: ImpactEncoding, count: usize) -> Option<Self> {
+        let keys_len =
+            usize::try_from(u64::from_le_bytes(raw.get(15..23)?.try_into().ok()?)).ok()?;
+        // ⚠️ Length checked here, not per lookup. A truncated table decoded lazily would
+        // answer some lookups and silently lose the terms past the cut.
+        if raw.len() != HEADER_KEYS + count.checked_mul(ENTRY)? + keys_len {
+            return None;
+        }
+        let blob = raw.get(HEADER_KEYS + count * ENTRY..)?.to_vec();
+        std::str::from_utf8(&blob).ok()?;
+        let mut keys = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let b = raw.get(HEADER_KEYS + i * ENTRY..HEADER_KEYS + (i + 1) * ENTRY)?;
+            let at = u64::from_le_bytes(b.get(0..8)?.try_into().ok()?);
+            let len = u16::from_le_bytes(b.get(8..10)?.try_into().ok()?);
+            // Each span inside the key area and on a character boundary, so `key` slices.
+            let from = usize::try_from(at).ok()?;
+            std::str::from_utf8(blob.get(from..from.checked_add(usize::from(len))?)?).ok()?;
+            keys.push((at, len));
+            entries.push(entry_at(b.get(10..)?)?);
+        }
+        Some(Self {
+            encoding,
+            blob,
+            keys,
+            entries,
+        })
+    }
+
+    /// Version 1, before M177: a dimension is a `u32`, and reads as its decimal spelling --
+    /// the one key a query for it names. Sorted again by those keys' bytes, since `10` sorts
+    /// before `9` as a string and after it as a number.
+    fn decode_u32(raw: &[u8], encoding: ImpactEncoding, count: usize) -> Option<Self> {
+        if raw.len() != HEADER + count.checked_mul(ENTRY_U32)? {
+            return None;
+        }
+        let mut rows: Vec<(u32, Entry)> = Vec::with_capacity(count);
+        for i in 0..count {
+            let b = raw.get(HEADER + i * ENTRY_U32..HEADER + (i + 1) * ENTRY_U32)?;
+            rows.push((
+                u32::from_le_bytes(b.get(0..4)?.try_into().ok()?),
+                entry_at(b.get(4..)?)?,
+            ));
+        }
+        if !rows.is_sorted_by(|a, b| a.0 < b.0) {
+            return None;
+        }
+        let mut spelled: Vec<(String, Entry)> =
+            rows.into_iter().map(|(d, e)| (d.to_string(), e)).collect();
+        spelled.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut me = Self {
+            encoding,
+            blob: Vec::new(),
+            keys: Vec::with_capacity(count),
+            entries: Vec::with_capacity(count),
+        };
+        for (k, e) in spelled {
+            me.keys.push((me.blob.len() as u64, k.len() as u16));
+            me.blob.extend_from_slice(k.as_bytes());
+            me.entries.push(e);
+        }
+        Some(me)
+    }
+
+    /// [`Self::decode`] over the fetched buffer (M119).
+    #[must_use]
+    pub fn decode_bytes(raw: bytes::Bytes) -> Option<Self> {
+        Self::decode(&raw)
     }
 
     /// [`Self::decode_bytes`], kept for `raw` itself (M122), as
@@ -272,7 +351,8 @@ impl Dictionary {
             std::sync::LazyLock::new(|| crate::shared::ByBuffer::new(crate::text::DECODED_BUDGET));
         KEPT.get_or(
             raw,
-            |d| d.dims.len() * std::mem::size_of::<u32>(),
+            // M177: the key bytes are held too, not only the table.
+            |d| d.blob.len() + d.keys.len() * (6 + std::mem::size_of::<Entry>()),
             |b| Self::decode_bytes(b.clone()),
         )
     }
@@ -286,38 +366,49 @@ impl Dictionary {
     /// Distinct dimensions in the dictionary.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.count
+        self.entries.len()
     }
 
     /// Whether the field has no postings at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.entries.is_empty()
     }
 
-    fn at(&self, i: usize) -> Option<Entry> {
-        let b = self.raw.get(HEADER + i * ENTRY..HEADER + (i + 1) * ENTRY)?;
-        Some(Entry {
-            dim: u32::from_le_bytes(b.get(0..4)?.try_into().ok()?),
-            offset: u64::from_le_bytes(b.get(4..12)?.try_into().ok()?),
-            bytes: u32::from_le_bytes(b.get(12..16)?.try_into().ok()?),
-            count: u32::from_le_bytes(b.get(16..20)?.try_into().ok()?),
-            max_impact: f32::from_le_bytes(b.get(20..24)?.try_into().ok()?),
-        })
+    /// The key of the entry at `i`, or `""` past the end.
+    #[must_use]
+    pub fn key(&self, i: usize) -> &str {
+        self.keys
+            .get(i)
+            .and_then(|(at, len)| {
+                let at = usize::try_from(*at).unwrap_or(usize::MAX);
+                self.blob.get(at..at.saturating_add(usize::from(*len)))
+            })
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
     }
 
-    /// Every dimension, ascending.
-    pub fn dims(&self) -> impl Iterator<Item = u32> + '_ {
-        self.dims.iter().copied()
+    /// Every key, in byte order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.keys.len()).map(|i| self.key(i))
     }
 
-    /// One dimension's entry, or `None` when the vocabulary does not contain it.
+    /// One key's entry, or `None` when the vocabulary does not contain it.
     ///
     /// ⚠️ `None` is the **common** case, not an error: a query term the corpus never used
     /// contributes nothing, and must cost nothing — no range, no request, no failure.
     #[must_use]
-    pub fn lookup(&self, dim: u32) -> Option<Entry> {
-        self.dims.binary_search(&dim).ok().and_then(|i| self.at(i))
+    pub fn lookup(&self, key: &str) -> Option<Entry> {
+        self.keys
+            .binary_search_by(|(at, len)| {
+                let at = usize::try_from(*at).unwrap_or(usize::MAX);
+                self.blob
+                    .get(at..at.saturating_add(usize::from(*len)))
+                    .unwrap_or_default()
+                    .cmp(key.as_bytes())
+            })
+            .ok()
+            .and_then(|i| self.entries.get(i).copied())
     }
 
     /// Decodes one posting list from exactly the bytes its entry addresses.
@@ -325,6 +416,16 @@ impl Dictionary {
     pub fn decode_list(&self, entry: &Entry, raw: &[u8]) -> Vec<(u32, f32)> {
         read_list(raw, entry.count, self.encoding, entry.max_impact)
     }
+}
+
+/// An entry's fixed fields: offset(8) bytes(4) count(4) max(4).
+fn entry_at(b: &[u8]) -> Option<Entry> {
+    Some(Entry {
+        offset: u64::from_le_bytes(b.get(0..8)?.try_into().ok()?),
+        bytes: u32::from_le_bytes(b.get(8..12)?.try_into().ok()?),
+        count: u32::from_le_bytes(b.get(12..16)?.try_into().ok()?),
+        max_impact: f32::from_le_bytes(b.get(16..20)?.try_into().ok()?),
+    })
 }
 
 /// One posting list: delta-encoded rows, then the impacts.

@@ -246,8 +246,16 @@ fn doc(id: &str, x: f32) -> Document {
     d.vectors.insert(
         "s".into(),
         VectorField::Sparse(vec![
-            (3, Impact::new(0.5)),
-            ((x as u32) % 7, Impact::new(0.25)),
+            ("3".to_owned(), Impact::new(0.5)),
+            // M177: dimension 3 once; `x % 7` landing on it moves to 7, unused.
+            (
+                match (x as u32) % 7 {
+                    3 => 7,
+                    n => n,
+                }
+                .to_string(),
+                Impact::new(0.25),
+            ),
         ]),
     );
     d
@@ -294,7 +302,7 @@ async fn answers(e: &E, index: &str) -> Option<String> {
     }];
     let sparse = vec![Prefetch::Sparse {
         field: "s".to_owned(),
-        query: vec![(3, 1.0), (2, 0.5)],
+        query: vec![("3".to_owned(), 1.0), ("2".to_owned(), 0.5)],
         limit: 10,
     }];
     let text = vec![Prefetch::Text {

@@ -8897,7 +8897,7 @@ mod query_error_tests {
     fn only_a_known_width_of_zero_refuses_a_vector_leg() {
         let text = Prefetch::Sparse {
             field: "t".to_owned(),
-            query: vec![(1, 1.0)],
+            query: vec![("1".to_owned(), 1.0)],
             limit: 1,
         };
         assert!(matches!(

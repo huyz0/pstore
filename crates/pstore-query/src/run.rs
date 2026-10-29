@@ -28,8 +28,8 @@ pub enum Prefetch {
     Sparse {
         /// The field to search.
         field: String,
-        /// `(dimension, impact)` pairs.
-        query: Vec<(u32, f32)>,
+        /// `(key, impact)` pairs (M177: a key is its string).
+        query: Vec<(String, f32)>,
         /// Rows this leg contributes at most.
         limit: usize,
     },
@@ -1592,7 +1592,7 @@ enum Runnable<'a> {
     },
     Sparse {
         field: &'a str,
-        query: &'a [(u32, f32)],
+        query: &'a [(String, f32)],
         limit: usize,
     },
     Multi {

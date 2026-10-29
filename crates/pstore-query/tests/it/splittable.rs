@@ -25,7 +25,7 @@ fn only_legs_that_score_a_row_alone_split_in_one_exchange() {
         (
             Prefetch::Sparse {
                 field: "s".to_owned(),
-                query: vec![(1, 1.0)],
+                query: vec![("1".to_owned(), 1.0)],
                 limit: 1,
             },
             true,
