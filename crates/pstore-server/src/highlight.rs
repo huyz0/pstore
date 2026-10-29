@@ -499,7 +499,8 @@ impl Highlight {
                 .map(|(a, b)| (a, b.min(to)))
                 .collect()
         };
-        if by == FragmentBy::None || (total > self.max_chars && spans.is_empty()) {
+        // A unit with no token is cut like `none`'s: `cut` leaves it whole when it fits.
+        if by == FragmentBy::None || spans.is_empty() {
             let to = cut(text, unit.start, unit.end, self.max_chars);
             out.push(Candidate {
                 element,
@@ -529,11 +530,9 @@ impl Highlight {
                 continue;
             };
             let (from, end) = (shift(first).0, shift(last).1);
-            let to = if first.c_end - first.c_start > self.max_chars {
-                cut(text, from, end, self.max_chars)
-            } else {
-                end
-            };
+            // Only a token longer than `max_chars`, a window of its own, is cut: any other
+            // window fits, and `cut` leaves it whole.
+            let to = cut(text, from, end, self.max_chars);
             out.push(Candidate {
                 element,
                 from,

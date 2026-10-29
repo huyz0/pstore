@@ -56,3 +56,11 @@ the mutation script had that refusal removed. The restored tree refuses it, and 
 asserting so passes. Its minors were applied (a stray doc line; `docs/deploy.md` now says 0
 gives `[]` and that a sentence ends at whitespace holding a line feed) or recorded: offset
 conversion is O(fragments × length), bounded by 16 fragments.
+
+**Amendment (PR #14's mutation shards 10 and 11).** Three mutants in `Highlight::candidates`
+survived: `>` to `>=` and `-` to `+` in the test choosing whether to cut a window, and `>` to
+`>=` in `total > max_chars` for a unit with no token. All three are equivalent.
+A window's characters, combining marks included, are counted the way `cut` counts them, so
+`cut` leaves any window that fits whole, and the condition only skipped a call that changed
+nothing. The same holds for a tokenless unit that fits. Both conditions were removed, so `cut`
+is now always called, and the `highlight::` tests pass unchanged.
