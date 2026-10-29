@@ -87,6 +87,7 @@ const STEM: Analyzer = Analyzer {
     case_sensitive: false,
     ascii_folding: false,
     tokenizer: pstore_format::text::Tokenizer::WordV1,
+    max_token_length: None,
 };
 
 const VOCAB: &[&str] = &[
