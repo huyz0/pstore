@@ -18,6 +18,20 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
+/// A TCP listener and a UDP socket on one free port, as a peer serves both. ⚠️ Binding UDP to
+/// whatever port TCP was given raced any other socket holding that number, and the unwrap
+/// failed with `AddrInUse` in CI; a port whose UDP half is taken is skipped instead, as
+/// `tests/it/peers.rs` already does.
+pub(crate) async fn same_port() -> (tokio::net::TcpListener, std::net::UdpSocket) {
+    for _ in 0..64 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
+            return (tcp, udp);
+        }
+    }
+    panic!("no port free for both TCP and UDP in 64 tries");
+}
+
 #[test]
 fn only_quic_availability_failures_allow_transport_retry() {
     let closed = |error_code| {
@@ -114,9 +128,8 @@ async fn inbound_and_outbound_connections_share_the_same_admission_ceiling() {
     )
     .await
     .unwrap();
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = same_port().await;
     let address = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(address).unwrap();
     let handler: Handler = Arc::new(|_, req| {
         Box::pin(async move {
             Reply {
@@ -195,9 +208,8 @@ async fn typed_payloads_preserve_float_bits_without_a_json_value_bridge() {
     let ca = Authority::new();
     let m = ca.issue(&["localhost", "127.0.0.1"], false);
     let tls = PeerTls::from_pem(m.ca.as_bytes(), m.cert.as_bytes(), m.key.as_bytes()).unwrap();
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = same_port().await;
     let address = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(address).unwrap();
     let handler: Handler<TypedPayload, TypedPayload> = Arc::new(|protocol, mut req| {
         Box::pin(async move {
             req.body.transport = format!("{protocol:?}");
@@ -585,9 +597,8 @@ async fn start_with(
     server: PeerTls,
     handler: Handler,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = same_port().await;
     let address = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(address).unwrap();
     let task = tokio::spawn(async move {
         serve(tcp, udp, server, handler).await.unwrap();
     });

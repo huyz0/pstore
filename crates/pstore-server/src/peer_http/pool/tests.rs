@@ -21,9 +21,8 @@ use std::time::Duration;
 async fn udp_backoff_survives_replacing_a_rejected_http2_connection() {
     use crate::peer_http::Error;
     let ca = Authority::new();
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, _blackhole) = crate::peer_http::tests::same_port().await;
     let address = tcp.local_addr().unwrap();
-    let _blackhole = std::net::UdpSocket::bind(address).unwrap();
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let handler: Handler = Arc::new(|_, req| {
         Box::pin(async move {
@@ -176,9 +175,8 @@ async fn exhausted_request_ids_refuse_dispatch_and_do_not_wrap_to_zero() {
 async fn a_timed_out_rpc_releases_admission_and_does_not_poison_later_calls() {
     for mode in [PeerTransport::H2, PeerTransport::H3] {
         let ca = Authority::new();
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tcp, udp) = crate::peer_http::tests::same_port().await;
         let address = tcp.local_addr().unwrap();
-        let udp = std::net::UdpSocket::bind(address).unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         struct Running(Arc<std::sync::atomic::AtomicUsize>);
@@ -256,9 +254,8 @@ async fn start(
     tokio::task::JoinHandle<()>,
     Option<std::net::UdpSocket>,
 ) {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, advertised_udp) = crate::peer_http::tests::same_port().await;
     let address = tcp.local_addr().unwrap();
-    let advertised_udp = std::net::UdpSocket::bind(address).unwrap();
     let (udp, held) = if blackhole {
         (
             std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
@@ -630,9 +627,8 @@ fn a_poisoned_pool_retains_identity_and_reclaims_departed_entries() {
 async fn a_late_error_from_an_old_connection_cannot_evict_its_replacement() {
     for mode in [PeerTransport::H2, PeerTransport::H3] {
         let ca = Authority::new();
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tcp, udp) = crate::peer_http::tests::same_port().await;
         let address = tcp.local_addr().unwrap();
-        let udp = std::net::UdpSocket::bind(address).unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let handler: Handler = {

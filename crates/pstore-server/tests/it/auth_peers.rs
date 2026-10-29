@@ -29,9 +29,18 @@ fn identity(ca: &Authority) -> PeerTls {
 }
 
 async fn start(api: Arc<Api<MemoryStore>>) -> (String, tokio::task::JoinHandle<()>) {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // ⚠️ A port whose UDP half another socket holds is skipped, not unwrapped (`AddrInUse`
+    // failed CI), as `peers.rs` does.
+    let (tcp, udp) = 'bound: {
+        for _ in 0..64 {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
+                break 'bound (tcp, udp);
+            }
+        }
+        panic!("no port free for both TCP and UDP in 64 tries");
+    };
     let address = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(address).unwrap();
     let task = tokio::spawn(async move {
         pstore_server::serve_peers(api, tcp, udp, std::future::pending())
             .await
