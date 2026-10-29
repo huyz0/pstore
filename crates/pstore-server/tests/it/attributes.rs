@@ -259,7 +259,8 @@ async fn a_value_the_format_cannot_store_is_refused_not_coerced() {
         // M9h.2 gave a flat array meaning; a nested one still has none.
         (json!([[1, 2]]), "x"),
         (json!({"k": 1}), "x"),
-        (json!(null), "x"),
+        // M174: `null` in an upsert is an absent attribute, accepted:
+        // `upsert_columns::null_in_an_upsert_is_absent_and_in_a_patch_removes`.
         (json!(u64::MAX), "x"),
         (json!(1), ""),
         (json!(1), "text"),

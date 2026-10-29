@@ -116,7 +116,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Vendor field | Current pstore capability | Status / next work |
 |---|---|---|
 | `upsert_rows` | `documents: [{id, vector, vectors?, text?, attributes?}]`; overwrite by string ID | Equivalent operation, different shape; B |
-| `upsert_columns` | No column upsert parser | Missing; B/D |
+| `upsert_columns` | Columns normalized to `documents` rows (M174) | Delivered; D |
 | `patch_rows` | Nested `attributes` instead of flattened row attributes; vectors refused | Partial, deferred; C |
 | `patch_columns` | ID column plus attribute columns | Partial, deferred and string IDs; C |
 | `deletes` | String ID list, after upserts/patches | Equivalent primitive; ordering/response differ; C |

@@ -97,6 +97,11 @@ pub struct WriteRequest {
     /// The same patches in columns (M13): `{"id": [..], "<attr>": [..]}`, one value per id.
     #[serde(default)]
     pub patch_columns: Option<serde_json::Value>,
+    /// The same upserts in columns (M174): `{"id": [..], "vector": [..], "vectors": [..],
+    /// "text": [..], "<attr>": [..]}`, one cell per id, `null` for none. Appended to
+    /// `documents` as soon as the body is parsed, so nothing else reads it.
+    #[serde(default)]
+    pub upsert_columns: Option<serde_json::Value>,
     /// A filter each of `documents` applies only if the id's current version admits (M13).
     #[serde(default)]
     pub upsert_condition: Option<serde_json::Value>,
@@ -251,7 +256,9 @@ type Named = std::collections::BTreeMap<String, Vec<VectorIn>>;
 fn named_vectors<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<std::collections::BTreeMap<String, Vec<Vec<f32>>>, D::Error> {
-    Named::deserialize(d)?
+    // M174: `null` is no fields, as `vector`'s null is no vector.
+    Option::<Named>::deserialize(d)?
+        .unwrap_or_default()
         .into_iter()
         .map(|(name, vs)| {
             vs.into_iter()
