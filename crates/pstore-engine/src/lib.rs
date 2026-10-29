@@ -1601,9 +1601,14 @@ fn texts_refusal(texts: &BTreeMap<String, FullText>, own: &str) -> Option<String
 /// A full-text schema as a refusal names it.
 fn describe(f: &FullText) -> String {
     let a = &f.analyzer;
+    let max = a
+        .max_token_length
+        .map(|m| format!(", max_token_length {m}"))
+        .unwrap_or_default();
     format!(
-        "language {}, stemming {}, remove_stopwords {}, case_sensitive {}, ascii_folding {}, \
-         k1 {}, b {}",
+        "tokenizer {}, language {}, stemming {}, remove_stopwords {}, case_sensitive {}, \
+         ascii_folding {}{max}, k1 {}, b {}",
+        a.tokenizer.name(),
         a.language.name(),
         a.stemming,
         a.remove_stopwords,

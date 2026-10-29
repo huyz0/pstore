@@ -327,6 +327,40 @@ always. The primary takes it by naming `"field": "text"`, since a string leg has
 - A query with a prefix leg is answered by the server that received it, never split across
   servers.
 
+## Tokenizers and a token length limit
+
+`full_text_search.tokenizer` names how a string becomes tokens
+([M181](milestones/M181/SPEC.md)). It is fixed when the field is declared: a later declaration
+that differs is refused, and an upgrade never retokenizes an index.
+
+| Tokenizer | Tokens |
+|---|---|
+| `word_v0`, `word_v1` (the default) | Runs of letters and digits, ideographs included: `東京タワー` is one token. Emoji are dropped |
+| `word_v2` | As `word_v1`, but each ideograph is a token of its own (`東` `京` `タワー`), and an emoji or a flag is one token |
+| `word_v3`, `word_v4` | Unicode word boundaries (UAX #29): `can't` and `3.14` stay whole, ideographs are one each, an emoji or a flag is one token |
+| `pre_tokenized_array` | Each string of a `[]string` value is one token, as written ([M158](milestones/M158/SPEC.md)) |
+
+`"max_token_length": n`, an integer from 1 to 255, drops any token of more than `n`
+characters (Unicode scalar values, counted before case and folding: `👩‍💻` is 3). A dropped
+token is not counted in the row's length. A query token over the limit matches nothing:
+`ContainsAllTokens`, `ContainsTokenSequence` and `ContainsAllTokensPrefix` naming it match no
+row, and `ContainsAnyToken` ignores it. It is refused under `pre_tokenized_array`.
+
+How this differs from the vendor's options of the same names:
+
+- pstore's default is `word_v1`, which keeps no emoji: the vendor's `word_v1` keeps them, and
+  its default for a new namespace is `word_v4`. pstore's `word_v1` cannot change without
+  retokenizing every index that already declared it.
+- `word_v4` is `word_v3`'s token stream: the vendor's `word_v4` fixes are not published. Both
+  use Unicode 16.0, not the vendor's 17.0.
+- Token positions are not stored, so `ContainsTokenSequence ["a", "b"]` matches across a
+  dropped token, as it does across a stopword.
+- Thai, Lao, Khmer and Myanmar get no dictionary segmentation: `word_v3` splits them about one
+  segment per consonant.
+- Declare a tokenizer other than `word_v1` or `pre_tokenized_array`, or any limit, only once
+  every server runs M181: an older build refuses such a schema in a HEAD, but may read a
+  row's stamp as no declaration and record the index as `word_v1`, as M158 states for its own.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

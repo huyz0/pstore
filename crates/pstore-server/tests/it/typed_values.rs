@@ -293,7 +293,8 @@ async fn what_still_has_no_type_is_refused() {
         json!({"k": 1}),
         // M9h.2 gave a flat array meaning; a nested one still has none.
         json!([[1, 2]]),
-        json!(null),
+        // M174: `null` is an absent attribute now, accepted:
+        // `upsert_columns::null_in_an_upsert_is_absent_and_in_a_patch_removes`.
     ] {
         let api = api();
         let (s, b) = put(&api, &json!({"documents": [doc("a", json!({"n": v}))]})).await;

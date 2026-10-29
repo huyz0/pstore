@@ -1618,6 +1618,96 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
         .ok_or_else(refuse)
 }
 
+/// Why no attribute may be named `name`, if none may.
+fn name_refusal(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("has an empty name");
+    }
+    // `$` names are the engine's (M9d: `$metric` carries a row's metric to the fold), as
+    // turbopuffer reserves them for `$dist`.
+    if name.starts_with('$') {
+        return Some("is reserved: names beginning `$` are");
+    }
+    // `id` in a filter always means the document id (M9b); an attribute of that name would
+    // give `["id", "Eq", x]` two meanings.
+    (name == pstore_query::ID_ATTRIBUTE).then_some("is reserved: `id` is the document id")
+}
+
+/// The document fields a column of `upsert_columns` may name; every other column is an
+/// attribute.
+const DOCUMENT_COLUMNS: [&str; 3] = ["vector", "vectors", "text"];
+
+/// A write's upserts as one list (M174): `documents`, then the rows of `upsert_columns`, each
+/// read as a `documents` entry is, with every `null` attribute left out -- an upsert replaces
+/// the row, so a null is an attribute the row does not hold. Run as soon as the body is
+/// parsed, so every rule that reads `documents` reads both.
+///
+/// Cells are moved, not copied, as `patch_rows_of` moves them (M120).
+fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
+    if let Some(cols) = req.upsert_columns.take() {
+        let bad = |why: String| ApiError::bad_request(format!("upsert_columns: {why}"));
+        let serde_json::Value::Object(mut cols) = cols else {
+            return Err(bad("an object of columns".to_owned()));
+        };
+        let ids = match cols.remove("id") {
+            Some(serde_json::Value::Array(ids)) => ids,
+            _ => return Err(bad("an `id` column is required".to_owned())),
+        };
+        let mut columns = Vec::with_capacity(cols.len());
+        // A column's name is an attribute's, checked in every row that holds it, null or not;
+        // a column of no rows names nothing.
+        for (name, col) in cols {
+            match col {
+                serde_json::Value::Array(c) if c.len() == ids.len() => {
+                    columns.push((name, c.into_iter()));
+                }
+                _ => return Err(bad(format!("column `{name}` must have one value per id"))),
+            }
+        }
+        for id in ids {
+            let serde_json::Value::String(id) = id else {
+                return Err(bad("ids are strings".to_owned()));
+            };
+            let mut attrs = serde_json::Map::new();
+            let mut row = serde_json::Map::new();
+            // Each column's cells in id order, one a row. A null cell is left to the row's
+            // reading: no vector, no fields, no text, and an attribute dropped below.
+            for (name, v) in columns
+                .iter_mut()
+                .filter_map(|(name, col)| col.next().map(|v| (name.as_str(), v)))
+            {
+                let to = if DOCUMENT_COLUMNS.contains(&name) {
+                    &mut row
+                } else {
+                    &mut attrs
+                };
+                to.insert(name.to_owned(), v);
+            }
+            row.insert("attributes".to_owned(), attrs.into());
+            row.insert("id".to_owned(), id.clone().into());
+            let doc = serde_json::from_value(row.into())
+                .map_err(|e| bad(format!("document {id}: {e}")))?;
+            req.documents.push(doc);
+        }
+    }
+    for d in &mut req.documents {
+        // A null's name is checked before it is dropped; every other name is `to_document`'s.
+        if let Some((name, why)) = d
+            .attributes
+            .iter()
+            .filter(|(_, v)| v.is_null())
+            .find_map(|(n, _)| name_refusal(n).map(|why| (n, why)))
+        {
+            return Err(ApiError::bad_request(format!(
+                "document {}: attribute `{name}` {why}",
+                d.id
+            )));
+        }
+        d.attributes.retain(|_, v| !v.is_null());
+    }
+    Ok(())
+}
+
 /// A write's patches (M13), from `patch_rows` and `patch_columns`, in that order. Values are
 /// converted as a document's attributes are; `null` removes an attribute.
 ///
@@ -1929,6 +2019,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let (mut req, keys) = parse_write(&body)?;
+    upserts_of(&mut req)?;
     let applied = matches!(req.durability, types::Durability::Applied);
     let ids_wanted = req.affected_ids;
     if applied && !api.registry_mut().applied_writes {
@@ -4504,17 +4595,28 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                 let a = &mut fts.analyzer;
                 match k.as_str() {
                     "tokenizer" => {
-                        a.tokenizer = match v.as_str() {
-                            Some("word_v1") => Tokenizer::WordV1,
-                            // M158: the client's own tokens.
-                            Some("pre_tokenized_array") => Tokenizer::PreTokenizedArray,
-                            _ => {
-                                return Err(format!(
-                                    "full_text_search: tokenizer {v} is not word_v1 or \
-                                     pre_tokenized_array"
-                                ));
-                            }
-                        };
+                        // M158: `pre_tokenized_array`, the client's own tokens; M181: `word_v0`
+                        // to `word_v4`.
+                        a.tokenizer = v.as_str().and_then(Tokenizer::parse).ok_or_else(|| {
+                            format!(
+                                "full_text_search: tokenizer {v} is not one of {}",
+                                Tokenizer::ALL.map(Tokenizer::name).join(", ")
+                            )
+                        })?;
+                    }
+                    // M181: an integer, never `5.0`.
+                    "max_token_length" => {
+                        a.max_token_length = Some(
+                            v.as_u64()
+                                .and_then(|n| u8::try_from(n).ok())
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "full_text_search: max_token_length {v} is not an \
+                                         integer in [1, 255]"
+                                    )
+                                })?,
+                        );
                     }
                     "language" => {
                         a.language = v.as_str().and_then(Language::parse).ok_or_else(|| {
@@ -4549,6 +4651,8 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                         opts.get("case_sensitive") == Some(&serde_json::Value::Bool(false)),
                     ),
                     ("ascii_folding: true", a.ascii_folding),
+                    // M181: a token is kept whole, so no limit can drop it.
+                    ("max_token_length", a.max_token_length.is_some()),
                 ];
                 if let Some((what, _)) = changes.iter().find(|(_, set)| *set) {
                     return Err(format!(
@@ -4685,11 +4789,8 @@ fn declared_trigram(req: &WriteRequest) -> Result<Option<Vec<String>>, ApiError>
 /// A full-text schema as `GET /v1/indexes/{index}` reports it (M14).
 fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     let a = &f.analyzer;
-    serde_json::json!({
-        "tokenizer": match a.tokenizer {
-            pstore_format::text::Tokenizer::WordV1 => "word_v1",
-            pstore_format::text::Tokenizer::PreTokenizedArray => "pre_tokenized_array",
-        },
+    let mut out = serde_json::json!({
+        "tokenizer": a.tokenizer.name(),
         "language": a.language.name(),
         "stemming": a.stemming,
         "remove_stopwords": a.remove_stopwords,
@@ -4697,7 +4798,12 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
         "ascii_folding": a.ascii_folding,
         "k1": f.k1,
         "b": f.b,
-    })
+    });
+    // M181: reported only when set, as a field that never declared one is unchanged.
+    if let (Some(max), Some(o)) = (a.max_token_length, out.as_object_mut()) {
+        o.insert("max_token_length".to_owned(), max.into());
+    }
+    out
 }
 
 /// Refuses a batch whose documents disagree on their vector width (M170: none is a width).
@@ -4778,18 +4884,8 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
     for (name, value) in &attributes {
-        if name.is_empty() {
-            return Err(refuse(name, "has an empty name"));
-        }
-        // `$` names are the engine's (M9d: `$metric` carries a row's metric to the fold), as
-        // turbopuffer reserves them for `$dist`.
-        if name.starts_with('$') {
-            return Err(refuse(name, "is reserved: names beginning `$` are"));
-        }
-        // `id` in a filter always means the document id (M9b); an attribute of that name
-        // would give `["id", "Eq", x]` two meanings.
-        if name == pstore_query::ID_ATTRIBUTE {
-            return Err(refuse(name, "is reserved: `id` is the document id"));
+        if let Some(why) = name_refusal(name) {
+            return Err(refuse(name, why));
         }
         let v = match (dated.get(name), value) {
             // M9h.3, M171: a declared type is read from a string, or an array of them.
@@ -6446,5 +6542,49 @@ mod tests {
         assert!(!agree(
             serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [1.0, 2.0]}])
         ));
+    }
+    /// M174: a batch in columns is the batch in rows, document for document, every null
+    /// left out -- read by the same path, so a base64 vector and a declared type agree too.
+    #[test]
+    fn columns_normalize_to_the_rows_documents() {
+        use base64::Engine as _;
+        let b64 = |v: &[f32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let schema = serde_json::json!({"owner": "uuid", "at": "datetime"});
+        let u = "6f1e2d3c-4b5a-4968-8776-655443322110";
+        let rows = serde_json::json!({"schema": schema, "documents": [
+            {"id": "a", "vector": [1.0, 2.0], "vectors": {"late": [[1.0], [2.0]]},
+             "text": "red fox",
+             "attributes": {"n": 3, "f": 0.5, "b": true, "s": "x", "arr": [1, 2],
+                            "owner": u, "at": "2026-10-29T01:02:03Z"}},
+            {"id": "b", "vector": b64(&[3.0, 4.0]),
+             "attributes": {"n": null, "f": 1.5, "s": "y", "owner": null}},
+        ]});
+        let columns = serde_json::json!({"schema": schema, "upsert_columns": {
+            "id": ["a", "b"],
+            "vector": [b64(&[1.0, 2.0]), [3.0, 4.0]],
+            "vectors": [{"late": [[1.0], [2.0]]}, null],
+            "text": ["red fox", null],
+            "n": [3, null], "f": [0.5, 1.5], "b": [true, null], "s": ["x", "y"],
+            "arr": [[1, 2], null], "owner": [u, null], "at": ["2026-10-29T01:02:03Z", null],
+        }});
+        let docs = |body: serde_json::Value| {
+            let mut req: WriteRequest = serde_json::from_value(body).unwrap();
+            upserts_of(&mut req).unwrap();
+            let dated = declared_types(&req).unwrap();
+            req.documents
+                .into_iter()
+                .map(|d| to_document(d, &dated).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let (rows, columns) = (docs(rows), docs(columns));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows, columns);
+        let b = &rows[1];
+        assert!(!b.attrs.contains_key("n") && !b.attrs.contains_key("owner"));
+        assert!(b.attrs.contains_key("f"));
+        assert_eq!(rows[0].attrs.len(), 8, "every attribute and the text field");
     }
 }

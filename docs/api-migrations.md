@@ -1,5 +1,24 @@
 # Native API migration notes
 
+## M174: column upserts, and `null` in an upsert
+
+A write may give its upserts in columns, as `patch_columns` gives patches:
+
+```json
+{"upsert_columns": {"id": ["a", "b"], "vector": [[1.0, 0.5], [0.5, 1.0]],
+                    "text": ["red fox", null], "n": [1, null]}}
+```
+
+- One cell per id in every column; `vector`, `vectors` and `text` are those document
+  fields, every other column an attribute. Each row is read exactly as a `documents` entry,
+  and the rows follow `documents` in the same request, so a later duplicate id wins.
+- A column of another length, a non-string id, or a cell the row form refuses fails the
+  whole request, HTTP 400, nothing stored.
+- **Changed:** `null` in an upsert (a `documents` attribute, or a cell) now means the row
+  does not hold that attribute, as omitting it does; before, a `null` attribute was refused.
+  `"vectors": null` is accepted as no named fields. A patch's `null` still removes, and
+  `null` inside an array is still refused.
+
 ## M173: attribute types persist
 
 A type a write declares in its `schema` is now recorded in the index's schema at the fold,

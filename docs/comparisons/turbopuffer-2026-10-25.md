@@ -116,7 +116,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Vendor field | Current pstore capability | Status / next work |
 |---|---|---|
 | `upsert_rows` | `documents: [{id, vector, vectors?, text?, attributes?}]`; overwrite by string ID | Equivalent operation, different shape; B |
-| `upsert_columns` | No column upsert parser | Missing; B/D |
+| `upsert_columns` | Columns normalized to `documents` rows (M174) | Delivered; D |
 | `patch_rows` | Nested `attributes` instead of flattened row attributes; vectors refused | Partial, deferred; C |
 | `patch_columns` | ID column plus attribute columns | Partial, deferred and string IDs; C |
 | `deletes` | String ID list, after upserts/patches | Equivalent primitive; ordering/response differ; C |
@@ -318,8 +318,8 @@ All ten `FullTextSearchConfig` properties:
 | `language` | Same 18 language names in the enum; this alone does not prove identical stemming/tokenization |
 | `stemming`, `ascii_folding`, `case_sensitive` | Configurable |
 | `remove_stopwords` | Configurable only for English; other languages refused when true; vendor supports additional languages with exceptions; default conflict recorded above |
-| `max_token_length` | No public option |
-| `tokenizer` | `word_v1` and, from [M158](../milestones/M158/VERIFIED.md), `pre_tokenized_array` (each string of a `[]string` value is one token, kept byte for byte; `language`, stemming, stopwords, folding and `case_sensitive: false` refused; no highlighting). The vendor's `word_v0` through `word_v4` are not accepted. ⚠️ Operating rule: declare `pre_tokenized_array` only once every server runs M158 or later, since an older build reads its `v2` stamp as no stamp and could record the index as `word_v1` |
+| `max_token_length` | Configurable from [M181](../milestones/M181/VERIFIED.md), 1 to 255 characters; a longer token is dropped from the document and its length, and a query token over it matches nothing. The vendor's default is not published; pstore's is no limit. Refused under `pre_tokenized_array` |
+| `tokenizer` | `word_v1` and, from [M158](../milestones/M158/VERIFIED.md), `pre_tokenized_array` (each string of a `[]string` value is one token, kept byte for byte; `language`, stemming, stopwords, folding and `case_sensitive: false` refused; no highlighting). `word_v0` to `word_v4` from [M181](../milestones/M181/VERIFIED.md): pstore's `word_v1` (the default) and `word_v0` keep no emoji, unlike the vendor's `word_v1`; `word_v4` is `word_v3`'s token stream, since the vendor's fixes are not published; both use Unicode 16.0, not 17.0; the vendor's default for a new namespace is `word_v4`. ⚠️ Operating rule: declare `pre_tokenized_array` only once every server runs M158 or later, since an older build reads its `v2` stamp as no stamp and could record the index as `word_v1` |
 
 The vendor FTS guide excludes Arabic, Greek, Romanian, Tamil, and Turkish from its
 stopword-removal support. Pre-tokenized arrays have their own case/stemming restrictions

@@ -151,17 +151,64 @@ pub struct Analyzer {
     pub ascii_folding: bool,
     /// How a string becomes tokens (M158).
     pub tokenizer: Tokenizer,
+    /// The most characters a raw token may hold (M181), or `None` for no limit. A longer
+    /// token has no term, as a stopword has none.
+    pub max_token_length: Option<u8>,
 }
 
 /// How a string becomes tokens (M158): the vendor's `tokenizer` option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tokenizer {
+    /// Maximal runs of alphanumeric characters (M181): [`Tokenizer::WordV1`]'s tokens.
+    WordV0,
     /// Maximal runs of alphanumeric characters, as every analyzer before M158.
+    ///
+    /// ⚠️ Unlike the vendor's `word_v1`, it keeps no emoji: changing it would retokenize every
+    /// index stamped with it.
     #[default]
     WordV1,
+    /// Runs of alphanumerics that are not `Ideographic`; each `Ideographic` codepoint alone;
+    /// each grapheme cluster that starts with an emoji or regional indicator whole (M181).
+    WordV2,
+    /// UAX #29 word segments holding an alphanumeric, or starting with an emoji or regional
+    /// indicator (M181).
+    WordV3,
+    /// [`Tokenizer::WordV3`]'s tokens (M181): the vendor's edge-case fixes are not published.
+    WordV4,
     /// The client's own tokens: a document's string is one token, kept byte for byte, and a
     /// query operand is its tokens joined by [`TOKEN_SEPARATOR`].
     PreTokenizedArray,
+}
+
+impl Tokenizer {
+    /// Every tokenizer, in the order the wire lists them.
+    pub const ALL: [Self; 6] = [
+        Self::WordV0,
+        Self::WordV1,
+        Self::WordV2,
+        Self::WordV3,
+        Self::WordV4,
+        Self::PreTokenizedArray,
+    ];
+
+    /// The wire's name for it, which [`Self::parse`] reads back.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WordV0 => "word_v0",
+            Self::WordV1 => "word_v1",
+            Self::WordV2 => "word_v2",
+            Self::WordV3 => "word_v3",
+            Self::WordV4 => "word_v4",
+            Self::PreTokenizedArray => "pre_tokenized_array",
+        }
+    }
+
+    /// The tokenizer the wire calls `name`, or `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == name)
+    }
 }
 
 /// What joins a `[]string` query operand's tokens into one string (M158): the ASCII unit
@@ -228,14 +275,13 @@ impl FullText {
             self.k1.to_bits(),
             self.b.to_bits()
         );
-        match a.tokenizer {
-            Tokenizer::WordV1 => line,
-            Tokenizer::PreTokenizedArray => {
-                format!(
-                    "v2{};pre_tokenized_array",
-                    line.get(2..).unwrap_or_default()
-                )
-            }
+        let rest = line.get(2..).unwrap_or_default();
+        // M181: a `v2` line names any tokenizer but `word_v1`; a `v3` line adds the limit.
+        // A build before M181 refuses both.
+        match (a.tokenizer, a.max_token_length) {
+            (Tokenizer::WordV1, None) => line,
+            (t, None) => format!("v2{rest};{}", t.name()),
+            (t, Some(max)) => format!("v3{rest};{};{max}", t.name()),
         }
     }
 
@@ -243,14 +289,7 @@ impl FullText {
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
         let mut parts = s.split(';');
-        let tokenizer = match parts.next()? {
-            "v1" => Tokenizer::WordV1,
-            "v2" => match s.rsplit(';').next()? {
-                "pre_tokenized_array" => Tokenizer::PreTokenizedArray,
-                _ => return None,
-            },
-            _ => return None,
-        };
+        let version = parts.next()?;
         let language = Language::parse(parts.next()?)?;
         let flags: Vec<bool> = parts
             .next()?
@@ -267,10 +306,25 @@ impl FullText {
         let bits = |p: Option<&str>| p.and_then(|h| u32::from_str_radix(h, 16).ok());
         let k1 = f32::from_bits(bits(parts.next())?);
         let b = f32::from_bits(bits(parts.next())?);
-        // A `v2` line names its tokenizer last, read above.
-        if tokenizer != Tokenizer::WordV1 {
-            parts.next()?;
-        }
+        let (tokenizer, max_token_length) = match version {
+            "v1" => (Tokenizer::WordV1, None),
+            // `word_v1` with no limit has the `v1` line, and only that one.
+            "v2" => match Tokenizer::parse(parts.next()?)? {
+                Tokenizer::WordV1 => return None,
+                t => (t, None),
+            },
+            "v3" => {
+                let t = Tokenizer::parse(parts.next()?)?;
+                let max = parts.next()?;
+                // The door refuses a limit under `pre_tokenized_array`; one decimal spelling.
+                let n = max.parse::<u8>().ok().filter(|n| *n > 0)?;
+                if t == Tokenizer::PreTokenizedArray || n.to_string() != max {
+                    return None;
+                }
+                (t, Some(n))
+            }
+            _ => return None,
+        };
         if parts.next().is_some() {
             return None;
         }
@@ -282,6 +336,7 @@ impl FullText {
                 case_sensitive: *case_sensitive,
                 ascii_folding: *ascii_folding,
                 tokenizer,
+                max_token_length,
             },
             k1,
             b,
@@ -362,39 +417,156 @@ pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
     let stemmer = a
         .stemming
         .then(|| rust_stemmers::Stemmer::create(a.language.algorithm()));
+    raw_spans(a.tokenizer, s)
+        .into_iter()
+        .map(|span| {
+            let raw = &s[span.clone()];
+            if over_limit(a, raw) {
+                return Token { span, term: None };
+            }
+            let t = if a.case_sensitive {
+                raw.to_owned()
+            } else {
+                raw.to_lowercase()
+            };
+            let t: String = if a.ascii_folding {
+                t.nfkd().filter(|c| !is_combining_mark(*c)).collect()
+            } else {
+                t
+            };
+            let term = if a.remove_stopwords && STOPWORDS.contains(&t.as_str()) {
+                None
+            } else {
+                Some(match &stemmer {
+                    Some(st) => st.stem(&t).into_owned(),
+                    None => t,
+                })
+            };
+            Token { span, term }
+        })
+        .collect()
+}
+
+/// Whether the raw token `raw` holds more characters than `a`'s `max_token_length` (M181):
+/// such a token has no term, and a query token over it matches nothing. Characters are
+/// scalar values, counted before case or folding.
+#[must_use]
+pub fn over_limit(a: &Analyzer, raw: &str) -> bool {
+    a.max_token_length
+        .is_some_and(|max| raw.chars().count() > usize::from(max))
+}
+
+/// A Unicode property's ranges, read from `regex-syntax`'s tables once (M181).
+fn property(name: &str) -> Vec<(char, char)> {
+    use regex_syntax::hir::{Class, HirKind};
+    let hir = regex_syntax::parse(&format!("\\p{{{name}}}"));
+    match hir.as_ref().map(regex_syntax::hir::Hir::kind) {
+        Ok(HirKind::Class(Class::Unicode(c))) => {
+            c.ranges().iter().map(|r| (r.start(), r.end())).collect()
+        }
+        // Unreachable while the `unicode-bool` feature is on: the property test fails first.
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `ranges`, sorted and disjoint, hold `c`.
+fn holds(ranges: &[(char, char)], c: char) -> bool {
+    let i = ranges.partition_point(|&(_, hi)| hi < c);
+    ranges.get(i).is_some_and(|&(lo, _)| lo <= c)
+}
+
+static EXTENDED_PICTOGRAPHIC: std::sync::LazyLock<Vec<(char, char)>> =
+    std::sync::LazyLock::new(|| property("Extended_Pictographic"));
+static REGIONAL_INDICATOR: std::sync::LazyLock<Vec<(char, char)>> =
+    std::sync::LazyLock::new(|| property("Regional_Indicator"));
+static IDEOGRAPHIC: std::sync::LazyLock<Vec<(char, char)>> =
+    std::sync::LazyLock::new(|| property("Ideographic"));
+
+/// Whether `c` is `Extended_Pictographic` (M181), by `regex-syntax`'s Unicode tables.
+#[must_use]
+pub fn is_extended_pictographic(c: char) -> bool {
+    holds(&EXTENDED_PICTOGRAPHIC, c)
+}
+
+/// Whether `c` is `Regional_Indicator` (M181), by `regex-syntax`'s Unicode tables.
+#[must_use]
+pub fn is_regional_indicator(c: char) -> bool {
+    holds(&REGIONAL_INDICATOR, c)
+}
+
+/// Whether `c` is `Ideographic` (M181), by `regex-syntax`'s Unicode tables.
+#[must_use]
+pub fn is_ideographic(c: char) -> bool {
+    holds(&IDEOGRAPHIC, c)
+}
+
+/// Whether a segment starting with `c` is an emoji or a flag: kept whole by `word_v2` to
+/// `word_v4` (M181).
+fn starts_emoji(segment: &str) -> bool {
+    segment
+        .chars()
+        .next()
+        .is_some_and(|c| is_extended_pictographic(c) || is_regional_indicator(c))
+}
+
+/// The byte spans of `s`'s raw tokens under a `word_v*` tokenizer (M181).
+fn raw_spans(tokenizer: Tokenizer, s: &str) -> Vec<std::ops::Range<usize>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let span = |(i, g): (usize, &str)| i..i + g.len();
+    match tokenizer {
+        Tokenizer::WordV0 | Tokenizer::WordV1 | Tokenizer::PreTokenizedArray => {
+            alphanumeric_runs(s, |_| false)
+        }
+        // An emoji's cluster whole, then runs over the text between clusters.
+        Tokenizer::WordV2 => {
+            let mut out = Vec::new();
+            let mut from = 0;
+            for (i, g) in s.grapheme_indices(true) {
+                if starts_emoji(g) {
+                    let between = s.get(from..i).unwrap_or_default();
+                    out.extend(
+                        alphanumeric_runs(between, is_ideographic)
+                            .into_iter()
+                            .map(|r| r.start + from..r.end + from),
+                    );
+                    out.push(span((i, g)));
+                    from = i + g.len();
+                }
+            }
+            let rest = s.get(from..).unwrap_or_default();
+            out.extend(
+                alphanumeric_runs(rest, is_ideographic)
+                    .into_iter()
+                    .map(|r| r.start + from..r.end + from),
+            );
+            out
+        }
+        Tokenizer::WordV3 | Tokenizer::WordV4 => s
+            .split_word_bound_indices()
+            .filter(|(_, w)| w.chars().any(char::is_alphanumeric) || starts_emoji(w))
+            .map(span)
+            .collect(),
+    }
+}
+
+/// Maximal runs of alphanumeric characters, each `split` character a run of its own.
+fn alphanumeric_runs(s: &str, split: impl Fn(char) -> bool) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start = None;
     // The sentinel space closes a token that runs to the end of the text.
     for (i, c) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
-        match (c.is_alphanumeric(), start) {
-            (true, None) => start = Some(i),
-            (false, Some(from)) => {
-                start = None;
-                let raw = &s[from..i];
-                let t = if a.case_sensitive {
-                    raw.to_owned()
-                } else {
-                    raw.to_lowercase()
-                };
-                let t: String = if a.ascii_folding {
-                    t.nfkd().filter(|c| !is_combining_mark(*c)).collect()
-                } else {
-                    t
-                };
-                let term = if a.remove_stopwords && STOPWORDS.contains(&t.as_str()) {
-                    None
-                } else {
-                    Some(match &stemmer {
-                        Some(st) => st.stem(&t).into_owned(),
-                        None => t,
-                    })
-                };
-                out.push(Token {
-                    span: from..i,
-                    term,
-                });
+        if let Some(from) = start
+            && (!c.is_alphanumeric() || split(c))
+        {
+            out.push(from..i);
+            start = None;
+        }
+        if c.is_alphanumeric() {
+            if split(c) {
+                out.push(i..i + c.len_utf8());
+            } else if start.is_none() {
+                start = Some(i);
             }
-            _ => {}
         }
     }
     out
