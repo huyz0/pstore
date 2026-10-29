@@ -63,6 +63,6 @@ gates above were run by hand.
 
 CI on the PR: every job green except `mutants-shard (7)`, which missed two mutants in
 `raw_spans` (`+` to `-` on each bound of the offset that places the runs between two
-emoji). No test had text after a first emoji and before a second, where the offset is not
-0. `ideographs_before_an_emoji_are_split` gained `x👍東京y👍z`; both mutants, applied by hand,
+emoji). No test had text after a first emoji and before a second, where the offset is
+nonzero. `ideographs_before_an_emoji_are_split` gained `x👍東京y👍z`; both mutants, applied by hand,
 now fail it. `cargo deny check` passed in CI's `check` job.
