@@ -47,6 +47,12 @@ fn elements_and_members_count_one_container_each() {
         Err(Breach::Elements { depth: 1 })
     );
     assert_eq!(scan(b"[[1,2,3],[1,2,3],[]]", &elements), Ok(()));
+    // The deepest level a body may reach is counted too.
+    let deepest = format!("{}1,2,3,4{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
+    assert_eq!(
+        scan(deepest.as_bytes(), &elements),
+        Err(Breach::Elements { depth: DEPTH })
+    );
     assert_eq!(
         scan(b"{\"a\":[[1,2,3,[]]]}", &elements),
         Err(Breach::Elements { depth: 3 })
