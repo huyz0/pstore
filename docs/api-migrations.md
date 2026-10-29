@@ -1,5 +1,37 @@
 # Native API migration notes
 
+## M164: aggregations and facets inside a multi-query
+
+A sub-query of `{"queries": [...]}` may now be an aggregation (`aggregate_by`, with
+`group_by`) or a ranked query with `facets`, where both were refused before:
+
+```json
+{"queries": [
+  {"vector": [1.0, 0.5], "top_k": 10},
+  {"aggregate_by": {"n": ["Count", "id"], "s": ["Sum", "price"]}, "filters": ["tag", "Eq", "x"]},
+  {"text": "shoe", "facets": {"aggregate_by": {"n": ["Count", "id"]}, "group_by": ["color"]}}
+]}
+```
+
+- The root then carries `aggregations` and `aggregation_groups`, one entry per sub-query
+  in request order, `null` where a sub-query has none; with facets it carries `facets` and
+  `meta.facets_epochs` the same way. A multi-query asking for neither answers byte for byte
+  as before.
+- ⚠️ An aggregation sub-query's `results` entry is `[]`: read its counts from
+  `aggregations[i]` or `aggregation_groups[i]`.
+- Every entry is what the same query answers alone, with the same limits and refusals,
+  and one more, below.
+  Aggregations and facets count their own filtered set: no other sub-query's `top_k` or
+  `offset`, and no outer `rerank_by` window, cuts them.
+- Every sub-query, aggregation and facet query answers from one snapshot when the
+  sub-queries share a level and none reads `as_of` (M131). Otherwise each faceted sub-query
+  still counts its facets at its own hits' snapshot.
+- An aggregation sub-query beside an outer `rerank_by` is refused: fusion ranks rows.
+  Facets beside it are kept per sub-query.
+
+No stored-data migration is needed. The [M164 verification](milestones/M164/VERIFIED.md)
+records the evidence.
+
 ## M172: uint64 attributes
 
 A write's `schema` may declare an attribute `"uint64"`:

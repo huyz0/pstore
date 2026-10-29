@@ -2538,23 +2538,56 @@ async fn query_index<S: BlobStore + 'static>(
         ));
     }
     let (reqs, outer) = multi_query(raw)?;
+    // M164: every facet query derived, and every refusal found, before any runs -- facets
+    // first, as for a query alone (M65), so every refusal names `facets`.
+    let facet_reqs = reqs
+        .iter()
+        .map(|r| Ok(facets::derive(r)?.map(|(f, _)| f)))
+        .collect::<Result<Vec<_>, ApiError>>()?;
     reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
     let peers: Vec<Option<peers::QueryPeers>> =
         reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
+    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
+    let whole = pinnable(&reqs, &token)?;
     // Planned again inside, so a pinned retry (M131) can run every leg once more.
     let all = {
-        let (reqs, peers, engine, index, token) = (&reqs, &peers, &engine, &index, &token);
+        let (reqs, facet_reqs, peers, engine, index, token) =
+            (&reqs, &facet_reqs, &peers, &engine, &index, &token);
+        let pinned_whole = whole.is_some();
         move || {
-            futures_util::future::try_join_all(reqs.iter().zip(peers).map(|(req, p)| async {
-                run(engine, index, req, plan(req)?, token, p.as_ref()).await
-            }))
+            futures_util::future::try_join_all(reqs.iter().zip(facet_reqs).zip(peers).map(
+                move |((req, facet), p)| async move {
+                    // A query and its facets, together: depth is the deeper of the two (M65).
+                    let pair = move || async move {
+                        let ranked = run(engine, index, req, plan(req)?, token, p.as_ref());
+                        match facet {
+                            None => Ok::<_, ApiError>((ranked.await?, None)),
+                            Some(f) => {
+                                let beside = run(engine, index, f, plan(f)?, token, None);
+                                let (got, faceted) =
+                                    futures_util::future::try_join(ranked, beside).await?;
+                                Ok((got, Some(faceted)))
+                            }
+                        }
+                    };
+                    // M164: a request not pinned as a whole still pins each query to its
+                    // facets, as `query_index` pins a faceted query alone.
+                    let own = match facet {
+                        Some(_) if !pinned_whole => pinnable(std::slice::from_ref(req), token)?,
+                        _ => None,
+                    };
+                    match own {
+                        Some(level) => engine.pinned(index, level, pair).await,
+                        None => pair().await,
+                    }
+                },
+            ))
         }
     };
-    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
-    let got = match pinnable(&reqs, &token)? {
+    let got = match whole {
         Some(level) => engine.pinned(&index, level, all).await,
         None => all().await,
     };
@@ -2563,28 +2596,52 @@ async fn query_index<S: BlobStore + 'static>(
     // the entries its HEAD covers, and merging the request's back would restore them.
     let mut merged = got
         .first()
-        .map_or_else(|| token.clone(), |g| g.token.clone());
-    for g in got.iter().skip(1) {
+        .map_or_else(|| token.clone(), |(g, _)| g.token.clone());
+    for (g, _) in got.iter().skip(1) {
         merged.merge(&g.token);
     }
     let session = merged.encode();
+    // M164: the aggregation fields when any query aggregates, the facets when any has them.
+    let aggregating = reqs.iter().any(|r| r.aggregate_by.is_some());
+    let faceting = facet_reqs.iter().any(Option::is_some);
+    let mut aggregations = Vec::with_capacity(got.len());
+    let mut aggregation_groups = Vec::with_capacity(got.len());
+    let mut facets = Vec::with_capacity(got.len());
+    let mut facets_epochs = Vec::with_capacity(got.len());
+    let mut epochs = Vec::with_capacity(got.len());
+    let mut unfolded_hits = Vec::with_capacity(got.len());
+    let mut consistencies = Vec::with_capacity(got.len());
+    let mut staleness_ms = Vec::with_capacity(got.len());
+    let mut lists = Vec::with_capacity(got.len());
+    for (g, faceted) in got {
+        epochs.push(g.epoch);
+        unfolded_hits.push(g.unfolded_hits);
+        consistencies.push(g.consistency);
+        staleness_ms.push(g.staleness_ms);
+        aggregations.push(g.aggregations);
+        aggregation_groups.push(g.aggregation_groups);
+        facets_epochs.push(faceted.as_ref().map(|f| f.epoch));
+        facets.push(faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups)));
+        lists.push(g.results);
+    }
     Ok(with_session(
         axum::Json(MultiQueryResponse {
             meta: MultiQueryMeta {
-                epochs: got.iter().map(|g| g.epoch).collect(),
-                unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
+                epochs,
+                unfolded_hits,
                 cost: api.spend(tenant).since(before),
-                consistencies: got.iter().map(|g| g.consistency).collect(),
+                consistencies,
                 session: session.clone(),
-                staleness_ms: got.iter().map(|g| g.staleness_ms).collect(),
+                staleness_ms,
+                facets_epochs: faceting.then_some(facets_epochs),
             },
-            results: {
-                let lists = got.into_iter().map(|g| g.results).collect();
-                match &outer {
-                    // M142: one list, the fused one.
-                    Some(outer) => vec![rerank::fuse_outer(lists, outer)],
-                    None => lists,
-                }
+            aggregations: aggregating.then_some(aggregations),
+            aggregation_groups: aggregating.then_some(aggregation_groups),
+            facets: faceting.then_some(facets),
+            results: match &outer {
+                // M142: one list, the fused one.
+                Some(outer) => vec![rerank::fuse_outer(lists, outer)],
+                None => lists,
             },
         }),
         &session,
@@ -2669,20 +2726,15 @@ fn multi_query(
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
             }
-            // A multi-query's results are lists of rows; an aggregation's are not (M12).
-            if q.get("aggregate_by").is_some() {
-                return Err(ApiError::bad_request(
-                    "aggregate_by inside a multi-query is not offered",
-                ));
-            }
-            if q.get("facets").is_some_and(|f| !f.is_null()) {
-                return Err(ApiError::bad_request(
-                    "facets inside a multi-query is not offered",
-                ));
-            }
             parse_query(q)
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<QueryRequest>, _>>()?;
+    // M164: fusion ranks rows, and an aggregation has none.
+    if outer.is_some() && subs.iter().any(|q| q.aggregate_by.is_some()) {
+        return Err(ApiError::bad_request(
+            "rerank_by fuses rankings: a query inside it cannot be an aggregate_by",
+        ));
+    }
     Ok((subs, outer))
 }
 

@@ -302,7 +302,6 @@ async fn facets_are_refused_at_the_door() {
         json!({"facets": {"aggregate_by": agg}}),
         json!({"vector": Q, "rank_by": ["price", "asc"], "facets": {"aggregate_by": agg}}),
         json!({"vector": Q, "aggregate_by": agg, "facets": {"aggregate_by": agg}}),
-        json!({"queries": [{"vector": Q, "facets": {"aggregate_by": agg}}]}),
     ];
     for q in cases {
         let why = refused(&api, &q).await;

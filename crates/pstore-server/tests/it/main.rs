@@ -46,6 +46,7 @@ mod lifecycle;
 mod limit_per;
 mod metrics;
 mod multi;
+mod multi_aggregate;
 mod multi_fde;
 mod named_dense;
 mod order;
