@@ -49,6 +49,9 @@ pub struct Bound {
     query: Vec<String>,
     /// The literal prefix of a `*Prefix` op (M138): the last raw token as [`plain`] makes it.
     prefix: Option<String>,
+    /// A token the op requires is over the index's `max_token_length` (M181), so no row
+    /// holds it and the op matches nothing. `Any` and `AnyPrefix` require no one token.
+    unmatchable: bool,
 }
 
 impl Bound {
@@ -56,22 +59,27 @@ impl Bound {
     /// literal prefix, and analyzes the text before it (M138).
     #[must_use]
     pub fn new(analyzer: pstore_format::text::Analyzer, op: TokenOp, text: &str) -> Self {
-        use pstore_format::text::{analyze, analyze_query, query_tokens};
+        use pstore_format::text::{analyze, analyze_query, over_limit, query_tokens};
         // M158: an operand, read as one -- under `pre_tokenized_array`, tokens joined by U+001F.
         let last = matches!(op, TokenOp::AllPrefix | TokenOp::AnyPrefix)
             .then(|| query_tokens(&analyzer, text).pop())
             .flatten();
-        match last {
-            Some(t) => Self {
-                analyzer,
-                query: analyze_query(&analyzer, text.get(..t.span.start).unwrap_or_default()),
-                prefix: analyze(&plain(&analyzer), text.get(t.span).unwrap_or_default()).pop(),
-            },
-            None => Self {
-                analyzer,
-                query: analyze_query(&analyzer, text),
-                prefix: None,
-            },
+        let query_text = match &last {
+            Some(t) => text.get(..t.span.start).unwrap_or_default(),
+            None => text,
+        };
+        // M181: every raw token the op requires, the prefix included, within the limit.
+        let unmatchable = matches!(op, TokenOp::All | TokenOp::Sequence | TokenOp::AllPrefix)
+            && query_tokens(&analyzer, text)
+                .iter()
+                .any(|t| over_limit(&analyzer, text.get(t.span.clone()).unwrap_or_default()));
+        Self {
+            analyzer,
+            query: analyze_query(&analyzer, query_text),
+            prefix: last.and_then(|t| {
+                analyze(&plain(&analyzer), text.get(t.span).unwrap_or_default()).pop()
+            }),
+            unmatchable,
         }
     }
 
@@ -743,6 +751,9 @@ impl Predicate {
 /// runs across them.
 fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
     use pstore_format::text::{Tokenizer, analyze};
+    if b.unmatchable {
+        return false;
+    }
     let mut rows: Vec<Vec<String>> = elems.iter().map(|e| analyze(&b.analyzer, e)).collect();
     if b.analyzer.tokenizer == Tokenizer::PreTokenizedArray {
         rows = vec![rows.concat()];

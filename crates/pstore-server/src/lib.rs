@@ -4580,17 +4580,28 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                 let a = &mut fts.analyzer;
                 match k.as_str() {
                     "tokenizer" => {
-                        a.tokenizer = match v.as_str() {
-                            Some("word_v1") => Tokenizer::WordV1,
-                            // M158: the client's own tokens.
-                            Some("pre_tokenized_array") => Tokenizer::PreTokenizedArray,
-                            _ => {
-                                return Err(format!(
-                                    "full_text_search: tokenizer {v} is not word_v1 or \
-                                     pre_tokenized_array"
-                                ));
-                            }
-                        };
+                        // M158: `pre_tokenized_array`, the client's own tokens; M181: `word_v0`
+                        // to `word_v4`.
+                        a.tokenizer = v.as_str().and_then(Tokenizer::parse).ok_or_else(|| {
+                            format!(
+                                "full_text_search: tokenizer {v} is not one of {}",
+                                Tokenizer::ALL.map(Tokenizer::name).join(", ")
+                            )
+                        })?;
+                    }
+                    // M181: an integer, never `5.0`.
+                    "max_token_length" => {
+                        a.max_token_length = Some(
+                            v.as_u64()
+                                .and_then(|n| u8::try_from(n).ok())
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "full_text_search: max_token_length {v} is not an \
+                                         integer in [1, 255]"
+                                    )
+                                })?,
+                        );
                     }
                     "language" => {
                         a.language = v.as_str().and_then(Language::parse).ok_or_else(|| {
@@ -4625,6 +4636,8 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                         opts.get("case_sensitive") == Some(&serde_json::Value::Bool(false)),
                     ),
                     ("ascii_folding: true", a.ascii_folding),
+                    // M181: a token is kept whole, so no limit can drop it.
+                    ("max_token_length", a.max_token_length.is_some()),
                 ];
                 if let Some((what, _)) = changes.iter().find(|(_, set)| *set) {
                     return Err(format!(
@@ -4761,11 +4774,8 @@ fn declared_trigram(req: &WriteRequest) -> Result<Option<Vec<String>>, ApiError>
 /// A full-text schema as `GET /v1/indexes/{index}` reports it (M14).
 fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
     let a = &f.analyzer;
-    serde_json::json!({
-        "tokenizer": match a.tokenizer {
-            pstore_format::text::Tokenizer::WordV1 => "word_v1",
-            pstore_format::text::Tokenizer::PreTokenizedArray => "pre_tokenized_array",
-        },
+    let mut out = serde_json::json!({
+        "tokenizer": a.tokenizer.name(),
         "language": a.language.name(),
         "stemming": a.stemming,
         "remove_stopwords": a.remove_stopwords,
@@ -4773,7 +4783,12 @@ fn fts_json(f: &pstore_format::text::FullText) -> serde_json::Value {
         "ascii_folding": a.ascii_folding,
         "k1": f.k1,
         "b": f.b,
-    })
+    });
+    // M181: reported only when set, as a field that never declared one is unchanged.
+    if let (Some(max), Some(o)) = (a.max_token_length, out.as_object_mut()) {
+        o.insert("max_token_length".to_owned(), max.into());
+    }
+    out
 }
 
 /// Refuses a batch whose documents disagree on their vector width (M170: none is a width).
