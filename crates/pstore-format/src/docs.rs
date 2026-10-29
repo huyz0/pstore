@@ -64,6 +64,8 @@ fn encode_value(e: &mut Enc, v: &Value) {
             e.u8(8);
             e.u64(*n);
         }
+        // M175: a null array element, the tag alone.
+        Value::Null => e.u8(9),
         // M9h.2: a count, then each element with its own tag.
         Value::Array(items) => {
             e.u8(4);
@@ -130,6 +132,8 @@ fn skip_value(d: &mut Dec<'_>, array: bool) -> Result<(), FormatError> {
             }
         }
         4 => return Err(FormatError::Corrupt("an array inside an array")),
+        9 if !array => {}
+        9 => return Err(FormatError::Corrupt("a null outside an array")),
         _ => return Err(FormatError::Corrupt("unknown value tag")),
     }
     Ok(())
@@ -161,6 +165,9 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
         6 => Value::Uuid(d.uuid()?),
         7 => Value::Bytes(d.bytes()?.to_vec()),
         8 => Value::Uint(d.u64()?),
+        // M175: only an array element is null; at the top level an attribute is absent.
+        9 if !array => Value::Null,
+        9 => return Err(FormatError::Corrupt("a null outside an array")),
         // A tag from a future version. Refused, not guessed: a mistyped attribute is
         // one a filter later reads as the wrong thing.
         _ => return Err(FormatError::Corrupt("unknown value tag")),
@@ -389,6 +396,11 @@ mod tests {
         b.attrs.insert("u".to_owned(), Value::Uuid([0x5a; 16]));
         // M172: a uint64 at its maximum, scalar and in an array.
         b.attrs.insert("big".to_owned(), Value::Uint(u64::MAX));
+        // M175: null elements, first, between and last.
+        b.attrs.insert(
+            "nulls".to_owned(),
+            Value::Array(vec![Value::Null, Value::Int(1), Value::Null]),
+        );
         b.attrs.insert(
             "bigs".to_owned(),
             Value::Array(vec![Value::Uint(0), Value::Uint(1 << 63)]),
@@ -474,6 +486,11 @@ mod tests {
         let back = decode_rows(&encode_rows(&docs)).unwrap();
         let attrs = |ds: &[Document]| ds.iter().map(|d| d.attrs.clone()).collect::<Vec<_>>();
         assert_eq!(attrs(&back), attrs(&docs));
+        // M175: and through the bundle's encoding, which shares the value tags.
+        assert_eq!(
+            attrs(&decode_docs(&encode_docs(&docs)).unwrap()),
+            attrs(&docs)
+        );
         for v in [
             Value::Uuid([7; 16]),
             Value::Bytes(vec![1, 2, 3]),
@@ -489,6 +506,28 @@ mod tests {
                 assert!(decode_rows(short).is_err(), "{v:?} cut by {cut} was read");
             }
         }
+    }
+
+    /// M175: a null is an array's element only; at the top level each decoder refuses it,
+    /// whether it builds the value or reads past it.
+    #[test]
+    fn a_null_outside_an_array_is_refused() {
+        let mut d = Document::new("x", Vec::new());
+        d.attrs.insert("v".to_owned(), Value::Null);
+        d.attrs.insert("w".to_owned(), Value::Int(1));
+        let buf = encode_rows(std::slice::from_ref(&d));
+        // The message, not only the refusal: without its own arm a top-level null is still
+        // refused, as an unknown tag, which misnames the corruption.
+        let null_outside = |r: Result<(), FormatError>| {
+            matches!(r, Err(FormatError::Corrupt("a null outside an array")))
+        };
+        assert!(null_outside(decode_rows(&buf).map(drop)));
+        let only_w = |name: &str| name == "w";
+        let p = Projection {
+            id: false,
+            attrs: &only_w,
+        };
+        assert!(null_outside(decode_rows_where(&buf, &p).map(drop)));
     }
 
     #[test]

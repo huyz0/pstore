@@ -4876,9 +4876,13 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
             // M9h.3, M171: a declared type is read from a string, or an array of them.
             (Some(d), _) => typed::read(*d, value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
+            // M175: an element may be null; a filter literal may not, so not `scalar`'s.
             (None, serde_json::Value::Array(items)) => items
                 .iter()
-                .map(|i| scalar(i).map_err(|why| format!("holds an element that {why}")))
+                .map(|i| match i {
+                    serde_json::Value::Null => Ok(pstore_format::Value::Null),
+                    _ => scalar(i).map_err(|why| format!("holds an element that {why}")),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(pstore_format::Value::Array),
             (None, _) => scalar(value),
@@ -5316,6 +5320,7 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
             serde_json::Value::from(pstore_format::typed::format_bytes(b))
         }
         pstore_format::Value::Uint(n) => serde_json::Value::from(*n),
+        pstore_format::Value::Null => serde_json::Value::Null,
     }
 }
 
