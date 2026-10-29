@@ -21,7 +21,14 @@ pub(crate) fn read(kind: Declared, value: &serde_json::Value) -> Result<Value, S
     match value {
         serde_json::Value::Array(items) => items
             .iter()
-            .map(|x| one(kind, x))
+            // M175: a null element, under any type.
+            .map(|x| {
+                if x.is_null() {
+                    Ok(Value::Null)
+                } else {
+                    one(kind, x)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         _ => one(kind, value),

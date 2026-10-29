@@ -166,7 +166,8 @@ fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
         Some(Value::Str(_)) => 3,
         Some(Value::Uuid(_)) => 4,
         Some(Value::Bytes(_)) => 5,
-        Some(Value::Array(_)) => 6,
+        // M175: a null is only ever an array's element, never a key's value.
+        Some(Value::Array(_) | Value::Null) => 6,
         None => 7,
     };
     if by.desc && group < 7 {

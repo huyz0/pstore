@@ -1,5 +1,20 @@
 # Native API migration notes
 
+## M175: null elements in arrays
+
+An array attribute may hold `null` elements: `{"tags": ["a", null, "b"]}`, stored and
+answered in place, order kept. Under a declared or recorded type, the other elements are
+read by it (`["6f1e…", null]` as a `uuid` array).
+
+- A null element matches no filter: `Contains`, `Any*` and their negations read it as a
+  value equal to nothing, so `NotContains 1` holds for `[null]`.
+- `group_by`, facets and `limit_per` key arrays element by element: a null element equals
+  only a null element, and sorts after every other kind.
+- Unchanged: a `null` attribute is absent (M174); a filter literal holding `null`, or an
+  array literal, is still refused; the text field's elements are strings.
+- The format gains value tag 9, inside arrays only. A reader before M175 refuses it: upgrade
+  readers first.
+
 ## M174: column upserts, and `null` in an upsert
 
 A write may give its upserts in columns, as `patch_columns` gives patches:

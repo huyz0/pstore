@@ -226,12 +226,16 @@ pub enum Value {
     /// An unsigned integer (M172), declared `uint64`: a number, compared with ints and floats
     /// by exact value. Zone maps prune on it.
     Uint(u64),
+    /// A null **array element** (M175), never an attribute's value: [`check_storable`] refuses
+    /// one at the top level, where a null is an absent attribute. Equal only to itself, ordered
+    /// by no comparison, and after every other kind.
+    Null,
 }
 
 impl Value {
     /// The bytes [`Document::footprint`] counts for this value: 8 for a number, bool or
-    /// instant, 16 for a UUID, a string's or byte string's bytes, and an array's elements
-    /// summed.
+    /// instant, 16 for a UUID, a string's or byte string's bytes, 1 for a null element (M175),
+    /// and an array's elements summed.
     #[must_use]
     pub fn footprint(&self) -> u64 {
         match self {
@@ -240,6 +244,8 @@ impl Value {
             Self::Array(vs) => vs.iter().map(Self::footprint).sum(),
             Self::Uuid(_) => 16,
             Self::Bytes(b) => b.len() as u64,
+            // M175: a null element is its tag alone.
+            Self::Null => 1,
         }
     }
 
@@ -254,6 +260,7 @@ impl Value {
             Self::Uuid(_) => 6,
             Self::Bytes(_) => 7,
             Self::Uint(_) => 8,
+            Self::Null => 9,
         }
     }
 }
@@ -313,7 +320,8 @@ impl Number {
             | Value::Array(_)
             | Value::DateTime(_)
             | Value::Uuid(_)
-            | Value::Bytes(_) => None,
+            | Value::Bytes(_)
+            | Value::Null => None,
         }
     }
 }
@@ -391,6 +399,12 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
     let out_of_range =
         |v: &Value| matches!(v, Value::DateTime(t) if !(datetime::MIN..=datetime::MAX).contains(t));
     for v in d.attrs.values() {
+        // M175: a null is an array's element only; an attribute that is null is absent.
+        if matches!(v, Value::Null) {
+            return Err(FormatError::Unsupported(
+                "a null is an array element only: an absent attribute is left out",
+            ));
+        }
         let inside: &[Value] = match v {
             Value::Array(items) => items,
             _ => std::slice::from_ref(v),
@@ -743,7 +757,8 @@ impl Filter {
                 | Value::DateTime(_)
                 | Value::Uuid(_)
                 | Value::Bytes(_)
-                | Value::Uint(_),
+                | Value::Uint(_)
+                | Value::Null,
             ) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,

@@ -248,6 +248,19 @@ fn an_array_holds_only_finite_scalars() {
     }
 }
 
+/// M175: a null array element is storable; a null attribute is not, being absent.
+#[test]
+fn a_null_is_storable_only_as_an_array_element() {
+    let mut d = Document::new("a", vec![1.0]);
+    d.attrs.insert(
+        "n".to_owned(),
+        Value::Array(vec![Value::Null, Value::Int(1)]),
+    );
+    assert!(pstore_format::check_storable(&d).is_ok());
+    d.attrs.insert("m".to_owned(), Value::Null);
+    assert!(pstore_format::check_storable(&d).is_err());
+}
+
 #[test]
 fn a_nested_array_does_not_decode() {
     // Written past `check_storable`, a nested array must still not come back as data.
