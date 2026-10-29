@@ -70,10 +70,11 @@ which never ended once its step was broken. A timeout is not a kill (`scripts/mu
 the step is now a count of the tokens that fit, which is finite under any mutation. With
 `*=` applied locally, the `highlight::` tests fail rather than hang.
 
-Shards 7 and 9 missed four mutants that no case reached, and
+Shards 6, 7 and 9 missed five mutants that no case reached, and
 `structured_sentences_and_paragraphs_are_units` now covers each one:
 - `<` to `<=` in `units`, which kept an empty unit at a leading break and made it the earliest, unmarked fragment. The new case is `"\n\nq a"` by paragraph with no mark.
 - `<` to `<=` on either side of the overlap test, which skipped a unit that only touches another. The new cases are `"q。q q"` and `"q q。q"`, so each order is covered.
 - `to - from` to `to + from` in `cut`, reached on every window since the change above.
+- (shard 6) `+` to `*` in a break's end, equivalent while the whitespace is one byte. The new case is `"q\n\u{3000}\u{3000}b q"`, which holds wide spaces.
 
 Each mutant was applied locally and the `highlight::` tests then failed.

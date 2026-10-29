@@ -580,6 +580,11 @@ async fn structured_sentences_and_paragraphs_are_units() {
         structured(" q a\n", "q", all("word")).await,
         texts(&["<em>q</em> a"])
     );
+    // A break's whitespace run may hold wide characters: the next unit starts after them.
+    assert_eq!(
+        structured("q\n\u{3000}\u{3000}b q", "q", all("paragraph")).await,
+        texts(&["<em>q</em>", "b <em>q</em>"])
+    );
     // A break at the very start leaves no empty unit to be the earliest, unmarked fragment.
     assert_eq!(
         structured("\n\nq a", "zzz", all("paragraph")).await,
