@@ -306,12 +306,14 @@ fn windows(spans: &[Span], max_chars: usize) -> Vec<(usize, usize, usize)> {
     for (i, s) in spans.iter().enumerate() {
         hi = hi.max(i);
         if s.c_end - s.c_start <= max_chars {
-            while spans
-                .get(hi + 1)
-                .is_some_and(|n| n.c_end - s.c_start <= max_chars)
-            {
-                hi += 1;
-            }
+            // Counted, not stepped in a loop: a loop whose step a mutant breaks never ends,
+            // and a sweep reports it as a timeout rather than a kill.
+            hi += spans
+                .get(hi + 1..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|n| n.c_end - s.c_start <= max_chars)
+                .count();
         }
         out.push((i, hi, marked(i, hi)));
     }

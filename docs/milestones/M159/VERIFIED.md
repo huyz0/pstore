@@ -64,3 +64,8 @@ A window's characters, combining marks included, are counted the way `cut` count
 `cut` leaves any window that fits whole, and the condition only skipped a call that changed
 nothing. The same holds for a tokenless unit that fits. Both conditions were removed, so `cut`
 is now always called, and the `highlight::` tests pass unchanged.
+
+Shard 4 timed out `+=` to `*=` in `windows`: the window's end was stepped in a `while` loop,
+which never ended once its step was broken. A timeout is not a kill (`scripts/mutants.sh`), so
+the step is now a count of the tokens that fit, which is finite under any mutation. With
+`*=` applied locally, the `highlight::` tests fail rather than hang.
