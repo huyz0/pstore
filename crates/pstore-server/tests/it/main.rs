@@ -19,6 +19,7 @@ mod auth_sources;
 mod boost;
 mod bounded;
 mod branch;
+mod buffered;
 mod chaos;
 mod closed_requests;
 mod composition;

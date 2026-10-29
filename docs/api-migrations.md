@@ -166,6 +166,31 @@ A multi-query's root may carry `rerank_by`, `limit` and `offset` beside `queries
 A multi-query without `rerank_by` answers as before. No stored-data migration is needed.
 The [M142 verification](milestones/M142/VERIFIED.md) records the evidence.
 
+## M141: a tenant's buffered rows are bounded
+
+⚠️ **Behaviour change.** A tenant's rows held in one server's memory are now bounded:
+
+- When a `batched` write would take the tenant's not-yet-flushed rows past 8 MiB, the
+  server first writes those rows to the store as one bundle, as a `durable` write would.
+  The write itself is still answered as `batched` (`durable: false`), and it pays that
+  bundle's latency. Before, batched rows stayed in memory until a durable write came.
+- When a write of any durability would take the tenant's rows held in memory past 64 MiB,
+  counting both unflushed rows and flushed rows not yet folded, it is refused with
+  `429 overloaded` and `Retry-After: 1`. Nothing of it is buffered, so retrying is safe.
+  The server asks for a fold of the tenant, and a retry succeeds once that fold commits.
+  With scheduled folds off (`PSTORE_FOLD=off`), an operator must run
+  `POST /v1/admin/fold` for the tenant.
+- A single write whose rows alone exceed the 64 MiB bound is refused with
+  `413 request_too_large`. It can never fit, so split it.
+
+Sizes are an estimate per row, `Document::footprint`: the id's bytes, 4 per dense
+vector component, 8 per sparse pair, and each attribute's name and value, including the
+marks the server stores (a delete's tombstone, an applied write's request id). It is not
+process memory.
+`PSTORE_REQUEST_LIMITS_CONFIG` takes `tenant_flush_bytes` and `tenant_buffered_bytes` to
+lower either bound. Nothing stored changes, and rolling back restores unbounded buffering.
+Evidence is in [M141 verification](milestones/M141/VERIFIED.md).
+
 ## M140: order by up to eight attributes
 
 `rank_by` also accepts a list of 1 to 8 `[attribute, "asc" | "desc"]` pairs:
