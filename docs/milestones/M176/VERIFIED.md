@@ -27,7 +27,9 @@ fixes did not touch. No `cargo mutants` run is claimed for them.
    parent. Killed: the server admitting an id of another kind, or a write of two kinds; the
    engine's door rung for an index with no schema; a NUL-led string id admitted; a declared
    `id` kind ignored, `string` included, or any other kind accepted; an engine message naming
-   the held form; no re-read before a refusal by a held kind; the ids rewritten before it.
+   the held form; no re-read before a refusal by a held kind; the ids rewritten before it;
+   from CI's mutants on #23, the re-read guard's `||` as `&&`, which re-read HEAD before a
+   final refusal: the mixing case now asserts it reads nothing.
 4. `concurrent_first_writes_record_the_first_kind` and `a_later_fold_records_no_kind`: green
    after; the first red on the parent. Killed: the kind taken from the last upsert; recorded
    by a fold that did not create the schema; no quarantine of another kind; the quarantine
