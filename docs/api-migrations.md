@@ -1,5 +1,48 @@
 # Native API migration notes
 
+## M174: column upserts, and `null` in an upsert
+
+A write may give its upserts in columns, as `patch_columns` gives patches:
+
+```json
+{"upsert_columns": {"id": ["a", "b"], "vector": [[1.0, 0.5], [0.5, 1.0]],
+                    "text": ["red fox", null], "n": [1, null]}}
+```
+
+- One cell per id in every column; `vector`, `vectors` and `text` are those document
+  fields, every other column an attribute. Each row is read exactly as a `documents` entry,
+  and the rows follow `documents` in the same request, so a later duplicate id wins.
+- A column of another length, a non-string id, or a cell the row form refuses fails the
+  whole request, HTTP 400, nothing stored.
+- **Changed:** `null` in an upsert (a `documents` attribute, or a cell) now means the row
+  does not hold that attribute, as omitting it does; before, a `null` attribute was refused.
+  `"vectors": null` is accepted as no named fields. A patch's `null` still removes, and
+  `null` inside an array is still refused.
+
+## M173: attribute types persist
+
+A type a write declares in its `schema` is now recorded in the index's schema at the fold,
+and holds for every later write, from this process or any other:
+
+- A later write that declares nothing reads `owner` as a UUID, `seq` as a uint64, and so
+  on: a value that is not one is refused, nothing stored. Before, an undeclared write
+  stored such a value as a plain string or int.
+- Declaring a recorded name as another type is refused, HTTP 400, `schema_conflict`, naming
+  the attribute and both types. A process's own unfolded declarations count too.
+- Two writers that type one name two ways before a fold: the fold keeps the first
+  declaration in lane order, and quarantines the rows that contradict it, counted in
+  `quarantined_rows` as a wrong-width row is. So is a row holding a plain string under a
+  name another writer declared. Patches are typed at the door only, and rows already
+  sealed keep their values.
+- `GET /v1/indexes/{id}` answers `schema.attributes`: each recorded name to `"datetime"`,
+  `"uuid"`, `"bytes"` or `"uint64"`, `{}` when none.
+- HEAD gains a section for the recorded types. A reader older than M173 refuses such a
+  HEAD, and once one is written an older build cannot read the tenant: upgrade every reader
+  first, and there is no rollback after.
+
+A tenant whose writes declare no types is unchanged, and its HEAD keeps its bytes. The
+[M173 verification](milestones/M173/VERIFIED.md) records the evidence.
+
 ## M164: aggregations and facets inside a multi-query
 
 A sub-query of `{"queries": [...]}` may now be an aggregation (`aggregate_by`, with
@@ -140,6 +183,27 @@ A relevance query may carry `limit_per`:
 
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
+
+## M147: an index can be created empty
+
+`PUT /v1/indexes/{index}` (scope `write`) with `{"dims": n, "distance_metric": m}` creates
+the index with no rows. `dims` is from 1 to the server's `array_elements` limit (16,384 by
+default); `distance_metric` takes the write path's names and defaults to `dot_product`; any
+other field is refused. It answers `200 {"epoch", "cost"}`, or `409 index_exists` when the
+name already exists, is held unfolded, or is an external index's, and `409
+replica_read_only` for a replica's name. A name dropped earlier can be created again.
+
+The created index is listed, its summary shows 0 segments, and its queries, aggregates and
+`warm` answer `200` with nothing. Its first write must match the declared width and name
+its metric, as a write to any index of that schema must; its analyzer and `regex` stay at
+their defaults.
+
+⚠️ **Behaviour change.** An index whose rows were all deleted and then compacted away used
+to be listed while its queries, aggregates and `warm` answered `404 index_not_found`. They
+now answer `200` with no rows, as for a created empty index. A query `as_of` an epoch at
+which the index had no segment is still 404.
+
+Nothing stored changes. Evidence is in [M147 verification](milestones/M147/VERIFIED.md).
 
 ## M143: a request body's JSON shape is bounded
 

@@ -19,6 +19,7 @@ pub use head::{
     Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource,
     Replication, SegmentRef, TimeTravel,
 };
+pub use pstore_format::typed::Kind;
 pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
@@ -441,6 +442,10 @@ pub enum EngineError {
         /// What the rows carry.
         got: String,
     },
+    /// A create named an index that exists (M147): the name has segments, rejects, a
+    /// quarantine or rows held unfolded, or is an external index's.
+    #[error("the index {0:?} exists")]
+    IndexExists(String),
     /// The epoch asked for cannot be reconstructed.
     #[error(transparent)]
     TimeTravel(#[from] head::TimeTravel),
@@ -1456,8 +1461,34 @@ pub struct Declared {
     pub fts: Option<FullText>,
     /// The attributes whose trigrams are sketched, sorted and distinct.
     pub trigram: Option<Vec<String>>,
+    /// The attributes' types (M173): each name to its kind. Empty is no declaration.
+    pub types: Types,
     /// The index's further text fields (M152), each under its own analyzer and parameters.
     pub texts: Option<BTreeMap<String, FullText>>,
+}
+
+/// Attribute names to the kinds an index records or a write declares (M173).
+pub type Types = BTreeMap<String, Kind>;
+
+/// The reserved attribute a row or a patch carries the kind of each known-typed name it holds
+/// in, from the door to the fold (M173): names and kinds alternating. As `$fts`, absent is no
+/// opinion; stripped before a seal.
+const TYPES_ATTR: &str = "$types";
+
+/// The kinds a row's or a patch's write knew for the names it holds, in its stamp's order.
+fn types_of(d: &Document) -> Vec<(String, Kind)> {
+    let Some(pstore_format::Value::Array(xs)) = d.attrs.get(TYPES_ATTR) else {
+        return Vec::new();
+    };
+    xs.chunks_exact(2)
+        .filter_map(|pair| match pair {
+            [
+                pstore_format::Value::Str(name),
+                pstore_format::Value::Str(kind),
+            ] => Some((name.clone(), Kind::named(kind)?)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The reserved attribute a row carries its write's declared further text fields in (M152):
@@ -1483,6 +1514,33 @@ fn texts_of(d: &Document) -> Option<BTreeMap<String, FullText>> {
             _ => None,
         })
         .collect()
+}
+
+/// Stamps on `attrs` the kind `known` gives each name they hold (M173), or nothing when none.
+fn stamp_types(known: &Types, attrs: &mut BTreeMap<String, pstore_format::Value>) {
+    let held: Vec<pstore_format::Value> = known
+        .iter()
+        .filter(|(name, _)| attrs.contains_key(*name))
+        .flat_map(|(name, kind)| {
+            [
+                pstore_format::Value::Str(name.clone()),
+                pstore_format::Value::Str(kind.name().to_owned()),
+            ]
+        })
+        .collect();
+    if !held.is_empty() {
+        attrs.insert(TYPES_ATTR.to_owned(), pstore_format::Value::Array(held));
+    }
+}
+
+/// An attribute-type conflict (M173), from the kind known and the kind a write gives.
+fn type_conflict(index: &str, name: &str, expected: Kind, got: Kind) -> EngineError {
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "an attribute's type",
+        expected: format!("`{name}` as {}", expected.name()),
+        got: format!("`{name}` as {}", got.name()),
+    }
 }
 
 /// A further-text-fields conflict, from what the index has and what a row declares.
@@ -1687,6 +1745,7 @@ fn stripped(mut d: Document) -> Document {
     d.attrs.remove(METRIC_ATTR);
     d.attrs.remove(FTS_ATTR);
     d.attrs.remove(TRGM_ATTR);
+    d.attrs.remove(TYPES_ATTR);
     d.attrs.remove(TEXTS_ATTR);
     d
 }
@@ -1936,6 +1995,9 @@ pub struct Answer {
     /// also what lets a caller tell "this index does not exist" from "it matched nothing",
     /// without asking again.
     pub segments: Vec<SegmentRef>,
+    /// Whether that manifest names the index (M147), with segments or none: an index created
+    /// empty, or emptied by deletes and a compaction, exists with no segment.
+    pub named: bool,
     /// The epoch of the manifest the segments came from (M10): the HEAD a live query read,
     /// or the epoch an `as_of` query asked for. ⚠️ Never this engine's last commit, which is
     /// 0 on a process that only reads and stale on one another process has folded past.
@@ -2019,7 +2081,8 @@ impl Read {
 
 /// What an order or an aggregation reads: see `Engine::scope`.
 struct Scope {
-    refs: Vec<SegmentRef>,
+    /// Whether the HEAD read names the index, segments or none (M147).
+    named: bool,
     targets: Vec<pstore_query::Target>,
     unfolded: Arc<Vec<Document>>,
     shadow: Arc<std::collections::HashSet<String>>,
@@ -2133,6 +2196,11 @@ pub struct Engine<S> {
     /// `schemas` and by the same rule: an early refusal at zero requests, re-read before it
     /// stands.
     replica_names: Mutex<std::collections::BTreeSet<String>>,
+    /// The attribute types this process's own writes declared and no schema it has read
+    /// records yet, per index (M173): what the door reads beside the recorded ones. An entry
+    /// leaves when a schema this process reads records its name, whatever kind it records,
+    /// or drops its index after the epoch this process had read when it declared it.
+    unfolded_types: Mutex<BTreeMap<String, (Epoch, Types)>>,
     /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
     /// Filled by nothing else, so no other read pays to clone HEAD.
     ///
@@ -2324,6 +2392,7 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(None),
             schemas: Mutex::new(None),
             replica_names: Mutex::new(std::collections::BTreeSet::new()),
+            unfolded_types: Mutex::new(BTreeMap::new()),
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
@@ -2428,6 +2497,25 @@ impl<S: BlobStore> Engine<S> {
             {
                 *cache = Some((head.epoch, head.schemas.clone()));
             }
+            // M173: the recorded type wins, so a declaration it records leaves the map; and a
+            // drop after the declaration takes it, or a re-created index would inherit it.
+            let mut unfolded = self
+                .unfolded_types
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unfolded.retain(|index, (since, types)| {
+                if head
+                    .dropped
+                    .iter()
+                    .any(|(name, at, _)| name == index && *at > since.0)
+                {
+                    return false;
+                }
+                if let Some(s) = head.schemas.get(index) {
+                    types.retain(|name, _| !s.types.contains_key(name));
+                }
+                !types.is_empty()
+            });
             let mut names = self
                 .replica_names
                 .lock()
@@ -2498,6 +2586,55 @@ impl<S: BlobStore> Engine<S> {
             .cloned()
     }
 
+    /// The attribute types a write to `index` is read by (M173): those the schema this
+    /// process last read records -- read first, at best effort, if it has read none (M35) --
+    /// and those its own unfolded writes declared. The recorded type wins.
+    pub async fn known_types(&self, index: &str) -> Types {
+        if self.schemas_unseen()
+            && let Ok(at) = head::read(&*self.store, self.tenant).await
+        {
+            self.remember_schemas(&at.head);
+        }
+        self.known_now(index)
+    }
+
+    /// [`Self::known_types`] after reading HEAD again (M173), for a refusal by a known type to
+    /// re-read once before it stands, as a width's does (M9f.2): the type held may be a
+    /// dropped index's.
+    ///
+    /// # Errors
+    /// A HEAD read that fails.
+    pub async fn reread_types(&self, index: &str) -> Result<Types, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
+        Ok(self.known_now(index))
+    }
+
+    /// [`Self::known_types`], by what this process holds now, at zero requests.
+    fn known_now(&self, index: &str) -> Types {
+        let recorded = self
+            .cached_schema(index)
+            .map(|s| s.types)
+            .unwrap_or_default();
+        let mut known = self
+            .unfolded_types
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(index)
+            .map(|(_, types)| types.clone())
+            .unwrap_or_default();
+        known.extend(recorded);
+        known
+    }
+
+    /// The first of `declared` that differs from a type `known` holds, as the refusal.
+    fn declared_conflict(index: &str, known: &Types, declared: &Types) -> Option<EngineError> {
+        declared.iter().find_map(|(name, &got)| {
+            let &want = known.get(name)?;
+            (want != got).then(|| type_conflict(index, name, want, got))
+        })
+    }
+
     /// The width and text field a batch of rows implies, for **recording** a new schema.
     ///
     /// ⚠️ **The text field is `None` when no row carries one**, because `seal` builds a text
@@ -2536,6 +2673,7 @@ impl<S: BlobStore> Engine<S> {
                 .find_map(trgm_of)
                 .unwrap_or_default(),
             fields: Default::default(),
+            types: Default::default(),
             // M152: by the same rule.
             texts: docs
                 .iter()
@@ -2622,6 +2760,25 @@ impl<S: BlobStore> Engine<S> {
         // schema. A conditional upsert is a full row and is checked as any upsert is.
         if is_rowless(doc) {
             return None;
+        }
+        // M173: a type its write gave a name, and every value under a recorded name.
+        if let Some((name, got, want)) = types_of(doc).into_iter().find_map(|(name, got)| {
+            let &want = schema.types.get(&name)?;
+            (want != got).then_some((name, got, want))
+        }) {
+            return Some(type_conflict(index, &name, want, got));
+        }
+        if let Some((name, &want)) = schema
+            .types
+            .iter()
+            .find(|(name, kind)| doc.attrs.get(*name).is_some_and(|v| !kind.holds(v)))
+        {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "an attribute's value",
+                expected: format!("`{name}` a {}", want.name()),
+                got: "another type".to_owned(),
+            });
         }
         // The metric first (M9d): cosine and dot have one width, so only this tells them apart.
         let metric = metric_of(doc);
@@ -3307,8 +3464,7 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<(), EngineError> {
         let declared = Declared {
             fts: Some(*fts),
-            trigram: None,
-            texts: None,
+            ..Declared::default()
         };
         self.write_marked(index, docs, metric, Marks::None, &declared)
             .await
@@ -3395,11 +3551,13 @@ impl<S: BlobStore> Engine<S> {
         marks: Marks,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
+        let known = self.known_now(index);
         let mut ops = Vec::with_capacity(patches.len());
         for (i, p) in patches.into_iter().enumerate() {
             let id = p.id.clone();
             let mut attrs = patch_attrs(p)?;
             self.stamp(&mut attrs);
+            stamp_types(&known, &mut attrs);
             if let Some(c) = marks.get(i) {
                 attrs.insert(COND_ATTR.to_owned(), pstore_format::Value::Str(c.clone()));
             }
@@ -3550,6 +3708,7 @@ impl<S: BlobStore> Engine<S> {
         let mut attrs = patch_attrs(patch)?;
         attrs.remove(OP_ATTR);
         self.stamp(&mut attrs);
+        stamp_types(&self.known_now(index), &mut attrs);
         let attrs = bounded(attrs, how);
         self.mem()
             .buffer(index, vec![by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)]);
@@ -3584,6 +3743,18 @@ impl<S: BlobStore> Engine<S> {
         {
             return Err(EngineError::Refused(why));
         }
+        // M173: a declaration must agree with every type known. ⚠️ A refusal re-reads HEAD
+        // once before it stands (M9f.2): the schema held may be a dropped index's.
+        let mut known = self.known_now(index);
+        if Self::declared_conflict(index, &known, &declared.types).is_some() {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+            known = self.known_now(index);
+            if let Some(e) = Self::declared_conflict(index, &known, &declared.types) {
+                return Err(e);
+            }
+        }
+        known.extend(declared.types.iter().map(|(n, k)| (n.clone(), *k)));
         let mut docs = docs;
         for (i, d) in docs.iter_mut().enumerate() {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
@@ -3663,6 +3834,7 @@ impl<S: BlobStore> Engine<S> {
                     ),
                 );
             }
+            stamp_types(&known, &mut d.attrs);
             if let Some(t) = &declared.texts {
                 d.attrs.insert(
                     TEXTS_ATTR.to_owned(),
@@ -3707,6 +3879,7 @@ impl<S: BlobStore> Engine<S> {
             let mut m = self.mem();
             if self.door_conflict(&m, index, &docs, metric).is_none() {
                 m.buffer(index, docs);
+                self.remember_declared(index, &declared.types);
                 return Ok(());
             }
         }
@@ -3718,7 +3891,39 @@ impl<S: BlobStore> Engine<S> {
             return Err(e);
         }
         m.buffer(index, docs);
+        self.remember_declared(index, &declared.types);
         Ok(())
+    }
+
+    /// Keeps a buffered write's declarations that no schema this process holds records
+    /// (M173), for the door to read until one does.
+    fn remember_declared(&self, index: &str, declared: &Types) {
+        let recorded = self
+            .cached_schema(index)
+            .map(|s| s.types)
+            .unwrap_or_default();
+        let fresh: Vec<_> = declared
+            .iter()
+            .filter(|(name, _)| !recorded.contains_key(*name))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let read = self
+            .schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(Epoch(0), |(epoch, _)| *epoch);
+        let mut unfolded = self
+            .unfolded_types
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (since, held) = unfolded.entry(index.to_owned()).or_default();
+        *since = read;
+        for (name, kind) in fresh {
+            held.insert(name.clone(), *kind);
+        }
     }
 
     /// Why `docs` cannot join `index` under `metric`, by what this process knows without a
@@ -3899,7 +4104,7 @@ impl<S: BlobStore> Engine<S> {
         // As a query decides it (M9c): segments, or unfolded rows that are not deletes, once
         // the rows another fold already folded are pruned (code review).
         self.prune_to(&at.head);
-        let exists = !refs.is_empty() || {
+        let exists = at.head.indexes.contains_key(index) || {
             let m = self.mem();
             let ops: Vec<Document> = m
                 .durable_rows(index)
@@ -4865,6 +5070,126 @@ impl<S: BlobStore> Engine<S> {
         Err(EngineError::Lost)
     }
 
+    /// Creates `index` with no rows (M147): one HEAD CAS naming it with an empty segment list
+    /// and `dims` client components compared by `metric`, every other schema fact at its
+    /// default. An index is then a key of `indexes`, whatever its list holds.
+    ///
+    /// # Errors
+    /// [`EngineError::IndexExists`] for a name that exists as a drop decides it, or that an
+    /// external index holds; a replica's name as a branch refuses one; [`EngineError::Refused`]
+    /// for an invalid name or a `dims` of 0; and as a commit fails.
+    pub async fn create_index(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+    ) -> Result<Epoch, EngineError> {
+        self.create_index_inner(
+            index,
+            dims,
+            metric,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// [`Self::create_index`], with `interfere` awaited between the first attempt's read and
+    /// its commit, so a test can make another create land first.
+    #[doc(hidden)]
+    pub async fn create_index_with_interference_for_test(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Epoch, EngineError> {
+        self.create_index_inner(index, dims, metric, Some(interfere))
+            .await
+    }
+
+    async fn create_index_inner(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Epoch, EngineError> {
+        require_fencing(&*self.store)?;
+        if !valid_name(index) {
+            return Err(EngineError::Refused(format!(
+                "an index name {index:?} must match [A-Za-z0-9_.-]{{1,128}} and not be . or .."
+            )));
+        }
+        let Some(stored) = (dims > 0)
+            .then(|| dims.checked_add(metric.extra() as u32))
+            .flatten()
+        else {
+            return Err(EngineError::Refused(format!(
+                "an index's dims must be from 1 to {}, not {dims}",
+                u32::MAX - metric.extra() as u32
+            )));
+        };
+        let schema = IndexSchema {
+            dims: stored,
+            text_field: String::new(),
+            metric,
+            fts: FullText::default(),
+            trigram: Vec::new(),
+            fields: BTreeMap::new(),
+            types: BTreeMap::new(),
+            texts: BTreeMap::new(),
+        };
+        let mut interfere = interfere;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            if at.head.replications.contains_key(index) {
+                return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                    index.to_owned(),
+                )));
+            }
+            let held = {
+                let m = self.mem();
+                m.pending
+                    .get(index)
+                    .into_iter()
+                    .flatten()
+                    .chain(m.durable_rows(index))
+                    .any(|d| !is_rowless(d))
+            };
+            if at.head.indexes.contains_key(index)
+                || at.head.schema_rejects.contains_key(index)
+                || at.head.quarantine.contains_key(index)
+                || at.head.externals.contains_key(index)
+                || held
+            {
+                return Err(EngineError::IndexExists(index.to_owned()));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            next.indexes.insert(index.to_owned(), Vec::new());
+            next.schemas.insert(index.to_owned(), schema.clone());
+            if let Some(f) = interfere.take() {
+                f.await;
+            }
+            match self.commit_head(&at, &next).await {
+                Ok(epoch) => {
+                    // As a fold does: this process's door and its bounded reads know at once.
+                    self.record_commit(epoch);
+                    self.remember_schemas(&next);
+                    return Ok(epoch);
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
     /// [`Self::delete_index`], with `interfere` awaited between the first attempt's reads and
     /// its commit, so a test can make another delete land first and force the retry.
     #[doc(hidden)]
@@ -4883,7 +5208,15 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<Option<Epoch>, EngineError> {
         let _flushing = self.flushing.lock().await;
         Ok(match self.fold_inner(Some(index), interfere).await? {
-            Folded::Committed(epoch) => Some(epoch),
+            Folded::Committed(epoch) => {
+                // M173: this process's declarations went with the rows they typed, which a
+                // HEAD may never have named, so no `dropped` entry evicts them.
+                self.unfolded_types
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(index);
+                Some(epoch)
+            }
             Folded::Nothing(_) | Folded::Missing => None,
         })
     }
@@ -5078,11 +5411,22 @@ impl<S: BlobStore> Engine<S> {
             let mut judged: BTreeMap<String, String> = BTreeMap::new();
             // M98: and each named field's width, which the seal records the same way.
             let mut learned: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+            // M173: and each attribute's type, which the seal records the same way.
+            let mut typed: BTreeMap<String, Types> = BTreeMap::new();
             for (idx, docs) in &mut by_index {
                 let Some(schema) = at.head.schemas.get(idx).or_else(|| created.get(idx)) else {
                     continue;
                 };
-                let schema = &self.filled(idx, schema.clone(), docs);
+                let mut schema = schema.clone();
+                // ⚠️ **From every operation this fold read, before any is judged** (M173), as
+                // the analyzer is (M14): a name's first `$types` in lane order decides it,
+                // superseded, deleted and patch operations included, so every row --
+                // before the declaring one too -- is judged by one type.
+                for (name, kind) in docs.iter().flat_map(types_of) {
+                    schema.types.entry(name).or_insert(kind);
+                }
+                typed.insert(idx.clone(), schema.types.clone());
+                let schema = &self.filled(idx, schema, docs);
                 judged.insert(idx.clone(), schema.text_field.clone());
                 // ⚠️ **Per row, not per index.** Dropping the whole index's rows would
                 // discard every *correct* row any writer had flushed for it in this span —
@@ -5352,6 +5696,12 @@ impl<S: BlobStore> Engine<S> {
             // one width and an index recording none would let the next fold accept it.
             // ⚠️ Added, never assigned (M98 review): the map is seeded with the schema's, and
             // a recorded width neither changes nor goes.
+            // M173: the types judged by, which hold the recorded ones, as the widths are.
+            for (idx, types) in &typed {
+                if let Some(s) = next.schemas.get_mut(idx) {
+                    s.types.clone_from(types);
+                }
+            }
             for (idx, widths) in &learned {
                 if let Some(s) = next.schemas.get_mut(idx) {
                     // A client's fields only: an encoding derived from one (M67) has the
@@ -7006,6 +7356,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded,
                 unfolded_at,
                 segments: refs,
+                named: at.head.indexes.contains_key(index),
                 epoch: at.head.epoch,
                 watermarks: at.head.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
@@ -7056,6 +7407,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded,
             unfolded_at,
             segments: refs,
+            named: at.head.indexes.contains_key(index),
             epoch: at.head.epoch,
             watermarks: at.head.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
@@ -7345,6 +7697,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded: Arc::default(),
                 unfolded_at: 0,
                 segments: refs,
+                named: then.indexes.contains_key(index),
                 epoch: then.epoch,
                 watermarks: then.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
@@ -7387,6 +7740,8 @@ impl<S: BlobStore> Engine<S> {
             unfolded: Arc::default(),
             unfolded_at,
             segments: refs,
+            // Targets past the empty return above are this epoch's segments, so it names the index.
+            named: true,
             epoch: then.epoch,
             watermarks: then.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
@@ -7504,7 +7859,7 @@ impl<S: BlobStore> Engine<S> {
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
         let Scope {
-            refs,
+            named,
             targets,
             unfolded,
             shadow,
@@ -7533,7 +7888,8 @@ impl<S: BlobStore> Engine<S> {
         }
         // As a relevance query decides it: segments, or unfolded rows that are not deletes. An
         // index only unfolded deletes ever touched does not exist (code review).
-        let exists = !refs.is_empty() || !unfolded.is_empty();
+        // M147: a named index with no segment exists too: created empty, or emptied.
+        let exists = named || !unfolded.is_empty();
         // The unfolded rows are the newest version of each id they carry, tombstones already
         // gone; the segments' older rows of those ids were shadowed above.
         for d in unfolded.iter() {
@@ -7659,7 +8015,7 @@ impl<S: BlobStore> Engine<S> {
             })
             .sum();
         Ok(Scope {
-            refs,
+            named: head.indexes.contains_key(index),
             targets,
             unfolded,
             shadow,
@@ -7773,7 +8129,7 @@ impl<S: BlobStore> Engine<S> {
         if fast {
             aggregator.count_rows(scope.live);
         }
-        let exists = !scope.refs.is_empty() || !scope.unfolded.is_empty();
+        let exists = scope.named || !scope.unfolded.is_empty();
         let mut unfolded = 0;
         for d in scope.unfolded.iter() {
             // Counted only when its group was kept (code review): a row whose key fell outside
@@ -8830,5 +9186,312 @@ mod schema_cache_tests {
         // A newer one with other schemas is taken.
         e.remember_schemas(&head(4, 8));
         assert_eq!(dims(&e), Some(8));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod type_tests {
+    use super::*;
+    use pstore_format::Value;
+
+    fn s(x: &str) -> Value {
+        Value::Str(x.to_owned())
+    }
+
+    fn uuid() -> Value {
+        Value::Uuid([7; 16])
+    }
+
+    fn types(pairs: &[(&str, Kind)]) -> Types {
+        pairs.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect()
+    }
+
+    fn engine(store: &pstore_blob::MemoryStore, lane: u64) -> Engine<pstore_blob::MemoryStore> {
+        Engine::new(Arc::new(store.clone()), TenantId(1), LaneId(lane))
+    }
+
+    #[test]
+    fn a_stamp_names_the_known_kinds_a_row_holds_and_reads_back() {
+        let known = types(&[("a", Kind::Uuid), ("b", Kind::Uint64), ("c", Kind::Bytes)]);
+        let mut attrs = BTreeMap::from([("a".to_owned(), uuid()), ("z".to_owned(), s("x"))]);
+        stamp_types(&known, &mut attrs);
+        assert_eq!(attrs[TYPES_ATTR], Value::Array(vec![s("a"), s("uuid")]));
+        let d = Document {
+            id: "d".to_owned(),
+            vectors: BTreeMap::new(),
+            attrs: attrs.clone(),
+        };
+        assert_eq!(types_of(&d), vec![("a".to_owned(), Kind::Uuid)]);
+        assert!(!stripped(d).attrs.contains_key(TYPES_ATTR));
+        // Nothing known held: no stamp at all.
+        let mut none = BTreeMap::from([("z".to_owned(), s("x"))]);
+        stamp_types(&known, &mut none);
+        assert!(!none.contains_key(TYPES_ATTR));
+        // What no stamp spells is no opinion.
+        for bad in [
+            Value::Array(vec![s("a")]),
+            Value::Array(vec![Value::Int(1), s("uuid")]),
+            Value::Array(vec![s("a"), s("blob")]),
+            s("a"),
+        ] {
+            let mut d = Document::new("d", vec![1.0]);
+            d.attrs.insert(TYPES_ATTR.to_owned(), bad.clone());
+            assert!(types_of(&d).is_empty(), "{bad:?}");
+        }
+        let mut two = Document::new("d", vec![1.0]);
+        two.attrs.insert(
+            TYPES_ATTR.to_owned(),
+            Value::Array(vec![s("a"), s("uuid"), s("b"), s("uint64")]),
+        );
+        assert_eq!(
+            types_of(&two),
+            vec![("a".to_owned(), Kind::Uuid), ("b".to_owned(), Kind::Uint64)]
+        );
+    }
+
+    #[test]
+    fn a_row_is_judged_by_its_stamp_and_by_its_values() {
+        let e = engine(&pstore_blob::MemoryStore::new(), 1);
+        let schema = head::IndexSchema {
+            dims: 1,
+            types: types(&[("o", Kind::Uuid)]),
+            ..head::IndexSchema::default()
+        };
+        let row = |attrs: &[(&str, Value)]| {
+            let mut d = Document::new("r", vec![1.0]);
+            for (n, v) in attrs {
+                d.attrs.insert((*n).to_owned(), v.clone());
+            }
+            d
+        };
+        let judged = |d: &Document| e.row_conflict("i", &schema, d).map(|x| x.to_string());
+        assert_eq!(judged(&row(&[("o", uuid())])), None);
+        assert_eq!(judged(&row(&[("p", s("x"))])), None, "an untyped name");
+        assert_eq!(
+            judged(&row(&[("o", Value::Array(vec![uuid(), uuid()]))])),
+            None
+        );
+        let value = judged(&row(&[("o", s("x"))])).unwrap();
+        assert!(value.contains("`o` a uuid"), "{value}");
+        let element = judged(&row(&[("o", Value::Array(vec![uuid(), s("x")]))]));
+        assert!(element.is_some(), "an array element of another type");
+        // An empty array holds any kind: only the stamp tells.
+        let stamped = row(&[
+            ("o", Value::Array(vec![])),
+            (TYPES_ATTR, Value::Array(vec![s("o"), s("bytes")])),
+        ]);
+        let stamp = judged(&stamped).unwrap();
+        assert!(
+            stamp.contains("`o` as bytes") && stamp.contains("`o` as uuid"),
+            "{stamp}"
+        );
+        let agreeing = row(&[
+            ("o", uuid()),
+            (TYPES_ATTR, Value::Array(vec![s("o"), s("uuid")])),
+        ]);
+        assert_eq!(judged(&agreeing), None);
+        // A patch is not judged.
+        let mut patch = row(&[("o", s("x"))]);
+        patch.vectors.clear();
+        patch.attrs.insert(OP_ATTR.to_owned(), Value::Int(OP_PATCH));
+        assert_eq!(judged(&patch), None);
+    }
+
+    #[test]
+    fn the_recorded_type_wins_and_evicts_the_unfolded_one() {
+        let e = engine(&pstore_blob::MemoryStore::new(), 1);
+        e.remember_declared("i", &types(&[("o", Kind::Bytes), ("p", Kind::Uuid)]));
+        assert_eq!(
+            e.known_now("i"),
+            types(&[("o", Kind::Bytes), ("p", Kind::Uuid)])
+        );
+        assert!(e.known_now("j").is_empty(), "per index");
+        let mut h = Head {
+            epoch: Epoch(1),
+            ..Head::default()
+        };
+        h.schemas.insert(
+            "i".to_owned(),
+            head::IndexSchema {
+                types: types(&[("o", Kind::Uuid)]),
+                ..head::IndexSchema::default()
+            },
+        );
+        e.remember_schemas(&h);
+        assert_eq!(
+            e.known_now("i"),
+            types(&[("o", Kind::Uuid), ("p", Kind::Uuid)])
+        );
+        let held = |e: &Engine<pstore_blob::MemoryStore>| {
+            e.unfolded_types
+                .lock()
+                .unwrap()
+                .get("i")
+                .map(|(_, t)| t.clone())
+        };
+        assert_eq!(held(&e), Some(types(&[("p", Kind::Uuid)])), "evicted");
+        // A declaration the schema records is never kept; nor an index with none left.
+        e.remember_declared("i", &types(&[("o", Kind::Uuid)]));
+        assert_eq!(held(&e), Some(types(&[("p", Kind::Uuid)])));
+        h.epoch = Epoch(2);
+        h.schemas.get_mut("i").unwrap().types = types(&[("o", Kind::Uuid), ("p", Kind::Uuid)]);
+        e.remember_schemas(&h);
+        assert_eq!(held(&e), None);
+        // A declaration agrees with a known type, or names both.
+        let known = types(&[("o", Kind::Uuid)]);
+        assert!(
+            Engine::<pstore_blob::MemoryStore>::declared_conflict("i", &known, &known).is_none()
+        );
+        let other = types(&[("n", Kind::Bytes)]);
+        assert!(
+            Engine::<pstore_blob::MemoryStore>::declared_conflict("i", &known, &other).is_none()
+        );
+        let bytes = types(&[("o", Kind::Bytes)]);
+        let e = Engine::<pstore_blob::MemoryStore>::declared_conflict("i", &known, &bytes)
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("`o` as uuid") && e.contains("`o` as bytes"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_drop_after_a_declaration_takes_it_and_one_before_does_not() {
+        let e = engine(&pstore_blob::MemoryStore::new(), 1);
+        let held = |e: &Engine<pstore_blob::MemoryStore>| e.known_now("i");
+        e.remember_declared("i", &types(&[("o", Kind::Uuid)]));
+        let dropped_at = |epoch: u64, at: u64| Head {
+            epoch: Epoch(epoch),
+            dropped: vec![("i".to_owned(), at, head::IndexSchema::default())],
+            ..Head::default()
+        };
+        e.remember_schemas(&dropped_at(2, 2));
+        assert!(held(&e).is_empty(), "the drop came after the declaration");
+        // Declared having read that HEAD: the drop is the old index's.
+        e.remember_declared("i", &types(&[("o", Kind::Uuid)]));
+        e.remember_schemas(&dropped_at(3, 2));
+        assert_eq!(held(&e), types(&[("o", Kind::Uuid)]));
+        // Another index's drop takes nothing.
+        let mut other = dropped_at(4, 4);
+        other.dropped[0].0 = "j".to_owned();
+        e.remember_schemas(&other);
+        assert_eq!(held(&e), types(&[("o", Kind::Uuid)]));
+    }
+
+    #[tokio::test]
+    async fn every_patch_carries_the_kinds_known_for_what_it_sets() {
+        let e = engine(&pstore_blob::MemoryStore::new(), 1);
+        e.remember_declared("i", &types(&[("o", Kind::Uuid), ("n", Kind::Bytes)]));
+        let patch = || Patch {
+            id: "x".to_owned(),
+            set: BTreeMap::from([("o".to_owned(), uuid())]),
+            unset: vec!["n".to_owned()],
+        };
+        e.patch("i", vec![patch()], None).await.unwrap();
+        e.patch_conditioned(
+            "i",
+            vec![patch()],
+            vec![pstore_query::Predicate::Absent("o".to_owned())],
+        )
+        .await
+        .unwrap();
+        let filter = pstore_query::Predicate::Absent("o".to_owned());
+        e.patch_by_filter("i", &filter, patch()).await.unwrap();
+        let held = e.mem().pending["i"].clone();
+        assert_eq!(held.len(), 3);
+        for op in &held {
+            assert_eq!(
+                op.attrs[TYPES_ATTR],
+                Value::Array(vec![s("o"), s("uuid")]),
+                "{op:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fold_records_the_first_stamp_in_lane_order_and_judges_every_row() {
+        let store = pstore_blob::MemoryStore::new();
+        let (one, two) = (engine(&store, 1), engine(&store, 2));
+        let row = |id: &str, v: Value| {
+            let mut d = Document::new(id, vec![1.0]);
+            d.attrs.insert("o".to_owned(), v);
+            d
+        };
+        let declared = |k: Kind| Declared {
+            types: types(&[("o", k)]),
+            ..Declared::default()
+        };
+        // Lane 2 first in time, declaring bytes.
+        two.write_declared(
+            "i",
+            vec![row("b", Value::Bytes(vec![1]))],
+            Metric::DotProduct,
+            None,
+            &declared(Kind::Bytes),
+        )
+        .await
+        .unwrap();
+        two.flush().await.unwrap();
+        // Lane 1: an untyped string, then the declaring row: one batch, the string first.
+        one.write("i", vec![row("s", s("x"))]).await.unwrap();
+        one.write_declared(
+            "i",
+            vec![row("a", uuid())],
+            Metric::DotProduct,
+            None,
+            &declared(Kind::Uuid),
+        )
+        .await
+        .unwrap();
+        one.flush().await.unwrap();
+        one.fold().await.unwrap();
+        let at = head::read(&store, TenantId(1)).await.unwrap().head;
+        assert_eq!(at.schemas["i"].types, types(&[("o", Kind::Uuid)]));
+        assert_eq!(
+            at.schema_rejects["i"], 2,
+            "the string before and the bytes after"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patchs_stamp_records_a_type_too() {
+        let store = pstore_blob::MemoryStore::new();
+        let (one, two) = (engine(&store, 1), engine(&store, 2));
+        // Lane 1: a patch of no row, stamped `o` as bytes, first in lane order.
+        let mut patch = Document {
+            id: "nobody".to_owned(),
+            vectors: BTreeMap::new(),
+            attrs: BTreeMap::from([
+                ("o".to_owned(), Value::Bytes(vec![1])),
+                (OP_ATTR.to_owned(), Value::Int(OP_PATCH)),
+            ]),
+        };
+        stamp_types(&types(&[("o", Kind::Bytes)]), &mut patch.attrs);
+        one.mem().buffer("i", vec![patch]);
+        // And a row with no `o`, so the fold seals something and records the schema.
+        one.write("i", vec![Document::new("p", vec![1.0])])
+            .await
+            .unwrap();
+        one.flush().await.unwrap();
+        let mut d = Document::new("a", vec![1.0]);
+        d.attrs.insert("o".to_owned(), uuid());
+        let declared = Declared {
+            types: types(&[("o", Kind::Uuid)]),
+            ..Declared::default()
+        };
+        two.write_declared("i", vec![d], Metric::DotProduct, None, &declared)
+            .await
+            .unwrap();
+        two.flush().await.unwrap();
+        one.fold().await.unwrap();
+        let at = head::read(&store, TenantId(1)).await.unwrap().head;
+        assert_eq!(at.schemas["i"].types, types(&[("o", Kind::Bytes)]));
+        assert_eq!(at.schema_rejects["i"], 1);
     }
 }

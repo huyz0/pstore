@@ -180,6 +180,7 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
         attributes: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
         dists: vec![None, None, None],
         segments: Vec::new(),
+        named: true,
         epoch: pstore_types::Epoch(0),
         watermarks: BTreeMap::new(),
         staleness: std::time::Duration::ZERO,

@@ -34,13 +34,27 @@ for every later write:
   their values when a later fold, compaction or GC rewrites their segment. A later write
   may type a new name; its first fold adds it. A branch inherits its parent's types; an
   index created after a drop starts with none.
+- **One name, one type.** A name's values of another type are rows sealed before its type
+  was recorded, which keep them. M171's and M172's tests that wrote several types under one
+  name now write the untyped rows first and fold them before the declaring write, or, for
+  two declared types, write them as a build before M173 did: by an engine, with no
+  declaration. None loses a case.
+- **When the door reads.** The known types are read after a write's request-level checks,
+  before its values are read: a value refused costs, once per process, the HEAD read M35
+  already makes; a write holding no attribute value (deletes, or vectors alone) reads
+  none, so M141's bound refuses it at no cost. A refusal by a type the request did not declare re-reads HEAD once before
+  it stands, as a width's does (M9f.2), and a drop this process makes, or reads after its
+  declaration, takes its unfolded declarations for that index.
 - **Answering.** The index summary's `schema` gains `attributes`: each recorded name to
   `"datetime"`, `"uuid"`, `"bytes"` or `"uint64"`; `{}` when none.
 
 HEAD gains a trailing section after `keys_since`, the recorded types per live and dropped
 schema, written only when some schema records one, so a HEAD with none keeps its bytes. It
 forces `keys_since`, written as `u64::MAX` when absent; that value with no section after it
-is refused. A reader before M173 refuses such a HEAD, and once one is committed an older
+is refused. ⚠️ **Merged after M152**, which landed first with its own trailing section (the
+further text fields) and reads `u64::MAX` as absent wherever it appears: the types follow
+the text fields' section, which they force (empty when there are none), and the sentinel
+rule is M152's. A reader before M173 refuses such a HEAD, and once one is committed an older
 build cannot read the tenant: deploy readers first, and no rollback after.
 
 ## Acceptance criteria
@@ -62,8 +76,8 @@ build cannot read the tenant: deploy readers first, and no rollback after.
 5. The summary answers `schema.attributes`, exactly the recorded kinds, before and after a
    restart; `{}` for an index with none, and for one re-created after a drop.
 6. HEAD: types round-trip for live and dropped schemas; a HEAD with none encodes as before;
-   `keys_since` absent beside types round-trips as absent; `u64::MAX` with no section, or
-   bytes after it, is refused.
+   `keys_since` absent beside types round-trips as absent; bytes after the types are
+   refused. (Before the merge after M152: also `u64::MAX` with no section; see the Delta.)
 7. No sealed row carries `$types`; existing tests pass; those extended lose no case.
 
 ## Test plan
@@ -101,4 +115,6 @@ not judged; the risk is bounded by HEAD reads, not only races. Minors taken: the
 refusal and no rollback; branches and drops; `$types` stripped; the Delta shortened.
 Round 2 (two majors, both taken): rows merged from a patch are not judged; the recorded
 type evicts the unfolded map's entry, with a criterion for the process that lost. Minor
-taken: "through upserts". Round 3 (verify): resolved, nothing new.
+taken: "through upserts". Round 3 (verify): resolved, nothing new. The "One name, one
+type" and "When the door reads" bullets were added during implementation, and were
+reviewed with the code.

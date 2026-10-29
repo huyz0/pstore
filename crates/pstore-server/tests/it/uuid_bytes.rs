@@ -15,7 +15,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pstore_blob::{Accounted, MemoryStore};
 use pstore_server::Api;
-use pstore_types::LaneId;
+use pstore_types::{LaneId, TenantId};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -61,6 +61,33 @@ fn ids(b: &Value) -> Vec<String> {
         .iter()
         .map(|r| r["id"].as_str().unwrap().to_owned())
         .collect()
+}
+
+/// Rows holding several types under one name, as a build before M173 sealed them: since
+/// M173 a name holds the one type its index records, so no write through the API can.
+/// Written by an engine with no declaration, as such a build wrote them, and flushed for the
+/// API's fold.
+async fn older_build(store: &Accounted<MemoryStore>, rows: &[(&str, &str, pstore_format::Value)]) {
+    let tenant = TenantId(23);
+    let engine = pstore_engine::Engine::new(Arc::new(store.as_tenant(tenant)), tenant, LaneId(9));
+    let docs = rows
+        .iter()
+        .map(|(id, name, v)| {
+            let mut d = pstore_format::Document::new(*id, vec![1.0, 0.0]);
+            d.attrs.insert((*name).to_owned(), v.clone());
+            d
+        })
+        .collect();
+    engine.write("u", docs).await.unwrap();
+    engine.flush().await.unwrap();
+}
+
+fn uuid(s: &str) -> pstore_format::Value {
+    pstore_format::Value::Uuid(pstore_format::typed::parse_uuid(s).unwrap())
+}
+
+fn bytes(s: &str) -> pstore_format::Value {
+    pstore_format::Value::Bytes(pstore_format::typed::parse_bytes(s).unwrap())
 }
 
 const U1: &str = "00000000-0000-4000-8000-000000000001";
@@ -177,26 +204,31 @@ async fn rank_by_orders_uuids_then_bytes_after_strings_and_before_arrays() {
         {"id": "l", "vector": [1.0, 0.0], "attributes": {"k": [1]}},
         {"id": "none", "vector": [1.0, 0.0]},
     ]);
-    // One name, three declarations is not a thing a write can say: two writes.
-    let typed: Vec<Value> = docs.as_array().unwrap().clone();
-    let (uuids, rest): (Vec<Value>, Vec<Value>) = typed
-        .into_iter()
-        .partition(|d| d["id"].as_str().unwrap().starts_with('u'));
-    let (bytes, plain): (Vec<Value>, Vec<Value>) = rest
-        .into_iter()
-        .partition(|d| d["id"].as_str().unwrap().starts_with('y'));
-    for (docs, schema) in [
-        (uuids, json!({"k": "uuid"})),
-        (bytes, json!({"k": "bytes"})),
-        (plain, Value::Null),
-    ] {
-        let mut body = json!({"durability": "durable", "documents": docs});
-        if !schema.is_null() {
-            body["schema"] = schema;
-        }
-        let (s, b) = write(&a, &body).await;
-        assert_eq!(s, StatusCode::OK, "{b}");
-    }
+    // One name, two types: rows an older build sealed (M173).
+    let (typed, plain): (Vec<Value>, Vec<Value>) = docs
+        .as_array()
+        .unwrap()
+        .iter()
+        .cloned()
+        .partition(|d| d["id"].as_str().unwrap().starts_with(['u', 'y']));
+    let typed: Vec<(&str, &str, pstore_format::Value)> = typed
+        .iter()
+        .map(|d| {
+            let (id, k) = (
+                d["id"].as_str().unwrap(),
+                d["attributes"]["k"].as_str().unwrap(),
+            );
+            let v = if id.starts_with('u') {
+                uuid(k)
+            } else {
+                bytes(k)
+            };
+            (id, "k", v)
+        })
+        .collect();
+    older_build(&store, &typed).await;
+    let (s, b) = write(&a, &json!({"durability": "durable", "documents": plain})).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
     fold(&a).await;
     let order = |dir: &str| json!({"rank_by": ["k", dir], "top_k": 10});
     let (s, b) = query(&a, &order("asc")).await;
@@ -329,17 +361,18 @@ async fn malformed_typed_values_are_refused_and_nothing_is_buffered() {
 async fn a_datetime_zone_never_rules_out_a_uuid_or_bytes_row_under_the_same_name() {
     let store = Accounted::new(MemoryStore::new());
     let a = api(&store);
-    // Three writes, one fold: one block, whose `w` holds a datetime, a UUID and bytes.
-    for (id, w, ty) in [
-        ("d", "2024-01-01T00:00:00Z", "datetime"),
-        ("u", U2, "uuid"),
-        ("y", "AAE=", "bytes"),
-    ] {
-        let body = json!({"durability": "durable", "schema": {"w": ty},
-            "documents": [{"id": id, "vector": [1.0, 0.0], "attributes": {"w": w}}]});
-        let (s, b) = write(&a, &body).await;
-        assert_eq!(s, StatusCode::OK, "{b}");
-    }
+    // One fold: one block, whose `w` holds a datetime, a UUID and bytes, as an older build
+    // sealed them (M173).
+    let at = pstore_format::datetime::parse("2024-01-01T00:00:00Z").unwrap();
+    older_build(
+        &store,
+        &[
+            ("d", "w", pstore_format::Value::DateTime(at)),
+            ("u", "w", uuid(U2)),
+            ("y", "w", bytes("AAE=")),
+        ],
+    )
+    .await;
     fold(&a).await;
     for (lit, want) in [("2024-01-01T00:00:00Z", "d"), (U2, "u"), ("AAE=", "y")] {
         let q = json!({"rank_by": ["id", "asc"], "top_k": 10, "filters": ["w", "Eq", lit]});

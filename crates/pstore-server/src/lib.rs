@@ -692,7 +692,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
                 "/v1/indexes/{index}",
-                Write.on(axum::routing::delete(delete_index::<S>)),
+                Write.on(axum::routing::delete(delete_index::<S>).put(create_index::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/documents",
@@ -1291,6 +1291,9 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            EngineError::IndexExists(_) => {
+                Self::new(StatusCode::CONFLICT, "index_exists", e.to_string())
+            }
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
                 use pstore_engine::ReplicaRefusal as R;
@@ -1615,17 +1618,106 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
         .ok_or_else(refuse)
 }
 
+/// Why no attribute may be named `name`, if none may.
+fn name_refusal(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("has an empty name");
+    }
+    // `$` names are the engine's (M9d: `$metric` carries a row's metric to the fold), as
+    // turbopuffer reserves them for `$dist`.
+    if name.starts_with('$') {
+        return Some("is reserved: names beginning `$` are");
+    }
+    // `id` in a filter always means the document id (M9b); an attribute of that name would
+    // give `["id", "Eq", x]` two meanings.
+    (name == pstore_query::ID_ATTRIBUTE).then_some("is reserved: `id` is the document id")
+}
+
+/// The document fields a column of `upsert_columns` may name; every other column is an
+/// attribute.
+const DOCUMENT_COLUMNS: [&str; 3] = ["vector", "vectors", "text"];
+
+/// A write's upserts as one list (M174): `documents`, then the rows of `upsert_columns`, each
+/// read as a `documents` entry is, with every `null` attribute left out -- an upsert replaces
+/// the row, so a null is an attribute the row does not hold. Run as soon as the body is
+/// parsed, so every rule that reads `documents` reads both.
+///
+/// Cells are moved, not copied, as `patch_rows_of` moves them (M120).
+fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
+    if let Some(cols) = req.upsert_columns.take() {
+        let bad = |why: String| ApiError::bad_request(format!("upsert_columns: {why}"));
+        let serde_json::Value::Object(mut cols) = cols else {
+            return Err(bad("an object of columns".to_owned()));
+        };
+        let ids = match cols.remove("id") {
+            Some(serde_json::Value::Array(ids)) => ids,
+            _ => return Err(bad("an `id` column is required".to_owned())),
+        };
+        let mut columns = Vec::with_capacity(cols.len());
+        // A column's name is an attribute's, checked in every row that holds it, null or not;
+        // a column of no rows names nothing.
+        for (name, col) in cols {
+            match col {
+                serde_json::Value::Array(c) if c.len() == ids.len() => {
+                    columns.push((name, c.into_iter()));
+                }
+                _ => return Err(bad(format!("column `{name}` must have one value per id"))),
+            }
+        }
+        for id in ids {
+            let serde_json::Value::String(id) = id else {
+                return Err(bad("ids are strings".to_owned()));
+            };
+            let mut attrs = serde_json::Map::new();
+            let mut row = serde_json::Map::new();
+            // Each column's cells in id order, one a row. A null cell is left to the row's
+            // reading: no vector, no fields, no text, and an attribute dropped below.
+            for (name, v) in columns
+                .iter_mut()
+                .filter_map(|(name, col)| col.next().map(|v| (name.as_str(), v)))
+            {
+                let to = if DOCUMENT_COLUMNS.contains(&name) {
+                    &mut row
+                } else {
+                    &mut attrs
+                };
+                to.insert(name.to_owned(), v);
+            }
+            row.insert("attributes".to_owned(), attrs.into());
+            row.insert("id".to_owned(), id.clone().into());
+            let doc = serde_json::from_value(row.into())
+                .map_err(|e| bad(format!("document {id}: {e}")))?;
+            req.documents.push(doc);
+        }
+    }
+    for d in &mut req.documents {
+        // A null's name is checked before it is dropped; every other name is `to_document`'s.
+        if let Some((name, why)) = d
+            .attributes
+            .iter()
+            .filter(|(_, v)| v.is_null())
+            .find_map(|(n, _)| name_refusal(n).map(|why| (n, why)))
+        {
+            return Err(ApiError::bad_request(format!(
+                "document {}: attribute `{name}` {why}",
+                d.id
+            )));
+        }
+        d.attributes.retain(|_, v| !v.is_null());
+    }
+    Ok(())
+}
+
 /// A write's patches (M13), from `patch_rows` and `patch_columns`, in that order. Values are
 /// converted as a document's attributes are; `null` removes an attribute.
 ///
 /// ⚠️ Takes both by value (M120): every attribute map and every column cell was copied out of
 /// the request, which nothing reads again.
-fn patches_of(
+fn patch_rows_of(
     patch_rows: Vec<serde_json::Value>,
     patch_columns: Option<serde_json::Value>,
-    dated: &typed::Declarations,
-) -> Result<Vec<pstore_engine::Patch>, ApiError> {
-    let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+) -> Result<Vec<RawPatch>, ApiError> {
+    let mut rows: Vec<RawPatch> = Vec::new();
     for mut raw in patch_rows {
         let o = raw
             .as_object_mut()
@@ -1685,6 +1777,45 @@ fn patches_of(
             rows.push((id.to_owned(), attrs));
         }
     }
+    Ok(rows)
+}
+
+/// A write's documents, patches and by-filter patch, their attributes read by `dated`.
+type TypedOps = (
+    Vec<Document>,
+    Vec<pstore_engine::Patch>,
+    Option<(pstore_query::Predicate, pstore_engine::Patch)>,
+);
+
+fn typed_ops(
+    docs: Vec<types::DocumentIn>,
+    patches: Vec<RawPatch>,
+    patch_by: Option<(
+        pstore_query::Predicate,
+        serde_json::Map<String, serde_json::Value>,
+    )>,
+    dated: &typed::Declarations,
+) -> Result<TypedOps, ApiError> {
+    let patches = patches_of(patches, dated)?;
+    let patch_by = patch_by
+        .map(|(f, attrs)| patch_by_filter_attrs(attrs, dated).map(|p| (f, p)))
+        .transpose()?;
+    let docs = docs
+        .into_iter()
+        .map(|d| to_document(d, dated))
+        .collect::<Result<_, _>>()?;
+    Ok((docs, patches, patch_by))
+}
+
+/// A patch as a request spells it: its id and its attributes, not yet read by any type.
+type RawPatch = (String, serde_json::Map<String, serde_json::Value>);
+
+/// The patches `rows` spell, their attributes read by `dated` (M173: the known types, so
+/// after the HEAD read a refusal of the request's shape never pays for).
+fn patches_of(
+    rows: Vec<RawPatch>,
+    dated: &typed::Declarations,
+) -> Result<Vec<pstore_engine::Patch>, ApiError> {
     rows.into_iter()
         .map(|(id, attrs)| {
             let who = format!("patch of {id}");
@@ -1746,8 +1877,13 @@ fn write_filter(name: &str, v: &serde_json::Value) -> Result<pstore_query::Predi
 /// `patch_by_filter` (M13.2): `{"filters": .., "attributes": {..}}`, both required.
 fn patch_by_filter_of(
     v: &serde_json::Value,
-    dated: &typed::Declarations,
-) -> Result<(pstore_query::Predicate, pstore_engine::Patch), ApiError> {
+) -> Result<
+    (
+        pstore_query::Predicate,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    ApiError,
+> {
     let bad = || {
         ApiError::bad_request(
             "patch_by_filter is {\"filters\": <filter>, \"attributes\": {..}}, both required",
@@ -1762,15 +1898,22 @@ fn patch_by_filter_of(
         return Err(bad());
     };
     let filter = write_filter("patch_by_filter", f)?;
+    Ok((filter, attrs.clone()))
+}
+
+/// `patch_by_filter`'s attributes, read by `dated` as [`patches_of`] reads a patch's.
+fn patch_by_filter_attrs(
+    attrs: serde_json::Map<String, serde_json::Value>,
+    dated: &typed::Declarations,
+) -> Result<pstore_engine::Patch, ApiError> {
     // Refusals from the document conversion name no operation, so they are prefixed here.
-    let patch = patch_of(String::new(), "patch_by_filter", attrs.clone(), dated).map_err(|e| {
+    patch_of(String::new(), "patch_by_filter", attrs, dated).map_err(|e| {
         if e.message.starts_with("patch_by_filter") {
             e
         } else {
             ApiError::bad_request(format!("patch_by_filter: {}", e.message))
         }
-    })?;
-    Ok((filter, patch))
+    })
 }
 
 /// What a write's operations will hold in its tenant's buffer (M141), by
@@ -1876,6 +2019,7 @@ async fn write_documents<S: BlobStore + 'static>(
     // rejection is a body this API did not design -- and an unknown `durability` must come
     // back as `unsupported_durability` rather than as a serde message about an enum variant.
     let (mut req, keys) = parse_write(&body)?;
+    upserts_of(&mut req)?;
     let applied = matches!(req.durability, types::Durability::Applied);
     let ids_wanted = req.affected_ids;
     if applied && !api.registry_mut().applied_writes {
@@ -1904,16 +2048,16 @@ async fn write_documents<S: BlobStore + 'static>(
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
     }
-    let dated = declared_types(&req)?;
+    let types = declared_types(&req)?;
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
+        types: types.clone(),
         texts: declared_further(&req)?,
     };
-    let patches = patches_of(
+    let patches = patch_rows_of(
         std::mem::take(&mut req.patch_rows),
         req.patch_columns.take(),
-        &dated,
     )?;
     let (delete_partial, patch_partial) = (
         req.delete_by_filter_allow_partial,
@@ -1927,7 +2071,7 @@ async fn write_documents<S: BlobStore + 'static>(
     let patch_by = req
         .patch_by_filter
         .as_ref()
-        .map(|v| patch_by_filter_of(v, &dated))
+        .map(patch_by_filter_of)
         .transpose()?;
     if req.documents.is_empty()
         && req.deletes.is_empty()
@@ -2007,17 +2151,54 @@ async fn write_documents<S: BlobStore + 'static>(
     widths_agree(&req)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    admit(&engine, key.as_ref()).await?;
-
+    // M173: every attribute is read by its known type -- recorded, or declared by this
+    // process's unfolded writes -- and by the request's own; the engine refuses a declaration
+    // that differs from a known one.
+    // Read only for a write holding a value to read: one with none, deletes or vectors alone,
+    // is refused by M141's bound, or buffered, without a blob request.
+    let valued = req.documents.iter().any(|d| !d.attributes.is_empty())
+        || patches.iter().any(|(_, attrs)| !attrs.is_empty())
+        || patch_by
+            .as_ref()
+            .is_some_and(|(_, attrs)| !attrs.is_empty());
+    let mut dated = if valued {
+        engine.known_types(&index).await
+    } else {
+        pstore_engine::Types::new()
+    };
+    dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
-    // Moved, not copied (M119): the documents are not read again.
-    let docs: Vec<Document> = std::mem::take(&mut req.documents)
-        .into_iter()
-        .map(|d| to_document(d, &dated))
-        .collect::<Result<_, _>>()?;
+    // Moved, not copied (M119): the documents are not read again -- unless a type this
+    // request did not declare reads them. A refusal by one re-reads HEAD once before it
+    // stands (M9f.2), because the type held may be a dropped index's, and the read needs
+    // the request as it came.
+    let kept = (dated.len() > types.len())
+        .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
+    let (docs, patches, patch_by) = match (
+        typed_ops(
+            std::mem::take(&mut req.documents),
+            patches,
+            patch_by,
+            &dated,
+        ),
+        kept,
+    ) {
+        (Ok(ops), _) => ops,
+        (Err(e), None) => return Err(e),
+        (Err(e), Some((d, p, b))) => {
+            let mut fresh = engine.reread_types(&index).await?;
+            fresh.extend(types);
+            if fresh == dated {
+                return Err(e);
+            }
+            typed_ops(d, p, b, &fresh)?
+        }
+    };
     check_further(&docs, declared.texts.as_ref())?;
     check_pre_tokenized(&docs, declared.fts.as_ref(), declared.texts.as_ref())?;
+    admit(&engine, key.as_ref()).await?;
+
     // M133: every reference resolved, and refused, before anything is buffered.
     let ops: Vec<_> = docs.iter().map(|d| (d.id.as_str(), &d.attrs)).collect();
     let upsert_if = ref_new::conds("upsert_condition", upsert_if, &ops)?;
@@ -2356,7 +2537,7 @@ const AFFECTED_IDS_MAX: usize = 10_000;
 /// [`AFFECTED_IDS_MAX`], returned; a write naming all of them leaves none, and is refused.
 fn affected_ids_bounded(
     req: &WriteRequest,
-    patches: &[pstore_engine::Patch],
+    patches: &[RawPatch],
     by_filter: bool,
     served: bool,
 ) -> Result<Option<usize>, ApiError> {
@@ -2370,7 +2551,7 @@ fn affected_ids_bounded(
         .iter()
         .map(|d| d.id.as_str())
         .chain(req.deletes.iter().map(String::as_str))
-        .chain(patches.iter().map(|p| p.id.as_str()))
+        .chain(patches.iter().map(|(id, _)| id.as_str()))
         .collect();
     if named.len() > AFFECTED_IDS_MAX {
         return Err(ApiError::bad_request(format!(
@@ -3367,7 +3548,8 @@ async fn run<E: BlobStore>(
         }
     };
     let token = checked(answer.epoch.0, &answer.watermarks)?;
-    if answer.segments.is_empty() && answer.unfolded.is_empty() {
+    // M147: a HEAD that names the index with no segment is an empty index, not a missing one.
+    if !answer.named && answer.unfolded.is_empty() {
         return Err(missing());
     }
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
@@ -3625,6 +3807,7 @@ async fn index_summary<S: BlobStore + 'static>(
                 .into_iter()
                 .map(|(n, w)| (n, w.saturating_sub(sc.metric.extra() as u32)))
                 .collect(),
+            attributes: sc.types.into_iter().map(|(n, k)| (n, k.name())).collect(),
         }),
         rejected_rows: s.rejected_rows,
         quarantined_rows: s.quarantined_rows,
@@ -3898,6 +4081,53 @@ async fn delete_index<S: BlobStore + 'static>(
         epoch: epoch.0,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// `PUT /v1/indexes/{index}` (M147): creates the index with no rows, its width and metric
+/// declared. One HEAD read and one HEAD CAS.
+async fn create_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<FoldResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let req: CreateRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed create request: {e}")))?;
+    let most = api.ingress.limits().array_elements();
+    let dims = u32::try_from(req.dims)
+        .ok()
+        .filter(|d| *d >= 1 && (*d as usize) <= most)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "dims must be from 1 to {most}, the longest array this server admits, not {}",
+                req.dims
+            ))
+        })?;
+    let metric = match req.distance_metric.as_deref() {
+        None => pstore_engine::Metric::DotProduct,
+        Some(name) => pstore_engine::Metric::parse(name).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "distance_metric {name:?} is not one of cosine_distance, euclidean_squared, \
+                 dot_product"
+            ))
+        })?,
+    };
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let epoch = engine.create_index(&index, dims, metric).await?;
+    Ok(axum::Json(FoldResponse {
+        epoch: epoch.0,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRequest {
+    dims: u64,
+    distance_metric: Option<String>,
 }
 
 /// A write body, with the durability level refused by name rather than by serde's message.
@@ -4245,7 +4475,7 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
-        let Some(declared) = typed::Declared::named(ty) else {
+        let Some(declared) = typed::named(ty) else {
             return Err(bad(format!(
                 "{name:?} is declared {ty}; a write declares datetime, uuid, bytes or uint64"
             )));
@@ -4639,22 +4869,12 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
     for (name, value) in &attributes {
-        if name.is_empty() {
-            return Err(refuse(name, "has an empty name"));
-        }
-        // `$` names are the engine's (M9d: `$metric` carries a row's metric to the fold), as
-        // turbopuffer reserves them for `$dist`.
-        if name.starts_with('$') {
-            return Err(refuse(name, "is reserved: names beginning `$` are"));
-        }
-        // `id` in a filter always means the document id (M9b); an attribute of that name
-        // would give `["id", "Eq", x]` two meanings.
-        if name == pstore_query::ID_ATTRIBUTE {
-            return Err(refuse(name, "is reserved: `id` is the document id"));
+        if let Some(why) = name_refusal(name) {
+            return Err(refuse(name, why));
         }
         let v = match (dated.get(name), value) {
             // M9h.3, M171: a declared type is read from a string, or an array of them.
-            (Some(d), _) => d.read(value),
+            (Some(d), _) => typed::read(*d, value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
             (None, serde_json::Value::Array(items)) => items
                 .iter()
@@ -6300,5 +6520,49 @@ mod tests {
         assert!(!agree(
             serde_json::json!([{"id": "a", "vector": [1.0]}, {"id": "b", "vector": [1.0, 2.0]}])
         ));
+    }
+    /// M174: a batch in columns is the batch in rows, document for document, every null
+    /// left out -- read by the same path, so a base64 vector and a declared type agree too.
+    #[test]
+    fn columns_normalize_to_the_rows_documents() {
+        use base64::Engine as _;
+        let b64 = |v: &[f32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let schema = serde_json::json!({"owner": "uuid", "at": "datetime"});
+        let u = "6f1e2d3c-4b5a-4968-8776-655443322110";
+        let rows = serde_json::json!({"schema": schema, "documents": [
+            {"id": "a", "vector": [1.0, 2.0], "vectors": {"late": [[1.0], [2.0]]},
+             "text": "red fox",
+             "attributes": {"n": 3, "f": 0.5, "b": true, "s": "x", "arr": [1, 2],
+                            "owner": u, "at": "2026-10-29T01:02:03Z"}},
+            {"id": "b", "vector": b64(&[3.0, 4.0]),
+             "attributes": {"n": null, "f": 1.5, "s": "y", "owner": null}},
+        ]});
+        let columns = serde_json::json!({"schema": schema, "upsert_columns": {
+            "id": ["a", "b"],
+            "vector": [b64(&[1.0, 2.0]), [3.0, 4.0]],
+            "vectors": [{"late": [[1.0], [2.0]]}, null],
+            "text": ["red fox", null],
+            "n": [3, null], "f": [0.5, 1.5], "b": [true, null], "s": ["x", "y"],
+            "arr": [[1, 2], null], "owner": [u, null], "at": ["2026-10-29T01:02:03Z", null],
+        }});
+        let docs = |body: serde_json::Value| {
+            let mut req: WriteRequest = serde_json::from_value(body).unwrap();
+            upserts_of(&mut req).unwrap();
+            let dated = declared_types(&req).unwrap();
+            req.documents
+                .into_iter()
+                .map(|d| to_document(d, &dated).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let (rows, columns) = (docs(rows), docs(columns));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows, columns);
+        let b = &rows[1];
+        assert!(!b.attrs.contains_key("n") && !b.attrs.contains_key("owner"));
+        assert!(b.attrs.contains_key("f"));
+        assert_eq!(rows[0].attrs.len(), 8, "every attribute and the text field");
     }
 }
