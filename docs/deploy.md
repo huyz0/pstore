@@ -250,7 +250,8 @@ list -- and `meta.facets_epoch`.
   requests are the ranking's plus the aggregation's.
 - It is a separate read of HEAD: `meta.facets_epoch` differs from `meta.epoch` only if a fold
   landed between the two. The consistency level and `as_of` apply to both.
-- Not with `rank_by`, `aggregate_by`, a query with no ranking leg, or inside `queries`.
+- Not with `rank_by`, `aggregate_by`, or a query with no ranking leg. Inside `queries`
+  each sub-query's facets are its own entry of the root's `facets` (M164).
 
 ## Geo filters and a distance decay
 
