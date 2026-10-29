@@ -365,7 +365,11 @@ async fn ids_not_of_the_index_kind_are_refused() {
     assert_eq!(b["error"]["code"], "bad_request", "{b}");
     // A refusal by no held kind is final: HEAD is read again only to judge a held one (CI's
     // mutants on #23 found the guard's `||` deletable).
-    assert_eq!(store.total(OpClass::Read) - reads, 0, "a final refusal read HEAD again");
+    assert_eq!(
+        store.total(OpClass::Read) - reads,
+        0,
+        "a final refusal read HEAD again"
+    );
     refused(
         "new",
         json!({"documents": [doc(json!("\u{0}u1"), 1)]}),
