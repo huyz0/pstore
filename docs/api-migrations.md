@@ -1,5 +1,33 @@
 # Native API migration notes
 
+## M178: sparse vectors
+
+A document, an `upsert_columns` column and a query take `sparse`, an object of string key
+to weight.
+
+```json
+{"documents": [{"id": "a", "sparse": {"cat": 0.7, "dog": 1.5}}]}
+{"sparse": {"cat": 1.0}, "top_k": 10}
+```
+
+- 1 to 1,024 keys of 1 to 256 bytes; each weight a number of magnitude at most 65,504,
+  stored as f16 (the nearest f16 answers). Anything else is `400`, naming the document and
+  the bound; past 1,024 keys the body's own shape bound answers `413` first. A key spelled
+  twice in one object is its last weight.
+- A query's `sparse` is a leg: alone, rows rank by the dot product over the keys they share
+  with it (`"fusion": {"sum": {}}` reports it as the score); with other legs it fuses after
+  them, so a positional fusion weight names it last. Its score can be negative, so `sum`
+  and `max` take it only alone, never beside `text`; `rank_by` and `aggregate_by` refuse it; `facets` take it as their ranking.
+- `sparse` is reserved: `vectors.sparse`, a dense or `multi` query's `field: "sparse"`, a
+  patch's or `patch_columns`' `sparse` are refused. An attribute named `sparse` stays one.
+  A patch keeps the row's sparse field; an upsert replaces it.
+- **Changed**: an `upsert_columns` column named `sparse` was an attribute before M178 and is
+  now this field, each cell an object or `null`; a client writing an attribute of that name
+  by column renames it. A document's `attributes.sparse` is unchanged.
+- No result or export returns it yet.
+- A write holding `sparse` writes its index's WAL run in a version builds before M177 refuse:
+  do not roll back past M177 while one is unfolded.
+
 ## M176: typed document ids
 
 An index's ids are of one kind: `string` (as before), `uint64` or `uuid`.

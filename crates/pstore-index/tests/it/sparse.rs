@@ -429,11 +429,13 @@ async fn impact_encodings_are_measured() {
         "u8 measured overlap {u8_overlap:.4} / top-1 {u8_top1:.4} against the pinned floor \
          {OVERLAP_FLOOR} / {TOP1_FLOOR}: the DEFAULT ENCODING must change to f16, not the floor"
     );
-    // The default is what the measurement selected, not what was assumed.
+    // M178: the default is f16, not the u8 this measurement cleared -- u8's scale is the
+    // segment's, so a stored weight moves on compaction, which a public field cannot answer
+    // for. The floors above are unchanged, and f16 is measured exact to 4 places above them.
     assert_eq!(
         sparse::DEFAULT_ENCODING,
-        ImpactEncoding::U8,
-        "the shipped default no longer matches the encoding this measurement clears"
+        ImpactEncoding::F16,
+        "the shipped default is not the encoding M178 chose"
     );
 }
 

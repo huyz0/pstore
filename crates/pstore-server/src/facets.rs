@@ -38,9 +38,10 @@ pub(crate) fn derive(req: &QueryRequest) -> Result<Option<(QueryRequest, Plan)>,
                 .to_owned(),
         ));
     }
-    if req.vector.is_none() && req.multi.is_none() && req.text.is_none() {
+    if req.vector.is_none() && req.multi.is_none() && req.text.is_none() && req.sparse.is_none() {
         return Err(refuse(
-            "needs a ranking leg (vector, multi or text); an aggregation alone is aggregate_by"
+            "needs a ranking leg (vector, multi, text or sparse); an aggregation alone is \
+             aggregate_by"
                 .to_owned(),
         ));
     }
