@@ -465,3 +465,38 @@ async fn a_refusal_by_the_requests_own_type_reads_nothing() {
         "only a type the request did not declare re-reads HEAD"
     );
 }
+
+/// A restarted API whose first request is patches alone reads them by the recorded types:
+/// the door reads HEAD for a write holding attribute values, whatever operation holds them.
+#[tokio::test]
+async fn a_patch_alone_after_a_restart_is_read_by_the_recorded_type() {
+    const U3: &str = "abcdef01-2345-4678-9abc-def012345678";
+    let store = Accounted::new(MemoryStore::new());
+    let a = api(&store, 1);
+    wrote(
+        &a,
+        "n",
+        json!([row("a", json!({"owner": U1}))]),
+        json!({"owner": "uuid"}),
+    )
+    .await;
+    fold(&a).await;
+    drop(a);
+    let owner = |store: &Accounted<MemoryStore>, body: Value| {
+        let store = store.clone();
+        async move {
+            let b = api(&store, 1);
+            let (s, r) = send(&b, "PUT", "/v1/indexes/n/documents", Some(&body)).await;
+            assert_eq!(s, StatusCode::OK, "{body} -> {r}");
+            fold(&b).await;
+            rows(&b, "n").await[0]["attributes"]["owner"].clone()
+        }
+    };
+    let patch = json!({"durability": "durable",
+                       "patch_rows": [{"id": "a", "attributes": {"owner": U2.to_uppercase()}}]});
+    assert_eq!(owner(&store, patch).await, U2);
+    let by_filter = json!({"durability": "durable",
+                           "patch_by_filter": {"filters": ["id", "Eq", "a"],
+                                               "attributes": {"owner": U3.to_uppercase()}}});
+    assert_eq!(owner(&store, by_filter).await, U3);
+}

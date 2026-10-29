@@ -72,7 +72,9 @@ run is claimed for them.
    `buffered::deletes_reserve_their_tombstones` assert a refusal costs no blob request, the
    door reads the known types only for a write holding an attribute value. Both tests pass
    unedited; the guard forced true fails them, and forced false fails four of
-   `persistent_types::`, applied by hand.
+   `persistent_types::`, applied by hand. CI's mutants on that merge missed the guard's
+   patch term (`||` as `&&`, and `!` deleted): `a_patch_alone_after_a_restart_is_read_by_the_recorded_type`
+   now fails on both, and on the by-filter term's `!` deleted, applied by hand.
    Existing tests: the M171 and M172 server tests that wrote several types under one name
    (`datetime::datetimes_come_back_in_utc`,
    `datetime::a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes`,
