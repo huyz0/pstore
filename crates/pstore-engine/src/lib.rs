@@ -442,6 +442,10 @@ pub enum EngineError {
         /// What the rows carry.
         got: String,
     },
+    /// A create named an index that exists (M147): the name has segments, rejects, a
+    /// quarantine or rows held unfolded, or is an external index's.
+    #[error("the index {0:?} exists")]
+    IndexExists(String),
     /// The epoch asked for cannot be reconstructed.
     #[error(transparent)]
     TimeTravel(#[from] head::TimeTravel),
@@ -1986,6 +1990,9 @@ pub struct Answer {
     /// also what lets a caller tell "this index does not exist" from "it matched nothing",
     /// without asking again.
     pub segments: Vec<SegmentRef>,
+    /// Whether that manifest names the index (M147), with segments or none: an index created
+    /// empty, or emptied by deletes and a compaction, exists with no segment.
+    pub named: bool,
     /// The epoch of the manifest the segments came from (M10): the HEAD a live query read,
     /// or the epoch an `as_of` query asked for. ⚠️ Never this engine's last commit, which is
     /// 0 on a process that only reads and stale on one another process has folded past.
@@ -2069,7 +2076,8 @@ impl Read {
 
 /// What an order or an aggregation reads: see `Engine::scope`.
 struct Scope {
-    refs: Vec<SegmentRef>,
+    /// Whether the HEAD read names the index, segments or none (M147).
+    named: bool,
     targets: Vec<pstore_query::Target>,
     unfolded: Arc<Vec<Document>>,
     shadow: Arc<std::collections::HashSet<String>>,
@@ -4091,7 +4099,7 @@ impl<S: BlobStore> Engine<S> {
         // As a query decides it (M9c): segments, or unfolded rows that are not deletes, once
         // the rows another fold already folded are pruned (code review).
         self.prune_to(&at.head);
-        let exists = !refs.is_empty() || {
+        let exists = at.head.indexes.contains_key(index) || {
             let m = self.mem();
             let ops: Vec<Document> = m
                 .durable_rows(index)
@@ -5049,6 +5057,125 @@ impl<S: BlobStore> Engine<S> {
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
                     stale.extend(copies);
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// Creates `index` with no rows (M147): one HEAD CAS naming it with an empty segment list
+    /// and `dims` client components compared by `metric`, every other schema fact at its
+    /// default. An index is then a key of `indexes`, whatever its list holds.
+    ///
+    /// # Errors
+    /// [`EngineError::IndexExists`] for a name that exists as a drop decides it, or that an
+    /// external index holds; a replica's name as a branch refuses one; [`EngineError::Refused`]
+    /// for an invalid name or a `dims` of 0; and as a commit fails.
+    pub async fn create_index(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+    ) -> Result<Epoch, EngineError> {
+        self.create_index_inner(
+            index,
+            dims,
+            metric,
+            None::<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )
+        .await
+    }
+
+    /// [`Self::create_index`], with `interfere` awaited between the first attempt's read and
+    /// its commit, so a test can make another create land first.
+    #[doc(hidden)]
+    pub async fn create_index_with_interference_for_test(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+        interfere: impl Future<Output = ()> + Send,
+    ) -> Result<Epoch, EngineError> {
+        self.create_index_inner(index, dims, metric, Some(interfere))
+            .await
+    }
+
+    async fn create_index_inner(
+        &self,
+        index: &str,
+        dims: u32,
+        metric: Metric,
+        interfere: Option<impl Future<Output = ()> + Send>,
+    ) -> Result<Epoch, EngineError> {
+        require_fencing(&*self.store)?;
+        if !valid_name(index) {
+            return Err(EngineError::Refused(format!(
+                "an index name {index:?} must match [A-Za-z0-9_.-]{{1,128}} and not be . or .."
+            )));
+        }
+        let Some(stored) = (dims > 0)
+            .then(|| dims.checked_add(metric.extra() as u32))
+            .flatten()
+        else {
+            return Err(EngineError::Refused(format!(
+                "an index's dims must be from 1 to {}, not {dims}",
+                u32::MAX - metric.extra() as u32
+            )));
+        };
+        let schema = IndexSchema {
+            dims: stored,
+            text_field: String::new(),
+            metric,
+            fts: FullText::default(),
+            trigram: Vec::new(),
+            fields: BTreeMap::new(),
+            texts: BTreeMap::new(),
+        };
+        let mut interfere = interfere;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            if at.head.replications.contains_key(index) {
+                return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                    index.to_owned(),
+                )));
+            }
+            let held = {
+                let m = self.mem();
+                m.pending
+                    .get(index)
+                    .into_iter()
+                    .flatten()
+                    .chain(m.durable_rows(index))
+                    .any(|d| !is_rowless(d))
+            };
+            if at.head.indexes.contains_key(index)
+                || at.head.schema_rejects.contains_key(index)
+                || at.head.quarantine.contains_key(index)
+                || at.head.externals.contains_key(index)
+                || held
+            {
+                return Err(EngineError::IndexExists(index.to_owned()));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            next.indexes.insert(index.to_owned(), Vec::new());
+            next.schemas.insert(index.to_owned(), schema.clone());
+            if let Some(f) = interfere.take() {
+                f.await;
+            }
+            match self.commit_head(&at, &next).await {
+                Ok(epoch) => {
+                    // As a fold does: this process's door and its bounded reads know at once.
+                    self.record_commit(epoch);
+                    self.remember_schemas(&next);
+                    return Ok(epoch);
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
                     backoff(self.lane, attempt).await;
                 }
                 Err(e) => return Err(e),
@@ -7223,6 +7350,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded,
                 unfolded_at,
                 segments: refs,
+                named: at.head.indexes.contains_key(index),
                 epoch: at.head.epoch,
                 watermarks: at.head.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
@@ -7273,6 +7401,7 @@ impl<S: BlobStore> Engine<S> {
             unfolded,
             unfolded_at,
             segments: refs,
+            named: at.head.indexes.contains_key(index),
             epoch: at.head.epoch,
             watermarks: at.head.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
@@ -7562,6 +7691,7 @@ impl<S: BlobStore> Engine<S> {
                 unfolded: Arc::default(),
                 unfolded_at: 0,
                 segments: refs,
+                named: then.indexes.contains_key(index),
                 epoch: then.epoch,
                 watermarks: then.watermarks.clone(),
                 staleness: std::time::Duration::ZERO,
@@ -7604,6 +7734,8 @@ impl<S: BlobStore> Engine<S> {
             unfolded: Arc::default(),
             unfolded_at,
             segments: refs,
+            // Targets past the empty return above are this epoch's segments, so it names the index.
+            named: true,
             epoch: then.epoch,
             watermarks: then.watermarks.clone(),
             staleness: std::time::Duration::ZERO,
@@ -7721,7 +7853,7 @@ impl<S: BlobStore> Engine<S> {
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
         let Scope {
-            refs,
+            named,
             targets,
             unfolded,
             shadow,
@@ -7750,7 +7882,8 @@ impl<S: BlobStore> Engine<S> {
         }
         // As a relevance query decides it: segments, or unfolded rows that are not deletes. An
         // index only unfolded deletes ever touched does not exist (code review).
-        let exists = !refs.is_empty() || !unfolded.is_empty();
+        // M147: a named index with no segment exists too: created empty, or emptied.
+        let exists = named || !unfolded.is_empty();
         // The unfolded rows are the newest version of each id they carry, tombstones already
         // gone; the segments' older rows of those ids were shadowed above.
         for d in unfolded.iter() {
@@ -7876,7 +8009,7 @@ impl<S: BlobStore> Engine<S> {
             })
             .sum();
         Ok(Scope {
-            refs,
+            named: head.indexes.contains_key(index),
             targets,
             unfolded,
             shadow,
@@ -7990,7 +8123,7 @@ impl<S: BlobStore> Engine<S> {
         if fast {
             aggregator.count_rows(scope.live);
         }
-        let exists = !scope.refs.is_empty() || !scope.unfolded.is_empty();
+        let exists = scope.named || !scope.unfolded.is_empty();
         let mut unfolded = 0;
         for d in scope.unfolded.iter() {
             // Counted only when its group was kept (code review): a row whose key fell outside

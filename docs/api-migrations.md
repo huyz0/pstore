@@ -165,6 +165,27 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M147: an index can be created empty
+
+`PUT /v1/indexes/{index}` (scope `write`) with `{"dims": n, "distance_metric": m}` creates
+the index with no rows. `dims` is from 1 to the server's `array_elements` limit (16,384 by
+default); `distance_metric` takes the write path's names and defaults to `dot_product`; any
+other field is refused. It answers `200 {"epoch", "cost"}`, or `409 index_exists` when the
+name already exists, is held unfolded, or is an external index's, and `409
+replica_read_only` for a replica's name. A name dropped earlier can be created again.
+
+The created index is listed, its summary shows 0 segments, and its queries, aggregates and
+`warm` answer `200` with nothing. Its first write must match the declared width and name
+its metric, as a write to any index of that schema must; its analyzer and `regex` stay at
+their defaults.
+
+⚠️ **Behaviour change.** An index whose rows were all deleted and then compacted away used
+to be listed while its queries, aggregates and `warm` answered `404 index_not_found`. They
+now answer `200` with no rows, as for a created empty index. A query `as_of` an epoch at
+which the index had no segment is still 404.
+
+Nothing stored changes. Evidence is in [M147 verification](milestones/M147/VERIFIED.md).
+
 ## M143: a request body's JSON shape is bounded
 
 ⚠️ **Behaviour change.** Every public JSON body is checked before it is parsed. A body is

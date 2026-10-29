@@ -135,7 +135,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | `encryption` | Deployment bucket encryption only | Missing namespace `{mode, key_name}` contract; I |
 | `sharding` | Segment distribution, no initial `num_shards` setting | Missing persistent namespace shard contract; I |
 | `disable_backpressure` | No compatible ingestion/backlog mode | Missing; A/C |
-| `create_namespace` | No empty namespace creation; empty mutation refused | Missing; G |
+| `create_namespace` | `PUT /v1/indexes/{index}` with `dims` and `distance_metric` ([M147](../milestones/M147/SPEC.md)); no FTS or typed-attribute declarations at creation | Partial; G/D |
 | `source_namespace`, `source_api_key`, `source_region` | Branch strings; replication/external copy use operator-configured named stores | Missing copy source contract; H |
 | `dest_encryption` on copy request | None | Missing re-encryption; H/I |
 

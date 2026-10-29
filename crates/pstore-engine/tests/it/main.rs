@@ -18,6 +18,7 @@ mod bundle_errors;
 mod centroid_skip;
 mod cold_depth;
 mod compaction;
+mod create;
 mod dense_index;
 mod depth_at_scale;
 mod dict_skip;
