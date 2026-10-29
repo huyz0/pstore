@@ -1252,7 +1252,7 @@ fn patch_attrs(p: Patch) -> Result<BTreeMap<String, pstore_format::Value>, Engin
     {
         return Err(EngineError::Format(format!(
             "patch of {}: attribute `{name}` is reserved",
-            p.id
+            pstore_format::id::shown(&p.id)
         )));
     }
     let mut attrs = p.set;
@@ -1261,7 +1261,9 @@ fn patch_attrs(p: Patch) -> Result<BTreeMap<String, pstore_format::Value>, Engin
         vectors: BTreeMap::new(),
         attrs: attrs.clone(),
     })
-    .map_err(|e| EngineError::Format(format!("patch of {}: {e}", p.id)))?;
+    .map_err(|e| {
+        EngineError::Format(format!("patch of {}: {e}", pstore_format::id::shown(&p.id)))
+    })?;
     attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
     if !p.unset.is_empty() {
         attrs.insert(
@@ -1540,6 +1542,26 @@ fn type_conflict(index: &str, name: &str, expected: Kind, got: Kind) -> EngineEr
         what: "an attribute's type",
         expected: format!("`{name}` as {}", expected.name()),
         got: format!("`{name}` as {}", got.name()),
+    }
+}
+
+/// The name an index's id kind is recorded under among its types (M176): `id`, which no
+/// attribute can take.
+pub const ID_KIND: &str = "id";
+
+/// An id-kind conflict (M176), from the kind known and the row's id, named as written; `None`
+/// is a string.
+fn id_conflict(index: &str, expected: Option<Kind>, id: &str) -> EngineError {
+    let name = |k: Option<Kind>| k.map_or("string", Kind::name);
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "the id's kind",
+        expected: format!("`id` as {}", name(expected)),
+        got: format!(
+            "id {:?} as {}",
+            pstore_format::id::shown(id),
+            name(pstore_format::id::kind(id))
+        ),
     }
 }
 
@@ -2761,6 +2783,11 @@ impl<S: BlobStore> Engine<S> {
         if is_rowless(doc) {
             return None;
         }
+        // M176: one id kind, the recorded one, a string when none.
+        let want = schema.types.get(ID_KIND).copied();
+        if pstore_format::id::kind(&doc.id) != want {
+            return Some(id_conflict(index, want, &doc.id));
+        }
         // M173: a type its write gave a name, and every value under a recorded name.
         if let Some((name, got, want)) = types_of(doc).into_iter().find_map(|(name, got)| {
             let &want = schema.types.get(&name)?;
@@ -3760,7 +3787,7 @@ impl<S: BlobStore> Engine<S> {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
                 return Err(EngineError::Format(format!(
                     "document {}: attribute `{name}` is reserved: names beginning `$` are",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
             if let Some(name) = d
@@ -3771,7 +3798,7 @@ impl<S: BlobStore> Engine<S> {
                 return Err(EngineError::Format(format!(
                     "document {}: vector field `{name}` is reserved: names ending `{}` hold an \
                      encoding the engine derives",
-                    d.id,
+                    pstore_format::id::shown(&d.id),
                     pstore_format::fde::FIELD_SUFFIX
                 )));
             }
@@ -3780,14 +3807,17 @@ impl<S: BlobStore> Engine<S> {
             if let Some(name) = d.vectors.keys().find(|k| k.contains('\0')) {
                 return Err(EngineError::Format(format!(
                     "document {}: vector field {name:?} contains a NUL byte, which is reserved",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
             for field in d.vectors.values_mut() {
                 if let pstore_format::VectorField::Dense(vs) = field {
                     for v in vs.iter_mut() {
                         *v = transform_stored(metric, v).ok_or_else(|| {
-                            EngineError::Unmeasurable(format!("document {}", d.id))
+                            EngineError::Unmeasurable(format!(
+                                "document {}",
+                                pstore_format::id::shown(&d.id)
+                            ))
                         })?;
                     }
                 }
@@ -3866,7 +3896,7 @@ impl<S: BlobStore> Engine<S> {
             if d.attrs.contains_key(TOMBSTONE) {
                 return Err(EngineError::Format(format!(
                     "document {}: an attribute with an empty name is reserved",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
         }
@@ -3994,6 +4024,23 @@ impl<S: BlobStore> Engine<S> {
             .find(|d| !is_rowless(d))
             .or_else(|| docs.iter().find(|d| !is_rowless(d)))
             .map(|d| (metric_of(d), d.vector().len()));
+        // M176: one id kind, the first held row's or the batch's own first row's.
+        if let Some(want) = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .chain(docs.iter())
+            .find(|d| !is_rowless(d))
+            .map(|d| pstore_format::id::kind(&d.id))
+            && let Some(odd) = docs
+                .iter()
+                .filter(|d| !is_rowless(d))
+                .find(|d| pstore_format::id::kind(&d.id) != want)
+        {
+            return Some(id_conflict(index, want, &odd.id));
+        }
         // M14: and one analyzer, on the same rung -- the first row that DECLARES one, since an
         // undeclared row has no opinion to compare.
         let declared = m
@@ -5424,6 +5471,16 @@ impl<S: BlobStore> Engine<S> {
                 // before the declaring one too -- is judged by one type.
                 for (name, kind) in docs.iter().flat_map(types_of) {
                     schema.types.entry(name).or_insert(kind);
+                }
+                // M176: the id kind, only by the fold creating the schema, never later: the
+                // first upsert's in lane order, superseded or deleted ones included.
+                if created.contains_key(idx)
+                    && let Some(kind) = docs
+                        .iter()
+                        .find(|d| !is_rowless(d))
+                        .and_then(|d| pstore_format::id::kind(&d.id))
+                {
+                    schema.types.insert(ID_KIND.to_owned(), kind);
                 }
                 typed.insert(idx.clone(), schema.types.clone());
                 let schema = &self.filled(idx, schema, docs);

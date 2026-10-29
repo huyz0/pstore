@@ -40,12 +40,92 @@ pub enum Durability {
     Applied,
 }
 
+/// A document's id as a write names it (M176): a JSON string, held as written, or an integer
+/// in `0..=u64::MAX`, held in `uint64`'s form (`pstore_format::id`). A `uuid` is a string
+/// until the index's kind is known. Displayed as written, never in its held form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Id(pub String);
+
+impl Id {
+    /// The id as held.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// An id from a JSON value, or why it is none.
+    ///
+    /// # Errors
+    /// Anything but a string not beginning with NUL or an integer in `0..=u64::MAX`.
+    pub fn of(v: &serde_json::Value) -> Result<Self, String> {
+        match v {
+            serde_json::Value::String(s) => Self::string(s.clone()),
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .map(|n| Self(pstore_format::id::uint(n)))
+                .ok_or_else(|| not_an_id(n)),
+            other => Err(not_an_id(other)),
+        }
+    }
+
+    fn string(s: String) -> Result<Self, String> {
+        if pstore_format::id::is_string(&s) {
+            Ok(Self(s))
+        } else {
+            Err(format!("id {s:?} begins with NUL, which no id may"))
+        }
+    }
+}
+
+fn not_an_id(v: &dyn std::fmt::Display) -> String {
+    format!("id {v} is neither a string nor an integer in 0..=18446744073709551615")
+}
+
+/// A held id as answered (M176): a `uint64` a JSON integer, a `uuid` lowercase and
+/// hyphenated, a string as written. Only at serialization: fusion and windows order by the
+/// held form, which orders as the values do.
+fn id_out<S: serde::Serializer>(id: &str, s: S) -> Result<S::Ok, S::Error> {
+    match pstore_format::id::value(id) {
+        pstore_format::Value::Uint(n) => s.serialize_u64(n),
+        pstore_format::Value::Uuid(u) => s.serialize_str(&pstore_format::typed::format_uuid(&u)),
+        _ => s.serialize_str(id),
+    }
+}
+
+/// [`id_out`] over a list.
+fn ids_out<S: serde::Serializer>(ids: &[String], s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    struct One<'a>(&'a str);
+    impl Serialize for One<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            id_out(self.0, s)
+        }
+    }
+    let mut seq = s.serialize_seq(Some(ids.len()))?;
+    for id in ids {
+        seq.serialize_element(&One(id))?;
+    }
+    seq.end()
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&pstore_format::id::shown(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::of(&serde_json::Value::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// One document, as a client sends it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentIn {
-    /// The client's identifier.
-    pub id: String,
+    /// The client's identifier (M176: a string or an integer).
+    pub id: Id,
     /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d). Absent for a
     /// document of an index with no vectors (M170).
     #[serde(default, deserialize_with = "some_vector")]
@@ -79,7 +159,7 @@ pub struct WriteRequest {
     pub documents: Vec<DocumentIn>,
     /// Ids to delete, applied **after** `documents` (M9c). Either list may be empty, not both.
     #[serde(default)]
-    pub deletes: Vec<String>,
+    pub deletes: Vec<Id>,
     /// How the index compares vectors (M9d): `cosine_distance`, `euclidean_squared`, or
     /// `dot_product`, the default and every index's metric before M9d. Refused if unknown.
     #[serde(default)]
@@ -373,10 +453,13 @@ pub struct AppliedOut {
 #[derive(Debug, Clone, Serialize)]
 pub struct AffectedIds {
     /// Ids an upsert wrote.
+    #[serde(serialize_with = "ids_out")]
     pub upserted: Vec<String>,
     /// Ids a delete removed.
+    #[serde(serialize_with = "ids_out")]
     pub deleted: Vec<String>,
     /// Ids a patch changed.
+    #[serde(serialize_with = "ids_out")]
     pub patched: Vec<String>,
 }
 
@@ -481,7 +564,8 @@ fn default_top_k() -> usize {
 /// One ranked result.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResultRow {
-    /// The document's id.
+    /// The document's id, held (M176).
+    #[serde(serialize_with = "id_out")]
     pub id: String,
     /// Its fused score. Absent for a `rank_by` order (M9e), which has none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -726,6 +810,8 @@ pub struct Schema {
     /// Each named dense field's width, as a client writes it (M98); absent when none is known.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vectors: std::collections::BTreeMap<String, u32>,
+    /// The ids' kind (M176): `string`, `uint64` or `uuid`.
+    pub id: &'static str,
     /// Each attribute's recorded type (M173): `datetime`, `uuid`, `bytes` or `uint64`; `{}`
     /// when none is recorded.
     pub attributes: std::collections::BTreeMap<String, &'static str>,

@@ -104,6 +104,7 @@ mod time_travel;
 mod tls_fixture;
 mod tokenizers;
 mod tokens;
+mod typed_ids;
 mod typed_values;
 mod uint64;
 mod upsert;
