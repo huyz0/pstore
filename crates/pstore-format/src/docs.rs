@@ -516,13 +516,18 @@ mod tests {
         d.attrs.insert("v".to_owned(), Value::Null);
         d.attrs.insert("w".to_owned(), Value::Int(1));
         let buf = encode_rows(std::slice::from_ref(&d));
-        assert!(decode_rows(&buf).is_err());
+        // The message, not only the refusal: without its own arm a top-level null is still
+        // refused, as an unknown tag, which misnames the corruption.
+        let null_outside = |r: Result<(), FormatError>| {
+            matches!(r, Err(FormatError::Corrupt("a null outside an array")))
+        };
+        assert!(null_outside(decode_rows(&buf).map(drop)));
         let only_w = |name: &str| name == "w";
         let p = Projection {
             id: false,
             attrs: &only_w,
         };
-        assert!(decode_rows_where(&buf, &p).is_err());
+        assert!(null_outside(decode_rows_where(&buf, &p).map(drop)));
     }
 
     #[test]

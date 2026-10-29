@@ -34,10 +34,12 @@ claimed for them.
    The first also round-trips the bundle encoding, from code review.
    Killed: tag 9 written as another tag, in blocks and in conditions; tag 9 decoded or
    skipped at the top level, in blocks and in conditions; tag 9 not skipped;
-   `check_storable` storing a top-level null. After rebasing onto M141's buffer bound, `Value::footprint`
+   `check_storable` storing a top-level null. From CI's mutants run on #21: the top-level
+   refusal's own arm deleted, in decoding or in skipping, which fell through to "unknown
+   value tag"; `a_null_outside_an_array_is_refused` now names the message, and both fail it. After rebasing onto M141's buffer bound, `Value::footprint`
    counts a null element as its tag, 1 byte;
    `footprint::every_value_kind_is_counted` asserts it.
-6. The workspace suite, without the two IPv6 tests: 2,503 passed, none failed, on main after M147 and M174 (#16, #19). Changed:
+6. The workspace suite, without the two IPv6 tests: 2,513 passed, none failed, on main after M181 (#18). Changed:
    `arrays::what_an_array_cannot_hold_is_refused` and
    `upsert_columns::null_in_an_upsert_is_absent_and_in_a_patch_removes` lose their
    `[1, null]` refusal, accepted now and asserted by criterion 1; every other case stays.
