@@ -3039,6 +3039,8 @@ enum Plan {
     Aggregate(pstore_query::AggregateSpec, Option<pstore_query::Predicate>),
     /// A `rank_by` order (M9e).
     Ordered(pstore_query::Order, Option<pstore_query::Predicate>),
+    /// A `rank_by` scoring expression (M182).
+    Scored(pstore_query::Expr, Option<pstore_query::Predicate>),
     /// A relevance ranking: its legs, filter and fusion, and its boost (M62).
     Ranked(
         Vec<pstore_query::Prefetch>,
@@ -3166,7 +3168,10 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     // ⚠️ Before `prefetch`, which refuses a query with no vector and no text: an ordered query
     // has neither by definition (M9e).
     if let Some(by) = order_by(req)? {
-        return Ok(Plan::Ordered(by, filter));
+        return Ok(match by {
+            RankBy::Order(by) => Plan::Ordered(by, filter),
+            RankBy::Expr(e) => Plan::Scored(e, filter),
+        });
     }
     // M146: a group limit names the window too (it never sits beside a diversify).
     // M163: a page's end is the depth every path ranks to; `offset` bounds it as an order's.
@@ -3492,6 +3497,52 @@ async fn run<E: BlobStore>(
                     .collect(),
                 epoch: got.epoch.0,
                 unfolded_hits: got.unfolded,
+                consistency: level_name(level),
+            });
+        }
+        Plan::Scored(expr, filter) => {
+            let got = engine
+                .scored_as(
+                    index,
+                    &expr,
+                    filter.as_ref(),
+                    req.offset.unwrap_or(0),
+                    req.top_k,
+                    req.as_of.map(pstore_types::Epoch),
+                    consistency,
+                )
+                .await?;
+            let ordered = got.ordered;
+            // As an order's: the session's unfolded write may be what creates the index.
+            let token = checked(ordered.epoch.0, &ordered.watermarks)?;
+            if !ordered.exists {
+                return Err(missing());
+            }
+            return Ok(Answered {
+                token,
+                staleness_ms: millis(ordered.staleness),
+                aggregations: None,
+                aggregation_groups: None,
+                results: ordered
+                    .rows
+                    .into_iter()
+                    .zip(got.scores)
+                    .map(|(d, score)| ResultRow {
+                        attributes: selected(req, &d.attrs),
+                        id: d.id,
+                        // The wire's f32, narrowed from the f64 the rows were ordered by.
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "M182 Delta 1 bounds a kept score inside f32's range"
+                        )]
+                        score: Some(score as f32),
+                        dist: None,
+                        highlight: None,
+                        highlights: None,
+                    })
+                    .collect(),
+                epoch: ordered.epoch.0,
+                unfolded_hits: ordered.unfolded,
                 consistency: level_name(level),
             });
         }
@@ -4169,25 +4220,39 @@ fn parse_write(body: &[u8]) -> Result<(WriteRequest, usize), ApiError> {
 /// The most a `rank_by` query may skip and return together (M9e): its rows are held in memory.
 const MAX_ORDERED: usize = 10_000;
 
-/// The order a query asks for, if it asks for one -- or why it cannot mean one (M9e).
+/// What `rank_by` asks for: an order (M9e), or a scoring expression (M182).
+enum RankBy {
+    Order(pstore_query::Order),
+    Expr(pstore_query::Expr),
+}
+
+/// The order or expression a query asks for, if it asks for one -- or why it cannot mean one
+/// (M9e).
 ///
 /// ⚠️ **Refused, never combined.** An ordered answer and a relevance answer are different
 /// questions, so `rank_by` beside `vector`, `text`, `field` or `exact: true` is a request that
-/// means nothing -- and answering one of them would silently drop the other.
+/// means nothing -- and answering one of them would silently drop the other. A scoring
+/// expression is its own ranking, refused beside them the same way.
 ///
 /// `rank_by` is one `[attribute, "asc" | "desc"]` pair, or a list of 1 to 8 of them (M140): an
-/// array whose first element is itself an array is the list.
-fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError> {
+/// array whose first element is itself an array is the list. M182: any other array but a pair
+/// of strings is an expression, which an order never was.
+fn order_by(req: &QueryRequest) -> Result<Option<RankBy>, ApiError> {
     // M163: a relevance ranking takes `offset` too; `plan` bounds its page.
     let Some(raw) = &req.rank_by else {
         return Ok(None);
     };
-    let by = match raw.as_array() {
+    let by = match raw.as_array().map(Vec::as_slice) {
         Some(list) if list.is_empty() || list.first().is_some_and(serde_json::Value::is_array) => {
-            pstore_query::Order::new(list.iter().map(order_key).collect::<Result<_, _>>()?)
-                .map_err(ApiError::bad_request)?
+            RankBy::Order(
+                pstore_query::Order::new(list.iter().map(order_key).collect::<Result<_, _>>()?)
+                    .map_err(ApiError::bad_request)?,
+            )
         }
-        _ => order_key(raw)?.into(),
+        Some([serde_json::Value::String(_), serde_json::Value::String(_)]) | None => {
+            RankBy::Order(order_key(raw)?.into())
+        }
+        Some(_) => RankBy::Expr(scoring_expression(raw)?),
     };
     if req.vector.is_some()
         || req.multi.is_some()
@@ -4196,10 +4261,16 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError>
         || req.exact
         || req.fusion.is_some()
     {
-        return Err(ApiError::bad_request(
-            "rank_by orders by an attribute; it cannot be combined with vector, multi, text, \
-             field, exact or fusion",
-        ));
+        return Err(ApiError::bad_request(match by {
+            RankBy::Order(_) => {
+                "rank_by orders by an attribute; it cannot be combined with vector, multi, \
+                 text, field, exact or fusion"
+            }
+            RankBy::Expr(_) => {
+                "rank_by scores by an expression; it cannot be combined with vector, multi, \
+                 text, field, exact or fusion"
+            }
+        }));
     }
     if req.top_k.saturating_add(req.offset.unwrap_or(0)) > MAX_ORDERED {
         return Err(ApiError::bad_request(format!(
@@ -4207,6 +4278,109 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError>
         )));
     }
     Ok(Some(by))
+}
+
+/// A `rank_by` scoring expression (M182), in the vendor's spelling: `["Sum", [e, ...]]`,
+/// `["Max", [e, ...]]`, `["Product", w, e]` or `["Product", e, w]`,
+/// `[field, "BM25", query]` with optional `{"last_as_prefix": bool}`, or any filter.
+/// Refused when it is none of them, or outside [`pstore_query::Expr::check`]'s limits.
+fn scoring_expression(v: &serde_json::Value) -> Result<pstore_query::Expr, ApiError> {
+    let e = expression(v).map_err(|why| ApiError::bad_request(format!("rank_by: {why}")))?;
+    e.check()
+        .map_err(|why| ApiError::bad_request(format!("rank_by: {why}")))?;
+    // As `filters` caps a filter's patterns: every filter of the expression together.
+    let patterns = e.filters().iter().map(|p| p.patterns()).sum::<usize>();
+    if patterns > MAX_PATTERNS {
+        return Err(ApiError::bad_request(format!(
+            "rank_by: an expression's filters hold at most {MAX_PATTERNS} patterns, and these \
+             hold {patterns}"
+        )));
+    }
+    Ok(e)
+}
+
+/// One node of [`scoring_expression`], recursively.
+fn expression(v: &serde_json::Value) -> Result<pstore_query::Expr, String> {
+    use pstore_query::Expr;
+    let clauses = |c: &serde_json::Value, op: &str| -> Result<Vec<Expr>, String> {
+        c.as_array()
+            .ok_or_else(|| format!("{op} takes an array of clauses"))?
+            .iter()
+            .map(expression)
+            .collect()
+    };
+    let weight = |w: &serde_json::Value| -> Result<f32, String> {
+        let n = w
+            .as_f64()
+            .ok_or_else(|| format!("a Product's weight is a number, not {w}"))?;
+        // Checked before the narrowing, which would make 1e-50 a 0 `check` accepts. The bounds
+        // are `MIN_WEIGHT` and `MAX_WEIGHT` as decimals: widening the f32s would move them.
+        if n != 0.0 && !(1e-3..=1e3).contains(&n) {
+            return Err(format!(
+                "a Product's weight is 0 or from {} to {}, not {w}",
+                pstore_query::MIN_WEIGHT,
+                pstore_query::MAX_WEIGHT
+            ));
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a weight within [1e-3, 1e3] is exact enough in f32"
+        )]
+        Ok(n as f32)
+    };
+    match v.as_array().map(Vec::as_slice) {
+        Some([serde_json::Value::String(op), c]) if op == "Sum" => Ok(Expr::Sum(clauses(c, op)?)),
+        Some([serde_json::Value::String(op), c]) if op == "Max" => Ok(Expr::Max(clauses(c, op)?)),
+        Some([serde_json::Value::String(op), a, b]) if op == "Product" => match (a, b) {
+            (w @ serde_json::Value::Number(_), e) | (e, w @ serde_json::Value::Number(_)) => {
+                Ok(Expr::Product(weight(w)?, Box::new(expression(e)?)))
+            }
+            _ => Err("Product takes a weight and a clause, in either order".to_owned()),
+        },
+        Some([serde_json::Value::String(op), ..]) if op == "Product" => {
+            Err("Product takes a weight and a clause, in either order".to_owned())
+        }
+        Some(
+            [
+                serde_json::Value::String(field),
+                serde_json::Value::String(op),
+                q,
+                rest @ ..,
+            ],
+        ) if op == "BM25" => {
+            let last_as_prefix = match rest {
+                [] => false,
+                [serde_json::Value::Object(o)] => {
+                    if let Some(k) = o.keys().find(|k| *k != "last_as_prefix") {
+                        return Err(format!(
+                            "a BM25 clause's params are last_as_prefix, not {k:?}"
+                        ));
+                    }
+                    match o.get("last_as_prefix") {
+                        None => false,
+                        Some(serde_json::Value::Bool(b)) => *b,
+                        Some(_) => {
+                            return Err("a BM25 clause's last_as_prefix is a bool".to_owned());
+                        }
+                    }
+                }
+                _ => {
+                    return Err(
+                        "a BM25 clause is [field, \"BM25\", query] or [field, \"BM25\", query, \
+                         {\"last_as_prefix\": bool}]"
+                            .to_owned(),
+                    );
+                }
+            };
+            Ok(Expr::Bm25 {
+                field: field.clone(),
+                query: types::token_operand(q).map_err(|why| format!("BM25: {why}"))?,
+                last_as_prefix,
+            })
+        }
+        Some(_) => clause(v).map(Expr::Filter).map_err(|e| e.message),
+        None => Err(format!("an expression is an array, not {v}")),
+    }
 }
 
 /// One `[attribute, "asc" | "desc"]` pair of `rank_by`.
