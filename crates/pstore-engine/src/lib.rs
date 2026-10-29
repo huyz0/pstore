@@ -1035,6 +1035,9 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
             .quarantine
             .get(index)
             .map_or(0, |q| q.iter().map(|(_, n)| u64::from(*n)).sum()),
+        created_ms: h.times.get(index).map(|t| t.0).filter(|c| *c > 0),
+        written_ms: h.times.get(index).map(|t| t.1),
+        bytes: refs.iter().map(|r| r.len).sum(),
     })
 }
 
@@ -2169,6 +2172,14 @@ pub struct IndexStats {
     pub rejected_rows: u64,
     /// Of those, the rows still set aside (M25): exportable, until discarded.
     pub quarantined_rows: u64,
+    /// When it came into being, Unix milliseconds (M148): `None` without a recorded time, as
+    /// for an index made before M148.
+    pub created_ms: Option<u64>,
+    /// When a commit last wrote it -- a fold of its rows, its create, branch or sync, never a
+    /// compaction -- Unix milliseconds (M148), or `None` without a recorded time.
+    pub written_ms: Option<u64>,
+    /// The summed lengths of its segment objects (M148), or `None` when one is not recorded.
+    pub bytes: Option<u64>,
 }
 
 /// One writer's view of one tenant.
@@ -2258,6 +2269,9 @@ pub struct Engine<S> {
     outcome_cache: Mutex<BTreeMap<String, Arc<applied::Decided>>>,
     /// M132: this engine initialises HEAD's `keys_since` on every commit.
     keys_on: std::sync::atomic::AtomicBool,
+    /// M148: the clock a commit stamps index times with, in Unix milliseconds; `None` is
+    /// the system's. Set only by a test, to run a process behind the last writer.
+    clock: Mutex<Option<u64>>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
     /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
@@ -2410,6 +2424,7 @@ impl<S: BlobStore> Engine<S> {
             observed: Mutex::new(Observed::default()),
             outcome_cache: Mutex::new(BTreeMap::new()),
             keys_on: std::sync::atomic::AtomicBool::new(false),
+            clock: Mutex::new(None),
             fresh: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
             // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
@@ -3184,6 +3199,48 @@ impl<S: BlobStore> Engine<S> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.observe(&at.head);
         Ok(key.e0() <= at.head.epoch.0)
+    }
+
+    /// Makes this engine's clock read `ms` (M148), or the system's again with `None`.
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&self, ms: Option<u64>) {
+        *self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ms;
+    }
+
+    fn now_ms(&self) -> u64 {
+        let fixed = *self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fixed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        })
+    }
+
+    /// Stamps each of `names` as written by the commit of `next` on `at` (M148): its
+    /// `written_ms` moves to now, never back, and an index `at` did not hold gets
+    /// `created_ms` now, one it held without a time (made before M148) 0, unknown.
+    pub(crate) fn stamp_times<'a>(
+        &self,
+        at: &Head,
+        next: &mut Head,
+        names: impl IntoIterator<Item = &'a str>,
+    ) {
+        let now = self.now_ms();
+        for n in names {
+            let existed = at.indexes.contains_key(n)
+                || at.schema_rejects.contains_key(n)
+                || at.quarantine.contains_key(n);
+            let prev = at.times.get(n).copied();
+            let created = prev.map_or(if existed { 0 } else { now }, |(c, _)| c);
+            let written = prev.map_or(now, |(_, w)| w.max(now));
+            next.times.insert(n.to_owned(), (created, written));
+        }
     }
 
     /// Commits `next` on `at`. M132: an engine set for keys initialises `keys_since` on a HEAD
@@ -5043,6 +5100,7 @@ impl<S: BlobStore> Engine<S> {
                 next.schemas.insert(dest.to_owned(), schema.clone());
             }
             next.branched.insert(dest.to_owned(), next.epoch.0);
+            self.stamp_times(&at.head, &mut next, [dest]);
             // A lost attempt's copies were never live: buried under their own epochs, as a
             // compaction buries its losers, so GC reaps them and `as_of` never finds them.
             for k in &stale {
@@ -5169,6 +5227,7 @@ impl<S: BlobStore> Engine<S> {
             next.nonce = nonce_for(next.epoch, self.lane);
             next.indexes.insert(index.to_owned(), Vec::new());
             next.schemas.insert(index.to_owned(), schema.clone());
+            self.stamp_times(&at.head, &mut next, [index]);
             if let Some(f) = interfere.take() {
                 f.await;
             }
@@ -5599,6 +5658,11 @@ impl<S: BlobStore> Engine<S> {
             // computed from would otherwise share a tag. Derived from the epoch and lane,
             // so it is deterministic and needs no clock.
             next.nonce = nonce_for(next.epoch, self.lane);
+            // M148: every index this fold writes, its rejects included. A name that does not
+            // exist after the commit keeps no time: `encode` writes only existing ones.
+            let written: std::collections::BTreeSet<String> =
+                touched.keys().chain(rejects.keys()).cloned().collect();
+            self.stamp_times(&at.head, &mut next, written.iter().map(String::as_str));
 
             for (idx, ids) in &touched {
                 let prepared = match prepared_for.remove(idx) {

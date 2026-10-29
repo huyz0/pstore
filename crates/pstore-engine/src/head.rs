@@ -271,6 +271,11 @@ pub struct Head {
     /// engine set for idempotency keys, raised by every fold that drops a listed pair. ⚠️ The
     /// last trailing section, after the outcomes: absent means `None`.
     pub keys_since: Option<u64>,
+    /// Per index, `(created_ms, written_ms)` in Unix milliseconds (M148): when it came into
+    /// being, 0 when unknown (made before M148), and the last commit that wrote it. ⚠️ A
+    /// trailing section after `keys_since`, and `encode` writes only the entries of indexes
+    /// that exist, so it never outlives its index.
+    pub times: BTreeMap<String, (u64, u64)>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -547,7 +552,7 @@ impl Head {
             .iter()
             .filter(|(_, _, s, _)| !s.fields.is_empty())
             .collect();
-        // M152: the further text fields are last, and force `keys_since`, which has no
+        // M152: the further text fields follow `keys_since` and force it, though it has no
         // presence marker: a forced `None` is written as `u64::MAX`, which no epoch reaches.
         let texts: Vec<_> = all
             .iter()
@@ -559,13 +564,24 @@ impl Head {
         );
         // M129: the applied outcomes follow, and force the widths.
         // M132: `keys_since` follows, and forces the outcomes.
-        // M173: the recorded types are last, and force the text fields' section (empty if
+        // M173: the recorded types follow the text fields, and force their section (empty if
         // none), which forces `keys_since`.
+        // M148: the times are last, only those of indexes that exist, and force the types'
+        // count (0 when none), and so everything before it.
         let typed: Vec<_> = all
             .iter()
             .filter(|(_, _, s, _)| !s.types.is_empty())
             .collect();
-        let types = !typed.is_empty();
+        let times: Vec<_> = self
+            .times
+            .iter()
+            .filter(|(n, _)| {
+                self.indexes.contains_key(*n)
+                    || self.schema_rejects.contains_key(*n)
+                    || self.quarantine.contains_key(*n)
+            })
+            .collect();
+        let types = !typed.is_empty() || !times.is_empty();
         let texted = !texts.is_empty() || types;
         let since = self.keys_since.is_some() || texted;
         let outs = !self.outcomes.is_empty() || since;
@@ -705,6 +721,14 @@ impl Head {
                     put_str(&mut out, attr);
                     out.push(kind_code(*k));
                 }
+            }
+        }
+        if !times.is_empty() {
+            out.extend_from_slice(&(times.len() as u32).to_le_bytes());
+            for (name, (created, written)) in times {
+                put_str(&mut out, name);
+                out.extend_from_slice(&created.to_le_bytes());
+                out.extend_from_slice(&written.to_le_bytes());
             }
         }
         out
@@ -1108,6 +1132,16 @@ impl Head {
                     .ok_or(EngineError::CorruptHead)?;
                 schema.types.insert(attr, k);
             }
+        }
+        // M148: and here, no times. A decoder from before it refuses anything after the
+        // recorded types, so every node reads this before any writes it.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let created = c.u64()?;
+            h.times.insert(name, (created, c.u64()?));
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2244,6 +2278,73 @@ mod tests {
                 "{why} decoded"
             );
         }
+        Ok(())
+    }
+
+    /// M148 criterion 6: `times` round-trips beside an absent and a present `keys_since`,
+    /// with and without outcomes; a HEAD without it encodes as M147's; and `encode` keeps
+    /// only the entries of indexes that exist (rows, rejects or a quarantine).
+    #[test]
+    fn times_round_trip_beside_keys_since() -> Result<(), EngineError> {
+        for (keys_since, outcomes) in [
+            (None, vec![]),
+            (Some(4), vec![]),
+            (None, vec![(3, "o3".to_owned())]),
+            (Some(4), vec![(3, "o3".to_owned())]),
+        ] {
+            let mut m147 = Head {
+                keys_since,
+                outcomes,
+                ..sample()
+            };
+            m147.indexes.insert("a".to_owned(), Vec::new());
+            m147.schema_rejects.insert("r".to_owned(), 1);
+            m147.quarantine
+                .insert("q".to_owned(), vec![("k".to_owned(), 1)]);
+            let mut with = m147.clone();
+            for (i, n) in ["a", "r", "q"].into_iter().enumerate() {
+                with.times.insert(n.to_owned(), (i as u64, 10 + i as u64));
+            }
+            let back = Head::decode(&with.encode())?;
+            assert_eq!(back, with, "{keys_since:?}");
+            // Without times, M147's bytes exactly: the times entry of a name that does not
+            // exist is never written.
+            let mut ghost = m147.clone();
+            ghost.times.insert("gone".to_owned(), (1, 2));
+            assert_eq!(hex(&ghost.encode()), hex(&m147.encode()), "{keys_since:?}");
+            assert_eq!(Head::decode(&m147.encode())?, m147);
+            // A ghost beside a real entry is dropped, the real one kept.
+            let mut both = with.clone();
+            both.times.insert("gone".to_owned(), (1, 2));
+            assert_eq!(Head::decode(&both.encode())?, with);
+            let bytes = with.encode();
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            for cut in m147.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                // A cut leaving exactly M147's form is M147's HEAD; every other is refused.
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.times.is_empty(), "a cut at {cut} decoded times");
+                }
+            }
+        }
+        // After M152's further text fields, live and dropped.
+        for keys_since in [None, Some(17)] {
+            let mut h = texted(keys_since);
+            h.times.insert("a".to_owned(), (5, 6));
+            let back = Head::decode(&h.encode())?;
+            assert_eq!(back, h, "{keys_since:?}");
+            assert_eq!(back.times.len(), 1);
+        }
+        // After M173's recorded types, live and dropped, which the times follow.
+        let mut h = every_section();
+        assert!(h.indexes.contains_key("a"));
+        assert!(h.schemas.get("a").is_some_and(|s| !s.types.is_empty()));
+        h.times.insert("a".to_owned(), (7, 8));
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back, h);
+        assert_eq!(back.times.len(), 1);
         Ok(())
     }
 }

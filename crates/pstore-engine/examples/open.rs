@@ -208,6 +208,10 @@ async fn by_deployment_size(sizes: &[u32]) {
                 externals: Default::default(),
                 outcomes: Vec::new(),
                 keys_since: None,
+                // M148: and each index's times, which a deployment's HEAD carries too.
+                times: (0..50)
+                    .map(|j| (format!("t{i:08}-index-{j:07}"), (1, 1)))
+                    .collect(),
             };
             store
                 .put(

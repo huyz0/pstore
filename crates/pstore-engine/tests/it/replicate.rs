@@ -1659,3 +1659,41 @@ async fn a_cancelled_replica_is_forgotten_by_the_door() {
         .await
         .expect("a write the door already knows is allowed read HEAD again");
 }
+
+async fn times(e: &E) -> Option<(u64, u64)> {
+    e.head_for_test().await.times.get("dst").copied()
+}
+
+#[tokio::test]
+async fn a_sync_sets_the_replicas_times() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.dst.set_clock_for_test(Some(1_000));
+    s.create().await;
+    assert_eq!(
+        times(&s.dst).await,
+        None,
+        "a replication's create writes nothing"
+    );
+    let mut st = SyncState::default();
+    s.dst.set_clock_for_test(Some(2_000));
+    s.sync(&mut st).await;
+    assert_eq!(
+        times(&s.dst).await,
+        Some((2_000, 2_000)),
+        "the sync that creates it"
+    );
+    // A source's write and compaction each reach the replica as a write.
+    write(&s.src, "src", 30..40).await;
+    s.dst.set_clock_for_test(Some(3_000));
+    assert!(!s.sync(&mut st).await.committed.is_empty());
+    assert_eq!(times(&s.dst).await, Some((2_000, 3_000)));
+    s.src.compact("src").await.unwrap().unwrap();
+    s.dst.set_clock_for_test(Some(4_000));
+    assert!(!s.sync(&mut st).await.committed.is_empty());
+    assert_eq!(times(&s.dst).await, Some((2_000, 4_000)));
+    // An idle sync commits nothing, so moves nothing.
+    s.dst.set_clock_for_test(Some(5_000));
+    assert!(s.sync(&mut st).await.idle);
+    assert_eq!(times(&s.dst).await, Some((2_000, 4_000)));
+}

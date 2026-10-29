@@ -3784,6 +3784,9 @@ async fn index_summary<S: BlobStore + 'static>(
         rejected_rows: 0,
         quarantined_rows: 0,
         updated_epoch: None,
+        created_ms: None,
+        written_ms: None,
+        bytes: Some(0),
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -3813,8 +3816,20 @@ async fn index_summary<S: BlobStore + 'static>(
         quarantined_rows: s.quarantined_rows,
         updated_epoch: s.updated_epoch.map(|e| e.0),
         approx_row_count: s.documents,
+        created_at: s.created_ms.map(rfc3339_ms),
+        updated_at: s.written_ms.map(rfc3339_ms),
+        approx_logical_bytes: s.bytes,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// Unix milliseconds as RFC 3339 UTC, always with three fractional digits (M148).
+fn rfc3339_ms(ms: u64) -> String {
+    // `u64::MAX / 1000` fits an `i64`, so the fallback never runs; a far future saturates in
+    // `format`'s microseconds.
+    let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
+    let whole = pstore_format::datetime::format(secs.saturating_mul(1_000_000));
+    format!("{}.{:03}Z", whole.trim_end_matches('Z'), ms % 1000)
 }
 
 fn no_index(index: &str) -> ApiError {
@@ -6281,6 +6296,13 @@ mod tests {
         assert_eq!(literal(&serde_json::json!(-5)), Ok(Value::Int(-5)));
         assert!(literal(&serde_json::json!({"k": 1})).is_err());
         assert!(scalar(&serde_json::json!(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn times_are_rfc3339_at_millisecond_precision() {
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_ms(1_500), "1970-01-01T00:00:01.500Z");
+        assert_eq!(rfc3339_ms(1_761_609_600_007), "2025-10-28T00:00:00.007Z");
     }
 
     /// Bodies the fast parse must answer exactly as the tree does (M120): valid ones of every

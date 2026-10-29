@@ -631,6 +631,12 @@ impl<S: BlobStore> Engine<S> {
                     self.apply(&mut next, d, m, &mut used);
                 }
             }
+            // M148: each replica this sync writes.
+            self.stamp_times(
+                &at.head,
+                &mut next,
+                included.iter().map(|(d, _)| d.as_str()),
+            );
             // Copies nothing commits are buried under their own epochs, as a compaction's
             // losers are, so GC reaps them and nothing names them.
             let named: BTreeSet<&str> = next
