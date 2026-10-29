@@ -28,6 +28,7 @@ mod shared;
 pub mod sparse;
 pub mod text;
 pub mod trigram;
+pub mod typed;
 mod writer;
 
 pub use docs::{
@@ -217,6 +218,14 @@ pub enum Value {
     /// An instant: microseconds since 1970-01-01T00:00:00Z, within
     /// [`datetime::MIN`]`..=`[`datetime::MAX`] (M9h.3). A scalar, so an array may hold one.
     DateTime(i64),
+    /// A UUID's 16 bytes, in their written order (M171). Compared by those bytes, which is
+    /// the order of the lowercase hyphenated form.
+    Uuid([u8; 16]),
+    /// Bytes (M171), compared bytewise. At most 4,096 a value, which the server bounds.
+    Bytes(Vec<u8>),
+    /// An unsigned integer (M172), declared `uint64`: a number, compared with ints and floats
+    /// by exact value. Zone maps prune on it.
+    Uint(u64),
 }
 
 impl Value {
@@ -228,6 +237,9 @@ impl Value {
             Self::Bool(_) => 3,
             Self::Array(_) => 4,
             Self::DateTime(_) => 5,
+            Self::Uuid(_) => 6,
+            Self::Bytes(_) => 7,
+            Self::Uint(_) => 8,
         }
     }
 }
@@ -255,18 +267,23 @@ impl Ord for Value {
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
             (Self::Array(a), Self::Array(b)) => a.cmp(b),
             (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
+            (Self::Uuid(a), Self::Uuid(b)) => a.cmp(b),
+            (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
+            (Self::Uint(a), Self::Uint(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
 }
 
-/// A number: what an int and a float are both compared as.
+/// A number: what an int, a uint64 and a float are all compared as.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Number {
     /// An integer.
     Int(i64),
     /// A float.
     Float(f64),
+    /// An unsigned integer (M172).
+    Uint(u64),
 }
 
 impl Number {
@@ -276,7 +293,13 @@ impl Number {
         match v {
             Value::Int(n) => Some(Self::Int(*n)),
             Value::Float(f) => Some(Self::Float(*f)),
-            Value::Str(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_) => None,
+            Value::Uint(n) => Some(Self::Uint(*n)),
+            Value::Str(_)
+            | Value::Bool(_)
+            | Value::Array(_)
+            | Value::DateTime(_)
+            | Value::Uuid(_)
+            | Value::Bytes(_) => None,
         }
     }
 }
@@ -286,35 +309,39 @@ impl Number {
 /// for a NaN, which `check_storable` keeps out of storage.
 #[must_use]
 pub fn cmp_numbers(a: Number, b: Number) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (Number::Int(x), Number::Int(y)) => Some(x.cmp(&y)),
-        (Number::Float(x), Number::Float(y)) => x.partial_cmp(&y),
-        (Number::Int(x), Number::Float(y)) => int_vs_float(x, y),
-        (Number::Float(x), Number::Int(y)) => int_vs_float(y, x).map(std::cmp::Ordering::reverse),
+    match (whole(a), whole(b)) {
+        (Ok(x), Ok(y)) => Some(x.cmp(&y)),
+        (Err(x), Err(y)) => x.partial_cmp(&y),
+        (Ok(x), Err(y)) => int_vs_float(x, y),
+        (Err(x), Ok(y)) => int_vs_float(y, x).map(std::cmp::Ordering::reverse),
     }
 }
 
-/// `i` against `f`, exactly.
-fn int_vs_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+/// An integer of either signedness as one `i128`, which holds both exactly (M172), or the
+/// float.
+fn whole(n: Number) -> Result<i128, f64> {
+    match n {
+        Number::Int(i) => Ok(i128::from(i)),
+        Number::Uint(u) => Ok(i128::from(u)),
+        Number::Float(f) => Err(f),
+    }
+}
+
+/// `i`, an `i64` or a `u64`, against `f`, exactly.
+fn int_vs_float(i: i128, f: f64) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    // 2^63 is exact as an f64; every i64 is below it and at least -2^63.
-    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
     if f.is_nan() {
         return None;
     }
-    if f >= TWO_63 {
-        return Some(Ordering::Less);
-    }
-    if f < -TWO_63 {
-        return Some(Ordering::Greater);
-    }
-    // In range, so the truncation is exact, and so is the fraction left over.
+    // Within i128's range the truncation is exact, and so is the fraction left over. Beyond
+    // it the cast saturates to i128's bound, which no i64 or u64 reaches, so the order is
+    // decided before the fraction is read.
     let t = f.trunc();
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "t is integral and in i64's range"
+        reason = "exact within i128's range, saturating beyond it, as stated"
     )]
-    let whole = t as i64;
+    let whole = t as i128;
     Some(i.cmp(&whole).then_with(|| {
         let frac = f - t;
         if frac > 0.0 {
@@ -677,7 +704,10 @@ impl Filter {
                 | Value::Float(_)
                 | Value::Bool(_)
                 | Value::Array(_)
-                | Value::DateTime(_),
+                | Value::DateTime(_)
+                | Value::Uuid(_)
+                | Value::Bytes(_)
+                | Value::Uint(_),
             ) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,
@@ -753,6 +783,9 @@ pub struct Zones {
     /// Scalar datetime attributes (M9h.3): `(min, max)` microseconds, and whether the name
     /// also holds a scalar string in the block. Present only in a flag-2 segment.
     pub datetimes: BTreeMap<String, (i64, i64, bool)>,
+    /// Uint64 attributes (M172). Present only in a flag-3 segment, and recorded for every
+    /// uint64 row wherever zone maps are on, since a uint64 makes a segment typed.
+    pub uints: BTreeMap<String, (u64, u64)>,
     /// The segment is typed (M9h.1) and says its zone maps are on, so an absent int or float
     /// zone means **no row of that type** holds the name.
     ///
@@ -766,7 +799,7 @@ pub struct Zones {
 
 impl Zones {
     /// Whether some row holding `name` as a number could satisfy `ok(lo, hi)` over its
-    /// type's zone. Numbers of both types are checked, because a filter compares them as one.
+    /// type's zone. Numbers of every type are checked, because a filter compares them as one.
     #[must_use]
     pub fn could_hold_number(&self, name: &str, ok: impl Fn(Number, Number) -> bool) -> bool {
         let int = self.ints.get(name).map_or(!self.complete, |&(lo, hi)| {
@@ -776,6 +809,10 @@ impl Zones {
             .floats
             .get(name)
             .is_some_and(|&(lo, hi)| ok(Number::Float(lo), Number::Float(hi)));
-        int || float
+        let uint = self
+            .uints
+            .get(name)
+            .is_some_and(|&(lo, hi)| ok(Number::Uint(lo), Number::Uint(hi)));
+        int || float || uint
     }
 }

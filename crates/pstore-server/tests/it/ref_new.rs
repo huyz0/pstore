@@ -28,18 +28,28 @@ fn api(store: &Accounted<MemoryStore>, lane: u64) -> A {
     api
 }
 
+/// ⚠️ Retries `429 overloaded` (M128): more of this tenant's writers race than one server
+/// admits at once, and a request refused before dispatch changed nothing, so retrying it is
+/// the client's documented remedy and every write still races.
 async fn send(api: &A, method: &str, path: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json")
-        .header("x-pstore-tenant", "33")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let res = Arc::clone(api).router().oneshot(req).await.unwrap();
-    let status = res.status();
-    let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&body).unwrap())
+    loop {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-pstore-tenant", "33")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = Arc::clone(api).router().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        if status == StatusCode::TOO_MANY_REQUESTS && body["error"]["code"] == "overloaded" {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        return (status, body);
+    }
 }
 
 fn doc(id: &str, attrs: Value) -> Value {

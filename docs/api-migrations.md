@@ -1,5 +1,54 @@
 # Native API migration notes
 
+## M172: uint64 attributes
+
+A write's `schema` may declare an attribute `"uint64"`:
+
+```json
+{"schema": {"seq": "uint64"},
+ "documents": [{"id": "a", "attributes": {"seq": 18446744073709551615}}]}
+```
+
+- The value is a JSON integer from 0 to 18446744073709551615, stored and answered exactly,
+  never as a float. A negative integer, `5.0`, `1e3`, a string or a bool is refused, nothing
+  stored. An array of them is declared the same way.
+- A uint64 is a number: filters, `rank_by`, facets, `group_by`, `limit_per`, boosts and
+  `$ref_new` compare it with ints and floats by exact value. A filter or boost literal above
+  `i64` is now read as that unsigned number instead of being refused. An undeclared write of
+  one is still refused, and the message names the `uint64` declaration.
+- A facet bucket reports an integral float in `[2^63, 2^64)` as that integer, as it already
+  did below `2^63`: `9223372036854775808`, where it answered `9.223372036854776e18` before.
+- A `sum` with a uint64 in it is exact while it fits `u64` or `i64`; one of ints alone is
+  unchanged.
+- Segments holding uint64s carry a new value tag and a new zone-map flag. A reader older
+  than M172 refuses such a segment rather than misreading it: upgrade readers first.
+
+A write without the declaration is unchanged. No stored-data migration is needed.
+The [M172 verification](milestones/M172/VERIFIED.md) records the evidence.
+
+## M171: UUID and bytes attributes
+
+A write's `schema` may declare an attribute `"uuid"` or `"bytes"` beside `"datetime"`:
+
+```json
+{"schema": {"owner": "uuid", "thumb": "bytes"},
+ "documents": [{"id": "a", "attributes": {"owner": "6F1C2A3B-4D5E-4F60-8A7B-9C8D7E6F5A4B",
+                                          "thumb": "AAE="}}]}
+```
+
+- A UUID is 8-4-4-4-12 hex digits of either case, stored as 16 bytes and answered
+  lowercase. Bytes are standard padded base64, at most 4,096 bytes, answered the same way.
+  An array of either is declared the same way. A malformed value is refused, nothing stored.
+- Filters, boosts and `$ref_new` conditions read a string literal as the row's type: a
+  literal that does not parse matches no such row (and its negation every one). UUIDs
+  compare by their bytes, bytes bytewise. `rank_by` orders the groups bool, number,
+  datetime, string, UUID, bytes, array, absent.
+- Segments holding these values carry two new value tags. A reader older than M171
+  refuses such a segment rather than misreading it: upgrade readers first.
+
+A write without these declarations is unchanged. No stored-data migration is needed.
+The [M171 verification](milestones/M171/VERIFIED.md) records the evidence.
+
 ## M170: documents with no vector
 
 A document may omit `vector` (or send `null`): `{"id": "a", "text": "...", "attributes": {...}}`.
@@ -16,6 +65,24 @@ paged exactly as documents with vectors are.
 
 Every request valid before answers as before. No stored-data migration is needed.
 The [M170 verification](milestones/M170/VERIFIED.md) records the evidence.
+
+## M163: `offset` on a relevance ranking
+
+A relevance query (`vector`, `multi`, `text`, `field` or `exact`) may carry `offset`. The
+answer is rows `offset` to `offset + top_k` of the same query at `top_k = offset + top_k`.
+
+- `top_k + offset` is at most 10,000 when `offset` is given, `offset: 0` included.
+- A boost's or `limit_per`'s window must reach `top_k + offset`; its default is twice
+  that, from 100 to 1,000. The boost and the group cut run before the skip.
+- Each page is ranked at its own depth. With an approximate ranking, two pages at
+  different depths can disagree (a row can repeat or be missed). Use `exact: true` or
+  `rank_by` for stable paging.
+- Refused beside `diversify` and `aggregate_by`.
+- ⚠️ A multi-vector leg with `rerank: "exact"` whose depth passes 1,000 is now refused
+  with `bad_request`. Before, a `top_k` past 1,000 on such a leg failed the request.
+
+No stored-data migration is needed. The [M163 verification](milestones/M163/VERIFIED.md)
+records the evidence.
 
 ## M146: a hard per-group limit on a relevance ranking
 
@@ -242,6 +309,32 @@ operator starts them with `PSTORE_APPLIED_WRITES=1`. `batched` and `durable` are
 unchanged, and their `documents_*` counters still count what was submitted. An applied
 write waits for a fold, so it is slower; it is not exactly-once, and a retry after a lost
 response may apply again (M132's idempotency keys close that). See the [proof](research/11-design/mutation-completion.md).
+
+## M128: public request bodies and active requests are bounded
+
+⚠️ **Behaviour change.** Every public route now admits a request before its handler runs,
+after authentication and the route's scope check:
+
+- A body larger than 2 MiB is refused with `413 request_too_large`, whether or not it
+  declares a `Content-Length`. Before, axum's own 2 MB ceiling answered with an untyped
+  plain-text body.
+- A body that has not fully arrived 30 s after admission is refused with
+  `408 request_timeout`. **This deadline is new**: a client that streamed a slow body
+  must send it faster or split the request.
+- A declared `Content-Encoding` other than `identity` is refused with
+  `415 unsupported_content_encoding`. Decompression is unsupported; send bodies plain.
+- At 64 active public requests in the process, 8 for one tenant, or 128 MiB of reserved
+  body bytes, a request is refused with `429 overloaded` and `Retry-After: 1`. It is refused
+  before dispatch, so it changed nothing; retrying it is safe. The hint is local to this
+  server, not a fleet reservation.
+
+A tenant is the verified bearer's. In private mode (`PSTORE_ALLOW_UNAUTHENTICATED=1`) it is
+the `X-Pstore-Tenant` header, and requests without one share one private allowance.
+`PSTORE_REQUEST_LIMITS_CONFIG` (strict JSON, `{"version":1, ...}`, fields `body_bytes`,
+`active_requests`, `tenant_active_requests`, `reserved_body_bytes`,
+`body_read_timeout_ms`) can lower any of these, never raise them; an invalid value refuses
+startup. Peer traffic keeps its own admission (M127). Nothing stored changes, and rolling
+back restores the old ceilings. Evidence is in [M128 verification](milestones/M128/VERIFIED.md).
 
 ## M127: explicit authentication and encrypted peers
 

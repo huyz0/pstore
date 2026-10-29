@@ -300,9 +300,24 @@ async fn what_still_has_no_type_is_refused() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v} was stored: {b}");
     }
     let api = seeded(&[("a", json!(1))], false).await;
+    // M172: a filter literal beyond i64 is a uint64 now, as the spec's delta says, and
+    // compares by value: the row holding 1 is below it. Undeclared, a write of one is still
+    // refused above.
     for f in [
         json!(["n", "Eq", beyond_i64]),
         json!(["n", "Eq", u64::MAX]),
+        json!(["n", "Gte", u64::MAX]),
+    ] {
+        let q = json!({"vector": [1.0, 0.5], "filters": f});
+        let (s, b) = query(&api, &q).await;
+        assert_eq!(s, StatusCode::OK, "{f}: {b}");
+        assert_eq!(b["results"], json!([]), "{f}: {b}");
+    }
+    let q = json!({"vector": [1.0, 0.5], "filters": ["n", "Lt", u64::MAX]});
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["results"][0]["id"], "a", "{b}");
+    for f in [
         json!(["n", "Eq", {"k": 1}]),
         json!(["n", "Eq", [1]]),
         json!(["n", "In", [1, [2]]]),

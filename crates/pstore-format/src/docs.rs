@@ -50,6 +50,20 @@ fn encode_value(e: &mut Enc, v: &Value) {
             e.u8(5);
             e.i64(*t);
         }
+        // M171: 16 bytes, and a length then the bytes.
+        Value::Uuid(u) => {
+            e.u8(6);
+            e.raw(u);
+        }
+        Value::Bytes(b) => {
+            e.u8(7);
+            e.bytes(b);
+        }
+        // M172: 8 bytes, little-endian.
+        Value::Uint(n) => {
+            e.u8(8);
+            e.u64(*n);
+        }
         // M9h.2: a count, then each element with its own tag.
         Value::Array(items) => {
             e.u8(4);
@@ -96,6 +110,15 @@ fn skip_value(d: &mut Dec<'_>, array: bool) -> Result<(), FormatError> {
         2 => {
             d.f64()?;
         }
+        8 => {
+            d.u64()?;
+        }
+        6 => {
+            d.uuid()?;
+        }
+        7 => {
+            d.bytes()?;
+        }
         3 => match d.u8()? {
             0 | 1 => {}
             _ => return Err(FormatError::Corrupt("a bool that is neither 0 nor 1")),
@@ -135,6 +158,9 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
         }
         4 => return Err(FormatError::Corrupt("an array inside an array")),
         5 => Value::DateTime(d.i64()?),
+        6 => Value::Uuid(d.uuid()?),
+        7 => Value::Bytes(d.bytes()?.to_vec()),
+        8 => Value::Uint(d.u64()?),
         // A tag from a future version. Refused, not guessed: a mistyped attribute is
         // one a filter later reads as the wrong thing.
         _ => return Err(FormatError::Corrupt("unknown value tag")),
@@ -359,6 +385,21 @@ mod tests {
         let mut b = Document::new("b", Vec::new());
         b.attrs.insert("n".to_owned(), Value::Int(4));
         b.attrs.insert("when".to_owned(), Value::DateTime(7));
+        // M171: both new tags, scalar and in an array.
+        b.attrs.insert("u".to_owned(), Value::Uuid([0x5a; 16]));
+        // M172: a uint64 at its maximum, scalar and in an array.
+        b.attrs.insert("big".to_owned(), Value::Uint(u64::MAX));
+        b.attrs.insert(
+            "bigs".to_owned(),
+            Value::Array(vec![Value::Uint(0), Value::Uint(1 << 63)]),
+        );
+        b.attrs.insert(
+            "y".to_owned(),
+            Value::Array(vec![
+                Value::Bytes(vec![0, 1, 255]),
+                Value::Bytes(Vec::new()),
+            ]),
+        );
         vec![a, b]
     }
 
@@ -423,6 +464,31 @@ mod tests {
             );
         }
         assert!(refused > 10, "the corruptions refused nothing: {refused}");
+    }
+
+    /// M171: every tag round-trips, and a UUID or bytes cut short is refused, never padded.
+    /// M172: and a uint64.
+    #[test]
+    fn every_value_tag_round_trips_and_a_short_one_is_refused() {
+        let docs = rows();
+        let back = decode_rows(&encode_rows(&docs)).unwrap();
+        let attrs = |ds: &[Document]| ds.iter().map(|d| d.attrs.clone()).collect::<Vec<_>>();
+        assert_eq!(attrs(&back), attrs(&docs));
+        for v in [
+            Value::Uuid([7; 16]),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Uint(u64::MAX - 1),
+        ] {
+            let mut d = Document::new("x", Vec::new());
+            d.attrs.insert("v".to_owned(), v.clone());
+            let buf = encode_rows(std::slice::from_ref(&d));
+            assert_eq!(decode_rows(&buf).unwrap()[0].attrs["v"], v);
+            // The value is the buffer's last bytes, so a shorter buffer cuts into it.
+            for cut in 1..=3 {
+                let short = &buf[..buf.len() - cut];
+                assert!(decode_rows(short).is_err(), "{v:?} cut by {cut} was read");
+            }
+        }
     }
 
     #[test]

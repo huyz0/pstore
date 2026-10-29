@@ -17,6 +17,8 @@ use pstore_query::{ID_ATTRIBUTE, Op, Predicate};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
+const UUID: &str = "00000000-0000-4000-8000-000000000001";
+
 fn dt(s: &str) -> Value {
     Value::DateTime(datetime::parse(s).unwrap())
 }
@@ -60,6 +62,18 @@ fn blocks(dates: bool) -> Vec<[Option<Value>; 3]> {
                 Some(dt("2024-06-01T00:00:00Z")),
                 Some(s("2029-01-01T00:00:00Z")),
                 Some(s("zzz")),
+            ],
+            // M171: a UUID beside a datetime, and bytes beside one, in blocks of their own:
+            // a string literal reads as either, so neither may let the zone rule it out.
+            [
+                Some(dt("2024-01-01T00:00:00Z")),
+                Some(Value::Uuid(pstore_format::typed::parse_uuid(UUID).unwrap())),
+                None,
+            ],
+            [
+                Some(dt("2024-01-01T00:00:00Z")),
+                Some(Value::Bytes(vec![0, 1])),
+                None,
             ],
             // A datetime at the microsecond neighbours.
             [
@@ -114,6 +128,8 @@ fn literals() -> Vec<Value> {
         "zzz",
         "not a date",
         "",
+        UUID,
+        "AAE=",
     ]
     .into_iter()
     .map(s)

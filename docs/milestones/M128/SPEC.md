@@ -1,7 +1,7 @@
 # M128: bounded public request ingress and active work
 
-Independent spec review passed in round 1. Runtime implementation has not started. M127
-is still under validation; this milestone must land separately after M127.
+Independent spec review passed in round 1. Implemented after M127 landed; evidence is in
+[VERIFIED.md](VERIFIED.md).
 
 ## Serves
 D-55 and D-56 in [memory management](../../research/09-rust-stack/memory-management.md).

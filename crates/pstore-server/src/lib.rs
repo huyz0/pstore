@@ -35,6 +35,8 @@ mod diversify;
 mod external;
 mod facets;
 mod highlight;
+mod ingress;
+pub use ingress::{IngressCounts, LimitsError, RequestLimits, RequestLimitsBuilder};
 mod limit_per;
 mod peer_http;
 pub use peer_http::PeerTransport;
@@ -49,6 +51,7 @@ pub use peer_tls::{PeerListenerConfig, PeerTls};
 mod peers;
 mod replication;
 mod session;
+mod typed;
 mod types;
 pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
@@ -124,6 +127,8 @@ type Tenant<S> = Engine<Caching<TenantView<S>>>;
 #[derive(Debug)]
 pub struct Api<S> {
     auth: Auth,
+    /// Public request admission (M128): one per `Api`, shared by every router it builds.
+    ingress: Arc<ingress::Ingress>,
     store: Accounted<S>,
     lane: LaneId,
     /// The read cache every tenant's view shares, or `None` for an uncached server (M20).
@@ -304,7 +309,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// is anything but `Supported`. **Zero requests**: it reads the profile the store already
     /// carries and probes nothing.
     pub fn new(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, Auth::closed())
+        Self::build(store, lane, None, Auth::closed(), RequestLimits::default())
     }
 
     /// [`Api::new`], reading every tenant's segments through `cache` (M20).
@@ -319,7 +324,13 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Arc<CacheCore>,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), Auth::closed())
+        Self::build(
+            store,
+            lane,
+            Some(cache),
+            Auth::closed(),
+            RequestLimits::default(),
+        )
     }
 
     /// Builds an HTTP server with an explicit authentication policy.
@@ -331,7 +342,7 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         auth: Auth,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, auth)
+        Self::build(store, lane, None, auth, RequestLimits::default())
     }
 
     /// [`Api::with_auth`] with a shared read cache.
@@ -344,7 +355,7 @@ impl<S: BlobStore + 'static> Api<S> {
         cache: Arc<CacheCore>,
         auth: Auth,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), auth)
+        Self::build(store, lane, Some(cache), auth, RequestLimits::default())
     }
 
     /// Explicitly anonymous HTTP for private embeddings and test fixtures.
@@ -352,7 +363,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// # Errors
     /// As [`Api::new`].
     pub fn unsecured(store: Accounted<S>, lane: LaneId) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, None, Auth::unsecured())
+        Self::build(
+            store,
+            lane,
+            None,
+            Auth::unsecured(),
+            RequestLimits::default(),
+        )
     }
 
     /// [`Api::unsecured`] with a shared read cache.
@@ -364,7 +381,39 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Arc<CacheCore>,
     ) -> Result<Arc<Self>, StartupError> {
-        Self::build(store, lane, Some(cache), Auth::unsecured())
+        Self::build(
+            store,
+            lane,
+            Some(cache),
+            Auth::unsecured(),
+            RequestLimits::default(),
+        )
+    }
+
+    /// An HTTP server with an explicit authentication policy, an optional read cache, and
+    /// public request limits other than the defaults (M128).
+    ///
+    /// # Errors
+    /// As [`Api::new`].
+    pub fn with_limits(
+        store: Accounted<S>,
+        lane: LaneId,
+        cache: Option<Arc<CacheCore>>,
+        auth: Auth,
+        limits: RequestLimits,
+    ) -> Result<Arc<Self>, StartupError> {
+        Self::build(store, lane, cache, auth, limits)
+    }
+
+    /// The public request limits every router of this server admits under (M128).
+    pub fn request_limits(&self) -> RequestLimits {
+        *self.ingress.limits()
+    }
+
+    /// What public admission holds right now (M128's tests and measurements).
+    #[doc(hidden)]
+    pub fn ingress_counts(&self) -> IngressCounts {
+        self.ingress.counts()
     }
 
     fn build(
@@ -372,6 +421,7 @@ impl<S: BlobStore + 'static> Api<S> {
         lane: LaneId,
         cache: Option<Arc<CacheCore>>,
         auth: Auth,
+        limits: RequestLimits,
     ) -> Result<Arc<Self>, StartupError> {
         // ⚠️ `Accounted` is not itself a `BlobStore` — a tenant view is — so the profile is
         // read through one. It is the same underlying backend's, and reading it costs nothing.
@@ -386,6 +436,7 @@ impl<S: BlobStore + 'static> Api<S> {
         }
         Ok(Arc::new(Self {
             auth,
+            ingress: Arc::new(ingress::Ingress::new(limits)),
             store,
             lane,
             cache,
@@ -636,7 +687,7 @@ impl<S: BlobStore + 'static> Api<S> {
     /// The routes. `api-design.md`'s surface, minus everything M7c defers.
     pub fn router(self: Arc<Self>) -> Router {
         use auth::Scope::{Admin, List, Read, Write};
-        auth::ScopedRouter::new()
+        auth::ScopedRouter::new(Arc::clone(&self.ingress))
             .route("/v1/indexes", List.on(get(list_indexes::<S>)))
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
@@ -702,6 +753,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/admin/duties", Admin.on(get(duties)))
             .route("/metrics", Admin.on(get(metrics::<S>)))
             .finish()
+            // M128: the ceiling axum's own extractors held implicitly, now the typed limit.
+            .layer(axum::extract::DefaultBodyLimit::max(
+                self.ingress.limits().body_bytes(),
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 self.auth.clone(),
                 auth::authenticate,
@@ -1568,7 +1623,7 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
 fn patches_of(
     patch_rows: Vec<serde_json::Value>,
     patch_columns: Option<serde_json::Value>,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<Vec<pstore_engine::Patch>, ApiError> {
     let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
     for mut raw in patch_rows {
@@ -1644,7 +1699,7 @@ fn patch_of(
     id: String,
     who: &str,
     attrs: serde_json::Map<String, serde_json::Value>,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<pstore_engine::Patch, ApiError> {
     let unset: Vec<String> = attrs
         .iter()
@@ -1691,7 +1746,7 @@ fn write_filter(name: &str, v: &serde_json::Value) -> Result<pstore_query::Predi
 /// `patch_by_filter` (M13.2): `{"filters": .., "attributes": {..}}`, both required.
 fn patch_by_filter_of(
     v: &serde_json::Value,
-    dated: &std::collections::BTreeSet<String>,
+    dated: &typed::Declarations,
 ) -> Result<(pstore_query::Predicate, pstore_engine::Patch), ApiError> {
     let bad = || {
         ApiError::bad_request(
@@ -1760,7 +1815,7 @@ async fn write_documents<S: BlobStore + 'static>(
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
     }
-    let dated = declared_datetimes(&req)?;
+    let dated = declared_types(&req)?;
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
@@ -2632,6 +2687,7 @@ const MAX_GROUP_BY: usize = 8;
 fn total_json(t: pstore_query::Total) -> serde_json::Value {
     match t {
         pstore_query::Total::Int(n) => serde_json::Value::from(n),
+        pstore_query::Total::Uint(n) => serde_json::Value::from(n),
         pstore_query::Total::Float(f) => serde_json::Value::from(f),
         pstore_query::Total::Null => serde_json::Value::Null,
     }
@@ -2654,6 +2710,11 @@ enum Plan {
         // Boxed: the plan's largest variant, by far, without it.
         Option<Box<limit_per::LimitPer>>,
     ),
+}
+
+/// Where a relevance query's page ends: `top_k` past its `offset` (M163).
+fn page_end(req: &QueryRequest) -> usize {
+    req.top_k.saturating_add(req.offset.unwrap_or(0))
 }
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
@@ -2768,11 +2829,18 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         return Ok(Plan::Ordered(by, filter));
     }
     // M146: a group limit names the window too (it never sits beside a diversify).
+    // M163: a page's end is the depth every path ranks to; `offset` bounds it as an order's.
+    let page_end = page_end(req);
+    if req.offset.is_some() && page_end > MAX_ORDERED {
+        return Err(ApiError::bad_request(format!(
+            "top_k + offset may be at most {MAX_ORDERED} for a relevance ranking"
+        )));
+    }
     let named_limit = req.limit_per.as_ref().and_then(diversify::named_window);
     let boost = req
         .boost
         .as_ref()
-        .map(|b| boost::parse(b, req.top_k, named_diversify.or(named_limit)))
+        .map(|b| boost::parse(b, page_end, named_diversify.or(named_limit)))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("boost: {why}")))?;
     // ⚠️ Every leg cut at the window, not `top_k` (M62 spec review): a candidate a leg ranks
@@ -2781,7 +2849,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     let limit_per = req
         .limit_per
         .as_ref()
-        .map(|p| limit_per::LimitPer::parse(p, req.top_k, named_boost))
+        .map(|p| limit_per::LimitPer::parse(p, page_end, named_boost))
         .transpose()
         .map_err(|why| ApiError::bad_request(format!("limit_per: {why}")))?;
     let window = boost
@@ -2789,7 +2857,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
         .or(limit_per.as_ref().map(|p| p.window));
-    let legs = prefetch(req, window.unwrap_or(req.top_k))?;
+    let legs = prefetch(req, window.unwrap_or(page_end))?;
     let fusion = fusion(req, legs.len())?;
     Ok(Plan::Ranked(
         legs,
@@ -3096,7 +3164,7 @@ async fn run<E: BlobStore>(
         .map(|b| b.window)
         .or(diversify.map(|d| d.window))
         .or(limit_per.as_ref().map(|p| p.window))
-        .unwrap_or(req.top_k);
+        .unwrap_or(page_end(req));
     let answer = match req.as_of {
         Some(e) => {
             engine
@@ -3172,30 +3240,33 @@ async fn run<E: BlobStore>(
     }
     // M146: after the boost, on the stored attributes, whatever the query selects.
     if let Some(p) = &limit_per {
-        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, req.top_k);
+        paired = limit_per::per_group(paired, |((_, _, attrs, _), _)| attrs, p, page_end(req));
     }
-    paired.truncate(req.top_k);
+    // M163: the page is cut at its end, then its first `offset` rows skipped.
+    paired.truncate(page_end(req));
+    paired.drain(..req.offset.unwrap_or(0).min(paired.len()));
     let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
-    let unfolded_hits = if boost.is_none() && diversify.is_none() && limit_per.is_none() {
-        answer
-            .hits
-            .iter()
-            .filter(|h| h.segment == answer.unfolded_at)
-            .count()
-    } else {
-        // The rows were reordered and cut: a hit on the unfolded rows is one whose id an
-        // unfolded row carries. Ids are unique in one answer, an id's newest version being the
-        // only one served.
-        let fresh: std::collections::HashSet<&str> = answer
-            .hits
-            .iter()
-            .filter(|h| h.segment == answer.unfolded_at)
-            .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
-            .collect();
-        rows.iter()
-            .filter(|(id, ..)| fresh.contains(id.as_str()))
-            .count()
-    };
+    let unfolded_hits =
+        if boost.is_none() && diversify.is_none() && limit_per.is_none() && req.offset.is_none() {
+            answer
+                .hits
+                .iter()
+                .filter(|h| h.segment == answer.unfolded_at)
+                .count()
+        } else {
+            // The rows were reordered and cut: a hit on the unfolded rows is one whose id an
+            // unfolded row carries. Ids are unique in one answer, an id's newest version being the
+            // only one served.
+            let fresh: std::collections::HashSet<&str> = answer
+                .hits
+                .iter()
+                .filter(|h| h.segment == answer.unfolded_at)
+                .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
+                .collect();
+            rows.iter()
+                .filter(|(id, ..)| fresh.contains(id.as_str()))
+                .count()
+        };
     // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
     // only, from the attributes the row round returned, whatever `include_attributes` asks.
     // M158: a pre-tokenized field's tokens are not words in a string, so there is nothing to
@@ -3711,12 +3782,8 @@ const MAX_ORDERED: usize = 10_000;
 /// `rank_by` is one `[attribute, "asc" | "desc"]` pair, or a list of 1 to 8 of them (M140): an
 /// array whose first element is itself an array is the list.
 fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError> {
+    // M163: a relevance ranking takes `offset` too; `plan` bounds its page.
     let Some(raw) = &req.rank_by else {
-        if req.offset.is_some() {
-            return Err(ApiError::bad_request(
-                "offset applies only to a rank_by order",
-            ));
-        }
         return Ok(None);
     };
     let by = match raw.as_array() {
@@ -3901,6 +3968,13 @@ fn multi_rerank(
     if filtered {
         return Err(bad("rerank cannot be combined with filters"));
     }
+    // ⚠️ Before the default's `clamp`, which panicked on a depth past the bound (M163).
+    if limit > boost::MAX_WINDOW {
+        return Err(bad(&format!(
+            "rerank reaches at most {} candidates; the leg's depth is {limit}",
+            boost::MAX_WINDOW
+        )));
+    }
     let window = match m.rerank_window.as_ref() {
         None => limit.saturating_mul(4).clamp(limit, boost::MAX_WINDOW),
         Some(w) => w
@@ -3984,31 +4058,31 @@ fn many(vs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String> {
 /// finite floats and bools; turning `1.5` into `1`, `true` into `"true"`, or `null` into an
 /// absent attribute would store a value the client did not write, and nothing downstream
 /// could tell.
-/// The attribute names a write declares datetimes (M9h.3), or why its `schema` is refused.
+/// The attribute types a write declares (M9h.3, M171), or why its `schema` is refused.
 ///
 /// ⚠️ A declaration that would do nothing is refused rather than ignored: another type, a
 /// name no document uses, or the text field -- which is always a string -- would each
 /// answer 200 and store something other than what the client meant.
-fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<String>, ApiError> {
+fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
     let Some(schema) = &req.schema else {
-        return Ok(std::collections::BTreeSet::new());
+        return Ok(typed::Declarations::new());
     };
     let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
     let schema = schema
         .as_object()
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = typed::Declarations::new();
     for (name, ty) in schema {
         // An object naming `full_text_search` is a full-text declaration (M14), which
         // `declared_fts` reads; any other object is refused below, with a datetime's message.
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
-        if ty.as_str() != Some("datetime") {
+        let Some(declared) = typed::Declared::named(ty) else {
             return Err(bad(format!(
-                "{name:?} is declared {ty}; datetime is the one type a write declares"
+                "{name:?} is declared {ty}; a write declares datetime, uuid, bytes or uint64"
             )));
-        }
+        };
         if name == pstore_format::text::DEFAULT_TEXT_FIELD {
             return Err(bad(format!("{name:?} is the text field, always a string")));
         }
@@ -4021,7 +4095,7 @@ fn declared_datetimes(req: &WriteRequest) -> Result<std::collections::BTreeSet<S
                 "{name:?} is declared and no document carries it"
             )));
         }
-        out.insert(name.clone());
+        out.insert(name.clone(), declared);
     }
     Ok(out)
 }
@@ -4369,10 +4443,7 @@ fn vector_free(req: &types::WriteRequest) -> Result<(), ApiError> {
 ///
 /// ⚠️ Takes the document by value (M119): its vectors move into the format's, where a borrow
 /// copied every one of them.
-fn to_document(
-    d: types::DocumentIn,
-    dated: &std::collections::BTreeSet<String>,
-) -> Result<Document, ApiError> {
+fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Document, ApiError> {
     let text_field = pstore_format::text::DEFAULT_TEXT_FIELD;
     let types::DocumentIn {
         id,
@@ -4399,16 +4470,16 @@ fn to_document(
         if name == pstore_query::ID_ATTRIBUTE {
             return Err(refuse(name, "is reserved: `id` is the document id"));
         }
-        let v = match value {
-            // M9h.3: a declared datetime is an RFC 3339 string, or an array of them.
-            _ if dated.contains(name) => declared_datetime(value),
+        let v = match (dated.get(name), value) {
+            // M9h.3, M171: a declared type is read from a string, or an array of them.
+            (Some(d), _) => d.read(value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
-            serde_json::Value::Array(items) => items
+            (None, serde_json::Value::Array(items)) => items
                 .iter()
                 .map(|i| scalar(i).map_err(|why| format!("holds an element that {why}")))
                 .collect::<Result<Vec<_>, _>>()
                 .map(pstore_format::Value::Array),
-            _ => scalar(value),
+            (None, _) => scalar(value),
         };
         let v = match v {
             Ok(v) => v,
@@ -4622,7 +4693,8 @@ fn clause(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError> {
             let op = op
                 .as_str()
                 .ok_or_else(|| bad("the operator is a string".to_owned()))?;
-            let scalar = |x: &serde_json::Value| scalar(x).map_err(|why| bad(format!("{x} {why}")));
+            let scalar =
+                |x: &serde_json::Value| literal(x).map_err(|why| bad(format!("{x} {why}")));
             let cmp = |o: Op| -> Result<Predicate, ApiError> {
                 Ok(Predicate::Cmp(attr.clone(), o, scalar(value)?))
             };
@@ -4807,34 +4879,20 @@ fn scalar(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
                     .map(Value::Float)
                     .ok_or_else(|| "is not a finite number".to_owned())
             } else {
-                Err("is an integer beyond i64; integers must fit i64".to_owned())
+                Err("is an integer beyond i64; declare the attribute uint64 in `schema` to store it"
+                    .to_owned())
             }
         }
         _ => Err("is not an integer, a float, a string or a bool, the attribute types".to_owned()),
     }
 }
 
-/// A value under a name the write declared a datetime (M9h.3).
-fn declared_datetime(value: &serde_json::Value) -> Result<pstore_format::Value, String> {
-    let one = |x: &serde_json::Value| {
-        x.as_str()
-            .and_then(pstore_format::datetime::parse)
-            .map(pstore_format::Value::DateTime)
-            .ok_or_else(|| {
-                format!(
-                    "is declared a datetime and {x} is not one: RFC 3339, \
-                     YYYY-MM-DDTHH:MM:SS[.ffffff] and Z or ±HH:MM, years 0000 to 9999 in UTC"
-                )
-            })
-    };
-    match value {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(one)
-            .collect::<Result<Vec<_>, _>>()
-            .map(pstore_format::Value::Array),
-        _ => one(value),
-    }
+/// A filter's literal (M172): a write's [`scalar`], or an integer in `(i64::MAX, u64::MAX]`
+/// as the unsigned number it is, which compares with every number exactly.
+fn literal(x: &serde_json::Value) -> Result<pstore_format::Value, String> {
+    // `scalar` refuses only such an integer and what no type holds, and only the integer
+    // has a `u64`, so the refusal stands for everything else.
+    scalar(x).or_else(|why| x.as_u64().map(pstore_format::Value::Uint).ok_or(why))
 }
 
 /// One attribute as JSON.
@@ -4849,6 +4907,13 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
         pstore_format::Value::DateTime(t) => {
             serde_json::Value::from(pstore_format::datetime::format(*t))
         }
+        pstore_format::Value::Uuid(u) => {
+            serde_json::Value::from(pstore_format::typed::format_uuid(u))
+        }
+        pstore_format::Value::Bytes(b) => {
+            serde_json::Value::from(pstore_format::typed::format_bytes(b))
+        }
+        pstore_format::Value::Uint(n) => serde_json::Value::from(*n),
     }
 }
 
@@ -5796,6 +5861,21 @@ pub async fn store_identity<S: BlobStore>(
 mod tests {
     use super::*;
 
+    /// M172: a filter literal above `i64` is a uint64, one within it an int, and what no type
+    /// holds is refused as before.
+    #[test]
+    fn a_literal_beyond_i64_is_unsigned_and_the_rest_are_read_as_written() {
+        use pstore_format::Value;
+        assert_eq!(
+            literal(&serde_json::json!(u64::MAX)),
+            Ok(Value::Uint(u64::MAX))
+        );
+        assert_eq!(literal(&serde_json::json!(5)), Ok(Value::Int(5)));
+        assert_eq!(literal(&serde_json::json!(-5)), Ok(Value::Int(-5)));
+        assert!(literal(&serde_json::json!({"k": 1})).is_err());
+        assert!(scalar(&serde_json::json!(u64::MAX)).is_err());
+    }
+
     /// Bodies the fast parse must answer exactly as the tree does (M120): valid ones of every
     /// shape, and each way a typed parse and a tree disagree.
     pub(crate) fn bodies() -> Vec<Vec<u8>> {
@@ -5954,6 +6034,26 @@ mod tests {
         // API test can tell a dropped `exact` from a forwarded one.
         assert!(dense_tune(serde_json::json!({"vector": [1.0], "exact": true})).exact);
         assert!(!dense_tune(serde_json::json!({"vector": [1.0]})).exact);
+    }
+
+    /// Read by the binary's startup log and by M128's tests. A unit test, so a mutant that
+    /// forgets the configured limits fails in the first test binary cargo runs, rather than
+    /// in the integration binary a CI mutation sweep can time out waiting for.
+    #[test]
+    fn an_api_reports_the_limits_it_was_given() {
+        let limits = RequestLimits::builder()
+            .active_requests(32)
+            .build()
+            .unwrap();
+        let api = Api::with_limits(
+            Accounted::new(pstore_blob::MemoryStore::new()),
+            LaneId(1),
+            None,
+            Auth::unsecured(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(api.request_limits(), limits);
     }
 
     /// M170: the door's width checks, here so that a mutation breaking every write fails

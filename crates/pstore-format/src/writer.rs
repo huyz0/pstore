@@ -238,7 +238,19 @@ impl SegmentWriter {
                                 zones.datetimes.insert(k.clone(), (*t, *t, false));
                             }
                         }
-                        Value::Str(_) | Value::Bool(_) | Value::Array(_) => {}
+                        Value::Uint(n) => {
+                            if let Some(e) = zones.uints.get_mut(k) {
+                                e.0 = e.0.min(*n);
+                                e.1 = e.1.max(*n);
+                            } else {
+                                zones.uints.insert(k.clone(), (*n, *n));
+                            }
+                        }
+                        Value::Str(_)
+                        | Value::Bool(_)
+                        | Value::Array(_)
+                        | Value::Uuid(_)
+                        | Value::Bytes(_) => {}
                     }
                 }
             }
@@ -246,7 +258,10 @@ impl SegmentWriter {
             // fact that lets a string literal rule the block out.
             for d in rows {
                 for (k, v) in &d.attrs {
-                    if let (Value::Str(_), Some(e)) = (v, zones.datetimes.get_mut(k)) {
+                    // M171: and a UUID or bytes, which a string literal is read as too.
+                    if let (Value::Str(_) | Value::Uuid(_) | Value::Bytes(_), Some(e)) =
+                        (v, zones.datetimes.get_mut(k))
+                    {
                         e.2 = true;
                     }
                 }
@@ -276,12 +291,17 @@ impl SegmentWriter {
         //
         // M9h.3: flag 2 when a block holds a scalar datetime zone, and then a datetime table per
         // block after the float tables. Without one, flag 1 keeps M9h.1's bytes.
-        let dated = self.blocks.iter().any(|b| !b.zones.datetimes.is_empty());
+        //
+        // M172: flag 3 when a block holds a uint64 zone: flag 2's tables, then a uint64 table
+        // per block. Without one, flags 1 and 2 keep their bytes.
+        let unsigned = self.blocks.iter().any(|b| !b.zones.uints.is_empty());
+        let dated = unsigned || self.blocks.iter().any(|b| !b.zones.datetimes.is_empty());
         if self.typed {
-            idx.u8(match (self.zone_maps, dated) {
-                (false, _) => 0,
-                (true, false) => 1,
-                (true, true) => 2,
+            idx.u8(match (self.zone_maps, dated, unsigned) {
+                (false, _, _) => 0,
+                (true, false, _) => 1,
+                (true, true, false) => 2,
+                (true, true, true) => 3,
             });
         }
         if self.typed && self.zone_maps {
@@ -302,6 +322,16 @@ impl SegmentWriter {
                     idx.i64(*lo);
                     idx.i64(*hi);
                     idx.u8(u8::from(*strings));
+                }
+            }
+        }
+        if self.typed && self.zone_maps && unsigned {
+            for b in &self.blocks {
+                idx.u32(b.zones.uints.len() as u32);
+                for (k, (lo, hi)) in &b.zones.uints {
+                    idx.bytes(k.as_bytes());
+                    idx.u64(*lo);
+                    idx.u64(*hi);
                 }
             }
         }
@@ -382,7 +412,13 @@ impl SegmentWriter {
             d.attrs.values().any(|v| {
                 matches!(
                     v,
-                    Value::Float(_) | Value::Bool(_) | Value::Array(_) | Value::DateTime(_)
+                    Value::Float(_)
+                        | Value::Bool(_)
+                        | Value::Array(_)
+                        | Value::DateTime(_)
+                        | Value::Uuid(_)
+                        | Value::Bytes(_)
+                        | Value::Uint(_)
                 )
             })
         });
