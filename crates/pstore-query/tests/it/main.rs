@@ -18,6 +18,7 @@ mod multi_text;
 mod named_dense;
 mod parallel_legs;
 mod parallel_masks;
+mod prefix;
 mod several_fields;
 mod splittable;
 mod text_field;

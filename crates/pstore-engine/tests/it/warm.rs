@@ -250,6 +250,7 @@ async fn every_query(e: &Engine<Cached>, full: bool) {
         field: "text".to_owned(),
         query: "fox".to_owned(),
         limit: 5,
+        last_as_prefix: false,
     }];
     e.query("idx", &text, Fusion::default(), 5).await.unwrap();
 }

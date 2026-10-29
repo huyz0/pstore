@@ -140,6 +140,7 @@ pub(crate) fn fuse_outer(lists: Vec<Vec<ResultRow>>, outer: &Outer) -> Vec<Resul
                             dist: None,
                             attributes: row.attributes,
                             highlight: None,
+                            highlights: None,
                         },
                     ));
                 }
@@ -186,6 +187,7 @@ mod tests {
             dist: Some(0.25),
             attributes: attr.map(|a| BTreeMap::from([("a".to_owned(), json!(a))])),
             highlight: Some("h".to_owned()),
+            highlights: None,
         }
     }
 

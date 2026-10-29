@@ -201,6 +201,7 @@ async fn main() {
                 field: text::DEFAULT_TEXT_FIELD.to_owned(),
                 query: qtext.clone(),
                 limit,
+                last_as_prefix: false,
             }]
         };
         let hits = if per_shard {

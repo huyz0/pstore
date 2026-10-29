@@ -182,6 +182,7 @@ fn leg(field: &str, q: &str) -> Prefetch {
         field: field.to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }
 }
 
@@ -540,6 +541,7 @@ fn fleg(field: &str, q: &str) -> Prefetch {
         field: field.to_owned(),
         query: q.to_owned(),
         limit: LIMIT,
+        last_as_prefix: false,
     }
 }
 

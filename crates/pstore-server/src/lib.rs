@@ -1623,12 +1623,11 @@ fn tenant_of(headers: &HeaderMap) -> Result<TenantId, ApiError> {
 ///
 /// ⚠️ Takes both by value (M120): every attribute map and every column cell was copied out of
 /// the request, which nothing reads again.
-fn patches_of(
+fn patch_rows_of(
     patch_rows: Vec<serde_json::Value>,
     patch_columns: Option<serde_json::Value>,
-    dated: &typed::Declarations,
-) -> Result<Vec<pstore_engine::Patch>, ApiError> {
-    let mut rows: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+) -> Result<Vec<RawPatch>, ApiError> {
+    let mut rows: Vec<RawPatch> = Vec::new();
     for mut raw in patch_rows {
         let o = raw
             .as_object_mut()
@@ -1688,6 +1687,45 @@ fn patches_of(
             rows.push((id.to_owned(), attrs));
         }
     }
+    Ok(rows)
+}
+
+/// A write's documents, patches and by-filter patch, their attributes read by `dated`.
+type TypedOps = (
+    Vec<Document>,
+    Vec<pstore_engine::Patch>,
+    Option<(pstore_query::Predicate, pstore_engine::Patch)>,
+);
+
+fn typed_ops(
+    docs: Vec<types::DocumentIn>,
+    patches: Vec<RawPatch>,
+    patch_by: Option<(
+        pstore_query::Predicate,
+        serde_json::Map<String, serde_json::Value>,
+    )>,
+    dated: &typed::Declarations,
+) -> Result<TypedOps, ApiError> {
+    let patches = patches_of(patches, dated)?;
+    let patch_by = patch_by
+        .map(|(f, attrs)| patch_by_filter_attrs(attrs, dated).map(|p| (f, p)))
+        .transpose()?;
+    let docs = docs
+        .into_iter()
+        .map(|d| to_document(d, dated))
+        .collect::<Result<_, _>>()?;
+    Ok((docs, patches, patch_by))
+}
+
+/// A patch as a request spells it: its id and its attributes, not yet read by any type.
+type RawPatch = (String, serde_json::Map<String, serde_json::Value>);
+
+/// The patches `rows` spell, their attributes read by `dated` (M173: the known types, so
+/// after the HEAD read a refusal of the request's shape never pays for).
+fn patches_of(
+    rows: Vec<RawPatch>,
+    dated: &typed::Declarations,
+) -> Result<Vec<pstore_engine::Patch>, ApiError> {
     rows.into_iter()
         .map(|(id, attrs)| {
             let who = format!("patch of {id}");
@@ -1749,8 +1787,13 @@ fn write_filter(name: &str, v: &serde_json::Value) -> Result<pstore_query::Predi
 /// `patch_by_filter` (M13.2): `{"filters": .., "attributes": {..}}`, both required.
 fn patch_by_filter_of(
     v: &serde_json::Value,
-    dated: &typed::Declarations,
-) -> Result<(pstore_query::Predicate, pstore_engine::Patch), ApiError> {
+) -> Result<
+    (
+        pstore_query::Predicate,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    ApiError,
+> {
     let bad = || {
         ApiError::bad_request(
             "patch_by_filter is {\"filters\": <filter>, \"attributes\": {..}}, both required",
@@ -1765,15 +1808,22 @@ fn patch_by_filter_of(
         return Err(bad());
     };
     let filter = write_filter("patch_by_filter", f)?;
+    Ok((filter, attrs.clone()))
+}
+
+/// `patch_by_filter`'s attributes, read by `dated` as [`patches_of`] reads a patch's.
+fn patch_by_filter_attrs(
+    attrs: serde_json::Map<String, serde_json::Value>,
+    dated: &typed::Declarations,
+) -> Result<pstore_engine::Patch, ApiError> {
     // Refusals from the document conversion name no operation, so they are prefixed here.
-    let patch = patch_of(String::new(), "patch_by_filter", attrs.clone(), dated).map_err(|e| {
+    patch_of(String::new(), "patch_by_filter", attrs, dated).map_err(|e| {
         if e.message.starts_with("patch_by_filter") {
             e
         } else {
             ApiError::bad_request(format!("patch_by_filter: {}", e.message))
         }
-    })?;
-    Ok((filter, patch))
+    })
 }
 
 /// What a write's operations will hold in its tenant's buffer (M141), by
@@ -1907,16 +1957,16 @@ async fn write_documents<S: BlobStore + 'static>(
         principal.source(tenant, "")?;
         return branch_index(&api, tenant, token, src, &index).await;
     }
-    let dated = declared_types(&req)?;
+    let types = declared_types(&req)?;
     let declared = pstore_engine::Declared {
         fts: declared_fts(&req)?,
         trigram: declared_trigram(&req)?,
+        types: types.clone(),
         texts: declared_further(&req)?,
     };
-    let patches = patches_of(
+    let patches = patch_rows_of(
         std::mem::take(&mut req.patch_rows),
         req.patch_columns.take(),
-        &dated,
     )?;
     let (delete_partial, patch_partial) = (
         req.delete_by_filter_allow_partial,
@@ -1930,7 +1980,7 @@ async fn write_documents<S: BlobStore + 'static>(
     let patch_by = req
         .patch_by_filter
         .as_ref()
-        .map(|v| patch_by_filter_of(v, &dated))
+        .map(patch_by_filter_of)
         .transpose()?;
     if req.documents.is_empty()
         && req.deletes.is_empty()
@@ -2010,17 +2060,54 @@ async fn write_documents<S: BlobStore + 'static>(
     widths_agree(&req)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    admit(&engine, key.as_ref()).await?;
-
+    // M173: every attribute is read by its known type -- recorded, or declared by this
+    // process's unfolded writes -- and by the request's own; the engine refuses a declaration
+    // that differs from a known one.
+    // Read only for a write holding a value to read: one with none, deletes or vectors alone,
+    // is refused by M141's bound, or buffered, without a blob request.
+    let valued = req.documents.iter().any(|d| !d.attributes.is_empty())
+        || patches.iter().any(|(_, attrs)| !attrs.is_empty())
+        || patch_by
+            .as_ref()
+            .is_some_and(|(_, attrs)| !attrs.is_empty());
+    let mut dated = if valued {
+        engine.known_types(&index).await
+    } else {
+        pstore_engine::Types::new()
+    };
+    dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
-    // Moved, not copied (M119): the documents are not read again.
-    let docs: Vec<Document> = std::mem::take(&mut req.documents)
-        .into_iter()
-        .map(|d| to_document(d, &dated))
-        .collect::<Result<_, _>>()?;
+    // Moved, not copied (M119): the documents are not read again -- unless a type this
+    // request did not declare reads them. A refusal by one re-reads HEAD once before it
+    // stands (M9f.2), because the type held may be a dropped index's, and the read needs
+    // the request as it came.
+    let kept = (dated.len() > types.len())
+        .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
+    let (docs, patches, patch_by) = match (
+        typed_ops(
+            std::mem::take(&mut req.documents),
+            patches,
+            patch_by,
+            &dated,
+        ),
+        kept,
+    ) {
+        (Ok(ops), _) => ops,
+        (Err(e), None) => return Err(e),
+        (Err(e), Some((d, p, b))) => {
+            let mut fresh = engine.reread_types(&index).await?;
+            fresh.extend(types);
+            if fresh == dated {
+                return Err(e);
+            }
+            typed_ops(d, p, b, &fresh)?
+        }
+    };
     check_further(&docs, declared.texts.as_ref())?;
     check_pre_tokenized(&docs, declared.fts.as_ref(), declared.texts.as_ref())?;
+    admit(&engine, key.as_ref()).await?;
+
     // M133: every reference resolved, and refused, before anything is buffered.
     let ops: Vec<_> = docs.iter().map(|d| (d.id.as_str(), &d.attrs)).collect();
     let upsert_if = ref_new::conds("upsert_condition", upsert_if, &ops)?;
@@ -2359,7 +2446,7 @@ const AFFECTED_IDS_MAX: usize = 10_000;
 /// [`AFFECTED_IDS_MAX`], returned; a write naming all of them leaves none, and is refused.
 fn affected_ids_bounded(
     req: &WriteRequest,
-    patches: &[pstore_engine::Patch],
+    patches: &[RawPatch],
     by_filter: bool,
     served: bool,
 ) -> Result<Option<usize>, ApiError> {
@@ -2373,7 +2460,7 @@ fn affected_ids_bounded(
         .iter()
         .map(|d| d.id.as_str())
         .chain(req.deletes.iter().map(String::as_str))
-        .chain(patches.iter().map(|p| p.id.as_str()))
+        .chain(patches.iter().map(|(id, _)| id.as_str()))
         .collect();
     if named.len() > AFFECTED_IDS_MAX {
         return Err(ApiError::bad_request(format!(
@@ -2912,7 +2999,7 @@ fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
         let legs = legs.map_err(ApiError::bad_request)?.unwrap_or_default();
         if let Some(f) = legs
             .iter()
-            .filter_map(|(f, _)| *f)
+            .filter_map(|(f, _, _)| *f)
             .find(|f| *f != pstore_format::text::DEFAULT_TEXT_FIELD)
         {
             return Err(ApiError::bad_request(format!(
@@ -3309,6 +3396,7 @@ async fn run<E: BlobStore>(
                         score: None,
                         dist: None,
                         highlight: None,
+                        highlights: None,
                     })
                     .collect(),
                 epoch: got.epoch.0,
@@ -3448,7 +3536,8 @@ async fn run<E: BlobStore>(
             .and_then(|t| t.legs().ok())
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|(_, q)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
+            // M180: the whole query's terms, a prefix leg's last token's own included.
+            .flat_map(|(_, q, _)| pstore_format::text::analyze_query(&answer.fts.analyzer, &q))
             .collect();
         (h, terms)
     });
@@ -3458,12 +3547,17 @@ async fn run<E: BlobStore>(
             .map(|(id, score, attrs, dist)| ResultRow {
                 highlight: marks
                     .as_ref()
+                    .filter(|(h, _)| h.structure.is_none())
                     .and_then(|(h, terms)| match attrs.get(&h.attr) {
                         Some(pstore_format::Value::Str(text)) => {
                             Some(h.render(text, &answer.fts.analyzer, terms))
                         }
                         _ => None,
                     }),
+                highlights: marks.as_ref().and_then(|(h, terms)| {
+                    h.fragments(attrs.get(&h.attr)?, &answer.fts.analyzer, terms)
+                        .map(|f| f.into_iter().map(types::HighlightMatch::from).collect())
+                }),
                 attributes: selected(req, &attrs),
                 id,
                 score: Some(score),
@@ -3622,6 +3716,7 @@ async fn index_summary<S: BlobStore + 'static>(
                 .into_iter()
                 .map(|(n, w)| (n, w.saturating_sub(sc.metric.extra() as u32)))
                 .collect(),
+            attributes: sc.types.into_iter().map(|(n, k)| (n, k.name())).collect(),
         }),
         rejected_rows: s.rejected_rows,
         quarantined_rows: s.quarantined_rows,
@@ -4117,13 +4212,14 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
         )));
     }
     // M155: an object names its field; a string is the primary's.
-    for (field, t) in texts {
+    for (field, t, last_as_prefix) in texts {
         legs.push(pstore_query::Prefetch::Text {
             field: field
                 .unwrap_or(pstore_format::text::DEFAULT_TEXT_FIELD)
                 .to_owned(),
             query: t,
             limit,
+            last_as_prefix,
         });
     }
     if legs.is_empty() {
@@ -4288,7 +4384,7 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
-        let Some(declared) = typed::Declared::named(ty) else {
+        let Some(declared) = typed::named(ty) else {
             return Err(bad(format!(
                 "{name:?} is declared {ty}; a write declares datetime, uuid, bytes or uint64"
             )));
@@ -4682,7 +4778,7 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         }
         let v = match (dated.get(name), value) {
             // M9h.3, M171: a declared type is read from a string, or an array of them.
-            (Some(d), _) => d.read(value),
+            (Some(d), _) => typed::read(*d, value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
             (None, serde_json::Value::Array(items)) => items
                 .iter()

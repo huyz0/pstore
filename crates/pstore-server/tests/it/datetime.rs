@@ -147,11 +147,16 @@ async fn datetimes_come_back_in_utc() {
             .iter()
             .map(|(id, v, _)| doc(id, json!({"t": v})))
             .collect();
-        let (s, b) = put(&api, &declared(json!(documents))).await;
-        assert_eq!(s, StatusCode::OK, "{b}");
-        // Undeclared, the same string stays a string, written as it was.
-        let plain = json!({"documents": [doc("p", json!({"t": "2024-05-01T14:30:00+02:00"}))]});
+        // Undeclared, the same string stays a string, written as it was -- before the type
+        // is known (M173), and so first, and folded before the type is recorded.
+        let plain = json!({"durability": "durable",
+            "documents": [doc("p", json!({"t": "2024-05-01T14:30:00+02:00"}))]});
         let (s, b) = put(&api, &plain).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        if folded {
+            fold(&api).await;
+        }
+        let (s, b) = put(&api, &declared(json!(documents))).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         if folded {
             fold(&api).await;
@@ -174,13 +179,17 @@ async fn a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes() {
             doc("c", json!({"t": "2025-01-01T00:00:00Z"})),
             doc("arr", json!({"t": ["2024-01-01T00:00:00Z"]})),
         ]);
-        let (s, b) = put(&api, &declared(dated)).await;
-        assert_eq!(s, StatusCode::OK, "{b}");
+        // The undeclared rows first, folded before `t`'s type is recorded (M173).
         let plain = json!({"durability": "durable", "documents": [
             doc("s", json!({"t": "2024-06-01T00:00:00Z"})),
             doc("n", json!({"t": 5})),
         ]});
         let (s, b) = put(&api, &plain).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        if folded {
+            fold(&api).await;
+        }
+        let (s, b) = put(&api, &declared(dated)).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         if folded {
             fold(&api).await;
@@ -296,27 +305,32 @@ fn rfc3339(secs: i64) -> String {
 
 #[tokio::test]
 async fn rank_by_puts_datetimes_between_numbers_and_strings() {
-    let api = api();
-    let (s, b) = put(
-        &api,
-        &declared(json!([
-            // Instant order is the reverse of text order: 19:00 UTC, then 20:00.
-            doc("d24", json!({"t": "2024-01-01T00:00:00+05:00"})),
-            doc("d23", json!({"t": "2023-12-31T20:00:00Z"})),
-        ])),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "{b}");
-    let others = json!({"durability": "durable", "documents": [
-        doc("t", json!({"t": true})),
-        doc("i", json!({"t": 1})),
-        doc("s", json!({"t": "a"})),
-        doc("arr", json!({"t": [1]})),
-        doc("none", json!({})),
-    ]});
-    let (s, b) = put(&api, &others).await;
-    assert_eq!(s, StatusCode::OK, "{b}");
     for folded in [false, true] {
+        let api = api();
+        // The other types first: unfolded beside the datetimes, or sealed before `t`'s type
+        // is recorded (M173).
+        let others = json!({"durability": "durable", "documents": [
+            doc("t", json!({"t": true})),
+            doc("i", json!({"t": 1})),
+            doc("s", json!({"t": "a"})),
+            doc("arr", json!({"t": [1]})),
+            doc("none", json!({})),
+        ]});
+        let (s, b) = put(&api, &others).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        if folded {
+            fold(&api).await;
+        }
+        let (s, b) = put(
+            &api,
+            &declared(json!([
+                // Instant order is the reverse of text order: 19:00 UTC, then 20:00.
+                doc("d24", json!({"t": "2024-01-01T00:00:00+05:00"})),
+                doc("d23", json!({"t": "2023-12-31T20:00:00Z"})),
+            ])),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
         if folded {
             fold(&api).await;
         }

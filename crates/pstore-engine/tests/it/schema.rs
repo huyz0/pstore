@@ -459,6 +459,7 @@ async fn body(e: &Engine<MemoryStore>, q: &str) -> Vec<String> {
         field: "body".to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let answer = e
         .query("idx", &legs, pstore_query::Fusion::default(), 10)
@@ -685,6 +686,7 @@ async fn a_vector_only_segment_does_not_refuse_a_text_query() {
         field: "text".to_owned(),
         query: "alpha".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let answer = e
         .query("idx", &legs, pstore_query::Fusion::default(), 10)
@@ -750,6 +752,7 @@ async fn before_any_text_the_fresh_segment_indexes_the_process_field() {
         field: "title".to_owned(),
         query: "gamma".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let answer = b
         .query("idx", &legs, pstore_query::Fusion::default(), 10)
@@ -1102,6 +1105,7 @@ async fn text_hits(
         field: field.to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     match e
         .query(index, &legs, pstore_query::Fusion::default(), 10)
@@ -1553,6 +1557,7 @@ async fn text_query(
         field: field.to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     e.query(index, &legs, pstore_query::Fusion::default(), 10)
         .await

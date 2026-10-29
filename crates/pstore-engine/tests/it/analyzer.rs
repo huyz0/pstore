@@ -28,6 +28,7 @@ async fn find(e: &Engine<MemoryStore>, q: &str) -> Vec<String> {
         field: "text".to_owned(),
         query: q.to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }];
     let answer = e.query("idx", &legs, Fusion::default(), 10).await.unwrap();
     e.resolve(&answer).into_iter().map(|(id, _)| id).collect()

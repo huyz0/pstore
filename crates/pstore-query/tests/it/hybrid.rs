@@ -409,6 +409,7 @@ async fn a_three_leg_query_is_no_deeper_than_its_deepest_leg() {
         field: text::DEFAULT_TEXT_FIELD.to_owned(),
         query: "quarterly revenue".to_owned(),
         limit: 20,
+        last_as_prefix: false,
     });
 
     s.reset();
@@ -448,6 +449,7 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
             field: text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "Quarterly, REVENUE".to_owned(),
             limit: 10,
+            last_as_prefix: false,
         }],
         Fusion::default(),
         10,
@@ -461,6 +463,7 @@ async fn a_text_leg_is_no_longer_refused_and_still_names_what_is_missing() {
             field: text::DEFAULT_TEXT_FIELD.to_owned(),
             query: "revenue".to_owned(),
             limit: 10,
+            last_as_prefix: false,
         }]
     };
     // A segment WITH a text index whose term dictionary is missing is an error naming the
@@ -549,6 +552,7 @@ async fn a_text_leg_naming_another_field_is_refused() {
             field: "body".to_owned(),
             query: "revenue".to_owned(),
             limit: 10,
+            last_as_prefix: false,
         }],
         Fusion::default(),
         10,
@@ -568,6 +572,7 @@ async fn a_text_leg_naming_another_field_is_refused() {
                 field: text::DEFAULT_TEXT_FIELD.to_owned(),
                 query: "revenue".to_owned(),
                 limit: 10,
+                last_as_prefix: false,
             }],
             Fusion::default(),
             10,

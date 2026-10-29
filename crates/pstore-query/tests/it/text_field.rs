@@ -73,6 +73,7 @@ fn text_leg(field: &str) -> Vec<Prefetch> {
         field: field.to_owned(),
         query: "quarterly revenue".to_owned(),
         limit: 10,
+        last_as_prefix: false,
     }]
 }
 

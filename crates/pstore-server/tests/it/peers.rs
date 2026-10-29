@@ -840,6 +840,30 @@ async fn queries_that_cannot_be_split_run_on_one_server() {
     assert_eq!(metric(a, "pstore_peer_parts_sent").await, sent);
 }
 
+/// M180: a query with a prefix leg is answered by its coordinator alone, as one server
+/// answers it, and sends no part -- the peer protocol does not carry the option.
+#[tokio::test]
+async fn a_prefix_query_is_not_split() {
+    let (store, servers, alone) = cluster(&[]).await;
+    fill(&store, &servers[0].api, &urls(&servers), 8).await;
+    let q = json!({"text": [{"field": "text", "query": "common wor", "last_as_prefix": true}],
+                   "vector": Q, "top_k": 10});
+    let (s0, want) = query(&alone.api, &q).await;
+    assert_eq!(s0, 200, "{want}");
+    assert!(!want["results"].as_array().unwrap().is_empty());
+    for (i, server) in servers.iter().enumerate() {
+        let sent = metric(&server.api, "pstore_peer_parts_sent").await;
+        let (s, got) = query(&server.api, &q).await;
+        assert_eq!(s, 200, "at {i}: {got}");
+        assert_eq!(answer(&got), answer(&want), "at {i}");
+        assert_eq!(
+            metric(&server.api, "pstore_peer_parts_sent").await,
+            sent,
+            "at {i}: split"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_split_boosted_query_answers_as_one_server_does() {
     // M62: the legs and the engine's `top_k` are the window, so a split query's candidates are

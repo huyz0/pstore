@@ -933,6 +933,21 @@ impl TermDict {
         self.entries.get(i).copied()
     }
 
+    /// The entries of every term starting with `prefix` (M180), in term order: one run, since
+    /// the terms are sorted, and so one contiguous span of postings, which are written in term
+    /// order. Empty when no term starts with it.
+    #[must_use]
+    pub fn prefixed(&self, prefix: &str) -> &[TermEntry] {
+        let from = self.terms.partition_point(|t| self.term(*t) < prefix);
+        let to = from
+            + self
+                .terms
+                .get(from..)
+                .unwrap_or_default()
+                .partition_point(|t| self.term(*t).starts_with(prefix));
+        self.entries.get(from..to).unwrap_or_default()
+    }
+
     /// Decodes one posting list from exactly the bytes its entry addresses.
     #[must_use]
     pub fn decode_list(&self, entry: &TermEntry, raw: &[u8]) -> Vec<(u32, u32)> {

@@ -116,11 +116,13 @@ fn others() -> Value {
     ])
 }
 
+/// The ints and floats first, folded when durable: since M173 a name holds one recorded
+/// type, so its other values are rows sealed before the type was recorded.
 async fn seeded(store: &Accounted<MemoryStore>, durable: bool) -> Arc<Api<MemoryStore>> {
     let a = api(store);
     for (docs, schema) in [
-        (uints(), json!({"n": "uint64", "ns": "uint64"})),
         (others(), Value::Null),
+        (uints(), json!({"n": "uint64", "ns": "uint64"})),
     ] {
         let mut body = json!({"documents": docs});
         if !schema.is_null() {
@@ -131,9 +133,9 @@ async fn seeded(store: &Accounted<MemoryStore>, durable: bool) -> Arc<Api<Memory
         }
         let (s, b) = write(&a, &body).await;
         assert_eq!(s, StatusCode::OK, "{b}");
-    }
-    if durable {
-        fold(&a).await;
+        if durable {
+            fold(&a).await;
+        }
     }
     a
 }
@@ -301,13 +303,14 @@ async fn equal_numbers_are_one_group_and_report_the_integer() {
         let uint = json!({"schema": {"k": "uint64"}, "documents": [
             {"id": "r", "vector": [1.0, 0.0], "attributes": {"k": 5}},
             {"id": "s", "vector": [1.0, 0.0], "attributes": {"k": TWO_63}}]});
+        // Each folded: the untyped rows are sealed before `k`'s type is recorded (M173).
         for body in [&float, &uint] {
             let mut body = body.clone();
             body["durability"] = json!("durable");
             let (s, b) = write(&a, &body).await;
             assert_eq!(s, StatusCode::OK, "{b}");
+            fold(&a).await;
         }
-        fold(&a).await;
         let q = json!({"aggregate_by": {"n": ["Count", "id"]}, "group_by": ["k"]});
         let (s, b) = query(&a, &q).await;
         assert_eq!(s, StatusCode::OK, "{b}");
