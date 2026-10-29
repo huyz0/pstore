@@ -13,6 +13,7 @@ use pstore_format::{Document, Field, Value, VectorField};
 fn every_value_kind_is_counted() {
     for (v, want) in [
         (Value::Int(-1), 8),
+        (Value::Uint(u64::MAX), 8),
         (Value::Float(1.5), 8),
         (Value::Bool(true), 8),
         (Value::DateTime(0), 8),

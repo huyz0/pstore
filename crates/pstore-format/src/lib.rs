@@ -235,7 +235,7 @@ impl Value {
     #[must_use]
     pub fn footprint(&self) -> u64 {
         match self {
-            Self::Int(_) | Self::Float(_) | Self::Bool(_) | Self::DateTime(_) => 8,
+            Self::Int(_) | Self::Uint(_) | Self::Float(_) | Self::Bool(_) | Self::DateTime(_) => 8,
             Self::Str(s) => s.len() as u64,
             Self::Array(vs) => vs.iter().map(Self::footprint).sum(),
             Self::Uuid(_) => 16,
