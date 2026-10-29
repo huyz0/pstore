@@ -3734,7 +3734,9 @@ async fn index_summary<S: BlobStore + 'static>(
 
 /// Unix milliseconds as RFC 3339 UTC, always with three fractional digits (M148).
 fn rfc3339_ms(ms: u64) -> String {
-    let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX / 1_000_000);
+    // `u64::MAX / 1000` fits an `i64`, so the fallback never runs; a far future saturates in
+    // `format`'s microseconds.
+    let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
     let whole = pstore_format::datetime::format(secs.saturating_mul(1_000_000));
     format!("{}.{:03}Z", whole.trim_end_matches('Z'), ms % 1000)
 }

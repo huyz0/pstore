@@ -104,3 +104,8 @@ pass unchanged. The two pinned counts grew by 4 bytes each, the types' forced co
 (.harness/m148-m173-suite.log). `times_round_trip_beside_keys_since` gained a round trip
 beside recorded types, live and dropped, and fails with the times not forcing the types'
 count and with the times written before the types (.harness/m148-m173-mutations.log).
+
+CI's mutation shard missed `/` → `%` in `rfc3339_ms`'s `i64::MAX / 1_000_000` fallback,
+which no input reaches (`u64::MAX / 1000` fits an `i64`), so the mutant is equivalent. The
+fallback is now `i64::MAX`, saturated in the multiply, and the `ms / 1000` beside it is
+killed by `times_are_rfc3339_at_millisecond_precision` (.harness/m148-ci-mutation-red.log).
