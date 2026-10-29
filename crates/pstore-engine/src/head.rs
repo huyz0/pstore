@@ -2337,6 +2337,14 @@ mod tests {
             assert_eq!(back, h, "{keys_since:?}");
             assert_eq!(back.times.len(), 1);
         }
+        // After M173's recorded types, live and dropped, which the times follow.
+        let mut h = every_section();
+        assert!(h.indexes.contains_key("a"));
+        assert!(h.schemas.get("a").is_some_and(|s| !s.types.is_empty()));
+        h.times.insert("a".to_owned(), (7, 8));
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back, h);
+        assert_eq!(back.times.len(), 1);
         Ok(())
     }
 }

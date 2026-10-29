@@ -74,7 +74,7 @@ No `cargo mutants` run is claimed.
    no truncation decodes times.
 7. PASS: `summary_reports_times_and_bytes` and
    `an_unfolded_index_reports_no_bytes_and_no_times` assert `blob_reads` 1 for every
-   summary they read. Two pinned byte counts grow by the section's 52 bytes for one index,
+   summary they read. Two pinned byte counts grow by the section's 56 bytes for one index,
    itemised in `patch.rs` and `served_epoch.rs`; their read counts are unchanged.
 8. PASS, with the IPv6 exception M127 records.
    - `cargo clippy --all-targets --all-features -- -D warnings` passed.
@@ -96,3 +96,11 @@ without times encodes as before. The two pinned counts grew by 11 bytes each, th
 `keys_since` and count in place of the marker.
 
 Code review: see the commit message.
+
+Rebased again after M173, which had appended its recorded types after the further text
+fields. `times` now follows the types and forces their count (0 when none), which forces
+everything before it. A HEAD without times still encodes as before, and M173's own tests
+pass unchanged. The two pinned counts grew by 4 bytes each, the types' forced count
+(.harness/m148-m173-suite.log). `times_round_trip_beside_keys_since` gained a round trip
+beside recorded types, live and dropped, and fails with the times not forcing the types'
+count and with the times written before the types (.harness/m148-m173-mutations.log).
