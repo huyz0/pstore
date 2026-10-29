@@ -41,7 +41,8 @@ for every later write:
   declaration. None loses a case.
 - **When the door reads.** The known types are read after a write's request-level checks,
   before its values are read: a value refused costs, once per process, the HEAD read M35
-  already makes. A refusal by a type the request did not declare re-reads HEAD once before
+  already makes; a write holding no attribute value (deletes, or vectors alone) reads
+  none, so M141's bound refuses it at no cost. A refusal by a type the request did not declare re-reads HEAD once before
   it stands, as a width's does (M9f.2), and a drop this process makes, or reads after its
   declaration, takes its unfolded declarations for that index.
 - **Answering.** The index summary's `schema` gains `attributes`: each recorded name to

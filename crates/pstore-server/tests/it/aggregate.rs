@@ -543,7 +543,6 @@ async fn what_an_aggregation_cannot_mean_is_refused() {
         (with("group_by", json!([])), "group_by"),
         (with("group_by", json!(nine)), "group_by"),
         (with("group_by", json!(["n"])), "label"),
-        (json!({"queries": [count()]}), "multi-query"),
     ] {
         let (s, body, _) = send(a, "POST", "/v1/indexes/docs/query", &q, None).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{q} was accepted: {body}");

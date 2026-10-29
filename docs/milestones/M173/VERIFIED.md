@@ -67,6 +67,12 @@ run is claimed for them.
    of a write for the re-read, as `>=`, which re-read HEAD on a refusal by the request's own
    type. `a_refusal_by_the_requests_own_type_reads_nothing` now fails on it, applied by
    hand; CI's run on the fix is the evidence.
+   After merging main's M141 (a tenant's buffered rows bounded), whose
+   `buffered::a_write_larger_than_the_bound_is_too_large_not_overloaded` and
+   `buffered::deletes_reserve_their_tombstones` assert a refusal costs no blob request, the
+   door reads the known types only for a write holding an attribute value. Both tests pass
+   unedited; the guard forced true fails them, and forced false fails four of
+   `persistent_types::`, applied by hand.
    Existing tests: the M171 and M172 server tests that wrote several types under one name
    (`datetime::datetimes_come_back_in_utc`,
    `datetime::a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes`,

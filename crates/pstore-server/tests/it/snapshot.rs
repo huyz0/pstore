@@ -165,7 +165,7 @@ async fn query(api: &Arc<Api<Interfering>>, body: &Value) -> (StatusCode, Value)
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-/// Two ranked legs and an ordered one, at `level` (a multi-query offers no `aggregate_by`).
+/// Two ranked legs and an ordered one, at `level`.
 fn three(level: &str) -> Value {
     json!({"queries": [
         {"vector": [1.0, 0.5], "top_k": 10, "consistency": level},
@@ -235,4 +235,48 @@ async fn mixed_levels_are_unpinned() {
     let (s, b) = query(&api, &q).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
     assert_eq!(b["error"]["code"], "not_folded", "{b}");
+}
+
+/// M164 criterion 3: a multi-query's aggregation and facets count what its hits were drawn
+/// from, whatever folds while they run.
+#[tokio::test]
+async fn aggregations_and_facets_share_the_legs_snapshot() {
+    let (store, api) = world().await;
+    store.0.armed.store(true, Ordering::SeqCst);
+    let count = json!({"n": ["Count", "id"]});
+    let q = json!({"queries": [
+        {"vector": [1.0, 0.5], "top_k": 10},
+        {"aggregate_by": count},
+        {"vector": [1.0, 0.5], "top_k": 10, "facets": {"aggregate_by": count}},
+    ]});
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["epochs"], json!([1, 1, 1]), "{b}");
+    assert_eq!(b["meta"]["facets_epochs"], json!([null, null, 1]), "{b}");
+    assert_eq!(b["aggregations"][1]["n"], 2, "{b}");
+    assert_eq!(b["facets"][2]["n"], 2, "{b}");
+    assert!(!b["results"].to_string().contains("\"c\""), "{b}");
+    // The rival did fold: the next request counts its row.
+    let (_, b) = query(&api, &q).await;
+    assert_eq!(b["aggregations"][1]["n"], 3, "{b}");
+}
+
+/// M164 criterion 8: a request that cannot be pinned as a whole still answers a faceted
+/// sub-query's hits and facets from one snapshot, as that query alone is answered.
+#[tokio::test]
+async fn an_unpinned_multi_query_pins_each_faceted_pair() {
+    let (store, api) = world().await;
+    store.0.armed.store(true, Ordering::SeqCst);
+    let q = json!({"queries": [
+        {"vector": [1.0, 0.5], "top_k": 10, "facets": {"aggregate_by": {"n": ["Count", "id"]}}},
+        {"vector": [1.0, 0.5], "top_k": 10, "as_of": 1},
+    ]});
+    let (s, b) = query(&api, &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["meta"]["facets_epochs"][0], b["meta"]["epochs"][0], "{b}");
+    let hits = b["results"][0].as_array().unwrap().len();
+    assert_eq!(b["facets"][0]["n"], hits, "{b}");
+    // Whichever leg takes the armed read, the pair is one epoch's: 1 with 2 rows, 2 with 3.
+    let n = b["facets"][0]["n"].as_u64().unwrap();
+    assert_eq!(b["meta"]["epochs"][0].as_u64().unwrap() + 1, n, "{b}");
 }

@@ -1823,6 +1823,95 @@ fn patch_by_filter_attrs(
     })
 }
 
+/// What a write's operations will hold in its tenant's buffer (M141), by
+/// [`pstore_format::Document::footprint`]'s rules: documents, each patch's id and
+/// attributes, each delete's tombstone, each by-filter operation's encoded filter, and an
+/// applied request's `stamp` on every row. An estimate: the engine trues it up to the
+/// stored rows as they are buffered.
+fn write_footprint(
+    docs: &[Document],
+    patches: &[pstore_engine::Patch],
+    deletes: &[String],
+    delete_by: Option<&pstore_query::Predicate>,
+    patch_by: Option<&(pstore_query::Predicate, pstore_engine::Patch)>,
+    stamp: u64,
+) -> u64 {
+    let patch = |p: &pstore_engine::Patch| {
+        p.id.len() as u64
+            + p.set
+                .iter()
+                .map(|(k, v)| k.len() as u64 + v.footprint())
+                .sum::<u64>()
+            + p.unset.iter().map(|k| k.len() as u64).sum::<u64>()
+    };
+    let filter = |f: &pstore_query::Predicate| pstore_query::condition::encode(f).len() as u64;
+    // A delete is stored as a tombstone: its id and an 8-byte mark under an empty name.
+    let rows = docs.len()
+        + patches.len()
+        + deletes.len()
+        + usize::from(delete_by.is_some())
+        + usize::from(patch_by.is_some());
+    docs.iter().map(Document::footprint).sum::<u64>()
+        + patches.iter().map(patch).sum::<u64>()
+        + deletes.iter().map(|d| d.len() as u64 + 8).sum::<u64>()
+        + delete_by.map_or(0, filter)
+        + patch_by.map_or(0, |(f, p)| filter(f) + patch(p))
+        + rows as u64 * stamp
+}
+
+/// Reserves `bytes` of `tenant`'s buffer for one write (M141), flushing first when a
+/// batched write would pass the flush bound, or refuses.
+///
+/// ⚠️ **The flush bound is soft**: one flush, then the reservation is retried without it,
+/// so writes racing this one can pass it by their own size. The buffer bound is hard.
+async fn reserve_buffer<'e, S: BlobStore + 'static>(
+    api: &Api<S>,
+    tenant: TenantId,
+    engine: &'e Tenant<S>,
+    bytes: u64,
+    batched: bool,
+) -> Result<pstore_engine::BufferReservation<'e>, ApiError> {
+    let limits = api.ingress.limits();
+    if bytes > limits.tenant_buffered_bytes() {
+        return Err(ApiError {
+            message: "the write's rows are larger than a tenant's buffer bound".to_owned(),
+            ..ingress::too_large()
+        });
+    }
+    let bounds = pstore_engine::BufferBounds {
+        flush_at: batched.then_some(limits.tenant_flush_bytes()),
+        cap: limits.tenant_buffered_bytes(),
+    };
+    let refused = match engine.reserve_buffer(bytes, bounds) {
+        Ok(r) => return Ok(r),
+        Err(pstore_engine::BufferRefusal::Flush) => {
+            engine.flush().await?;
+            match engine.reserve_buffer(
+                bytes,
+                pstore_engine::BufferBounds {
+                    flush_at: None,
+                    ..bounds
+                },
+            ) {
+                Ok(r) => return Ok(r),
+                Err(e) => e,
+            }
+        }
+        Err(e) => e,
+    };
+    debug_assert_eq!(refused, pstore_engine::BufferRefusal::Full);
+    api.requested
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(tenant);
+    Err(ApiError {
+        message: "this tenant's buffered rows are at their bound; a fold has been requested, \
+                  retry once it commits (with scheduled folds off, POST /v1/admin/fold)"
+            .to_owned(),
+        ..ingress::overloaded()
+    })
+}
+
 /// `PUT /v1/indexes/{index}/documents`.
 async fn write_documents<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -1971,7 +2060,18 @@ async fn write_documents<S: BlobStore + 'static>(
     // M173: every attribute is read by its known type -- recorded, or declared by this
     // process's unfolded writes -- and by the request's own; the engine refuses a declaration
     // that differs from a known one.
-    let mut dated = engine.known_types(&index).await;
+    // Read only for a write holding a value to read: one with none, deletes or vectors alone,
+    // is refused by M141's bound, or buffered, without a blob request.
+    let valued = req.documents.iter().any(|d| !d.attributes.is_empty())
+        || patches.iter().any(|(_, attrs)| !attrs.is_empty())
+        || patch_by
+            .as_ref()
+            .is_some_and(|(_, attrs)| !attrs.is_empty());
+    let mut dated = if valued {
+        engine.known_types(&index).await
+    } else {
+        pstore_engine::Types::new()
+    };
     dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
@@ -2018,6 +2118,17 @@ async fn write_documents<S: BlobStore + 'static>(
         None => None,
     };
     let deletes = std::mem::take(&mut req.deletes);
+    // M141: the whole request's share of the tenant's buffer, before anything is buffered.
+    let need = write_footprint(
+        &docs,
+        &patches,
+        &deletes,
+        delete_by.as_ref(),
+        patch_by.as_ref(),
+        pstore_engine::stamp_footprint(op, ids_wanted, key.as_ref()),
+    );
+    let batched = matches!(req.durability, types::Durability::Batched);
+    let reserved = reserve_buffer(&api, tenant, &engine, need, batched).await?;
     let buffer = async {
         let written = docs.len();
         if !docs.is_empty() {
@@ -2054,8 +2165,9 @@ async fn write_documents<S: BlobStore + 'static>(
         }
         Ok::<_, ApiError>((written, patched, deleted))
     };
-    let (written, patched, deleted) =
-        pstore_engine::stamped(op, ids_wanted, key.as_ref(), buffer).await?;
+    let (written, patched, deleted) = reserved
+        .scope(pstore_engine::stamped(op, ids_wanted, key.as_ref(), buffer))
+        .await?;
     let durable = matches!(
         req.durability,
         types::Durability::Durable | types::Durability::Applied
@@ -2513,23 +2625,56 @@ async fn query_index<S: BlobStore + 'static>(
         ));
     }
     let (reqs, outer) = multi_query(raw)?;
+    // M164: every facet query derived, and every refusal found, before any runs -- facets
+    // first, as for a query alone (M65), so every refusal names `facets`.
+    let facet_reqs = reqs
+        .iter()
+        .map(|r| Ok(facets::derive(r)?.map(|(f, _)| f)))
+        .collect::<Result<Vec<_>, ApiError>>()?;
     reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
     let peers: Vec<Option<peers::QueryPeers>> =
         reqs.iter().map(|r| api.query_peers(tenant, r)).collect();
+    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
+    let whole = pinnable(&reqs, &token)?;
     // Planned again inside, so a pinned retry (M131) can run every leg once more.
     let all = {
-        let (reqs, peers, engine, index, token) = (&reqs, &peers, &engine, &index, &token);
+        let (reqs, facet_reqs, peers, engine, index, token) =
+            (&reqs, &facet_reqs, &peers, &engine, &index, &token);
+        let pinned_whole = whole.is_some();
         move || {
-            futures_util::future::try_join_all(reqs.iter().zip(peers).map(|(req, p)| async {
-                run(engine, index, req, plan(req)?, token, p.as_ref()).await
-            }))
+            futures_util::future::try_join_all(reqs.iter().zip(facet_reqs).zip(peers).map(
+                move |((req, facet), p)| async move {
+                    // A query and its facets, together: depth is the deeper of the two (M65).
+                    let pair = move || async move {
+                        let ranked = run(engine, index, req, plan(req)?, token, p.as_ref());
+                        match facet {
+                            None => Ok::<_, ApiError>((ranked.await?, None)),
+                            Some(f) => {
+                                let beside = run(engine, index, f, plan(f)?, token, None);
+                                let (got, faceted) =
+                                    futures_util::future::try_join(ranked, beside).await?;
+                                Ok((got, Some(faceted)))
+                            }
+                        }
+                    };
+                    // M164: a request not pinned as a whole still pins each query to its
+                    // facets, as `query_index` pins a faceted query alone.
+                    let own = match facet {
+                        Some(_) if !pinned_whole => pinnable(std::slice::from_ref(req), token)?,
+                        _ => None,
+                    };
+                    match own {
+                        Some(level) => engine.pinned(index, level, pair).await,
+                        None => pair().await,
+                    }
+                },
+            ))
         }
     };
-    // M131: every leg from one snapshot when they share a level and none reads a past epoch.
-    let got = match pinnable(&reqs, &token)? {
+    let got = match whole {
         Some(level) => engine.pinned(&index, level, all).await,
         None => all().await,
     };
@@ -2538,28 +2683,52 @@ async fn query_index<S: BlobStore + 'static>(
     // the entries its HEAD covers, and merging the request's back would restore them.
     let mut merged = got
         .first()
-        .map_or_else(|| token.clone(), |g| g.token.clone());
-    for g in got.iter().skip(1) {
+        .map_or_else(|| token.clone(), |(g, _)| g.token.clone());
+    for (g, _) in got.iter().skip(1) {
         merged.merge(&g.token);
     }
     let session = merged.encode();
+    // M164: the aggregation fields when any query aggregates, the facets when any has them.
+    let aggregating = reqs.iter().any(|r| r.aggregate_by.is_some());
+    let faceting = facet_reqs.iter().any(Option::is_some);
+    let mut aggregations = Vec::with_capacity(got.len());
+    let mut aggregation_groups = Vec::with_capacity(got.len());
+    let mut facets = Vec::with_capacity(got.len());
+    let mut facets_epochs = Vec::with_capacity(got.len());
+    let mut epochs = Vec::with_capacity(got.len());
+    let mut unfolded_hits = Vec::with_capacity(got.len());
+    let mut consistencies = Vec::with_capacity(got.len());
+    let mut staleness_ms = Vec::with_capacity(got.len());
+    let mut lists = Vec::with_capacity(got.len());
+    for (g, faceted) in got {
+        epochs.push(g.epoch);
+        unfolded_hits.push(g.unfolded_hits);
+        consistencies.push(g.consistency);
+        staleness_ms.push(g.staleness_ms);
+        aggregations.push(g.aggregations);
+        aggregation_groups.push(g.aggregation_groups);
+        facets_epochs.push(faceted.as_ref().map(|f| f.epoch));
+        facets.push(faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups)));
+        lists.push(g.results);
+    }
     Ok(with_session(
         axum::Json(MultiQueryResponse {
             meta: MultiQueryMeta {
-                epochs: got.iter().map(|g| g.epoch).collect(),
-                unfolded_hits: got.iter().map(|g| g.unfolded_hits).collect(),
+                epochs,
+                unfolded_hits,
                 cost: api.spend(tenant).since(before),
-                consistencies: got.iter().map(|g| g.consistency).collect(),
+                consistencies,
                 session: session.clone(),
-                staleness_ms: got.iter().map(|g| g.staleness_ms).collect(),
+                staleness_ms,
+                facets_epochs: faceting.then_some(facets_epochs),
             },
-            results: {
-                let lists = got.into_iter().map(|g| g.results).collect();
-                match &outer {
-                    // M142: one list, the fused one.
-                    Some(outer) => vec![rerank::fuse_outer(lists, outer)],
-                    None => lists,
-                }
+            aggregations: aggregating.then_some(aggregations),
+            aggregation_groups: aggregating.then_some(aggregation_groups),
+            facets: faceting.then_some(facets),
+            results: match &outer {
+                // M142: one list, the fused one.
+                Some(outer) => vec![rerank::fuse_outer(lists, outer)],
+                None => lists,
             },
         }),
         &session,
@@ -2644,20 +2813,15 @@ fn multi_query(
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
             }
-            // A multi-query's results are lists of rows; an aggregation's are not (M12).
-            if q.get("aggregate_by").is_some() {
-                return Err(ApiError::bad_request(
-                    "aggregate_by inside a multi-query is not offered",
-                ));
-            }
-            if q.get("facets").is_some_and(|f| !f.is_null()) {
-                return Err(ApiError::bad_request(
-                    "facets inside a multi-query is not offered",
-                ));
-            }
             parse_query(q)
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<QueryRequest>, _>>()?;
+    // M164: fusion ranks rows, and an aggregation has none.
+    if outer.is_some() && subs.iter().any(|q| q.aggregate_by.is_some()) {
+        return Err(ApiError::bad_request(
+            "rerank_by fuses rankings: a query inside it cannot be an aggregate_by",
+        ));
+    }
     Ok((subs, outer))
 }
 
@@ -6103,6 +6267,46 @@ mod tests {
         assert_eq!(millis(Duration::from_micros(999_900)), 1000);
         assert_eq!(millis(Duration::from_nanos(1)), 1);
         assert_eq!(millis(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn a_writes_footprint_counts_every_operation_once() {
+        // M141: each part a distinct size, so a term dropped, doubled or combined the wrong
+        // way changes the sum.
+        let doc = Document::new("d00", vec![1.0, 0.5]);
+        let patch = pstore_engine::Patch {
+            id: "pp".to_owned(),
+            set: [("ab".to_owned(), pstore_format::Value::Str("xyz".to_owned()))].into(),
+            unset: vec!["u".to_owned()],
+        };
+        let by = pstore_engine::Patch {
+            id: String::new(),
+            set: [("kk".to_owned(), pstore_format::Value::Int(1))].into(),
+            unset: Vec::new(),
+        };
+        let gone = pstore_query::Predicate::Absent("owner".to_owned());
+        let even = pstore_query::Predicate::Cmp(
+            "n".to_owned(),
+            pstore_query::Op::Eq,
+            pstore_format::Value::Int(2),
+        );
+        let (e1, e2) = (
+            pstore_query::condition::encode(&gone).len() as u64,
+            pstore_query::condition::encode(&even).len() as u64,
+        );
+        assert!(e1 > 0 && e2 > 0 && e1 != e2);
+        let got = write_footprint(
+            std::slice::from_ref(&doc),
+            std::slice::from_ref(&patch),
+            &["del".to_owned()],
+            Some(&gone),
+            Some(&(even, by)),
+            7,
+        );
+        // The row, the patch (2 + 2 + 3 + 1), the tombstone (3 + 8), the two filters, the
+        // patch by filter's patch (2 + 8), and the stamp on each of five operations.
+        assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
+        assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
     }
 
     #[test]
