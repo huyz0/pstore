@@ -121,6 +121,11 @@ impl TextIndex {
         if !segment.has_text() {
             return Err(FormatError::UnknownField);
         }
+        // M151: which of several fields is the caller's question, and `for_field` answers it.
+        // Opening field 0 here would hand a caller another field's postings by default.
+        if segment.text_fields().len() > 1 {
+            return Err(FormatError::UnknownField);
+        }
         let postings = segment
             .section(Section::TextPostings)
             .ok_or(FormatError::Corrupt("text with no postings section"))?;
@@ -132,6 +137,67 @@ impl TextIndex {
             dict,
             postings,
             norms,
+        })
+    }
+
+    /// Opens the text field `field` of a segment that may carry several (M151), over the fetched
+    /// sidecar `dictionary`, whose decoded dictionaries are kept for it.
+    ///
+    /// ⚠️ A carried field's postings and fieldnorms are a slice of the segment's, and its
+    /// dictionary one of the sidecar's, so everything after the open reads exactly what a
+    /// one-field segment's reader reads, through narrower ranges. One carried field is
+    /// [`Self::from_segment_shared`], with nothing new checked.
+    ///
+    /// # Errors
+    /// `UnknownField` when the segment does not carry `field`, and `Corrupt` when its
+    /// sidecar or sections do not fit each other.
+    pub fn for_field(
+        segment: &Segment,
+        dictionary: &bytes::Bytes,
+        field: &str,
+    ) -> Result<Self, FormatError> {
+        let names = segment.text_fields();
+        let i = names
+            .iter()
+            .position(|n| n == field)
+            .ok_or(FormatError::UnknownField)?;
+        if names.len() == 1 {
+            return Self::from_segment_shared(segment, dictionary);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if !names.iter().all(|n| seen.insert(n)) {
+            return Err(FormatError::Corrupt("a text field named twice"));
+        }
+        let postings = segment
+            .section(Section::TextPostings)
+            .ok_or(FormatError::Corrupt("text with no postings section"))?;
+        let norms = segment
+            .section(Section::Fieldnorms)
+            .ok_or(FormatError::Corrupt("text with no fieldnorms section"))?;
+        let dicts = pstore_format::text::Dictionaries::decode_shared(dictionary, names.len())
+            .ok_or(FormatError::Corrupt("the term dictionaries did not decode"))?;
+        let last = dicts
+            .postings(names.len() - 1)
+            .ok_or(FormatError::Corrupt("the term dictionaries did not decode"))?;
+        if last.end != postings.end - postings.start {
+            return Err(FormatError::Corrupt(
+                "the text fields' postings do not fill their section",
+            ));
+        }
+        let (Some(span), Some(dict)) = (dicts.postings(i), dicts.term_dict(i)) else {
+            return Err(FormatError::Corrupt("the term dictionaries did not decode"));
+        };
+        let width = u64::from(dict.doc_count()) * 4;
+        if norms.end - norms.start != width * names.len() as u64 {
+            return Err(FormatError::Corrupt(
+                "the fieldnorms are not one per row per text field",
+            ));
+        }
+        let at = norms.start + width * i as u64;
+        Ok(Self {
+            dict: std::sync::Arc::clone(dict),
+            postings: postings.start + span.start..postings.start + span.end,
+            norms: at..at + width,
         })
     }
 

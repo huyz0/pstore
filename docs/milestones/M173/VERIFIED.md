@@ -38,10 +38,16 @@ run is claimed for them.
    `attributes` omitted.
 6. `recorded_types_round_trip_after_keys_since`, with the HEAD fixture's live and dropped
    schemas now recording types: green after. Killed: the dropped schemas' types not
-   written; the section written with no types; the sentinel read as an epoch.
-   `a_head_of_every_section_is_refused_cut_anywhere_but_a_section_boundary` now finds 17
-   decodable cuts rather than 15: the types force the outcomes and `keys_since`, so the
-   cut before each is inside the HEAD, not at its end.
+   written; the section written with no types; the sentinel read as an epoch. ⚠️ After merging main, which
+   carries M152's further-text-fields section after `keys_since` and reads `u64::MAX` as
+   absent wherever it appears (debug-asserting it is never an epoch), the types follow that
+   section, and the sentinel case is replaced by a HEAD with both sections; the fixture's
+   types alone force an empty text-field section; both round-trip. The sentinel's refusal
+   is M152's rule now, not this milestone's.
+   `a_head_of_every_section_is_refused_cut_anywhere_but_a_section_boundary` now finds 19
+   decodable cuts rather than 15: the types force the outcomes, `keys_since` and, after the
+   merge, M152's text-field section, so the cut before each is inside the HEAD, not at its
+   end.
 7. `a_stamp_names_the_known_kinds_a_row_holds_and_reads_back`: green after. Killed:
    `$types` not stripped. A quarantined row's export lists it under `reserved`, beside
    `$fts` and the other reserved names (M25), as the reason the fold refused the row; no

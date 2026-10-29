@@ -50,7 +50,10 @@ for every later write:
 HEAD gains a trailing section after `keys_since`, the recorded types per live and dropped
 schema, written only when some schema records one, so a HEAD with none keeps its bytes. It
 forces `keys_since`, written as `u64::MAX` when absent; that value with no section after it
-is refused. A reader before M173 refuses such a HEAD, and once one is committed an older
+is refused. ⚠️ **Merged after M152**, which landed first with its own trailing section (the
+further text fields) and reads `u64::MAX` as absent wherever it appears: the types follow
+the text fields' section, which they force (empty when there are none), and the sentinel
+rule is M152's. A reader before M173 refuses such a HEAD, and once one is committed an older
 build cannot read the tenant: deploy readers first, and no rollback after.
 
 ## Acceptance criteria
@@ -72,8 +75,8 @@ build cannot read the tenant: deploy readers first, and no rollback after.
 5. The summary answers `schema.attributes`, exactly the recorded kinds, before and after a
    restart; `{}` for an index with none, and for one re-created after a drop.
 6. HEAD: types round-trip for live and dropped schemas; a HEAD with none encodes as before;
-   `keys_since` absent beside types round-trips as absent; `u64::MAX` with no section, or
-   bytes after it, is refused.
+   `keys_since` absent beside types round-trips as absent; bytes after the types are
+   refused. (Before the merge after M152: also `u64::MAX` with no section; see the Delta.)
 7. No sealed row carries `$types`; existing tests pass; those extended lose no case.
 
 ## Test plan

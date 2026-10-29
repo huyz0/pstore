@@ -318,7 +318,7 @@ All ten `FullTextSearchConfig` properties:
 | `stemming`, `ascii_folding`, `case_sensitive` | Configurable |
 | `remove_stopwords` | Configurable only for English; other languages refused when true; vendor supports additional languages with exceptions; default conflict recorded above |
 | `max_token_length` | No public option |
-| `tokenizer` | Only `word_v1`; vendor lists `pre_tokenized_array`, `word_v0` through `word_v4` |
+| `tokenizer` | `word_v1` and, from [M158](../milestones/M158/VERIFIED.md), `pre_tokenized_array` (each string of a `[]string` value is one token, kept byte for byte; `language`, stemming, stopwords, folding and `case_sensitive: false` refused; no highlighting). The vendor's `word_v0` through `word_v4` are not accepted. ⚠️ Operating rule: declare `pre_tokenized_array` only once every server runs M158 or later, since an older build reads its `v2` stamp as no stamp and could record the index as `word_v1` |
 
 The vendor FTS guide excludes Arabic, Greek, Romanian, Tamil, and Turkish from its
 stopword-removal support. Pre-tokenized arrays have their own case/stemming restrictions

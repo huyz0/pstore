@@ -162,6 +162,14 @@ fn put_pred(b: &mut Vec<u8>, p: &Predicate) {
             put_str(b, v.as_str());
             b.push(*k);
         }
+        // M145: the name, the value, the distance, and the case flag as one byte.
+        Predicate::FuzzySubstring(a, v, k, case) => {
+            b.push(13);
+            put_str(b, a);
+            put_str(b, v.as_str());
+            b.push(*k);
+            b.push(u8::from(*case));
+        }
         // M66: the name, then the numbers as `f64` bits.
         Predicate::GeoRadius(a, lat, lon, m) => {
             b.push(10);
@@ -331,6 +339,16 @@ impl Reader<'_> {
                 Predicate::Pattern(a, Pattern::new(kind, &self.string()?).ok()?)
             }
             9 => Predicate::Fuzzy(self.string()?, self.string()?.into(), self.u8()?),
+            13 => {
+                let (a, v) = (self.string()?, self.string()?);
+                let k = self.u8().filter(|k| *k <= 2)?;
+                let case = match self.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                Predicate::FuzzySubstring(a, v.into(), k, case)
+            }
             10 => Predicate::GeoRadius(self.string()?, self.f64()?, self.f64()?, self.f64()?),
             11 => Predicate::GeoBox(
                 self.string()?,
@@ -404,6 +422,10 @@ mod tests {
             Predicate::Pattern(a(), Pattern::new(PatternKind::IGlob, "ſ*").unwrap()),
             Predicate::Pattern(a(), Pattern::new(PatternKind::Regex, "^(?i)σ.k$").unwrap()),
             Predicate::Fuzzy(a(), "ſσk".into(), 2),
+            // M145: each distance and both case settings.
+            Predicate::FuzzySubstring(a(), "ſσK".into(), 0, true),
+            Predicate::FuzzySubstring(a(), "abc".into(), 1, false),
+            Predicate::FuzzySubstring(a(), "xyzw".into(), 2, true),
             Predicate::Tokens(a(), TokenOp::Any, String::new(), None),
             Predicate::Tokens(
                 a(),
@@ -468,12 +490,15 @@ mod tests {
                 assert_eq!(decode(&good[..cut]), None, "{p:?} cut at byte {}", cut / 2);
             }
         }
-        // An unknown tag at every place one is read: the predicate, a value, an operator, a
-        // pattern kind, a token operator, an analyzer. M135: an `AnyCmp` operator is one of
+        // An unknown tag at every place one is read: the predicate (13 is known since M145), a
+        // value, an operator, a pattern kind, a token operator, an analyzer. M135: an `AnyCmp` operator is one of
         // the four orderings, so `Eq` (0) is as unknown as 5.
         let s1 = "0100000061";
         for bad in [
-            "0d".to_owned(),
+            "0e".to_owned(),
+            // M145: a distance past 2, and a case byte that is neither 0 nor 1.
+            format!("0d{s1}{s1}0301"),
+            format!("0d{s1}{s1}0002"),
             format!("0c{s1}05"),
             format!("00{s1}0009"),
             format!("00{s1}05"),

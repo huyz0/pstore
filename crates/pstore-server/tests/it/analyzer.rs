@@ -449,8 +449,10 @@ async fn what_an_analyzer_cannot_mean_is_refused() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(msg.contains(why), "{fts}: {msg:?} does not name {why:?}");
     }
+    // M155 reversed this case on purpose: `full_text_search` on `title` now declares a further
+    // text field, so the refusal kept is of a type no text field has.
     let body = json!({"durability": "durable",
-        "schema": {"title": {"type": "string", "full_text_search": true}},
+        "schema": {"title": {"type": "int", "full_text_search": true}},
         "documents": [{"id": "x", "vector": [1.0, 0.5], "attributes": {"title": "t"}}]});
     let (s, b) = send(a, "PUT", "/v1/indexes/docs/documents", &body).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");

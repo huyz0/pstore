@@ -503,6 +503,59 @@ async fn an_empty_text_field_is_filled_by_the_first_fold_with_text() {
     assert_eq!(body(&a, "alpha").await, ["a"]);
 }
 
+/// A row whose `field` is an array of strings (M150).
+fn arrayed(id: &str, field: &str, texts: &[&str]) -> Document {
+    let mut d = doc(id, 4);
+    d.attrs.insert(
+        field.to_owned(),
+        Value::Array(texts.iter().map(|t| Value::Str((*t).to_owned())).collect()),
+    );
+    d
+}
+
+#[tokio::test]
+async fn an_array_of_strings_is_text_to_the_fold_and_to_the_door() {
+    // M150 criterion 5: the first fold of array rows only records its field and indexes them,
+    // and a second field's array row is refused as a second field's string row is.
+    let (store, _v, a, b) = three().await;
+    folded(
+        &a,
+        vec![
+            arrayed("a", "body", &["", "alpha beta"]),
+            arrayed("e", "body", &[""]),
+        ],
+    )
+    .await;
+    assert_eq!(
+        text_field(&store).await,
+        "body",
+        "the fold of array rows filled nothing"
+    );
+    assert_eq!(body(&a, "alpha").await, ["a"]);
+    refresh(&b).await;
+    // `[]` and `[""]` hold no text, so a second field's are no conflict, as an absent one is not.
+    b.write(
+        "idx",
+        vec![arrayed("c", "title", &[]), arrayed("d", "title", &[""])],
+    )
+    .await
+    .expect("an array with no text was read as a second text field");
+    let err = b
+        .write("idx", vec![arrayed("b", "title", &["beta"])])
+        .await
+        .expect_err("a second text field was accepted as an array");
+    assert!(
+        matches!(
+            err,
+            EngineError::SchemaConflict {
+                what: "the text field",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_patch_that_adds_text_fills_the_text_field() {
     let (store, _v, a, _b) = three().await;

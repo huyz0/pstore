@@ -309,3 +309,215 @@ async fn a_pattern_decides_a_delete_by_filter_as_a_query_does() {
     }
     assert_eq!(rows.len(), 300);
 }
+
+/// M145's reference, written here: some substring of some string element within `k` edits
+/// of `q`, every start and end tried, lowercased when case-insensitive (the rows below are
+/// ASCII, `é` and `É`, where lowercasing and the index's fold agree).
+fn fuzzy_substring(q: &str, k: usize, case: bool, v: &Value) -> bool {
+    let key = |s: &str| -> Vec<char> {
+        s.chars()
+            .map(|c| {
+                if case {
+                    c
+                } else {
+                    c.to_lowercase().next().unwrap()
+                }
+            })
+            .collect()
+    };
+    let q = key(q);
+    let hit = |s: &str| {
+        let s = key(s);
+        (0..=s.len()).any(|a| (a..=s.len()).any(|b| levenshtein(&s[a..b], &q) <= k))
+    };
+    match v {
+        Value::String(s) => hit(s),
+        Value::Array(items) => items.iter().any(|e| e.as_str().is_some_and(hit)),
+        _ => false,
+    }
+}
+
+/// The vendor's options: `[{3, 0}, {6, 1}]` unless given.
+fn vendor(attr: &str, q: &str, steps: &[(u64, u64)], case: Option<bool>) -> Value {
+    let steps: Vec<Value> = steps
+        .iter()
+        .map(|(m, d)| json!({"min_query_chars": m, "distance": d}))
+        .collect();
+    let mut o = json!({"max_edit_distance": steps});
+    if let Some(c) = case {
+        o["case_sensitive"] = json!(c);
+    }
+    json!([attr, "Fuzzy", q, o])
+}
+
+const STEPS: &[(u64, u64)] = &[(3, 0), (6, 1)];
+
+#[tokio::test]
+async fn the_vendor_fuzzy_picks_its_distance_by_query_length() {
+    // M145 criterion 2, before and after the fold.
+    let a = api();
+    let docs: Vec<Value> = [
+        ("t1", json!("turbopuffer inc")),
+        ("t2", json!("turbo")),
+        ("t3", json!("zzz")),
+        ("t4", json!(["x", "turbo"])),
+    ]
+    .into_iter()
+    .map(|(id, v)| json!({"id": id, "vector": [1.0, 0.5], "attributes": {"s": v}}))
+    .collect();
+    write(&a, json!({"documents": docs})).await;
+    let all: BTreeSet<String> = ["t1", "t2", "t3", "t4"].map(String::from).into();
+    let set = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
+    for folded in [false, true] {
+        if folded {
+            fold(&a).await;
+        }
+        let at = format!("folded: {folded}");
+        assert_eq!(
+            ids(&a, &vendor("s", "turbopufer", STEPS, None)).await,
+            set(&["t1"]),
+            "{at}"
+        );
+        // Five characters take `k = 0`, six take `k = 1`: a substitution, then an insertion.
+        assert_eq!(
+            ids(&a, &vendor("s", "turxo", STEPS, None)).await,
+            set(&[]),
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &vendor("s", "turbxo", STEPS, None)).await,
+            set(&["t1", "t2", "t4"]),
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &vendor("s", "tu", STEPS, None)).await,
+            set(&[]),
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &json!(["Not", vendor("s", "tu", STEPS, None)])).await,
+            all,
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &vendor("s", "TURBO", STEPS, Some(false))).await,
+            set(&["t1", "t2", "t4"]),
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &vendor("s", "TURBO", STEPS, None)).await,
+            set(&[]),
+            "{at}"
+        );
+        assert_eq!(
+            ids(&a, &vendor("s", "TURBO", STEPS, Some(true))).await,
+            set(&[]),
+            "{at}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_vendor_fuzzy_reads_arrays_and_decides_a_delete_by_filter() {
+    // M145 criterion 3: the reference above decides every answer.
+    let rows = [
+        ("a", json!("aAé")),
+        ("b", json!(["", "éaÉa"])),
+        ("c", json!([5])),
+        ("d", json!([])),
+        ("e", json!(5)),
+        ("f", json!("AAAA")),
+        ("g", json!(["zz", 5])),
+        ("h", json!("xaÉAx")),
+        ("i", json!(["q", "xxaaaéab"])),
+    ];
+    let filters = [
+        ("éaé", 0, false),
+        ("éaé", 0, true),
+        ("aaaa", 0, false),
+        ("aaaa", 1, true),
+        ("zzq", 1, true),
+        ("aÉa", 0, true),
+        ("aaaéaa", 1, false),
+        ("aaaéaa", 1, true),
+        ("aaaéaaéaa", 2, false),
+    ];
+    for (q, k, case) in filters {
+        // One step: `k` from `3 * (k + 1)` characters, and below that nothing matches.
+        let steps = [(3 * (k + 1), k)];
+        let f = vendor("s", q, &steps, Some(case));
+        let long = q.chars().count() as u64 >= 3 * (k + 1);
+        let want: BTreeSet<String> = rows
+            .iter()
+            .filter(|(_, v)| long && fuzzy_substring(q, k as usize, case, v))
+            .map(|(id, _)| (*id).to_owned())
+            .collect();
+        for folded in [false, true] {
+            let a = api();
+            let docs: Vec<Value> = rows
+                .iter()
+                .map(|(id, v)| json!({"id": id, "vector": [1.0, 0.5], "attributes": {"s": v}}))
+                .collect();
+            write(&a, json!({"documents": docs})).await;
+            if folded {
+                fold(&a).await;
+            }
+            assert_eq!(ids(&a, &f).await, want, "{f} folded: {folded}");
+            let before = ids(&a, &json!(["And", []])).await;
+            write(&a, json!({"delete_by_filter": f})).await;
+            fold(&a).await;
+            let after = ids(&a, &json!(["And", []])).await;
+            let kept: BTreeSet<String> = before.difference(&want).cloned().collect();
+            assert_eq!(after, kept, "delete {f} folded: {folded}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn what_the_vendor_fuzzy_cannot_mean_is_refused() {
+    // M145 criterion 4.
+    let a = api();
+    seeded(&a, 10).await;
+    let step =
+        |m: Value, d: Value| json!({"max_edit_distance": [{"min_query_chars": m, "distance": d}]});
+    let ok = step(json!(3), json!(0));
+    for f in [
+        json!(["s", "Fuzzy", 5, ok]),
+        json!(["s", "Fuzzy", "a".repeat(257), ok]),
+        json!(["s", "Fuzzy", "abc", null]),
+        json!(["s", "Fuzzy", "abc", {}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 3, "distance": 0}], "x": 1}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 3, "distance": 0}], "case_sensitive": 1}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": 1}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": []}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": (0..9).map(|i| json!({"min_query_chars": 3 + i, "distance": 0})).collect::<Vec<_>>()}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [5]}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 3}]}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 3, "distance": 0, "x": 1}]}]),
+        json!(["s", "Fuzzy", "abc", step(json!(-3), json!(0))]),
+        json!(["s", "Fuzzy", "abc", step(json!(3), json!(-1))]),
+        json!(["s", "Fuzzy", "abc", step(json!(3.5), json!(0))]),
+        json!(["s", "Fuzzy", "abc", step(json!(12), json!(3))]),
+        json!(["s", "Fuzzy", "abc", step(json!(5), json!(1))]),
+        json!(["s", "Fuzzy", "abc", step(json!(8), json!(2))]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 6, "distance": 1}, {"min_query_chars": 6, "distance": 1}]}]),
+        json!(["s", "Fuzzy", "abc", {"max_edit_distance": [{"min_query_chars": 6, "distance": 1}, {"min_query_chars": 3, "distance": 0}]}]),
+        json!(["s", "Fuzzy", "abc", ok, {}]),
+        json!(["$id", "Fuzzy", "abc", ok]),
+        json!(["", "Fuzzy", "abc", ok]),
+        json!(["s", "Fuzzy", "abc"]),
+    ] {
+        let q = json!({"rank_by": ["id", "asc"], "filters": f});
+        let (s, b) = send(&a, "POST", "/v1/indexes/docs/query", &q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{f} was accepted: {b}");
+    }
+    // The M15 shape answers as before, and the vendor's `false` and an omitted flag are the
+    // two settings, not refusals.
+    ids(&a, &json!(["s", "Fuzzy", {"value": "abc", "max_edits": 1}])).await;
+    ids(&a, &vendor("s", "abc", &[(3, 0)], Some(false))).await;
+    ids(
+        &a,
+        &vendor("s", "abcdefghi", &[(3, 0), (6, 1), (9, 2)], None),
+    )
+    .await;
+}

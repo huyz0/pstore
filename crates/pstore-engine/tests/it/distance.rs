@@ -206,6 +206,7 @@ async fn the_metric_survives_a_head_round_trip() {
                 trigram: Vec::new(),
                 fields: Default::default(),
                 types: Default::default(),
+                texts: Default::default(),
             },
         );
     }

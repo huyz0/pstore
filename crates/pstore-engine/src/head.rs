@@ -87,10 +87,17 @@ pub struct IndexSchema {
     /// The **stored** width of each named dense field the index's rows have carried (M98), as
     /// `dims` is `vector`'s, which is never a key. Filled by the fold, never changed.
     pub fields: BTreeMap<String, u32>,
+    /// The index's **further** text fields (M152), each with its own analyzer and BM25
+    /// parameters; empty for none. Recorded by the first fold, never changed. No name is both
+    /// one of these and `text_field`.
+    pub texts: BTreeMap<String, pstore_format::text::FullText>,
     /// Each attribute's recorded type (M173): recorded by the fold that first reads one, then
     /// never changed. A write reads its attributes by them.
     pub types: BTreeMap<String, pstore_format::typed::Kind>,
 }
+
+/// The most further text fields an index may declare (M152).
+pub const MAX_TEXTS: usize = 8;
 
 impl IndexSchema {
     /// The width a client writes and queries: `dims` less what the metric's transform adds.
@@ -540,15 +547,28 @@ impl Head {
             .iter()
             .filter(|(_, _, s, _)| !s.fields.is_empty())
             .collect();
+        // M152: the further text fields are last, and force `keys_since`, which has no
+        // presence marker: a forced `None` is written as `u64::MAX`, which no epoch reaches.
+        let texts: Vec<_> = all
+            .iter()
+            .filter(|(_, _, s, _)| !s.texts.is_empty())
+            .collect();
+        debug_assert!(
+            self.keys_since != Some(u64::MAX),
+            "keys_since is an epoch, and u64::MAX means none"
+        );
         // M129: the applied outcomes follow, and force the widths.
         // M132: `keys_since` follows, and forces the outcomes.
-        // M173: the recorded types are last, and force `keys_since`.
+        // M173: the recorded types are last, and force the text fields' section (empty if
+        // none), which forces `keys_since`.
         let typed: Vec<_> = all
             .iter()
             .filter(|(_, _, s, _)| !s.types.is_empty())
             .collect();
         let types = !typed.is_empty();
-        let outs = !self.outcomes.is_empty() || self.keys_since.is_some() || types;
+        let texted = !texts.is_empty() || types;
+        let since = self.keys_since.is_some() || texted;
+        let outs = !self.outcomes.is_empty() || since;
         let wide = !widths.is_empty() || outs;
         let ext = wide || !self.externals.is_empty();
         let lens = ext || self.indexes.values().flatten().any(|r| r.len.is_some());
@@ -662,11 +682,19 @@ impl Head {
                 put_str(&mut out, key);
             }
         }
-        // ⚠️ M173: `u64::MAX` for none when the types force it: no epoch reaches it.
-        match self.keys_since {
-            Some(since) => out.extend_from_slice(&since.to_le_bytes()),
-            None if types => out.extend_from_slice(&u64::MAX.to_le_bytes()),
-            None => {}
+        if since {
+            out.extend_from_slice(&self.keys_since.unwrap_or(u64::MAX).to_le_bytes());
+        }
+        if texted {
+            out.extend_from_slice(&(texts.len() as u32).to_le_bytes());
+            for (kind, at, s, name) in texts {
+                put_ref(&mut out, *kind, *at, *name);
+                out.extend_from_slice(&(s.texts.len() as u32).to_le_bytes());
+                for (field, fts) in &s.texts {
+                    put_str(&mut out, field);
+                    put_str(&mut out, &fts.encode());
+                }
+            }
         }
         if types {
             out.extend_from_slice(&(typed.len() as u32).to_le_bytes());
@@ -754,6 +782,7 @@ impl Head {
                     trigram: Vec::new(),
                     fields: Default::default(),
                     types: Default::default(),
+                    texts: BTreeMap::new(),
                 },
             );
         }
@@ -811,6 +840,7 @@ impl Head {
                     trigram: Vec::new(),
                     fields: Default::default(),
                     types: Default::default(),
+                    texts: BTreeMap::new(),
                 },
             ));
         }
@@ -1010,16 +1040,52 @@ impl Head {
         if c.at_end() {
             return Ok(h);
         }
-        let since = c.u64()?;
-        // M173: the sentinel stands for none only before the types, which it was written for.
+        // M152: `u64::MAX` is a forced `None`, wherever it appears.
+        h.keys_since = Some(c.u64()?).filter(|s| *s != u64::MAX);
+        // ⚠️ M152: end of buffer here is "no further text fields". A decoder from before it
+        // refuses anything after `keys_since`, so every node reads this before any writes it.
         if c.at_end() {
-            if since == u64::MAX {
-                return Err(EngineError::CorruptHead);
-            }
-            h.keys_since = Some(since);
             return Ok(h);
         }
-        h.keys_since = (since != u64::MAX).then_some(since);
+        for _ in 0..c.u32()? {
+            let kind = c.u8()?;
+            let schema = match kind {
+                0 => {
+                    let name = c.string()?;
+                    h.schemas.get_mut(&name)
+                }
+                1 => {
+                    let at = c.u32()? as usize;
+                    h.dropped.get_mut(at).map(|(_, _, s)| s)
+                }
+                _ => None,
+            }
+            .ok_or(EngineError::CorruptHead)?;
+            let n = c.u32()? as usize;
+            if n > MAX_TEXTS {
+                return Err(EngineError::CorruptHead);
+            }
+            for _ in 0..n {
+                let field = c.string()?;
+                // No HEAD this wrote names a field it could not have been declared with, or one
+                // that is also the primary.
+                if field.is_empty()
+                    || field.starts_with('$')
+                    || field == schema.text_field
+                    || schema.texts.contains_key(&field)
+                {
+                    return Err(EngineError::CorruptHead);
+                }
+                let fts = pstore_format::text::FullText::decode(&c.string()?)
+                    .ok_or(EngineError::CorruptHead)?;
+                schema.texts.insert(field, fts);
+            }
+        }
+        // M173: end of buffer here is "no recorded types"; they follow the text fields, which
+        // they force.
+        if c.at_end() {
+            return Ok(h);
+        }
         for _ in 0..c.u32()? {
             let kind = c.u8()?;
             let schema = match kind {
@@ -1737,8 +1803,8 @@ mod tests {
     }
 
     /// M173 criterion 6: the recorded types round-trip, live and dropped, beside an absent
-    /// `keys_since`, which reads back absent; the sentinel with no types after it, and bytes
-    /// after the types, are refused.
+    /// `keys_since`, which reads back absent, after the text-field section (M152) they force;
+    /// bytes after the types are refused.
     #[test]
     fn recorded_types_round_trip_after_keys_since() -> Result<(), EngineError> {
         use pstore_format::typed::Kind;
@@ -1777,10 +1843,15 @@ mod tests {
         }
         let bytes = none.encode();
         assert_eq!(Head::decode(&bytes)?, none);
-        // The sentinel alone, as if the types were cut away: refused.
-        let mut sentinel = none.clone();
-        sentinel.keys_since = Some(u64::MAX);
-        assert!(Head::decode(&sentinel.encode()).is_err());
+        // The types force an empty text-field section (M152) before them; beside a text field
+        // they follow it.
+        let mut texted = h.clone();
+        if let Some(s) = texted.schemas.get_mut("a") {
+            s.texts
+                .insert("notes".to_owned(), pstore_format::text::FullText::default());
+        }
+        assert_eq!(Head::decode(&texted.encode())?, texted);
+        assert_eq!(types(&Head::decode(&texted.encode())?), types(&back));
         let mut longer = all.encode();
         longer.push(0);
         assert!(Head::decode(&longer).is_err());
@@ -1881,6 +1952,7 @@ mod tests {
                 ("owner".to_owned(), pstore_format::typed::Kind::Uuid),
                 ("seq".to_owned(), pstore_format::typed::Kind::Uint64),
             ]),
+            texts: Default::default(),
         };
         h.schemas.insert("a".to_owned(), schema.clone());
         h.schema_rejects.insert("a".to_owned(), 3);
@@ -1914,9 +1986,9 @@ mod tests {
         // makes -- and none inside a section: a `?` that read short as a default would add
         // one. (`a_truncated_head_is_refused_at_every_length_but_a_section_boundary` pins the
         // same for a HEAD whose later sections are empty.)
-        // M173: the recorded types force the outcomes and `keys_since`, so the cuts before
-        // each of those are now inside the HEAD rather than its end: two more.
-        assert_eq!(decodable.len(), 17, "{decodable:?} of {}", bytes.len());
+        // M173: the recorded types force the outcomes, `keys_since` and M152's text fields,
+        // whose `at_end` checks now each find a cut inside the HEAD: 19.
+        assert_eq!(decodable.len(), 19, "{decodable:?} of {}", bytes.len());
         for cut in &decodable {
             assert_ne!(
                 Head::decode(&bytes[..*cut])?,
@@ -1958,5 +2030,220 @@ mod tests {
         assert_eq!(dv_of(&dv1), dv_of(&dv));
         assert_eq!(key_index(&dv1), None);
         assert_eq!(unscoped(&seg1), None);
+    }
+
+    /// M152 criterion 2: a HEAD carrying every optional section before the further text
+    /// fields' -- a non-default analyzer, a trigram set, named widths, a dropped schema,
+    /// dictionaries, lengths, an external and outcomes -- with or without `keys_since`.
+    fn rich(keys_since: Option<u64>) -> Head {
+        let mut h = with_dicts();
+        h.epoch = pstore_types::Epoch(21);
+        if let Some(r) = h.indexes.get_mut("a").and_then(|r| r.first_mut()) {
+            r.len = Some(4096);
+        }
+        let fts = pstore_format::text::FullText {
+            k1: 2.0,
+            b: 0.3,
+            ..Default::default()
+        };
+        let schema = IndexSchema {
+            dims: 3,
+            text_field: "body".to_owned(),
+            metric: Metric::CosineDistance,
+            fts,
+            trigram: vec!["body".to_owned(), "tag".to_owned()],
+            fields: BTreeMap::from([("img".to_owned(), 4)]),
+            ..IndexSchema::default()
+        };
+        h.schemas.insert("a".to_owned(), schema.clone());
+        h.dropped.push(("gone".to_owned(), 9, schema));
+        h.branched.insert("a".to_owned(), 2);
+        h.externals
+            .insert("x".to_owned(), external(ExternalKind::Parquet, 3));
+        h.outcomes.push((20, "o20".to_owned()));
+        h.keys_since = keys_since;
+        h
+    }
+
+    /// `rich(None)` and `rich(Some(17))` as the parent's encoder wrote them: captured at
+    /// 4af59f2 with `cargo test -p pstore-engine --lib print_rich_for_capture -- --nocapture`,
+    /// a test that printed `hex(&rich(..).encode())` and was then replaced by this one.
+    const RICH_NONE: &str = concat!(
+        "1500000000000000000000000000000001000000010000006102000000070000006b2f312e736567",
+        "04000000070000006b2f322e73656705000000000000000000000001000000010000006103000000",
+        "04000000626f64790000000000000000000000000000000001000000010000006101010000000400",
+        "0000676f6e6509000000000000000300000004000000626f64790102000000000100000061210000",
+        "0076313b656e676c6973683b303030303b34303030303030303b3365393939393961010000000021",
+        "00000076313b656e676c6973683b303030303b34303030303030303b336539393939396102000000",
+        "0001000000610200000004000000626f64790300000074616701000000000200000004000000626f",
+        "64790300000074616701000000010000006102000000000000000000000000000000010000000100",
+        "0000610200000002ff0100000001000000610200000080200001000000010000007800100000006c",
+        "616b652f6473332e7061727175657404000000656d623319000000303034362f746e742f37302f65",
+        "78742f612f332e636f646573eb0300000000000043e2010000000000020000000001000000610100",
+        "000003000000696d670400000001000000000100000003000000696d670400000001000000140000",
+        "0000000000030000006f3230",
+    );
+    const RICH_SOME: &str = concat!(
+        "1500000000000000000000000000000001000000010000006102000000070000006b2f312e736567",
+        "04000000070000006b2f322e73656705000000000000000000000001000000010000006103000000",
+        "04000000626f64790000000000000000000000000000000001000000010000006101010000000400",
+        "0000676f6e6509000000000000000300000004000000626f64790102000000000100000061210000",
+        "0076313b656e676c6973683b303030303b34303030303030303b3365393939393961010000000021",
+        "00000076313b656e676c6973683b303030303b34303030303030303b336539393939396102000000",
+        "0001000000610200000004000000626f64790300000074616701000000000200000004000000626f",
+        "64790300000074616701000000010000006102000000000000000000000000000000010000000100",
+        "0000610200000002ff0100000001000000610200000080200001000000010000007800100000006c",
+        "616b652f6473332e7061727175657404000000656d623319000000303034362f746e742f37302f65",
+        "78742f612f332e636f646573eb0300000000000043e2010000000000020000000001000000610100",
+        "000003000000696d670400000001000000000100000003000000696d670400000001000000140000",
+        "0000000000030000006f32301100000000000000",
+    );
+
+    /// M152 criterion 2: a HEAD with no further text fields is byte for byte the parent's.
+    #[test]
+    fn a_head_without_further_fields_writes_the_parents_bytes() {
+        assert_eq!(hex(&rich(None).encode()), RICH_NONE);
+        assert_eq!(hex(&rich(Some(17)).encode()), RICH_SOME);
+    }
+
+    /// The further fields `multi` declares in M152's criterion 1.
+    fn further() -> BTreeMap<String, pstore_format::text::FullText> {
+        use pstore_format::text::{Analyzer, FullText, Language};
+        BTreeMap::from([
+            (
+                "title".to_owned(),
+                FullText {
+                    analyzer: Analyzer {
+                        language: Language::English,
+                        stemming: true,
+                        remove_stopwords: true,
+                        ..Analyzer::default()
+                    },
+                    k1: 2.0,
+                    b: 0.3,
+                },
+            ),
+            (
+                "tags".to_owned(),
+                FullText {
+                    analyzer: Analyzer {
+                        case_sensitive: true,
+                        ..Analyzer::default()
+                    },
+                    k1: 0.8,
+                    b: 1.0,
+                },
+            ),
+        ])
+    }
+
+    /// `rich(keys_since)` with further fields on its live schema and on its dropped one.
+    fn texted(keys_since: Option<u64>) -> Head {
+        let mut h = rich(keys_since);
+        if let Some(s) = h.schemas.get_mut("a") {
+            s.texts = further();
+        }
+        if let Some((_, _, s)) = h.dropped.first_mut() {
+            s.texts = further().into_iter().take(1).collect();
+        }
+        h
+    }
+
+    /// M152 criterion 2: further fields round-trip, live and dropped, and a forced
+    /// `keys_since` of `None` reads back as `None`.
+    #[test]
+    fn further_fields_round_trip_live_and_dropped() -> Result<(), EngineError> {
+        for keys_since in [None, Some(17)] {
+            let h = texted(keys_since);
+            let back = Head::decode(&h.encode())?;
+            assert_eq!(back, h);
+            assert_eq!(back.keys_since, keys_since);
+            assert_eq!(back.dropped.first().map(|d| d.2.texts.len()), Some(1));
+        }
+        // Alone, so every earlier optional section is forced before it.
+        let mut alone = Head::default();
+        alone.schemas.insert(
+            "a".to_owned(),
+            IndexSchema {
+                texts: further(),
+                ..IndexSchema::default()
+            },
+        );
+        assert_eq!(Head::decode(&alone.encode())?, alone);
+        // Only on a dropped schema.
+        let mut dropped = Head::default();
+        dropped.dropped.push((
+            "gone".to_owned(),
+            3,
+            IndexSchema {
+                texts: further(),
+                ..IndexSchema::default()
+            },
+        ));
+        assert_eq!(Head::decode(&dropped.encode())?, dropped);
+        Ok(())
+    }
+
+    /// `rich(Some(17))`'s bytes, then a further-fields section of one record for live `a`.
+    fn with_section(names: &[&str]) -> Vec<u8> {
+        let mut out = rich(Some(17)).encode();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.push(0);
+        put_str(&mut out, "a");
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for n in names {
+            put_str(&mut out, n);
+            put_str(&mut out, &pstore_format::text::FullText::default().encode());
+        }
+        out
+    }
+
+    /// M152 criterion 5: a cut anywhere inside the section, and each impossible record, is
+    /// `CorruptHead`.
+    #[test]
+    fn a_damaged_further_fields_section_is_a_corrupt_head() -> Result<(), EngineError> {
+        let old = rich(Some(17)).encode();
+        let bytes = texted(Some(17)).encode();
+        assert_eq!(
+            hex(bytes.get(..old.len()).ok_or(EngineError::CorruptHead)?),
+            hex(&old),
+            "the section is not last"
+        );
+        for cut in old.len() + 1..bytes.len() {
+            assert!(
+                Head::decode(bytes.get(..cut).ok_or(EngineError::CorruptHead)?).is_err(),
+                "a cut at {cut} decoded"
+            );
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(Head::decode(&longer).is_err());
+        // The fixture is well formed: one name decodes.
+        let fields = |b: &[u8]| Head::decode(b).map(|h| h.schemas.get("a").map(|s| s.texts.len()));
+        assert_eq!(fields(&with_section(&["t0"]))?, Some(1));
+        let nine: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
+        let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+        assert_eq!(
+            fields(&with_section(
+                nine.get(..8).ok_or(EngineError::CorruptHead)?
+            ))?,
+            Some(8)
+        );
+        for (why, names) in [
+            ("nine names", nine.clone()),
+            ("an empty name", vec![""]),
+            ("a reserved name", vec!["$x"]),
+            ("a repeated name", vec!["t", "t"]),
+            ("the primary's name", vec!["body"]),
+        ] {
+            assert!(
+                matches!(
+                    Head::decode(&with_section(&names)),
+                    Err(EngineError::CorruptHead)
+                ),
+                "{why} decoded"
+            );
+        }
+        Ok(())
     }
 }

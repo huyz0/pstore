@@ -86,6 +86,7 @@ const STEM: Analyzer = Analyzer {
     remove_stopwords: false,
     case_sensitive: false,
     ascii_folding: false,
+    tokenizer: pstore_format::text::Tokenizer::WordV1,
 };
 
 const VOCAB: &[&str] = &[
@@ -352,7 +353,9 @@ async fn what_a_token_predicate_cannot_mean_is_refused() {
     seeded(a, 0..10, true).await;
     for f in [
         json!(["text", "ContainsAnyToken", 5]),
-        json!(["text", "ContainsAllTokens", ["a"]]),
+        // M158: an array of strings is an operand now, the tokens of a pre-tokenized field;
+        // an array holding anything else is still refused.
+        json!(["text", "ContainsAllTokens", ["a", 5]]),
         json!(["text", "ContainsTokenSequence", null]),
     ] {
         let (s, b) = send(

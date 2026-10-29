@@ -390,6 +390,7 @@ mod tests {
                 trigram: Vec::new(),
                 fields: Default::default(),
                 types: Default::default(),
+                texts: Default::default(),
             },
         );
         assert!(taken(&h));

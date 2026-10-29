@@ -193,6 +193,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                                 trigram: Vec::new(),
                                 fields: Default::default(),
                                 types: Default::default(),
+                                texts: Default::default(),
                             },
                         )
                     })
