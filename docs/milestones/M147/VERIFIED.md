@@ -25,6 +25,13 @@ were added for them. One survivor was equivalent: past the empty return in the `
 answer, the targets are that epoch's segments, so the index is named. It is now the
 literal `true`. No `cargo mutants` run is claimed.
 
+CI's `cargo mutants` shard on the PR found one survivor the sweep above did not try: the
+retry guard in `create_index_inner` replaced with `true`, so the last attempt backs off and
+the loop answers `Lost` where a contended HEAD should answer `Contended`.
+`external_retry::a_create_that_keeps_contending_reports_contention_after_every_attempt` was
+added for it, failed with that mutation applied by hand
+(.harness/m147-ci-mutation-red.log) and passes without it (.harness/m147-ci-mutation-green.log).
+
 1. PASS: `created_index_survives_restart`, `a_created_index_exists_on_every_read`,
    `an_index_emptied_by_deletes_and_compaction_exists_on_every_read`. List, summary (0
    segments, 0 documents, the declared dims and metric), vector query, `rank_by`,
