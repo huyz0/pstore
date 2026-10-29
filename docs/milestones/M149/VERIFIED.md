@@ -98,8 +98,9 @@ The engine and server suites passed after the rebase (.harness/m149-m173-suite.l
 
 Code review: see the commit message.
 
-CI's mutation shard missed `-` → `+` and `-` → `/` in `set_read_only`'s retry guard
-(`attempt < MAX_COMMIT_ATTEMPTS - 1`): no test made every attempt contend, the one case
-where the last error tells `Contended` from `Lost`. M86's
-`a_flag_that_keeps_contending_reports_contention_after_every_attempt` now does, and fails
-under both (.harness/m149-ci-mutation-red.log).
+CI's mutation shards missed seven mutants of `set_read_only`'s retry guard
+(`attempt < MAX_COMMIT_ATTEMPTS - 1`): the guard made `true` or `false`, `<` made `==`, `>`
+or `<=`, and `-` made `+` or `/`. No test made every attempt contend, the one case where
+the attempts counted and the last error, `Contended` rather than `Lost`, show the guard.
+M86's `a_flag_that_keeps_contending_reports_contention_after_every_attempt` now does, and
+fails under all seven (.harness/m149-ci-mutation-red.log).
