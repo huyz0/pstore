@@ -466,3 +466,47 @@ async fn a_prefix_leg_costs_no_round() {
     assert_eq!(d1, d0, "depth");
     assert!(r1 > r0 && r1 <= r0 + 2, "{r0} then {r1} requests");
 }
+
+/// M181 criterion 3: a query token over `max_token_length` matches nothing, since every
+/// stored term came from a raw token within it -- never "no constraint".
+#[tokio::test]
+async fn over_limit_query_tokens_match_nothing() {
+    use pstore_query::{Predicate, TokenOp};
+    let a = Analyzer {
+        max_token_length: Some(5),
+        ..Analyzer::default()
+    };
+    let admitted_in = |rows: &[&str], op: TokenOp, q: &str| -> Vec<usize> {
+        let p = Predicate::Tokens(FIELD.to_owned(), op, q.to_owned(), None).bound(&a);
+        rows.iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                let attrs = BTreeMap::from([(FIELD.to_owned(), Value::Str((*r).to_string()))]);
+                p.admits("id", &attrs)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let admitted = |op: TokenOp, q: &str| admitted_in(&["abcde x", "x"], op, q);
+    assert!(admitted(TokenOp::All, "abcde abcdefg").is_empty());
+    assert!(admitted(TokenOp::Sequence, "abcde abcdefg").is_empty());
+    assert!(admitted(TokenOp::All, "abcdefg").is_empty());
+    assert_eq!(admitted(TokenOp::Any, "abcde abcdefg"), [0]);
+    assert!(admitted(TokenOp::AllPrefix, "x abcdefg").is_empty());
+    assert_eq!(admitted(TokenOp::AnyPrefix, "x abcdefg"), [0, 1]);
+    // Within the limit, as before: the controls.
+    assert_eq!(admitted(TokenOp::AllPrefix, "x abc"), [0]);
+    assert_eq!(admitted(TokenOp::All, "abcde"), [0]);
+    // A prefix meets the row's tokens as the index stored them: `abcdefgh` was dropped.
+    assert!(admitted_in(&["abcdefgh y"], TokenOp::AnyPrefix, "q abc").is_empty());
+    assert_eq!(admitted_in(&["abcde y"], TokenOp::AnyPrefix, "q abc"), [0]);
+
+    let segment: &[&[&str]] = &[&["abcde", "x"], &["x"]];
+    assert!(run(&a, &[segment], "abcdefg", false).await.is_empty());
+    assert!(run(&a, &[segment], "abcdefg", true).await.is_empty());
+    assert_eq!(
+        run(&a, &[segment], "x abcdefg", true).await,
+        run(&a, &[segment], "x", false).await
+    );
+    assert_eq!(run(&a, &[segment], "x abcde", true).await.len(), 2);
+}
