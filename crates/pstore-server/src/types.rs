@@ -644,9 +644,21 @@ pub(crate) fn token_operand(v: &serde_json::Value) -> Result<String, String> {
 pub struct MultiQueryResponse {
     /// Each query's ranking, in request order.
     pub results: Vec<Vec<ResultRow>>,
+    /// Each query's `aggregations`, or `null` (M164); absent when no query aggregates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregations: Option<Vec<Option<Totals>>>,
+    /// Each query's `aggregation_groups`, or `null` (M164); absent when no query aggregates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation_groups: Option<Vec<Option<Vec<Totals>>>>,
+    /// Each query's `facets`, or `null` (M164); absent when no query has facets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<Vec<Option<serde_json::Value>>>,
     /// Freshness per query, and the request's cost.
     pub meta: MultiQueryMeta,
 }
+
+/// One aggregation's labels and totals, or one group's key and totals (M12).
+pub(crate) type Totals = serde_json::Map<String, serde_json::Value>;
 
 /// [`MultiQueryResponse`]'s meta.
 #[derive(Debug, Clone, Serialize)]
@@ -663,6 +675,10 @@ pub struct MultiQueryMeta {
     pub session: String,
     /// Each query's `staleness_ms` (M11.2).
     pub staleness_ms: Vec<u64>,
+    /// The epoch each query's facets were counted at, or `null` (M164); absent when no
+    /// query has facets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets_epochs: Option<Vec<Option<u64>>>,
 }
 
 /// The answer to a query.

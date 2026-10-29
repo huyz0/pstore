@@ -11,7 +11,7 @@ mod replica;
 
 pub use applied::{
     Affected, Applied, IdempotencyKey, Mark, OUTCOMES_KEPT, OperationId, Outcome, applying,
-    applying_with_ids, keyed, stamped,
+    applying_with_ids, keyed, stamp_footprint, stamped,
 };
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
@@ -25,7 +25,7 @@ use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
 use pstore_format::{Document, Filter, Segment};
 use pstore_types::{Epoch, LaneId, Seq, TenantId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The key one lane's bundle lives at. **Derived**, so a successor computes it rather than
@@ -540,6 +540,83 @@ struct Memtable {
     pruned: u64,
     /// Bumped whenever the rows change, so a cached fresh segment knows it is stale.
     generation: u64,
+    /// M141: the summed [`Document::footprint`] of every row in `pending`.
+    pending_bytes: u64,
+    /// M141: bytes held by [`BufferReservation`]s of requests not yet finished: the sum of
+    /// `reservations`' remainders.
+    reserved: u64,
+    /// M141: each live reservation's bytes not yet converted into rows, by its id.
+    reservations: HashMap<u64, u64>,
+    /// M141: the id the next reservation takes.
+    next_reservation: u64,
+}
+
+tokio::task_local! {
+    /// The reservation a request's buffer calls convert into rows (M141).
+    static RESERVATION: u64;
+}
+
+/// Why [`Engine::reserve_buffer`] refused (M141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferRefusal {
+    /// A batched write would take the pending rows past the flush bound: flush, then retry.
+    Flush,
+    /// The tenant's pending and unfolded rows would pass its bound: refuse the write.
+    Full,
+}
+
+/// The bounds a write's reservation is checked against (M141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferBounds {
+    /// Pending bytes past which a batched write first flushes; `None` for no such check.
+    pub flush_at: Option<u64>,
+    /// Pending plus unfolded bytes past which a write is refused.
+    pub cap: u64,
+}
+
+/// What the buffered-bytes accounting holds now (M141's tests and measurements).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Buffered {
+    /// The footprint of the rows buffered and not yet in a bundle.
+    pub pending: u64,
+    /// Bytes reserved by requests still running.
+    pub reserved: u64,
+    /// The encoded size of flushed bundles not yet known folded.
+    pub unfolded: u64,
+}
+
+/// A request's share of its tenant's buffer, held until the request finishes (M141).
+/// Dropping it, on any path, returns the bytes; the rows it buffered stay counted.
+#[derive(Debug)]
+pub struct BufferReservation<'a> {
+    mem: &'a Mutex<Memtable>,
+    id: u64,
+}
+
+impl Drop for BufferReservation<'_> {
+    fn drop(&mut self) {
+        let mut m = self
+            .mem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = m.reservations.remove(&self.id).unwrap_or(0);
+        m.reserved = m.reserved.saturating_sub(left);
+    }
+}
+
+impl BufferReservation<'_> {
+    /// Runs `f` so the rows it buffers convert this reservation into rows (M141): each
+    /// buffer call moves its rows' footprint out of the reservation, so a running request
+    /// is counted once. Rows past what was reserved are charged as rows, unchecked: the
+    /// reservation is trued up to what was stored.
+    pub async fn scope<F: std::future::Future>(&self, f: F) -> F::Output {
+        RESERVATION.scope(self.id, f).await
+    }
+}
+
+/// The footprint of `rows`.
+fn footprint<'a>(rows: impl IntoIterator<Item = &'a Document>) -> u64 {
+    rows.into_iter().map(Document::footprint).sum()
 }
 
 impl Memtable {
@@ -551,6 +628,17 @@ impl Memtable {
         // M129: an applied request's operations carry its id to the fold.
         applied::stamp(&mut docs, is_tombstone);
         self.generation += 1;
+        let bytes = footprint(&docs);
+        self.pending_bytes += bytes;
+        if let Some(left) = RESERVATION
+            .try_with(|id| *id)
+            .ok()
+            .and_then(|id| self.reservations.get_mut(&id))
+        {
+            let moved = bytes.min(*left);
+            *left -= moved;
+            self.reserved -= moved;
+        }
         self.pending
             .entry(index.to_owned())
             .or_default()
@@ -3945,6 +4033,50 @@ impl<S: BlobStore> Engine<S> {
         })
     }
 
+    /// Reserves `bytes` of this tenant's buffer for one request, or refuses (M141). Checked
+    /// and charged under the memtable lock, so two requests cannot both pass a bound only
+    /// one of them fits. **Issues no request.**
+    ///
+    /// # Errors
+    /// [`BufferRefusal::Full`] when the pending rows, the reservations and the unfolded
+    /// bundles would pass `bounds.cap`; otherwise [`BufferRefusal::Flush`] when
+    /// `bounds.flush_at` is set and the pending rows plus the reservations would pass it.
+    pub fn reserve_buffer(
+        &self,
+        bytes: u64,
+        bounds: BufferBounds,
+    ) -> Result<BufferReservation<'_>, BufferRefusal> {
+        let mut m = self.mem();
+        let held = m.pending_bytes.saturating_add(m.reserved);
+        let after = held.saturating_add(bytes);
+        // The cap first: a flush moves rows from pending to unfolded and cannot make room,
+        // so a write that cannot fit is refused before it spends one.
+        let unfolded: u64 = m.stamps.range(m.pruned..).map(|(_, (_, b))| *b).sum();
+        if after.saturating_add(unfolded) > bounds.cap {
+            return Err(BufferRefusal::Full);
+        }
+        if bounds.flush_at.is_some_and(|at| after > at) {
+            return Err(BufferRefusal::Flush);
+        }
+        m.reserved = m.reserved.saturating_add(bytes);
+        let id = m.next_reservation;
+        m.next_reservation += 1;
+        m.reservations.insert(id, bytes);
+        drop(m);
+        Ok(BufferReservation { mem: &self.mem, id })
+    }
+
+    /// What the buffered-bytes accounting holds now (M141). **Issues no request.**
+    #[must_use]
+    pub fn buffered(&self) -> Buffered {
+        let m = self.mem();
+        Buffered {
+            pending: m.pending_bytes,
+            reserved: m.reserved,
+            unfolded: m.stamps.range(m.pruned..).map(|(_, (_, b))| *b).sum(),
+        }
+    }
+
     /// Drops the unfolded rows `head` shows another fold already folded (M9f): what a query
     /// does before pairing rows with a HEAD, done by the paths that only report. A HEAD older
     /// than a prune this engine already did changes nothing.
@@ -4351,8 +4483,13 @@ impl<S: BlobStore> Engine<S> {
         let mut batch: BTreeMap<String, Vec<Document>> = BTreeMap::new();
         for (idx, n) in counts {
             if let Some(rows) = m.pending.get_mut(idx) {
-                batch.insert(idx.clone(), rows.drain(..(*n).min(rows.len())).collect());
-                if rows.is_empty() {
+                let moved: Vec<Document> = rows.drain(..(*n).min(rows.len())).collect();
+                let empty = rows.is_empty();
+                // M141: exactly the rows that moved stop being pending; rows buffered during
+                // the PUT stay behind, and stay charged.
+                m.pending_bytes = m.pending_bytes.saturating_sub(footprint(&moved));
+                batch.insert(idx.clone(), moved);
+                if empty {
                     m.pending.remove(idx);
                 }
             }
@@ -5336,7 +5473,9 @@ impl<S: BlobStore> Engine<S> {
                     // flush lock is held), so the prune below removes them.
                     if let Some(x) = drop {
                         let mut m = self.mem();
-                        m.pending.remove(x);
+                        if let Some(rows) = m.pending.remove(x) {
+                            m.pending_bytes = m.pending_bytes.saturating_sub(footprint(&rows));
+                        }
                         m.generation += 1;
                         // M17: an uncertain write's rows of it are gone too, so resolving it
                         // must not drain the index's newer rows in their place.

@@ -39,11 +39,14 @@ pub struct RequestLimits {
     tenant_active: usize,
     reserved_body_bytes: usize,
     body_read_timeout: Duration,
+    tenant_flush_bytes: u64,
+    tenant_buffered_bytes: u64,
 }
 
 impl Default for RequestLimits {
     /// Version 1: 2 MiB bodies, 64 active requests, 8 per tenant, a 128 MiB body pool and a
-    /// 30 s body-read deadline.
+    /// 30 s body-read deadline; and (M141) a tenant's batched rows flushed past 8 MiB and its
+    /// buffered rows bounded at 64 MiB.
     fn default() -> Self {
         Self {
             body_bytes: 2 << 20,
@@ -51,6 +54,8 @@ impl Default for RequestLimits {
             tenant_active: 8,
             reserved_body_bytes: 128 << 20,
             body_read_timeout: Duration::from_secs(30),
+            tenant_flush_bytes: 8 << 20,
+            tenant_buffered_bytes: 64 << 20,
         }
     }
 }
@@ -73,6 +78,9 @@ pub enum LimitsError {
     /// The body pool cannot hold one maximum body.
     #[error("request limits: reserved_body_bytes is smaller than body_bytes")]
     PoolBelowBody,
+    /// A tenant's buffer bound is below its flush bound (M141).
+    #[error("request limits: tenant_buffered_bytes is smaller than tenant_flush_bytes")]
+    BufferBelowFlush,
 }
 
 /// A checked way to lower [`RequestLimits`]; it starts at the defaults.
@@ -115,6 +123,20 @@ impl RequestLimitsBuilder {
         self
     }
 
+    /// Pending batched bytes past which a tenant's batched write first flushes (M141).
+    #[must_use]
+    pub fn tenant_flush_bytes(mut self, n: u64) -> Self {
+        self.0.tenant_flush_bytes = n;
+        self
+    }
+
+    /// Pending plus unfolded bytes past which a tenant's write is refused (M141).
+    #[must_use]
+    pub fn tenant_buffered_bytes(mut self, n: u64) -> Self {
+        self.0.tenant_buffered_bytes = n;
+        self
+    }
+
     /// The limits, or why they are unsafe.
     ///
     /// # Errors
@@ -139,6 +161,28 @@ impl RequestLimitsBuilder {
             if got > ceiling {
                 return Err(LimitsError::AboveDefault(name));
             }
+        }
+        for (name, got, ceiling) in [
+            (
+                "tenant_flush_bytes",
+                l.tenant_flush_bytes,
+                d.tenant_flush_bytes,
+            ),
+            (
+                "tenant_buffered_bytes",
+                l.tenant_buffered_bytes,
+                d.tenant_buffered_bytes,
+            ),
+        ] {
+            if got == 0 {
+                return Err(LimitsError::Zero(name));
+            }
+            if got > ceiling {
+                return Err(LimitsError::AboveDefault(name));
+            }
+        }
+        if l.tenant_buffered_bytes < l.tenant_flush_bytes {
+            return Err(LimitsError::BufferBelowFlush);
         }
         if l.body_read_timeout.is_zero() {
             return Err(LimitsError::Zero("body_read_timeout_ms"));
@@ -166,6 +210,8 @@ struct Config {
     tenant_active_requests: Option<u64>,
     reserved_body_bytes: Option<u64>,
     body_read_timeout_ms: Option<u64>,
+    tenant_flush_bytes: Option<u64>,
+    tenant_buffered_bytes: Option<u64>,
 }
 
 impl RequestLimits {
@@ -214,6 +260,8 @@ impl RequestLimits {
                 d.reserved_body_bytes,
             )?)
             .body_read_timeout(timeout)
+            .tenant_flush_bytes(c.tenant_flush_bytes.unwrap_or(d.tenant_flush_bytes))
+            .tenant_buffered_bytes(c.tenant_buffered_bytes.unwrap_or(d.tenant_buffered_bytes))
             .build()
     }
 
@@ -245,6 +293,18 @@ impl RequestLimits {
     #[must_use]
     pub fn body_read_timeout(&self) -> Duration {
         self.body_read_timeout
+    }
+
+    /// Pending batched bytes past which a tenant's batched write first flushes (M141).
+    #[must_use]
+    pub fn tenant_flush_bytes(&self) -> u64 {
+        self.tenant_flush_bytes
+    }
+
+    /// Pending plus unfolded bytes past which a tenant's write is refused (M141).
+    #[must_use]
+    pub fn tenant_buffered_bytes(&self) -> u64 {
+        self.tenant_buffered_bytes
     }
 }
 
@@ -356,7 +416,7 @@ impl Ingress {
     }
 }
 
-fn too_large() -> ApiError {
+pub(crate) fn too_large() -> ApiError {
     ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "request_too_large",
@@ -364,7 +424,7 @@ fn too_large() -> ApiError {
     )
 }
 
-fn overloaded() -> ApiError {
+pub(crate) fn overloaded() -> ApiError {
     ApiError {
         retry_after: Some(1),
         ..ApiError::new(

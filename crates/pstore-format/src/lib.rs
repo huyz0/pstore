@@ -229,6 +229,20 @@ pub enum Value {
 }
 
 impl Value {
+    /// The bytes [`Document::footprint`] counts for this value: 8 for a number, bool or
+    /// instant, 16 for a UUID, a string's or byte string's bytes, and an array's elements
+    /// summed.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        match self {
+            Self::Int(_) | Self::Uint(_) | Self::Float(_) | Self::Bool(_) | Self::DateTime(_) => 8,
+            Self::Str(s) => s.len() as u64,
+            Self::Array(vs) => vs.iter().map(Self::footprint).sum(),
+            Self::Uuid(_) => 16,
+            Self::Bytes(b) => b.len() as u64,
+        }
+    }
+
     fn rank(&self) -> u8 {
         match self {
             Self::Int(_) => 0,
@@ -639,6 +653,28 @@ impl Document {
     #[must_use]
     pub fn field(&self, name: &str) -> &[Vec<f32>] {
         self.vectors.get(name).map_or(&[], VectorField::as_dense)
+    }
+
+    /// A deterministic estimate of the bytes this row holds in memory (M141): the id's
+    /// bytes, 4 per dense component, 8 per sparse pair, and per attribute its key's bytes
+    /// plus its value's. Not RSS: allocator and map overhead are
+    /// not counted.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        let vectors: usize = self
+            .vectors
+            .values()
+            .map(|field| match field {
+                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum(),
+                VectorField::Sparse(pairs) => 8 * pairs.len(),
+            })
+            .sum();
+        let attrs: u64 = self
+            .attrs
+            .iter()
+            .map(|(k, v)| k.len() as u64 + v.footprint())
+            .sum();
+        self.id.len() as u64 + vectors as u64 + attrs
     }
 
     /// The single dense vector in [`DEFAULT_FIELD`], or empty.

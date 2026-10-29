@@ -66,7 +66,7 @@ row is therefore not a claim that an existing turbopuffer SDK works against psto
 | Mixed mutation order | Filter delete, filter patch, then other writes, per write documentation | Upserts, patches, explicit deletes, filter patch, filter delete | A row touched by several operations can finish in a different state |
 | Affected counts | Actual affected counts and optional affected IDs | Submitted upsert/patch/delete counts, not actual applied counts; filter effects not represented by those counts | Clients cannot infer which conditional actions succeeded from current counters |
 | Invalid schema writes | Typed schema and write validation | Some conflicts across folds/writers are acknowledged then rejected/quarantined at fold | Durable bytes do not imply that every submitted row became searchable |
-| Multi-query | Documented atomic shared snapshot | Concurrent independent queries with individual epochs; aggregations and facets refused inside multi | Count and hits can describe different versions |
+| Multi-query | Documented atomic shared snapshot | One snapshot for legs at one level ([M131](../milestones/M131/VERIFIED.md)), aggregations and facets included ([M164](../milestones/M164/VERIFIED.md)); mixed levels or `as_of` run apart | Count and hits differ only across sub-queries at mixed levels |
 | Copy | Physical isolation, cross-region/org source configuration, optional new encryption | `copy_from_namespace` is a branch alias sharing immutable objects | Do not sell it as an isolated backup or encryption boundary |
 | Tenant identity | Bearer API key; service resolves authorization | Caller supplies `X-Pstore-Tenant`; no native authentication or quota wiring | An untrusted client must not be allowed to select another tenant through a header |
 
@@ -184,7 +184,7 @@ vector and BM25 searches use separate fields.
 | `vector_encoding` | No float/base64 response option | B, D |
 | `consistency.level` | Different shape: string modes; default eventual; session/bounded are extra | B, C |
 | single-query `rerank_by` | Windowed hand-written boosting/MMR, no model configuration `{model,attribute,query}` | F, J |
-| multi-query `queries` | 1..16 queries, entire root body; independent snapshots; no nested multi/aggregate/facets | F |
+| multi-query `queries` | 1..16 queries, entire root body; aggregations and facets per sub-query ([M164](../milestones/M164/VERIFIED.md)); no nested multi | F |
 | multi-query `rerank_by` | `["RRF", {rank_constant, weights}]` over the queries' answers ([M142](../milestones/M142/VERIFIED.md)); no model reranker | J |
 | multi-query `limit`, `offset` | Outer window beside `rerank_by`, `limit` as `n` or `{total}` ([M142](../milestones/M142/VERIFIED.md)) | Refused without `rerank_by` |
 
@@ -274,7 +274,7 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | `WriteBilling.billable_logical_bytes_written`, `query` | Blob operations and physical bytes counted; no logical pricing model |
 | `WritePerformance.server_total_ms`, `embedding_tokens`, `embedding_ms` | Not returned as this per-write contract |
 | `SingleQueryResult.rows` | `results`; row attributes nested rather than flattened |
-| `aggregations`, `aggregation_groups` | Present for standalone aggregation; no aggregate subquery in multi |
+| `aggregations`, `aggregation_groups` | Present for standalone aggregation; in a multi-query, one entry per sub-query ([M164](../milestones/M164/VERIFIED.md)) |
 | `QueryResult.performance`, `billing` | `meta.cost`, epoch, consistency, staleness, session instead |
 | `MultiQueryResult.results` | Array of row arrays, rather than sub-result objects; independent `meta.epochs` |
 | `MultiQueryResult.performance`, `billing` | Aggregate physical cost in native meta; no matching commercial envelope |
