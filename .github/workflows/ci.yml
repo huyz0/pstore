@@ -14,12 +14,14 @@ on:
   schedule:
     - cron: "0 3 * * *"
 
-# A newer push to the same PR supersedes the run in flight. Not on `main`, where every commit
-# keeps its own result, nor the nightly sweep: those are grouped by commit, because a group
-# holds one pending run and a third arrival cancels the second whatever `cancel-in-progress` says.
+# A newer push supersedes the run in flight: on a PR, and on `main`, where the newest commit
+# contains every older one and runner slots are the bottleneck. ⚠️ Until 2026-10-29 each main
+# commit kept its own run, and several delivery threads pushing to main left runs queued for
+# over two hours behind each other and behind every PR. The cost: a red main can span several
+# commits, found from the last green one. The nightly sweep is grouped by commit.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,13 +33,36 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  # Does this change need the Rust jobs? A change that touches only documentation does not:
+  # it ran the full build, test, coverage, recall, mutation and three-OS matrix for a Markdown
+  # edit. `scripts/ci-changes.py` decides, and counts as code any document a Rust source reads
+  # (`docs/deploy.md`, `docs/research`). `harness` always runs. A job skipped by `if` reports
+  # as skipped, which a required check accepts, and any doubt in the script answers `true`.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: classify
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) ./scripts/ci-changes.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" ;;
+            push) ./scripts/ci-changes.py "${{ github.event.before }}" "${{ github.sha }}" ;;
+            *) echo code=true ;;
+          esac | tee -a "$GITHUB_OUTPUT"
+
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo doc --no-deps --all-features
@@ -46,6 +71,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     services:
       # ⚠️ A service container cannot be given a command, so RustFS finds its data directory
@@ -70,16 +97,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --all-features
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: llvm-tools-preview }
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: taiki-e/install-action@cargo-llvm-cov
       # The LINE floor (D-110) and the REGION floor, both 95, in one measurement over one
       # scope: the crates that ship. A crate opts out with `ships = false` in its Cargo.toml
@@ -95,11 +126,14 @@ jobs:
   # adds a round trip must fail the build. Release mode and its own job, because a
   # gate-scale corpus does not belong in the unit suite.
   recall:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - run: ./scripts/recall.sh
       - run: ./scripts/ndcg.sh
       # The depth and byte gates at the scale their criteria are stated at. In this job and
@@ -123,18 +157,42 @@ jobs:
   # mutants, and a branch carrying several milestones holds hundreds, past GitHub's six-hour
   # job limit. `mutants` itself only gathers the shards, so the check a merge waits on keeps
   # its name.
+  #
+  # ⚠️ As many shards as the diff needs, not always twelve. Every shard builds the workspace
+  # before testing anything, so a fixed twelve held twelve runners for a diff of three
+  # mutants, or of none. `mutants-plan` lists the diff's mutants (no build) and asks for one
+  # shard per `MUTANTS_PER_SHARD`, at most 12; none when the diff has no mutants.
+  mutants-plan:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-mutants
+      - id: plan
+        run: |
+          ./scripts/mutants.sh --list > mutants.txt
+          ./scripts/mutants-plan.py "$(grep -c . mutants.txt || true)" | tee -a "$GITHUB_OUTPUT"
+
   mutants-shard:
-    if: github.event_name == 'pull_request'
+    needs: mutants-plan
+    if: needs.mutants-plan.outputs.shards != '0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: ${{ fromJSON(needs.mutants-plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: taiki-e/install-action@cargo-mutants
       - uses: taiki-e/install-action@nextest
       # MUTANTS_TIMEOUT: a mutant caught late, two to a runner, needs more than 300 s to be
@@ -142,21 +200,26 @@ jobs:
       # mutant's first failing test, not at the end of its test binary (scripts/mutants.sh).
       - run: ./scripts/mutants.sh
         env:
-          MUTANTS_SHARD: "${{ matrix.shard }}/12"
+          MUTANTS_SHARD: "${{ matrix.shard }}/${{ needs.mutants-plan.outputs.shards }}"
           MUTANTS_TIMEOUT: "600"
           MUTANTS_TEST_TOOL: nextest
 
   mutants:
-    needs: mutants-shard
+    needs: [changes, mutants-plan, mutants-shard]
     # Not on a cancelled run: a superseded PR run would otherwise end with a red `mutants`.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      # Every shard green, or -- on a push, which runs no shard -- every shard skipped.
+      # Every shard green; or no shard, because this is a push, the change needs no Rust jobs,
+      # or the plan found no mutants. ⚠️ A plan that failed is red here, never "no shards".
       - run: |
-          r="${{ needs.mutants-shard.result }}"
-          echo "mutants-shard: $r"
-          [ "$r" = success ] || [ "$r" = skipped ]
+          c="${{ needs.changes.result }}" p="${{ needs.mutants-plan.result }}"
+          s="${{ needs.mutants-shard.result }}" n="${{ needs.mutants-plan.outputs.shards }}"
+          echo "changes: $c  mutants-plan: $p ($n shards)  mutants-shard: $s"
+          [ "$c" = success ] || exit 1
+          [ "$s" = success ] && exit 0
+          [ "$s" = skipped ] || exit 1
+          [ "$p" = skipped ] || { [ "$p" = success ] && [ "$n" = 0 ]; }
 
   # The full sweep, sharded. Shards need no runtime coordination -- each one discovers every
   # mutant and selects its own subset -- so this is a matrix and nothing else.
@@ -171,6 +234,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: taiki-e/install-action@cargo-mutants
       # ⚠️ Every shard must be run with the same denominator or the results are meaningless:
       # they do not compare notes, they each filter the same enumeration.
@@ -180,12 +244,15 @@ jobs:
   # `unsafe_code = "forbid"` at the workspace root makes a stray unsafe block a
   # compile error, and miri checks the one crate that is allowed to have them.
   unsafe-audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with: { components: miri }
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - name: Only pstore-kernel may relax the unsafe_code lint
         run: |
           offenders=$(grep -rlE '^\s*unsafe_code\s*=\s*"(allow|warn)"' --include=Cargo.toml . \
@@ -219,6 +286,8 @@ jobs:
       - run: ./scripts/selftest-coverage-mismatch.sh
       - run: ./scripts/check-milestone-ids.py
       - run: ./scripts/check-milestone-ids.py --self-test
+      - run: ./scripts/ci-changes.py --self-test
+      - run: ./scripts/mutants-plan.py --self-test
       - run: ./scripts/check-poison.sh --selftest
       # Every shell script the gates run is portable, or declares why not -- a grep, and
       # the `portable` job below is what catches what a grep cannot.
@@ -234,6 +303,8 @@ jobs:
   # so because nothing ran it there. Required, not `continue-on-error` -- a portability job
   # allowed to fail is a portability comment.
   portable:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -247,6 +318,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: ./scripts/gates.sh
