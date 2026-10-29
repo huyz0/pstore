@@ -118,16 +118,45 @@ jobs:
   # matched against the code UNDER TEST, so a commit that changes only *test* code produces
   # no mutants and passes in seconds while having materially changed the suite's strength.
   # That is what the nightly sweep is for.
-  mutants:
+  #
+  # ⚠️ The diff's mutants are sharded across runners: one job took over four hours for 84
+  # mutants, and a branch carrying several milestones holds hundreds, past GitHub's six-hour
+  # job limit. `mutants` itself only gathers the shards, so the check a merge waits on keeps
+  # its name.
+  mutants-shard:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
+      - uses: taiki-e/install-action@nextest
+      # MUTANTS_TIMEOUT: a mutant caught late, two to a runner, needs more than 300 s to be
+      # measured as caught rather than reported as a timeout. MUTANTS_TEST_TOOL: stop at a
+      # mutant's first failing test, not at the end of its test binary (scripts/mutants.sh).
       - run: ./scripts/mutants.sh
-        if: github.event_name == 'pull_request'
+        env:
+          MUTANTS_SHARD: "${{ matrix.shard }}/12"
+          MUTANTS_TIMEOUT: "600"
+          MUTANTS_TEST_TOOL: nextest
+
+  mutants:
+    needs: mutants-shard
+    # Not on a cancelled run: a superseded PR run would otherwise end with a red `mutants`.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      # Every shard green, or -- on a push, which runs no shard -- every shard skipped.
+      - run: |
+          r="${{ needs.mutants-shard.result }}"
+          echo "mutants-shard: $r"
+          [ "$r" = success ] || [ "$r" = skipped ]
 
   # The full sweep, sharded. Shards need no runtime coordination -- each one discovers every
   # mutant and selects its own subset -- so this is a matrix and nothing else.

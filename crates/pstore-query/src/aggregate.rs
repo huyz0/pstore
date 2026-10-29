@@ -81,6 +81,7 @@ impl Key {
             Some(Value::Bool(b)) => Self::Bool(*b),
             Some(Value::Int(n)) => Self::Num(Number::Int(*n)),
             Some(Value::Float(f)) => Self::Num(normalized(*f)),
+            Some(Value::Uint(n)) => Self::Num(unsigned(*n)),
             Some(Value::DateTime(t)) => Self::DateTime(*t),
             Some(Value::Str(s)) => Self::Str(s.clone()),
             Some(Value::Uuid(u)) => Self::Uuid(*u),
@@ -109,6 +110,7 @@ impl Key {
             Self::Bool(b) => Some(Value::Bool(*b)),
             Self::Num(Number::Int(n)) => Some(Value::Int(*n)),
             Self::Num(Number::Float(f)) => Some(Value::Float(*f)),
+            Self::Num(Number::Uint(n)) => Some(Value::Uint(*n)),
             Self::DateTime(t) => Some(Value::DateTime(*t)),
             Self::Str(s) => Some(Value::Str(s.clone())),
             Self::Uuid(u) => Some(Value::Uuid(*u)),
@@ -119,19 +121,30 @@ impl Key {
     }
 }
 
-/// An integral float within `i64` as the integer, exactly -- `-0.0` included; any other float
-/// as itself. `i64::MAX as f64` rounds up to 2^63, which is out of range, hence `<`.
+/// An integral float within `i64` as the integer, exactly -- `-0.0` included; within `u64`
+/// above that (M172), as the unsigned integer; any other float as itself. `i64::MAX as f64`
+/// rounds up to 2^63 and `u64::MAX as f64` to 2^64, which are out of range, hence `<`.
 fn normalized(f: f64) -> Number {
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
         reason = "the bounds are the exact powers of two; the cast is exact inside them"
     )]
-    if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+    if f.fract() != 0.0 || f < i64::MIN as f64 {
+        Number::Float(f)
+    } else if f < i64::MAX as f64 {
         Number::Int(f as i64)
+    } else if f < u64::MAX as f64 {
+        Number::Uint(f as u64)
     } else {
         Number::Float(f)
     }
+}
+
+/// A uint64 within `i64` as the int it equals (M172), so the two are reported alike.
+fn unsigned(n: u64) -> Number {
+    i64::try_from(n).map_or(Number::Uint(n), Number::Int)
 }
 
 impl Ord for Key {
@@ -171,6 +184,8 @@ struct Acc {
     ints: i128,
     floats: f64,
     any_float: bool,
+    /// Whether a uint64 was summed (M172): only then may an integer sum answer above `i64`.
+    any_uint: bool,
 }
 
 impl Acc {
@@ -179,6 +194,7 @@ impl Acc {
         self.ints += other.ints;
         self.floats += other.floats;
         self.any_float |= other.any_float;
+        self.any_uint |= other.any_uint;
     }
 }
 
@@ -187,6 +203,8 @@ impl Acc {
 pub enum Total {
     /// A count, or a sum of integers only within `i64`.
     Int(i64),
+    /// A sum of integers, a uint64 among them, above `i64` and within `u64` (M172).
+    Uint(u64),
     /// A sum with a float in it, or of integers outside `i64`.
     Float(f64),
     /// A float sum that overflowed: JSON cannot carry ±∞.
@@ -201,6 +219,10 @@ fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
             Aggregate::Count(Some(a)) => acc.count += u64::from(doc.attrs.contains_key(a)),
             Aggregate::Sum(a) => match doc.attrs.get(a) {
                 Some(Value::Int(n)) => acc.ints += i128::from(*n),
+                Some(Value::Uint(n)) => {
+                    acc.ints += i128::from(*n);
+                    acc.any_uint = true;
+                }
                 Some(Value::Float(f)) => {
                     acc.floats += f;
                     acc.any_float = true;
@@ -343,6 +365,15 @@ impl Aggregator {
     }
 }
 
+/// An integer sum as an int, or as a uint64 when one was summed (M172), if it fits.
+fn integral(sum: i128, any_uint: bool) -> Option<Total> {
+    match i64::try_from(sum) {
+        Ok(n) => Some(Total::Int(n)),
+        Err(_) if any_uint => u64::try_from(sum).ok().map(Total::Uint),
+        Err(_) => None,
+    }
+}
+
 fn total(agg: &Aggregate, acc: Acc) -> Total {
     match agg {
         Aggregate::Count(_) => Total::Int(i64::try_from(acc.count).unwrap_or(i64::MAX)),
@@ -360,7 +391,7 @@ fn total(agg: &Aggregate, acc: Acc) -> Total {
                     Total::Null
                 }
             } else {
-                i64::try_from(acc.ints).map_or(Total::Float(ints), Total::Int)
+                integral(acc.ints, acc.any_uint).unwrap_or(Total::Float(ints))
             }
         }
     }
@@ -532,12 +563,40 @@ mod tests {
             Key::of(Some(&Value::Float(big))).value(),
             Some(Value::Int(1 << 60))
         );
-        // 2^63 is not inside i64.
+        // 2^63 is not inside i64, but is inside u64 (M172): reported as that uint64, and one
+        // key with it. 2^64 is inside neither.
         let edge = 2f64.powi(63);
         assert_eq!(
             Key::of(Some(&Value::Float(edge))).value(),
-            Some(Value::Float(edge))
+            Some(Value::Uint(1 << 63))
         );
+        let past = 2f64.powi(64);
+        assert_eq!(
+            Key::of(Some(&Value::Float(past))).value(),
+            Some(Value::Float(past))
+        );
+        // -2^63 is inside i64 and reported as the integer; below it, a float stays one.
+        let low = -(2f64.powi(63));
+        assert_eq!(
+            Key::of(Some(&Value::Float(low))).value(),
+            Some(Value::Int(i64::MIN))
+        );
+        assert_eq!(
+            Key::of(Some(&Value::Float(-1e19))).value(),
+            Some(Value::Float(-1e19))
+        );
+        // M172: a uint64 within i64 reports as the int it equals; above, as itself.
+        assert_eq!(Key::of(Some(&Value::Uint(5))).value(), Some(Value::Int(5)));
+        assert_eq!(
+            Key::of(Some(&Value::Uint(u64::MAX))).value(),
+            Some(Value::Uint(u64::MAX))
+        );
+        assert_eq!(
+            Key::of(Some(&Value::Uint(1 << 63))),
+            Key::of(Some(&Value::Float(edge)))
+        );
+        assert!(Key::of(Some(&Value::Int(i64::MAX))) < Key::of(Some(&Value::Uint(1 << 63))));
+        assert!(Key::of(Some(&Value::Uint(u64::MAX))) < Key::of(Some(&Value::Float(past))));
     }
 
     #[test]
@@ -569,6 +628,25 @@ mod tests {
             Total::Null
         );
         assert_eq!(sum(&[Value::Int(i64::MAX)]), Total::Int(i64::MAX));
+        // M172: with a uint64 in it, an integer sum is exact within u64, as well as i64.
+        assert_eq!(sum(&[Value::Uint(u64::MAX)]), Total::Uint(u64::MAX));
+        assert_eq!(
+            sum(&[Value::Uint(u64::MAX), Value::Int(-1)]),
+            Total::Uint(u64::MAX - 1)
+        );
+        assert_eq!(sum(&[Value::Uint(3), Value::Int(-5)]), Total::Int(-2));
+        assert_eq!(
+            sum(&[Value::Uint(u64::MAX), Value::Uint(1)]),
+            Total::Float(u64::MAX as f64 + 1.0)
+        );
+        assert_eq!(sum(&[Value::Uint(1), Value::Float(0.5)]), Total::Float(1.5));
+        // Merged partial sums keep whether a uint64 was summed.
+        let mut left = Aggregator::new(spec(Aggregate::Sum("k".into())));
+        left.offer(&doc("x", Value::Uint(u64::MAX)));
+        let mut right = Aggregator::new(spec(Aggregate::Sum("k".into())));
+        right.offer(&doc("y", Value::Int(-2)));
+        right.merge(left);
+        assert_eq!(right.finish()[0].1[0], Total::Uint(u64::MAX - 2));
         let count = |a: Aggregate| {
             let mut g = Aggregator::new(spec(a));
             g.offer(&doc("x", Value::Int(1)));

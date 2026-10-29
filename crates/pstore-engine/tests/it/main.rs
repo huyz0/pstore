@@ -49,6 +49,7 @@ mod lengths;
 mod linearizability;
 mod memtable_races;
 mod multi;
+mod multi_text;
 mod named_dense_clusters;
 mod open_cost;
 mod oq6;

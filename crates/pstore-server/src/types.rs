@@ -520,24 +520,81 @@ pub struct QueryMeta {
     pub facets_epoch: Option<u64>,
 }
 
-/// A query's text: one string, or several, each a BM25 leg (M9g).
+/// A query's text: one string, or several, each a BM25 leg (M9g). An entry of several may
+/// instead be `{"field": <name>, "query": <string>}`, a leg over that text field (M155).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TextIn {
     /// One leg.
     One(String),
-    /// A leg each.
-    Many(Vec<String>),
+    /// A leg each: a string, or an object naming its field. Read by [`TextIn::legs`].
+    Many(Vec<serde_json::Value>),
 }
 
 impl TextIn {
-    /// The legs' queries, in request order.
-    #[must_use]
-    pub fn queries(&self) -> Vec<&str> {
+    /// The legs, in request order: each one's field (`None` for the primary, as a string
+    /// entry is) and its query. Refused when an entry is neither a string nor an object of
+    /// exactly `field` and `query`, both strings.
+    pub fn legs(&self) -> Result<Vec<(Option<&str>, String)>, String> {
         match self {
-            Self::One(q) => vec![q.as_str()],
-            Self::Many(qs) => qs.iter().map(String::as_str).collect(),
+            Self::One(q) => Ok(vec![(None, token_operand(&serde_json::json!(q))?)]),
+            Self::Many(qs) => qs
+                .iter()
+                .map(|e| match e {
+                    serde_json::Value::String(_) => Ok((None, token_operand(e)?)),
+                    serde_json::Value::Object(o) => {
+                        if let Some(k) = o.keys().find(|k| *k != "field" && *k != "query") {
+                            return Err(format!(
+                                "text: a leg object has field and query, not {k:?}"
+                            ));
+                        }
+                        match (o.get("field"), o.get("query")) {
+                            (
+                                Some(serde_json::Value::String(f)),
+                                Some(
+                                    q
+                                    @ (serde_json::Value::String(_) | serde_json::Value::Array(_)),
+                                ),
+                            ) => Ok((Some(f.as_str()), token_operand(q)?)),
+                            _ => Err("text: a leg object's field is a string, and its query a \
+                                      string or an array of strings"
+                                .to_owned()),
+                        }
+                    }
+                    _ => Err("text: each entry is a string, or {\"field\", \"query\"}".to_owned()),
+                })
+                .collect(),
         }
+    }
+}
+
+/// A text operand as the analyzer reads it (M158): a string as it is, or an array of strings
+/// joined by [`pstore_format::text::TOKEN_SEPARATOR`] -- tokens, under `pre_tokenized_array`.
+/// Refused when it is neither, or when any string holds the separator, which would make one
+/// token two.
+pub(crate) fn token_operand(v: &serde_json::Value) -> Result<String, String> {
+    use pstore_format::text::TOKEN_SEPARATOR;
+    let one = |s: &str| {
+        if s.contains(TOKEN_SEPARATOR) {
+            Err("a text operand holds no U+001F".to_owned())
+        } else {
+            Ok(s.to_owned())
+        }
+    };
+    match v {
+        serde_json::Value::String(s) => one(s),
+        serde_json::Value::Array(items) => {
+            let tokens = items
+                .iter()
+                .map(|e| {
+                    e.as_str()
+                        .ok_or_else(|| "a text operand's array holds strings only".to_owned())
+                        .and_then(one)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(tokens.join(&TOKEN_SEPARATOR.to_string()))
+        }
+        _ => Err("a text operand is a string or an array of strings".to_owned()),
     }
 }
 
@@ -598,6 +655,9 @@ pub struct Schema {
     pub text_field: String,
     /// The analyzer and BM25 parameters its text is indexed and scored with (M14).
     pub full_text_search: serde_json::Value,
+    /// Each further text field's `full_text_search`, by name (M155); absent when none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub text_fields: std::collections::BTreeMap<String, serde_json::Value>,
     /// The attributes whose trigrams are sketched (M15.2), sorted.
     pub regex: Vec<String>,
     /// Each named dense field's width, as a client writes it (M98); absent when none is known.

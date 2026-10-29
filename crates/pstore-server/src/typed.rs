@@ -1,5 +1,6 @@
-//! The attribute types a write declares in its `schema` (M9h.3, M171): `datetime`, `uuid`
-//! and `bytes`, each a JSON string, or an array of them, read as the declared type.
+//! The attribute types a write declares in its `schema` (M9h.3, M171, M172): `datetime`,
+//! `uuid` and `bytes`, each a JSON string, and `uint64`, a JSON integer -- or an array of
+//! them, read as the declared type.
 
 use pstore_format::Value;
 use std::collections::BTreeMap;
@@ -13,6 +14,8 @@ pub(crate) enum Declared {
     Uuid,
     /// Standard padded base64, at most [`pstore_format::typed::MAX_BYTES`] (M171).
     Bytes,
+    /// A JSON integer in `0..=u64::MAX` (M172).
+    Uint64,
 }
 
 /// What a write declares: an attribute name to its type.
@@ -25,6 +28,7 @@ impl Declared {
             "datetime" => Some(Self::DateTime),
             "uuid" => Some(Self::Uuid),
             "bytes" => Some(Self::Bytes),
+            "uint64" => Some(Self::Uint64),
             _ => None,
         }
     }
@@ -63,6 +67,14 @@ impl Declared {
                 .and_then(pstore_format::typed::parse_bytes)
                 .ok_or_else(|| format!("is declared bytes and {x} is not standard padded base64"))
                 .and_then(bounded),
+            // `as_u64` is `None` for a negative integer and for whatever serde_json read as
+            // a float, `5.0` and `1e3` among them.
+            Self::Uint64 => x.as_u64().map(Value::Uint).ok_or_else(|| {
+                format!(
+                    "is declared uint64 and {x} is not one: an integer from 0 to {}",
+                    u64::MAX
+                )
+            }),
         }
     }
 }
@@ -96,6 +108,7 @@ mod tests {
         );
         assert_eq!(Declared::named(&json!("uuid")), Some(Declared::Uuid));
         assert_eq!(Declared::named(&json!("bytes")), Some(Declared::Bytes));
+        assert_eq!(Declared::named(&json!("uint64")), Some(Declared::Uint64));
         assert_eq!(Declared::named(&json!("blob")), None);
         assert_eq!(Declared::named(&json!(1)), None);
         let u = "00000000-0000-4000-8000-000000000001";

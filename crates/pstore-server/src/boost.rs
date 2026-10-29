@@ -200,9 +200,11 @@ fn term(raw: &serde_json::Value) -> Result<Term, String> {
         "eq" => Function::Eq(match o.get("value") {
             Some(serde_json::Value::String(s)) => Value::Str(s.clone()),
             Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
-            Some(serde_json::Value::Number(n)) => match n.as_i64() {
-                Some(i) => Value::Int(i),
-                None => Value::Float(
+            Some(serde_json::Value::Number(n)) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => Value::Int(i),
+                // M172: above i64, the unsigned number it is, as a filter reads it.
+                (None, Some(u)) => Value::Uint(u),
+                (None, None) => Value::Float(
                     n.as_f64()
                         .ok_or(format!("attr {attr}: eq's value is out of range"))?,
                 ),
@@ -231,6 +233,11 @@ fn number(v: &Value) -> Option<f64> {
         )]
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a boost scores in f64; an integer beyond 2^53 is ranked, not counted"
+        )]
+        Value::Uint(u) => Some(*u as f64),
         _ => None,
     }
 }
@@ -324,5 +331,35 @@ impl Boost {
         )]
         let total = total.clamp(-max, max) as f32;
         total
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    /// M172: an `eq` term's number is read as a filter reads it: an int within `i64`, a
+    /// uint64 above it, a float otherwise.
+    #[test]
+    fn an_eq_terms_number_is_read_by_its_range() {
+        let eq = |v: serde_json::Value| {
+            term(&serde_json::json!({"attr": "n", "fn": "eq", "weight": 1.0, "value": v}))
+                .unwrap()
+                .f
+        };
+        assert_eq!(eq(serde_json::json!(5)), Function::Eq(Value::Int(5)));
+        assert_eq!(
+            eq(serde_json::json!(u64::MAX)),
+            Function::Eq(Value::Uint(u64::MAX))
+        );
+        assert_eq!(eq(serde_json::json!(2.5)), Function::Eq(Value::Float(2.5)));
+        assert_eq!(
+            number(&Value::Uint(1 << 63)),
+            Some(9_223_372_036_854_775_808.0)
+        );
     }
 }

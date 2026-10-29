@@ -127,7 +127,10 @@ fn costly(t: &Template) -> Option<&Predicate> {
     // is at most a negated one: `NotGlob` is `Not(Pattern)`.
     fn pred(p: &Predicate) -> Option<&Predicate> {
         match p {
-            Predicate::Pattern(..) | Predicate::Fuzzy(..) | Predicate::Tokens(..) => Some(p),
+            Predicate::Pattern(..)
+            | Predicate::Fuzzy(..)
+            | Predicate::FuzzySubstring(..)
+            | Predicate::Tokens(..) => Some(p),
             Predicate::Not(p) => pred(p),
             _ => None,
         }

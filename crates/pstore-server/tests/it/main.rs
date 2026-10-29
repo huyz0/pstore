@@ -57,6 +57,7 @@ mod patterns;
 mod peer_fixture;
 mod peer_startup;
 mod peers;
+mod pre_tokenized;
 mod quarantine;
 mod read_cache;
 mod ref_new;
@@ -83,6 +84,9 @@ mod socket;
 )]
 #[path = "../support/mod.rs"]
 mod support;
+mod text_arrays;
+mod text_fields;
+mod text_filters;
 mod text_only;
 mod time_travel;
 #[allow(
@@ -94,6 +98,7 @@ mod time_travel;
 mod tls_fixture;
 mod tokens;
 mod typed_values;
+mod uint64;
 mod upsert;
 mod uuid_bytes;
 mod warm;

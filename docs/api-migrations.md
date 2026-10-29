@@ -1,5 +1,31 @@
 # Native API migration notes
 
+## M172: uint64 attributes
+
+A write's `schema` may declare an attribute `"uint64"`:
+
+```json
+{"schema": {"seq": "uint64"},
+ "documents": [{"id": "a", "attributes": {"seq": 18446744073709551615}}]}
+```
+
+- The value is a JSON integer from 0 to 18446744073709551615, stored and answered exactly,
+  never as a float. A negative integer, `5.0`, `1e3`, a string or a bool is refused, nothing
+  stored. An array of them is declared the same way.
+- A uint64 is a number: filters, `rank_by`, facets, `group_by`, `limit_per`, boosts and
+  `$ref_new` compare it with ints and floats by exact value. A filter or boost literal above
+  `i64` is now read as that unsigned number instead of being refused. An undeclared write of
+  one is still refused, and the message names the `uint64` declaration.
+- A facet bucket reports an integral float in `[2^63, 2^64)` as that integer, as it already
+  did below `2^63`: `9223372036854775808`, where it answered `9.223372036854776e18` before.
+- A `sum` with a uint64 in it is exact while it fits `u64` or `i64`; one of ints alone is
+  unchanged.
+- Segments holding uint64s carry a new value tag and a new zone-map flag. A reader older
+  than M172 refuses such a segment rather than misreading it: upgrade readers first.
+
+A write without the declaration is unchanged. No stored-data migration is needed.
+The [M172 verification](milestones/M172/VERIFIED.md) records the evidence.
+
 ## M171: UUID and bytes attributes
 
 A write's `schema` may declare an attribute `"uuid"` or `"bytes"` beside `"datetime"`:

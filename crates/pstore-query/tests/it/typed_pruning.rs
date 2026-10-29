@@ -7,8 +7,9 @@
     reason = "assertions in tests are the reporting mechanism"
 )]
 
-//! Pruning over ints and floats together is sound (M9h.1): whatever zone maps a segment
-//! carries, the rows `could_admit` lets through hold every row `admits` accepts.
+//! Pruning over ints and floats together is sound (M9h.1), and over uint64s beside them
+//! (M172): whatever zone maps a segment carries, the rows `could_admit` lets through hold
+//! every row `admits` accepts.
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_format::{Document, Segment, SegmentWriter, Value};
@@ -39,6 +40,18 @@ fn values(mixed: bool) -> Vec<Value> {
             Value::Float(40.0),
             Value::Float(1e10),
             Value::Float(0.25),
+            // M172: uint64s on both sides of i64::MAX, and floats beside them.
+            Value::Uint(0),
+            Value::Uint(7),
+            Value::Uint(BIG as u64),
+            Value::Uint(i64::MAX as u64),
+            Value::Uint(1 << 63),
+            Value::Uint(u64::MAX),
+            Value::Float(9_223_372_036_854_775_808.0),
+            Value::Float(1.9e19),
+            Value::Uint(40),
+            Value::Int(i64::MAX),
+            Value::Uint(3),
         ]);
     }
     v
@@ -69,6 +82,9 @@ fn docs(mixed: bool) -> Vec<Document> {
             Value::Int(5),
             Value::Array(vec![Value::Float(1e12), Value::Int(BIG), Value::Bool(true)]),
             Value::Float(6.0),
+            Value::Array(vec![Value::Uint(u64::MAX)]),
+            Value::Uint(9),
+            Value::Array(vec![Value::Uint(1 << 63), Value::Int(-1)]),
         ];
         for (i, v) in arrays.into_iter().enumerate() {
             let mut d = Document::new(format!("a{i:03}"), vec![1.0, 1.0]);
@@ -99,6 +115,9 @@ fn literals() -> Vec<Value> {
         Value::Float(-0.5),
         Value::Float(1e11),
         Value::Int(BIG - 1),
+        Value::Uint((1 << 63) + 1),
+        Value::Uint(u64::MAX - 1),
+        Value::Float(18_446_744_073_709_551_616.0),
         Value::Str("2".to_owned()),
         Value::Bool(true),
     ]);
@@ -157,7 +176,7 @@ async fn sound(docs: &[Document], bytes: bytes::Bytes) -> bool {
             .collect();
         let got: BTreeSet<String> = seg
             .rows_where(&store, &key, |z| {
-                if !z.ints.is_empty() || !z.floats.is_empty() {
+                if !z.ints.is_empty() || !z.floats.is_empty() || !z.uints.is_empty() {
                     *zoned.lock().unwrap() = true;
                 }
                 p.could_admit(z)
@@ -204,6 +223,61 @@ async fn a_zone_free_typed_segment_prunes_soundly() {
     assert!(!sound(&docs, bytes).await, "the fallback kept zones");
 }
 
+/// M172: a segment of ints and uint64s alone is typed and zoned, so a block whose uint64s
+/// and ints all lie below a `Gt` literal is never read -- and a block holding one above is.
+#[tokio::test]
+async fn a_block_of_uint64s_below_a_literal_is_pruned() {
+    let mut docs = Vec::new();
+    for (i, v) in [
+        Value::Int(1),
+        Value::Uint(2),
+        Value::Int(3),
+        Value::Uint(1 << 63),
+        Value::Int(4),
+        Value::Uint(5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
+        d.attrs.insert("n".to_owned(), v);
+        docs.push(d);
+    }
+    let store = MemoryStore::new();
+    let key = Key::new("seg");
+    store
+        .put(&key, written(&docs, None).unwrap())
+        .await
+        .unwrap();
+    let seg = Segment::open(&store, &key).await.unwrap();
+    for (literal, read) in [
+        (Value::Int(10), vec!["d3"]),
+        (Value::Uint(i64::MAX as u64), vec!["d3"]),
+        (Value::Float(1e19), vec![]),
+        (Value::Int(0), vec!["d0", "d1", "d2", "d3", "d4", "d5"]),
+    ] {
+        let p = Predicate::Cmp("n".to_owned(), Op::Gt, literal.clone());
+        let blocks = Mutex::new(Vec::new());
+        let got: Vec<String> = seg
+            .rows_where(&store, &key, |z| {
+                let admit = p.could_admit(z);
+                blocks.lock().unwrap().push(admit);
+                admit
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, d)| p.admits(&d.id, &d.attrs))
+            .map(|(_, d)| d.id)
+            .collect();
+        assert_eq!(got, read, "{literal:?}");
+        let blocks = blocks.into_inner().unwrap();
+        let first_read = blocks[0];
+        assert_eq!(first_read, read.len() == 6, "{literal:?}: {blocks:?}");
+        assert_eq!(blocks[1], !read.is_empty(), "{literal:?}: {blocks:?}");
+    }
+}
+
 async fn has_zones(bytes: bytes::Bytes) -> bool {
     let store = MemoryStore::new();
     let key = Key::new("seg");
@@ -211,7 +285,7 @@ async fn has_zones(bytes: bytes::Bytes) -> bool {
     let seg = Segment::open(&store, &key).await.unwrap();
     let zoned = Mutex::new(false);
     seg.rows_where(&store, &key, |z| {
-        if !z.ints.is_empty() || !z.floats.is_empty() || z.complete {
+        if !z.ints.is_empty() || !z.floats.is_empty() || !z.uints.is_empty() || z.complete {
             *zoned.lock().unwrap() = true;
         }
         true

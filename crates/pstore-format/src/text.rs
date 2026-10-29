@@ -149,7 +149,24 @@ pub struct Analyzer {
     pub case_sensitive: bool,
     /// NFKD, then drop combining marks: `é` becomes `e`.
     pub ascii_folding: bool,
+    /// How a string becomes tokens (M158).
+    pub tokenizer: Tokenizer,
 }
+
+/// How a string becomes tokens (M158): the vendor's `tokenizer` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tokenizer {
+    /// Maximal runs of alphanumeric characters, as every analyzer before M158.
+    #[default]
+    WordV1,
+    /// The client's own tokens: a document's string is one token, kept byte for byte, and a
+    /// query operand is its tokens joined by [`TOKEN_SEPARATOR`].
+    PreTokenizedArray,
+}
+
+/// What joins a `[]string` query operand's tokens into one string (M158): the ASCII unit
+/// separator, which no query token may hold.
+pub const TOKEN_SEPARATOR: char = '\u{1F}';
 
 /// Lucene's English stopword set.
 const STOPWORDS: [&str; 33] = [
@@ -199,7 +216,9 @@ impl FullText {
     #[must_use]
     pub fn encode(&self) -> String {
         let a = &self.analyzer;
-        format!(
+        // M158: today's line, byte for byte, for `word_v1`; a `v2` line, which a build before
+        // M158 refuses, for any other tokenizer.
+        let line = format!(
             "v1;{};{}{}{}{};{:08x};{:08x}",
             a.language.name(),
             u8::from(a.stemming),
@@ -208,16 +227,30 @@ impl FullText {
             u8::from(a.ascii_folding),
             self.k1.to_bits(),
             self.b.to_bits()
-        )
+        );
+        match a.tokenizer {
+            Tokenizer::WordV1 => line,
+            Tokenizer::PreTokenizedArray => {
+                format!(
+                    "v2{};pre_tokenized_array",
+                    line.get(2..).unwrap_or_default()
+                )
+            }
+        }
     }
 
     /// The full-text schema [`Self::encode`] wrote, or `None` for anything else.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
         let mut parts = s.split(';');
-        if parts.next()? != "v1" {
-            return None;
-        }
+        let tokenizer = match parts.next()? {
+            "v1" => Tokenizer::WordV1,
+            "v2" => match s.rsplit(';').next()? {
+                "pre_tokenized_array" => Tokenizer::PreTokenizedArray,
+                _ => return None,
+            },
+            _ => return None,
+        };
         let language = Language::parse(parts.next()?)?;
         let flags: Vec<bool> = parts
             .next()?
@@ -234,6 +267,10 @@ impl FullText {
         let bits = |p: Option<&str>| p.and_then(|h| u32::from_str_radix(h, 16).ok());
         let k1 = f32::from_bits(bits(parts.next())?);
         let b = f32::from_bits(bits(parts.next())?);
+        // A `v2` line names its tokenizer last, read above.
+        if tokenizer != Tokenizer::WordV1 {
+            parts.next()?;
+        }
         if parts.next().is_some() {
             return None;
         }
@@ -244,6 +281,7 @@ impl FullText {
                 remove_stopwords: *remove_stopwords,
                 case_sensitive: *case_sensitive,
                 ascii_folding: *ascii_folding,
+                tokenizer,
             },
             k1,
             b,
@@ -259,6 +297,38 @@ impl FullText {
 #[must_use]
 pub fn analyze(a: &Analyzer, s: &str) -> Vec<String> {
     tokens(a, s).into_iter().filter_map(|t| t.term).collect()
+}
+
+/// The terms a query operand `q` becomes under `a` (M158): [`analyze`], except that under
+/// `pre_tokenized_array` `q` is tokens joined by [`TOKEN_SEPARATOR`], each one term, whole.
+#[must_use]
+pub fn analyze_query(a: &Analyzer, q: &str) -> Vec<String> {
+    query_tokens(a, q)
+        .into_iter()
+        .filter_map(|t| t.term)
+        .collect()
+}
+
+/// [`tokens`] of a query operand (M158): under `pre_tokenized_array`, each non-empty piece
+/// between [`TOKEN_SEPARATOR`]s, with its span.
+#[must_use]
+pub fn query_tokens(a: &Analyzer, q: &str) -> Vec<Token> {
+    if a.tokenizer != Tokenizer::PreTokenizedArray {
+        return tokens(a, q);
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    for piece in q.split(TOKEN_SEPARATOR) {
+        let to = from + piece.len();
+        if !piece.is_empty() {
+            out.push(Token {
+                span: from..to,
+                term: Some(piece.to_owned()),
+            });
+        }
+        from = to + TOKEN_SEPARATOR.len_utf8();
+    }
+    out
 }
 
 /// One token of a text (M63): the byte span it came from, and the term the analyzer made of
@@ -278,6 +348,17 @@ pub struct Token {
 #[must_use]
 pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
     use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    // M158: a document's string is one token, whole -- U+001F included, so a stored token is
+    // never split, whichever write stored it.
+    if a.tokenizer == Tokenizer::PreTokenizedArray {
+        return (!s.is_empty())
+            .then(|| Token {
+                span: 0..s.len(),
+                term: Some(s.to_owned()),
+            })
+            .into_iter()
+            .collect();
+    }
     let stemmer = a
         .stemming
         .then(|| rust_stemmers::Stemmer::create(a.language.algorithm()));
@@ -388,6 +469,30 @@ pub fn dict_key(segment: &pstore_blob::Key) -> pstore_blob::Key {
     pstore_blob::Key::new(format!("{}.tdict", segment.as_str()))
 }
 
+/// The strings a text field holds (M150): a string's one, an array's string elements in order,
+/// and nothing for anything else. An array's other elements are skipped: the door refuses
+/// them, but a row written below it may hold one.
+///
+/// ⚠️ Every place that asks whether a row has text, or what its tokens are, reads this, so the
+/// segment build, the fresh view and the M36 stamp cannot disagree about an array.
+pub fn strings(v: &Value) -> impl Iterator<Item = &str> {
+    let (one, many): (Option<&str>, &[Value]) = match v {
+        Value::Str(s) => (Some(s.as_str()), &[]),
+        Value::Array(items) => (None, items.as_slice()),
+        _ => (None, &[]),
+    };
+    one.into_iter().chain(many.iter().filter_map(|e| match e {
+        Value::Str(s) => Some(s.as_str()),
+        _ => None,
+    }))
+}
+
+/// Whether a text field's value holds text (M150): some string of it is non-empty.
+#[must_use]
+pub fn has_text(v: &Value) -> bool {
+    strings(v).any(|s| !s.is_empty())
+}
+
 /// Builds the postings, the dictionary and the fieldnorms for one text attribute.
 ///
 /// ⚠️ `docs` is taken in **segment row order**, and a document with no text still occupies a
@@ -405,10 +510,15 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
         std::collections::BTreeMap::new();
     let mut fieldnorms = Vec::with_capacity(docs.len());
     for (row, d) in docs.iter().enumerate() {
-        let tokens = match d.attrs.get(field) {
-            Some(Value::Str(s)) => analyze(analyzer, s),
-            _ => Vec::new(),
-        };
+        // M150: an array's strings, each analyzed alone and in order: what the same strings
+        // joined by a space would give, since a space ends a token under every analyzer.
+        let tokens: Vec<String> = d
+            .attrs
+            .get(field)
+            .into_iter()
+            .flat_map(strings)
+            .flat_map(|s| analyze(analyzer, s))
+            .collect();
         fieldnorms.push(tokens.len() as u32);
         let mut tf: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for t in &tokens {
@@ -487,6 +597,194 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
     }
 }
 
+/// Several text fields built for one segment (M151): the fields carried, in order, and their
+/// postings, fieldnorms and dictionary sidecar joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fields {
+    /// The fields carried: those asked for that some row has a token in, in the order asked.
+    pub names: Vec<String>,
+    /// The `TextPostings` section: each carried field's postings, back to back.
+    pub postings: Vec<u8>,
+    /// The sidecar: one field's dictionary as [`build_with`] writes it, or a container of
+    /// several. Empty when nothing is carried.
+    pub dictionary: Vec<u8>,
+    /// Each carried field's token count for every row, field after field: `names.len() *
+    /// rows` of them.
+    pub fieldnorms: Vec<u32>,
+}
+
+const CONTAINER_MAGIC: &[u8; 8] = b"PSTORETM";
+const CONTAINER_VERSION: u16 = 1;
+/// MAGIC(8) VERSION(2) fields(2).
+///
+/// ⚠️ Written as one number: `8 + 2 + 2` has an equivalent mutant, `2 + 2` as `2 * 2`, which
+/// no test can fail and which PR #8's mutation gate reported as missed.
+const CONTAINER_HEADER: usize = 12;
+/// dictionary_len(4) postings_start(8) postings_len(8).
+const CONTAINER_ENTRY: usize = 4 + 8 + 8;
+
+/// Builds every field of `fields` that some row has text in (M151).
+///
+/// ⚠️ **One carried field is [`build_with`]'s output, byte for byte**, and several are each
+/// field's [`build_with`] joined: a field's slice of a segment is its one-field build, so a
+/// reader of one field reads what it always read, through narrower ranges. A field no row has
+/// a token in is not carried, as a one-field build of it writes no postings.
+///
+/// `None` for an empty list or a repeated name: a field is found by its position among the
+/// segment's names, and a repeat makes that ambiguous.
+#[must_use]
+pub fn build_fields(docs: &[Document], fields: &[(&str, &Analyzer)]) -> Option<Fields> {
+    let mut seen = std::collections::BTreeSet::new();
+    if fields.is_empty() || !fields.iter().all(|(n, _)| seen.insert(*n)) {
+        return None;
+    }
+    // ⚠️ Carried when it has POSTINGS, not when some row has a non-empty string: text that
+    // analyzes to no token (`"The"` under stopword removal) writes no postings, and the
+    // segment writer records a one-field segment's name only beside its postings. Carrying
+    // such a field would add its rows to `doc_count` and lower `avgdl` (code review).
+    let built: Vec<(String, Built)> = fields
+        .iter()
+        .map(|(n, a)| ((*n).to_owned(), build_with(docs, n, a)))
+        .filter(|(_, b)| !b.postings.is_empty())
+        .collect();
+    if let [(name, one)] = built.as_slice() {
+        return Some(Fields {
+            names: vec![name.clone()],
+            postings: one.postings.clone(),
+            dictionary: one.dictionary.clone(),
+            fieldnorms: one.fieldnorms.clone(),
+        });
+    }
+    let mut out = Fields::default();
+    if built.is_empty() {
+        return Some(out);
+    }
+    out.dictionary.extend_from_slice(CONTAINER_MAGIC);
+    out.dictionary
+        .extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+    out.dictionary
+        .extend_from_slice(&(built.len() as u16).to_le_bytes());
+    let mut start = 0u64;
+    for (_, b) in &built {
+        out.dictionary
+            .extend_from_slice(&(b.dictionary.len() as u32).to_le_bytes());
+        out.dictionary.extend_from_slice(&start.to_le_bytes());
+        out.dictionary
+            .extend_from_slice(&(b.postings.len() as u64).to_le_bytes());
+        start += b.postings.len() as u64;
+    }
+    for (name, b) in built {
+        out.dictionary.extend_from_slice(&b.dictionary);
+        out.postings.extend_from_slice(&b.postings);
+        out.fieldnorms.extend_from_slice(&b.fieldnorms);
+        out.names.push(name);
+    }
+    Some(out)
+}
+
+/// A segment's term dictionaries, one per carried text field (M151), each a slice of the
+/// fetched sidecar.
+#[derive(Debug, Clone)]
+pub struct Dictionaries {
+    /// Per field: its dictionary's bytes, decoded, and its span within `TextPostings`, or
+    /// `None` for a segment's only field, whose span is the whole section.
+    fields: Vec<(
+        bytes::Bytes,
+        std::sync::Arc<TermDict>,
+        Option<std::ops::Range<u64>>,
+    )>,
+}
+
+impl Dictionaries {
+    /// Decodes the sidecar of a segment carrying `n` text fields: for one, the dictionary
+    /// itself; for several, a `PSTORETM` container. `None` for anything malformed.
+    ///
+    /// ⚠️ Only what the sidecar alone can show is checked here: that the postings spans run
+    /// back to back from 0 is, but that the last ends where `TextPostings` does needs the
+    /// segment, and `pstore-index`'s `TextIndex::for_field` checks it.
+    #[must_use]
+    pub fn decode(raw: &bytes::Bytes, n: usize) -> Option<Self> {
+        if n == 1 {
+            let d = TermDict::decode(raw)?;
+            return Some(Self {
+                fields: vec![(raw.clone(), std::sync::Arc::new(d), None)],
+            });
+        }
+        if n < 2
+            || raw.get(..8)? != CONTAINER_MAGIC
+            || u16::from_le_bytes(raw.get(8..10)?.try_into().ok()?) != CONTAINER_VERSION
+            || usize::from(u16::from_le_bytes(raw.get(10..12)?.try_into().ok()?)) != n
+        {
+            return None;
+        }
+        let mut at = CONTAINER_HEADER + n * CONTAINER_ENTRY;
+        let mut start = 0u64;
+        let mut fields = Vec::with_capacity(n);
+        for i in 0..n {
+            let e = raw.get(CONTAINER_HEADER + i * CONTAINER_ENTRY..)?;
+            let len = u32::from_le_bytes(e.get(0..4)?.try_into().ok()?) as usize;
+            let lo = u64::from_le_bytes(e.get(4..12)?.try_into().ok()?);
+            let span = u64::from_le_bytes(e.get(12..20)?.try_into().ok()?);
+            if lo != start {
+                return None;
+            }
+            start = lo.checked_add(span)?;
+            let end = at.checked_add(len)?;
+            if end > raw.len() {
+                return None;
+            }
+            let slice = raw.slice(at..end);
+            let d = TermDict::decode(&slice)?;
+            fields.push((slice, std::sync::Arc::new(d), Some(lo..start)));
+            at = end;
+        }
+        (at == raw.len()).then_some(Self { fields })
+    }
+
+    /// [`Self::decode`], kept for `raw` itself, as [`TermDict::decode_shared`] keeps one
+    /// dictionary (M122), charged the buffer and every decoded dictionary's heap.
+    #[must_use]
+    pub fn decode_shared(raw: &bytes::Bytes, n: usize) -> Option<std::sync::Arc<Self>> {
+        static KEPT: std::sync::LazyLock<crate::shared::ByBuffer<Dictionaries>> =
+            std::sync::LazyLock::new(|| crate::shared::ByBuffer::new(DECODED_BUDGET));
+        // ⚠️ `n` is not part of the key: one buffer is one segment's sidecar, whose field
+        // count is its segment's. A different `n` for the same buffer would be a different
+        // segment's footer paired with it, which no caller does.
+        KEPT.get_or(
+            raw,
+            |d| d.fields.iter().map(|(_, t, _)| t.heap()).sum(),
+            |b| Self::decode(b, n),
+        )
+        .filter(|d| d.fields() == n)
+    }
+
+    /// Fields decoded: never none, since `decode` refuses a count of 0. Named
+    /// `fields` rather than `len`, which would ask for an `is_empty` that is always false.
+    #[must_use]
+    pub fn fields(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Field `i`'s dictionary bytes: a slice of the buffer decoded.
+    #[must_use]
+    pub fn dictionary(&self, i: usize) -> Option<&bytes::Bytes> {
+        self.fields.get(i).map(|(b, _, _)| b)
+    }
+
+    /// Field `i`'s decoded dictionary.
+    #[must_use]
+    pub fn term_dict(&self, i: usize) -> Option<&std::sync::Arc<TermDict>> {
+        self.fields.get(i).map(|(_, d, _)| d)
+    }
+
+    /// Field `i`'s postings span within `TextPostings`; `None` for a segment's only field,
+    /// whose span is the whole section, and for a field that is not there.
+    #[must_use]
+    pub fn postings(&self, i: usize) -> Option<std::ops::Range<u64>> {
+        self.fields.get(i).and_then(|(_, _, s)| s.clone())
+    }
+}
+
 /// Where one term's postings are, and how many documents contain it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TermEntry {
@@ -501,7 +799,9 @@ pub struct TermEntry {
 }
 
 /// What the decoded term dictionaries kept by [`TermDict::decode_shared`] may hold alive, in
-/// all: their buffers and their decoded heaps.
+/// all: their buffers and their decoded heaps. ⚠️ [`Dictionaries::decode_shared`] keeps its
+/// own, to the same budget (M151), so the two together may hold twice this: a container
+/// never enters the first, and a one-field sidecar never the second.
 pub const DECODED_BUDGET: usize = 32 << 20;
 
 /// The term dictionary: sorted terms, fixed-width entries, and a blob of term bytes.
@@ -576,7 +876,7 @@ impl TermDict {
     }
 
     /// The bytes this holds beyond itself.
-    fn heap(&self) -> usize {
+    pub(crate) fn heap(&self) -> usize {
         self.blob.len()
             + self.terms.len() * std::mem::size_of::<(u32, u16)>()
             + self.entries.len() * std::mem::size_of::<TermEntry>()

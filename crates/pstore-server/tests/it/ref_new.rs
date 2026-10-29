@@ -388,6 +388,12 @@ async fn malformed_templates_are_refused() {
             json!(["Or", [["v", "Lt", r], ["Not", ["s", "Fuzzy", {"value": "ab", "max_edits": 1}]]]]),
             "cannot sit beside",
         ),
+        // M145: the vendor's `Fuzzy` is as costly as M15's.
+        (
+            json!(["And", [["v", "Lt", r], ["s", "Fuzzy", "abcd",
+                   {"max_edit_distance": [{"min_query_chars": 3, "distance": 0}]}]]]),
+            "cannot sit beside",
+        ),
         (
             json!([
                 "Not",
