@@ -1,5 +1,32 @@
 # Native API migration notes
 
+## M176: typed document ids
+
+An index's ids are of one kind: `string` (as before), `uint64` or `uuid`.
+
+```json
+{"schema": {"id": "uuid"}, "documents": [{"id": "6F1E2D3C-4B5A-4968-8776-655443322110", ...}]}
+{"documents": [{"id": 18446744073709551615, ...}]}
+```
+
+- A new index's first write of JSON-integer ids makes it `uint64`; `uuid` is only declared,
+  so no existing string id is reread. `schema.id` in the index summary answers the kind.
+- Integers answer as exact JSON integers (above 2^53 too); uuids lowercase. `rank_by: id`
+  and id ranges order by value: `2` before `10`.
+- Every id a write names (rows, columns, patches, deletes) must be of the index's kind: one
+  of another kind is `400 schema_conflict`; a write mixing kinds, or a string id beginning
+  with NUL, is `400 bad_request`. `schema: {"id": "string"}` refuses integer ids.
+- Upgrade every server before writing a typed id: a fold by a build before M176 records no
+  kind and seals rows of both kinds together.
+- A filter compares `id` as a typed attribute compares: an integer literal against a
+  `uint64` id, a uuid string in any case against a `uuid` one; anything else matches nothing.
+  On a string index an integer literal matches nothing, as before.
+- The kind is recorded by the fold that gives the index its schema, from its first upsert in
+  lane order; rows of another kind are quarantined. Rows hold typed ids in a form a build
+  before M176 answers raw: do not roll back past it once a typed id is written.
+- M174's "a non-string id is refused" in `upsert_columns` now reads: an id that is neither a
+  string nor an integer in `0..=u64::MAX`.
+
 ## M175: null elements in arrays
 
 An array attribute may hold `null` elements: `{"tags": ["a", null, "b"]}`, stored and

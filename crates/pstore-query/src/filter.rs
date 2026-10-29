@@ -586,7 +586,8 @@ impl Predicate {
         // Only the id, which is not an attribute, is built.
         let get = |name: &str| -> Option<std::borrow::Cow<'_, Value>> {
             if name == ID {
-                Some(std::borrow::Cow::Owned(Value::Str(id.to_owned())))
+                // M176: a typed id is compared as its value, as a typed attribute is.
+                Some(std::borrow::Cow::Owned(pstore_format::id::value(id)))
             } else {
                 attrs.get(name).map(std::borrow::Cow::Borrowed)
             }
@@ -689,6 +690,9 @@ impl Predicate {
     #[must_use]
     pub fn could_admit(&self, zones: &Zones) -> bool {
         match self {
+            // No zone describes the id (M176): a typed one's literal is a number, and the
+            // name's numeric zone, of an attribute or of none, says nothing of it.
+            Self::Cmp(name, ..) | Self::In(name, _) if name == ID => true,
             Self::Cmp(name, op, want) => match Number::of(want) {
                 Some(x) => zones.could_hold_number(name, |lo, hi| {
                     let (lo, hi) = (cmp_numbers(lo, x), cmp_numbers(hi, x));
@@ -703,7 +707,7 @@ impl Predicate {
                     }
                 }),
                 None => match want {
-                    Value::Str(s) if name != ID => could_hold_string(zones, name, *op, s),
+                    Value::Str(s) => could_hold_string(zones, name, *op, s),
                     _ => true,
                 },
             },
@@ -1135,6 +1139,23 @@ mod tests {
             ..Zones::default()
         };
         assert!(Predicate::Cmp(ID.to_owned(), Op::Eq, lit(hi + 1)).could_admit(&id));
+        // M176: nor by a numeric zone, for a `uint64` id's integer literal, alone or in a set.
+        let numbered = Zones {
+            ints: [(ID.to_owned(), (0, 1))].into_iter().collect(),
+            complete: true,
+            ..Zones::default()
+        };
+        for z in [
+            &numbered,
+            &Zones {
+                complete: true,
+                ..Zones::default()
+            },
+        ] {
+            assert!(Predicate::Cmp(ID.to_owned(), Op::Eq, Value::Uint(7)).could_admit(z));
+            assert!(Predicate::Cmp(ID.to_owned(), Op::Gt, Value::Int(5)).could_admit(z));
+            assert!(Predicate::In(ID.to_owned(), vec![Value::Int(9)]).could_admit(z));
+        }
     }
 
     /// M171: a UUID or bytes row against its own type's literal (a `$ref_new` resolves to

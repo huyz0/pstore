@@ -153,7 +153,8 @@ fn resolve(t: &Template, id: &str, attrs: &BTreeMap<String, Value>) -> Result<Pr
         Template::Not(t) => Predicate::Not(Box::new(resolve(t, id, attrs)?)),
         Template::Ref(attr, op, name) => {
             let v = if name == pstore_query::ID_ATTRIBUTE {
-                Some(Value::Str(id.to_owned()))
+                // M176: a typed id is its value, as `id` itself is compared.
+                Some(pstore_format::id::value(id))
             } else {
                 attrs.get(name).cloned()
             };

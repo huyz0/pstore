@@ -21,6 +21,7 @@ mod docs;
 pub mod external;
 pub mod fde;
 pub mod geo;
+pub mod id;
 pub mod lance;
 pub mod parquet;
 mod reader;
