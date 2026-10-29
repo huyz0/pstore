@@ -49,7 +49,10 @@ impl Kind {
     pub fn holds(self, v: &crate::Value) -> bool {
         use crate::Value;
         match (self, v) {
-            (_, Value::Array(items)) => items.iter().all(|i| self.holds_scalar(i)),
+            // M175: a null element holds under every kind.
+            (_, Value::Array(items)) => items
+                .iter()
+                .all(|i| matches!(i, Value::Null) || self.holds_scalar(i)),
             _ => self.holds_scalar(v),
         }
     }
@@ -148,6 +151,12 @@ mod tests {
         assert!(!Kind::Uuid.holds(&Value::Str("x".into())));
         assert!(!Kind::Uuid.holds(&Value::Array(vec![Value::Uuid([0; 16]), Value::Int(1)])));
         assert!(Kind::Uint64.holds(&Value::Uint(1)) && !Kind::Uint64.holds(&Value::Int(1)));
+        // M175: a null element holds under every kind; a wrong-kind one beside it does not.
+        for k in Kind::ALL {
+            assert!(k.holds(&Value::Array(vec![Value::Null])), "{k:?}");
+            assert!(!k.holds(&Value::Array(vec![Value::Null, Value::Str("x".into())])));
+        }
+        assert!(Kind::Uuid.holds(&Value::Array(vec![Value::Null, Value::Uuid([0; 16])])));
         assert!(Kind::Bytes.holds(&Value::Bytes(vec![])) && !Kind::Bytes.holds(&Value::Uint(1)));
         assert!(Kind::DateTime.holds(&Value::DateTime(0)));
         assert!(!Kind::DateTime.holds(&Value::Int(0)));

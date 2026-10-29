@@ -250,7 +250,8 @@ impl SegmentWriter {
                         | Value::Bool(_)
                         | Value::Array(_)
                         | Value::Uuid(_)
-                        | Value::Bytes(_) => {}
+                        | Value::Bytes(_)
+                        | Value::Null => {}
                     }
                 }
             }

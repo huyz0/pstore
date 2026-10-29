@@ -26,6 +26,8 @@ fn every_value_kind_is_counted() {
         (Value::Uuid([7; 16]), 16),
         (Value::Bytes(vec![1, 2, 3]), 3),
         (Value::Bytes(vec![]), 0),
+        // M175: a null element, its tag.
+        (Value::Array(vec![Value::Null, Value::Int(1)]), 9),
     ] {
         assert_eq!(v.footprint(), want, "{v:?}");
     }
