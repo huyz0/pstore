@@ -580,6 +580,21 @@ async fn structured_sentences_and_paragraphs_are_units() {
         structured(" q a\n", "q", all("word")).await,
         texts(&["<em>q</em> a"])
     );
+    // A break at the very start leaves no empty unit to be the earliest, unmarked fragment.
+    assert_eq!(
+        structured("\n\nq a", "zzz", all("paragraph")).await,
+        texts(&["q a"])
+    );
+    // Units that touch, with no whitespace between them, do not overlap: each is taken,
+    // whichever ranks first.
+    assert_eq!(
+        structured("q。q q", "q", all("sentence")).await,
+        texts(&["<em>q</em> <em>q</em>", "<em>q</em>。"])
+    );
+    assert_eq!(
+        structured("q q。q", "q", all("sentence")).await,
+        texts(&["<em>q</em> <em>q</em>。", "<em>q</em>"])
+    );
     // A unit longer than max_chars gives its best window, which ends at a token's end.
     assert_eq!(
         structured(
