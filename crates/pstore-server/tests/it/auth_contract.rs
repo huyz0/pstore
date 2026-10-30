@@ -151,6 +151,8 @@ async fn route_scopes_fence_every_public_operation() {
         ("DELETE", "/v1/indexes/docs/replication", "write"),
         ("POST", "/v1/indexes/docs/replication/pause", "write"),
         ("POST", "/v1/indexes/docs/replication/resume", "write"),
+        ("POST", "/v1/indexes/docs/copy", "write"),
+        ("GET", "/v1/indexes/docs/copy", "read"),
         ("PATCH", "/v1/indexes/docs/schema", "write"),
         ("POST", "/v1/admin/fold", "admin"),
         ("POST", "/v1/admin/gc", "admin"),

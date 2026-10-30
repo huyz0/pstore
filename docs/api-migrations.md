@@ -1,5 +1,41 @@
 # Native API migration notes
 
+## M166: an isolated copy, as an operation with a status
+
+`copy_from_namespace` is a **branch**: the new index shares its source's segment objects,
+in the same tenant. It is not an isolated copy, and dropping or losing the source's objects
+affects it. The isolated copy is a new route:
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71", "store": "far"}}
+GET  /v1/indexes/{dest}/copy
+```
+
+- The body and its authorization are a replication's (`tenant` defaults to the caller's,
+  `store` to this server's own; the principal must hold the source tenant and store). The
+  copy is a one-shot replication: the worker copies the source's folded segments and delete
+  vectors under `dest`'s own keys and finishes in that same commit.
+- `202` answers the status; its `run` is the operation's token, and a resume after a pause
+  starts a new run. The same `POST` again answers `200` with the copy it started while it
+  runs or is paused, and after it succeeded while `dest` is still an index, even once the
+  source is gone.
+- `state` is `running`, `paused`, `succeeded`, `failed` or `cancelled`, and the only field
+  to branch on. `epoch` is the commit that ended it; `source_epoch` the source epoch a
+  success holds; `code` is `source_not_found` for the one failure (the source held no
+  folded segment, never retried); `last_error` is the worker's latest note while it runs.
+- A success is never partial: `dest` holds every segment of the source at `source_epoch` or
+  none. After it, `dest` is an ordinary writable index that answers without the source, its
+  tenant's objects or its store.
+- `DELETE /v1/indexes/{dest}/replication` cancels a copy (`cancelled`). A running copy also
+  appears in `/v1/replications`, and pause and resume act on it.
+- A tenant keeps the last 64 outcomes; dropping `dest` removes its outcome, and a new
+  copy, replication or branch into `dest` replaces it. `404 copy_not_found` otherwise.
+- Not provided: wall-clock times, progress, encryption, or charging for the copied bytes.
+
+HEAD gains a trailing section. A process older than M166 refuses a HEAD that carries one,
+so every node is upgraded before copies are offered. Evidence is in
+[M166 verification](milestones/M166/VERIFIED.md).
+
 ## M179: stored vectors in results and exports
 
 A ranked query or a `rank_by` order takes `include_vectors: ["vector"]`, and each result

@@ -13,7 +13,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use pstore_blob::{Accounted, BlobError, BlobStore, Key, TenantView};
-use pstore_engine::{EngineError, ReplicaSource, Replication, Sources, SyncState};
+use pstore_engine::{
+    CopyFailure, CopyState, CopyStatus, EngineError, ReplicaSource, Replication, Sources, SyncState,
+};
 use pstore_jobs::{Claim, Entry, JobsError, Register};
 use pstore_types::TenantId;
 use serde::{Deserialize, Serialize};
@@ -536,6 +538,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .map(|(t, _)| *t)
             .collect();
         let mut gone = Vec::new();
+        let mut ended = Vec::new();
         for tenant in due {
             // Before every sync, not once a tick: a long copy must not let every other claim
             // lapse behind it (code review M2).
@@ -551,6 +554,10 @@ impl<S: BlobStore + 'static> Api<S> {
             tick.synced += 1;
             let changed = match engine.replicate(&sources, &mut h.st).await {
                 Ok(out) => {
+                    // M166: a copy that ended no longer runs: the register's `gen` says so.
+                    if !out.finished.is_empty() {
+                        ended.push(tenant);
+                    }
                     let ran = !(out.idle
                         && out.committed.is_empty()
                         && out.current.is_empty()
@@ -614,6 +621,11 @@ impl<S: BlobStore + 'static> Api<S> {
                     .is_ok()
             {
                 h.written = Some((now, h.notes.clone()));
+            }
+        }
+        for tenant in ended {
+            if !gone.contains(&tenant) {
+                let _ = self.reconcile(tenant, false).await;
             }
         }
         for tenant in gone {
@@ -823,29 +835,7 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let req: CreateBody = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(format!("a replication's body: {e}")))?;
-    let Some(index) = req.source.index else {
-        return Err(ApiError::bad_request("source.index is required"));
-    };
-    let source_tenant = match req.source.tenant {
-        None => tenant,
-        Some(t) => TenantId(t.parse::<u128>().map_err(|_| {
-            ApiError::bad_request(format!("source.tenant {t:?} is not a tenant id"))
-        })?),
-    };
-    let store = req.source.store.unwrap_or_default();
-    principal.source(source_tenant, &store)?;
-    let Some(from) = api.source_store(tenant, &store) else {
-        return Err(ApiError::bad_request(format!(
-            "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"
-        )));
-    };
-    let source = ReplicaSource {
-        store,
-        tenant: source_tenant,
-        index,
-    };
+    let (source, from) = api.parse_source(tenant, &principal, &body, "a replication's body")?;
     api.engine(tenant)
         .await
         .create_replication(&dest, source, &*from)
@@ -856,6 +846,142 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     let _ = api.reconcile(tenant, true).await;
     let out = api.status_of(tenant, &dest, false).await?;
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
+}
+
+impl<S: BlobStore + 'static> Api<S> {
+    /// A create's body (M22, and M166's copy): the source it names, authorized for this
+    /// principal before anything is read, and the store to read it from.
+    fn parse_source(
+        &self,
+        tenant: TenantId,
+        principal: &crate::auth::Principal,
+        body: &[u8],
+        what: &str,
+    ) -> Result<(ReplicaSource, Arc<dyn BlobStore>), ApiError> {
+        let req: CreateBody = serde_json::from_slice(body)
+            .map_err(|e| ApiError::bad_request(format!("{what}: {e}")))?;
+        let Some(index) = req.source.index else {
+            return Err(ApiError::bad_request("source.index is required"));
+        };
+        let source_tenant = match req.source.tenant {
+            None => tenant,
+            Some(t) => TenantId(t.parse::<u128>().map_err(|_| {
+                ApiError::bad_request(format!("source.tenant {t:?} is not a tenant id"))
+            })?),
+        };
+        let store = req.source.store.unwrap_or_default();
+        principal.source(source_tenant, &store)?;
+        let Some(from) = self.source_store(tenant, &store) else {
+            return Err(ApiError::bad_request(format!(
+                "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"
+            )));
+        };
+        let source = ReplicaSource {
+            store,
+            tenant: source_tenant,
+            index,
+        };
+        Ok((source, from))
+    }
+
+    /// The copy into `dest`'s status (M166): HEAD and the worker's notes, in one round.
+    async fn copy_status_of(&self, tenant: TenantId, dest: &str) -> Result<Value, ApiError> {
+        let engine = self.engine(tenant).await;
+        let store = self.store.as_tenant(tenant);
+        let (status, notes) = futures_util::future::join(engine.copy_status(dest), async {
+            match store.get(&notes_key(tenant)).await {
+                Ok(b) => Ok(serde_json::from_slice::<Notes>(&b).unwrap_or_default()),
+                Err(BlobError::NotFound(_)) => Ok(Notes::new()),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        let Some(status) = status? else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "copy_not_found",
+                format!("the index {dest:?} has no copy running and no recent outcome"),
+            ));
+        };
+        let mut notes = notes.map_err(|e| EngineError::Blob(e.to_string()))?;
+        let last_error = match status.state {
+            CopyState::Running | CopyState::Paused => notes
+                .remove(dest)
+                .or_else(|| notes.remove(TENANT_NOTE))
+                .and_then(|n| n.last_error),
+            CopyState::Succeeded | CopyState::Failed | CopyState::Cancelled => None,
+        };
+        Ok(describe_copy(dest, &status, last_error))
+    }
+}
+
+/// A copy's status as the wire says it (M166): `state` is the machine state.
+fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Value {
+    json!({
+        "index": dest,
+        "state": match s.state {
+            CopyState::Running => "running",
+            CopyState::Paused => "paused",
+            CopyState::Succeeded => "succeeded",
+            CopyState::Failed => "failed",
+            CopyState::Cancelled => "cancelled",
+        },
+        "run": s.run,
+        "source": {
+            "store": s.source.store,
+            "tenant": s.source.tenant.0.to_string(),
+            "index": s.source.index,
+        },
+        "epoch": s.epoch,
+        "source_epoch": s.source_epoch,
+        "code": s.failure.map(|f| match f {
+            CopyFailure::SourceNotFound => "source_not_found",
+        }),
+        "last_error": last_error,
+    })
+}
+
+/// `POST /v1/indexes/{dest}/copy` (M166): copies the source into the new `dest`, as a
+/// replication that finishes in the commit that copies. `202` when this request started it;
+/// `200` with the copy a repeated request started.
+pub(crate) async fn copy<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::auth::Principal>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let (source, from) = api.parse_source(tenant, &principal, &body, "a copy's body")?;
+    let (status, started) = api
+        .engine(tenant)
+        .await
+        .create_copy(&dest, source, &*from)
+        .await?;
+    if !started {
+        return Ok((
+            StatusCode::OK,
+            axum::Json(describe_copy(&dest, &status, None)),
+        )
+            .into_response());
+    }
+    // As a create's: the change has happened, whatever the register says.
+    let _ = api.reconcile(tenant, true).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(describe_copy(&dest, &status, None)),
+    )
+        .into_response())
+}
+
+/// `GET /v1/indexes/{dest}/copy` (M166).
+pub(crate) async fn copy_status<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    Ok(axum::Json(api.copy_status_of(tenant, &dest).await?))
 }
 
 /// `GET /v1/indexes/{dest}/replication`.

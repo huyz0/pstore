@@ -276,9 +276,54 @@ pub struct Head {
     /// trailing section after `keys_since`, and `encode` writes only the entries of indexes
     /// that exist, so it never outlives its index.
     pub times: BTreeMap<String, (u64, u64)>,
-    /// The indexes an owner made read-only (M149). ⚠️ The last trailing section, after
-    /// `times`, and `encode` writes only the names of indexes that exist.
+    /// The indexes an owner made read-only (M149). ⚠️ A trailing section after `times`, and
+    /// `encode` writes only the names of indexes that exist.
     pub read_only: BTreeSet<String>,
+    /// The replications that are copies (M166): one-shot, finishing in the commit that
+    /// copies. ⚠️ With [`Self::copies`], the last trailing section, after `read_only`;
+    /// `encode` writes only the names of replications that exist.
+    pub once: BTreeSet<String>,
+    /// How each recent copy ended, by destination (M166): at most [`COPIES_RETAINED`],
+    /// through [`Self::record_copy`].
+    pub copies: BTreeMap<String, CopyOutcome>,
+}
+
+/// The most copy outcomes a tenant's HEAD keeps (M166).
+pub const COPIES_RETAINED: usize = 64;
+
+/// How a copy ended (M166).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOutcome {
+    /// What it copied.
+    pub source: ReplicaSource,
+    /// The epoch of its latest start: the operation's token. A resume after a
+    /// pause starts it again, under a new run.
+    pub run: u64,
+    /// The epoch that ended it.
+    pub epoch: u64,
+    /// How.
+    pub end: CopyEnd,
+}
+
+/// A copy's terminal state (M166).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyEnd {
+    /// The destination holds the source's folded state at `source_epoch`.
+    Succeeded {
+        /// The source's epoch the copy holds.
+        source_epoch: u64,
+    },
+    /// Never retried.
+    Failed(CopyFailure),
+    /// Cancelled before it finished.
+    Cancelled,
+}
+
+/// Why a copy failed (M166): a code, never free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFailure {
+    /// The source held no folded segment.
+    SourceNotFound,
 }
 
 /// Where a replica's source index lives (M22).
@@ -595,7 +640,14 @@ impl Head {
                     || self.quarantine.contains_key(*n)
             })
             .collect();
-        let timed = !times.is_empty() || !flagged.is_empty();
+        // M166: the copies last, forcing the read-only count (0 when none) before them.
+        let once: Vec<&String> = self
+            .once
+            .iter()
+            .filter(|n| self.replications.contains_key(*n))
+            .collect();
+        let copied = !once.is_empty() || !self.copies.is_empty();
+        let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
         let texted = !texts.is_empty() || types;
         let since = self.keys_since.is_some() || texted;
@@ -746,13 +798,53 @@ impl Head {
                 out.extend_from_slice(&written.to_le_bytes());
             }
         }
-        if !flagged.is_empty() {
+        if !flagged.is_empty() || copied {
             out.extend_from_slice(&(flagged.len() as u32).to_le_bytes());
             for name in flagged {
                 put_str(&mut out, name);
             }
         }
+        if copied {
+            out.extend_from_slice(&(once.len() as u32).to_le_bytes());
+            for name in once {
+                put_str(&mut out, name);
+            }
+            out.extend_from_slice(&(self.copies.len() as u32).to_le_bytes());
+            for (dest, o) in &self.copies {
+                put_str(&mut out, dest);
+                put_str(&mut out, &o.source.store);
+                out.extend_from_slice(&o.source.tenant.0.to_le_bytes());
+                put_str(&mut out, &o.source.index);
+                out.extend_from_slice(&o.run.to_le_bytes());
+                out.extend_from_slice(&o.epoch.to_le_bytes());
+                match &o.end {
+                    CopyEnd::Succeeded { source_epoch } => {
+                        out.push(0);
+                        out.extend_from_slice(&source_epoch.to_le_bytes());
+                    }
+                    CopyEnd::Failed(CopyFailure::SourceNotFound) => out.extend_from_slice(&[1, 0]),
+                    CopyEnd::Cancelled => out.push(2),
+                }
+            }
+        }
         out
+    }
+
+    /// Records how the copy into `dest` ended (M166), replacing `dest`'s last outcome and
+    /// evicting the smallest `epoch` past [`COPIES_RETAINED`].
+    pub fn record_copy(&mut self, dest: &str, outcome: CopyOutcome) {
+        self.copies.insert(dest.to_owned(), outcome);
+        while self.copies.len() > COPIES_RETAINED {
+            let Some(oldest) = self
+                .copies
+                .iter()
+                .min_by_key(|(_, o)| o.epoch)
+                .map(|(d, _)| d.clone())
+            else {
+                break;
+            };
+            self.copies.remove(&oldest);
+        }
     }
 
     /// A digest of the running replications' `(name, run)` set, or `None` when none runs
@@ -1170,6 +1262,46 @@ impl Head {
         }
         for _ in 0..c.u32()? {
             h.read_only.insert(c.string()?);
+        }
+        // M166: and here, no copies.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.once.insert(c.string()?);
+        }
+        for _ in 0..c.u32()? {
+            let dest = c.string()?;
+            let store = c.string()?;
+            let tenant = u128::from(c.u64()?) | (u128::from(c.u64()?) << 64);
+            let index = c.string()?;
+            let run = c.u64()?;
+            let epoch = c.u64()?;
+            let end = match c.u8()? {
+                0 => CopyEnd::Succeeded {
+                    source_epoch: c.u64()?,
+                },
+                1 => match c.u8()? {
+                    0 => CopyEnd::Failed(CopyFailure::SourceNotFound),
+                    _ => return Err(EngineError::CorruptHead),
+                },
+                2 => CopyEnd::Cancelled,
+                _ => return Err(EngineError::CorruptHead),
+            };
+            let source = ReplicaSource {
+                store,
+                tenant: pstore_types::TenantId(tenant),
+                index,
+            };
+            h.copies.insert(
+                dest,
+                CopyOutcome {
+                    source,
+                    run,
+                    epoch,
+                    end,
+                },
+            );
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2431,5 +2563,103 @@ mod tests {
             assert_eq!(Head::decode(&h.encode())?, h, "{timed}");
         }
         Ok(())
+    }
+
+    /// M166 criterion 9: the once-names and copy outcomes round-trip after every earlier
+    /// section, absent or present; a HEAD without them encodes as M149's; `encode` keeps only
+    /// the once-names of replications that exist; and a cut never decodes them.
+    #[test]
+    fn copies_round_trip_after_every_section() -> Result<(), EngineError> {
+        let source = ReplicaSource {
+            store: "eu".to_owned(),
+            tenant: pstore_types::TenantId(7 | (3 << 64)),
+            index: "src".to_owned(),
+        };
+        let outcomes = [
+            CopyEnd::Succeeded { source_epoch: 41 },
+            CopyEnd::Failed(CopyFailure::SourceNotFound),
+            CopyEnd::Cancelled,
+        ];
+        for base in [Head::default(), sample(), every_section()] {
+            for flagged in [false, true] {
+                let mut m149 = base.clone();
+                if flagged {
+                    m149.indexes.insert("a".to_owned(), Vec::new());
+                    m149.read_only.insert("a".to_owned());
+                }
+                let mut with = m149.clone();
+                with.replications.insert(
+                    "running".to_owned(),
+                    Replication {
+                        source: source.clone(),
+                        running: true,
+                        run: 9,
+                        applied: None,
+                        rejected: 0,
+                    },
+                );
+                let replicated = with.clone();
+                with.once.insert("running".to_owned());
+                for (i, end) in outcomes.iter().enumerate() {
+                    let i = i as u64;
+                    with.copies.insert(
+                        format!("done{i}"),
+                        CopyOutcome {
+                            source: source.clone(),
+                            run: 10 + i,
+                            epoch: 20 + i,
+                            end: end.clone(),
+                        },
+                    );
+                }
+                assert_eq!(Head::decode(&with.encode())?, with, "{flagged}");
+                // No outcome and no live once-name: M149's bytes.
+                let mut ghost = replicated.clone();
+                ghost.once.insert("gone".to_owned());
+                assert_eq!(hex(&ghost.encode()), hex(&replicated.encode()));
+                let mut once = replicated.clone();
+                once.once.insert("running".to_owned());
+                assert_eq!(Head::decode(&once.encode())?, once);
+                let mut longer = with.encode();
+                longer.push(0);
+                assert!(Head::decode(&longer).is_err());
+                let bytes = with.encode();
+                for cut in replicated.encode().len()..bytes.len() {
+                    let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                    if let Ok(h) = Head::decode(part) {
+                        assert!(
+                            h.copies.is_empty() && h.once.is_empty(),
+                            "a cut at {cut} decoded copies"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M166 criterion 6: at most [`COPIES_RETAINED`] outcomes; one more evicts the smallest
+    /// `epoch`, and an outcome recorded for a held name replaces it.
+    #[test]
+    fn copy_outcomes_are_bounded() {
+        let outcome = |epoch| CopyOutcome {
+            source: ReplicaSource::local(pstore_types::TenantId(1), "s"),
+            run: epoch - 1,
+            epoch,
+            end: CopyEnd::Cancelled,
+        };
+        let mut h = Head::default();
+        // Recorded out of order, so the eviction cannot be by name or by insertion.
+        for i in (0..COPIES_RETAINED as u64).rev() {
+            h.record_copy(&format!("d{i:03}"), outcome(100 + i));
+        }
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        h.record_copy("d000", outcome(500));
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        assert_eq!(h.copies.get("d000").map(|o| o.epoch), Some(500));
+        h.record_copy("new", outcome(501));
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        assert!(!h.copies.contains_key("d001"), "the smallest epoch was 101");
+        assert!(h.copies.contains_key("d002") && h.copies.contains_key("new"));
     }
 }

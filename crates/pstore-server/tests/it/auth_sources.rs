@@ -198,10 +198,20 @@ async fn source_grants_fence_branch_replication_and_external_copy() {
                 "/v1/indexes/destination/external/copy",
                 json!({"index":"source", "tenant":tenant, "store":name}),
             ),
+            // M166: a copy is authorized on the source side as a replication is.
+            (
+                "/v1/indexes/destination/copy",
+                json!({"source":{"index":"source", "tenant":tenant, "store":name}}),
+            ),
         ] {
             let before = requests(&store);
             let far_before = requests(&remote);
-            let got = send(&api, "PUT", path, Some(&pairs), None, &body).await;
+            let method = if path.ends_with("/copy") && !path.contains("external") {
+                "POST"
+            } else {
+                "PUT"
+            };
+            let got = send(&api, method, path, Some(&pairs), None, &body).await;
             assert_eq!(
                 got.status,
                 StatusCode::FORBIDDEN,

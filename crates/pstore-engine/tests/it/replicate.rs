@@ -16,7 +16,8 @@ use pstore_blob::{
     Precondition, PutOutcome, TenantView,
 };
 use pstore_engine::{
-    Engine, EngineError, ReplicaRefusal, ReplicaSource, Sources, SyncState, Synced,
+    CopyFailure, CopyState, Engine, EngineError, ReplicaRefusal, ReplicaSource, Sources, SyncState,
+    Synced,
 };
 use pstore_format::{Document, Impact, Value, VectorField};
 use pstore_index::vec_index::Query;
@@ -1725,4 +1726,289 @@ async fn a_replica_is_read_only_by_its_replication() {
     s.src.set_read_only("src", true).await.unwrap().unwrap();
     s.sync(&mut st).await;
     s.same("from a read-only source").await;
+}
+
+// M166: a copy is a one-shot replication, finished in the commit that copies.
+
+impl Setup {
+    async fn copy(&self) -> (pstore_engine::CopyStatus, bool) {
+        let from: Arc<dyn BlobStore> = match self.source.store.as_str() {
+            "" => Arc::new(self.here.acct.as_tenant(DST)),
+            _ => self.remotes.store("far").unwrap(),
+        };
+        self.dst
+            .create_copy("dst", self.source.clone(), &*from)
+            .await
+            .unwrap()
+    }
+    async fn state(&self) -> Option<CopyState> {
+        self.dst.copy_status("dst").await.unwrap().map(|s| s.state)
+    }
+}
+
+/// M166 criteria 1 and 2 (engine): the copying commit, lost once, finishes it; inside the
+/// interference the copy is running with nothing at `dst`; after, `dst` is the source's,
+/// an ordinary index, and the replication is gone.
+#[tokio::test]
+async fn a_copy_never_reads_as_finished_partway() {
+    for kind in [Kind::CrossTenant, Kind::Remote] {
+        let s = setup(kind);
+        write(&s.src, "src", 0..30).await;
+        write(&s.src, "src", 30..60).await;
+        let (started, created) = s.copy().await;
+        assert!(created);
+        assert_eq!(started.state, CopyState::Running);
+        let other = s.here.engine(DST, 2);
+        let watcher = s.here.engine(DST, 3);
+        let mut st = SyncState::default();
+        let out = s
+            .dst
+            .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+                let mid = watcher.copy_status("dst").await.unwrap().unwrap();
+                assert_eq!(mid.state, CopyState::Running, "{kind:?}");
+                assert!(!watcher.head_for_test().await.indexes.contains_key("dst"));
+                write(&other, "elsewhere", 0..5).await;
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.committed, vec!["dst".to_owned()], "{kind:?}");
+        let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(done.state, CopyState::Succeeded, "{kind:?}");
+        assert_eq!(done.run, started.run);
+        assert_eq!(done.source, s.source);
+        assert_eq!(
+            done.source_epoch,
+            Some(s.src.head_for_test().await.epoch.0),
+            "{kind:?}"
+        );
+        assert!(done.epoch.is_some_and(|e| e > started.run));
+        assert!(s.dst.replications().await.unwrap().is_empty(), "{kind:?}");
+        let head = s.dst.head_for_test().await;
+        assert!(head.once.is_empty());
+        assert_eq!(head.branched.get("dst").copied(), done.epoch);
+        s.same("a finished copy").await;
+        s.dst.write("dst", vec![doc("mine", 1.0)]).await.unwrap();
+        fold(&s.dst).await;
+        assert!(answers(&s.dst, "dst").await.unwrap().contains("mine"));
+        // The source moves on; the copy does not.
+        write(&s.src, "src", 60..70).await;
+        assert!(s.sync(&mut st).await.committed.is_empty());
+        assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+    }
+}
+
+/// M166 criterion 7 (engine): after a finish, the next syncs read no source HEAD.
+#[tokio::test]
+async fn a_finished_copy_stops_polling() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    // Any read of the source's HEAD now fails, so a sync that read it would say so.
+    s.here
+        .hooked
+        .fail
+        .lock()
+        .unwrap()
+        .push(format!("tnt/{}/HEAD", SRC.0));
+    for _ in 0..2 {
+        let out = s.sync(&mut st).await;
+        assert_eq!(
+            out,
+            Synced {
+                idle: true,
+                ..Synced::default()
+            }
+        );
+    }
+}
+
+/// M166 criterion 3 (engine): a source gone before the first sync fails the copy, typed,
+/// with nothing at `dst`; a store this process lacks is retried, the copy running.
+#[tokio::test]
+async fn a_copy_of_a_missing_source_fails_typed() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let (started, _) = s.copy().await;
+    s.src.delete_index("src").await.unwrap();
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert!(out.committed.is_empty() && out.failed.is_empty(), "{out:?}");
+    let failed = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(failed.state, CopyState::Failed);
+    assert_eq!(failed.failure, Some(CopyFailure::SourceNotFound));
+    assert_eq!(failed.run, started.run);
+    assert!(s.dst.replications().await.unwrap().is_empty());
+    assert!(!s.dst.head_for_test().await.indexes.contains_key("dst"));
+    assert_eq!(answers(&s.dst, "dst").await, None);
+    // Not a state: the next sync has nothing to do.
+    assert!(s.sync(&mut st).await.idle);
+
+    let s = setup(Kind::Remote);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    let mut st = SyncState::default();
+    let out = s.dst.replicate(&Remotes::default(), &mut st).await.unwrap();
+    assert!(out.failed.contains_key("dst"), "{out:?}");
+    assert_eq!(s.state().await, Some(CopyState::Running));
+}
+
+/// M166 criterion 4: a paused copy says so; a cancelled one is `cancelled` and copies
+/// nothing more.
+#[tokio::test]
+async fn a_paused_or_cancelled_copy_says_so() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let (started, _) = s.copy().await;
+    s.dst.pause_replication("dst").await.unwrap();
+    assert_eq!(s.state().await, Some(CopyState::Paused));
+    s.dst.resume_replication("dst").await.unwrap();
+    assert_eq!(s.state().await, Some(CopyState::Running));
+    s.dst.cancel_replication("dst").await.unwrap();
+    let c = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(c.state, CopyState::Cancelled);
+    assert!(c.run > started.run, "a resume is a new run");
+    assert!(s.dst.head_for_test().await.once.is_empty());
+    let mut st = SyncState::default();
+    assert!(s.sync(&mut st).await.committed.is_empty());
+    assert_eq!(answers(&s.dst, "dst").await, None);
+    // A plain replication's cancel records nothing.
+    let from = s.here.acct.as_tenant(DST);
+    s.dst
+        .create_replication("plain", ReplicaSource::local(SRC, "src"), &from)
+        .await
+        .unwrap();
+    s.dst.cancel_replication("plain").await.unwrap();
+    assert!(s.dst.copy_status("plain").await.unwrap().is_none());
+}
+
+/// M166 criterion 5 (engine): a repeated create answers the copy it started, before the
+/// source is read; another source, or after `dst` is dropped, never does.
+#[tokio::test]
+async fn a_repeated_copy_returns_the_same_operation() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "other", 0..30).await;
+    let (first, created) = s.copy().await;
+    assert!(created);
+    let (again, created) = s.copy().await;
+    assert!(!created);
+    assert_eq!(again, first);
+    s.dst.pause_replication("dst").await.unwrap();
+    let (paused, created) = s.copy().await;
+    assert!(!created && paused.state == CopyState::Paused);
+    s.dst.resume_replication("dst").await.unwrap();
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    s.src.delete_index("src").await.unwrap();
+    let (done, created) = s.copy().await;
+    assert!(!created);
+    assert_eq!(done.state, CopyState::Succeeded);
+    let from = s.here.acct.as_tenant(DST);
+    refused(
+        s.dst
+            .create_copy("dst", ReplicaSource::local(SRC, "other"), &from)
+            .await,
+        &ReplicaRefusal::IndexExists("dst".to_owned()),
+    );
+    // Dropped: its outcome goes with it, and a copy there is never the old one.
+    s.dst.delete_index("dst").await.unwrap();
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+    write(&s.dst, "dst", 0..3).await;
+    refused(
+        s.dst
+            .create_copy("dst", ReplicaSource::local(SRC, "other"), &from)
+            .await,
+        &ReplicaRefusal::IndexExists("dst".to_owned()),
+    );
+}
+
+/// M166: a new replication, copy or branch into `dst` replaces its outcome.
+#[tokio::test]
+async fn a_new_operation_into_a_dest_replaces_its_outcome() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    s.src.delete_index("src").await.unwrap();
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    assert_eq!(s.state().await, Some(CopyState::Failed));
+    write(&s.src, "src", 0..30).await;
+    let from = s.here.acct.as_tenant(DST);
+    s.dst
+        .create_replication("dst", s.source.clone(), &from)
+        .await
+        .unwrap();
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+    s.dst.cancel_replication("dst").await.unwrap();
+    // A copy refused at create leaves nothing; a cancelled copy into `b`
+    // leaves an outcome, and a branch into `b` replaces it.
+    s.dst
+        .create_copy("b", ReplicaSource::local(SRC, "gone"), &from)
+        .await
+        .unwrap_err();
+    write(&s.dst, "base", 0..3).await;
+    s.dst
+        .create_copy("b", ReplicaSource::local(SRC, "src"), &from)
+        .await
+        .unwrap();
+    s.dst.cancel_replication("b").await.unwrap();
+    assert!(s.dst.copy_status("b").await.unwrap().is_some());
+    assert!(!s.dst.head_for_test().await.indexes.contains_key("b"));
+    s.dst.branch("base", "b").await.unwrap();
+    assert!(s.dst.copy_status("b").await.unwrap().is_none());
+}
+
+/// M166 criterion 5: two creates racing past the first HEAD read make one copy; the CAS's
+/// own match answers the loser with the winner's.
+#[tokio::test]
+async fn racing_copies_make_one() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let rival = s.here.engine(DST, 4);
+    let source = s.source.clone();
+    let from_rival = s.here.acct.as_tenant(DST);
+    let won: Arc<Mutex<Option<pstore_engine::CopyStatus>>> = Arc::default();
+    let won_in = Arc::clone(&won);
+    // Before this create reads the source's HEAD, the rival makes the copy.
+    *s.here.hooked.hook.lock().unwrap() = Some((
+        format!("tnt/{}/HEAD", SRC.0),
+        Box::new(move || {
+            Box::pin(async move {
+                let (st, created) = rival.create_copy("dst", source, &from_rival).await.unwrap();
+                assert!(created);
+                *won_in.lock().unwrap() = Some(st);
+            })
+        }),
+    ));
+    let (lost, created) = s.copy().await;
+    assert!(!created, "the loser made a second copy");
+    assert_eq!(Some(lost), won.lock().unwrap().clone());
+}
+
+/// M166 criterion 3: a failure is the plan's run's alone; a copy re-created into `dst` while
+/// the sync ran keeps running.
+#[tokio::test]
+async fn a_failure_never_ends_a_newer_copy() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "other", 0..30).await;
+    s.copy().await;
+    s.src.delete_index("src").await.unwrap();
+    let ctl = s.here.engine(DST, 5);
+    let from = s.here.acct.as_tenant(DST);
+    let mut st = SyncState::default();
+    s.dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+            ctl.cancel_replication("dst").await.unwrap();
+            ctl.create_copy("dst", ReplicaSource::local(SRC, "other"), &from)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    let now = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(now.state, CopyState::Running, "{now:?}");
+    assert_eq!(now.source, ReplicaSource::local(SRC, "other"));
 }

@@ -745,6 +745,15 @@ impl<S: BlobStore + 'static> Api<S> {
                 "/v1/indexes/{index}/replication",
                 Read.on(get(replication::status::<S>)),
             )
+            // M166: an isolated copy, as an operation with a status.
+            .route(
+                "/v1/indexes/{index}/copy",
+                Write.on(post(replication::copy::<S>)),
+            )
+            .route(
+                "/v1/indexes/{index}/copy",
+                Read.on(get(replication::copy_status::<S>)),
+            )
             .route(
                 "/v1/indexes/{index}/replication/pause",
                 Write.on(post(replication::pause::<S>)),
