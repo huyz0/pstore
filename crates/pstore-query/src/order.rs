@@ -403,19 +403,22 @@ pub async fn select_held<S: BlobStore>(
     Ok(segments)
 }
 
-/// The full-precision `vector` of each `wanted` row, in **one fan-out** over the `segments`
-/// [`select_held`] opened (M179), never one segment after another. Only a segment whose
-/// `Vectors` section is `vector` is read (as `fetch_rows`'s M64 rule); a row of any other
-/// answers none.
+/// The full-precision vectors `projection` names of each `wanted` row, by field, in **one
+/// fan-out** over the `segments` [`select_held`] opened (M179), never one segment after
+/// another: `vector` (under its name, one vector) where the segment's `Vectors` section is
+/// `vector` (as `fetch_rows`'s M64 rule), and each named dense field (M190) joined with it in
+/// the same round. A row holding none of them has no entry.
 ///
 /// # Errors
-/// A vector range that cannot be read.
+/// A vector range that cannot be read; [`QueryError::VaryingField`] for a named field a
+/// wanted row's segment folded at a varying count of vectors a row.
 pub async fn vectors_at<S: BlobStore>(
     store: &S,
     targets: &[Target],
     segments: &[Segment],
     wanted: &[Located],
-) -> Result<BTreeMap<Located, Vec<f32>>, QueryError> {
+    projection: crate::Projection<'_>,
+) -> Result<BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>>, QueryError> {
     let mut per_segment: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (segment, row) in wanted {
         per_segment.entry(*segment).or_default().push(*row);
@@ -423,9 +426,39 @@ pub async fn vectors_at<S: BlobStore>(
     let read =
         futures_util::future::try_join_all(per_segment.into_iter().filter_map(|(i, rows)| {
             let (t, segment) = (targets.get(i)?, segments.get(i)?);
-            segment.reads_vector_rows().then_some(async move {
-                let got = segment.vector_rows(store, &t.segment, &rows).await?;
-                Ok::<_, QueryError>(got.into_iter().map(move |(row, v)| ((i, row), v)))
+            Some(async move {
+                let named = crate::run::named_fields(segment, projection.named)?;
+                let vector = async {
+                    if projection.vector && segment.reads_vector_rows() {
+                        segment.vector_rows(store, &t.segment, &rows).await
+                    } else {
+                        Ok(BTreeMap::new())
+                    }
+                };
+                let fields = futures_util::future::try_join_all(named.into_iter().map(|name| {
+                    let rows = &rows;
+                    async move {
+                        let got = segment.field_rows(store, &t.segment, name, rows).await?;
+                        Ok::<_, QueryError>((name, got))
+                    }
+                }));
+                let (vector, fields) = futures_util::future::try_join(
+                    async { Ok::<_, QueryError>(vector.await?) },
+                    fields,
+                )
+                .await?;
+                let mut out: BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>> = BTreeMap::new();
+                for (row, v) in vector {
+                    out.entry((i, row))
+                        .or_default()
+                        .insert(pstore_format::DEFAULT_FIELD.to_owned(), vec![v]);
+                }
+                for (name, got) in fields {
+                    for (row, vs) in got {
+                        out.entry((i, row)).or_default().insert(name.clone(), vs);
+                    }
+                }
+                Ok::<_, QueryError>(out)
             })
         }))
         .await?;

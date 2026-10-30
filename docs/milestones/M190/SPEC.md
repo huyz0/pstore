@@ -1,4 +1,4 @@
-# M190: named and multi-vector fields in results and exports
+# M190: named vector fields in results and exports
 
 ## Serves
 Workstream D/H of [the plan](../../comparisons/turbopuffer-next-plan.md): "return requested
@@ -34,12 +34,16 @@ a document's named fields, and each row answers them as a write spells them.
 - **Refused**, as M179 refuses `vector`: beside `aggregate_by` or `as_of`, inside a
   multi-query's `queries`, and above `MAX_VECTOR_ROWS` rows.
 - **Layout.** A folded segment stores a field at one vector a row (`per_row` 1) only when
-  **every** row of the segment holds exactly one vector of it; one row without the field,
-  or with two, stores it at a varying count (`per_row` 0), whose rows' offsets must be read
-  before their vectors. This milestone projects the first layout. A query whose fetched rows
-  lie in a segment storing a projected field at a varying count fails `422 bad_query`
-  naming the rule, never answering nothing: M190.2 reads that layout, with one more round,
-  if the owner admits that round outside D-34 (asked 2026-10-30).
+  **every** row of the segment holds exactly one vector of it (the writer has no other
+  fixed count); one row without the field, or with two, stores it at a varying count
+  (`per_row` 0), whose rows' offsets must be read before their vectors. So a folded
+  multi-vector field is always of the second layout. This milestone projects the first,
+  and every unfolded row's fields, multi-vector ones included, from memory. A query whose
+  fetched rows lie in a segment storing a projected field at a varying count fails
+  `422 bad_query` naming the rule, never answering nothing (with something unfolded a
+  fetched row is any leg's candidate, so one never returned can fail it): M190.2 reads
+  that layout, with one more round, if the owner admits that round outside D-34 (asked
+  2026-10-30).
 - **Cost**: the named fields' rows are read in the round that reads `vector`'s (M179), one
   `field_rows` call a projected field a segment, joined with `rows_at` and `vector_rows`,
   never awaited after them: a ranked query's row fetch (every `fetch_rows` caller: the
@@ -50,9 +54,8 @@ a document's named fields, and each row answers them as a write spells them.
 
 ## Acceptance criteria
 1. Over 300 rows, each with `vector` of width 8 and a named `title` of width 4 (one vector),
-   and half of them also a named `tokens` of width 4 holding exactly 3 vectors (folded so
-   both fields are fixed width in their segment: the `tokens` rows fold alone), under each
-   of the three metrics, folded with 50 more rows unfolded, and restarted: a ranked query
+   folded in two segments, and 50 more unfolded that also hold a named `tokens` of width 4
+   and 1 to 5 vectors, under each of the three metrics, and restarted: a ranked query
    with `include_vectors: ["vector", "title", "tokens"]` answers each row's `title` and
    `tokens` vectors, in order, bit for bit as written (dot product, euclidean) or as each
    one's f32 normalization within 1e-6 per component (cosine); `float` and `base64` decode
@@ -64,11 +67,11 @@ a document's named fields, and each row answers them as a write spells them.
    equal. (`fde` legs are approximate and excluded.)
 3. Unfolded, a row with `title` alone answers `vectors` with `title` only and a row with no
    named field no `vectors` key; folded, a segment whose rows all lack named fields answers
-   no `vectors` key; no response key ends the derived-encoding suffix, folded or unfolded. In
-   a width-0 index, `title` folded and unfolded answers `vectors` and no `vector`. A name
+   no `vectors` key; no response key ends the derived-encoding suffix, folded or unfolded. A
+   name
    the index has no field of is admitted and answers no entry. With `diversify`, each picked
    row answers its `title`. A query whose fetched rows include a segment storing `title` at
-   a varying count fails 422 naming the rule. 400 naming the rule: `[""]`, a 65-byte name, a
+   a varying count, or a folded `tokens`, fails 422 naming the rule. 400 naming the rule: `[""]`, a 65-byte name, a
    name with a NUL, a name ending the derived-encoding suffix, `["sparse"]`,
    `["title", "title"]`, `[1]`, `[]`, `"title"`, and 10 distinct names; 9 are admitted.
 4. On the depth-counting store, cold, at 1 and at 4 folded segments, every row holding
@@ -81,7 +84,7 @@ a document's named fields, and each row answers them as a write spells them.
 Server tests in `crates/pstore-server/tests/it/vectors_named.rs`. Red first: on the parent
 any name but `vector` is 400, so 1, 2 and 4 fail and 3's asserted messages do not match.
 Mutations, each to be killed: a named field's euclidean extra component kept, or cosine
-unnormalized (1); a multi-vector field's vectors reordered or one dropped (1, 2); a field's
+unnormalized (1); an unfolded multi-vector field's vectors reordered or one dropped (1, 2); a field's
 rows read from another field, through `vector_rows`, or for another row (2, 3); an empty
 `vectors` object or field list answered (3); the derived field not filtered (3); a varying
 layout answering nothing rather than failing (3); `diversify` dropping the picked rows'
@@ -107,8 +110,8 @@ fetched row, bounded by the fetched rows, never by the index.
 
 ## Tasks
 - M190.1: the request's names, `fetch_rows` and the order's vector round over fixed-width
-  named fields, the varying layout's refusal, the response's `vectors`, the test module
-  registered in `tests/it/main.rs`, docs.
+  named fields, unfolded rows' fields from memory, the varying layout's refusal, the
+  response's `vectors`, the test module registered in `tests/it/main.rs`, docs.
 
 ## Review
 Spec review round 1 (approve with changes, five majors, all taken): the fixed layout is a
@@ -117,3 +120,7 @@ bound moved to M190.2; the derived fields never answered; the width-0 index; the
 layout split out to M190.2 behind the owner's decision, refused rather than silent here.
 Minors taken: `vector` accepted by name, the 9-name cap a per-query bound, every
 `fetch_rows` caller, `fde` excluded, per-segment request counts, the format alternative.
+While writing the tests: the writer's only fixed count is one, so a folded multi-vector
+field is always of the varying layout; criterion 1's `tokens` moved to the unfolded rows.
+And a named field needs a `vector` beside it (M61), so no width-0 index holds one: that
+case left criterion 3.
