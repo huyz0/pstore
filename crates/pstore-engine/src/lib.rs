@@ -7666,7 +7666,9 @@ impl<S: BlobStore> Engine<S> {
             None => (Arc::default(), None, Arc::default(), None, None, None),
         };
         // M165: the fresh segment holds this process's unfolded rows, not a folded segment.
-        pstore_query::explain::fresh((targets.len() > unfolded_at).then_some(unfolded_at));
+        // It is the target at `unfolded_at` when there is one; past the targets, the ordinal
+        // names none.
+        pstore_query::explain::fresh(Some(unfolded_at));
         // M14: the same rule as the metric's, and the fresh segment was built by it.
         let fts = at
             .head
