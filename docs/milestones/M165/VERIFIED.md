@@ -76,5 +76,11 @@ No `cargo mutants` run is claimed.
      `a_fresh_ordinal_past_the_targets_names_none` and a text query in
      `explain_counts_remote_segments` now catch them. Each was run here against its mutant
      and failed, and passed with the line restored.
+   - CI's mutation shard 0 found `>` to `>=` missed where the engine names its fresh
+     ordinal. It is equivalent: an ordinal past the targets names none, which
+     `a_fresh_ordinal_past_the_targets_names_none` pins, so the comparison was removed and
+     the engine passes `Some(unfolded_at)`. With that change the engine's tests (607 in
+     `it`) and the explain tests in pstore-query and pstore-server passed here, with fmt
+     and clippy.
 
 Code review: see the commit message.
