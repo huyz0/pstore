@@ -1307,3 +1307,25 @@ async fn status_notes_are_written_at_most_once_a_renewal_period() {
     let (_, b) = status(&api, DST, "dst").await;
     assert!(b["last_commit_ms"].as_u64().unwrap() > first, "{b}");
 }
+
+/// M162: a replica has no history to measure a snapshot's recall in, as it has no `as_of`.
+#[tokio::test(start_paused = true)]
+async fn a_replica_has_no_recall() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..3).await;
+    let (status, created) = create(
+        &api,
+        DST,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 2, Duration::from_secs(1)).await;
+    assert!(rows(&api, DST, "dst").await.is_some(), "the replica synced");
+    let (s, b) = send(&api, DST, "POST", "/v1/indexes/dst/recall", &json!({})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    assert_eq!(b["error"]["code"], "replica_no_history", "{b}");
+}

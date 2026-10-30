@@ -275,6 +275,30 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M162: an index measures its own recall, online, at one snapshot
+
+`POST /v1/indexes/{index}/recall` (scope `read`) with `{"num", "top_k", "filters",
+"seed", "include_ground_truth"}`, every field optional (`num` 1 to 25, default 10;
+`top_k` 1 to 100, default 10; `seed` default 0), answers `{"avg_recall",
+"avg_ann_count", "avg_exhaustive_count", "num", "epoch", "cost"}` and, with
+`include_ground_truth`, `ground_truth: [{"query_vector", "nearest_neighbors": [{"id",
+"dist"}]}]`.
+
+It reads HEAD once. The queries are the vectors of the documents nearest a probe drawn
+from `seed`, so a seed over the same snapshot measures the same queries; they are not a
+uniform sample of the index. Each is searched as a default query searches and
+exhaustively, both at that snapshot and with `filters`; rows no fold has committed are
+not measured, and `epoch` names the snapshot. With `filters` every list is probed, so a
+filtered recall measures only the compressed scoring, not missed lists.
+
+The exhaustive searches read every vector of the index, and `cost` says so. A request
+that would score more than 2,000,000 rows (`num` times the index's rows, twice that with
+`filters`) is `400 recall_too_large` before any segment read: ask for fewer queries. An
+index with no default vector field is `400 recall_needs_vectors`, and a replica is
+`409 replica_no_history`. No other route changes.
+
+Nothing stored changes. Evidence is in [M162 verification](milestones/M162/VERIFIED.md).
+
 ## M161: index list pages state what a walk sees while names change
 
 Each page of `GET /v1/indexes` adds `epoch`: the epoch of the HEAD the page was read

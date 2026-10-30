@@ -91,7 +91,7 @@ write into branch/copy and query into multi-query.
 | `GET /v2/namespaces/{namespace}/metadata` | `GET /v1/indexes/{index}` | Partial metadata; see route conflict above | G |
 | `PATCH /v1/namespaces/{namespace}/metadata` | `PATCH /v1/indexes/{index}` with `read_only` ([M149](../milestones/M149/SPEC.md)) | Partial: read-only only; pinning missing | I |
 | `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial: synchronous process-local metadata warm, rather than accepted asynchronous hint | H |
-| `POST /v1/namespaces/{namespace}/_debug/recall` | Offline `scripts/recall.sh` | Missing online sampled recall/ground truth endpoint | H |
+| `POST /v1/namespaces/{namespace}/_debug/recall` | `POST /v1/indexes/{index}/recall` ([M162](../milestones/M162/VERIFIED.md)) | Online recall at one snapshot with `num`, `top_k`, `filters`, `seed` and ground truth; queries sampled near a seeded probe, no `rank_by`; a row budget refuses oversized requests | H |
 | `POST /v2/namespaces/{namespace}` | `PUT /v1/indexes/{index}/documents` | Partial write contract; separate field matrix below | B, C, D |
 | `DELETE /v2/namespaces/{namespace}` | `DELETE /v1/indexes/{index}` | Equivalent logical deletion; retention/GC and response differ | B, G |
 | `POST /v2/namespaces/{namespace}/query` | `POST /v1/indexes/{index}/query` | Partial query contract; separate expression matrix below | B, E, F |
@@ -285,7 +285,7 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | Warm `status`, `message` | Native warm metadata/cost; synchronous semantics |
 | Delete `status` | Native epoch/cost response |
 | List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `epoch`, `cost` |
-| Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | Offline recall output only |
+| Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | The same four, plus `num`, `epoch` and `cost` ([M162](../milestones/M162/VERIFIED.md)) |
 | Explain `plan_text` | Missing |
 | Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Missing general copy job contract |
 | Operation `result.success` (WriteResult) or `result.error.{status_code,detail}` | Replication status has different fields and lifecycle |

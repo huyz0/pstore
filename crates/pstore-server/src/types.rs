@@ -922,6 +922,45 @@ pub struct ReadOnlyResponse {
     pub cost: Cost,
 }
 
+/// What `POST /v1/indexes/{index}/recall` answers (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallResponse {
+    /// The mean share of each sampled query's exhaustive results its approximate search also
+    /// returned, over the queries whose exhaustive search returned any; `null` when none did.
+    pub avg_recall: Option<f64>,
+    /// The mean count of approximate results.
+    pub avg_ann_count: f64,
+    /// The mean count of exhaustive results.
+    pub avg_exhaustive_count: f64,
+    /// The queries sampled.
+    pub num: usize,
+    /// The HEAD every search answered at: rows no fold had committed are not measured.
+    pub epoch: u64,
+    /// Each sampled query and its exhaustive results, with `include_ground_truth`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_truth: Option<Vec<RecallGroundTruth>>,
+    /// What it cost: the exhaustive searches read every vector of the index.
+    pub cost: Cost,
+}
+
+/// One sampled query of a recall response (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallGroundTruth {
+    /// A document's vector in client space (normalized under `cosine_distance`).
+    pub query_vector: Vec<f32>,
+    /// The exhaustive results, in rank order.
+    pub nearest_neighbors: Vec<RecallNeighbor>,
+}
+
+/// One exhaustive result of a sampled query (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallNeighbor {
+    /// The document's id.
+    pub id: String,
+    /// Its distance, as a query reports it.
+    pub dist: f32,
+}
+
 /// `GET /v1/indexes?prefix=&cursor=&page_size=` (M9f).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ListParams {

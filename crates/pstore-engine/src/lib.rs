@@ -7,6 +7,7 @@ mod external;
 mod filter_rows;
 mod head;
 pub mod lanes;
+mod recall;
 mod replica;
 
 pub use applied::{
@@ -20,6 +21,7 @@ pub use head::{
     Replication, SegmentRef, TimeTravel,
 };
 pub use pstore_format::typed::Kind;
+pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
 pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
@@ -449,6 +451,17 @@ pub enum EngineError {
     /// A write, or a drop, named an index its owner made read-only (M149).
     #[error("the index {0:?} is read-only")]
     IndexReadOnly(String),
+    /// A recall request would score more rows than [`RECALL_ROW_BUDGET`] (M162).
+    #[error("recall would score {rows} rows, over the budget of {budget}")]
+    RecallTooLarge {
+        /// The rows it would score.
+        rows: u64,
+        /// [`RECALL_ROW_BUDGET`].
+        budget: u64,
+    },
+    /// A recall request named an index with no default vectors to search (M162).
+    #[error("the index {0:?} has no default vector field to measure recall over")]
+    RecallNeedsVectors(String),
     /// The epoch asked for cannot be reconstructed.
     #[error(transparent)]
     TimeTravel(#[from] head::TimeTravel),
@@ -8018,6 +8031,35 @@ impl<S: BlobStore> Engine<S> {
             )));
         }
         let then = at.head.as_of(epoch)?;
+        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
+        // (M9f.2).
+        let recorded = schema_recorded_at(&at.head, index, epoch);
+        self.query_head(
+            &then, recorded, index, prefetch, filter, fusion, top_k, false,
+        )
+        .await
+    }
+
+    /// One search against a HEAD already read (M162): `then`'s segments and delete vectors,
+    /// no freshness layer, and no HEAD read of its own, so several searches answer at one
+    /// snapshot for one read. `recorded` is the index's schema at that HEAD's epoch, if one
+    /// was recorded (M170). With `vectors`, each hit's vector in client space, as
+    /// [`Self::query_split_vectors`] gives.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, and the HEAD it runs against"
+    )]
+    async fn query_head(
+        &self,
+        then: &Head,
+        recorded: Option<head::IndexSchema>,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        vectors: bool,
+    ) -> Result<Answer, EngineError> {
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
         // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
         // unfolded rows are newer than any past epoch.
@@ -8028,9 +8070,7 @@ impl<S: BlobStore> Engine<S> {
             false,
             self.params.exact_scan_threshold,
         );
-        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
-        // (M9f.2). Read before the empty return, which reports its analyzer too (M63).
-        let recorded = schema_recorded_at(&at.head, index, epoch);
+        // Read before the empty return, which reports its analyzer too (M63).
         let schema = recorded.clone().unwrap_or_default();
         if targets.is_empty() {
             return Ok(Answer {
@@ -8062,7 +8102,7 @@ impl<S: BlobStore> Engine<S> {
         let filter = bound.as_ref();
         vectors_recorded(recorded.map(|s| s.dims), index, prefetch)?;
         let (prefetch, q2) = scored_by(metric, prefetch)?;
-        let resolved = pstore_query::query_rows_filtered_texts(
+        let resolved = pstore_query::query_rows_split_texts(
             &self.store,
             &targets,
             &prefetch,
@@ -8072,10 +8112,12 @@ impl<S: BlobStore> Engine<S> {
             &std::collections::HashSet::new(),
             fusion,
             top_k,
+            Vec::new(),
+            vectors,
         )
         .await
         .map_err(|e| query_error(metric, &prefetch, e))?;
-        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, false);
+        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, vectors);
         Ok(Answer {
             hits,
             ids,

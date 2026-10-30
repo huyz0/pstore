@@ -58,8 +58,8 @@ pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
     IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta,
-    QueryRequest, QueryResponse, ReadOnlyResponse, ResultRow, Schema, TextIn, WarmMeta,
-    WarmResponse, WriteRequest, WriteResponse,
+    QueryRequest, QueryResponse, ReadOnlyResponse, RecallGroundTruth, RecallNeighbor,
+    RecallResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -703,6 +703,11 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/query", Read.on(post(query_index::<S>)))
             .route("/v1/indexes/{index}/warm", Read.on(post(warm_index::<S>)))
+            // M162: the index's recall, measured at one snapshot.
+            .route(
+                "/v1/indexes/{index}/recall",
+                Read.on(post(recall_index::<S>)),
+            )
             // M132: a key that makes an applied write's retry safe.
             .route(
                 "/v1/indexes/{index}/idempotency-keys",
@@ -1300,6 +1305,15 @@ impl From<EngineError> for ApiError {
             EngineError::IndexReadOnly(_) => {
                 Self::new(StatusCode::CONFLICT, "index_read_only", e.to_string())
             }
+            // M162: sized before any segment read; fewer queries fit.
+            EngineError::RecallTooLarge { .. } => {
+                Self::new(StatusCode::BAD_REQUEST, "recall_too_large", e.to_string())
+            }
+            EngineError::RecallNeedsVectors(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "recall_needs_vectors",
+                e.to_string(),
+            ),
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
                 use pstore_engine::ReplicaRefusal as R;
@@ -4461,6 +4475,77 @@ async fn patch_index<S: BlobStore + 'static>(
     }))
 }
 
+/// `POST /v1/indexes/{index}/recall` (M162): ANN against exhaustive search, for queries
+/// sampled by `seed` near one probe, at the one HEAD the request reads.
+async fn recall_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<RecallResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let raw: RecallBody = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed recall request: {e}")))?;
+    let num = raw.num.unwrap_or(10);
+    if !(1..=25).contains(&num) {
+        return Err(ApiError::bad_request(format!(
+            "num is from 1 to 25, not {num}"
+        )));
+    }
+    let top_k = raw.top_k.unwrap_or(10);
+    if !(1..=100).contains(&top_k) {
+        return Err(ApiError::bad_request(format!(
+            "top_k is from 1 to 100, not {top_k}"
+        )));
+    }
+    let filter = raw.filters.as_ref().map(predicate).transpose()?;
+    let req = pstore_engine::RecallRequest {
+        num,
+        top_k,
+        filter,
+        seed: raw.seed.unwrap_or(0),
+        ground_truth: raw.include_ground_truth.unwrap_or(false),
+    };
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let r = engine
+        .recall(&index, &req)
+        .await?
+        .ok_or_else(|| no_index(&index))?;
+    Ok(axum::Json(RecallResponse {
+        avg_recall: r.avg_recall,
+        avg_ann_count: r.avg_ann_count,
+        avg_exhaustive_count: r.avg_exhaustive_count,
+        num: r.num,
+        epoch: r.epoch.0,
+        ground_truth: req.ground_truth.then(|| {
+            r.ground_truth
+                .into_iter()
+                .map(|g| RecallGroundTruth {
+                    query_vector: g.query_vector,
+                    nearest_neighbors: g
+                        .nearest_neighbors
+                        .into_iter()
+                        .map(|(id, dist)| RecallNeighbor { id, dist })
+                        .collect(),
+                })
+                .collect()
+        }),
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// What `POST /v1/indexes/{index}/recall` carries (M162). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecallBody {
+    num: Option<usize>,
+    top_k: Option<usize>,
+    filters: Option<serde_json::Value>,
+    seed: Option<u64>,
+    include_ground_truth: Option<bool>,
+}
+
 /// What `PATCH /v1/indexes/{index}` carries (M149). Anything else is refused.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6920,6 +7005,21 @@ mod tests {
         // patch by filter's patch (2 + 8), and the stamp on each of five operations.
         assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
         assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
+    }
+
+    #[test]
+    fn recall_refusals_are_named() {
+        // M162: a budget no API test's corpus reaches, and an index with no default vectors.
+        let too = ApiError::from(EngineError::RecallTooLarge { rows: 3, budget: 2 });
+        assert_eq!(
+            (too.status, too.code),
+            (StatusCode::BAD_REQUEST, "recall_too_large")
+        );
+        let bare = ApiError::from(EngineError::RecallNeedsVectors("t".to_owned()));
+        assert_eq!(
+            (bare.status, bare.code),
+            (StatusCode::BAD_REQUEST, "recall_needs_vectors")
+        );
     }
 
     #[test]
