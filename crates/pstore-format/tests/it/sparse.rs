@@ -20,20 +20,24 @@ use pstore_format::{Document, Impact, VectorField};
 use std::collections::BTreeMap;
 
 const FIELD: &str = "body_sparse";
+/// A v2 dictionary's table: after magic(8) version(2) encoding(1) count(4) key bytes(8).
+const ENTRIES_AT: usize = 23;
+/// A v2 entry: key at(8) len(2) offset(8) bytes(4) count(4) max(4).
+const ENTRY: usize = 30;
+/// An entry's key span: at(8) len(2).
+const SPAN: usize = 10;
 
-/// A document whose sparse field is `pairs`.
+/// A document whose sparse field is `pairs`, each dimension keyed by its decimal spelling
+/// (M177) and kept in key byte order, the order a scan answers.
 fn doc(id: usize, pairs: Vec<(u32, f32)>) -> Document {
+    let mut pairs: Vec<(String, Impact)> = pairs
+        .into_iter()
+        .map(|(d, w)| (d.to_string(), Impact::new(w)))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     Document {
         id: format!("d{id}"),
-        vectors: BTreeMap::from([(
-            FIELD.into(),
-            VectorField::Sparse(
-                pairs
-                    .into_iter()
-                    .map(|(d, w)| (d, Impact::new(w)))
-                    .collect(),
-            ),
-        )]),
+        vectors: BTreeMap::from([(FIELD.into(), VectorField::Sparse(pairs))]),
         attrs: BTreeMap::new(),
     }
 }
@@ -82,7 +86,7 @@ fn a_sparse_field_round_trips() {
         };
         for (dim, want) in pairs {
             let e = dict
-                .lookup(*dim)
+                .lookup(dim)
                 .unwrap_or_else(|| panic!("dimension {dim} is not in the dictionary"));
             let raw = &p.section[e.offset as usize..e.offset as usize + e.bytes as usize];
             let list = dict.decode_list(&e, raw);
@@ -116,12 +120,12 @@ fn a_posting_list_holds_every_row_carrying_its_dimension_and_no_other() {
         let mut want: Vec<u32> = Vec::new();
         for (row, d) in docs.iter().enumerate() {
             if let VectorField::Sparse(pairs) = &d.vectors[FIELD]
-                && pairs.iter().any(|(x, _)| *x == dim)
+                && pairs.iter().any(|(x, _)| *x == dim.to_string())
             {
                 want.push(row as u32);
             }
         }
-        match dict.lookup(dim) {
+        match dict.lookup(&dim.to_string()) {
             None => assert!(want.is_empty(), "dimension {dim} has rows but no entry"),
             Some(e) => {
                 let raw = &p.section[e.offset as usize..e.offset as usize + e.bytes as usize];
@@ -144,7 +148,9 @@ fn rows_in_a_list_are_ascending() {
     let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
     for dim in 0..30u32 {
-        let Some(e) = dict.lookup(dim) else { continue };
+        let Some(e) = dict.lookup(&dim.to_string()) else {
+            continue;
+        };
         let raw = &p.section[e.offset as usize..e.offset as usize + e.bytes as usize];
         let rows: Vec<u32> = dict
             .decode_list(&e, raw)
@@ -209,13 +215,15 @@ fn the_dictionary_names_every_dimension_the_corpus_used_and_no_other() {
     let docs = covering_corpus(80, 40, 3);
     let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let want: std::collections::BTreeSet<u32> = (0..40).collect();
+    let want: std::collections::BTreeSet<String> = (0..40u32).map(|d| d.to_string()).collect();
     assert_eq!(
-        dict.dims().collect::<std::collections::BTreeSet<_>>(),
+        dict.keys()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>(),
         want,
         "the dictionary does not enumerate the corpus's vocabulary"
     );
-    assert_eq!(dict.dims().count(), dict.len());
+    assert_eq!(dict.keys().count(), dict.len());
 }
 
 #[test]
@@ -228,13 +236,19 @@ fn a_dimension_between_two_entries_is_not_found() {
     let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
     assert_eq!(dict.len(), 6);
+    // Each found key's list is its own row's: the entry found is that key's.
     for present in [0u32, 10, 20, 30, 40, 50] {
-        assert_eq!(dict.lookup(present).map(|e| e.dim), Some(present));
+        let e = dict.lookup(&present.to_string()).unwrap();
+        let raw = &p.section[e.offset as usize..][..e.bytes as usize];
+        let rows: Vec<u32> = dict.decode_list(&e, raw).iter().map(|(r, _)| *r).collect();
+        assert_eq!(rows, vec![present / 10], "{present}");
     }
-    for gap in [3u32, 11, 25, 39, 49] {
+    // In byte order the keys are 0, 10, 20, ...: these fall between two.
+    for gap in ["05", "1", "15", "25", "39", "4", "49"] {
         assert!(dict.lookup(gap).is_none(), "dimension {gap} was invented");
     }
-    assert!(dict.lookup(51).is_none());
+    assert!(dict.lookup("51").is_none());
+    assert!(dict.lookup("").is_none());
 }
 
 #[test]
@@ -243,17 +257,17 @@ fn the_dictionary_is_sorted_and_fixed_width_so_a_lookup_is_a_search() {
     // term is the difference between a lookup and a pass over 600 KB.
     let p = sparse::build(&corpus(50, 400, 10), FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let dims: Vec<u32> = dict.dims().collect();
+    let dims: Vec<&str> = dict.keys().collect();
     assert!(
         dims.windows(2).all(|w| w[0] < w[1]),
         "the dictionary is not sorted by dimension"
     );
     assert!(
-        dict.lookup(u32::MAX).is_none(),
+        dict.lookup(&u32::MAX.to_string()).is_none(),
         "an absent dimension was found"
     );
     for d in &dims {
-        assert_eq!(dict.lookup(*d).map(|e| e.dim), Some(*d));
+        assert!(dict.lookup(d).is_some(), "{d}");
     }
 }
 
@@ -278,7 +292,7 @@ fn a_document_with_no_sparse_field_contributes_nothing() {
     docs.insert(10, Document::new("dense-only", vec![1.0, 2.0]));
     let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    for dim in dict.dims().collect::<Vec<_>>() {
+    for dim in dict.keys().collect::<Vec<_>>() {
         let e = dict.lookup(dim).unwrap();
         let raw = &p.section[e.offset as usize..e.offset as usize + e.bytes as usize];
         for (row, _) in dict.decode_list(&e, raw) {
@@ -307,7 +321,7 @@ fn f16_round_trips_within_its_precision() {
         .collect();
     let p = sparse::build(&docs, FIELD, ImpactEncoding::F16);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let e = dict.lookup(0).unwrap();
+    let e = dict.lookup("0").unwrap();
     let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
     assert_eq!(got.len(), weights.len());
     for ((_, out), want) in got.iter().zip(&weights) {
@@ -340,7 +354,7 @@ fn f32_impacts_are_exact() {
         .collect();
     let p = sparse::build(&docs, FIELD, ImpactEncoding::F32);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let e = dict.lookup(3).unwrap();
+    let e = dict.lookup("3").unwrap();
     let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
     assert_eq!(
         got.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
@@ -367,7 +381,7 @@ fn an_encodings_width_is_what_it_writes() {
             let docs: Vec<Document> = (0..4).map(|i| doc(i, vec![(1, 3.0)])).collect();
             let p = sparse::build(&docs, FIELD, enc);
             let dict = Dictionary::decode(&p.dictionary).unwrap();
-            let e = dict.lookup(1).unwrap();
+            let e = dict.lookup("1").unwrap();
             let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
             assert_eq!(
                 got.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
@@ -387,7 +401,7 @@ fn an_encodings_width_is_what_it_writes() {
         let docs: Vec<Document> = (0..4).map(|i| doc(i, vec![(1, 0.5)])).collect();
         let p = sparse::build(&docs, FIELD, enc);
         let dict = Dictionary::decode(&p.dictionary).unwrap();
-        let e = dict.lookup(1).unwrap();
+        let e = dict.lookup("1").unwrap();
         // 4 rows: 4 one-byte varints, then 4 impacts.
         assert_eq!(e.bytes as usize, 4 + 4 * w, "{enc:?} wrote the wrong width");
     }
@@ -476,7 +490,7 @@ async fn a_sparse_field_does_not_displace_the_dense_one() {
         let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0]);
         d.vectors.insert(
             "aaa_sparse".into(),
-            VectorField::Sparse(vec![(1, Impact::new(0.5))]),
+            VectorField::Sparse(vec![("1".to_owned(), Impact::new(0.5))]),
         );
         docs.push(d);
     }
@@ -555,8 +569,8 @@ async fn a_scan_reconstructs_a_sparse_field() {
             panic!("{} came back with no sparse field", got.id)
         };
         assert_eq!(
-            g.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
-            w.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            g.iter().map(|(d, _)| d).collect::<Vec<_>>(),
+            w.iter().map(|(d, _)| d).collect::<Vec<_>>(),
             "{}'s dimensions changed",
             got.id
         );
@@ -564,7 +578,7 @@ async fn a_scan_reconstructs_a_sparse_field() {
             // ⚠️ The scale is the TERM's largest magnitude, not this posting's. A bound
             // written against the posting's own weight passes for the largest weight in
             // every list and fails for the smallest, which reads as a decoding bug.
-            let bound = term_max(&docs, *dim) / 254.0;
+            let bound = term_max(&docs, dim) / 254.0;
             assert!(
                 (a.get() - b.get()).abs() <= bound,
                 "{}: dimension {dim} decoded as {} against {} written",
@@ -643,7 +657,7 @@ fn out_field(d: &Document) -> &VectorField {
 }
 
 /// The largest magnitude any document gives `dim` — the scale a u8 impact is quantized by.
-fn term_max(docs: &[Document], dim: u32) -> f32 {
+fn term_max(docs: &[Document], dim: &str) -> f32 {
     docs.iter()
         .filter_map(|d| match d.vectors.get(FIELD) {
             Some(VectorField::Sparse(p)) => Some(p),
@@ -676,12 +690,12 @@ fn a_dictionary_with_an_unknown_encoding_is_refused() {
     assert!(Dictionary::decode(&p.dictionary).is_none());
 
     let mut unsorted = sparse::build(&covering_corpus(20, 8, 3), FIELD, ImpactEncoding::U8);
-    // Swap two entries' dimension fields, which unsorts the table without changing its length.
-    let (a, b) = (15, 15 + 24);
-    let first: Vec<u8> = unsorted.dictionary[a..a + 4].to_vec();
-    let second: Vec<u8> = unsorted.dictionary[b..b + 4].to_vec();
-    unsorted.dictionary[a..a + 4].copy_from_slice(&second);
-    unsorted.dictionary[b..b + 4].copy_from_slice(&first);
+    // Swap two entries' key spans, which unsorts the table without changing its length.
+    let (a, b) = (ENTRIES_AT, ENTRIES_AT + ENTRY);
+    let first: Vec<u8> = unsorted.dictionary[a..a + SPAN].to_vec();
+    let second: Vec<u8> = unsorted.dictionary[b..b + SPAN].to_vec();
+    unsorted.dictionary[a..a + SPAN].copy_from_slice(&second);
+    unsorted.dictionary[b..b + SPAN].copy_from_slice(&first);
     assert!(
         Dictionary::decode(&unsorted.dictionary).is_none(),
         "an unsorted dictionary decoded, and every lookup past the swap would miss"
@@ -693,9 +707,9 @@ fn a_dictionary_with_an_unknown_encoding_is_refused() {
     // this: the sortedness check reads `a < b`, and `a <= b` accepts duplicates while every
     // other test passes, because `build` cannot produce one.
     let mut dupes = sparse::build(&covering_corpus(20, 8, 3), FIELD, ImpactEncoding::U8);
-    let (a, b) = (15, 15 + 24);
-    let first: Vec<u8> = dupes.dictionary[a..a + 4].to_vec();
-    dupes.dictionary[b..b + 4].copy_from_slice(&first);
+    let (a, b) = (ENTRIES_AT, ENTRIES_AT + ENTRY);
+    let first: Vec<u8> = dupes.dictionary[a..a + SPAN].to_vec();
+    dupes.dictionary[b..b + SPAN].copy_from_slice(&first);
     assert!(
         Dictionary::decode(&dupes.dictionary).is_none(),
         "a dictionary with a duplicate dimension decoded, and one of the two lists is now \
@@ -722,7 +736,7 @@ fn a_field_with_no_postings_has_an_empty_dictionary() {
     assert!(dict.is_empty());
     assert_eq!(dict.len(), 0);
     assert!(p.section.is_empty());
-    assert!(dict.lookup(0).is_none());
+    assert!(dict.lookup("0").is_none());
 }
 
 #[test]
@@ -732,7 +746,7 @@ fn a_truncated_posting_list_decodes_to_nothing_rather_than_to_rows() {
     // safe answer, and returning a short list would look like a correct answer.
     let p = sparse::build(&corpus(40, 10, 4), FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let e = dict.lookup(dict.dims().next().unwrap()).unwrap();
+    let e = dict.lookup(dict.keys().next().unwrap()).unwrap();
     let full = &p.section[e.offset as usize..][..e.bytes as usize];
     assert!(!dict.decode_list(&e, full).is_empty());
 
@@ -784,7 +798,7 @@ fn f16_saturates_rather_than_wrapping() {
         .collect();
     let p = sparse::build(&docs, FIELD, ImpactEncoding::F16);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let e = dict.lookup(0).unwrap();
+    let e = dict.lookup("0").unwrap();
     let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
     assert!(got[0].1.is_infinite() && got[0].1.is_sign_positive());
     assert!(got[1].1.is_infinite() && got[1].1.is_sign_negative());
@@ -806,7 +820,7 @@ fn a_term_whose_every_impact_is_zero_decodes_to_zero() {
     let docs: Vec<Document> = (0..5).map(|i| doc(i, vec![(4, 0.0)])).collect();
     let p = sparse::build(&docs, FIELD, ImpactEncoding::U8);
     let dict = Dictionary::decode(&p.dictionary).unwrap();
-    let e = dict.lookup(4).unwrap();
+    let e = dict.lookup("4").unwrap();
     assert_eq!(e.max_impact, 0.0);
     let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize]);
     assert_eq!(got.len(), 5);
@@ -915,7 +929,7 @@ fn f16_encodes_the_nearest_representable_value() {
         let docs = vec![doc(0, vec![(1, x)])];
         let p = sparse::build(&docs, FIELD, ImpactEncoding::F16);
         let dict = Dictionary::decode(&p.dictionary).unwrap();
-        let e = dict.lookup(1).unwrap();
+        let e = dict.lookup("1").unwrap();
         let got = dict.decode_list(&e, &p.section[e.offset as usize..][..e.bytes as usize])[0].1;
         let want = nearest_f16(&table, x);
         // Value equality, not bit equality: +0 and -0 are the same impact, and a tie between
@@ -977,8 +991,13 @@ fn a_sparse_dictionary_is_decoded_once_a_buffer() {
     assert!(!std::sync::Arc::ptr_eq(&one, &three));
     let fresh = Dictionary::decode(&p.dictionary).unwrap();
     for dim in 0..60u32 {
-        assert_eq!(one.lookup(dim), fresh.lookup(dim), "{dim}");
-        assert_eq!(three.lookup(dim), fresh.lookup(dim), "{dim}");
+        let dim = dim.to_string();
+        assert_eq!(one.lookup(&dim), fresh.lookup(&dim), "{dim}");
+        assert_eq!(three.lookup(&dim), fresh.lookup(&dim), "{dim}");
     }
     assert!(Dictionary::decode_shared(&raw.slice(..raw.len() - 1)).is_none());
+    // What the budget counts: the 60 keys' spellings, 110 bytes, and 6 bytes and an entry
+    // each (M177, found by CI's mutants: the weight was never read).
+    let entry = std::mem::size_of::<sparse::Entry>();
+    assert_eq!(fresh.held_bytes(), 110 + 60 * (6 + entry));
 }

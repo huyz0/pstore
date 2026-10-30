@@ -29,13 +29,16 @@ const FIELD: &str = "body_sparse";
 /// whole-section read it exists to refuse.
 const GAP: u64 = 256;
 
+/// A document keying each dimension by its decimal spelling (M177), in key byte order.
 fn doc(id: usize, pairs: &[(u32, f32)]) -> Document {
+    let mut pairs: Vec<(String, Impact)> = pairs
+        .iter()
+        .map(|(d, w)| (d.to_string(), Impact::new(*w)))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     Document {
         id: format!("d{id:05}"),
-        vectors: BTreeMap::from([(
-            FIELD.into(),
-            VectorField::Sparse(pairs.iter().map(|(d, w)| (*d, Impact::new(*w))).collect()),
-        )]),
+        vectors: BTreeMap::from([(FIELD.into(), VectorField::Sparse(pairs))]),
         attrs: BTreeMap::new(),
     }
 }
@@ -103,7 +106,7 @@ async fn put<S: BlobStore>(store: &S, docs: &[Document], enc: ImpactEncoding) ->
 }
 
 /// Every row sharing a dimension with `q`, and its exact f32 score.
-fn brute(docs: &[Document], q: &[(u32, f32)]) -> Vec<(usize, f32)> {
+fn brute(docs: &[Document], q: &[(String, f32)]) -> Vec<(usize, f32)> {
     let mut out: Vec<(usize, f32)> = Vec::new();
     for (row, d) in docs.iter().enumerate() {
         let VectorField::Sparse(pairs) = &d.vectors[FIELD] else {
@@ -128,12 +131,12 @@ fn brute(docs: &[Document], q: &[(u32, f32)]) -> Vec<(usize, f32)> {
 /// 200 queries, each the sparse field of a document of the corpus — the pinned distribution,
 /// because rank agreement under quantization is far more forgiving for uniformly drawn
 /// dimensions than for frequency-drawn ones.
-fn queries(docs: &[Document], n: usize) -> Vec<Vec<(u32, f32)>> {
+fn queries(docs: &[Document], n: usize) -> Vec<Vec<(String, f32)>> {
     (0..n)
         .map(|i| {
             let d = &docs[i * docs.len() / n];
             match &d.vectors[FIELD] {
-                VectorField::Sparse(p) => p.iter().map(|(x, w)| (*x, w.get())).collect(),
+                VectorField::Sparse(p) => p.iter().map(|(x, w)| (x.clone(), w.get())).collect(),
                 VectorField::Dense(_) => Vec::new(),
             }
         })
@@ -245,12 +248,12 @@ async fn the_postings_fetch_is_one_round_whatever_the_term_count() {
     let idx = SparseIndex::open(&s, &key, FIELD).await.unwrap();
 
     // A deliberately wide query: every dimension the corpus uses.
-    let mut wide: Vec<(u32, f32)> = Vec::new();
+    let mut wide: Vec<(String, f32)> = Vec::new();
     for q in queries(&docs, 200) {
         wide.extend(q);
     }
-    wide.sort_by_key(|(d, _)| *d);
-    wide.dedup_by_key(|(d, _)| *d);
+    wide.sort_by(|a, b| a.0.cmp(&b.0));
+    wide.dedup_by(|a, b| a.0 == b.0);
     assert!(wide.len() > 100, "the fixture is not wide enough to matter");
 
     s.reset();
@@ -312,14 +315,19 @@ async fn an_unknown_dimension_costs_nothing() {
 
     let real = &queries(&docs, 4)[1];
     let mut padded = real.clone();
-    padded.push((900_000, 1.0));
+    padded.push(("900000".to_owned(), 1.0));
     let plain = idx.search(&view, &key, real, 10).await.unwrap();
     let with_absent = idx.search(&view, &key, &padded, 10).await.unwrap();
     assert_eq!(plain, with_absent, "an absent dimension changed the answer");
 
     let before = acct.count(t, OpClass::Read);
     let none = idx
-        .search(&view, &key, &[(900_000, 1.0), (900_001, 2.0)], 10)
+        .search(
+            &view,
+            &key,
+            &[("900000".to_owned(), 1.0), ("900001".to_owned(), 2.0)],
+            10,
+        )
         .await
         .expect("a query of only absent dimensions was an error");
     assert!(none.is_empty(), "absent dimensions produced hits");
@@ -476,9 +484,81 @@ async fn the_opened_index_reports_the_vocabulary_it_will_search() {
     let q = &queries(&docs, 4)[0];
     let by_hand: u64 = q
         .iter()
-        .filter_map(|(d, _)| dict.lookup(*d))
+        .filter_map(|(d, _)| dict.lookup(d))
         .map(|e| u64::from(e.bytes))
         .sum();
     assert_eq!(idx.list_bytes(q), by_hand);
-    assert_eq!(idx.list_bytes(&[(900_000, 1.0)]), 0);
+    assert_eq!(idx.list_bytes(&[("900000".to_owned(), 1.0)]), 0);
+}
+
+/// M177: keys a mapping to numbers would merge, truncate or misorder.
+fn string_keys() -> Vec<String> {
+    let long = "k".repeat(199);
+    let mut keys = vec![
+        "1".to_owned(),
+        "01".to_owned(),
+        "1.0".to_owned(),
+        "\u{e9}".to_owned(),
+        "e\u{301}".to_owned(),
+        format!("{long}a"),
+        format!("{long}b"),
+        "prefix00-x".to_owned(),
+        "prefix00-y".to_owned(),
+    ];
+    keys.extend((0..40).map(|i| format!("w{i}")));
+    keys
+}
+
+#[tokio::test]
+async fn string_keys_rank_exactly_like_an_exhaustive_dot_product() {
+    // M177 criterion 2. Weights are dyadic, so every sum is exact in f32 whatever its order and
+    // ties are real: the oracle's order (score, then row) is the search's to the bit. Zero
+    // and negative weights score; a key no row names costs nothing; a repeated query key is
+    // one dimension, its weights summed.
+    let keys = string_keys();
+    let weights = [-1.0f32, -0.5, 0.0, 0.5, 1.0, 2.0];
+    let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng as usize
+    };
+    let docs: Vec<Document> = (0..2_000)
+        .map(|i| {
+            let mut picked: BTreeMap<String, Impact> = BTreeMap::new();
+            while picked.len() < 4 {
+                let k = keys[next() % keys.len()].clone();
+                picked.insert(k, Impact::new(weights[next() % weights.len()]));
+            }
+            let mut d = Document::new(format!("d{i:05}"), Vec::new());
+            d.vectors.insert(
+                FIELD.into(),
+                VectorField::Sparse(picked.into_iter().collect()),
+            );
+            d
+        })
+        .collect();
+    let store = MemoryStore::with_coalesce_gap(GAP);
+    let key = put(&store, &docs, ImpactEncoding::F32).await;
+    let idx = SparseIndex::open(&store, &key, FIELD).await.unwrap();
+
+    for n in 0..100 {
+        let mut q: Vec<(String, f32)> = (0..3)
+            .map(|_| {
+                (
+                    keys[next() % keys.len()].clone(),
+                    weights[next() % weights.len()],
+                )
+            })
+            .collect();
+        q.push(("nobody-names-this".to_owned(), 1.0));
+        if n % 2 == 0 {
+            let again = q[0].clone();
+            q.push((again.0, 0.5));
+        }
+        let want: Vec<(usize, f32)> = brute(&docs, &q).into_iter().take(20).collect();
+        let got = idx.search(&store, &key, &q, 20).await.unwrap();
+        assert_eq!(got, want, "query {n}: {q:?}");
+    }
 }

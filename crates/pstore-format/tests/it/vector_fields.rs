@@ -80,7 +80,10 @@ fn a_sparse_field_is_representable() {
         id: "d1".to_owned(),
         vectors: BTreeMap::from([(
             "body_sparse".into(),
-            VectorField::Sparse(vec![(7, Impact::new(0.5)), (2_999, Impact::new(1.25))]),
+            VectorField::Sparse(vec![
+                ("7".to_owned(), Impact::new(0.5)),
+                ("2999".to_owned(), Impact::new(1.25)),
+            ]),
         )]),
         attrs: BTreeMap::new(),
     };
@@ -88,7 +91,7 @@ fn a_sparse_field_is_representable() {
         panic!("a sparse field did not round-trip as sparse");
     };
     assert_eq!(postings.len(), 2);
-    assert_eq!(postings[1].0, 2_999);
+    assert_eq!(postings[1].0, "2999");
     assert_eq!(postings[1].1.get(), 1.25);
     // A sparse field has no dense reading, and must not pretend to.
     assert!(d.field("body_sparse").is_empty());
@@ -146,7 +149,10 @@ async fn a_writer_refuses_only_what_it_still_cannot_store() {
     let mut w = SegmentWriter::new(8);
     w.push(Document {
         id: "d".to_owned(),
-        vectors: BTreeMap::from([("s".into(), VectorField::Sparse(vec![(1, Impact::new(0.5))]))]),
+        vectors: BTreeMap::from([(
+            "s".into(),
+            VectorField::Sparse(vec![("1".to_owned(), Impact::new(0.5))]),
+        )]),
         attrs: BTreeMap::new(),
     });
     let err = w.try_finish().unwrap_err();

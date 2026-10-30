@@ -885,11 +885,11 @@ impl Segment {
             let (b, read) = futures_util::future::join(store.get_ranges(key, &all), fields).await;
             (b?, None, read)
         };
-        // Row -> its `(dimension, impact)` pairs. Empty unless this segment carries a sparse
+        // Row -> its `(key, impact)` pairs. Empty unless this segment carries a sparse
         // field AND its dictionary was reachable; a missing sidecar is a read that cannot
         // reconstruct, and returning the field as *absent* would be the silent loss this
         // whole path exists to prevent.
-        let sparse_rows: Vec<Vec<(u32, crate::Impact)>> = match (&postings_at, &dict_raw) {
+        let mut sparse_rows: Vec<Vec<(String, crate::Impact)>> = match (&postings_at, &dict_raw) {
             (Some(at), Some(raw)) => {
                 let dict = crate::sparse::Dictionary::decode(raw)
                     .ok_or(FormatError::Corrupt("sparse dictionary"))?;
@@ -950,13 +950,15 @@ impl Segment {
                     }
                 }
                 if let Some(name) = &sparse_name
-                    && let Some(pairs) = sparse_rows.get(start + r)
+                    && let Some(pairs) = sparse_rows.get_mut(start + r)
                 {
                     // ⚠️ Overwrites whatever the `extra` loop left, which for a sparse field
                     // is an empty dense vector: a field present-but-empty is not the same
                     // document as the one that was written.
-                    doc.vectors
-                        .insert(name.clone(), crate::VectorField::Sparse(pairs.clone()));
+                    doc.vectors.insert(
+                        name.clone(),
+                        crate::VectorField::Sparse(std::mem::take(pairs)),
+                    );
                 }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);

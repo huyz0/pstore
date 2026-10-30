@@ -427,6 +427,11 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
             ));
         }
     }
+    for f in d.vectors.values() {
+        if let VectorField::Sparse(pairs) = f {
+            check_sparse_keys(pairs)?;
+        }
+    }
     if d.vectors
         .values()
         .filter(|f| matches!(f, VectorField::Sparse(_)))
@@ -436,6 +441,30 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
         return Err(FormatError::Unsupported(
             "a document may carry at most one sparse field: a second needs its own section \
              id pair (deferred by M5a)",
+        ));
+    }
+    Ok(())
+}
+
+/// The longest sparse key a dictionary can name: its length is a `u16` (M177).
+pub const SPARSE_KEY_MAX: usize = u16::MAX as usize;
+
+/// M177: a field's keys are each non-empty, at most [`SPARSE_KEY_MAX`] bytes, and distinct --
+/// one weight a dimension, as a `u32` dimension was one entry of its dictionary.
+fn check_sparse_keys(pairs: &[(String, Impact)]) -> Result<(), FormatError> {
+    if pairs.iter().any(|(k, _)| k.is_empty()) {
+        return Err(FormatError::Unsupported("a sparse key is empty"));
+    }
+    if pairs.iter().any(|(k, _)| k.len() > SPARSE_KEY_MAX) {
+        return Err(FormatError::Unsupported(
+            "a sparse key is longer than 65,535 bytes",
+        ));
+    }
+    let mut keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort_unstable();
+    if keys.windows(2).any(|w| w.first() == w.get(1)) {
+        return Err(FormatError::Unsupported(
+            "a sparse key is repeated: a dimension has one weight",
         ));
     }
     Ok(())
@@ -478,12 +507,12 @@ impl Impact {
 pub enum VectorField {
     /// One vector for a dense field; several for late interaction (D-28).
     Dense(Vec<Vec<f32>>),
-    /// `(dimension, impact)` pairs (D-72).
+    /// `(dimension, impact)` pairs (D-72), a dimension being its key's bytes (M177).
     ///
-    /// ⚠️ Representable in v1 and **refused by the writer** — the shape must exist now, the
-    /// retriever is M5a. `modalities-and-sequencing.md` §3: "the shape must exist in v1 even
-    /// if only `dense` is implemented".
-    Sparse(Vec<(u32, Impact)>),
+    /// ⚠️ A string, not a `u32`: a vocabulary mapped to numbers needs one mapping every
+    /// writer agrees on, which takes a lock or a shared table, and a hash into 32 bits
+    /// collides. The key itself needs neither. Keys compare as bytes, unnormalized.
+    Sparse(Vec<(String, Impact)>),
 }
 
 impl VectorField {
@@ -671,7 +700,8 @@ impl Document {
     }
 
     /// A deterministic estimate of the bytes this row holds in memory (M141): the id's
-    /// bytes, 4 per dense component, 8 per sparse pair, and per attribute its key's bytes
+    /// bytes, 4 per dense component, a sparse pair's key bytes plus 4 (M177), and per
+    /// attribute its key's bytes
     /// plus its value's. Not RSS: allocator and map overhead are
     /// not counted.
     #[must_use]
@@ -680,8 +710,8 @@ impl Document {
             .vectors
             .values()
             .map(|field| match field {
-                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum(),
-                VectorField::Sparse(pairs) => 8 * pairs.len(),
+                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum::<usize>(),
+                VectorField::Sparse(pairs) => pairs.iter().map(|(k, _)| k.len() + 4).sum(),
             })
             .sum();
         let attrs: u64 = self

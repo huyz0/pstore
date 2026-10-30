@@ -49,9 +49,10 @@ fn a_document_counts_its_id_vectors_and_attributes() {
     d.vectors.insert(
         Field::from("sp"),
         VectorField::Sparse(vec![
-            (1, pstore_format::Impact::new(1.0)),
-            (2, pstore_format::Impact::new(2.0)),
+            ("1".to_owned(), pstore_format::Impact::new(1.0)),
+            ("abc".to_owned(), pstore_format::Impact::new(2.0)),
         ]),
     );
-    assert_eq!(d.footprint(), 3 + 20 + 5 + 20 + 16);
+    // M177: a pair is its key's bytes plus its impact's 4.
+    assert_eq!(d.footprint(), 3 + 20 + 5 + 20 + (1 + 4) + (3 + 4));
 }

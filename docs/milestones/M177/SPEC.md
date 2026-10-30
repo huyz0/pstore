@@ -11,7 +11,7 @@ no writer can agree on without a lock or a shared table. After, a dimension **is
 string, `VectorField::Sparse(Vec<(String, Impact)>)`: nothing to map, nothing to agree on.
 Keys compare as raw bytes, no Unicode normalization.
 - **Dictionary v2** (`.sdict`): fixed-width entries sorted by key bytes, each naming its key's
-  span (`u32` offset, `u16` length) in a key area after the table, as M32's term dictionary
+  span (`u64` offset, `u16` length) in a key area after the table, as M32's term dictionary
   does; lookup stays a binary search. `Entry` loses `dim`. The shared decoded cache charges
   the key bytes. Postings (`SparsePostings`) are unchanged.
 - **WAL bundles**: a sparse field is kind 2, keys then impacts, and an index's run holding
@@ -39,7 +39,8 @@ Keys compare as raw bytes, no Unicode normalization.
    segment lacks, and a repeated query key (summed).
 3. Two engines on one store write rows naming the same keys in different orders and
    batches; after a fold and a restart a query by key finds both's rows as one dimension.
-   The same query split to a peer (M54) answers the oracle's top-k.
+   A sparse leg crosses M54's peer wire with its keys and weights bit for bit, and a
+   split query answers as the unsplit one.
 4. A v1 dictionary and a version-2 bundle with a kind-1 field, written by copies of
    today's encoders, decode: `7` answers `"7"`, `9` and `10` both found, `"07"` nothing; a
    compaction of v1 with v2 writes v2. A v3 dictionary, a kind-3 field, kind 2 in a version-2
@@ -50,7 +51,7 @@ Keys compare as raw bytes, no Unicode normalization.
 
 ## Test plan
 Format tests in `crates/pstore-format/tests/it/sparse.rs`, index and engine tests beside the
-existing sparse ones, the peer case in the server's peer tests. Red first: 1 to 3 do not
+existing sparse ones, the peer wire in `peers.rs`'s round trip, the split in the engine's `split` tests. Red first: 1 to 3 do not
 compile against u32 dimensions, so their red is the mutations, as M176's unit tests' was;
 4's fixtures come from copies of today's encoders kept in the test. Mutations, each to be
 killed: a key truncated to 4 or 8 bytes, or to a hash (1); the keys sorted other than by
@@ -85,3 +86,7 @@ Minors taken: the cache charges key bytes, `Entry` loses `dim`, a repeated query
 no normalization, sorted-set round trips, D-72 in Serves, the pinned sidecar's size.
 Round 2 (approve, three minors, all taken): the version is an index's run's, not a bundle's;
 which kinds each version takes; the rollback risk.
+Amended in implementation: criterion 3's peer clause is the wire round trip plus M54's split
+equality, as no HTTP request sends a sparse leg before M178; fixtures that named one
+dimension twice, now refused, name another. From M178's spec review: the key offset is a `u64`, as M178 bounds no
+segment's vocabulary (a refusal at fold would block every later fold).
