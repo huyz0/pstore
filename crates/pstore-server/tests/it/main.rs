@@ -83,6 +83,7 @@ mod shape;
 mod sketch;
 mod snapshot;
 mod socket;
+mod sparse;
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,

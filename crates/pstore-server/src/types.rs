@@ -137,6 +137,10 @@ pub struct DocumentIn {
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
+    /// The sparse vector (M178): `{"key": weight, ...}`, read by `lib.rs`'s `sparse_pairs`
+    /// so a refusal names its document and its bound. `null` is absent.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
     /// Typed attributes: a JSON integer (`i64`) or string each (M9a), a float or bool
     /// (M9h.1), an array of those (M9h.2), or a datetime the write's `schema` declares
     /// (M9h.3). Anything else is refused at the door rather than coerced — see `lib.rs`'s
@@ -492,6 +496,9 @@ pub struct QueryRequest {
     /// The `multi` leg (M61): MaxSim over a named field of several vectors a document.
     #[serde(default)]
     pub multi: Option<MultiIn>,
+    /// The sparse leg (M178): `{"key": weight, ...}`, as a document's `sparse` is spelled.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
     /// The BM25 leg's query text -- or several, each its own leg (M9g).
     #[serde(default)]
     pub text: Option<TextIn>,

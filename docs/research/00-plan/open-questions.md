@@ -159,7 +159,7 @@ Each entry: what we don't know, why it matters, and how to find out. Sorted by r
 `OQ-123` should routing hints be signed separately so a proxy can use them? ·
 `OQ-124` cross-region sessions — reserve token space now ·
 `OQ-125` does `session`-as-default surprise users expecting `strong`? (M11.1 ships `session` opt-in and keeps `eventual` the default; still open) ·
-~~`OQ-126`~~ impact payload encoding — **ANSWERED (M5a): u8 is 2.08× smaller than f32 (1.78 MB vs 3.70 MB on a 30,000-term corpus) at 0.9910 top-10 agreement and 1.0000 top-1; f16 is 1.53× smaller and exact to 4 places. u8 ships; varint carries BM25's exact term frequencies.** ·
+~~`OQ-126`~~ impact payload encoding — **ANSWERED (M5a): u8 is 2.08× smaller than f32 (1.78 MB vs 3.70 MB on a 30,000-term corpus) at 0.9910 top-10 agreement and 1.0000 top-1; f16 is 1.53× smaller and exact to 4 places. u8 ships; varint carries BM25's exact term frequencies.** ⚠️ **Corrected by [M178](../../milestones/M178/SPEC.md): f16 ships.** u8 still clears the floor, but its scale is a segment's, so a weight moves when a compaction merges it, which a public sparse field cannot answer for. ·
 `OQ-128` multi-vector storage layout: interleaved or separate section (refines OQ-65) ·
 `OQ-129` does accepting sparse vectors as input match how customers actually work? ·
 `OQ-130` coalescing interval for epoch hint → revalidation ·

@@ -46,13 +46,15 @@ one. After, HTTP does both, over one field a document names `sparse`.
    of admitted rows only.
 3. 400 naming the document or query and the rule broken: `{}`; 1,025 keys; a 257-byte and
    an empty key; a `"1"`, `null`, `65505` and `1e39` weight; `sparse` an array; a
-   `vectors.sparse` beside a `vector`; a `sparse` patch column or patch field; an empty query `sparse`. A
+   `vectors.sparse` beside a `vector`; a `sparse` patch column or patch field; an empty query `sparse`; a sparse leg beside
+   `rank_by` or `aggregate_by`, or under `sum` or `max` beside `text`; `facets` beside a
+   sparse leg alone answer 200, counting the filtered set. A
    key written twice answers its last weight. A patch keeps the field.
 4. A query naming no written key answers no rows, 200; over an unfolded write it answers
    that write's rows; a dense query on a sparse-only index is `schema_conflict`.
-5. A cold sparse query over one folded segment takes at most 3 sequential blob rounds
-   (D-34) and exactly the requests measured, pinned in the test, on the depth-counting
-   store.
+5. A cold sparse query over one folded segment takes at most 4 sequential blob rounds,
+   three to rank and one for the rows (D-34 as M47 restates it), and exactly the requests
+   measured, pinned in the test, on the depth-counting store.
 
 ## Test plan
 Server tests in `crates/pstore-server/tests/it/sparse.rs`.
@@ -86,3 +88,10 @@ its last; weights bounded by f16's range; criterion 3 red by its messages; ties 
 order; `sparse` reserved; the measured default test named; key offsets. Round 2 (approve
 with changes, one major, taken): no refusal at fold, `u64` key offsets in M177 instead;
 minors taken.
+Amended in implementation: 1,025 keys are refused first by the body's shape bound (M-era
+`ingress/shape.rs`, an object of at most 1,024 members), 413 naming it, not 400.
+Code review round 1: `sum` and `max` take a sparse leg only alone, since a dot product can
+be negative and those fusions add text legs' non-negative scores (as they refuse a dense
+leg); `rank_by` and `aggregate_by` refuse it, as they refuse every ranking leg; criterion 5
+names the rows' round D-34 as M47 restates it allows, which the test already counted.
+Round 2 (changes, one major, taken): `facets` take a sparse leg as their ranking, tested.

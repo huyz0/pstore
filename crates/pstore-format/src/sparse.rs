@@ -75,10 +75,12 @@ impl ImpactEncoding {
 
 /// The encoding a fold writes unless told otherwise.
 ///
-/// ⚠️ **u8 by decision, not by default-thinking** — D-72's cheapest option, and the one
-/// M5a.4 measures against f16 and f32. If the measurement does not clear the floor the spec
-/// pinned in advance, this constant is what changes.
-pub const DEFAULT_ENCODING: ImpactEncoding = ImpactEncoding::U8;
+/// ⚠️ **f16 since M178, by decision.** M5a.4 chose u8, D-72's cheapest, because it cleared
+/// its rank-agreement floor, and it still does. But u8 scales a weight by its key's largest
+/// in the SEGMENT, so a row's stored weight moves when a compaction merges it into another
+/// list: a public sparse field could not promise what a weight answers as. An f16 weight is
+/// its own nearest f16 wherever it is stored, at twice u8's bytes.
+pub const DEFAULT_ENCODING: ImpactEncoding = ImpactEncoding::F16;
 
 /// The two byte strings a sparse field becomes.
 #[derive(Debug, Clone, Default)]

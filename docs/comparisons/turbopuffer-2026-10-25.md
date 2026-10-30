@@ -152,7 +152,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Dense vectors | f32/f16/i8 schema types, array/base64 transport | f32 array/base64 input; internal quantization is an index mechanism | Internal int8 reranking does not establish i8/f16 public schema support; D |
 | Multiple dense attributes | Per-attribute ANN configuration | Up to 8 named fields in addition to required default vector; named dense search scans exactly | Partial indexing and wire semantics; D |
 | Multi-vector attributes | Vector arrays and late-interaction ANN configuration | Named arrays, exact MaxSim or opt-in FDE, optional exact rerank/probes | Equivalent family with different scoring/configuration contract; D/F |
-| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | Library vector field keyed by strings (M177), no mapping to agree on; no public sparse write/query | Library capability, missing API; D |
+| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | One public field, `sparse`: string keys (M177) and f16 weights, written in rows or columns and queried as a dot-product leg (M178); not returned in results | One field per document rather than per-attribute schema; D |
 | Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | Ordinary native result projection only walks scalar attributes, not stored vector fields; no corresponding response encoding control | Missing public round-trip/export capability; B/D/H |
 | Nested JSON objects | Not counted as available; vendor roadmap item | Public scalar parser refuses nested objects | Neither side has established current general nested-attribute parity |
 
@@ -200,7 +200,7 @@ contract fixtures, rather than assuming identical validation.
 | `ANN` / `kNN`, scalar dense vector | Default ANN, `exact` option | Different transport; named dense fields scanned exactly; vendor documents filters for kNN |
 | `ANN` / `kNN`, vector array | Exact MaxSim and opt-in FDE | Existing mechanism must be evaluated against vendor late-interaction semantics/quality, not just matching labels |
 | ANN/kNN `Embed` expression, optional `model` | None | Model integration; J |
-| `SparseKNN` | Index/query library only | Expose string-key sparse vectors first; D |
+| `SparseKNN` | A query's `sparse` leg, exact dot product over f16 weights (M178) | Spelled as a leg, not a `rank_by`; D |
 | `BM25` string | `text` query on default text field | Single-field only |
 | `BM25` token array and `last_as_prefix` | A text leg object's `query` may be an array of tokens (M158) and carry `"last_as_prefix": true` (M180) | Equivalent, scored 1.0 once a row. The prefix meets analyzed terms, so under stemming a complete word also expands through its stem; a prefix query is not split across servers |
 | `Sum`, `Max` | Text-leg fusion exists | Limited composition, no recursive per-field expression tree; E |
@@ -306,7 +306,7 @@ effects also need a published accounting definition.
 | `full_text_search` | Default text field only; not arbitrary string/string-array attributes | E |
 | `ann.distance_metric` | Index metric, not general per-field schema | D |
 | `ann.late_interaction` | Exact/FDE multi-vector query options | Different configuration surface; D/F |
-| `sparse_knn.distance_metric` | Library sparse index, dot-product family | Missing public schema; D |
+| `sparse_knn.distance_metric` | Dot product only, no declaration (M178) | No metric choice or schema entry; D |
 | `embed.{attribute,model,dims}` | No native model integration | J |
 | Schema `drop` | PATCH always refuses | G |
 
@@ -368,7 +368,7 @@ execution. pstore's absence of a public limit is a contract gap, not unlimited c
 | Attribute names/namespace | 1024 | No matching public cap found |
 | Vector columns | 8 | Required default plus at most 8 named fields; not identical counting |
 | Dense dimensions | 10,752 | No matching advertised/validated ceiling |
-| Sparse nonzeros | 1024 | Public sparse API absent |
+| Sparse nonzeros | 1024 | 1,024 a document or query, keys of 256 bytes (M178) |
 | Embedded attributes | 4 | Native embeddings absent |
 | Embedded upsert rows/batch | 256 | Native embeddings absent |
 | Full-text query length | 8192 | No matching public text-query cap |

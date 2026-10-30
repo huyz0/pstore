@@ -1641,7 +1641,7 @@ fn name_refusal(name: &str) -> Option<&'static str> {
 
 /// The document fields a column of `upsert_columns` may name; every other column is an
 /// attribute.
-const DOCUMENT_COLUMNS: [&str; 3] = ["vector", "vectors", "text"];
+const DOCUMENT_COLUMNS: [&str; 4] = ["vector", "vectors", "text", SPARSE_FIELD];
 
 /// A write's upserts as one list (M174): `documents`, then the rows of `upsert_columns`, each
 /// read as a `documents` entry is, with every `null` attribute left out -- an upsert replaces
@@ -1733,11 +1733,13 @@ fn patch_rows_of(
             .and_then(types::Id::of)
             .map_err(ApiError::bad_request)?;
         if let Some(k) = o.keys().find(|k| *k != "id" && *k != "attributes") {
-            return Err(ApiError::bad_request(if k == "vector" {
-                format!("patch of {id}: a patch carries no vector; upsert the row to change it")
-            } else {
-                format!("patch of {id}: unknown field {k}")
-            }));
+            return Err(ApiError::bad_request(
+                if k == "vector" || k == SPARSE_FIELD {
+                    format!("patch of {id}: a patch carries no {k}; upsert the row to change it")
+                } else {
+                    format!("patch of {id}: unknown field {k}")
+                },
+            ));
         }
         let attrs = match o.remove("attributes") {
             None => serde_json::Map::new(),
@@ -1761,10 +1763,10 @@ fn patch_rows_of(
         };
         let mut columns = Vec::new();
         for (name, col) in std::mem::take(cols) {
-            if name == "vector" {
-                return Err(bad(
-                    "a patch carries no vector; upsert the rows to change them",
-                ));
+            if name == "vector" || name == SPARSE_FIELD {
+                return Err(bad(&format!(
+                    "a patch carries no {name}; upsert the rows to change them"
+                )));
             }
             let col = match col {
                 serde_json::Value::Array(c) if c.len() == ids.len() => c,
@@ -1928,6 +1930,7 @@ fn patch_of(
         vector: None,
         vectors: std::collections::BTreeMap::new(),
         text: None,
+        sparse: None,
         attributes: set.into_iter().collect(),
     };
     for name in &unset {
@@ -3059,6 +3062,7 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
         ("vector", req.vector.is_some()),
         ("multi", req.multi.is_some()),
         ("text", req.text.is_some()),
+        ("sparse", req.sparse.is_some()),
         ("rank_by", req.rank_by.is_some()),
         ("offset", req.offset.is_some()),
         ("fusion", req.fusion.is_some()),
@@ -3859,6 +3863,12 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
         "sum" | "max" if req.vector.is_some() || req.multi.is_some() => Err(bad(&format!(
             "{kind} combines text legs' scores; a dense or multi leg's can be negative"
         ))),
+        // M178: a sparse dot product can be negative too, so it is summed with nothing; alone,
+        // its score is the leg's own.
+        "sum" | "max" if req.sparse.is_some() && req.text.is_some() => Err(bad(&format!(
+            "{kind} combines text legs' scores; a sparse leg's can be negative, so it takes \
+             {kind} only alone"
+        ))),
         // `k` is RRF's alone, and a parameter is never accepted to be ignored (code review).
         "sum" | "max" if params.contains_key("k") => {
             Err(bad(&format!("k is rrf's parameter, not {kind}'s")))
@@ -4408,13 +4418,14 @@ fn order_by(req: &QueryRequest) -> Result<Option<pstore_query::Order>, ApiError>
     if req.vector.is_some()
         || req.multi.is_some()
         || req.text.is_some()
+        || req.sparse.is_some()
         || req.field.is_some()
         || req.exact
         || req.fusion.is_some()
     {
         return Err(ApiError::bad_request(
             "rank_by orders by an attribute; it cannot be combined with vector, multi, text, \
-             field, exact or fusion",
+             sparse, field, exact or fusion",
         ));
     }
     if req.top_k.saturating_add(req.offset.unwrap_or(0)) > MAX_ORDERED {
@@ -4529,9 +4540,19 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
             last_as_prefix,
         });
     }
+    // M178: after the text legs, so a positional fusion weight names it last.
+    if let Some(s) = &req.sparse {
+        let query =
+            sparse_pairs(s).map_err(|why| ApiError::bad_request(format!("sparse: {why}")))?;
+        legs.push(pstore_query::Prefetch::Sparse {
+            field: SPARSE_FIELD.to_owned(),
+            query,
+            limit,
+        });
+    }
     if legs.is_empty() {
         return Err(ApiError::bad_request(
-            "a query must name a vector, multi, text, or several",
+            "a query must name a vector, multi, text, sparse, or several",
         ));
     }
     if legs.len() > pstore_query::MAX_LEGS {
@@ -4645,6 +4666,11 @@ fn named_field(name: &str) -> Result<String, ApiError> {
     if name == pstore_format::DEFAULT_FIELD {
         return Err(ApiError::bad_request(
             "`vector` is the dense field: a named vector field takes another name",
+        ));
+    }
+    if name == SPARSE_FIELD {
+        return Err(ApiError::bad_request(
+            "`sparse` is the sparse field (M178): a named vector field takes another name",
         ));
     }
     Ok(name.to_owned())
@@ -5094,6 +5120,7 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         vector,
         vectors,
         text,
+        sparse,
         attributes,
     } = d;
     let mut doc = Document::new(id.0.clone(), vector.unwrap_or_default());
@@ -5155,6 +5182,19 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         doc.vectors
             .insert(name.into(), pstore_format::VectorField::Dense(vs));
     }
+    if let Some(s) = sparse {
+        let pairs = sparse_pairs(&s)
+            .map_err(|why| ApiError::bad_request(format!("document {id}: sparse: {why}")))?;
+        doc.vectors.insert(
+            SPARSE_FIELD.into(),
+            pstore_format::VectorField::Sparse(
+                pairs
+                    .into_iter()
+                    .map(|(k, w)| (k, pstore_format::Impact::new(w)))
+                    .collect(),
+            ),
+        );
+    }
     if let Some(t) = text {
         // `attributes.text` and top-level `text` are one field spelled twice; which one
         // wins would be a rule nobody wrote down.
@@ -5184,6 +5224,54 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
         )));
     }
     Ok(p)
+}
+
+/// The one sparse field a document carries and a query searches (M178). A name of its own
+/// rather than one a caller picks: a segment holds one sparse field's postings (M177).
+const SPARSE_FIELD: &str = "sparse";
+/// The most keys a sparse vector holds, a document's or a query's.
+const MAX_SPARSE_KEYS: usize = 1_024;
+/// The longest sparse key, in bytes.
+const MAX_SPARSE_KEY: usize = 256;
+/// The largest sparse weight's magnitude: f16's largest finite value, as a weight is stored
+/// in f16 (M178), and a larger one would be infinite.
+const MAX_SPARSE_WEIGHT: f64 = 65_504.0;
+
+/// A sparse vector's `(key, weight)` pairs, or why `v` is not one (M178): an object of 1 to
+/// [`MAX_SPARSE_KEYS`] keys of 1 to [`MAX_SPARSE_KEY`] bytes, each weight a number no larger in
+/// magnitude than [`MAX_SPARSE_WEIGHT`]. A key spelled twice is its last weight, as a JSON
+/// object is read everywhere here.
+fn sparse_pairs(v: &serde_json::Value) -> Result<Vec<(String, f32)>, String> {
+    let serde_json::Value::Object(m) = v else {
+        return Err("an object of key to weight".to_owned());
+    };
+    if m.is_empty() || m.len() > MAX_SPARSE_KEYS {
+        return Err(format!(
+            "{} keys: a sparse vector holds 1 to {MAX_SPARSE_KEYS}",
+            m.len()
+        ));
+    }
+    m.iter()
+        .map(|(k, w)| {
+            if k.is_empty() || k.len() > MAX_SPARSE_KEY {
+                return Err(format!(
+                    "a key of {} bytes: a key is 1 to {MAX_SPARSE_KEY}",
+                    k.len()
+                ));
+            }
+            match w.as_f64() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "bounded by f16's range, inside f32's"
+                )]
+                Some(x) if x.abs() <= MAX_SPARSE_WEIGHT => Ok((k.clone(), x as f32)),
+                _ => Err(format!(
+                    "key {k:?}'s weight {w} is not a number of magnitude at most \
+                     {MAX_SPARSE_WEIGHT}"
+                )),
+            }
+        })
+        .collect()
 }
 
 /// The most `Glob`, `IGlob`, `Regex` and `Fuzzy` clauses one filter may hold (M15).
