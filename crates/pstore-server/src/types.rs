@@ -480,6 +480,13 @@ pub struct QueryRequest {
     /// A window of the ranking diversified by maximal marginal relevance (M64).
     #[serde(default)]
     pub diversify: Option<serde_json::Value>,
+    /// The stored vector fields each result carries (M179): `["vector"]`, the only one yet.
+    /// Parsed by `lib.rs`'s `vector_projection`.
+    #[serde(default)]
+    pub include_vectors: Option<serde_json::Value>,
+    /// How a projected vector is spelled (M179): `"float"`, the default, or `"base64"`.
+    #[serde(default)]
+    pub vector_encoding: Option<String>,
     /// `{"attributes": [...], "limit": m, "window": w}`: at most `m` rows of each group of
     /// the window's ranking (M146). Parsed by `limit_per.rs`.
     #[serde(default)]
@@ -593,6 +600,20 @@ pub struct ResultRow {
     /// `fragment_by`, `fragment_limit` or `include_offsets`. Then `$highlight` is absent.
     #[serde(rename = "$highlights", skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<HighlightMatch>>,
+    /// Its stored `vector`, when the query's `include_vectors` names it and the row has one
+    /// (M179).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorOut>,
+}
+
+/// A projected vector as `vector_encoding` spells it (M179).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum VectorOut {
+    /// A JSON array of numbers, each an f32's shortest spelling.
+    Float(Vec<f32>),
+    /// The standard-alphabet, padded base64 of its little-endian f32 bytes.
+    Base64(String),
 }
 
 /// One fragment of a structured highlight (M159). Ranges are `[start, end)` into the

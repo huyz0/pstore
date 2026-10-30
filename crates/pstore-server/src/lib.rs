@@ -3037,6 +3037,13 @@ fn multi_query(
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
             }
+            // M179: a multi-query's rows are fused and merged; their vectors are later.
+            if q.get("include_vectors").is_some() {
+                return Err(ApiError::bad_request(
+                    "include_vectors is a single query's: a query inside queries cannot \
+                     project vectors yet",
+                ));
+            }
             parse_query(q)
         })
         .collect::<Result<Vec<QueryRequest>, _>>()?;
@@ -3068,6 +3075,7 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
         ("fusion", req.fusion.is_some()),
         ("include_attributes", req.include_attributes.is_some()),
         ("exclude_attributes", req.exclude_attributes.is_some()),
+        ("include_vectors", req.include_vectors.is_some()),
     ] {
         if present {
             return Err(ApiError::bad_request(format!(
@@ -3177,6 +3185,94 @@ enum Plan {
     ),
 }
 
+/// The most rows one query projects vectors for (M179): a page of 1,000 vectors of width
+/// 1,536 is about 6 MB of f32s, where `MAX_ORDERED` alone would allow ten times it.
+const MAX_VECTOR_ROWS: usize = 1_000;
+
+/// How the query's results spell their stored `vector` (M179), `None` when it asks for none,
+/// or why it cannot ask.
+fn vector_projection(req: &QueryRequest) -> Result<Option<VectorEncoding>, ApiError> {
+    let bad = |why: &str| ApiError::bad_request(format!("include_vectors: {why}"));
+    let Some(raw) = &req.include_vectors else {
+        if req.vector_encoding.is_some() {
+            return Err(ApiError::bad_request(
+                "vector_encoding spells projected vectors: the query has no include_vectors",
+            ));
+        }
+        return Ok(None);
+    };
+    let names = raw
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| bad("a list of the vector fields to project, [\"vector\"]"))?;
+    if let Some(other) = names
+        .iter()
+        .find(|n| n.as_str() != Some(pstore_format::DEFAULT_FIELD))
+    {
+        return Err(bad(&format!(
+            "{other} is not projected: only `vector` is, a named field's vectors are later"
+        )));
+    }
+    let encoding = match req.vector_encoding.as_deref() {
+        None | Some("float") => VectorEncoding::Float,
+        Some("base64") => VectorEncoding::Base64,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "vector_encoding: {other:?} is not float or base64"
+            )));
+        }
+    };
+    if req.as_of.is_some() {
+        return Err(bad(
+            "a past epoch's vectors are later: it cannot be combined with as_of",
+        ));
+    }
+    // A ranked query's row fetch covers its whole page; an order reads only the page's rows.
+    let rows = if req.rank_by.is_some() {
+        req.top_k
+    } else {
+        page_end(req)
+    };
+    if rows > MAX_VECTOR_ROWS {
+        return Err(bad(&format!(
+            "{rows} rows: vectors are projected for at most {MAX_VECTOR_ROWS} (top_k, and a \
+             ranked query's offset)"
+        )));
+    }
+    Ok(Some(encoding))
+}
+
+/// How a projected vector is spelled (M179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorEncoding {
+    Float,
+    Base64,
+}
+
+impl VectorEncoding {
+    /// `v` as this encoding spells it, or nothing for a row with no vector. The engine
+    /// answers none, never an empty one, for a row of a width-0 index.
+    fn spell(self, v: Option<&[f32]>) -> Option<types::VectorOut> {
+        use base64::Engine as _;
+        let v = v?;
+        Some(match self {
+            Self::Float => types::VectorOut::Float(v.to_vec()),
+            Self::Base64 => {
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                types::VectorOut::Base64(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+        })
+    }
+}
+
+/// A document's `vector`, as an order's rows carry it (M179).
+fn stored_vector(d: &pstore_format::Document) -> Option<&[f32]> {
+    match d.vectors.get(pstore_format::DEFAULT_FIELD)?.as_dense() {
+        [v] => Some(v),
+        _ => None,
+    }
+}
+
 /// Where a relevance query's page ends: `top_k` past its `offset` (M163).
 fn page_end(req: &QueryRequest) -> usize {
     req.top_k.saturating_add(req.offset.unwrap_or(0))
@@ -3184,6 +3280,7 @@ fn page_end(req: &QueryRequest) -> usize {
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
+    vector_projection(req)?;
     // M63: checked first, before an aggregation or an order returns, so every refusal names it.
     let highlight = req
         .highlight
@@ -3532,6 +3629,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
+    let projected = vector_projection(req)?;
     let (legs, filter, fusion, boost, highlight, diversify, limit_per) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
@@ -3582,17 +3680,31 @@ async fn run<E: BlobStore>(
             });
         }
         Plan::Ordered(by, filter) => {
-            let got = engine
-                .ordered_as(
-                    index,
-                    by,
-                    filter.as_ref(),
-                    req.offset.unwrap_or(0),
-                    req.top_k,
-                    req.as_of.map(pstore_types::Epoch),
-                    consistency,
-                )
-                .await?;
+            // M179: the page's vectors, one round after selection, only when asked.
+            let got = if projected.is_some() {
+                engine
+                    .ordered_vectors(
+                        index,
+                        by,
+                        filter.as_ref(),
+                        req.offset.unwrap_or(0),
+                        req.top_k,
+                        consistency,
+                    )
+                    .await?
+            } else {
+                engine
+                    .ordered_as(
+                        index,
+                        by,
+                        filter.as_ref(),
+                        req.offset.unwrap_or(0),
+                        req.top_k,
+                        req.as_of.map(pstore_types::Epoch),
+                        consistency,
+                    )
+                    .await?
+            };
             // ⚠️ Before "no such index": the session's unfolded write may be what creates it.
             let token = checked(got.epoch.0, &got.watermarks)?;
             if !got.exists {
@@ -3607,6 +3719,7 @@ async fn run<E: BlobStore>(
                     .rows
                     .into_iter()
                     .map(|d| ResultRow {
+                        vector: projected.and_then(|e| e.spell(stored_vector(&d))),
                         attributes: selected(req, &d.attrs),
                         id: d.id,
                         score: None,
@@ -3644,8 +3757,9 @@ async fn run<E: BlobStore>(
                 )
                 .await?
         }
-        // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.)
-        None if diversify.is_some() => {
+        // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.) M179:
+        // and a projection's, in the same fetch.
+        None if diversify.is_some() || projected.is_some() => {
             engine
                 .query_split_vectors(
                     index,
@@ -3691,7 +3805,12 @@ async fn run<E: BlobStore>(
     if let Some(d) = diversify {
         // M64: the pick is `top_k × window × dims` multiply-adds, off the runtime's workers.
         let scores: Vec<f64> = paired.iter().map(|r| f64::from(r.0.1)).collect();
-        let vectors: Vec<Option<Vec<f32>>> = paired.iter_mut().map(|r| r.1.take()).collect();
+        // M179: copied, not taken, when the picked rows answer theirs.
+        let vectors: Vec<Option<Vec<f32>>> = if projected.is_some() {
+            paired.iter().map(|r| r.1.clone()).collect()
+        } else {
+            paired.iter_mut().map(|r| r.1.take()).collect()
+        };
         let k = req.top_k;
         let order =
             tokio::task::spawn_blocking(move || diversify::select(&scores, &vectors, d.lambda, k))
@@ -3712,7 +3831,7 @@ async fn run<E: BlobStore>(
     // M163: the page is cut at its end, then its first `offset` rows skipped.
     paired.truncate(page_end(req));
     paired.drain(..req.offset.unwrap_or(0).min(paired.len()));
-    let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
+    let rows = paired;
     let unfolded_hits =
         if boost.is_none() && diversify.is_none() && limit_per.is_none() && req.offset.is_none() {
             answer
@@ -3731,7 +3850,7 @@ async fn run<E: BlobStore>(
                 .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
                 .collect();
             rows.iter()
-                .filter(|(id, ..)| fresh.contains(id.as_str()))
+                .filter(|((id, ..), _)| fresh.contains(id.as_str()))
                 .count()
         };
     // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
@@ -3760,7 +3879,8 @@ async fn run<E: BlobStore>(
     Ok(Answered {
         results: rows
             .into_iter()
-            .map(|(id, score, attrs, dist)| ResultRow {
+            .map(|((id, score, attrs, dist), vector)| ResultRow {
+                vector: projected.and_then(|e| e.spell(vector.as_deref())),
                 highlight: marks
                     .as_ref()
                     .filter(|(h, _)| h.structure.is_none())
