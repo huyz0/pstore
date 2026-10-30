@@ -35,7 +35,7 @@ Implementation details are specified one milestone at a time under `docs/milesto
 | H | Separate branch/isolated-copy/replication products and cross-store authorization | Pending |
 | H | Restartable asynchronous operation status/results | Pending |
 | H | Snapshot export/restore and independent recovery proofs | Pending |
-| H | Online recall, explain and bounded data warming | Partial: online recall at one snapshot, from seeded queries, with ground truth and a row budget (`POST /v1/indexes/{index}/recall`) verified in [M162](../milestones/M162/VERIFIED.md); explain and data warming pending |
+| H | Online recall, explain and bounded data warming | Partial: online recall at one snapshot, from seeded queries, with ground truth and a row budget (`POST /v1/indexes/{index}/recall`) verified in [M162](../milestones/M162/VERIFIED.md); a ranked query's `explain: true` reports the plan it ran (each leg's mode and why, dense approximate or exact segments and probes, rows asked, returned and kept, remote segments), at no cost, verified in [M165](../milestones/M165/VERIFIED.md); data warming pending |
 | I | Qualified real-cloud backend profiles, including server GCS support | Pending |
 | I | Cache/compute reservations and persistent namespace sharding | Pending |
 | I | KMS/encryption boundaries and copy re-encryption | Pending |

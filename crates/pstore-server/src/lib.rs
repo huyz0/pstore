@@ -32,6 +32,7 @@ pub use auth::{Auth, AuthError};
 mod body;
 mod boost;
 mod diversify;
+mod explain;
 mod external;
 mod facets;
 mod highlight;
@@ -2810,30 +2811,34 @@ async fn query_index<S: BlobStore + 'static>(
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
-        let (got, faceted) = match facet {
-            None => {
-                let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
-                (api.requesting(tenant, ranked.await).await?, None)
-            }
-            Some((freq, _)) => {
-                // ⚠️ Together, never one after the other: depth is the deeper of the two
-                // (M65). M131: and from one snapshot, unless the query reads a past epoch;
-                // planned inside, so a pinned retry can run both again.
-                let (req, freq, token, peers, engine, index) =
-                    (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
-                let both = move || async move {
-                    let ranked = run(engine, index, req, crate::plan(req)?, token, peers);
-                    let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
-                    futures_util::future::try_join(ranked, beside).await
-                };
-                let both = match pinnable(std::slice::from_ref(req), token)? {
-                    Some(level) => engine.pinned(index, level, both).await,
-                    None => both().await,
-                };
-                let (got, faceted) = api.requesting(tenant, both).await?;
-                (got, Some(faceted))
-            }
-        };
+        let explaining = req.explain;
+        let ((got, faceted), explained) = explain::collect(explaining, async {
+            Ok::<_, ApiError>(match facet {
+                None => {
+                    let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
+                    (api.requesting(tenant, ranked.await).await?, None)
+                }
+                Some((freq, _)) => {
+                    // ⚠️ Together, never one after the other: depth is the deeper of the two
+                    // (M65). M131: and from one snapshot, unless the query reads a past epoch;
+                    // planned inside, so a pinned retry can run both again.
+                    let (req, freq, token, peers, engine, index) =
+                        (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
+                    let both = move || async move {
+                        let ranked = run(engine, index, req, crate::plan(req)?, token, peers);
+                        let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
+                        futures_util::future::try_join(ranked, beside).await
+                    };
+                    let both = match pinnable(std::slice::from_ref(req), token)? {
+                        Some(level) => engine.pinned(index, level, both).await,
+                        None => both().await,
+                    };
+                    let (got, faceted) = api.requesting(tenant, both).await?;
+                    (got, Some(faceted))
+                }
+            })
+        })
+        .await?;
         let facets_epoch = faceted.as_ref().map(|f| f.epoch);
         let facets = faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups));
         let session = got.token.encode();
@@ -2851,6 +2856,7 @@ async fn query_index<S: BlobStore + 'static>(
                     consistency: got.consistency,
                     session: session.clone(),
                     staleness_ms: got.staleness_ms,
+                    explain: explained,
                 },
             }),
             &session,
@@ -2998,6 +3004,12 @@ fn checked_query(req: QueryRequest) -> Result<QueryRequest, ApiError> {
             "top_k may be at most {MAX_ORDERED} for a query leg"
         )));
     }
+    // M165: a plan is a ranked query's legs, and an order or an aggregation runs none.
+    if req.explain && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
+        return Err(ApiError::bad_request(
+            "explain describes a ranked query's legs: rank_by and aggregate_by run none",
+        ));
+    }
     Ok(req)
 }
 
@@ -3058,7 +3070,15 @@ fn multi_query(
                      project vectors yet",
                 ));
             }
-            parse_query(q)
+            // M165: the sub-queries run together on one task, so one plan cannot be told
+            // from another's.
+            let q = parse_query(q)?;
+            if q.explain {
+                return Err(ApiError::bad_request(
+                    "explain is a query's alone: a query inside queries may not ask for it",
+                ));
+            }
+            Ok(q)
         })
         .collect::<Result<Vec<QueryRequest>, _>>()?;
     // M164: fusion ranks rows, and an aggregation has none.

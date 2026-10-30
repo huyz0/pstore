@@ -97,7 +97,7 @@ write into branch/copy and query into multi-query.
 | `POST /v2/namespaces/{namespace}/query` | `POST /v1/indexes/{index}/query` | Partial query contract; separate expression matrix below | B, E, F |
 | `POST /v2/namespaces/{namespace}/async` | Replication jobs only | Missing one-shot async copy; replication is a different lifecycle | H |
 | `GET /v1/namespaces/{namespace}/operations/{token}` | Replication status only | Missing generic token-based copy operation polling | H |
-| `POST /v2/namespaces/{namespace}/explain_query` | None | Missing query explanation (`plan_text`) | H |
+| `POST /v2/namespaces/{namespace}/explain_query` | `"explain": true` on `POST /v1/indexes/{index}/query` ([M165](../milestones/M165/VERIFIED.md)) | The plan the query ran, as structured counts in `meta.explain` beside its results, not a separate route or `plan_text`; ranked queries only | H |
 
 The spec deliberately omits deprecated `GET /v1/namespaces/{namespace}` export and
 `HEAD /v1/namespaces/{namespace}`. Current export is ordered query pagination; schema
@@ -286,7 +286,7 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | Delete `status` | Native epoch/cost response |
 | List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `epoch`, `cost` |
 | Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | The same four, plus `num`, `epoch` and `cost` ([M162](../milestones/M162/VERIFIED.md)) |
-| Explain `plan_text` | Missing |
+| Explain `plan_text` | `meta.explain`: structured per-leg mode, segments, probes and row counts, no text ([M165](../milestones/M165/VERIFIED.md)) |
 | Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Missing general copy job contract |
 | Operation `result.success` (WriteResult) or `result.error.{status_code,detail}` | Replication status has different fields and lifecycle |
 

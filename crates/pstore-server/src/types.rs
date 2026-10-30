@@ -559,6 +559,9 @@ pub struct QueryRequest {
     /// so a string or a fraction is refused rather than coerced.
     #[serde(default)]
     pub max_staleness_ms: Option<serde_json::Value>,
+    /// The plan the query ran, in `meta.explain` (M165). A ranked query's alone.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -658,6 +661,9 @@ pub struct QueryMeta {
     /// two concurrent reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets_epoch: Option<u64>,
+    /// The plan the query ran, when it asked (M165): see `explain::render`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<serde_json::Value>,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g). An entry of several may
