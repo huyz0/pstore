@@ -29,6 +29,11 @@ and each server default and range moved.
 
 No `cargo mutants` run is claimed.
 
+CI's mutation shard 5 found `z >> 31` → `z << 31` in `recall_probe` missed: the probe
+test checked only the draws' range and spread. `a_probe_is_its_seeds` now pins seed 0's
+first three draws to splitmix64's published outputs; run here against that mutant it
+failed, and passed once the line was restored.
+
 1. PASS: `recall_matches_its_own_queries`. Over 2,000 documents folded with lists of
    about 10 rows, the three averages equal the test's own default and `exact` queries of
    each sampled vector, and `avg_recall` is below 1. The sampled vectors are the probe

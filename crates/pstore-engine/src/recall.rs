@@ -226,6 +226,10 @@ mod tests {
             "{a:?}"
         );
         let zero = recall_probe(0, 4);
+        // splitmix64's first three outputs from seed 0 are 0xE220A8397B1DCDAF,
+        // 0x6E789E6AA1B965F4 and 0x06C45D188009454F: their top 16 bits, scaled.
+        let want = [0xE220, 0x6E78, 0x06C4].map(|top: u16| f32::from(top) / 32768.0 - 1.0);
+        assert_eq!(zero.get(..3), Some(&want[..]), "{zero:?}");
         assert!(zero.windows(2).any(|w| w.first() != w.last()), "{zero:?}");
     }
 
