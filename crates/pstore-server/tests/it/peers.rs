@@ -606,6 +606,13 @@ async fn explain_counts_remote_segments() {
     assert_eq!(x["segments"], json!(segs.len()), "{x}");
     assert_eq!(x["remote_segments"], json!(remote), "{x}");
     assert_eq!(local(x), (segs.len() - remote) as u64, "{x}");
+    // A text leg's shares are phased (M55): their segments are remote too.
+    let t = json!({"text": "word2 tag1", "top_k": 10, "explain": true});
+    let (s, got) = query(&servers[0].api, &t).await;
+    assert_eq!(s, 200, "{got}");
+    let x = &got["meta"]["explain"];
+    assert_eq!(x["segments"], json!(segs.len()), "{x}");
+    assert_eq!(x["remote_segments"], json!(remote), "{x}");
     // Both peers failing: every share runs here.
     for s in &servers[1..] {
         s.view.failing.store(true, Ordering::SeqCst);

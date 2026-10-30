@@ -385,3 +385,23 @@ async fn the_fresh_segment_is_in_no_figure() {
         (20, 2, 0)
     );
 }
+
+/// A fresh ordinal past this run's targets names none of them: every target is a segment.
+#[tokio::test]
+async fn a_fresh_ordinal_past_the_targets_names_none() {
+    let f = fixture().await;
+    let n = f.targets.len();
+    let (_, e) = collect(async {
+        pstore_query::explain::fresh(Some(n));
+        query(
+            &f.store,
+            &f.targets,
+            &[dense_leg(10, false)],
+            Fusion::Rrf { k: 60.0 },
+            10,
+        )
+        .await
+    })
+    .await;
+    assert_eq!(e.segments, n);
+}

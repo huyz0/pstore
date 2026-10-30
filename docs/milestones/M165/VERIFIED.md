@@ -71,5 +71,10 @@ No `cargo mutants` run is claimed.
      M179's refusal of projected vectors, and both refusals were kept. On that tree, fmt and
      clippy passed again, and the suite passed 2,600 tests with none failing, the same
      two `[::1]` tests skipped. Coverage was not re-run there.
+   - CI's mutation shard 9 found three mutants missed in `run.rs`: the fresh ordinal's
+     bound (`<` to `<=`), and a phased share's remote count (`+=` to `-=` and to `*=`).
+     `a_fresh_ordinal_past_the_targets_names_none` and a text query in
+     `explain_counts_remote_segments` now catch them. Each was run here against its mutant
+     and failed, and passed with the line restored.
 
 Code review: see the commit message.
