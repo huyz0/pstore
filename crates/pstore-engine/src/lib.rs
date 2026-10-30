@@ -2127,6 +2127,9 @@ struct Scope {
     /// The further text fields whose token predicates bind to their own analyzers (M156), by
     /// the same rule.
     texts: BTreeMap<String, FullText>,
+    /// The index's metric, by the rule a relevance query uses (M179): its schema's, else its
+    /// unfolded rows'.
+    metric: Metric,
 }
 
 /// What [`Engine::warm`] did (M21).
@@ -8142,6 +8145,44 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
+        self.ordered_at(index, by, filter, offset, limit, as_of, consistency, false)
+            .await
+    }
+
+    /// [`Self::ordered_as`] at the latest epoch, each row carrying its `vector` in client space
+    /// (M179), read in **one round more**, after selection, from the segments selection
+    /// already opened; an unfolded row's from memory. A row with no `vector` carries none.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_as`], and a vector range that cannot be read.
+    pub async fn ordered_vectors(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        consistency: Consistency,
+    ) -> Result<Ordered, EngineError> {
+        self.ordered_at(index, by, filter, offset, limit, None, consistency, true)
+            .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, its level, and whether it reads vectors"
+    )]
+    async fn ordered_at(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        vectors: bool,
+    ) -> Result<Ordered, EngineError> {
         // A past epoch is what it is (M9i.2): a strong read of one would check nothing.
         if as_of.is_some() && consistency == Consistency::Strong {
             return Err(EngineError::Query(
@@ -8161,6 +8202,7 @@ impl<S: BlobStore> Engine<S> {
                 as_of,
                 consistency,
                 true,
+                vectors,
                 &mut hit,
             )
             .await;
@@ -8175,6 +8217,7 @@ impl<S: BlobStore> Engine<S> {
                     as_of,
                     consistency,
                     false,
+                    vectors,
                     &mut hit,
                 )
                 .await
@@ -8185,7 +8228,7 @@ impl<S: BlobStore> Engine<S> {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the order's own parameters, its level, and the cache's say"
+        reason = "the order's own parameters, its level, the cache's say, and its vectors"
     )]
     async fn ordered_once(
         &self,
@@ -8197,6 +8240,7 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
         allow_hit: bool,
+        vectors: bool,
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
         let Scope {
@@ -8210,6 +8254,7 @@ impl<S: BlobStore> Engine<S> {
             settle,
             fts,
             texts,
+            metric,
             ..
         } = self
             .scope(index, as_of, consistency, allow_hit, hit)
@@ -8219,11 +8264,11 @@ impl<S: BlobStore> Engine<S> {
         let filter = bound.as_ref();
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
         let (selected, settled) = futures_util::future::join(
-            pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
+            pstore_query::select_held(&*self.store, &targets, filter, &shadow, &mut selector),
             self.settled_scope(settle.as_ref()),
         )
         .await;
-        selected.map_err(|e| EngineError::Query(e.to_string()))?;
+        let segments = selected.map_err(|e| EngineError::Query(e.to_string()))?;
         if !settled? {
             return Err(EngineError::NotFolded);
         }
@@ -8237,18 +8282,48 @@ impl<S: BlobStore> Engine<S> {
             if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
                 // As a block's rows are: attributes, no vectors -- copied only for a row the
                 // filter admits, the rows being shared with the fresh cache (M122).
+                // M179: its stored `vector` when asked, as the folded rows' are read below.
+                let vector = vectors
+                    .then(|| d.vectors.get(pstore_format::DEFAULT_FIELD))
+                    .flatten()
+                    .and_then(|f| match f.as_dense() {
+                        [v] => Some(client_space(metric, v)),
+                        _ => None,
+                    })
+                    .filter(|v| !v.is_empty());
                 selector.offer(Document {
                     id: d.id.clone(),
-                    vectors: BTreeMap::new(),
+                    vectors: with_vector(vector),
                     attrs: d.attrs.clone(),
                 });
             }
         }
-        let rows: Vec<Document> = selector
-            .into_sorted()
+        let page: Vec<(Document, Option<pstore_query::Located>)> = selector
+            .into_sorted_at()
             .into_iter()
             .skip(offset)
             .take(limit)
+            .collect();
+        // M179: the page's folded rows' vectors, one fan-out over the segments selection
+        // opened -- the order's fourth round, and only when asked.
+        let mut read = if vectors {
+            let wanted: Vec<pstore_query::Located> =
+                page.iter().filter_map(|(_, at)| *at).collect();
+            pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted)
+                .await
+                .map_err(|e| EngineError::Query(e.to_string()))?
+        } else {
+            BTreeMap::new()
+        };
+        let rows: Vec<Document> = page
+            .into_iter()
+            .map(|(mut d, at)| {
+                if let Some(v) = at.and_then(|at| read.remove(&at)) {
+                    d.vectors =
+                        with_vector(Some(client_space(metric, &v)).filter(|v| !v.is_empty()));
+                }
+                d
+            })
             .collect();
         // A row is unfolded exactly when its id has an unfolded operation: the segment's
         // version of such an id was shadowed.
@@ -8275,6 +8350,9 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
     ) -> Result<Scope, EngineError> {
+        // M179: an index not yet folded has its metric in its unfolded view, as a relevance
+        // query reads it; its rows are stripped of it.
+        let mut fresh_metric = None;
         let (head, epoch, settle, staleness, unfolded, shadow, shadowed, (fts, texts)) = match as_of
         {
             Some(epoch) => {
@@ -8312,7 +8390,10 @@ impl<S: BlobStore> Engine<S> {
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
                 let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
                     || (Arc::default(), Arc::default(), None),
-                    |v| (v.rows, v.shadow, Some((v.fts, v.texts))),
+                    |v| {
+                        fresh_metric = v.metric;
+                        (v.rows, v.shadow, Some((v.fts, v.texts)))
+                    },
                 );
                 let fts = at
                     .head
@@ -8355,7 +8436,14 @@ impl<S: BlobStore> Engine<S> {
                 u64::from(r.rows.saturating_sub(gone))
             })
             .sum();
+        let metric = head
+            .schemas
+            .get(index)
+            .map(|s| s.metric)
+            .or(fresh_metric)
+            .unwrap_or_default();
         Ok(Scope {
+            metric,
             named: head.indexes.contains_key(index),
             targets,
             unfolded,
@@ -8882,6 +8970,21 @@ fn client_space(metric: Metric, stored: &[f32]) -> Vec<f32> {
         .get(..stored.len().saturating_sub(metric.extra()))
         .unwrap_or_default()
         .to_vec()
+}
+
+/// A row's vectors as an order answers them (M179): its `vector` alone when it has one.
+fn with_vector(
+    vector: Option<Vec<f32>>,
+) -> BTreeMap<pstore_format::Field, pstore_format::VectorField> {
+    vector
+        .map(|v| {
+            (
+                pstore_format::DEFAULT_FIELD.into(),
+                pstore_format::VectorField::Dense(vec![v]),
+            )
+        })
+        .into_iter()
+        .collect()
 }
 
 /// A resolved ranking, as `Answer`'s parallel columns: hits, ids, attributes, `$dist`, and --

@@ -153,7 +153,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Multiple dense attributes | Per-attribute ANN configuration | Up to 8 named fields in addition to required default vector; named dense search scans exactly | Partial indexing and wire semantics; D |
 | Multi-vector attributes | Vector arrays and late-interaction ANN configuration | Named arrays, exact MaxSim or opt-in FDE, optional exact rerank/probes | Equivalent family with different scoring/configuration contract; D/F |
 | Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | One public field, `sparse`: string keys (M177) and f16 weights, written in rows or columns and queried as a dot-product leg (M178); not returned in results | One field per document rather than per-attribute schema; D |
-| Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | Ordinary native result projection only walks scalar attributes, not stored vector fields; no corresponding response encoding control | Missing public round-trip/export capability; B/D/H |
+| Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | `include_vectors: ["vector"]` on a ranked query or a `rank_by` export, float or base64, up to 1,000 rows ([M179](../milestones/M179/VERIFIED.md)); cosine answers the normalized vector | Named, multi-vector and sparse fields not projected; the request names vectors apart from `include_attributes`; D/H |
 | Nested JSON objects | Not counted as available; vendor roadmap item | Public scalar parser refuses nested objects | Neither side has established current general nested-attribute parity |
 
 Source: [conversion and parsers](../../crates/pstore-server/src/lib.rs),
@@ -181,7 +181,7 @@ vector and BM25 searches use separate fields.
 | `compute_attributes` | No general computation map; separate single-string highlight feature | E, F |
 | `distance_metric` | Metric selected on write/index, no per-query wire override | B, D |
 | `limit` | No integer/object alias on a single query (`top_k`); `Limit.per` is served as a top-level `limit_per` over a relevance window ([M146](../milestones/M146/VERIFIED.md)) | B |
-| `vector_encoding` | No float/base64 response option | B, D |
+| `vector_encoding` | `float` or `base64` beside `include_vectors` ([M179](../milestones/M179/VERIFIED.md)) | D |
 | `consistency.level` | Different shape: string modes; default eventual; session/bounded are extra | B, C |
 | single-query `rerank_by` | Windowed hand-written boosting/MMR, no model configuration `{model,attribute,query}` | F, J |
 | multi-query `queries` | 1..16 queries, entire root body; aggregations and facets per sub-query ([M164](../milestones/M164/VERIFIED.md)); no nested multi | F |

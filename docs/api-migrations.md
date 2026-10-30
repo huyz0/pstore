@@ -1,5 +1,26 @@
 # Native API migration notes
 
+## M179: stored vectors in results and exports
+
+A ranked query or a `rank_by` order takes `include_vectors: ["vector"]`, and each result
+row gains `vector` beside `id`.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector"], "vector_encoding": "base64"}
+```
+
+- `vector_encoding` is `"float"` (a JSON array, the default) or `"base64"` (standard,
+  padded, little-endian f32 bytes, the spelling a write accepts).
+- The value is the vector as the index stores it: exactly what was written under
+  `dot_product` and `euclidean_squared`, normalized under `cosine_distance`. Written back
+  under the same metric it reproduces the index's distances, not the client's bytes.
+- A row with no vector has no `vector` key. An attribute named `vector` is unaffected and
+  stays under `attributes`.
+- Only `vector` is projected yet. Refused (`400`): any other name, beside `aggregate_by` or
+  `as_of`, inside a multi-query's `queries`, and above 1,000 rows (a ranked query's
+  `top_k + offset`, an order's `top_k`).
+- An order with vectors costs one more blob round, four in all; a ranked query, none.
+
 ## M178: sparse vectors
 
 A document, an `upsert_columns` column and a query take `sparse`, an object of string key
