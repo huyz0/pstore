@@ -632,6 +632,14 @@ async fn a_named_projection_costs_no_round_and_a_request_a_segment() {
         assert_eq!(on.1, ov.1 + segments, "{segments}: {on:?} vs {ov:?}");
         assert!(rn.1 <= rv.1 + segments, "{segments}: {rn:?} vs {rv:?}");
         assert_eq!([rv, rn, ov, on], pinned, "{segments} segments");
+        // `title` alone reads no `vector`: one field's requests, as `vector` alone makes.
+        let rt = cost(segments, &with(&ranked, json!(["title"]))).await;
+        let ot = cost(segments, &with(&ordered, json!(["title"]))).await;
+        assert_eq!(
+            (rt, ot),
+            (rv, ov),
+            "{segments}: `title` alone read `vector` too"
+        );
     }
 }
 
