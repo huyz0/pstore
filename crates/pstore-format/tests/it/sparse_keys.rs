@@ -226,6 +226,9 @@ fn a_u32_dimension_written_before_m177_reads_as_its_spelling_and_only_that() {
     for other in ["07", "+7", "7 ", "0x7", "9.0", ""] {
         assert!(dict.lookup(other).is_none(), "{other:?} matched");
     }
+    // A dimension twice is two lists for one key: refused, however the table is ordered.
+    let twice = [(7, vec![(0, 1.0)]), (7, vec![(1, 2.0)])];
+    assert!(Dictionary::decode(&v1_dictionary(&twice).0).is_none());
 
     let run = v2_run(&[("a", vec![(7, 0.5), (10, 0.25)]), ("b", vec![])]);
     let docs = decode_docs(&run).unwrap();

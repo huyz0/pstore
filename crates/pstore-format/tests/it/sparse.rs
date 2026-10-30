@@ -996,4 +996,8 @@ fn a_sparse_dictionary_is_decoded_once_a_buffer() {
         assert_eq!(three.lookup(&dim), fresh.lookup(&dim), "{dim}");
     }
     assert!(Dictionary::decode_shared(&raw.slice(..raw.len() - 1)).is_none());
+    // What the budget counts: the 60 keys' spellings, 110 bytes, and 6 bytes and an entry
+    // each (M177, found by CI's mutants: the weight was never read).
+    let entry = std::mem::size_of::<sparse::Entry>();
+    assert_eq!(fresh.held_bytes(), 110 + 60 * (6 + entry));
 }

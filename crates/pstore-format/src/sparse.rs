@@ -316,9 +316,9 @@ impl Dictionary {
                 entry_at(b.get(4..)?)?,
             ));
         }
-        if !rows.is_sorted_by(|a, b| a.0 < b.0) {
-            return None;
-        }
+        // No numeric-order check: the table is re-sorted by spelling below, and `decode`
+        // refuses a key twice, so a dimension twice is refused there (CI's mutants found the
+        // check here could not fail alone).
         let mut spelled: Vec<(String, Entry)> =
             rows.into_iter().map(|(d, e)| (d.to_string(), e)).collect();
         spelled.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -349,12 +349,15 @@ impl Dictionary {
     pub fn decode_shared(raw: &bytes::Bytes) -> Option<std::sync::Arc<Self>> {
         static KEPT: std::sync::LazyLock<crate::shared::ByBuffer<Dictionary>> =
             std::sync::LazyLock::new(|| crate::shared::ByBuffer::new(crate::text::DECODED_BUDGET));
-        KEPT.get_or(
-            raw,
-            // M177: the key bytes are held too, not only the table.
-            |d| d.blob.len() + d.keys.len() * (6 + std::mem::size_of::<Entry>()),
-            |b| Self::decode_bytes(b.clone()),
-        )
+        KEPT.get_or(raw, Self::held_bytes, |b| Self::decode_bytes(b.clone()))
+    }
+
+    /// What a decoded dictionary holds alive, as [`Self::decode_shared`]'s budget counts it:
+    /// M177's key bytes too, not only the table -- a key's offset and length (6 bytes) and its
+    /// entry, a key.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.blob.len() + self.keys.len() * (6 + std::mem::size_of::<Entry>())
     }
 
     /// How impacts in this segment are stored.

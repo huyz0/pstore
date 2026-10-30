@@ -13,7 +13,13 @@ Red run: the new tests do not compile against `u32` dimensions, so their red is 
 mutations below, as M176's unit tests' was: applied one at a time by a script against the
 four commands above (`split::` aside) and reverted, all 19 killed; after M178's spec review
 widened the dictionary's key offsets to `u64`, the nine on `sparse.rs` ran again, all killed.
-No `cargo mutants` run is claimed for them.
+No `cargo mutants` run is claimed for them. CI's mutants run on the PR then found four missed: three in the
+dictionary cache's weight, which no test read, now `Dictionary::held_bytes`, pinned in
+`sparse::a_sparse_dictionary_is_decoded_once_a_buffer`; and `<` read as `<=` in version 1's
+numeric-order check, equivalent since `decode` refuses a key twice, so the check is removed
+and `sparse_keys::a_u32_dimension_written_before_m177_reads_as_its_spelling_and_only_that`
+asserts a dimension twice is refused. The three weight mutants, applied by hand, are killed;
+`cargo test -p pstore-format`: 348 passed, none failed.
 
 1. `sparse_keys::every_key_round_trips_and_keeps_its_own_postings` (70,010 keys, as sorted
    sets, through a bundle, a scan and a rebuild of the scan, each key's list exact) and
