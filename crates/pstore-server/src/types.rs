@@ -604,6 +604,10 @@ pub struct ResultRow {
     /// (M179).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorOut>,
+    /// Its stored named fields that `include_vectors` names, each its vectors in the order
+    /// written (M190); absent, never `{}`, when it holds none of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<std::collections::BTreeMap<String, Vec<VectorOut>>>,
 }
 
 /// A projected vector as `vector_encoding` spells it (M179).

@@ -109,6 +109,38 @@ pub enum QueryError {
     /// the first such field by name. A typo, or a field never declared.
     #[error("no segment carries the text field `{0}`")]
     UnknownTextField(String),
+    /// A projected named field a fetched row's segment folded at a varying count of vectors a
+    /// row (M190): its rows' offsets must be read before their vectors, a round the row
+    /// fetch does not have.
+    #[error(
+        "vector field `{0}` is folded at a varying count of vectors a row: projecting it is \
+         later (M190.2)"
+    )]
+    VaryingField(String),
+}
+
+/// What a row fetch reads beside each row's id and attributes (M64, M190).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Projection<'a> {
+    /// The `vector` field's vectors (M64).
+    pub vector: bool,
+    /// Named dense fields' vectors (M190), read in the segments before `folded` only.
+    pub named: &'a [String],
+    /// The first segment whose rows the caller holds whole, documents and vectors, so
+    /// nothing is read for their named fields: the unfolded rows' fresh segment, which
+    /// stores a field of several vectors a row at a varying count.
+    pub folded: usize,
+}
+
+impl Projection<'_> {
+    /// `vector` alone, or nothing (M64).
+    #[must_use]
+    pub fn vector(vector: bool) -> Self {
+        Self {
+            vector,
+            ..Self::default()
+        }
+    }
 }
 
 /// One segment and the centroid table that belongs to it.
@@ -354,7 +386,7 @@ pub async fn query_with_texts<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
-        false,
+        Projection::default(),
     )
     .await?
     .0)
@@ -804,7 +836,7 @@ async fn run<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
@@ -1252,7 +1284,7 @@ async fn summed<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); leg_count];
     for (_, j, hits) in candidates {
@@ -1360,7 +1392,7 @@ pub async fn query_rows_filtered_texts<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
-        false,
+        Projection::default(),
     )
     .await
 }
@@ -1399,7 +1431,7 @@ pub async fn query_rows_split<S: BlobStore + Clone>(
         fusion,
         top_k,
         elsewhere,
-        with_vectors,
+        Projection::vector(with_vectors),
     )
     .await
 }
@@ -1423,7 +1455,7 @@ pub async fn query_rows_split_texts<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
     let (hits, opened, known, dense) = run(
         store,
@@ -1497,7 +1529,7 @@ async fn fetch_rows<S: BlobStore>(
     targets: &[Target],
     opened: &[Opened],
     wanted: &[(usize, usize)],
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Known, QueryError> {
     let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -1516,24 +1548,45 @@ async fn fetch_rows<S: BlobStore>(
             // ⚠️ Only a segment whose `Vectors` section IS the `vector` field: another dense
             // field in it, or several vectors a row, would read as misaligned floats.
             let vectors = async {
-                if with_vectors && o.segment.reads_vector_rows() {
+                if with_vectors.vector && o.segment.reads_vector_rows() {
                     o.segment.vector_rows(store, &t.segment, rows).await
                 } else {
                     Ok(std::collections::BTreeMap::new())
                 }
             };
-            let (docs, vectors) = futures_util::future::try_join(
-                async { o.segment.rows_at(store, &t.segment, rows).await },
-                vectors,
+            // M190: each named field's rows, joined with the rows' own read, never after it.
+            let named = if *segment < with_vectors.folded {
+                named_fields(&o.segment, with_vectors.named)?
+            } else {
+                Vec::new()
+            };
+            let named =
+                futures_util::future::try_join_all(named.into_iter().map(|name| async move {
+                    let got = o.segment.field_rows(store, &t.segment, name, rows).await?;
+                    Ok::<_, QueryError>((name, got))
+                }));
+            let (docs, vectors, named) = futures_util::future::try_join3(
+                async { Ok(o.segment.rows_at(store, &t.segment, rows).await?) },
+                async { Ok(vectors.await?) },
+                named,
             )
             .await?;
             let mut docs = docs;
             for (row, doc) in rows.iter().zip(docs.iter_mut()) {
-                if let (Some(doc), Some(v)) = (doc.as_mut(), vectors.get(row)) {
+                let Some(doc) = doc.as_mut() else { continue };
+                if let Some(v) = vectors.get(row) {
                     doc.vectors.insert(
                         pstore_format::DEFAULT_FIELD.into(),
                         pstore_format::VectorField::Dense(vec![v.clone()]),
                     );
+                }
+                for (name, got) in &named {
+                    if let Some(vs) = got.get(row) {
+                        doc.vectors.insert(
+                            name.as_str().into(),
+                            pstore_format::VectorField::Dense(vs.clone()),
+                        );
+                    }
                 }
             }
             Ok((*segment, rows.iter().copied().zip(docs).collect::<Vec<_>>()))
@@ -1551,6 +1604,26 @@ async fn fetch_rows<S: BlobStore>(
     Ok(out)
 }
 
+/// The projected named fields `segment` holds as dense ones, or the first it folded at a
+/// varying count of vectors a row (M190), which one ranged read a row cannot fetch. A field
+/// it lacks, or holds sparse, has no rows to read.
+pub(crate) fn named_fields<'a>(
+    segment: &Segment,
+    named: &'a [String],
+) -> Result<Vec<&'a String>, QueryError> {
+    let mut out = Vec::new();
+    for name in named {
+        match segment.field_layout(name) {
+            Some(f) if f.kind == 0 && f.per_row == 0 => {
+                return Err(QueryError::VaryingField(name.clone()));
+            }
+            Some(f) if f.kind == 0 => out.push(name),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 /// The rows for `hits`, one fan-out round over the segments that carry them.
 async fn resolve_rows<S: BlobStore>(
     store: &S,
@@ -1558,7 +1631,7 @@ async fn resolve_rows<S: BlobStore>(
     opened: &[Opened],
     hits: &[Hit],
     mut known: Known,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
     // Only what the shadow check did not already fetch (M9c.2): when it ran, this is nothing.
     let missing: Vec<(usize, usize)> = hits
