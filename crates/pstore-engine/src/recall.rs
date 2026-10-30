@@ -203,8 +203,9 @@ pub fn recall_probe(seed: u64, dims: usize) -> Vec<f32> {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = state;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            // splitmix64's last step, `z ^= z >> 31`, changes only bits 0..33, below the
+            // 16 kept: it is left out, and seed 0's pinned draws show the same values.
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
             f32::from(u16::try_from(z >> 48).unwrap_or(0)) / 32768.0 - 1.0
         })
         .collect()

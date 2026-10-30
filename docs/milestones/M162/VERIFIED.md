@@ -33,6 +33,9 @@ CI's mutation shard 5 found `z >> 31` → `z << 31` in `recall_probe` missed: th
 test checked only the draws' range and spread. `a_probe_is_its_seeds` now pins seed 0's
 first three draws to splitmix64's published outputs; run here against that mutant it
 failed, and passed once the line was restored.
+Shard 4 then found `z ^= z >> 31` → `z |= z >> 31` missed. That is an equivalent
+mutant: the step changes only bits below the 16 the probe keeps, so it was removed. The
+pinned draws pass unchanged without it, which shows the probe's values did not move.
 
 1. PASS: `recall_matches_its_own_queries`. Over 2,000 documents folded with lists of
    about 10 rows, the three averages equal the test's own default and `exact` queries of
