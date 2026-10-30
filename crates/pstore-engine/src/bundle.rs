@@ -263,6 +263,17 @@ mod tests {
         assert_eq!(range.end, len - 28, "the directory ends at the footer");
         let bytes = &whole[range.start as usize..range.end as usize];
         assert_eq!(directory(bytes).unwrap(), want);
+        // A tail that starts exactly where the directory does holds all of it; one byte
+        // shorter does not.
+        let start = range.start as usize;
+        assert_eq!(
+            directory_from_tail(&whole[start..], len).unwrap(),
+            Directory::Read(want.clone())
+        );
+        assert_eq!(
+            directory_from_tail(&whole[start + 1..], len).unwrap(),
+            Directory::Needs(range.clone())
+        );
         // Not a bundle, or a length that disagrees with its footer.
         assert!(directory_from_tail(&whole[whole.len() - 20..], len).is_err());
         assert!(directory_from_tail(&whole[whole.len() - 256..], len + 1).is_err());

@@ -89,3 +89,7 @@ No `cargo mutants` run is claimed.
      (.harness/m160-fast.log).
 
 Code review: see the commit message.
+
+CI's mutation shard missed `<` → `<=` in `directory_from_tail`: no test read a tail that
+starts exactly where the directory does. `a_directory_reads_from_the_tail` now reads that
+tail and one a byte shorter, and fails under the mutant (.harness/m160-ci-mutation-red.log).
