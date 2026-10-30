@@ -62,6 +62,7 @@ mod peer_startup;
 mod peers;
 mod persistent_types;
 mod pre_tokenized;
+mod progress;
 mod quarantine;
 mod read_cache;
 mod read_only;

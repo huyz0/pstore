@@ -57,6 +57,7 @@ mod oq6;
 mod oq91;
 mod order;
 mod patch;
+mod progress;
 mod quarantine;
 mod read_only;
 mod reap;

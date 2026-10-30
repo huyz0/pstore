@@ -332,7 +332,7 @@ does not establish token-stream equivalence.
 | `approx_row_count` | Alias of folded `documents` count | Partial freshness/count definition |
 | `approx_logical_bytes` | Summed segment object lengths ([M148](../milestones/M148/SPEC.md)); deleted rows count until compaction, delete vectors do not | Partial; G |
 | `created_at`, `updated_at` | RFC 3339 times from HEAD ([M148](../milestones/M148/SPEC.md)); `updated_at` is fold time and compaction does not move it | Yes |
-| `index.status`, `unindexed_bytes`, `unindexed_rows` | Process-local `unfolded` boolean | No global indexing progress contract; G |
+| `index.status`, `unindexed_bytes`, `unindexed_rows` | `progress` with `?progress=true` ([M160](../milestones/M160/SPEC.md)): durable unfolded operations across every writer, bounded reads, `exact` past 64 bundles | Partial: opt-in, operations rather than rows |
 | `encryption.mode`, `key_name` | Bucket deployment configuration only | I |
 | `pinning` boolean/config, `replicas`, `pinning.status.{updated_at,ready_replicas,replicas,utilization}` | No namespace capacity reservation | I |
 | `sharding.num_shards` | No namespace shard configuration | I |

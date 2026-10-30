@@ -2177,6 +2177,30 @@ pub struct Ordered {
     pub staleness: std::time::Duration,
 }
 
+/// An index's durable operations no fold has committed yet, across every lane (M160).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    /// The HEAD the counts are relative to.
+    pub epoch: Epoch,
+    /// Operations -- upserts, patches, deletes, by-filter operations -- in the bundles past
+    /// that HEAD's watermarks that name the index.
+    pub rows: u64,
+    /// Their encoded bytes.
+    pub bytes: u64,
+    /// Whether every unfolded bundle was read. `false` past [`PROGRESS_BUNDLES`]: the counts
+    /// are then a lower bound.
+    pub exact: bool,
+    /// Whether HEAD holds the index (M160): one it does not, whose operations are only in
+    /// unfolded bundles, is durable and not yet indexed.
+    pub held: bool,
+}
+
+/// The most unfolded bundles one [`Engine::progress`] reads (M160).
+pub const PROGRESS_BUNDLES: usize = 64;
+
+/// The tail of a bundle read for its directory (M160); a longer directory takes one more.
+const PROGRESS_TAIL: u64 = 4096;
+
 /// What HEAD knows about one index, without reading a single segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStats {
@@ -5319,6 +5343,93 @@ impl<S: BlobStore> Engine<S> {
             }
         }
         Err(EngineError::Lost)
+    }
+
+    /// How far `index`'s durable writes are from being indexed (M160): every lane's bundles
+    /// past HEAD's watermark, counted from their directories. Reads only.
+    ///
+    /// ⚠️ **A constant depth, whatever the backlog**: HEAD and the registry; one `head` per
+    /// lane at its watermark; one round probing the present lanes' next keys, sharing
+    /// [`PROGRESS_BUNDLES`]; one range read per bundle's tail; one more for a long
+    /// directory. No doubling probe, so a stalled fold makes the answer inexact, not slow.
+    pub async fn progress(&self, index: &str) -> Result<Progress, EngineError> {
+        let (at, live) = futures_util::future::try_join(
+            head::read(&*self.store, self.tenant),
+            lanes::live(&*self.store, self.tenant),
+        )
+        .await?;
+        let held = quarantine_exists(&at.head, index);
+        let len_of = |lane: LaneId, seq: u64| {
+            let key = bundle_key(self.tenant, lane, Seq(seq));
+            async move {
+                match self.store.head(&key).await {
+                    Ok(len) => Ok(Some((key, len))),
+                    Err(pstore_blob::BlobError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(EngineError::from(e)),
+                }
+            }
+        };
+        let from = |lane: &LaneId| at.head.watermarks.get(&lane.0).copied().unwrap_or(0);
+        let first =
+            futures_util::future::try_join_all(live.iter().map(|lane| len_of(*lane, from(lane))))
+                .await?;
+        let mut present: Vec<(LaneId, (Key, u64))> = live
+            .iter()
+            .copied()
+            .zip(first)
+            .filter_map(|(lane, got)| got.map(|g| (lane, g)))
+            .collect();
+        // More present lanes than the budget leaves `more` at 0, so every lane read is
+        // marked inexact below: a lane with no probe may hold more.
+        let mut exact = true;
+        present.truncate(PROGRESS_BUNDLES);
+        let more = PROGRESS_BUNDLES
+            .checked_div(present.len())
+            .unwrap_or(0)
+            .saturating_sub(1) as u64;
+        let next = futures_util::future::try_join_all(present.iter().map(|(lane, _)| {
+            let base = from(lane);
+            futures_util::future::try_join_all((1..=more).map(move |k| len_of(*lane, base + k)))
+        }))
+        .await?;
+        let mut bundles: Vec<(Key, u64)> = Vec::new();
+        for ((_, head), tail) in present.into_iter().zip(next) {
+            bundles.push(head);
+            // A lane is dense: its count stops at the first absent key.
+            let found: Vec<_> = tail.into_iter().map_while(|b| b).collect();
+            if found.len() as u64 == more {
+                exact = false;
+            }
+            bundles.extend(found);
+        }
+        let dirs =
+            futures_util::future::try_join_all(bundles.iter().map(|(key, len)| async move {
+                let tail = self
+                    .store
+                    .get_range(key, len.saturating_sub(PROGRESS_TAIL)..*len)
+                    .await?;
+                match bundle::directory_from_tail(&tail, *len)? {
+                    bundle::Directory::Read(d) => Ok::<_, EngineError>(d),
+                    bundle::Directory::Needs(range) => {
+                        bundle::directory(&self.store.get_range(key, range).await?)
+                    }
+                }
+            }))
+            .await?;
+        let (mut rows, mut bytes) = (0u64, 0u64);
+        for dir in &dirs {
+            if let Some(e) = dir.get(index) {
+                rows += u64::from(e.docs);
+                bytes += u64::from(e.len);
+            }
+        }
+        Ok(Progress {
+            epoch: at.head.epoch,
+            rows,
+            bytes,
+            exact,
+            held,
+        })
     }
 
     /// Makes `index` read-only, or writable again (M149): one HEAD read and, when the value
