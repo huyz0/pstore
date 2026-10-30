@@ -726,7 +726,6 @@ pub fn build_with(docs: &[Document], field: &str, analyzer: &Analyzer) -> Built 
             term_at,
             term.len() as u16,
             Entry {
-                dim: 0,
                 offset,
                 bytes: (postings.len() as u64 - offset) as u32,
                 count: list.len() as u32,

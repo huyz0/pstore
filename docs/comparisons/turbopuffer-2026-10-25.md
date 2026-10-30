@@ -152,7 +152,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Dense vectors | f32/f16/i8 schema types, array/base64 transport | f32 array/base64 input; internal quantization is an index mechanism | Internal int8 reranking does not establish i8/f16 public schema support; D |
 | Multiple dense attributes | Per-attribute ANN configuration | Up to 8 named fields in addition to required default vector; named dense search scans exactly | Partial indexing and wire semantics; D |
 | Multi-vector attributes | Vector arrays and late-interaction ANN configuration | Named arrays, exact MaxSim or opt-in FDE, optional exact rerank/probes | Equivalent family with different scoring/configuration contract; D/F |
-| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | Library vector field uses u32 dimensions; no public sparse write/query | Library capability, missing API and lossless string vocabulary mapping; D |
+| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | Library vector field keyed by strings (M177), no mapping to agree on; no public sparse write/query | Library capability, missing API; D |
 | Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | Ordinary native result projection only walks scalar attributes, not stored vector fields; no corresponding response encoding control | Missing public round-trip/export capability; B/D/H |
 | Nested JSON objects | Not counted as available; vendor roadmap item | Public scalar parser refuses nested objects | Neither side has established current general nested-attribute parity |
 

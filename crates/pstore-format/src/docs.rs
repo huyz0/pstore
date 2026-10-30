@@ -183,6 +183,14 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
 /// so refusing one is a replay failure rather than durable loss.
 pub(crate) const DOCS_VERSION: u16 = 2;
 
+/// M177: a run holding a sparse field, whose keys are strings (kind 2).
+///
+/// ⚠️ Only such a run is version 3. A binary before M177 read every kind but 0 as `u32`
+/// pairs, so a kind-2 field in a version-2 run would be read as numbers out of key bytes; at
+/// version 3 it refuses the run instead. A run with no sparse field stays version 2, so a
+/// rollback still replays it.
+pub(crate) const SPARSE_KEYS_VERSION: u16 = 3;
+
 /// Encodes documents **with every named field**, for the WAL bundle.
 ///
 /// ⚠️ Unlike a segment block, a bundle is the durable record of a write before anything has
@@ -194,7 +202,16 @@ pub(crate) const DOCS_VERSION: u16 = 2;
 #[must_use]
 pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u16(DOCS_VERSION);
+    let sparse = docs.iter().any(|d| {
+        d.vectors
+            .values()
+            .any(|f| matches!(f, crate::VectorField::Sparse(_)))
+    });
+    e.u16(if sparse {
+        SPARSE_KEYS_VERSION
+    } else {
+        DOCS_VERSION
+    });
     e.u32(docs.len() as u32);
     for d in docs {
         e.bytes(d.id.as_bytes());
@@ -213,10 +230,10 @@ pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
                     }
                 }
                 crate::VectorField::Sparse(pairs) => {
-                    e.u8(1);
+                    e.u8(2);
                     e.u32(pairs.len() as u32);
-                    for (dim, impact) in pairs {
-                        e.u32(*dim);
+                    for (key, impact) in pairs {
+                        e.bytes(key.as_bytes());
                         e.f32(impact.get());
                     }
                 }
@@ -231,7 +248,7 @@ pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
 pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
     let mut d = Dec::new(buf);
     let version = d.u16()?;
-    if version != DOCS_VERSION {
+    if version != DOCS_VERSION && version != SPARSE_KEYS_VERSION {
         return Err(FormatError::UnsupportedVersion(version));
     }
     let n = d.u32()? as usize;
@@ -245,24 +262,38 @@ pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
             let name: crate::Field = d.str()?.into();
             let kind = d.u8()?;
             let count = d.u32()? as usize;
-            let field = if kind == 0 {
-                let mut vs = Vec::with_capacity(count.min(1 << 12));
-                for _ in 0..count {
-                    let dims = d.u32()? as usize;
-                    let mut v = Vec::with_capacity(dims.min(1 << 16));
-                    for _ in 0..dims {
-                        v.push(d.f32()?);
+            let field = match (kind, version) {
+                (0, _) => {
+                    let mut vs = Vec::with_capacity(count.min(1 << 12));
+                    for _ in 0..count {
+                        let dims = d.u32()? as usize;
+                        let mut v = Vec::with_capacity(dims.min(1 << 16));
+                        for _ in 0..dims {
+                            v.push(d.f32()?);
+                        }
+                        vs.push(v);
                     }
-                    vs.push(v);
+                    crate::VectorField::Dense(vs)
                 }
-                crate::VectorField::Dense(vs)
-            } else {
-                let mut pairs = Vec::with_capacity(count.min(1 << 20));
-                for _ in 0..count {
-                    let dim = d.u32()?;
-                    pairs.push((dim, crate::Impact::new(d.f32()?)));
+                // Before M177 a dimension was a `u32`: it reads as its decimal spelling, the
+                // one key a query for it names.
+                (1, DOCS_VERSION) => {
+                    let mut pairs = Vec::with_capacity(count.min(1 << 20));
+                    for _ in 0..count {
+                        let dim = d.u32()?;
+                        pairs.push((dim.to_string(), crate::Impact::new(d.f32()?)));
+                    }
+                    crate::VectorField::Sparse(pairs)
                 }
-                crate::VectorField::Sparse(pairs)
+                (2, SPARSE_KEYS_VERSION) => {
+                    let mut pairs = Vec::with_capacity(count.min(1 << 20));
+                    for _ in 0..count {
+                        let key = d.string()?;
+                        pairs.push((key, crate::Impact::new(d.f32()?)));
+                    }
+                    crate::VectorField::Sparse(pairs)
+                }
+                _ => return Err(FormatError::Corrupt("unknown vector field kind")),
             };
             vectors.insert(name, field);
         }

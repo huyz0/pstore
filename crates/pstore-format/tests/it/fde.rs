@@ -304,8 +304,8 @@ async fn field_rows_refuses_a_corrupt_table_and_skips_a_sparse_field() {
         d.vectors.insert(
             "terms".into(),
             VectorField::Sparse(vec![
-                (3, pstore_format::Impact::new(1.0)),
-                (9, pstore_format::Impact::new(2.0)),
+                ("3".to_owned(), pstore_format::Impact::new(1.0)),
+                ("9".to_owned(), pstore_format::Impact::new(2.0)),
             ]),
         );
         all.push(d.clone());
@@ -521,7 +521,7 @@ async fn a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width() {
             .insert("flat".into(), VectorField::Dense(vec![Vec::new()]));
         d.vectors.insert(
             "terms".into(),
-            VectorField::Sparse(vec![(1, pstore_format::Impact::new(1.0))]),
+            VectorField::Sparse(vec![("1".to_owned(), pstore_format::Impact::new(1.0))]),
         );
         all.push(d.clone());
         w.push(d);
