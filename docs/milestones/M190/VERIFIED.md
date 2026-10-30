@@ -33,9 +33,8 @@ code went back to M179's condition. No `cargo mutants` run is claimed.
    segments): green, a ranked query naming `title` as deep as naming `vector`, the order 4
    deep with one more request a segment, M179's pins unchanged. Killed: the named reads
    awaited after the rows' (ranked and order), the order's round skipped for named fields,
-   the named fields never read. The workspace suite, without the two IPv6 tests: 2,586
-   passed, none failed (before the equivalent filters left; the coverage run below, after
-   them, passed every test of the three crates changed). `scripts/coverage.sh --changed --fail-under-lines 95
+   the named fields never read. The workspace suite, without the two IPv6 tests, merged
+   with main after M162 (49a5df74): 2,597 passed, none failed. `scripts/coverage.sh --changed --fail-under-lines 95
    --fail-under-regions 95 --ignore-run-fail` with those skips, after `cargo llvm-cov clean`:
    lines 97.45%, regions 96.49% (`provisional`: a 4-core cloud container). CI's coverage
    and mutants runs on the PR are the gate.
