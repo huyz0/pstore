@@ -212,6 +212,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 times: (0..50)
                     .map(|j| (format!("t{i:08}-index-{j:07}"), (1, 1)))
                     .collect(),
+                read_only: Default::default(),
             };
             store
                 .put(

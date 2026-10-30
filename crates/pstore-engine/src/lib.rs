@@ -446,6 +446,9 @@ pub enum EngineError {
     /// quarantine or rows held unfolded, or is an external index's.
     #[error("the index {0:?} exists")]
     IndexExists(String),
+    /// A write, or a drop, named an index its owner made read-only (M149).
+    #[error("the index {0:?} is read-only")]
+    IndexReadOnly(String),
     /// The epoch asked for cannot be reconstructed.
     #[error(transparent)]
     TimeTravel(#[from] head::TimeTravel),
@@ -1038,6 +1041,7 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
         created_ms: h.times.get(index).map(|t| t.0).filter(|c| *c > 0),
         written_ms: h.times.get(index).map(|t| t.1),
         bytes: refs.iter().map(|r| r.len).sum(),
+        read_only: h.read_only.contains(index) || h.replications.contains_key(index),
     })
 }
 
@@ -2202,6 +2206,8 @@ pub struct IndexStats {
     pub written_ms: Option<u64>,
     /// The summed lengths of its segment objects (M148), or `None` when one is not recorded.
     pub bytes: Option<u64>,
+    /// Whether it takes no writes (M149): its owner's flag, or a replica's replication.
+    pub read_only: bool,
 }
 
 /// One writer's view of one tenant.
@@ -2234,6 +2240,9 @@ pub struct Engine<S> {
     /// leaves when a schema this process reads records its name, whatever kind it records,
     /// or drops its index after the epoch this process had read when it declared it.
     unfolded_types: Mutex<BTreeMap<String, (Epoch, Types)>>,
+    /// M149: the read-only names of the newest HEAD this process read, which the write door
+    /// refuses by, as it refuses a replica's.
+    read_only_names: Mutex<std::collections::BTreeSet<String>>,
     /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
     /// Filled by nothing else, so no other read pays to clone HEAD.
     ///
@@ -2429,6 +2438,7 @@ impl<S: BlobStore> Engine<S> {
             schemas: Mutex::new(None),
             replica_names: Mutex::new(std::collections::BTreeSet::new()),
             unfolded_types: Mutex::new(BTreeMap::new()),
+            read_only_names: Mutex::new(std::collections::BTreeSet::new()),
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
@@ -2560,6 +2570,13 @@ impl<S: BlobStore> Engine<S> {
             if !names.iter().eq(head.replications.keys()) {
                 *names = head.replications.keys().cloned().collect();
             }
+            let mut flagged = self
+                .read_only_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *flagged != head.read_only {
+                flagged.clone_from(&head.read_only);
+            }
         }
     }
 
@@ -2571,11 +2588,16 @@ impl<S: BlobStore> Engine<S> {
     /// recorded schema. Before, a process that had never read accepted a wrong width, and then
     /// refused every correct write to that index against the wrong row it held.
     async fn refuse_replica(&self, index: &str) -> Result<(), EngineError> {
+        // M149: and a read-only index, by the same rule.
         let named = |e: &Self| {
             e.replica_names
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(index)
+                || e.read_only_names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(index)
         };
         let at = if named(self) {
             head::read(&*self.store, self.tenant).await?
@@ -2595,6 +2617,9 @@ impl<S: BlobStore> Engine<S> {
             return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
                 index.to_owned(),
             )));
+        }
+        if at.head.read_only.contains(index) {
+            return Err(EngineError::IndexReadOnly(index.to_owned()));
         }
         Ok(())
     }
@@ -5296,6 +5321,52 @@ impl<S: BlobStore> Engine<S> {
         Err(EngineError::Lost)
     }
 
+    /// Makes `index` read-only, or writable again (M149): one HEAD read and, when the value
+    /// changes, one CAS commit; the value it already has commits nothing and answers that
+    /// HEAD's epoch. `None` when HEAD does not hold the index, by the rule `Head::encode`
+    /// keeps a flag by, so a flag answered is a flag written. A replica is read-only by its
+    /// replication and refused here.
+    pub async fn set_read_only(&self, index: &str, on: bool) -> Result<Option<Epoch>, EngineError> {
+        require_fencing(&*self.store)?;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+            if at.head.replications.contains_key(index) {
+                return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                    index.to_owned(),
+                )));
+            }
+            if !quarantine_exists(&at.head, index) {
+                return Ok(None);
+            }
+            if at.head.read_only.contains(index) == on {
+                return Ok(Some(at.head.epoch));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            if on {
+                next.read_only.insert(index.to_owned());
+            } else {
+                next.read_only.remove(index);
+            }
+            match self.commit_head(&at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    self.remember_schemas(&next);
+                    return Ok(Some(epoch));
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
     /// [`Self::delete_index`], with `interfere` awaited between the first attempt's reads and
     /// its commit, so a test can make another delete land first and force the retry.
     #[doc(hidden)]
@@ -5448,6 +5519,10 @@ impl<S: BlobStore> Engine<S> {
                         x.to_owned(),
                     )));
                 }
+                // M149: a read-only index is dropped by clearing its flag first.
+                if at.head.read_only.contains(x) {
+                    return Err(EngineError::IndexReadOnly(x.to_owned()));
+                }
                 let rows = |docs: Option<&Vec<Document>>| {
                     docs.is_some_and(|d| d.iter().any(|d| !is_rowless(d)))
                 };
@@ -5483,9 +5558,30 @@ impl<S: BlobStore> Engine<S> {
                     true
                 }
             });
+            // M149: a read-only index takes no writes either. Its rows that slipped past a
+            // door which had not read this HEAD are set aside, never dropped: every kind goes
+            // to its quarantine below and is counted as a reject, before the reject pass so
+            // none of them implies a schema.
+            let mut flagged_rows: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+            by_index.retain(|idx, docs| {
+                if at.head.read_only.contains(idx) {
+                    for d in docs.iter() {
+                        tally.rejected(d);
+                    }
+                    flagged_rows.insert(idx.clone(), std::mem::take(docs));
+                    false
+                } else {
+                    true
+                }
+            });
             // M132: a fold whose operations were all discarded still commits: its verdicts
             // are what the attempts' waiters read, and its watermarks move past them.
-            if by_index.is_empty() && drop.is_none() && replica_rows.is_empty() && !discarded {
+            if by_index.is_empty()
+                && drop.is_none()
+                && replica_rows.is_empty()
+                && flagged_rows.is_empty()
+                && !discarded
+            {
                 self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
@@ -5504,6 +5600,10 @@ impl<S: BlobStore> Engine<S> {
             let mut rejects: BTreeMap<String, u64> = BTreeMap::new();
             // M25: the rows themselves, quarantined below rather than dropped.
             let mut rejected: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+            for (idx, docs) in flagged_rows {
+                rejects.insert(idx.clone(), docs.len() as u64);
+                rejected.insert(idx, docs);
+            }
             // ⚠️ **A new index's schema is implied BEFORE the pass, and the pass runs against it**
             // (M9d, spec review): skipping the pass for a new index sealed two writers' first
             // rows together whatever they disagreed on -- same width, different metrics, and

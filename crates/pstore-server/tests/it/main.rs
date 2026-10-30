@@ -64,6 +64,7 @@ mod persistent_types;
 mod pre_tokenized;
 mod quarantine;
 mod read_cache;
+mod read_only;
 mod ref_new;
 mod registry;
 mod relevance_offset;

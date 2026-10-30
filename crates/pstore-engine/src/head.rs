@@ -8,7 +8,7 @@
 use crate::EngineError;
 use pstore_blob::{BlobStore, CasError, Key, Precondition};
 use pstore_types::{CasTag, Epoch, LaneId, Seq};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One committed segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +276,9 @@ pub struct Head {
     /// trailing section after `keys_since`, and `encode` writes only the entries of indexes
     /// that exist, so it never outlives its index.
     pub times: BTreeMap<String, (u64, u64)>,
+    /// The indexes an owner made read-only (M149). ⚠️ The last trailing section, after
+    /// `times`, and `encode` writes only the names of indexes that exist.
+    pub read_only: BTreeSet<String>,
 }
 
 /// Where a replica's source index lives (M22).
@@ -566,7 +569,7 @@ impl Head {
         // M132: `keys_since` follows, and forces the outcomes.
         // M173: the recorded types follow the text fields, and force their section (empty if
         // none), which forces `keys_since`.
-        // M148: the times are last, only those of indexes that exist, and force the types'
+        // M148: the times follow the types, only those of indexes that exist, and force the types'
         // count (0 when none), and so everything before it.
         let typed: Vec<_> = all
             .iter()
@@ -581,7 +584,19 @@ impl Head {
                     || self.quarantine.contains_key(*n)
             })
             .collect();
-        let types = !typed.is_empty() || !times.is_empty();
+        // M149: the read-only names are last, only those of indexes that exist, and force
+        // the times (a count of 0 when none) and so everything before them.
+        let flagged: Vec<&String> = self
+            .read_only
+            .iter()
+            .filter(|n| {
+                self.indexes.contains_key(*n)
+                    || self.schema_rejects.contains_key(*n)
+                    || self.quarantine.contains_key(*n)
+            })
+            .collect();
+        let timed = !times.is_empty() || !flagged.is_empty();
+        let types = !typed.is_empty() || timed;
         let texted = !texts.is_empty() || types;
         let since = self.keys_since.is_some() || texted;
         let outs = !self.outcomes.is_empty() || since;
@@ -723,12 +738,18 @@ impl Head {
                 }
             }
         }
-        if !times.is_empty() {
+        if timed {
             out.extend_from_slice(&(times.len() as u32).to_le_bytes());
             for (name, (created, written)) in times {
                 put_str(&mut out, name);
                 out.extend_from_slice(&created.to_le_bytes());
                 out.extend_from_slice(&written.to_le_bytes());
+            }
+        }
+        if !flagged.is_empty() {
+            out.extend_from_slice(&(flagged.len() as u32).to_le_bytes());
+            for name in flagged {
+                put_str(&mut out, name);
             }
         }
         out
@@ -1142,6 +1163,13 @@ impl Head {
             let name = c.string()?;
             let created = c.u64()?;
             h.times.insert(name, (created, c.u64()?));
+        }
+        // M149: and here, no read-only names.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.read_only.insert(c.string()?);
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2345,6 +2373,63 @@ mod tests {
         let back = Head::decode(&h.encode())?;
         assert_eq!(back, h);
         assert_eq!(back.times.len(), 1);
+        Ok(())
+    }
+
+    /// M149 criterion 7: `read_only` round-trips beside every combination of absent and
+    /// present `keys_since` and `times`; a HEAD without it encodes as M148's; and `encode`
+    /// keeps only the names of indexes that exist.
+    #[test]
+    fn read_only_round_trips_beside_times() -> Result<(), EngineError> {
+        for keys_since in [None, Some(4)] {
+            for timed in [false, true] {
+                let mut m148 = Head {
+                    keys_since,
+                    ..sample()
+                };
+                m148.indexes.insert("a".to_owned(), Vec::new());
+                m148.schema_rejects.insert("r".to_owned(), 1);
+                m148.quarantine
+                    .insert("q".to_owned(), vec![("k".to_owned(), 1)]);
+                if timed {
+                    m148.times.insert("a".to_owned(), (1, 2));
+                }
+                let mut with = m148.clone();
+                for n in ["a", "r", "q"] {
+                    with.read_only.insert(n.to_owned());
+                }
+                assert_eq!(
+                    Head::decode(&with.encode())?,
+                    with,
+                    "{keys_since:?} {timed}"
+                );
+                let mut ghost = m148.clone();
+                ghost.read_only.insert("gone".to_owned());
+                assert_eq!(hex(&ghost.encode()), hex(&m148.encode()));
+                let mut both = with.clone();
+                both.read_only.insert("gone".to_owned());
+                assert_eq!(Head::decode(&both.encode())?, with);
+                let mut longer = with.encode();
+                longer.push(0);
+                assert!(Head::decode(&longer).is_err());
+                let bytes = with.encode();
+                for cut in m148.encode().len()..bytes.len() {
+                    let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                    if let Ok(h) = Head::decode(part) {
+                        assert!(h.read_only.is_empty(), "a cut at {cut} decoded flags");
+                    }
+                }
+            }
+        }
+        // After M173's recorded types, live and dropped, with and without times.
+        for timed in [false, true] {
+            let mut h = every_section();
+            if timed {
+                h.times.insert("a".to_owned(), (3, 4));
+            }
+            h.read_only.insert("a".to_owned());
+            assert_eq!(Head::decode(&h.encode())?, h, "{timed}");
+        }
         Ok(())
     }
 }

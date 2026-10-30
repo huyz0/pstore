@@ -89,7 +89,7 @@ write into branch/copy and query into multi-query.
 | `GET /v1/namespaces/{namespace}/schema` | Summary's `schema` | Partial: no standalone schema read; not a general typed attribute schema | D |
 | `POST /v1/namespaces/{namespace}/schema` | `PATCH /v1/indexes/{index}/schema` | Missing evolution: current PATCH always returns `schema_immutable` | D, G |
 | `GET /v2/namespaces/{namespace}/metadata` | `GET /v1/indexes/{index}` | Partial metadata; see route conflict above | G |
-| `PATCH /v1/namespaces/{namespace}/metadata` | None | Missing general read-only and pinning controls | G, I |
+| `PATCH /v1/namespaces/{namespace}/metadata` | `PATCH /v1/indexes/{index}` with `read_only` ([M149](../milestones/M149/SPEC.md)) | Partial: read-only only; pinning missing | I |
 | `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial: synchronous process-local metadata warm, rather than accepted asynchronous hint | H |
 | `POST /v1/namespaces/{namespace}/_debug/recall` | Offline `scripts/recall.sh` | Missing online sampled recall/ground truth endpoint | H |
 | `POST /v2/namespaces/{namespace}` | `PUT /v1/indexes/{index}/documents` | Partial write contract; separate field matrix below | B, C, D |
@@ -336,7 +336,7 @@ does not establish token-stream equivalence.
 | `encryption.mode`, `key_name` | Bucket deployment configuration only | I |
 | `pinning` boolean/config, `replicas`, `pinning.status.{updated_at,ready_replicas,replicas,utilization}` | No namespace capacity reservation | I |
 | `sharding.num_shards` | No namespace shard configuration | I |
-| `read_only` | Replication destination is read-only, no generic user toggle | G |
+| `read_only` | `PATCH /v1/indexes/{index}` `{"read_only": bool}` ([M149](../milestones/M149/SPEC.md)); a replica is read-only by its replication | Yes |
 | Docs-only `last_write_at`, `branching.parent` | Not in pinned spec; no matching API metadata | Resolve vendor contract, then G |
 
 [Branching](https://turbopuffer.com/docs/branching) and physical copies must remain separate
@@ -469,7 +469,7 @@ Sources: [router](../../crates/pstore-server/src/lib.rs),
 | Namespace sharding | Fixed configured shards with a shared write log and consistent strong snapshot | Distributing segment work does not establish independent persistent shard capacity/resharding semantics |
 | Storage backends | Managed cloud regions; [Azure preview](https://turbopuffer.com/docs/regions), BYOC by arrangement | Server entry wires memory/S3/Azure; GCS library support is not an exposed production server backend |
 | Caching | Managed memory/NVMe, warm hint, reserved pinning | Cache implementation and persistent local cache configuration; warm only serving process metadata; no replica reservation API |
-| Read-only | General namespace flag | Replication-only restriction; generic control missing |
+| Read-only | General namespace flag | Per-index flag ([M149](../milestones/M149/SPEC.md)); rows a stale server accepted are set aside into the quarantine |
 | Availability/scaling | Managed operations and commercial SLA | No equivalent externally demonstrated SLA, fleet-scale failure history, or autoscaling capacity guarantee |
 | Auth/quotas | API keys, organization controls, limits | Native server trusts tenant header; meter library not wired; blob concurrency admission is not tenant rate/memory admission |
 | Transport/isolation | Documented TLS and service tenant isolation | Operator perimeter required; admin/internal routes need separate authorization |
