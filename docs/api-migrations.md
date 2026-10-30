@@ -226,6 +226,17 @@ A relevance query may carry `limit_per`:
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
 
+## M161: index list pages state what a walk sees while names change
+
+Each page of `GET /v1/indexes` adds `epoch`: the epoch of the HEAD the page was read
+from, 0 for a tenant that has none. Nothing else changes, and a page still costs one
+read and no LIST. A walk of pages is not a snapshot; the guarantees it does give are in
+[the deploy guide](deploy.md#listing-indexes-while-they-change). A client that wants a
+snapshot of the stored names checks that every page reported the same `epoch`, and
+walks again when they differ.
+
+Nothing stored changes. Evidence is in [M161 verification](milestones/M161/VERIFIED.md).
+
 ## M160: an index reports its indexing progress across every writer
 
 `GET /v1/indexes/{index}?progress=true` adds a `progress` object:
