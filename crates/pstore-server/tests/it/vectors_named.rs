@@ -193,7 +193,7 @@ const METRICS: [&str; 3] = ["dot_product", "euclidean_squared", "cosine_distance
 const ALL: [&str; 3] = ["vector", "title", "tokens"];
 
 /// 300 rows folded in two segments, each holding one `title`, and 50 more unfolded that
-/// also hold 1 to 5 `tokens` -- a folded multi-vector field is M190.2's -- under `metric`,
+/// also hold 1 to 5 `tokens` -- folded multi-vector fields are M191's -- under `metric`,
 /// read back by an API restarted over the same store.
 async fn built(metric: &str) -> (A<MemoryStore>, BTreeMap<String, Row>) {
     let store = Accounted::new(MemoryStore::new());
@@ -483,8 +483,9 @@ async fn rows_answer_only_the_named_fields_they_hold() {
 }
 
 #[tokio::test]
-async fn a_field_folded_at_a_varying_count_fails_naming_the_rule() {
-    // Criterion 3: one row without `title` folds it at a varying count.
+async fn a_field_folded_at_a_varying_count_is_answered() {
+    // Criterion 3: one row without `title` folds it at a varying count. M190 refused it;
+    // M191 answers it, the row without it having no entry.
     let a = api();
     write(
         &a,
@@ -500,13 +501,15 @@ async fn a_field_folded_at_a_varying_count_fails_naming_the_rule() {
         json!({"vector": [1.0, 1.0], "top_k": 2, "include_vectors": ["title"]}),
         json!({"rank_by": ["id", "asc"], "top_k": 2, "include_vectors": ["title"]}),
     ] {
-        let (s, b) = ask(&a, "x", &q).await;
-        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{q}: {b}");
-        let msg = b["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            msg.contains("`title` is folded at a varying count of vectors a row"),
-            "{q}: {b}"
-        );
+        let b = query(&a, "x", &q).await;
+        let results = b["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{q}: {b}");
+        for r in results {
+            match r["id"].as_str().unwrap() {
+                "a" => assert_eq!(r["vectors"], json!({"title": [[1.0]]}), "{q}: {b}"),
+                _ => assert!(r.get("vectors").is_none(), "{q}: {b}"),
+            }
+        }
     }
     // A folded multi-vector field is always of the varying layout.
     write(
@@ -518,18 +521,15 @@ async fn a_field_folded_at_a_varying_count_fails_naming_the_rule() {
     )
     .await;
     fold(&a).await;
-    let (s, b) = ask(
+    let b = query(
         &a,
         "m",
         &json!({"rank_by": ["id", "asc"], "top_k": 1, "include_vectors": ["tokens"]}),
     )
     .await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
-    assert!(
-        b["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("`tokens` is folded at a varying count of vectors a row"),
+    assert_eq!(
+        b["results"][0]["vectors"],
+        json!({"tokens": [[1.0], [2.0]]}),
         "{b}"
     );
     // `vector` alone still projects.

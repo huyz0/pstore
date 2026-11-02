@@ -40,8 +40,9 @@ fixed layout.
   two rounds, so a refused query reads no vector bytes. The bound reaches `pstore-query` on
   `Projection` (`max_bytes`); the server sets it to `MAX_PROJECTED_BYTES`, 64 MiB, and a
   test lowers it through `Api::set_projection_bytes_for_test`, a hidden method as
-  `set_index_params_for_test` is. One row always fits: 9 fields of 1,024 vectors of width
-  1,537 is about 57 MiB, so an export can always page one row at a time.
+  `set_index_params_for_test` is. One row always fits: 8 named fields of 1,024 vectors of width
+  1,537 are about 48 MiB (`vector` is never read this way), so an export can always page
+  one row at a time.
 - **Answer.** Unchanged from M190: `vectors: {name: [v, ...]}`, each vector in client space
   in the order written. Folded rows now answer alike whatever their segment's layout.
 - **M190's refusal goes.** `QueryError::VaryingField` and its "later (M190.2)" message are
@@ -65,14 +66,15 @@ fixed layout.
    `tokens` answer the same ids in the same order as on the original. Each query's
    `$dist` or score is bit for bit equal (dot product, euclidean), or within 1e-5 (cosine),
    and every attribute is equal.
-3. With the bound lowered to 1,000 bytes, a ranked query and an order whose hits' `tokens`
+3. With the bound lowered to 300 bytes, a ranked query and an order whose hits' `tokens`
    cover more fail `422` naming the bytes and the bound, and each is exactly one round
    shallower than when admitted: no vector range is read. With the bound at 10,000 bytes,
    the same queries over 5 rows are admitted. With something unfolded and a bound the
-   page fits but the candidates would not, a ranked query is admitted: the vectors are
-   read for its hits only. M190's
+   page fits but the candidates would not (200 bytes, `top_k` 2), a ranked query is
+   admitted: the vectors are read for its hits only. M190's
    `a_field_folded_at_a_varying_count_fails_naming_the_rule` now asserts the field is
-   answered, because this milestone changes that behaviour.
+   answered, because this milestone changes that behaviour, and is renamed
+   `a_field_folded_at_a_varying_count_is_answered`.
 4. On the depth-counting store, cold, at 1 and at 4 folded segments, with every row holding
    `tokens` at a varying count:
    - a ranked query naming `tokens` is exactly one round deeper than one naming `vector`;
@@ -116,6 +118,12 @@ Mutations, each to be killed:
   read; the offsets in `fetch_rows` and `vectors_at`, the vectors for the hits (page) with
   the bound between; `ProjectionTooLarge` replacing `VaryingField`; the server's bound and
   its test hook; AGENTS.md's budget line; the test module; docs and VERIFIED.md.
+
+## Amendments
+While the tests were written: criterion 3's bounds became the 300 and 200 bytes the test
+uses, and the M190 test it names was renamed for what it now asserts. The bound reaches `Projection` through the
+engine, set when a tenant's engine is built (`Engine::with_projection_bytes`), so the test
+hook is called before a tenant's first request.
 
 ## Review
 Spec review round 1 (approve with changes, three majors, all taken): the vectors read for

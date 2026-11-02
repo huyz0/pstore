@@ -115,7 +115,8 @@ reasoning, with numbers and sources, is in `INDEX.md`.
   time per index**. Requests scale with nodes and bytes.
 - Never put a **data-dependent chain** of blob fetches on a user-facing path. The budget
   is three sequential round trips to rank, and one more to fetch the rows ranked (D-34,
-  restated by M47 by the owner's decision); `rerank: exact` is an opt-in outside it.
+  restated by M47 by the owner's decision); `rerank: exact`, and projecting a field folded
+  at a varying count of vectors a row (M191, the owner's decision), are opt-ins outside it.
   Fan-out within a round is free, depth is not.
 - Never add a **lock, lease, or leader election** for correctness. CAS on a blob is the
   fencing mechanism — a paused or partitioned writer is already safe.
