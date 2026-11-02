@@ -492,6 +492,43 @@ fn token_bytes(b: &Value) -> usize {
 }
 
 #[tokio::test]
+async fn unfolded_rows_fields_are_answered_from_memory_outside_the_bound() {
+    // Criterion 3: an unfolded row's `tokens` are in memory, never read from its fresh
+    // segment (which folds them at a varying count), so they count nothing against the bound.
+    let store = MemoryStore::new();
+    let a = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    write(
+        &a,
+        "f",
+        json!({"documents": docs(&rows(0, 20, 400, |_| true, |_| 0))}),
+    )
+    .await;
+    fold(&a).await;
+    let cold = Api::unsecured(Accounted::new(store.clone()), LaneId(2)).unwrap();
+    cold.set_projection_bytes_for_test(0);
+    let fresh: BTreeMap<String, Row> = rows(20, 23, 401, |_| true, |i| 1 + i % 3)
+        .into_iter()
+        .collect();
+    write(&cold, "f", json!({"documents": docs(&fresh)})).await;
+    let q = json!({"vector": vec![1.0_f32; 8], "top_k": 23, "exact": true,
+        "include_vectors": ["tokens"]});
+    let (s, b) = ask(&cold, "f", &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b).len(), 23, "{b}");
+    for r in b["results"].as_array().unwrap() {
+        let id = r["id"].as_str().unwrap();
+        match fresh.get(id) {
+            Some(row) => assert_eq!(
+                named_of(r, "tokens").unwrap().len(),
+                row.named["tokens"].len(),
+                "{id}"
+            ),
+            None => assert!(named_of(r, "tokens").is_none(), "{id}: {r}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn the_bound_counts_every_segments_and_fields_bytes_and_admits_its_equal() {
     // Criterion 3. Two segments of 20 rows, each varying in `title` (every fifth row lacks
     // it) and in `tokens` (1 to 5 a row): under dot product a width-4 vector is 16 bytes

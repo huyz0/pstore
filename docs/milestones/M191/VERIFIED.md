@@ -36,7 +36,10 @@ killed. No `cargo mutants` run is claimed.
    the vectors read for every candidate, the bound checked after the read, `>` as `>=`,
    the bound removed, the bytes as the largest span, over one segment or one field only,
    the bound unset in the ranked path, the order or the server, and the refusal answered as
-   a 500 (ranked and order). M190's test, renamed from
+   a 500 (ranked and order). And (CI's mutants on the PR found it, then a test was added
+   and killed it here) the fresh segment's fields read rather than taken from memory:
+   `vectors_multi::unfolded_rows_fields_are_answered_from_memory_outside_the_bound` admits
+   unfolded hits with `tokens` under a bound of 0. M190's test, renamed from
    `a_field_folded_at_a_varying_count_fails_naming_the_rule`, now asserts the field is
    answered. `format`'s `fde::field_spans_locate_only_a_varying_fields_named_rows` and
    `fde::decode_vectors_reads_whole_vectors_of_its_width_only`: green, killing a fixed
