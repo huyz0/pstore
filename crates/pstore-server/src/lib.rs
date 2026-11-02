@@ -167,6 +167,9 @@ pub struct Api<S> {
     /// Index parameters every engine is built with, when set (M54's tests cluster small
     /// segments with them).
     index_params: Mutex<Option<pstore_index::cluster::Params>>,
+    /// The most bytes of folded vectors one query projects (M191): [`MAX_PROJECTED_BYTES`],
+    /// lowered only by a test.
+    projection_bytes: std::sync::atomic::AtomicU64,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -457,6 +460,7 @@ impl<S: BlobStore + 'static> Api<S> {
             }),
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
+            projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -809,7 +813,11 @@ impl<S: BlobStore + 'static> Api<S> {
             let engine = match filter_rows {
                 Some(rows) => engine.with_filter_rows(rows),
                 None => engine,
-            };
+            }
+            .with_projection_bytes(
+                self.projection_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
@@ -891,6 +899,14 @@ impl<S: BlobStore + 'static> Api<S> {
                 })?;
         *pool = Some(created.clone());
         Ok(created)
+    }
+
+    /// Lowers the bound on a query's projected vector bytes (M191's tests), for the engines
+    /// built after it: set it before a tenant's first request.
+    #[doc(hidden)]
+    pub fn set_projection_bytes_for_test(&self, bytes: u64) {
+        self.projection_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Builds every engine from now on with `params` (M54's tests: small clustered segments).
@@ -3206,6 +3222,11 @@ enum Plan {
 /// The most rows one query projects vectors for (M179): a page of 1,000 vectors of width
 /// 1,536 is about 6 MB of f32s, where `MAX_ORDERED` alone would allow ten times it.
 const MAX_VECTOR_ROWS: usize = 1_000;
+
+/// The most bytes of folded vectors of a varying layout one query reads to project (M191):
+/// `MAX_NAMED_FIELDS` fields of 1,024 vectors of width 1,537, 4 bytes a component, are
+/// about 48 MiB, so one row always fits (`vector` is never read this way).
+const MAX_PROJECTED_BYTES: u64 = 64 << 20;
 
 /// What the query's results project (M179, M190), `None` when it asks for nothing, or why it
 /// cannot ask.

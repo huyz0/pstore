@@ -2324,6 +2324,9 @@ pub struct Engine<S> {
     lane_recheck: Option<std::time::Duration>,
     /// The most rows one by-filter operation may admit (M136): `filter_rows::FILTER_ROWS`.
     filter_rows: usize,
+    /// The most bytes one query's varying fields' vectors may read (M191), unbounded unless
+    /// the server sets it.
+    projection_bytes: u64,
     /// How many whole rows the last fold's scans kept for deferred operations (M136), for a
     /// test to read.
     kept: std::sync::atomic::AtomicUsize,
@@ -2503,6 +2506,7 @@ impl<S: BlobStore> Engine<S> {
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             lane_recheck: None,
             filter_rows: filter_rows::FILTER_ROWS,
+            projection_bytes: u64::MAX,
             kept: std::sync::atomic::AtomicUsize::new(0),
             lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
@@ -2577,6 +2581,14 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn with_filter_rows(mut self, rows: usize) -> Self {
         self.filter_rows = rows;
+        self
+    }
+
+    /// The most bytes a projection of fields folded at a varying count of vectors a row may
+    /// read in one query (M191); above it the query is refused before any vector is read.
+    #[must_use]
+    pub fn with_projection_bytes(mut self, bytes: u64) -> Self {
+        self.projection_bytes = bytes;
         self
     }
 
@@ -7499,8 +7511,8 @@ impl<S: BlobStore> Engine<S> {
     /// row; an unfolded hit's named fields from memory.
     ///
     /// # Errors
-    /// As [`Self::query_split_as`], and [`EngineError::Unprojected`] for a named field a
-    /// fetched row's segment folded at a varying count of vectors a row.
+    /// As [`Self::query_split_as`], and [`EngineError::Unprojected`] when the hits' fields
+    /// folded at a varying count of vectors a row hold more than the projection bound (M191).
     #[allow(
         clippy::too_many_arguments,
         reason = "the query's own parameters, where to split it, and what it projects"
@@ -7529,6 +7541,7 @@ impl<S: BlobStore> Engine<S> {
                 vector,
                 named,
                 folded: 0,
+                max_bytes: self.projection_bytes,
             },
         )
         .await
@@ -8308,8 +8321,8 @@ impl<S: BlobStore> Engine<S> {
     /// unfolded row's from memory.
     ///
     /// # Errors
-    /// As [`Self::ordered_vectors`], and [`EngineError::Unprojected`] for a named field a page
-    /// row's segment folded at a varying count of vectors a row.
+    /// As [`Self::ordered_vectors`], and [`EngineError::Unprojected`] when the page rows'
+    /// fields folded at a varying count of vectors a row hold more than the projection bound.
     #[allow(
         clippy::too_many_arguments,
         reason = "the order's own parameters, and what it projects"
@@ -8329,6 +8342,7 @@ impl<S: BlobStore> Engine<S> {
             vector,
             named,
             folded: 0,
+            max_bytes: self.projection_bytes,
         };
         self.ordered_at(
             index,
@@ -8496,7 +8510,7 @@ impl<S: BlobStore> Engine<S> {
             pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted, vectors)
                 .await
                 .map_err(|e| match e {
-                    pstore_query::QueryError::VaryingField(_) => {
+                    pstore_query::QueryError::ProjectionTooLarge { .. } => {
                         EngineError::Unprojected(e.to_string())
                     }
                     e => EngineError::Query(e.to_string()),
@@ -9409,8 +9423,8 @@ fn query_error(
         (pstore_query::QueryError::UnknownTextField(field), _) => {
             EngineError::UnknownTextField(field)
         }
-        // M190: and a projected field it cannot read in the row fetch.
-        (e @ pstore_query::QueryError::VaryingField(_), _) => {
+        // M191: and a projection past its bound.
+        (e @ pstore_query::QueryError::ProjectionTooLarge { .. }, _) => {
             EngineError::Unprojected(e.to_string())
         }
         (
