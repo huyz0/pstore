@@ -1273,7 +1273,7 @@ impl Head {
         for _ in 0..c.u32()? {
             let dest = c.string()?;
             let store = c.string()?;
-            let tenant = u128::from(c.u64()?) | (u128::from(c.u64()?) << 64);
+            let tenant = c.u128()?;
             let index = c.string()?;
             let run = c.u64()?;
             let epoch = c.u64()?;
@@ -1502,6 +1502,14 @@ impl Cur<'_> {
     fn u32(&mut self) -> Result<u32, EngineError> {
         Ok(u32::from_le_bytes(
             self.take(4)?
+                .try_into()
+                .map_err(|_| EngineError::CorruptHead)?,
+        ))
+    }
+    /// `u128::to_le_bytes`'s inverse (M166): one read, so no operator joins two halves.
+    fn u128(&mut self) -> Result<u128, EngineError> {
+        Ok(u128::from_le_bytes(
+            self.take(16)?
                 .try_into()
                 .map_err(|_| EngineError::CorruptHead)?,
         ))

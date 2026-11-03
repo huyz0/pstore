@@ -1988,27 +1988,46 @@ async fn racing_copies_make_one() {
 }
 
 /// M166 criterion 3: a failure is the plan's run's alone; a copy re-created into `dst` while
-/// the sync ran keeps running.
+/// the sync ran keeps running, from another source or from the same one under a new run.
 #[tokio::test]
 async fn a_failure_never_ends_a_newer_copy() {
+    for again in ["other", "src"] {
+        let s = setup(Kind::CrossTenant);
+        write(&s.src, "src", 0..30).await;
+        write(&s.src, "other", 0..30).await;
+        s.copy().await;
+        s.src.delete_index("src").await.unwrap();
+        let ctl = s.here.engine(DST, 5);
+        let src = s.here.engine(SRC, 6);
+        let from = s.here.acct.as_tenant(DST);
+        let mut st = SyncState::default();
+        s.dst
+            .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+                ctl.cancel_replication("dst").await.unwrap();
+                write(&src, again, 30..40).await;
+                ctl.create_copy("dst", ReplicaSource::local(SRC, again), &from)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let now = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(now.state, CopyState::Running, "{again}: {now:?}");
+        assert_eq!(now.source, ReplicaSource::local(SRC, again));
+    }
+}
+
+/// M166: a plain replication whose source is gone is retried and reported, never ended as
+/// a copy is.
+#[tokio::test]
+async fn a_replications_missing_source_is_reported_not_ended() {
     let s = setup(Kind::CrossTenant);
     write(&s.src, "src", 0..30).await;
-    write(&s.src, "other", 0..30).await;
-    s.copy().await;
+    s.create().await;
     s.src.delete_index("src").await.unwrap();
-    let ctl = s.here.engine(DST, 5);
-    let from = s.here.acct.as_tenant(DST);
     let mut st = SyncState::default();
-    s.dst
-        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
-            ctl.cancel_replication("dst").await.unwrap();
-            ctl.create_copy("dst", ReplicaSource::local(SRC, "other"), &from)
-                .await
-                .unwrap();
-        })
-        .await
-        .unwrap();
-    let now = s.dst.copy_status("dst").await.unwrap().unwrap();
-    assert_eq!(now.state, CopyState::Running, "{now:?}");
-    assert_eq!(now.source, ReplicaSource::local(SRC, "other"));
+    let out = s.sync(&mut st).await;
+    assert!(out.failed.contains_key("dst"), "{out:?}");
+    assert!(s.dst.replications().await.unwrap().contains_key("dst"));
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
 }

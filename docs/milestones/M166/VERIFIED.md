@@ -79,3 +79,13 @@ misleading test comment (fixed); the failure path does not clear the cached plan
 replication is already gone; a notes read error fails
 even a terminal status; criterion 6 is tested at unit level only (above). The last three
 are left as they are.
+
+CI's mutation shards found three misses on the PR. Decoding a copy outcome's tenant as a
+low half `|` a high half was equivalent under `^`: the halves never overlap. It is now one
+16-byte little-endian read, `encode`'s exact inverse, and the head tests pass. Two were test
+gaps. `a_replications_missing_source_is_reported_not_ended` catches the failure path's
+guard forced true. `a_failure_never_ends_a_newer_copy` now also re-creates the copy from the
+same source under a new run, which catches the run-and-source check's `&&` turned `||`.
+Each test failed against its mutant and passed with the line restored
+(.harness/m166-ci-mutations.log). These runs were in the M167 working tree, which holds this
+branch's code plus M167's.
