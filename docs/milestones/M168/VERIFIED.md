@@ -67,10 +67,20 @@ count (`==` as `!=`, `+` as `-` and as `*`), the guard that makes a recorded spa
 `a_reindex_remaps_what_the_source_moved` covers them: a recorded dictionary answering 404 once
 is remapped and the sparse answer kept; a segment always gone fails after its stalls; and a ref
 from before M32 over a schema recording no primary rebuilds with the segment's own primary.
-Each mutant was run against it (.harness/m168-ci-misses.log): four fail it, and `!=` and `*`
-remap forever without yielding, so they hung until the 600-second timeout killed them, as
-`cargo mutants`' own timeout does. A full local `cargo mutants` run is not claimed; CI's shards
-on the fix are the check.
+Each mutant was run against it (.harness/m168-ci-misses.log). Four failed it; `!=` and `*`
+remapped forever without yielding and hung, which CI counts as a failure of the gate. The test
+store's 404 now yields, as a real round trip does, so the always-gone case is bounded by a
+30-second timeout and both mutants fail it.
+
+The third round found three more. `progress += 1` as `*=` never counts a rebuilt segment, and
+as `-=` was equivalent while `progress` was an `i32`. It is now a `usize`, so `-=` underflows,
+and the test adds 26 segments, the j-th answering 404 to its first j reads: 26 rounds that
+each rebuild one more, past `MAX_STALLS`. The guard `once.contains(d)` beside a reindex record
+was redundant: every create writes or clears the record, so no replication holds one. It is
+removed rather than tested. All five stall and progress mutants fail the test, the slowest in
+30 seconds. The engine and server suites pass after the change (1,232 and 115 tests, the two
+IPv6 tests skipped). A full local `cargo mutants` run is not claimed; CI's shards on the fix are
+the check.
 
 1. PASS: `a_reindex_rebuilds_under_a_new_analyzer`, from another tenant and from another store.
    After one sync the copy is `succeeded`, `dest`'s schema records stemming, and "run" finds

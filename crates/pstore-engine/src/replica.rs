@@ -861,9 +861,10 @@ impl<S: BlobStore> Engine<S> {
                         out.failed.insert(d.clone(), "unknown_store".to_owned());
                         continue;
                     };
-                    // M168: a reindex rebuilds what a copy would copy.
+                    // M168: a reindex rebuilds what a copy would copy. Only a copy holds a
+                    // record: every create writes or clears it, so a replication never does.
                     let got = match at.head.reindexes.get(d.as_str()) {
-                        Some(ask) if at.head.once.contains(d.as_str()) => {
+                        Some(ask) => {
                             self.rebuild(&src, &r.source, src_head, d, e, &mut copies, ask)
                                 .await
                         }
@@ -1330,7 +1331,7 @@ impl<S: BlobStore> Engine<S> {
                     .into_inner()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            let mut progress = 0;
+            let mut progress: usize = 0;
             let mut missing = false;
             for (h, r) in results {
                 match r {

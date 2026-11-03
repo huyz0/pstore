@@ -97,10 +97,16 @@ impl Hooked {
         {
             return Err(BlobError::Other("injected outage".to_owned()));
         }
-        if let Some(n) = self.missing.lock().unwrap().get_mut(key.as_str())
-            && *n > 0
-        {
-            *n -= 1;
+        let gone = match self.missing.lock().unwrap().get_mut(key.as_str()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        };
+        if gone {
+            // A 404 is a round trip: it yields, so a loop of them can be timed out.
+            tokio::task::yield_now().await;
             return Err(BlobError::NotFound(key.to_string()));
         }
         Ok(())
@@ -2609,7 +2615,7 @@ async fn a_reindex_remaps_what_the_source_moved() {
     );
 
     // A segment that is always gone: the reindex fails after its stalls, rather than
-    // remapping forever (which never yields, so it shows as the test's timeout).
+    // remapping forever.
     let s = setup(Kind::CrossTenant);
     write(&s.src, "src", 0..30).await;
     let key = s.src.head_for_test().await.indexes["src"][0].key.clone();
@@ -2621,10 +2627,35 @@ async fn a_reindex_remaps_what_the_source_moved() {
         .insert(key.clone(), u32::MAX);
     s.reindex(stemmed()).await;
     let mut st = SyncState::default();
-    let out = s.sync(&mut st).await;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), s.sync(&mut st))
+        .await
+        .expect("a reindex of a segment that is always gone never gave up");
     let why = out.failed.get("dst").expect("no failure reported");
     assert!(why.contains("kept changing"), "{why}");
     assert_eq!(s.state().await, Some(CopyState::Running));
+
+    // Each round rebuilding one more segment is progress, however many rounds it takes:
+    // the j-th of 26 segments answers 404 to its first j reads.
+    let s = setup(Kind::CrossTenant);
+    for k in 0..26 {
+        write(&s.src, "src", k * 2..k * 2 + 2).await;
+    }
+    let segs: Vec<String> = s.src.head_for_test().await.indexes["src"]
+        .iter()
+        .map(|r| r.key.clone())
+        .collect();
+    assert_eq!(segs.len(), 26);
+    {
+        let mut m = s.here.hooked.missing.lock().unwrap();
+        for (j, k) in segs.into_iter().enumerate() {
+            m.insert(k, u32::try_from(j).unwrap());
+        }
+    }
+    s.reindex(stemmed()).await;
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    assert_eq!(digest(&s.src, "src").await, digest(&s.dst, "dst").await);
 
     // A ref from before M32 records no dictionaries, and a source from before the primary
     // was recorded names none: the missing sidecar is not a move, and the primary is the
