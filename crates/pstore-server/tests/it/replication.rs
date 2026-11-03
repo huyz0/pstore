@@ -2069,6 +2069,12 @@ async fn a_reindex_body_is_checked() {
         let msg = b["error"]["message"].as_str().unwrap();
         assert!(msg.contains(names), "{schema}: {msg}");
     }
+    // Exactly eight further fields passes the checks, so the missing source answers.
+    let eight: serde_json::Map<String, Value> = (0..8)
+        .map(|i| (format!("f{i}"), json!({"full_text_search": true})))
+        .collect();
+    let (s, b) = reindex_into(&api, "dst", nowhere.clone(), Value::Object(eight)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
     let (s, b) = send(
         &api,
         DST,

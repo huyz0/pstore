@@ -2511,7 +2511,7 @@ async fn a_refused_rebuild_fails_typed() {
         Some(1)
     );
     s.reindex(Reindex {
-        texts: [(long, FullText::default())].into(),
+        texts: [(long.clone(), FullText::default())].into(),
         ..Reindex::default()
     })
     .await;
@@ -2530,6 +2530,39 @@ async fn a_refused_rebuild_fails_typed() {
         .push(format!("tnt/{}/idx/src/seg/", SRC.0));
     let again = s.sync(&mut st).await;
     assert!(again.idle && again.failed.is_empty(), "{again:?}");
+
+    // A finishing commit that loses once does not rebuild the refused copy again: its
+    // source segment, failing from then on, is not read by the retry.
+    let mut d = doc("a", 1.0);
+    d.attrs
+        .insert(long.clone(), Value::Str("words here".to_owned()));
+    let s = setup(Kind::CrossTenant);
+    s.src.write("src", vec![d]).await.unwrap();
+    fold(&s.src).await;
+    s.reindex(Reindex {
+        texts: [(long, FullText::default())].into(),
+        ..Reindex::default()
+    })
+    .await;
+    s.reindex_into("dst2", stemmed()).await.unwrap();
+    let watcher = s.here.engine(DST, 3);
+    let fail = s.here.hooked.fail.clone();
+    let mut st = SyncState::default();
+    let out = s
+        .dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+            // A rival commit, which loses the finishing commit once.
+            watcher.cancel_replication("dst2").await.unwrap();
+            fail.lock()
+                .unwrap()
+                .push(format!("tnt/{}/idx/src/seg/", SRC.0));
+        })
+        .await
+        .unwrap();
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert_eq!(out.finished, vec!["dst".to_owned()]);
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.failure, Some(CopyFailure::RebuildRefused));
 
     // A store failure under the seal: retried, the copy running until it succeeds.
     let s = setup(Kind::CrossTenant);
@@ -2662,6 +2695,10 @@ async fn a_reindex_naming_the_primary_is_refused() {
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
     invalid(s.reindex_into("dst", text(&many)).await);
     assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+    // Exactly `MAX_TEXTS` further fields is allowed.
+    let (at_most, created) = s.reindex_into("dst", text(&many[1..])).await.unwrap();
+    assert!(created);
+    assert_eq!(at_most.state, CopyState::Running);
 }
 
 /// M168 criterion 2 (engine): a reindex that leaves out the source's only further field and

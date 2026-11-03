@@ -53,7 +53,15 @@ equivalent until a redundant trailing filter was removed. The mutations, in grou
   primary's options or the regex set dropped, and the regex type, pre-tokenized and field-count
   checks.
 
-No `cargo mutants` run is claimed.
+CI's mutation shards on the PR found three survivors the hand list did not try: `>` as `>=` in
+the engine's and the server's further-field limit, so exactly `MAX_TEXTS` fields was untested,
+and `||` as `&&` in the commit loop's skip of a failed or refused copy, so a lost finishing
+commit would rebuild a refused reindex again. Each now has a check, seen red under that
+mutant and green without it (.harness/m168-ci-misses.log): eight further fields are accepted
+by the engine and pass the server's checks, and in `a_refused_rebuild_fails_typed` a rival
+commit makes the refused copy's finish lose once while its source segment starts failing,
+and the retry reports no failure. A full local `cargo mutants` run is not claimed; CI's shards
+on the fix are the check.
 
 1. PASS: `a_reindex_rebuilds_under_a_new_analyzer`, from another tenant and from another store.
    After one sync the copy is `succeeded`, `dest`'s schema records stemming, and "run" finds
