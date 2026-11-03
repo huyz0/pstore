@@ -439,6 +439,31 @@ a minute. `pstore_engines` and `pstore_engines_evicted_total` in `/metrics` show
 churn. A dropped tenant's next request costs what a restart costs it: a HEAD read, and on its
 first flush the lane probes.
 
+## Indexes per tenant
+
+Since M169, `PSTORE_INDEXES_PER_TENANT` caps how many indexes one tenant holds: 10,000 by
+default, `0` for no cap. A tenant's count is every name its HEAD holds: indexes, rejected or
+quarantined rows, external indexes and replication or copy destinations. A request that would add
+a name past the cap is refused `409 index_limit`, naming the cap; dropping an index makes room.
+An index the tenant already holds is never refused, so a lowered cap leaves a tenant over it able
+to write what it has.
+
+Where it is checked:
+- a create, branch, replication, copy or external index: against the HEAD its commit is built on,
+  so exactly;
+- a write to a new name: against the HEAD this server last read and the names it holds unfolded,
+  at no request. A write the cap would refuse reads HEAD once first, so a drop another server
+  made is seen.
+
+⚠️ **Not exact for concurrent writes.** Writes to new names that arrive together, on one server
+or on several, can each be admitted one below the cap, and all fold: a fold never refuses a write
+it acknowledged. The
+tenant then holds more than the cap, and every new name is refused until drops bring it below.
+
+Why 10,000: every open reads the tenant's HEAD whole, about 100 to 200 bytes per index, and M7b
+found an unsharded HEAD stays cheaper than an extra round trip up to about 29,700 indexes.
+`scripts/index-scale.sh` checks one tenant with 5,000 active indexes on one server.
+
 ## Listing indexes while they change
 
 `GET /v1/indexes?prefix=&cursor=&page_size=` answers one page from one HEAD read: the
@@ -558,6 +583,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_REPLICATION_SCAN_S` | `10` | How often a worker reads one more register shard. |
 | `PSTORE_REPLICATION_TTL_S` | `120` | How long a claim lasts unrenewed; renewed every third of it. |
 | `PSTORE_REPLICATION_MAX` | `64` | Tenants one worker holds at most. |
+| `PSTORE_INDEXES_PER_TENANT` | `10000` | The most indexes one tenant may hold (M169, above); `0` for no cap. |
 | `PSTORE_REPLICATION_IDLE_S` | `60` | The sync interval of a tenant whose sources do not change. |
 | `PSTORE_REPLICATION_SHARDS` | `64` | The register's shard count, **fixed when the register is first created**: about 2,000 tenants with jobs per shard. |
 | `PSTORE_SOURCES` | — | Comma-separated names of remote source stores, each configured by the variables below. |

@@ -129,6 +129,7 @@ impl<S: BlobStore> Engine<S> {
         }
         let at = head::read(&*self.store, self.tenant).await?;
         name_free(&at.head, index)?;
+        self.refuse_past_limit(&at.head, index)?;
         let src = Key::new(source);
         let col = match kind {
             ExternalKind::Parquet => ExternalColumn::pin_parquet(&*self.store, &src, column).await,
@@ -181,7 +182,9 @@ impl<S: BlobStore> Engine<S> {
                 {
                     if matches!(e, EngineError::Lost) {
                         at = head::read(&*self.store, self.tenant).await?;
-                        if let Err(taken) = name_free(&at.head, index) {
+                        if let Err(taken) = name_free(&at.head, index)
+                            .and_then(|()| self.refuse_past_limit(&at.head, index))
+                        {
                             self.bury_abandoned(&[codes.as_str().to_owned()]).await;
                             return Err(taken);
                         }
@@ -237,6 +240,7 @@ impl<S: BlobStore> Engine<S> {
         self.external_allowed(&entry.source)?;
         let at = head::read(&*self.store, self.tenant).await?;
         name_free(&at.head, dest)?;
+        self.refuse_past_limit(&at.head, dest)?;
         let raw = from.get(&Key::new(entry.codes.clone())).await?;
         // Whatever is moved is a codes blob: a damaged one is refused here, not at a query.
         ExternalIndex::from_bytes(&raw).map_err(|e| from_index(&e))?;

@@ -29,7 +29,7 @@ After:
     does. Never at the fold: a fold that refused would drop rows already acknowledged durable.
 - **The refusal**: `EngineError::IndexLimit { limit }`, answered **409 `index_limit`** with a
   message naming the limit and that dropping an index makes room.
-- **Not exact across processes**, and said so in `docs/deploy.md`: two servers whose cached
+- **Not exact for concurrent writes**, and said so in `docs/deploy.md`: two writers whose cached
   HEADs both read `limit - 1` may each admit one new name by write; the HEAD then holds more than
   the limit, and every later new name is refused until drops bring it below. The overshoot is
   bounded by new names written concurrently on other processes before their next HEAD read.
