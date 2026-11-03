@@ -304,6 +304,10 @@ struct Http {
     refusals: std::collections::BTreeMap<&'static str, u64>,
     /// `outcome -> count` for scheduled folds (M9i.1).
     folds: std::collections::BTreeMap<&'static str, u64>,
+    /// `outcome -> count` for folds of a replica's source (M192).
+    source_folds: std::collections::BTreeMap<&'static str, u64>,
+    /// Times a bounded replication went past its bound (M192).
+    lag_exceeded: u64,
 }
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -765,6 +769,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route(
                 "/v1/indexes/{index}/replication/resume",
                 Write.on(post(replication::resume::<S>)),
+            )
+            .route(
+                "/v1/indexes/{index}/replication/sync",
+                Write.on(post(replication::sync_now::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/schema",
@@ -1488,6 +1496,38 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
+    // M192: folds of a replica's source, and replications past their lag bound.
+    out.push_str(
+        "# HELP pstore_replication_source_fold_total Folds of a replica's source by outcome \
+         (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_source_fold_total counter\n");
+    for outcome in ["folded", "nothing", "failed"] {
+        out.push_str(&format!(
+            "pstore_replication_source_fold_total{{outcome=\"{outcome}\"}} {}\n",
+            http.source_folds.get(outcome).copied().unwrap_or(0)
+        ));
+    }
+    out.push_str(
+        "# HELP pstore_replication_lag_exceeded_total Times a bounded replication's lag went \
+         past the bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lag_exceeded_total counter\n");
+    out.push_str(&format!(
+        "pstore_replication_lag_exceeded_total {}\n",
+        http.lag_exceeded
+    ));
+    out.push_str(
+        "# HELP pstore_replication_lagging Bounded replications this worker holds past their \
+         lag bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lagging gauge\n");
+    out.push_str(&format!(
+        "pstore_replication_lagging {}\n",
+        api.replicating
+            .lagging
+            .load(std::sync::atomic::Ordering::SeqCst)
+    ));
     // M54: parts of queries sent to peers, those that failed, and those run for peers. M56:
     // and how many servers the list holds now, this one included.
     let (sent, failed, servers) = api
@@ -6424,6 +6464,18 @@ fn replication_policy(
             .map_or(d.max, |n| usize::try_from(n).unwrap_or(usize::MAX)),
         idle: positive("PSTORE_REPLICATION_IDLE_S")?.map_or(d.idle, secs),
         shards,
+        // M192: the source is folded every half of it, by a loop that looks once a second.
+        max_lag: match positive("PSTORE_REPLICATION_MAX_LAG_S")? {
+            None => None,
+            Some(n) if n < 2 => {
+                return Err(ConfigError::Replication(
+                    "PSTORE_REPLICATION_MAX_LAG_S",
+                    n.to_string(),
+                    "at least 2: the source is folded every half of it",
+                ));
+            }
+            Some(n) => Some(secs(n)),
+        },
         ..d
     };
     Ok(on.then_some(policy))

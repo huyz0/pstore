@@ -103,6 +103,7 @@ fn policy(max: usize) -> ReplicationPolicy {
         period: Duration::from_secs(1),
         idle: Duration::from_secs(60),
         shards: 4,
+        max_lag: None,
     }
 }
 

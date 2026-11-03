@@ -73,6 +73,7 @@ mod ref_new;
 mod registry;
 mod relevance_offset;
 mod replication;
+mod replication_lag;
 mod replication_races;
 mod rerank;
 mod restart;

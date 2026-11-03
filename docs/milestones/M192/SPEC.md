@@ -22,8 +22,8 @@ through this process's engine for it (`Engine::fold`), then syncs at once. The t
 at the earlier of its sync interval and its fold time, so `idle` never stretches past `L/2`.
 - A replication's **fresh** time is the start of the last source fold that succeeded and was
   followed by a sync that committed it or found it current. A write acknowledged before that
-  instant is on the replica. **Lag** = now − fresh; before any, now − when this worker took
-  the tenant.
+  instant is on the replica. **Lag** = now − fresh; before any, now − when this worker first
+  saw the replication.
 - **Exceeded** when lag > `L`, judged at each sync of the tenant. A failed source fold is that
   replication's `last_error` (`source fold: …`); fresh does not move.
 - A source in a **remote store** is not bounded: its credentials are read-only, so the worker
@@ -31,7 +31,8 @@ at the earlier of its sync interval and its fold time, so `idle` never stretches
 
 **Notes.** `REPLSTATUS`'s note gains `fresh_ms`, `max_lag_ms` and `lag_exceeded`, all
 optional, so either version reads the other's. Written as before (changed, and at most once
-per `ttl/3`), except a change of `lag_exceeded` is written at once.
+per `ttl/3`), except a change of `lag_exceeded`, or a replication's first `fresh_ms`, is
+written at once.
 
 **Status.** `GET …/replication` adds `max_lag_ms`, `fresh_ms`, `lag_ms` (this server's clock
 minus `fresh_ms`) and `lag_exceeded`, from the note. ⚠️ `fresh_ms` may be up to `ttl/3` older
@@ -85,9 +86,9 @@ folds of the source by its own writers. No LIST, no lock across processes: a fol
 | 2 | `replication_lag::an_idle_source_stays_bounded` | `due` ignoring the fold time; cadence `L` doubled |
 | 3 | `replication_lag::status_reports_the_lag`, `a_remote_source_is_not_bounded` | fresh taken at the sync's end; `lag_ms` sign; remote folded |
 | 4 | `replication_lag::a_failing_source_fold_is_exceeded_and_recovers` | exceeded never set or never cleared; `>` as `>=` around `L`; counter per tick |
-| 5 | `replication_lag::sync_now_*` | no fold; `fresh_ms` without commit or current; paused not refused; authority unchecked |
+| 5 | `replication_lag::sync_now_*`, `auth_sources::a_sync_now_needs_the_sources_authority` | no fold; `fresh_ms` without commit or current; paused not refused; authority unchecked |
 | 6 | `engine` `replicate::a_second_sync_waits_for_the_first` | gate dropped |
-| 7 | `server` lib `replication_max_lag_is_validated` | bound below 2 accepted |
+| 7 | `replication_lag::replication_max_lag_is_validated` | bound below 2 accepted |
 
 ## RA budget
 

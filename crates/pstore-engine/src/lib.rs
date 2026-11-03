@@ -2354,6 +2354,9 @@ pub struct Engine<S> {
     /// M129: an applied request folds, and reads outcome objects, only through this, so
     /// concurrent ones share a fold and its reads.
     fold_gate: tokio::sync::Mutex<()>,
+    /// M192: one replication sync at a time on this engine. Two derive the same copy keys
+    /// (same lane, same epoch), and one burying a key the other commits lets a GC reap it.
+    pub(crate) sync_gate: tokio::sync::Mutex<()>,
     /// M129: one HEAD read refreshes a stale mark for every request waiting on it.
     mark_gate: tokio::sync::Mutex<()>,
     /// M129: the highest-epoch HEAD this engine has read or committed.
@@ -2515,6 +2518,7 @@ impl<S: BlobStore> Engine<S> {
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fold_gate: tokio::sync::Mutex::new(()),
+            sync_gate: tokio::sync::Mutex::new(()),
             mark_gate: tokio::sync::Mutex::new(()),
             observed: Mutex::new(Observed::default()),
             outcome_cache: Mutex::new(BTreeMap::new()),
