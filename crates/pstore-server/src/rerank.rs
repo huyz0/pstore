@@ -142,6 +142,7 @@ pub(crate) fn fuse_outer(lists: Vec<Vec<ResultRow>>, outer: &Outer) -> Vec<Resul
                             highlight: None,
                             highlights: None,
                             vector: None,
+                            vectors: None,
                         },
                     ));
                 }
@@ -190,6 +191,7 @@ mod tests {
             highlight: Some("h".to_owned()),
             highlights: None,
             vector: None,
+            vectors: None,
         }
     }
 

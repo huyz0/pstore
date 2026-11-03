@@ -186,6 +186,10 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
         staleness: std::time::Duration::ZERO,
         fts: pstore_format::text::FullText::default(),
         vectors: vec![Some(vec![1.0]), Some(vec![2.0]), Some(vec![3.0])],
+        // M190: the named fields pair the same way.
+        fields: (1..=3)
+            .map(|i| BTreeMap::from([("t".to_owned(), vec![vec![i as f32 * 10.0]])]))
+            .collect(),
     };
     let got = e.resolve_rows_with_vectors(&answer);
     let pairs: Vec<(String, Option<Vec<f32>>)> = got
@@ -197,6 +201,18 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
         [
             ("a".to_owned(), Some(vec![1.0])),
             ("c".to_owned(), Some(vec![3.0]))
+        ]
+    );
+    let fields: Vec<(String, Vec<Vec<f32>>)> = e
+        .resolve_rows_projected(&answer)
+        .into_iter()
+        .map(|((id, ..), p)| (id, p.fields["t"].clone()))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            ("a".to_owned(), vec![vec![10.0]]),
+            ("c".to_owned(), vec![vec![30.0]])
         ]
     );
 }

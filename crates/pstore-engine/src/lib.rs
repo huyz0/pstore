@@ -362,6 +362,10 @@ pub enum EngineError {
     /// A request the engine will not carry out, and why (M16): a client's error.
     #[error("{0}")]
     Refused(String),
+    /// A projected field the index's data cannot answer in the query's rounds (M190): the
+    /// request is well formed, and naming the field elsewhere would not mend it.
+    #[error("{0}")]
+    Unprojected(String),
     /// A replication rule refused the request (M22), by name, so a server can map each to
     /// its status.
     #[error("{0}")]
@@ -2059,6 +2063,21 @@ pub struct Answer {
     /// no readable `vector`. **Empty** for every query that did not ask for them, which is
     /// every query but [`Engine::query_split_vectors`].
     pub vectors: Vec<Option<Vec<f32>>>,
+    /// Each hit's projected named fields (M190), in client space, by name: one entry a hit,
+    /// holding only the fields its row has. **Empty** for every query that names none.
+    pub fields: Vec<Fields>,
+}
+
+/// A row's named dense fields, each its vectors in the order written (M190).
+pub type Fields = BTreeMap<String, Vec<Vec<f32>>>;
+
+/// A resolved row's projected vectors (M179, M190): its `vector`, and its named fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Projected {
+    /// Its `vector` in client space, or `None`.
+    pub vector: Option<Vec<f32>>,
+    /// Its named fields in client space; empty when it holds none of those asked.
+    pub fields: Fields,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -2305,6 +2324,9 @@ pub struct Engine<S> {
     lane_recheck: Option<std::time::Duration>,
     /// The most rows one by-filter operation may admit (M136): `filter_rows::FILTER_ROWS`.
     filter_rows: usize,
+    /// The most bytes one query's varying fields' vectors may read (M191), unbounded unless
+    /// the server sets it.
+    projection_bytes: u64,
     /// How many whole rows the last fold's scans kept for deferred operations (M136), for a
     /// test to read.
     kept: std::sync::atomic::AtomicUsize,
@@ -2484,6 +2506,7 @@ impl<S: BlobStore> Engine<S> {
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             lane_recheck: None,
             filter_rows: filter_rows::FILTER_ROWS,
+            projection_bytes: u64::MAX,
             kept: std::sync::atomic::AtomicUsize::new(0),
             lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
@@ -2558,6 +2581,14 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn with_filter_rows(mut self, rows: usize) -> Self {
         self.filter_rows = rows;
+        self
+    }
+
+    /// The most bytes a projection of fields folded at a varying count of vectors a row may
+    /// read in one query (M191); above it the query is refused before any vector is read.
+    #[must_use]
+    pub fn with_projection_bytes(mut self, bytes: u64) -> Self {
+        self.projection_bytes = bytes;
         self
     }
 
@@ -4504,6 +4535,16 @@ impl<S: BlobStore> Engine<S> {
     /// survived resolving, so a hit whose row vanished cannot misalign the rest.
     #[must_use]
     pub fn resolve_rows_with_vectors(&self, answer: &Answer) -> Vec<(Resolved, Option<Vec<f32>>)> {
+        self.resolve_rows_projected(answer)
+            .into_iter()
+            .map(|(row, p)| (row, p.vector))
+            .collect()
+    }
+
+    /// [`Self::resolve_rows_with_vectors`], each row beside its named fields too (M190), from
+    /// [`Answer::fields`].
+    #[must_use]
+    pub fn resolve_rows_projected(&self, answer: &Answer) -> Vec<(Resolved, Projected)> {
         answer
             .hits
             .iter()
@@ -4524,7 +4565,8 @@ impl<S: BlobStore> Engine<S> {
                 };
                 let dist = answer.dists.get(i).copied().flatten();
                 let vector = answer.vectors.get(i).cloned().flatten();
-                row.map(|(id, attrs)| ((id, h.score, attrs, dist), vector))
+                let fields = answer.fields.get(i).cloned().unwrap_or_default();
+                row.map(|(id, attrs)| ((id, h.score, attrs, dist), Projected { vector, fields }))
             })
             .collect()
     }
@@ -7429,7 +7471,7 @@ impl<S: BlobStore> Engine<S> {
             top_k,
             consistency,
             peers,
-            false,
+            pstore_query::Projection::default(),
         )
         .await
     }
@@ -7454,7 +7496,7 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         peers: Option<&dyn Peers>,
     ) -> Result<Answer, EngineError> {
-        self.query_split_inner(
+        self.query_split_projected(
             index,
             prefetch,
             filter,
@@ -7463,6 +7505,48 @@ impl<S: BlobStore> Engine<S> {
             consistency,
             peers,
             true,
+            &[],
+        )
+        .await
+    }
+
+    /// [`Self::query_split_as`], and each hit's `vector` when `vector` asks (M64) and its
+    /// `named` dense fields in [`Answer::fields`] (M190), all read in the same fetch as its
+    /// row; an unfolded hit's named fields from memory.
+    ///
+    /// # Errors
+    /// As [`Self::query_split_as`], and [`EngineError::Unprojected`] when the hits' fields
+    /// folded at a varying count of vectors a row hold more than the projection bound (M191).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, where to split it, and what it projects"
+    )]
+    pub async fn query_split_projected(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        peers: Option<&dyn Peers>,
+        vector: bool,
+        named: &[String],
+    ) -> Result<Answer, EngineError> {
+        self.query_split_inner(
+            index,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+            consistency,
+            peers,
+            pstore_query::Projection {
+                vector,
+                named,
+                folded: 0,
+                max_bytes: self.projection_bytes,
+            },
         )
         .await
     }
@@ -7480,7 +7564,7 @@ impl<S: BlobStore> Engine<S> {
         top_k: usize,
         consistency: Consistency,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         // ⚠️ A read served from the `bounded` cache that fails is retried once from a fresh
         // HEAD (M11.2): `gc` may have reaped a segment the cached HEAD still names.
@@ -7536,7 +7620,7 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
@@ -7638,7 +7722,7 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
@@ -7727,6 +7811,7 @@ impl<S: BlobStore> Engine<S> {
                 staleness: std::time::Duration::ZERO,
                 fts,
                 vectors: Vec::new(),
+                fields: Vec::new(),
             });
         }
 
@@ -7758,12 +7843,21 @@ impl<S: BlobStore> Engine<S> {
             }
             _ => Vec::new(),
         };
+        // M190: the unfolded rows' named fields are in memory, and their fresh segment folds
+        // a field of several vectors a row at a varying count: nothing is read for them.
+        let projection = pstore_query::Projection {
+            folded: unfolded_at,
+            ..vectors
+        };
         let resolved = pstore_query::query_rows_split_texts(
-            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere, vectors,
+            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere,
+            projection,
         )
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;
-        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, vectors);
+        let fields = projected_fields(&resolved, &unfolded, unfolded_at, metric, vectors.named);
+        let (hits, ids, attributes, dists, vectors) =
+            split_rows(resolved, metric, q2, vectors.vector);
         Ok(Answer {
             hits,
             ids,
@@ -7778,6 +7872,7 @@ impl<S: BlobStore> Engine<S> {
             staleness: std::time::Duration::ZERO,
             fts,
             vectors,
+            fields,
         })
     }
 
@@ -8095,6 +8190,7 @@ impl<S: BlobStore> Engine<S> {
                 staleness: std::time::Duration::ZERO,
                 fts: schema.fts,
                 vectors: Vec::new(),
+                fields: Vec::new(),
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -8121,7 +8217,7 @@ impl<S: BlobStore> Engine<S> {
             fusion,
             top_k,
             Vec::new(),
-            vectors,
+            pstore_query::Projection::vector(vectors),
         )
         .await
         .map_err(|e| query_error(metric, &prefetch, e))?;
@@ -8141,6 +8237,7 @@ impl<S: BlobStore> Engine<S> {
             staleness: std::time::Duration::ZERO,
             fts: schema.fts,
             vectors,
+            fields: Vec::new(),
         })
     }
 
@@ -8195,8 +8292,17 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
-        self.ordered_at(index, by, filter, offset, limit, as_of, consistency, false)
-            .await
+        self.ordered_at(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            as_of,
+            consistency,
+            pstore_query::Projection::default(),
+        )
+        .await
     }
 
     /// [`Self::ordered_as`] at the latest epoch, each row carrying its `vector` in client space
@@ -8214,8 +8320,49 @@ impl<S: BlobStore> Engine<S> {
         limit: usize,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
-        self.ordered_at(index, by, filter, offset, limit, None, consistency, true)
+        self.ordered_projected(index, by, filter, offset, limit, consistency, true, &[])
             .await
+    }
+
+    /// [`Self::ordered_vectors`], each row carrying its `vector` when `vector` asks and its
+    /// `named` dense fields (M190), all in client space, read in the same one round more; an
+    /// unfolded row's from memory.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_vectors`], and [`EngineError::Unprojected`] when the page rows'
+    /// fields folded at a varying count of vectors a row hold more than the projection bound.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, and what it projects"
+    )]
+    pub async fn ordered_projected(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        consistency: Consistency,
+        vector: bool,
+        named: &[String],
+    ) -> Result<Ordered, EngineError> {
+        let projection = pstore_query::Projection {
+            vector,
+            named,
+            folded: 0,
+            max_bytes: self.projection_bytes,
+        };
+        self.ordered_at(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            None,
+            consistency,
+            projection,
+        )
+        .await
     }
 
     #[allow(
@@ -8231,7 +8378,7 @@ impl<S: BlobStore> Engine<S> {
         limit: usize,
         as_of: Option<Epoch>,
         consistency: Consistency,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Ordered, EngineError> {
         // A past epoch is what it is (M9i.2): a strong read of one would check nothing.
         if as_of.is_some() && consistency == Consistency::Strong {
@@ -8290,7 +8437,7 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
         allow_hit: bool,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
         let Scope {
@@ -8334,6 +8481,7 @@ impl<S: BlobStore> Engine<S> {
                 // filter admits, the rows being shared with the fresh cache (M122).
                 // M179: its stored `vector` when asked, as the folded rows' are read below.
                 let vector = vectors
+                    .vector
                     .then(|| d.vectors.get(pstore_format::DEFAULT_FIELD))
                     .flatten()
                     .and_then(|f| match f.as_dense() {
@@ -8341,9 +8489,16 @@ impl<S: BlobStore> Engine<S> {
                         _ => None,
                     })
                     .filter(|v| !v.is_empty());
+                // M190: and its named fields, from memory.
+                let mut held = with_vector(vector);
+                held.extend(
+                    fields_of(d, metric, vectors.named)
+                        .into_iter()
+                        .map(|(name, vs)| (name.into(), pstore_format::VectorField::Dense(vs))),
+                );
                 selector.offer(Document {
                     id: d.id.clone(),
-                    vectors: with_vector(vector),
+                    vectors: held,
                     attrs: d.attrs.clone(),
                 });
             }
@@ -8356,21 +8511,33 @@ impl<S: BlobStore> Engine<S> {
             .collect();
         // M179: the page's folded rows' vectors, one fan-out over the segments selection
         // opened -- the order's fourth round, and only when asked.
-        let mut read = if vectors {
+        // M190: and their named fields, in the same fan-out.
+        let mut read = if vectors.vector || !vectors.named.is_empty() {
             let wanted: Vec<pstore_query::Located> =
                 page.iter().filter_map(|(_, at)| *at).collect();
-            pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted)
+            pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted, vectors)
                 .await
-                .map_err(|e| EngineError::Query(e.to_string()))?
+                .map_err(|e| match e {
+                    pstore_query::QueryError::ProjectionTooLarge { .. } => {
+                        EngineError::Unprojected(e.to_string())
+                    }
+                    e => EngineError::Query(e.to_string()),
+                })?
         } else {
             BTreeMap::new()
         };
         let rows: Vec<Document> = page
             .into_iter()
             .map(|(mut d, at)| {
-                if let Some(v) = at.and_then(|at| read.remove(&at)) {
-                    d.vectors =
-                        with_vector(Some(client_space(metric, &v)).filter(|v| !v.is_empty()));
+                if let Some(fields) = at.and_then(|at| read.remove(&at)) {
+                    // Every vector read is one a write measured, so none is empty.
+                    d.vectors = fields
+                        .into_iter()
+                        .map(|(name, vs)| {
+                            let vs = vs.iter().map(|v| client_space(metric, v)).collect();
+                            (name.into(), pstore_format::VectorField::Dense(vs))
+                        })
+                        .collect();
                 }
                 d
             })
@@ -9037,6 +9204,46 @@ fn with_vector(
         .collect()
 }
 
+/// Each resolved hit's `named` fields in client space (M190), empty when none is named: an
+/// unfolded hit's from its row in memory, any other's from the row fetch.
+fn projected_fields(
+    resolved: &[(pstore_query::Hit, Option<Document>, Option<f32>)],
+    unfolded: &[Document],
+    unfolded_at: usize,
+    metric: Metric,
+    named: &[String],
+) -> Vec<Fields> {
+    if named.is_empty() {
+        return Vec::new();
+    }
+    resolved
+        .iter()
+        .map(|(h, d, _)| {
+            let row = if h.segment == unfolded_at {
+                unfolded.get(h.row)
+            } else {
+                d.as_ref()
+            };
+            row.map(|d| fields_of(d, metric, named)).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// `d`'s dense fields among `named`, each vector in client space (M190). A field it lacks has
+/// no entry; a write admits none of no vectors (M61).
+fn fields_of(d: &Document, metric: Metric, named: &[String]) -> Fields {
+    named
+        .iter()
+        .filter_map(|name| {
+            let vs = d.vectors.get(name.as_str())?.as_dense();
+            Some((
+                name.clone(),
+                vs.iter().map(|v| client_space(metric, v)).collect(),
+            ))
+        })
+        .collect()
+}
+
 /// A resolved ranking, as `Answer`'s parallel columns: hits, ids, attributes, `$dist`, and --
 /// when `vectors` asks (M64) -- each hit's vector in client space, else none at all.
 #[expect(
@@ -9223,6 +9430,10 @@ fn query_error(
         // M155: the query layer names the text field itself.
         (pstore_query::QueryError::UnknownTextField(field), _) => {
             EngineError::UnknownTextField(field)
+        }
+        // M191: and a projection past its bound.
+        (e @ pstore_query::QueryError::ProjectionTooLarge { .. }, _) => {
+            EngineError::Unprojected(e.to_string())
         }
         (
             pstore_query::QueryError::Format(pstore_format::FormatError::UnknownField),
