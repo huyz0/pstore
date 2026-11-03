@@ -2580,6 +2580,98 @@ async fn a_refused_rebuild_fails_typed() {
     assert_eq!(s.state().await, Some(CopyState::Succeeded));
 }
 
+/// M168: a reindex remaps when an object its HEAD names is gone -- a recorded sparse
+/// dictionary included -- and gives up after `MAX_STALLS` remaps that rebuilt nothing.
+#[tokio::test]
+async fn a_reindex_remaps_what_the_source_moved() {
+    // A recorded sparse dictionary answering 404 once is a remap, not a rebuild without it.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let key = s.src.head_for_test().await.indexes["src"][0].key.clone();
+    let dict = pstore_format::sparse::dict_key(&Key::new(key));
+    s.here
+        .hooked
+        .missing
+        .lock()
+        .unwrap()
+        .insert(dict.as_str().to_owned(), 1);
+    s.reindex(stemmed()).await;
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    assert_eq!(s.here.hooked.missing.lock().unwrap()[dict.as_str()], 0);
+    assert_eq!(digest(&s.src, "src").await, digest(&s.dst, "dst").await);
+    // The rows, the dense, the filtered, then the sparse answer.
+    let sparse = |a: Option<String>| a.unwrap().lines().nth(3).unwrap().to_owned();
+    assert_eq!(
+        sparse(answers(&s.src, "src").await),
+        sparse(answers(&s.dst, "dst").await)
+    );
+
+    // A segment that is always gone: the reindex fails after its stalls, rather than
+    // remapping forever (which never yields, so it shows as the test's timeout).
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let key = s.src.head_for_test().await.indexes["src"][0].key.clone();
+    s.here
+        .hooked
+        .missing
+        .lock()
+        .unwrap()
+        .insert(key.clone(), u32::MAX);
+    s.reindex(stemmed()).await;
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    let why = out.failed.get("dst").expect("no failure reported");
+    assert!(why.contains("kept changing"), "{why}");
+    assert_eq!(s.state().await, Some(CopyState::Running));
+
+    // A ref from before M32 records no dictionaries, and a source from before the primary
+    // was recorded names none: the missing sidecar is not a move, and the primary is the
+    // one the segment indexed.
+    let s = setup(Kind::CrossTenant);
+    let docs: Vec<Document> = (0..20)
+        .map(|i| {
+            let mut d = doc(&format!("d{i:04}"), i as f32);
+            d.vectors.remove("s");
+            d.attrs
+                .insert("tag".to_owned(), Value::Str(format!("t-{i}")));
+            d
+        })
+        .collect();
+    s.src.write("src", docs).await.unwrap();
+    fold(&s.src).await;
+    s.src
+        .commit_head_for_test(|h| {
+            for r in h.indexes.values_mut().flatten() {
+                r.dicts = None;
+            }
+            if let Some(schema) = h.schemas.get_mut("src") {
+                schema.text_field = String::new();
+            }
+        })
+        .await
+        .unwrap();
+    let key = s.src.head_for_test().await.indexes["src"][0].key.clone();
+    let dict = pstore_format::sparse::dict_key(&Key::new(key));
+    assert!(
+        s.here.hooked.inner.head(&dict).await.is_err(),
+        "a sparse sidecar"
+    );
+    let fox = text_ids(&s.src, "src", "text", "fox").await;
+    assert_eq!(fox.len(), 20);
+    s.reindex(Reindex {
+        trigram: vec!["tag".to_owned()],
+        ..Reindex::default()
+    })
+    .await;
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.committed, vec!["dst".to_owned()], "{out:?}");
+    assert_eq!(text_ids(&s.dst, "dst", "text", "fox").await, fox);
+    assert_eq!(digest(&s.src, "src").await, digest(&s.dst, "dst").await);
+}
+
 /// M168 criterion 7: a repeated reindex matches only its own options.
 #[tokio::test]
 async fn a_repeated_reindex_matches_only_its_schema() {
