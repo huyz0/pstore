@@ -67,7 +67,7 @@ row is therefore not a claim that an existing turbopuffer SDK works against psto
 | Affected counts | Actual affected counts and optional affected IDs | Submitted upsert/patch/delete counts, not actual applied counts; filter effects not represented by those counts | Clients cannot infer which conditional actions succeeded from current counters |
 | Invalid schema writes | Typed schema and write validation | Some conflicts across folds/writers are acknowledged then rejected/quarantined at fold | Durable bytes do not imply that every submitted row became searchable |
 | Multi-query | Documented atomic shared snapshot | One snapshot for legs at one level ([M131](../milestones/M131/VERIFIED.md)), aggregations and facets included ([M164](../milestones/M164/VERIFIED.md)); mixed levels or `as_of` run apart | Count and hits differ only across sub-queries at mixed levels |
-| Copy | Physical isolation, cross-region/org source configuration, optional new encryption | `copy_from_namespace` is a branch alias sharing immutable objects | Do not sell it as an isolated backup or encryption boundary |
+| Copy | Physical isolation, cross-region/org source configuration, optional new encryption | `copy_from_namespace` is a branch alias sharing immutable objects; `POST /v1/indexes/{dest}/copy` is a physical, isolated copy from any tenant or store ([M166](../milestones/M166/VERIFIED.md)) | The branch is not a backup; the copy is not an encryption boundary (I) |
 | Tenant identity | Bearer API key; service resolves authorization | Caller supplies `X-Pstore-Tenant`; no native authentication or quota wiring | An untrusted client must not be allowed to select another tenant through a header |
 
 Sources: [guarantees](https://turbopuffer.com/docs/guarantees), pinned OpenAPI;
@@ -95,7 +95,7 @@ write into branch/copy and query into multi-query.
 | `POST /v2/namespaces/{namespace}` | `PUT /v1/indexes/{index}/documents` | Partial write contract; separate field matrix below | B, C, D |
 | `DELETE /v2/namespaces/{namespace}` | `DELETE /v1/indexes/{index}` | Equivalent logical deletion; retention/GC and response differ | B, G |
 | `POST /v2/namespaces/{namespace}/query` | `POST /v1/indexes/{index}/query` | Partial query contract; separate expression matrix below | B, E, F |
-| `POST /v2/namespaces/{namespace}/async` | Replication jobs only | Missing one-shot async copy; replication is a different lifecycle | H |
+| `POST /v2/namespaces/{namespace}/async` | `POST`/`GET /v1/indexes/{dest}/copy` ([M166](../milestones/M166/VERIFIED.md)) | Partial: a one-shot copy with a token and machine state; no other operation kinds | H |
 | `GET /v1/namespaces/{namespace}/operations/{token}` | Replication status only | Missing generic token-based copy operation polling | H |
 | `POST /v2/namespaces/{namespace}/explain_query` | `"explain": true` on `POST /v1/indexes/{index}/query` ([M165](../milestones/M165/VERIFIED.md)) | The plan the query ran, as structured counts in `meta.explain` beside its results, not a separate route or `plan_text`; ranked queries only | H |
 
@@ -126,7 +126,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | `distance_metric` | Dot product default, cosine distance, squared Euclidean | Partial contract: vendor enum is cosine/squared Euclidean; no implicit metric equivalence; B/D |
 | `schema` | Request-scoped datetime conversion; index FTS/regex declarations | Partial typed schema; D/E |
 | `branch_from_namespace` | Same-tenant source string, alone in request, folded state | Partial source/visibility/inheritance contract; G |
-| `copy_from_namespace` | Same branch operation | Missing isolated copy; H |
+| `copy_from_namespace` | Same branch operation; the isolated copy is `POST /v1/indexes/{dest}/copy` ([M166](../milestones/M166/VERIFIED.md)) | Partial: no encryption on copy (I) |
 | `delete_by_filter` | Deferred predicate; executed after other operations | Partial with different ordering/completion; C |
 | `delete_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
 | `patch_by_filter` | `{filters, attributes}` instead of `{filters, patch}` | Partial, after explicit deletes, before filter delete; C |
@@ -287,7 +287,7 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `epoch`, `cost` |
 | Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | The same four, plus `num`, `epoch` and `cost` ([M162](../milestones/M162/VERIFIED.md)) |
 | Explain `plan_text` | `meta.explain`: structured per-leg mode, segments, probes and row counts, no text ([M165](../milestones/M165/VERIFIED.md)) |
-| Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Missing general copy job contract |
+| Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Partial: a copy's `run`, `state`, finishing `epoch` and typed `code` ([M166](../milestones/M166/VERIFIED.md)); no wall-clock times or progress |
 | Operation `result.success` (WriteResult) or `result.error.{status_code,detail}` | Replication status has different fields and lifecycle |
 
 Native cost fields are `blob_reads`, `blob_writes`, `blob_lists`, `bytes_read`, and

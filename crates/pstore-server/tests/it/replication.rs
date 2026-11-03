@@ -1329,3 +1329,269 @@ async fn a_replica_has_no_recall() {
     assert_eq!(s, StatusCode::CONFLICT, "{b}");
     assert_eq!(b["error"]["code"], "replica_no_history", "{b}");
 }
+
+// M166: an isolated copy, as an operation with a status.
+
+async fn copy(api: &A, dest: &str, source: Value) -> (StatusCode, Value) {
+    send(
+        api,
+        DST,
+        "POST",
+        &format!("/v1/indexes/{dest}/copy"),
+        &json!({ "source": source }),
+    )
+    .await
+}
+
+async fn copy_status(api: &A, dest: &str) -> (StatusCode, Value) {
+    send(
+        api,
+        DST,
+        "GET",
+        &format!("/v1/indexes/{dest}/copy"),
+        &Value::Null,
+    )
+    .await
+}
+
+/// A dense top-k, a filtered one and an id lookup: what a copy must answer as its source did.
+async fn answers(api: &A, tenant: u64, index: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for body in [
+        json!({"vector": [0.5, 1.0], "top_k": 5}),
+        json!({"vector": [0.5, 1.0], "top_k": 5, "filters": ["n", "Gt", 10]}),
+        json!({"rank_by": ["id", "asc"], "filters": ["id", "Eq", "d0003"], "include_attributes": ["n"]}),
+    ] {
+        let (s, b) = send(
+            api,
+            tenant,
+            "POST",
+            &format!("/v1/indexes/{index}/query"),
+            &body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        out.push(b["results"].clone());
+    }
+    out
+}
+
+/// Every object under `index`'s segment prefix in `tenant`.
+async fn segment_objects(store: &Accounted<MemoryStore>, tenant: u64, index: &str) -> usize {
+    let t = u128::from(tenant);
+    let prefix = format!("{:04x}/tnt/{t}/idx/{index}/seg/", t as u16);
+    store
+        .as_tenant(TenantId(0))
+        .list_unrestricted(&pstore_blob::Key::new(prefix))
+        .await
+        .unwrap()
+        .len()
+}
+
+/// M166 criterion 1: a copy from another tenant and from another store succeeds after one
+/// sync, answers as its source, keeps answering once the source is dropped and reaped and
+/// the store forgotten, and takes writes after.
+#[tokio::test(start_paused = true)]
+async fn a_copy_succeeds_and_is_independent() {
+    for remote in [false, true] {
+        let world = World::new();
+        let api = world.api(1);
+        let far = world.far_api();
+        let (src_api, src_store, source) = if remote {
+            (
+                &far,
+                &world.far,
+                json!({"index": "src", "tenant": SRC.to_string(), "store": "far"}),
+            )
+        } else {
+            (
+                &api,
+                &world.acct,
+                json!({"index": "src", "tenant": SRC.to_string()}),
+            )
+        };
+        write(src_api, SRC, "src", 0..20).await;
+        write(src_api, SRC, "src", 20..40).await;
+        let (s, b) = send(
+            src_api,
+            SRC,
+            "PUT",
+            "/v1/indexes/src/documents",
+            &json!({"durability": "durable", "deletes": ["d0007"]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        send(src_api, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+        let want = answers(src_api, SRC, "src").await;
+        let (s, started) = copy(&api, "dst", source.clone()).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+        assert_eq!(started["state"], "running");
+        let mut workers = vec![(Arc::clone(&api), Worker::default())];
+        run(&mut workers, 1, Duration::from_secs(1)).await;
+        let (s, done) = copy_status(&api, "dst").await;
+        assert_eq!(s, StatusCode::OK, "{done}");
+        assert_eq!(done["state"], "succeeded", "{remote}: {done}");
+        assert_eq!(done["run"], started["run"]);
+        assert_eq!(done["code"], Value::Null);
+        assert_eq!(done["last_error"], Value::Null);
+        assert!(done["source_epoch"].as_u64().is_some());
+        assert_eq!(answers(&api, DST, "dst").await, want, "{remote}");
+        // The source dropped and reaped until its segments are gone, and its store forgotten.
+        let (s, b) = send(src_api, SRC, "DELETE", "/v1/indexes/src", &Value::Null).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        for _ in 0..3 {
+            send(
+                src_api,
+                SRC,
+                "POST",
+                "/v1/admin/gc?retention=0",
+                &Value::Null,
+            )
+            .await;
+        }
+        assert_eq!(segment_objects(src_store, SRC, "src").await, 0, "{remote}");
+        // A process with no source store at all answers the copy, and writes it.
+        let bare = Api::unsecured(world.acct.clone(), LaneId(2)).unwrap();
+        bare.configure_replication(policy(), BTreeMap::new());
+        assert_eq!(answers(&bare, DST, "dst").await, want, "{remote}");
+        write(&bare, DST, "dst", 100..101).await;
+        assert!(
+            rows(&bare, DST, "dst")
+                .await
+                .unwrap()
+                .contains(&"d0100".to_owned())
+        );
+    }
+}
+
+/// M166 criterion 3 (server): a store the worker lacks keeps the copy running, with the
+/// worker's note as `last_error`, never as a state.
+#[tokio::test(start_paused = true)]
+async fn a_copy_that_cannot_read_its_store_runs_and_says_why() {
+    let world = World::new();
+    let far = world.far_api();
+    write(&far, SRC, "src", 0..5).await;
+    let api = world.api(1);
+    let (s, b) = copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string(), "store": "far"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+    // Worked by a process without "far".
+    let bare = Api::unsecured(world.acct.clone(), LaneId(2)).unwrap();
+    bare.configure_replication(policy(), BTreeMap::new());
+    let mut workers = vec![(Arc::clone(&bare), Worker::default())];
+    let ticks = usize::try_from((policy().ttl / 3).as_secs()).unwrap() + 2;
+    run(&mut workers, ticks, Duration::from_secs(1)).await;
+    let (s, b) = copy_status(&api, "dst").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["state"], "running");
+    assert!(b["last_error"].as_str().is_some(), "{b}");
+    assert_eq!(copy_status(&api, "nothing").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        copy_status(&api, "nothing").await.1["error"]["code"],
+        "copy_not_found"
+    );
+}
+
+/// M166 criterion 5 (server): a repeated POST answers the copy it started.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_post_returns_the_same_operation() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    write(&api, SRC, "other", 0..5).await;
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let (s, first) = copy(&api, "dst", source.clone()).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{first}");
+    let (s, again) = copy(&api, "dst", source.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again, first);
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    send(&api, SRC, "DELETE", "/v1/indexes/src", &Value::Null).await;
+    let (s, done) = copy(&api, "dst", source).await;
+    assert_eq!(s, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "succeeded");
+    assert_eq!(done["run"], first["run"]);
+    let (s, b) = copy(
+        &api,
+        "dst",
+        json!({"index": "other", "tenant": SRC.to_string()}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+}
+
+/// M166 criterion 7 (server): a finished copy releases its tenant, register entry included.
+#[tokio::test(start_paused = true)]
+async fn a_finished_copy_releases_the_tenant() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    write(&api, SRC, "other", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    // Beside a replication that keeps running: the entry's `gen` follows the copy's end.
+    create(
+        &api,
+        DST,
+        "follower",
+        json!({"index": "other", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let before = api.replication_entry_for_test(D).await.unwrap().0;
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    assert_eq!(copy_status(&api, "dst").await.1["state"], "succeeded");
+    let after = api.replication_entry_for_test(D).await.unwrap().0;
+    assert_ne!(after, before, "the entry still counts the finished copy");
+    // A status call repairs a stale entry: none was left to repair.
+    status(&api, DST, "follower").await;
+    assert_eq!(api.replication_entry_for_test(D).await.unwrap().0, after);
+    // And alone: the tenant is let go.
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 3, Duration::from_secs(1)).await;
+    assert_eq!(copy_status(&api, "dst").await.1["state"], "succeeded");
+    assert!(api.replication_entry_for_test(D).await.is_none());
+    assert_eq!(api.replication_tick(&mut workers[0].1).await.held, 0);
+}
+
+/// M166 criterion 10: a status is one round of two reads: HEAD and the notes.
+#[tokio::test(start_paused = true)]
+async fn a_copy_status_costs_two_reads() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    for _ in 0..2 {
+        let before = world.acct.count(D, OpClass::Read);
+        let before_list = world.acct.count(D, OpClass::List);
+        let (s, b) = copy_status(&api, "dst").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(world.acct.count(D, OpClass::Read) - before, 2);
+        assert_eq!(world.acct.count(D, OpClass::List), before_list);
+        let mut workers = vec![(Arc::clone(&api), Worker::default())];
+        run(&mut workers, 1, Duration::from_secs(1)).await;
+    }
+}

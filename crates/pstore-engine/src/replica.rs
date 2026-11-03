@@ -2,7 +2,10 @@
 //! tenant, or another store -- by pulling the source's folded state and committing it to its
 //! own HEAD. See `docs/milestones/M22/SPEC.md`.
 
-use crate::head::{self, Head, HeadAt, IndexSchema, ReplicaSource, Replication, fnv1a};
+use crate::head::{
+    self, CopyEnd, CopyFailure, CopyOutcome, Head, HeadAt, IndexSchema, ReplicaSource, Replication,
+    fnv1a,
+};
 use crate::{
     Engine, EngineError, MAX_COMMIT_ATTEMPTS, SegmentRef, backoff, is_rowless, nonce_for,
     require_fencing,
@@ -63,6 +66,38 @@ pub enum ReplicaRefusal {
     Invalid(String),
 }
 
+/// Where a copy is (M166): the only field a client branches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyState {
+    /// Its replication runs: no sync has committed it yet.
+    Running,
+    /// Its replication is paused.
+    Paused,
+    /// The destination holds the source's folded state.
+    Succeeded,
+    /// It ended without copying: [`CopyStatus::failure`] says why.
+    Failed,
+    /// Cancelled before it finished.
+    Cancelled,
+}
+
+/// A copy's status (M166), from one HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyStatus {
+    /// Where it is.
+    pub state: CopyState,
+    /// The epoch that created (or last resumed) it: the operation's token.
+    pub run: u64,
+    /// What it copies.
+    pub source: ReplicaSource,
+    /// The epoch that ended it, once it has.
+    pub epoch: Option<u64>,
+    /// The source epoch a succeeded copy holds.
+    pub source_epoch: Option<u64>,
+    /// Why a failed copy failed.
+    pub failure: Option<CopyFailure>,
+}
+
 /// The named remote stores a sync may read (M22): the server's configured sources.
 pub trait Sources: Send + Sync {
     /// The store named `name`, or `None` if this process has none by that name.
@@ -75,6 +110,8 @@ pub struct SyncState {
     /// The running replications, as the dest HEAD last said: `None` until read, and after
     /// [`Self::invalidate`].
     plan: Option<BTreeMap<String, Replication>>,
+    /// Which of the plan's replications are copies (M166), read with it.
+    once: BTreeSet<String>,
     /// `(dest, run)` to the source fingerprint it last committed or found current.
     known: BTreeMap<(String, u64), u64>,
 }
@@ -98,6 +135,8 @@ pub struct Synced {
     pub failed: BTreeMap<String, String>,
     /// Nothing changed at any source: the sync read each source's HEAD and stopped.
     pub idle: bool,
+    /// Copies this sync ended, succeeded or failed (M166): replications no longer running.
+    pub finished: Vec<String>,
 }
 
 /// Where a replication's source is read from: this engine's own store, or a remote one.
@@ -253,6 +292,20 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<Epoch, EngineError> {
+        self.create_inner(dest, source, from, false, &mut None)
+            .await
+    }
+
+    /// [`Self::create_replication`], a copy when `once` (M166). A copy that the CAS finds
+    /// already started, as [`same_copy`] decides, is put in `matched` and nothing is written.
+    async fn create_inner<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+        once: bool,
+        matched: &mut Option<CopyStatus>,
+    ) -> Result<Epoch, EngineError> {
         let refuse = |r| Err(EngineError::Replica(r));
         for n in [dest, source.index.as_str()] {
             if !crate::valid_name(n) {
@@ -271,6 +324,10 @@ impl<S: BlobStore> Engine<S> {
             return refuse(ReplicaRefusal::SourceNotFound(source.index));
         }
         self.commit_change(|now, next| {
+            if once && let Some(s) = same_copy(now, dest, &source) {
+                *matched = Some(s);
+                return Ok(None);
+            }
             if now.replications.contains_key(dest) {
                 return Err(EngineError::Replica(ReplicaRefusal::Exists(
                     dest.to_owned(),
@@ -305,9 +362,64 @@ impl<S: BlobStore> Engine<S> {
                     rejected: 0,
                 },
             );
+            // M166: a new operation into `dest` replaces how its last copy ended.
+            next.copies.remove(dest);
+            if once {
+                next.once.insert(dest.to_owned());
+            } else {
+                next.once.remove(dest);
+            }
             Ok(Some(()))
         })
         .await
+    }
+
+    /// Copies `source` into the new index `dest` (M166): a replication that finishes in the
+    /// commit that copies. Answers the copy's status, and whether this call started it: a
+    /// running, paused or succeeded copy of `source` into `dest` is answered as it is,
+    /// matched before `source` is read.
+    ///
+    /// # Errors
+    /// As [`Self::create_replication`].
+    pub async fn create_copy<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+    ) -> Result<(CopyStatus, bool), EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        if let Some(s) = same_copy(&at.head, dest, &source) {
+            return Ok((s, false));
+        }
+        let mut matched = None;
+        let epoch = self
+            .create_inner(dest, source.clone(), from, true, &mut matched)
+            .await?;
+        if let Some(s) = matched {
+            return Ok((s, false));
+        }
+        Ok((
+            CopyStatus {
+                state: CopyState::Running,
+                run: epoch.0,
+                source,
+                epoch: None,
+                source_epoch: None,
+                failure: None,
+            },
+            true,
+        ))
+    }
+
+    /// The copy into `dest`'s status (M166), after one HEAD read: `None` when `dest` has no
+    /// copy running and no outcome.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn copy_status(&self, dest: &str) -> Result<Option<CopyStatus>, EngineError> {
+        let at = head::read(&*self.store, self.tenant).await?;
+        self.remember_schemas(&at.head);
+        Ok(copy_status_in(&at.head, dest))
     }
 
     /// Sets `dest`'s replication running or paused; a change to running is a new run.
@@ -363,6 +475,20 @@ impl<S: BlobStore> Engine<S> {
             }
             next.replications.remove(dest);
             next.branched.insert(dest.to_owned(), next.epoch.0);
+            // M166: a copy cancelled says so.
+            if next.once.remove(dest)
+                && let Some(r) = now.replications.get(dest)
+            {
+                next.record_copy(
+                    dest,
+                    CopyOutcome {
+                        source: r.source.clone(),
+                        run: r.run,
+                        epoch: next.epoch.0,
+                        end: CopyEnd::Cancelled,
+                    },
+                );
+            }
             Ok(Some(()))
         })
         .await
@@ -474,6 +600,7 @@ impl<S: BlobStore> Engine<S> {
                 .collect();
             st.known
                 .retain(|(d, run), _| plan.get(d).is_some_and(|r| r.run == *run));
+            st.once = at.head.once.clone();
             st.plan = Some(plan);
             first = Some(at);
         }
@@ -509,6 +636,8 @@ impl<S: BlobStore> Engine<S> {
             .zip(reads.into_iter().map(|r| r.map(|at| at.head)))
             .collect();
         let mut changed: Vec<(String, Head, u64)> = Vec::new();
+        // M166: copies whose source holds no folded segment, ended rather than retried.
+        let mut gone: Vec<(String, Replication)> = Vec::new();
         for (d, r) in &plan {
             let read = heads
                 .get(&(r.source.store.clone(), r.source.tenant))
@@ -519,6 +648,7 @@ impl<S: BlobStore> Engine<S> {
                     out.failed.insert(d.clone(), e.clone());
                 }
                 Ok(h) => match fingerprint(h, &r.source.index) {
+                    None if st.once.contains(d) => gone.push((d.clone(), r.clone())),
                     None => {
                         out.failed.insert(
                             d.clone(),
@@ -532,7 +662,7 @@ impl<S: BlobStore> Engine<S> {
                 },
             }
         }
-        if changed.is_empty() {
+        if changed.is_empty() && gone.is_empty() {
             out.idle = true;
             return Ok(out);
         }
@@ -631,6 +761,46 @@ impl<S: BlobStore> Engine<S> {
                     self.apply(&mut next, d, m, &mut used);
                 }
             }
+            // M166: a copy ends in the commit that copies it, or, its source holding nothing,
+            // in this one -- only the run the plan was made from, as for a copy above.
+            let mut ended = Vec::new();
+            for (d, run) in &included {
+                if next.once.remove(d.as_str())
+                    && let Some(r) = next.replications.remove(d.as_str())
+                    && let Some(m) = mapped.get(d.as_str())
+                {
+                    let epoch = next.epoch.0;
+                    next.branched.insert(d.clone(), epoch);
+                    let end = CopyEnd::Succeeded {
+                        source_epoch: m.src_epoch,
+                    };
+                    let outcome = CopyOutcome {
+                        source: r.source,
+                        run: *run,
+                        epoch,
+                        end,
+                    };
+                    next.record_copy(d, outcome);
+                    ended.push(d.clone());
+                }
+            }
+            for (d, planned) in &gone {
+                let live =
+                    at.head.replications.get(d.as_str()).filter(|r| {
+                        r.running && r.run == planned.run && r.source == planned.source
+                    });
+                if live.is_some() && next.once.remove(d.as_str()) {
+                    next.replications.remove(d.as_str());
+                    let outcome = CopyOutcome {
+                        source: planned.source.clone(),
+                        run: planned.run,
+                        epoch: next.epoch.0,
+                        end: CopyEnd::Failed(CopyFailure::SourceNotFound),
+                    };
+                    next.record_copy(d, outcome);
+                    ended.push(d.clone());
+                }
+            }
             // M148: each replica this sync writes.
             self.stamp_times(
                 &at.head,
@@ -654,7 +824,7 @@ impl<S: BlobStore> Engine<S> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            if included.is_empty() && unused.is_empty() {
+            if included.is_empty() && unused.is_empty() && ended.is_empty() {
                 return Ok(out);
             }
             for k in &unused {
@@ -678,6 +848,12 @@ impl<S: BlobStore> Engine<S> {
                         }
                         out.committed.push(d);
                     }
+                    // M166: an ended copy no longer runs, so the next sync re-reads the plan
+                    // rather than polling its source.
+                    if !ended.is_empty() {
+                        st.plan = None;
+                    }
+                    out.finished = ended;
                     return Ok(out);
                 }
                 Err(EngineError::Lost | EngineError::Contended)
@@ -987,9 +1163,80 @@ impl<S: BlobStore> Engine<S> {
     }
 }
 
+/// The copy into `dest`'s status in `h` (M166): its running or paused replication, or else
+/// how it ended.
+fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
+    if h.once.contains(dest)
+        && let Some(r) = h.replications.get(dest)
+    {
+        return Some(CopyStatus {
+            state: if r.running {
+                CopyState::Running
+            } else {
+                CopyState::Paused
+            },
+            run: r.run,
+            source: r.source.clone(),
+            epoch: None,
+            source_epoch: None,
+            failure: None,
+        });
+    }
+    let o = h.copies.get(dest)?;
+    let (state, source_epoch, failure) = match o.end {
+        CopyEnd::Succeeded { source_epoch } => (CopyState::Succeeded, Some(source_epoch), None),
+        CopyEnd::Failed(f) => (CopyState::Failed, None, Some(f)),
+        CopyEnd::Cancelled => (CopyState::Cancelled, None, None),
+    };
+    Some(CopyStatus {
+        state,
+        run: o.run,
+        source: o.source.clone(),
+        epoch: Some(o.epoch),
+        source_epoch,
+        failure,
+    })
+}
+
+/// The copy of `source` into `dest` a repeated request started (M166): running, paused,
+/// or succeeded while `dest` is still an index.
+fn same_copy(h: &Head, dest: &str, source: &ReplicaSource) -> Option<CopyStatus> {
+    copy_status_in(h, dest).filter(|s| {
+        &s.source == source
+            && match s.state {
+                CopyState::Running | CopyState::Paused => true,
+                CopyState::Succeeded => h.indexes.contains_key(dest),
+                CopyState::Failed | CopyState::Cancelled => false,
+            }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M166: a succeeded outcome answers a repeated request only while `dest` is an index --
+    /// however the index stopped being one.
+    #[test]
+    fn a_success_is_matched_only_while_its_index_exists() {
+        let source = ReplicaSource::local(TenantId(1), "src");
+        let mut h = Head::default();
+        h.record_copy(
+            "dst",
+            CopyOutcome {
+                source: source.clone(),
+                run: 3,
+                epoch: 4,
+                end: CopyEnd::Succeeded { source_epoch: 2 },
+            },
+        );
+        assert_eq!(same_copy(&h, "dst", &source), None);
+        h.indexes.insert("dst".to_owned(), Vec::new());
+        let got = same_copy(&h, "dst", &source).map(|s| (s.state, s.run, s.epoch));
+        assert_eq!(got, Some((CopyState::Succeeded, 3, Some(4))));
+        let other = ReplicaSource::local(TenantId(1), "other");
+        assert_eq!(same_copy(&h, "dst", &other), None);
+    }
 
     #[test]
     fn a_named_fields_width_is_part_of_the_fingerprint() {

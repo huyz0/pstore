@@ -214,8 +214,9 @@ pub struct WriteRequest {
     /// every segment. **Alone** in its request.
     #[serde(default)]
     pub branch_from_namespace: Option<String>,
-    /// The same operation as `branch_from_namespace` (M16): segments are immutable, so a
-    /// physical copy would buy nothing a branch does not.
+    /// The same operation as `branch_from_namespace` (M16): the new index shares its
+    /// source's segments, in this tenant. Not an isolated copy, which is
+    /// `POST /v1/indexes/{dest}/copy` (M166).
     #[serde(default)]
     pub copy_from_namespace: Option<String>,
     /// An applied write's ask for the ids its operations changed (M130). Refused beside any

@@ -17,12 +17,12 @@ pub use applied::{
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
-    Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource,
-    Replication, SegmentRef, TimeTravel,
+    COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, Dicts, ExternalKind, ExternalRef, Head,
+    HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
-pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
+pub use replica::{CopyState, CopyStatus, ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
@@ -5263,6 +5263,8 @@ impl<S: BlobStore> Engine<S> {
                 next.schemas.insert(dest.to_owned(), schema.clone());
             }
             next.branched.insert(dest.to_owned(), next.epoch.0);
+            // M166: a new operation into `dest` replaces how its last copy ended.
+            next.copies.remove(dest);
             self.stamp_times(&at.head, &mut next, [dest]);
             // A lost attempt's copies were never live: buried under their own epochs, as a
             // compaction buries its losers, so GC reaps them and `as_of` never finds them.
@@ -6182,6 +6184,8 @@ impl<S: BlobStore> Engine<S> {
                     grave.push(head::burial(x, &r.key));
                 }
                 next.schema_rejects.remove(x);
+                // M166: and how a copy into it ended, so a copy there is never the old one.
+                next.copies.remove(x);
                 // M25: its quarantine, which was live, buried at this epoch like its segments.
                 for (key, _) in next.quarantine.remove(x).unwrap_or_default() {
                     grave.push(key);
