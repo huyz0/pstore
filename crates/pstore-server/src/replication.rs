@@ -1356,7 +1356,10 @@ mod tests {
     /// M192: the verdict at the bound and just past it, counted once, and a fold that was not
     /// followed by a current sync moving nothing.
     #[test]
-    #[expect(clippy::indexing_slicing, reason = "a missing note is the test failing")]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a missing note is the test failing"
+    )]
     fn judge_marks_past_the_bound_once_and_only_from_a_current_fold() {
         let t0 = Instant::now();
         let lag = Duration::from_secs(10);
