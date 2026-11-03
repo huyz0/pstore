@@ -732,6 +732,39 @@ impl VecIndex {
         query: &[f32],
         q: Query,
     ) -> Result<Vec<(usize, f32)>, pstore_format::FormatError> {
+        Ok(self.search_probed(store, key, query, q).await?.0)
+    }
+
+    /// [`Self::search_field`], with how it searched (M165): `None` when it scored every row
+    /// exactly, or the lists it probed.
+    ///
+    /// # Errors
+    /// As [`Self::search_field`].
+    pub async fn search_field_probed<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        field: &str,
+        query: &[f32],
+        q: Query,
+    ) -> Result<(Vec<(usize, f32)>, Option<usize>), pstore_format::FormatError> {
+        if self.segment.field_layout(field).is_none() {
+            return Err(pstore_format::FormatError::UnknownField);
+        }
+        self.search_probed(store, key, query, q).await
+    }
+
+    /// [`Self::search`], with how it searched, as [`Self::search_field_probed`].
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    async fn search_probed<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        query: &[f32],
+        q: Query,
+    ) -> Result<(Vec<(usize, f32)>, Option<usize>), pstore_format::FormatError> {
         let quantizer = Quantizer::new(self.dim.max(1));
         let Some(centroids) = self.centroids.as_ref().filter(|_| !q.exact) else {
             // D-10: no index, so read the vectors and be exactly right.
@@ -742,7 +775,7 @@ impl VecIndex {
                 .map(|(i, v)| (i, dot(v, query)))
                 .collect();
             crate::top::top_k_by(&mut scored, q.k, crate::top::best_first);
-            return Ok(scored);
+            return Ok((scored, None));
         };
 
         let probes = centroids.probe(query, q.p);
@@ -751,7 +784,7 @@ impl VecIndex {
             self.segment.section(Section::RaBitQ),
             self.segment.section(Section::Sq8),
         ) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Some(0)));
         };
 
         // ⚠️ The rabitq AND sq8 ranges for every probed list, issued in ONE call. That is
@@ -916,10 +949,13 @@ impl VecIndex {
         // `RaBitQ`, `Sq8` and `Vectors`, all of which stride by the index row count; mapping
         // any earlier sends them to the wrong offsets. The mapping is injective after the
         // deduplication above, so this cannot collapse two hits into one.
-        Ok(ranked
-            .into_iter()
-            .map(|(row, score)| (data_row.get(&row).copied().unwrap_or(row), score))
-            .collect())
+        Ok((
+            ranked
+                .into_iter()
+                .map(|(row, score)| (data_row.get(&row).copied().unwrap_or(row), score))
+                .collect(),
+            Some(rows.len()),
+        ))
     }
 }
 

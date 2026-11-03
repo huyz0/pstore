@@ -34,6 +34,7 @@ mod diversify;
 mod door;
 mod durable;
 mod errors;
+mod explain;
 mod external;
 mod facets;
 mod filters;

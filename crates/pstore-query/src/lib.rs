@@ -15,6 +15,7 @@
 mod aggregate;
 pub mod condition;
 pub mod deletes;
+pub mod explain;
 mod filter;
 mod fuse;
 mod order;

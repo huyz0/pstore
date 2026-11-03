@@ -66,6 +66,19 @@ pub enum Fusion {
     },
 }
 
+impl Fusion {
+    /// How a response names it (M165): `rrf`, `weighted_rrf`, `sum` or `max`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Rrf { .. } => "rrf",
+            Self::WeightedRrf { .. } => "weighted_rrf",
+            Self::Sum { .. } => "sum",
+            Self::Max { .. } => "max",
+        }
+    }
+}
+
 /// The most legs a query may fuse (M9g.1): one dense leg and fifteen text legs, turbopuffer's
 /// sixteen sub-queries.
 pub const MAX_LEGS: usize = 16;

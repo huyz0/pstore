@@ -29,6 +29,7 @@ mod drop_index;
 mod end_to_end;
 mod engine;
 mod engine_query;
+mod explain;
 mod external_copy;
 mod external_index;
 mod external_retry;
