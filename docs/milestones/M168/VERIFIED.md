@@ -78,8 +78,8 @@ and the test adds 26 segments, the j-th answering 404 to its first j reads: 26 r
 each rebuild one more, past `MAX_STALLS`. The guard `once.contains(d)` beside a reindex record
 was redundant: every create writes or clears the record, so no replication holds one. It is
 removed rather than tested. All five stall and progress mutants fail the test, the slowest in
-30 seconds. The engine and server suites pass after the change (1,232 and 115 tests, the two
-IPv6 tests skipped). A full local `cargo mutants` run is not claimed; CI's shards on the fix are
+30 seconds. Every test of `pstore-engine` and `pstore-server` passes after the change, the two
+IPv6 tests skipped. A full local `cargo mutants` run is not claimed; CI's shards on the fix are
 the check.
 
 1. PASS: `a_reindex_rebuilds_under_a_new_analyzer`, from another tenant and from another store.
