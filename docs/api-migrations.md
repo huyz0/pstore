@@ -1,5 +1,26 @@
 # Native API migration notes
 
+## M167: an export is a read-only copy, and a restore is a copy of it
+
+An export is M166's copy with `"read_only": true` in its body:
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71"}, "read_only": true}
+```
+
+- The commit that finishes the copy also makes `dest` read-only, as `PATCH` with
+  `{"read_only": true}` would (M149). Writes, deletes and the drop are refused with
+  `409 index_read_only` until a `PATCH` clears the flag.
+- The status gains `read_only`, the flag asked for, in every state. A repeated `POST` matches
+  only the same flag, including after a `PATCH` cleared it. The other flag answers `409`.
+  A replication's body refuses the field (`400`).
+- An export holds the source's **folded** rows at `source_epoch`: the source HEAD the sync
+  copied, which may be later than the `POST`. Unfolded writes are not in it, so fold first
+  (`POST /v1/admin/fold`). A past `as_of` epoch cannot be exported.
+- A restore is a copy whose source is the export, into any tenant or store the principal may
+  read; without `read_only` it is writable. It keeps answering once the export and its store
+  are gone. Evidence is in [M167 verification](milestones/M167/VERIFIED.md).
+
 ## M166: an isolated copy, as an operation with a status
 
 `copy_from_namespace` is a **branch**: the new index shares its source's segment objects,

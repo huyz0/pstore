@@ -96,6 +96,8 @@ pub struct CopyStatus {
     pub source_epoch: Option<u64>,
     /// Why a failed copy failed.
     pub failure: Option<CopyFailure>,
+    /// Whether it asked to finish read-only (M167): an export.
+    pub read_only: bool,
 }
 
 /// The named remote stores a sync may read (M22): the server's configured sources.
@@ -292,18 +294,18 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<Epoch, EngineError> {
-        self.create_inner(dest, source, from, false, &mut None)
-            .await
+        self.create_inner(dest, source, from, None, &mut None).await
     }
 
-    /// [`Self::create_replication`], a copy when `once` (M166). A copy that the CAS finds
-    /// already started, as [`same_copy`] decides, is put in `matched` and nothing is written.
+    /// [`Self::create_replication`], a copy when `once` is `Some` (M166), an export when it
+    /// is `Some(true)` (M167). A copy that the CAS finds already started, as [`same_copy`]
+    /// decides, is put in `matched` and nothing is written.
     async fn create_inner<R: BlobStore + ?Sized>(
         &self,
         dest: &str,
         source: ReplicaSource,
         from: &R,
-        once: bool,
+        once: Option<bool>,
         matched: &mut Option<CopyStatus>,
     ) -> Result<Epoch, EngineError> {
         let refuse = |r| Err(EngineError::Replica(r));
@@ -324,7 +326,9 @@ impl<S: BlobStore> Engine<S> {
             return refuse(ReplicaRefusal::SourceNotFound(source.index));
         }
         self.commit_change(|now, next| {
-            if once && let Some(s) = same_copy(now, dest, &source) {
+            if let Some(read_only) = once
+                && let Some(s) = same_copy(now, dest, &source, read_only)
+            {
                 *matched = Some(s);
                 return Ok(None);
             }
@@ -364,10 +368,16 @@ impl<S: BlobStore> Engine<S> {
             );
             // M166: a new operation into `dest` replaces how its last copy ended.
             next.copies.remove(dest);
-            if once {
+            if once.is_some() {
                 next.once.insert(dest.to_owned());
             } else {
                 next.once.remove(dest);
+            }
+            // M167: and whether it asked to finish read-only.
+            if once == Some(true) {
+                next.exports.insert(dest.to_owned());
+            } else {
+                next.exports.remove(dest);
             }
             Ok(Some(()))
         })
@@ -387,13 +397,36 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<(CopyStatus, bool), EngineError> {
+        self.copy_inner(dest, source, from, false).await
+    }
+
+    /// [`Self::create_copy`] that finishes read-only (M167): an export.
+    ///
+    /// # Errors
+    /// As [`Self::create_copy`].
+    pub async fn create_export<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+    ) -> Result<(CopyStatus, bool), EngineError> {
+        self.copy_inner(dest, source, from, true).await
+    }
+
+    async fn copy_inner<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+        read_only: bool,
+    ) -> Result<(CopyStatus, bool), EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
-        if let Some(s) = same_copy(&at.head, dest, &source) {
+        if let Some(s) = same_copy(&at.head, dest, &source, read_only) {
             return Ok((s, false));
         }
         let mut matched = None;
         let epoch = self
-            .create_inner(dest, source.clone(), from, true, &mut matched)
+            .create_inner(dest, source.clone(), from, Some(read_only), &mut matched)
             .await?;
         if let Some(s) = matched {
             return Ok((s, false));
@@ -406,6 +439,7 @@ impl<S: BlobStore> Engine<S> {
                 epoch: None,
                 source_epoch: None,
                 failure: None,
+                read_only,
             },
             true,
         ))
@@ -771,6 +805,10 @@ impl<S: BlobStore> Engine<S> {
                 {
                     let epoch = next.epoch.0;
                     next.branched.insert(d.clone(), epoch);
+                    // M167: an export is read-only from the commit that finishes it.
+                    if next.exports.contains(d.as_str()) {
+                        next.read_only.insert(d.clone());
+                    }
                     let end = CopyEnd::Succeeded {
                         source_epoch: m.src_epoch,
                     };
@@ -1180,6 +1218,7 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
             epoch: None,
             source_epoch: None,
             failure: None,
+            read_only: h.exports.contains(dest),
         });
     }
     let o = h.copies.get(dest)?;
@@ -1195,14 +1234,16 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
         epoch: Some(o.epoch),
         source_epoch,
         failure,
+        read_only: h.exports.contains(dest),
     })
 }
 
 /// The copy of `source` into `dest` a repeated request started (M166): running, paused,
-/// or succeeded while `dest` is still an index.
-fn same_copy(h: &Head, dest: &str, source: &ReplicaSource) -> Option<CopyStatus> {
+/// or succeeded while `dest` is still an index; and asking the same flag (M167).
+fn same_copy(h: &Head, dest: &str, source: &ReplicaSource, read_only: bool) -> Option<CopyStatus> {
     copy_status_in(h, dest).filter(|s| {
         &s.source == source
+            && s.read_only == read_only
             && match s.state {
                 CopyState::Running | CopyState::Paused => true,
                 CopyState::Succeeded => h.indexes.contains_key(dest),
@@ -1230,12 +1271,12 @@ mod tests {
                 end: CopyEnd::Succeeded { source_epoch: 2 },
             },
         );
-        assert_eq!(same_copy(&h, "dst", &source), None);
+        assert_eq!(same_copy(&h, "dst", &source, false), None);
         h.indexes.insert("dst".to_owned(), Vec::new());
-        let got = same_copy(&h, "dst", &source).map(|s| (s.state, s.run, s.epoch));
+        let got = same_copy(&h, "dst", &source, false).map(|s| (s.state, s.run, s.epoch));
         assert_eq!(got, Some((CopyState::Succeeded, 3, Some(4))));
         let other = ReplicaSource::local(TenantId(1), "other");
-        assert_eq!(same_copy(&h, "dst", &other), None);
+        assert_eq!(same_copy(&h, "dst", &other, false), None);
     }
 
     #[test]
