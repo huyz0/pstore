@@ -90,7 +90,7 @@ write into branch/copy and query into multi-query.
 | `POST /v1/namespaces/{namespace}/schema` | `PATCH /v1/indexes/{index}/schema` | Missing evolution: current PATCH always returns `schema_immutable` | D, G |
 | `GET /v2/namespaces/{namespace}/metadata` | `GET /v1/indexes/{index}` | Partial metadata; see route conflict above | G |
 | `PATCH /v1/namespaces/{namespace}/metadata` | `PATCH /v1/indexes/{index}` with `read_only` ([M149](../milestones/M149/SPEC.md)) | Partial: read-only only; pinning missing | I |
-| `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial: synchronous process-local metadata warm, rather than accepted asynchronous hint | H |
+| `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial by decision: synchronous process-local metadata warm, rather than accepted asynchronous hint; bulk vector data is never warmed (D-44, kept 2026-11-03) | H |
 | `POST /v1/namespaces/{namespace}/_debug/recall` | `POST /v1/indexes/{index}/recall` ([M162](../milestones/M162/VERIFIED.md)) | Online recall at one snapshot with `num`, `top_k`, `filters`, `seed` and ground truth; queries sampled near a seeded probe, no `rank_by`; a row budget refuses oversized requests | H |
 | `POST /v2/namespaces/{namespace}` | `PUT /v1/indexes/{index}/documents` | Partial write contract; separate field matrix below | B, C, D |
 | `DELETE /v2/namespaces/{namespace}` | `DELETE /v1/indexes/{index}` | Equivalent logical deletion; retention/GC and response differ | B, G |
