@@ -3,8 +3,8 @@
 //! own HEAD. See `docs/milestones/M22/SPEC.md`.
 
 use crate::head::{
-    self, CopyEnd, CopyFailure, CopyOutcome, Head, HeadAt, IndexSchema, ReplicaSource, Replication,
-    fnv1a,
+    self, CopyEnd, CopyFailure, CopyOutcome, Head, HeadAt, IndexSchema, Reindex, ReplicaSource,
+    Replication, fnv1a,
 };
 use crate::{
     Engine, EngineError, MAX_COMMIT_ATTEMPTS, SegmentRef, backoff, is_rowless, nonce_for,
@@ -98,6 +98,15 @@ pub struct CopyStatus {
     pub failure: Option<CopyFailure>,
     /// Whether it asked to finish read-only (M167): an export.
     pub read_only: bool,
+    /// The options it rebuilds under (M168): a reindex. `None` for a byte copy.
+    pub reindex: Option<Reindex>,
+}
+
+/// What a copy asks besides its source (M166, M167, M168).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Ask {
+    read_only: bool,
+    reindex: Option<Reindex>,
 }
 
 /// The named remote stores a sync may read (M22): the server's configured sources.
@@ -211,6 +220,9 @@ fn carried(key: &str, suffix: &str) -> Option<u64> {
 struct Copies {
     /// `(dest, h)` to the dest segment key holding it.
     segs: BTreeMap<(String, u64), String>,
+    /// `(dest, h)` to the segment a reindex rebuilt for it (M168), or `None` when every row
+    /// of its source segment was deleted.
+    built: BTreeMap<(String, u64), Option<SegmentRef>>,
     /// `(dest segment, g)` to the dest vector key holding it.
     dvs: BTreeMap<(String, u64), String>,
     /// Every segment and vector key written, recorded before its PUT, so one that fails
@@ -238,6 +250,42 @@ enum CopyErr {
     Missing,
     /// Anything else: this replication fails this time.
     Failed(String),
+}
+
+/// Why rebuilding one source segment did not finish (M168).
+enum BuildErr {
+    /// As a copy's.
+    Copy(CopyErr),
+    /// Its rows cannot be sealed under the reindex's options: the same on every retry, so the
+    /// copy ends.
+    Refused,
+}
+
+impl<E: Into<CopyErr>> From<E> for BuildErr {
+    fn from(e: E) -> Self {
+        Self::Copy(e.into())
+    }
+}
+
+/// Why a sync could not map a replication's state (M168): this time, or for good.
+enum MirrorErr {
+    /// Reported, and retried by the next sync.
+    Failed(String),
+    /// A reindex's seal was refused: the copy ends `rebuild_refused`.
+    Refused,
+}
+
+/// A delete vector as HEAD names it: its key and how many rows it deletes.
+type Dv = (String, u32);
+
+/// The hash a reindex's rebuild of a source segment is kept and keyed by (M168): the
+/// segment's key and its delete vector's, so a delete on it is a new rebuild, and never a
+/// byte copy's `fnv1a(key)`.
+fn rebuild_hash(segment: &str, dv: Option<&str>) -> u64 {
+    let mut b = segment.as_bytes().to_vec();
+    b.push(0);
+    b.extend_from_slice(dv.unwrap_or_default().as_bytes());
+    fnv1a(&b)
 }
 
 impl From<BlobError> for CopyErr {
@@ -305,7 +353,7 @@ impl<S: BlobStore> Engine<S> {
         dest: &str,
         source: ReplicaSource,
         from: &R,
-        once: Option<bool>,
+        once: Option<&Ask>,
         matched: &mut Option<CopyStatus>,
     ) -> Result<Epoch, EngineError> {
         let refuse = |r| Err(EngineError::Replica(r));
@@ -325,9 +373,14 @@ impl<S: BlobStore> Engine<S> {
         if fingerprint(&there.head, &source.index).is_none() {
             return refuse(ReplicaRefusal::SourceNotFound(source.index));
         }
+        // M168: a reindex's names, against the schema it read, before any segment is.
+        if let Some(r) = once.and_then(|a| a.reindex.as_ref()) {
+            check_reindex(r, there.head.schemas.get(&source.index))
+                .map_err(|why| EngineError::Replica(ReplicaRefusal::Invalid(why)))?;
+        }
         self.commit_change(|now, next| {
-            if let Some(read_only) = once
-                && let Some(s) = same_copy(now, dest, &source, read_only)
+            if let Some(ask) = once
+                && let Some(s) = same_copy(now, dest, &source, ask)
             {
                 *matched = Some(s);
                 return Ok(None);
@@ -374,10 +427,19 @@ impl<S: BlobStore> Engine<S> {
                 next.once.remove(dest);
             }
             // M167: and whether it asked to finish read-only.
-            if once == Some(true) {
+            if once.is_some_and(|a| a.read_only) {
                 next.exports.insert(dest.to_owned());
             } else {
                 next.exports.remove(dest);
+            }
+            // M168: and what it rebuilds under.
+            match once.and_then(|a| a.reindex.clone()) {
+                Some(r) => {
+                    next.reindexes.insert(dest.to_owned(), r);
+                }
+                None => {
+                    next.reindexes.remove(dest);
+                }
             }
             Ok(Some(()))
         })
@@ -397,7 +459,7 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<(CopyStatus, bool), EngineError> {
-        self.copy_inner(dest, source, from, false).await
+        self.copy_inner(dest, source, from, Ask::default()).await
     }
 
     /// [`Self::create_copy`] that finishes read-only (M167): an export.
@@ -410,7 +472,36 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<(CopyStatus, bool), EngineError> {
-        self.copy_inner(dest, source, from, true).await
+        let ask = Ask {
+            read_only: true,
+            reindex: None,
+        };
+        self.copy_inner(dest, source, from, ask).await
+    }
+
+    /// [`Self::create_copy`] that rebuilds every segment under `reindex`'s options rather
+    /// than copying its bytes (M168): a reindex, read-only at its finish when asked.
+    ///
+    /// # Errors
+    /// As [`Self::create_copy`], and [`ReplicaRefusal::Invalid`] for options that name the
+    /// source's primary text field or an attribute it types other than string, or more
+    /// further text fields than [`head::MAX_TEXTS`].
+    pub async fn create_reindex<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+        read_only: bool,
+        mut reindex: Reindex,
+    ) -> Result<(CopyStatus, bool), EngineError> {
+        // Sorted, each once, as a schema's set is: two spellings of one set are one ask.
+        reindex.trigram.sort_unstable();
+        reindex.trigram.dedup();
+        let ask = Ask {
+            read_only,
+            reindex: Some(reindex),
+        };
+        self.copy_inner(dest, source, from, ask).await
     }
 
     async fn copy_inner<R: BlobStore + ?Sized>(
@@ -418,15 +509,15 @@ impl<S: BlobStore> Engine<S> {
         dest: &str,
         source: ReplicaSource,
         from: &R,
-        read_only: bool,
+        ask: Ask,
     ) -> Result<(CopyStatus, bool), EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
-        if let Some(s) = same_copy(&at.head, dest, &source, read_only) {
+        if let Some(s) = same_copy(&at.head, dest, &source, &ask) {
             return Ok((s, false));
         }
         let mut matched = None;
         let epoch = self
-            .create_inner(dest, source.clone(), from, Some(read_only), &mut matched)
+            .create_inner(dest, source.clone(), from, Some(&ask), &mut matched)
             .await?;
         if let Some(s) = matched {
             return Ok((s, false));
@@ -439,7 +530,8 @@ impl<S: BlobStore> Engine<S> {
                 epoch: None,
                 source_epoch: None,
                 failure: None,
-                read_only,
+                read_only: ask.read_only,
+                reindex: ask.reindex,
             },
             true,
         ))
@@ -671,7 +763,8 @@ impl<S: BlobStore> Engine<S> {
             .collect();
         let mut changed: Vec<(String, Head, u64)> = Vec::new();
         // M166: copies whose source holds no folded segment, ended rather than retried.
-        let mut gone: Vec<(String, Replication)> = Vec::new();
+        // M168: and reindexes whose seal was refused, by the same commit, with their code.
+        let mut gone: Vec<(String, Replication, CopyFailure)> = Vec::new();
         for (d, r) in &plan {
             let read = heads
                 .get(&(r.source.store.clone(), r.source.tenant))
@@ -682,7 +775,9 @@ impl<S: BlobStore> Engine<S> {
                     out.failed.insert(d.clone(), e.clone());
                 }
                 Ok(h) => match fingerprint(h, &r.source.index) {
-                    None if st.once.contains(d) => gone.push((d.clone(), r.clone())),
+                    None if st.once.contains(d) => {
+                        gone.push((d.clone(), r.clone(), CopyFailure::SourceNotFound));
+                    }
                     None => {
                         out.failed.insert(
                             d.clone(),
@@ -726,7 +821,7 @@ impl<S: BlobStore> Engine<S> {
             out.current
                 .retain(|d| !changed.iter().any(|(c, _, _)| c == d));
             for (d, src_head, fp) in &mut changed {
-                if out.failed.contains_key(d.as_str()) {
+                if out.failed.contains_key(d.as_str()) || gone.iter().any(|(g, ..)| g == d) {
                     continue;
                 }
                 // ⚠️ **The replication the plan was made from, or nothing** (code review B1): paused,
@@ -766,15 +861,27 @@ impl<S: BlobStore> Engine<S> {
                         out.failed.insert(d.clone(), "unknown_store".to_owned());
                         continue;
                     };
-                    match self
-                        .mirror(&src, &r.source, src_head, d, &at.head, e, &mut copies)
-                        .await
-                    {
+                    // M168: a reindex rebuilds what a copy would copy.
+                    let got = match at.head.reindexes.get(d.as_str()) {
+                        Some(ask) if at.head.once.contains(d.as_str()) => {
+                            self.rebuild(&src, &r.source, src_head, d, e, &mut copies, ask)
+                                .await
+                        }
+                        _ => self
+                            .mirror(&src, &r.source, src_head, d, &at.head, e, &mut copies)
+                            .await
+                            .map_err(MirrorErr::Failed),
+                    };
+                    match got {
                         Ok(m) => {
                             mapped.insert(d.clone(), m);
                         }
-                        Err(why) => {
+                        Err(MirrorErr::Failed(why)) => {
                             out.failed.insert(d.clone(), why);
+                            continue;
+                        }
+                        Err(MirrorErr::Refused) => {
+                            gone.push((d.clone(), r.clone(), CopyFailure::RebuildRefused));
                             continue;
                         }
                     }
@@ -822,7 +929,7 @@ impl<S: BlobStore> Engine<S> {
                     ended.push(d.clone());
                 }
             }
-            for (d, planned) in &gone {
+            for (d, planned, failure) in &gone {
                 let live =
                     at.head.replications.get(d.as_str()).filter(|r| {
                         r.running && r.run == planned.run && r.source == planned.source
@@ -833,7 +940,7 @@ impl<S: BlobStore> Engine<S> {
                         source: planned.source.clone(),
                         run: planned.run,
                         epoch: next.epoch.0,
-                        end: CopyEnd::Failed(CopyFailure::SourceNotFound),
+                        end: CopyEnd::Failed(*failure),
                     };
                     next.record_copy(d, outcome);
                     ended.push(d.clone());
@@ -1155,6 +1262,235 @@ impl<S: BlobStore> Engine<S> {
         }
     }
 
+    /// [`Self::mirror`] for a reindex (M168): every live row of each source segment at
+    /// `src_head`, sealed under `ask` applied to the source's schema, remapping against a
+    /// fresh source HEAD whenever something it named was gone.
+    #[allow(clippy::too_many_arguments, reason = "one sync's state, threaded once")]
+    async fn rebuild(
+        &self,
+        src: &Src<'_, S>,
+        source: &ReplicaSource,
+        src_head: &mut Head,
+        dest: &str,
+        e: u64,
+        copies: &mut Copies,
+        ask: &Reindex,
+    ) -> Result<Mapped, MirrorErr> {
+        let index = source.index.as_str();
+        let mut stalls = 0;
+        loop {
+            let Some(fp) = fingerprint(src_head, index) else {
+                return Err(MirrorErr::Failed(format!(
+                    "the source index {index:?} does not exist"
+                )));
+            };
+            // Applied here, to the schema copied, so a type recorded since the POST is kept.
+            let was = src_head.schemas.get(index).cloned().unwrap_or_default();
+            let schema = ask.apply(&was, &self.text_field);
+            // Never a primary: a further field, the source's or the reindex's.
+            let further: BTreeSet<String> = was
+                .texts
+                .keys()
+                .chain(schema.texts.keys())
+                .cloned()
+                .collect();
+            let refs: Vec<(SegmentRef, Option<Dv>, u64)> = src_head
+                .indexes
+                .get(index)
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    let dv = src_head.deletes.get(&head::dv_ref(index, &r.key)).cloned();
+                    let h = rebuild_hash(&r.key, dv.as_ref().map(|(k, _)| k.as_str()));
+                    (r.clone(), dv, h)
+                })
+                .collect();
+            let written = Mutex::new(Vec::new());
+            // Owned, as the copy's list is: a stream over borrowed items is not `Send`.
+            let todo: Vec<(SegmentRef, Option<Dv>, u64, String)> = refs
+                .iter()
+                .filter(|(.., h)| !copies.built.contains_key(&(dest.to_owned(), *h)))
+                .map(|(r, dv, h)| (r.clone(), dv.clone(), *h, self.replica_seg_key(dest, e, *h)))
+                .collect();
+            let results: Vec<(u64, Result<Option<SegmentRef>, BuildErr>)> =
+                futures_util::stream::iter(todo.into_iter().map(|(r, dv, h, to)| {
+                    let (written, schema, further) = (&written, &schema, &further);
+                    async move {
+                        let out = self
+                            .rebuild_segment(src, &r, dv.as_ref(), &to, schema, further, written)
+                            .await;
+                        (h, out)
+                    }
+                }))
+                .buffer_unordered(IN_FLIGHT)
+                .collect()
+                .await;
+            copies.written.extend(
+                written
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let mut progress = 0;
+            let mut missing = false;
+            for (h, r) in results {
+                match r {
+                    Ok(built) => {
+                        progress += 1;
+                        copies.built.insert((dest.to_owned(), h), built);
+                    }
+                    Err(BuildErr::Copy(CopyErr::Missing)) => missing = true,
+                    Err(BuildErr::Copy(CopyErr::Failed(why))) => {
+                        return Err(MirrorErr::Failed(why));
+                    }
+                    Err(BuildErr::Refused) => return Err(MirrorErr::Refused),
+                }
+            }
+            if !missing {
+                let built: Vec<SegmentRef> = refs
+                    .iter()
+                    .filter_map(|(.., h)| copies.built.get(&(dest.to_owned(), *h)).cloned())
+                    .flatten()
+                    .collect();
+                return Ok(Mapped {
+                    dvs: built.iter().map(|r| (r.key.clone(), None)).collect(),
+                    refs: built,
+                    schema: Some(schema),
+                    src_epoch: src_head.epoch.0,
+                    fp,
+                });
+            }
+            // Something the snapshot named was gone: the source moved under it.
+            *src_head = src
+                .head(source.tenant)
+                .await
+                .map_err(|e| MirrorErr::Failed(e.to_string()))?
+                .head;
+            stalls = if progress == 0 { stalls + 1 } else { 0 };
+            if stalls >= MAX_STALLS {
+                return Err(MirrorErr::Failed(format!(
+                    "the source index {index:?} kept changing: {MAX_STALLS} remaps copied nothing"
+                )));
+            }
+        }
+    }
+
+    /// Rebuilds one source segment (M168): GETs it, its sparse dictionary and its delete
+    /// vector through the source's own store in one round, scans it in memory, and seals its
+    /// live rows under `schema` at `to`. `None` when every row is deleted. Every name the seal
+    /// created, or may have, is put in `written`, whatever the outcome. `further` names every
+    /// field that is never the primary.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one segment's rebuild, threaded once"
+    )]
+    async fn rebuild_segment(
+        &self,
+        src: &Src<'_, S>,
+        r: &SegmentRef,
+        dv: Option<&(String, u32)>,
+        to: &str,
+        schema: &IndexSchema,
+        further: &BTreeSet<String>,
+        written: &Mutex<Vec<String>>,
+    ) -> Result<Option<SegmentRef>, BuildErr> {
+        let key = Key::new(r.key.clone());
+        let dict = pstore_format::sparse::dict_key(&key);
+        // `None` dictionaries are a ref from before M32: the sidecar may exist.
+        let sparse = r.dicts.is_none_or(|d| d.sparse);
+        let (seg, side, deletes) = futures_util::future::join3(
+            src.get(&key),
+            async {
+                if sparse {
+                    Some(src.get(&dict).await)
+                } else {
+                    None
+                }
+            },
+            async {
+                match dv {
+                    Some((k, _)) => Some(src.get(&Key::new(k.clone())).await),
+                    None => None,
+                }
+            },
+        )
+        .await;
+        let mem = pstore_blob::MemoryStore::new();
+        let put = |e: BlobError| CopyErr::Failed(e.to_string());
+        let bytes = seg?;
+        let len = bytes.len() as u64;
+        mem.put(&key, bytes).await.map_err(put)?;
+        match side {
+            Some(Ok(b)) => {
+                mem.put(&dict, b).await.map_err(put)?;
+            }
+            // A dictionary HEAD records is missing: the source moved.
+            Some(Err(BlobError::NotFound(_))) if r.dicts.is_some() => {
+                return Err(CopyErr::Missing.into());
+            }
+            Some(Err(BlobError::NotFound(_))) | None => {}
+            Some(Err(e)) => return Err(CopyErr::Failed(e.to_string()).into()),
+        }
+        let deleted = match deletes {
+            Some(raw) => pstore_query::deletes::decode(&raw?),
+            None => std::collections::HashSet::new(),
+        };
+        let failed = |e: pstore_format::FormatError| CopyErr::Failed(e.to_string());
+        let opened = pstore_format::Segment::open_at(&mem, &key, Some(len))
+            .await
+            .map_err(failed)?;
+        let rows: Vec<pstore_format::Document> = opened
+            .scan(&mem, &key, None)
+            .await
+            .map_err(failed)?
+            .into_iter()
+            .enumerate()
+            .filter(|(row, _)| !deleted.contains(row))
+            .map(|(_, d)| d)
+            .collect();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        // The primary the schema records, else the one this segment indexed (M30), as a
+        // compaction's: never a further field, the source's or the reindex's -- a dropped
+        // further field read as the primary would keep its postings. A recorded primary is
+        // never one: M152 keeps it out of the source's, and the create refuses it in the ask.
+        let primary = Some(schema.text_field.as_str())
+            .filter(|f| !f.is_empty())
+            .or_else(|| {
+                opened
+                    .text_fields()
+                    .iter()
+                    .map(String::as_str)
+                    .find(|f| !further.contains(*f))
+            });
+        let mut names = crate::Names::default();
+        let sealed = self
+            .seal(
+                &mut names,
+                &Key::new(to.to_owned()),
+                &rows,
+                primary,
+                &schema.fts,
+                &schema.texts,
+                &schema.trigram,
+            )
+            .await;
+        written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(names.written);
+        match sealed {
+            Ok((key, dicts, len)) => Ok(Some(SegmentRef {
+                key: key.as_str().to_owned(),
+                rows: rows.len() as u32,
+                dicts: Some(dicts),
+                len: Some(len),
+            })),
+            Err(EngineError::Format(_)) => Err(BuildErr::Refused),
+            Err(e) => Err(CopyErr::Failed(e.to_string()).into()),
+        }
+    }
+
     /// Copies one source segment and the sidecars it has: one round of GETs, then one of
     /// PUTs. Answers whether a sidecar was absent, for the caller to confirm against a fresh
     /// source HEAD.
@@ -1219,6 +1555,7 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
             source_epoch: None,
             failure: None,
             read_only: h.exports.contains(dest),
+            reindex: h.reindexes.get(dest).cloned(),
         });
     }
     let o = h.copies.get(dest)?;
@@ -1235,15 +1572,51 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
         source_epoch,
         failure,
         read_only: h.exports.contains(dest),
+        reindex: h.reindexes.get(dest).cloned(),
     })
+}
+
+/// Why a reindex's options cannot apply to the source schema `s` (M168): a further text
+/// field or regex attribute named as its primary text field, or as an attribute it types
+/// other than string, or more further fields than [`head::MAX_TEXTS`].
+fn check_reindex(r: &Reindex, s: Option<&IndexSchema>) -> Result<(), String> {
+    if r.texts.len() > head::MAX_TEXTS {
+        return Err(format!(
+            "a reindex declares at most {} further text fields",
+            head::MAX_TEXTS
+        ));
+    }
+    for name in r.texts.keys().chain(&r.trigram) {
+        if name == crate::ID_KIND {
+            return Err("\"id\" is not an attribute: it is neither text nor sketched".to_owned());
+        }
+    }
+    let Some(s) = s else {
+        return Ok(());
+    };
+    for name in r.texts.keys().chain(&r.trigram) {
+        if !s.text_field.is_empty() && *name == s.text_field {
+            return Err(format!(
+                "{name:?} is the source's primary text field: declare its options under it"
+            ));
+        }
+        if let Some(k) = s.types.get(name) {
+            return Err(format!(
+                "{name:?} is a {} attribute: a text field or regex attribute is a string",
+                k.name()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The copy of `source` into `dest` a repeated request started (M166): running, paused,
 /// or succeeded while `dest` is still an index; and asking the same flag (M167).
-fn same_copy(h: &Head, dest: &str, source: &ReplicaSource, read_only: bool) -> Option<CopyStatus> {
+fn same_copy(h: &Head, dest: &str, source: &ReplicaSource, ask: &Ask) -> Option<CopyStatus> {
     copy_status_in(h, dest).filter(|s| {
         &s.source == source
-            && s.read_only == read_only
+            && s.read_only == ask.read_only
+            && s.reindex == ask.reindex
             && match s.state {
                 CopyState::Running | CopyState::Paused => true,
                 CopyState::Succeeded => h.indexes.contains_key(dest),
@@ -1271,12 +1644,12 @@ mod tests {
                 end: CopyEnd::Succeeded { source_epoch: 2 },
             },
         );
-        assert_eq!(same_copy(&h, "dst", &source, false), None);
+        assert_eq!(same_copy(&h, "dst", &source, &Ask::default()), None);
         h.indexes.insert("dst".to_owned(), Vec::new());
-        let got = same_copy(&h, "dst", &source, false).map(|s| (s.state, s.run, s.epoch));
+        let got = same_copy(&h, "dst", &source, &Ask::default()).map(|s| (s.state, s.run, s.epoch));
         assert_eq!(got, Some((CopyState::Succeeded, 3, Some(4))));
         let other = ReplicaSource::local(TenantId(1), "other");
-        assert_eq!(same_copy(&h, "dst", &other, false), None);
+        assert_eq!(same_copy(&h, "dst", &other, &Ask::default()), None);
     }
 
     #[test]

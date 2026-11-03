@@ -818,6 +818,8 @@ struct CreateBody {
     source: SourceBody,
     /// A copy's alone (M167): finish read-only, an export.
     read_only: Option<bool>,
+    /// A copy's alone (M168): the text and regex options to rebuild under, a reindex.
+    schema: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -837,11 +839,16 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from, read_only) =
+    let (source, from, read_only, schema) =
         api.parse_source(tenant, &principal, &body, "a replication's body")?;
     if read_only.is_some() {
         return Err(ApiError::bad_request(
             "read_only is a copy's: a replication follows its source and is always read-only",
+        ));
+    }
+    if schema.is_some() {
+        return Err(ApiError::bad_request(
+            "schema is a copy's: a replication follows its source's schema",
         ));
     }
     api.engine(tenant)
@@ -856,8 +863,14 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
 }
 
-/// A create's source, the store to read it from, and a copy's `read_only` (M167).
-type Parsed = (ReplicaSource, Arc<dyn BlobStore>, Option<bool>);
+/// A create's source, the store to read it from, and a copy's `read_only` (M167) and
+/// `schema` (M168).
+type Parsed = (
+    ReplicaSource,
+    Arc<dyn BlobStore>,
+    Option<bool>,
+    Option<pstore_engine::Reindex>,
+);
 
 impl<S: BlobStore + 'static> Api<S> {
     /// A create's body (M22, and M166's copy): the source it names, authorized for this
@@ -872,6 +885,8 @@ impl<S: BlobStore + 'static> Api<S> {
     ) -> Result<Parsed, ApiError> {
         let req: CreateBody = serde_json::from_slice(body)
             .map_err(|e| ApiError::bad_request(format!("{what}: {e}")))?;
+        // M168: checked before the source is authorized or read.
+        let schema = req.schema.as_ref().map(crate::reindex_of).transpose()?;
         let Some(index) = req.source.index else {
             return Err(ApiError::bad_request("source.index is required"));
         };
@@ -893,7 +908,7 @@ impl<S: BlobStore + 'static> Api<S> {
             tenant: source_tenant,
             index,
         };
-        Ok((source, from, req.read_only))
+        Ok((source, from, req.read_only, schema))
     }
 
     /// The copy into `dest`'s status (M166): HEAD and the worker's notes, in one round.
@@ -948,6 +963,7 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
         "source_epoch": s.source_epoch,
         "code": s.failure.map(|f| match f {
             CopyFailure::SourceNotFound => "source_not_found",
+            CopyFailure::RebuildRefused => "rebuild_refused",
         }),
         "last_error": last_error,
         "read_only": s.read_only,
@@ -957,7 +973,8 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
 /// `POST /v1/indexes/{dest}/copy` (M166): copies the source into the new `dest`, as a
 /// replication that finishes in the commit that copies. `202` when this request started it;
 /// `200` with the copy a repeated request started. With `read_only: true`, an export
-/// (M167): it finishes read-only.
+/// (M167): it finishes read-only. With `schema`, a reindex (M168): every segment is rebuilt
+/// under the text and regex options it declares.
 pub(crate) async fn copy<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(dest): Path<String>,
@@ -966,12 +983,19 @@ pub(crate) async fn copy<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from, read_only) = api.parse_source(tenant, &principal, &body, "a copy's body")?;
+    let (source, from, read_only, schema) =
+        api.parse_source(tenant, &principal, &body, "a copy's body")?;
     let engine = api.engine(tenant).await;
-    let (status, started) = if read_only == Some(true) {
-        engine.create_export(&dest, source, &*from).await?
-    } else {
-        engine.create_copy(&dest, source, &*from).await?
+    let read_only = read_only == Some(true);
+    let (status, started) = match schema {
+        // M168: a reindex rebuilds under the options; read-only at its finish when asked.
+        Some(r) => {
+            engine
+                .create_reindex(&dest, source, &*from, read_only, r)
+                .await?
+        }
+        None if read_only => engine.create_export(&dest, source, &*from).await?,
+        None => engine.create_copy(&dest, source, &*from).await?,
     };
     if !started {
         return Ok((

@@ -5247,6 +5247,77 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
     Ok(fts)
 }
 
+/// A reindex's `schema` (M168): the map a write declares, holding only `full_text_search`
+/// and `regex` entries, read by the write's own option parser with no document checks. `text`
+/// declares the primary's options; every other `full_text_search` is a further field, and
+/// the further fields and the regex set are the whole of each.
+pub(crate) fn reindex_of(schema: &serde_json::Value) -> Result<pstore_engine::Reindex, ApiError> {
+    let bad = |why: String| ApiError::bad_request(format!("schema: {why}"));
+    let map = schema.as_object().ok_or_else(|| {
+        bad("an object of attribute names to full_text_search and regex declarations".to_owned())
+    })?;
+    let mut r = pstore_engine::Reindex::default();
+    for (name, decl) in map {
+        let Some(decl) = decl.as_object() else {
+            return Err(bad(format!(
+                "{name:?} is declared {decl}: a reindex changes text and regex options only, and \
+                 an attribute's type is fixed, so re-write its rows into a new index"
+            )));
+        };
+        if let Some(k) = decl
+            .keys()
+            .find(|k| !["type", "full_text_search", "regex"].contains(&k.as_str()))
+        {
+            return Err(bad(format!("{name:?}: unknown key {k:?}")));
+        }
+        if name == pstore_query::ID_ATTRIBUTE {
+            return Err(bad(
+                "\"id\" is not an attribute: it is neither text nor sketched".to_owned(),
+            ));
+        }
+        let ty = decl.get("type");
+        if ty.is_some_and(|t| t != "string" && t != "[]string") {
+            return Err(bad(format!(
+                "{name:?}: a text field's or regex attribute's type is string or []string"
+            )));
+        }
+        if let Some(opts) = decl.get("full_text_search") {
+            let fts = full_text_options(opts).map_err(bad)?;
+            // M158: a pre-tokenized field holds an array of tokens.
+            if fts.analyzer.tokenizer == pstore_format::text::Tokenizer::PreTokenizedArray
+                && ty.is_some_and(|t| t == "string")
+            {
+                return Err(bad(format!(
+                    "{name:?}: a pre_tokenized_array field's type is []string"
+                )));
+            }
+            if name == pstore_format::text::DEFAULT_TEXT_FIELD {
+                r.fts = Some(fts);
+            } else {
+                r.texts.insert(name.clone(), fts);
+            }
+        }
+        if let Some(flag) = decl.get("regex") {
+            let on = flag
+                .as_bool()
+                .ok_or_else(|| bad(format!("{name:?}: regex is true or false")))?;
+            if on && ty.is_some_and(|t| t != "string") {
+                return Err(bad(format!("{name:?}: a regex attribute's type is string")));
+            }
+            if on {
+                r.trigram.push(name.clone());
+            }
+        }
+    }
+    if r.texts.len() > pstore_engine::MAX_TEXTS {
+        return Err(bad(format!(
+            "at most {} further text fields",
+            pstore_engine::MAX_TEXTS
+        )));
+    }
+    Ok(r)
+}
+
 /// The further text fields a write declares (M155): every `full_text_search` but the
 /// primary's, or `None` when it declares none.
 fn declared_further(

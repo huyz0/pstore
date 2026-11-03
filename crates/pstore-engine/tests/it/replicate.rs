@@ -16,9 +16,10 @@ use pstore_blob::{
     Precondition, PutOutcome, TenantView,
 };
 use pstore_engine::{
-    CopyFailure, CopyState, Engine, EngineError, ReplicaRefusal, ReplicaSource, Sources, SyncState,
-    Synced,
+    CopyFailure, CopyState, Engine, EngineError, Reindex, ReplicaRefusal, ReplicaSource, Sources,
+    SyncState, Synced,
 };
+use pstore_format::text::FullText;
 use pstore_format::{Document, Impact, Value, VectorField};
 use pstore_index::vec_index::Query;
 use pstore_query::{Fusion, OrderBy, Prefetch};
@@ -2199,4 +2200,538 @@ async fn a_repeated_export_matches_only_its_flag() {
         s.dst.create_export("dst", s.source.clone(), &from).await,
         &ReplicaRefusal::Exists("dst".to_owned()),
     );
+}
+
+// ---- M168: a reindex is a copy that rebuilds an index's text and regex options ----
+
+impl Setup {
+    async fn reindex_into(
+        &self,
+        dest: &str,
+        r: Reindex,
+    ) -> Result<(pstore_engine::CopyStatus, bool), EngineError> {
+        let from: Arc<dyn BlobStore> = match self.source.store.as_str() {
+            "" => Arc::new(self.here.acct.as_tenant(DST)),
+            _ => self.remotes.store("far").unwrap(),
+        };
+        self.dst
+            .create_reindex(dest, self.source.clone(), &*from, false, r)
+            .await
+    }
+    async fn reindex(&self, r: Reindex) -> (pstore_engine::CopyStatus, bool) {
+        self.reindex_into("dst", r).await.unwrap()
+    }
+}
+
+fn stemmed() -> Reindex {
+    let mut fts = FullText::default();
+    fts.analyzer.stemming = true;
+    Reindex {
+        fts: Some(fts),
+        ..Reindex::default()
+    }
+}
+
+/// The ids a BM25 query over `field` ranks, sorted.
+async fn text_ids(e: &E, index: &str, field: &str, q: &str) -> Vec<String> {
+    let p = vec![Prefetch::Text {
+        field: field.to_owned(),
+        query: q.to_owned(),
+        limit: 100,
+        last_as_prefix: false,
+    }];
+    let a = e
+        .query_filtered(index, &p, None, Fusion::default(), 100)
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = e.resolve(&a).into_iter().map(|(id, _)| id).collect();
+    ids.sort();
+    ids
+}
+
+/// Every row, whole, by id: the row digest.
+async fn digest(e: &E, index: &str) -> Vec<String> {
+    let by = OrderBy {
+        attr: "id".to_owned(),
+        desc: false,
+    };
+    let all = e.ordered(index, &by, None, 0, 100_000, None).await.unwrap();
+    all.rows.iter().map(|d| format!("{d:?}")).collect()
+}
+
+/// The source hash a replica segment key carries: its third `-` field, less any suffix.
+fn carried_h(key: &str) -> String {
+    let name = key.rsplit('/').next().unwrap().trim_end_matches(".seg");
+    let h = name.split('-').nth(2).unwrap();
+    h.split('_').next().unwrap().to_owned()
+}
+
+fn fnv1a(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, x| {
+        (h ^ u64::from(*x)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// M168 criterion 1: a reindex under stemming finds what the source's analyzer cannot, and
+/// leaves the source as it was.
+#[tokio::test]
+async fn a_reindex_rebuilds_under_a_new_analyzer() {
+    for kind in [Kind::CrossTenant, Kind::Remote] {
+        let s = setup(kind);
+        let mut a = doc("a", 1.0);
+        a.attrs
+            .insert("text".to_owned(), Value::Str("running fast".to_owned()));
+        let mut b = doc("b", 2.0);
+        b.attrs
+            .insert("text".to_owned(), Value::Str("a slow walk".to_owned()));
+        s.src.write("src", vec![a, b]).await.unwrap();
+        fold(&s.src).await;
+        let before = s.src.head_for_test().await;
+        let (started, created) = s.reindex(stemmed()).await;
+        assert!(created && started.reindex == Some(stemmed()), "{kind:?}");
+        let mut st = SyncState::default();
+        assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+        let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(done.state, CopyState::Succeeded, "{kind:?}");
+        assert_eq!(done.reindex, Some(stemmed()));
+        let hd = s.dst.head_for_test().await;
+        assert!(hd.schemas.get("dst").unwrap().fts.analyzer.stemming);
+        assert_eq!(
+            text_ids(&s.dst, "dst", "text", "run").await,
+            ["a"],
+            "{kind:?}"
+        );
+        assert!(text_ids(&s.src, "src", "text", "run").await.is_empty());
+        let after = s.src.head_for_test().await;
+        assert_eq!(after.schemas.get("src"), before.schemas.get("src"));
+        assert_eq!(after.indexes.get("src"), before.indexes.get("src"));
+        assert_eq!(digest(&s.dst, "dst").await, digest(&s.src, "src").await);
+    }
+}
+
+/// M168 criterion 3: live rows only, each segment rebuilt, an all-deleted segment gone, and
+/// every ref's fields its own object's.
+#[tokio::test]
+async fn a_reindex_keeps_live_rows_and_no_deletes() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..40).await;
+    write(&s.src, "src", 40..60).await;
+    s.src
+        .delete("src", vec!["d0001".to_owned(), "d0002".to_owned()])
+        .await
+        .unwrap();
+    s.src
+        .delete("src", (30..40).map(|i| format!("d{i:04}")).collect())
+        .await
+        .unwrap();
+    fold(&s.src).await;
+    let hs = s.src.head_for_test().await;
+    let src_refs = hs.indexes.get("src").unwrap().clone();
+    assert_eq!(src_refs.len(), 3);
+    assert_eq!(hs.deletes.len(), 2);
+    s.reindex(stemmed()).await;
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    assert_eq!(digest(&s.dst, "dst").await, digest(&s.src, "src").await);
+    let hd = s.dst.head_for_test().await;
+    let refs = hd.indexes.get("dst").unwrap();
+    assert_eq!(refs.len(), 2, "an all-deleted segment gave a segment");
+    assert!(hd.deletes.is_empty(), "a delete vector was carried");
+    let copies: BTreeSet<String> = src_refs
+        .iter()
+        .map(|r| format!("{:016x}", fnv1a(r.key.as_bytes())))
+        .collect();
+    let store = &s.here.hooked.inner;
+    let exists = |k: Key| async move { store.head(&k).await.is_ok() };
+    let mut rows = 0;
+    for r in refs {
+        assert!(
+            !copies.contains(&carried_h(&r.key)),
+            "{} is a byte copy",
+            r.key
+        );
+        let key = Key::new(r.key.clone());
+        assert_eq!(r.len, Some(store.head(&key).await.unwrap()));
+        let d = r.dicts.unwrap();
+        assert_eq!(d.text, exists(pstore_format::text::dict_key(&key)).await);
+        assert_eq!(
+            d.sparse,
+            exists(pstore_format::sparse::dict_key(&key)).await
+        );
+        rows += r.rows as usize;
+    }
+    assert_eq!(rows, 48);
+    let (src_a, dst_a) = (answers(&s.src, "src").await, answers(&s.dst, "dst").await);
+    // The text ranking is the new analyzer's; every other answer is the source's.
+    let cut = |a: Option<String>| {
+        let a = a.unwrap();
+        a.lines().take(4).collect::<Vec<_>>().join("\n")
+    };
+    assert_eq!(cut(src_a), cut(dst_a));
+    let by = OrderBy {
+        attr: "id".to_owned(),
+        desc: false,
+    };
+    let id = pstore_query::Predicate::Cmp(
+        "id".to_owned(),
+        pstore_query::Op::Eq,
+        Value::Str("d0005".to_owned()),
+    );
+    let got = s
+        .dst
+        .ordered("dst", &by, Some(&id), 0, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(got.rows.len(), 1);
+    assert_eq!(got.rows[0].id, "d0005");
+}
+
+/// M168 criterion 4: a delete on a segment already rebuilt, and a remap forced in the same
+/// window, rebuild that segment again: no deleted row reaches `dst`.
+#[tokio::test]
+async fn a_reindex_is_one_source_epoch_under_deletes() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    let refs = s
+        .src
+        .head_for_test()
+        .await
+        .indexes
+        .get("src")
+        .unwrap()
+        .clone();
+    let (a, b) = (refs[0].key.clone(), refs[1].key.clone());
+    let a_has = digest(&s.src, "src").await.len();
+    assert_eq!(a_has, 60);
+    s.reindex(stemmed()).await;
+    let src = Arc::new(s.here.engine(SRC, 8));
+    let hooked = s.here.hooked.clone();
+    // Which segment holds d0001 decides which to delete from: the other one is the remap.
+    let victim = if digest_of_segment_has(&s, &a, "d0001").await {
+        ("d0001", b.clone())
+    } else {
+        ("d0001", a.clone())
+    };
+    let (gone, remap) = victim;
+    *s.here.hooked.hook.lock().unwrap() = Some((
+        remap.clone(),
+        Box::new(move || {
+            Box::pin(async move {
+                src.delete("src", vec![gone.to_owned()]).await.unwrap();
+                fold(&src).await;
+                hooked.missing.lock().unwrap().insert(remap, 1);
+            })
+        }),
+    ));
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(done.source_epoch, Some(s.src.head_for_test().await.epoch.0));
+    let rows = digest(&s.dst, "dst").await;
+    assert_eq!(rows.len(), 59);
+    assert!(
+        !rows.iter().any(|r| r.contains("\"d0001\"")),
+        "a deleted row reached dst"
+    );
+    assert_eq!(rows, digest(&s.src, "src").await);
+}
+
+/// Whether the segment at `key` holds `id`: the first write's segment holds 0..30.
+async fn digest_of_segment_has(s: &Setup, key: &str, id: &str) -> bool {
+    let refs = s
+        .src
+        .head_for_test()
+        .await
+        .indexes
+        .get("src")
+        .unwrap()
+        .clone();
+    // Folds append, so the first ref is the first write's.
+    let first = refs.first().is_some_and(|r| r.key == key);
+    let n: u32 = id.trim_start_matches('d').parse().unwrap();
+    first == (n < 30)
+}
+
+/// M168 criterion 5: the finishing commit, lost once, publishes nothing before it; a second
+/// reindex cancelled after its rebuild leaves nothing but buried objects.
+#[tokio::test]
+async fn a_reindex_never_reads_as_finished_partway() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    let (started, _) = s.reindex(stemmed()).await;
+    s.reindex_into("dst2", stemmed()).await.unwrap();
+    let watcher = s.here.engine(DST, 3);
+    let mut st = SyncState::default();
+    let out = s
+        .dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+            let mid = watcher.copy_status("dst").await.unwrap().unwrap();
+            assert_eq!(mid.state, CopyState::Running);
+            assert_eq!(mid.reindex, Some(stemmed()));
+            let h = watcher.head_for_test().await;
+            assert!(!h.indexes.contains_key("dst") && !h.schemas.contains_key("dst"));
+            // A rival commit, which also loses the finishing commit once.
+            watcher.cancel_replication("dst2").await.unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.committed, vec!["dst".to_owned()]);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!((done.state, done.run), (CopyState::Succeeded, started.run));
+    let h = s.dst.head_for_test().await;
+    assert_eq!(Some(h.epoch.0), done.epoch);
+    let cancelled = s.dst.copy_status("dst2").await.unwrap().unwrap();
+    assert_eq!(cancelled.state, CopyState::Cancelled);
+    assert!(!h.indexes.contains_key("dst2") && !h.schemas.contains_key("dst2"));
+    let buried: BTreeSet<&String> = h.graveyard.values().flatten().collect();
+    assert!(
+        buried.iter().any(|k| k.contains("/idx/dst2/seg/R/")),
+        "the cancelled rebuild buried nothing"
+    );
+    assert_eq!(leaked(&s.here, &s.dst, "dst2").await, BTreeSet::new());
+    assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+}
+
+/// M168 criterion 6: a seal the format refuses ends the copy, typed, and nothing polls it;
+/// a store failure is retried.
+#[tokio::test]
+async fn a_refused_rebuild_fails_typed() {
+    let long = "l".repeat(pstore_format::INDEX_BUDGET + 1);
+    let s = setup(Kind::CrossTenant);
+    let mut d = doc("a", 1.0);
+    d.attrs
+        .insert(long.clone(), Value::Str("words here".to_owned()));
+    s.src.write("src", vec![d]).await.unwrap();
+    fold(&s.src).await;
+    assert_eq!(
+        s.src.head_for_test().await.indexes.get("src").map(Vec::len),
+        Some(1)
+    );
+    s.reindex(Reindex {
+        texts: [(long, FullText::default())].into(),
+        ..Reindex::default()
+    })
+    .await;
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert_eq!(out.finished, vec!["dst".to_owned()]);
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.state, CopyState::Failed);
+    assert_eq!(f.failure, Some(CopyFailure::RebuildRefused));
+    assert!(!s.dst.head_for_test().await.indexes.contains_key("dst"));
+    s.here
+        .hooked
+        .fail
+        .lock()
+        .unwrap()
+        .push(format!("tnt/{}/idx/src/seg/", SRC.0));
+    let again = s.sync(&mut st).await;
+    assert!(again.idle && again.failed.is_empty(), "{again:?}");
+
+    // A store failure under the seal: retried, the copy running until it succeeds.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.reindex(stemmed()).await;
+    s.here
+        .hooked
+        .fail_cas
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut st = SyncState::default();
+    let out = s.dst.replicate(&s.remotes, &mut st).await.unwrap();
+    assert!(out.failed.contains_key("dst"), "{out:?}");
+    assert_eq!(s.state().await, Some(CopyState::Running));
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    assert_eq!(s.state().await, Some(CopyState::Succeeded));
+}
+
+/// M168 criterion 7: a repeated reindex matches only its own options.
+#[tokio::test]
+async fn a_repeated_reindex_matches_only_its_schema() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let (first, created) = s.reindex(stemmed()).await;
+    assert!(created);
+    let (again, created) = s.reindex(stemmed()).await;
+    assert!(!created);
+    assert_eq!(again, first);
+    refused(
+        s.reindex_into("dst", Reindex::default()).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    let from = s.here.acct.as_tenant(DST);
+    refused(
+        s.dst.create_copy("dst", s.source.clone(), &from).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let (done, created) = s.reindex(stemmed()).await;
+    assert!(!created);
+    assert_eq!((done.state, done.run), (CopyState::Succeeded, first.run));
+    // A plain copy is not matched by a reindex.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    refused(
+        s.reindex_into("dst", stemmed()).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    // A regex set is one ask however it is spelled; a plain copy after a cancelled reindex
+    // is not one.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let set = |names: &[&str]| Reindex {
+        trigram: names.iter().map(|n| (*n).to_owned()).collect(),
+        ..Reindex::default()
+    };
+    let (first, _) = s.reindex(set(&["b", "a", "b"])).await;
+    assert_eq!(first.reindex, Some(set(&["a", "b"])));
+    let (again, created) = s.reindex(set(&["a", "b"])).await;
+    assert!(!created);
+    assert_eq!(again.run, first.run);
+    s.dst.cancel_replication("dst").await.unwrap();
+    let (plain, created) = s.copy().await;
+    assert!(created);
+    assert_eq!(plain.reindex, None);
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert_eq!(
+        s.dst.copy_status("dst").await.unwrap().unwrap().reindex,
+        None
+    );
+}
+
+/// M168 criterion 8 (engine): a reindex naming the source's primary, a typed attribute, or
+/// too many fields is refused at create, before any segment read.
+#[tokio::test]
+async fn a_reindex_naming_the_primary_is_refused() {
+    let s = setup(Kind::CrossTenant);
+    let mut d = doc("a", 1.0);
+    d.attrs.insert("u".to_owned(), Value::Uint(7));
+    s.src
+        .write_declared(
+            "src",
+            vec![d],
+            pstore_engine::Metric::DotProduct,
+            None,
+            &pstore_engine::Declared {
+                types: [("u".to_owned(), pstore_engine::Kind::Uint64)].into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    fold(&s.src).await;
+    s.here
+        .hooked
+        .fail
+        .lock()
+        .unwrap()
+        .push(format!("tnt/{}/idx/src/seg/", SRC.0));
+    let invalid = |r: Result<(pstore_engine::CopyStatus, bool), EngineError>| {
+        assert!(
+            matches!(r, Err(EngineError::Replica(ReplicaRefusal::Invalid(_)))),
+            "{r:?}"
+        );
+    };
+    let text = |names: &[&str]| Reindex {
+        texts: names
+            .iter()
+            .map(|n| ((*n).to_owned(), FullText::default()))
+            .collect(),
+        ..Reindex::default()
+    };
+    invalid(s.reindex_into("dst", text(&["text"])).await);
+    invalid(s.reindex_into("dst", text(&["id"])).await);
+    invalid(s.reindex_into("dst", text(&["u"])).await);
+    invalid(
+        s.reindex_into(
+            "dst",
+            Reindex {
+                trigram: vec!["u".to_owned()],
+                ..Reindex::default()
+            },
+        )
+        .await,
+    );
+    let many: Vec<String> = (0..=pstore_engine::MAX_TEXTS)
+        .map(|i| format!("f{i}"))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    invalid(s.reindex_into("dst", text(&many)).await);
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+}
+
+/// M168 criterion 2 (engine): a reindex that leaves out the source's only further field and
+/// its regex set drops both. No field is read as the primary, the segment holds no text
+/// dictionary, and its ref says so.
+#[tokio::test]
+async fn a_reindex_drops_what_it_leaves_out() {
+    let s = setup(Kind::CrossTenant);
+    let docs: Vec<Document> = (0..20)
+        .map(|i| {
+            let mut d = doc(&format!("d{i:04}"), i as f32);
+            d.attrs.remove("text");
+            d.attrs.insert(
+                "title".to_owned(),
+                Value::Str(format!("title {i} quarterly")),
+            );
+            d.attrs
+                .insert("tag".to_owned(), Value::Str(format!("t-{i}")));
+            d
+        })
+        .collect();
+    s.src
+        .write_declared(
+            "src",
+            docs,
+            pstore_engine::Metric::DotProduct,
+            None,
+            &pstore_engine::Declared {
+                texts: Some([("title".to_owned(), FullText::default())].into()),
+                trigram: Some(vec!["tag".to_owned()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    fold(&s.src).await;
+    let hs = s.src.head_for_test().await;
+    let was = hs.schemas.get("src").unwrap();
+    assert_eq!(was.trigram, ["tag"]);
+    assert!(was.texts.contains_key("title"));
+    let src_ref = hs.indexes.get("src").unwrap()[0].clone();
+    assert!(
+        src_ref.dicts.unwrap().text,
+        "the source has a text dictionary"
+    );
+    assert_eq!(
+        text_ids(&s.src, "src", "title", "quarterly").await.len(),
+        20
+    );
+    s.reindex(Reindex::default()).await;
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    let hd = s.dst.head_for_test().await;
+    let now = hd.schemas.get("dst").unwrap();
+    assert!(now.trigram.is_empty() && now.texts.is_empty(), "{now:?}");
+    assert!(
+        text_ids(&s.dst, "dst", "title", "quarterly")
+            .await
+            .is_empty(),
+        "a dropped field still answers"
+    );
+    let r = &hd.indexes.get("dst").unwrap()[0];
+    let key = Key::new(r.key.clone());
+    let store = &s.here.hooked.inner;
+    assert!(!r.dicts.unwrap().text, "the ref says a text dictionary");
+    assert!(
+        store
+            .head(&pstore_format::text::dict_key(&key))
+            .await
+            .is_err()
+    );
+    assert_eq!(digest(&s.dst, "dst").await, digest(&s.src, "src").await);
 }

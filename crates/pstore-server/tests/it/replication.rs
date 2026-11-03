@@ -1870,3 +1870,263 @@ async fn an_export_restores_into_a_fresh_tenant() {
             .contains(&"d0100".to_owned())
     );
 }
+
+// ---- M168: a reindex is a copy that rebuilds an index's text and regex options ----
+
+async fn reindex_into(api: &A, dest: &str, source: Value, schema: Value) -> (StatusCode, Value) {
+    send(
+        api,
+        DST,
+        "POST",
+        &format!("/v1/indexes/{dest}/copy"),
+        &json!({"source": source, "schema": schema}),
+    )
+    .await
+}
+
+/// The ids a BM25 leg over `field` ranks on `index`, sorted, or the refusal.
+async fn text_ids(
+    api: &A,
+    tenant: u64,
+    index: &str,
+    field: &str,
+    q: &str,
+) -> Result<Vec<String>, Value> {
+    let (s, b) = send(
+        api,
+        tenant,
+        "POST",
+        &format!("/v1/indexes/{index}/query"),
+        &json!({"text": [{"field": field, "query": q}], "top_k": 100}),
+    )
+    .await;
+    if s != StatusCode::OK {
+        return Err(b);
+    }
+    let mut ids: Vec<String> = b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// M168 criteria 2 and 7 (server): a reindex adds a further text field and a regex attribute
+/// and drops one; `dest` answers by the new set and judges writes by it; a repeated POST
+/// matches only its own `schema`.
+#[tokio::test(start_paused = true)]
+async fn a_reindex_adds_and_drops_text_and_regex_fields() {
+    let world = World::new();
+    let api = world.api(1);
+    let docs: Vec<Value> = (0..12u32)
+        .map(|i| {
+            json!({"id": format!("d{i:04}"), "vector": [f64::from(i).sin(), 1.0],
+                   "attributes": {"n": i, "title": format!("title {i} quarterly"),
+                                  "body": format!("body {} story", if i % 3 == 0 { "red" } else { "blue" }),
+                                  "tag": format!("t-{i}")}})
+        })
+        .collect();
+    let (s, b) = send(
+        &api,
+        SRC,
+        "PUT",
+        "/v1/indexes/src/documents",
+        &json!({"durability": "durable", "documents": docs,
+                "schema": {"title": {"type": "string", "full_text_search": true}}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&api, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let schema = json!({"body": {"type": "string", "full_text_search": true},
+                        "tag": {"type": "string", "regex": true},
+                        "text": {"full_text_search": {"stemming": true}}});
+    let (s, started) = reindex_into(&api, "dst", source.clone(), schema.clone()).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    let red: Vec<String> = (0..12u32)
+        .filter(|i| i % 3 == 0)
+        .map(|i| format!("d{i:04}"))
+        .collect();
+    assert_eq!(
+        text_ids(&api, DST, "dst", "body", "red").await.unwrap(),
+        red
+    );
+    let b = text_ids(&api, DST, "dst", "title", "quarterly")
+        .await
+        .unwrap_err();
+    assert_eq!(b["error"]["code"], "unknown_field", "{b}");
+    // The source is as it was: `title` answers, `body` was never a text field there.
+    assert_eq!(
+        text_ids(&api, SRC, "src", "title", "quarterly")
+            .await
+            .unwrap()
+            .len(),
+        12
+    );
+    let (s, summary) = send(&api, DST, "GET", "/v1/indexes/dst", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    let fields: Vec<&String> = summary["schema"]["text_fields"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(fields, ["body"], "{summary}");
+    assert_eq!(summary["schema"]["regex"], json!(["tag"]), "{summary}");
+    assert_eq!(
+        summary["schema"]["full_text_search"]["stemming"], true,
+        "{summary}"
+    );
+    // A regex filter on the sketched attribute answers on `dest`.
+    let (s, b) = send(
+        &api,
+        DST,
+        "POST",
+        "/v1/indexes/dst/query",
+        &json!({"rank_by": ["id", "asc"], "filters": ["tag", "Regex", "^t-1[01]$"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["results"].as_array().unwrap().len(), 2, "{b}");
+    // Writes are judged by the new set.
+    let one = |id: &str| json!([{"id": id, "vector": [0.1, 1.0], "attributes": {"body": "green", "title": "x", "tag": "t-x"}}]);
+    let (s, b) = send(
+        &api,
+        DST,
+        "PUT",
+        "/v1/indexes/dst/documents",
+        &json!({"durability": "durable", "documents": one("old"),
+                "schema": {"title": {"type": "string", "full_text_search": true}}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "schema_conflict", "{b}");
+    let (s, b) = send(
+        &api,
+        DST,
+        "PUT",
+        "/v1/indexes/dst/documents",
+        &json!({"durability": "durable", "documents": one("new"), "schema": schema.clone()}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&api, DST, "POST", "/v1/admin/fold", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        text_ids(&api, DST, "dst", "body", "green").await.unwrap(),
+        ["new"]
+    );
+    // A repeated POST: the same schema is the same copy; another, or none, is not.
+    let (s, again) = reindex_into(&api, "dst", source.clone(), schema).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again["run"], started["run"]);
+    let (s, b) = reindex_into(&api, "dst", source.clone(), json!({"tag": {"regex": true}})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    let (s, b) = copy_into(&api, DST, "dst", source, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+}
+
+/// M168 criterion 8 (server): each refused body is a `400` naming the key, before the source
+/// is read; the engine's refusals after its HEAD read are `400` too.
+#[tokio::test(start_paused = true)]
+async fn a_reindex_body_is_checked() {
+    let world = World::new();
+    let api = world.api(1);
+    // No such source: a body read past its checks would answer 404.
+    let nowhere = json!({"index": "nowhere", "tenant": SRC.to_string()});
+    let many: serde_json::Map<String, Value> = (0..=8)
+        .map(|i| (format!("f{i}"), json!({"full_text_search": true})))
+        .collect();
+    for (schema, names) in [
+        (json!({"n": "uint64"}), "\"n\""),
+        (json!({"n": {"type": "string", "sort": true}}), "\"sort\""),
+        (json!({"id": {"regex": true}}), "\"id\""),
+        (
+            json!({"n": {"type": "uint64", "full_text_search": true}}),
+            "\"n\"",
+        ),
+        (json!({"n": {"type": "[]string", "regex": true}}), "\"n\""),
+        (json!({"n": {"regex": "yes"}}), "regex"),
+        (
+            json!({"text": {"full_text_search": {"stemming": "yes"}}}),
+            "stemming",
+        ),
+        (
+            json!({"n": {"type": "string", "full_text_search": {"tokenizer": "pre_tokenized_array"}}}),
+            "pre_tokenized_array",
+        ),
+        (Value::Object(many), "8"),
+        (json!(["n"]), "object"),
+    ] {
+        let (s, b) = reindex_into(&api, "dst", nowhere.clone(), schema.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{schema}: {b}");
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(names), "{schema}: {msg}");
+    }
+    let (s, b) = send(
+        &api,
+        DST,
+        "PUT",
+        "/v1/indexes/rep/replication",
+        &json!({"source": {"index": "src", "tenant": SRC.to_string()}, "schema": {}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("schema"),
+        "{b}"
+    );
+    // The engine's: a regex attribute the source types other than string.
+    let (s, b) = send(
+        &api,
+        SRC,
+        "PUT",
+        "/v1/indexes/src/documents",
+        &json!({"durability": "durable", "schema": {"u": "uint64"},
+                "documents": [{"id": "a", "vector": [1.0, 0.0], "attributes": {"u": 7}}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&api, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let (s, b) = reindex_into(&api, "dst", source, json!({"u": {"regex": true}})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("uint64"),
+        "{b}"
+    );
+    let (s, _) = copy_status(&api, "dst").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // A rebuild the format refuses: a text field whose name cannot fit the segment's meta.
+    let long = "l".repeat(8_200);
+    let (s, b) = send(
+        &api,
+        SRC,
+        "PUT",
+        "/v1/indexes/wide/documents",
+        &json!({"durability": "durable",
+                "documents": [{"id": "a", "vector": [1.0, 0.0], "attributes": {long.clone(): "words"}}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&api, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let wide = json!({"index": "wide", "tenant": SRC.to_string()});
+    let (s, b) = reindex_into(&api, "w", wide, json!({long: {"full_text_search": true}})).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, f) = copy_status(&api, "w").await;
+    assert_eq!(
+        (f["state"].clone(), f["code"].clone()),
+        (json!("failed"), json!("rebuild_refused")),
+        "{f}"
+    );
+}
