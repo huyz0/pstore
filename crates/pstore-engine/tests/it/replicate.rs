@@ -1988,27 +1988,215 @@ async fn racing_copies_make_one() {
 }
 
 /// M166 criterion 3: a failure is the plan's run's alone; a copy re-created into `dst` while
-/// the sync ran keeps running.
+/// the sync ran keeps running, from another source or from the same one under a new run.
 #[tokio::test]
 async fn a_failure_never_ends_a_newer_copy() {
+    for again in ["other", "src"] {
+        let s = setup(Kind::CrossTenant);
+        write(&s.src, "src", 0..30).await;
+        write(&s.src, "other", 0..30).await;
+        s.copy().await;
+        s.src.delete_index("src").await.unwrap();
+        let ctl = s.here.engine(DST, 5);
+        let src = s.here.engine(SRC, 6);
+        let from = s.here.acct.as_tenant(DST);
+        let mut st = SyncState::default();
+        s.dst
+            .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+                ctl.cancel_replication("dst").await.unwrap();
+                write(&src, again, 30..40).await;
+                ctl.create_copy("dst", ReplicaSource::local(SRC, again), &from)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let now = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(now.state, CopyState::Running, "{again}: {now:?}");
+        assert_eq!(now.source, ReplicaSource::local(SRC, again));
+    }
+}
+
+/// M166: a plain replication whose source is gone is retried and reported, never ended as
+/// a copy is.
+#[tokio::test]
+async fn a_replications_missing_source_is_reported_not_ended() {
     let s = setup(Kind::CrossTenant);
     write(&s.src, "src", 0..30).await;
-    write(&s.src, "other", 0..30).await;
-    s.copy().await;
+    s.create().await;
     s.src.delete_index("src").await.unwrap();
-    let ctl = s.here.engine(DST, 5);
-    let from = s.here.acct.as_tenant(DST);
     let mut st = SyncState::default();
-    s.dst
+    let out = s.sync(&mut st).await;
+    assert!(out.failed.contains_key("dst"), "{out:?}");
+    assert!(s.dst.replications().await.unwrap().contains_key("dst"));
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+}
+
+// M167: an export is a copy that finishes read-only.
+
+impl Setup {
+    async fn export(&self) -> (pstore_engine::CopyStatus, bool) {
+        let from: Arc<dyn BlobStore> = match self.source.store.as_str() {
+            "" => Arc::new(self.here.acct.as_tenant(DST)),
+            _ => self.remotes.store("far").unwrap(),
+        };
+        self.dst
+            .create_export("dst", self.source.clone(), &*from)
+            .await
+            .unwrap()
+    }
+}
+
+/// M167 criterion 2: the finishing commit sets the flag itself: no later commit, and
+/// inside the lost commit's interference no HEAD holds a succeeded copy.
+#[tokio::test]
+async fn an_export_is_read_only_in_its_finishing_commit() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let (started, created) = s.export().await;
+    assert!(created && started.read_only);
+    let other = s.here.engine(DST, 2);
+    let watcher = s.here.engine(DST, 3);
+    let mut st = SyncState::default();
+    let out = s
+        .dst
         .replicate_with_interference_for_test(&s.remotes, &mut st, async {
-            ctl.cancel_replication("dst").await.unwrap();
-            ctl.create_copy("dst", ReplicaSource::local(SRC, "other"), &from)
-                .await
-                .unwrap();
+            let mid = watcher.copy_status("dst").await.unwrap().unwrap();
+            assert_eq!(mid.state, CopyState::Running);
+            assert!(mid.read_only);
+            assert!(watcher.head_for_test().await.read_only.is_empty());
+            // A rival commit, so the finishing commit loses once and is rebuilt.
+            write(&other, "elsewhere", 0..5).await;
         })
         .await
         .unwrap();
-    let now = s.dst.copy_status("dst").await.unwrap().unwrap();
-    assert_eq!(now.state, CopyState::Running, "{now:?}");
-    assert_eq!(now.source, ReplicaSource::local(SRC, "other"));
+    assert_eq!(out.committed, vec!["dst".to_owned()]);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(done.state, CopyState::Succeeded);
+    assert!(done.read_only);
+    let head = s.dst.head_for_test().await;
+    assert_eq!(Some(head.epoch.0), done.epoch, "a commit after the finish");
+    assert!(head.read_only.contains("dst"));
+    assert!(s.dst.index_stats("dst").await.unwrap().unwrap().read_only);
+    s.same("an export").await;
+    assert!(matches!(
+        s.dst.write("dst", vec![doc("mine", 1.0)]).await,
+        Err(EngineError::IndexReadOnly(_))
+    ));
+    assert!(matches!(
+        s.dst.delete_index("dst").await,
+        Err(EngineError::IndexReadOnly(_))
+    ));
+    s.dst.set_read_only("dst", false).await.unwrap().unwrap();
+    s.dst.write("dst", vec![doc("mine", 1.0)]).await.unwrap();
+    fold(&s.dst).await;
+    assert!(answers(&s.dst, "dst").await.unwrap().contains("mine"));
+}
+
+/// M167 criterion 4: the source compacts, collects, and takes a write and a fold between
+/// the export's source read and its first segment GET; the export is the source at its
+/// recorded `source_epoch`, which is the HEAD it re-read.
+#[tokio::test]
+async fn an_export_is_one_source_epoch() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    let first = s.src.head_for_test().await.epoch.0;
+    s.export().await;
+    let src = Arc::new(s.here.engine(SRC, 8));
+    *s.here.hooked.hook.lock().unwrap() = Some((
+        format!("tnt/{}/idx/src/seg/", SRC.0),
+        Box::new(move || {
+            Box::pin(async move {
+                src.compact("src").await.unwrap();
+                src.gc(0).await.unwrap();
+                write(&src, "src", 60..70).await;
+            })
+        }),
+    ));
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    let now = s.src.head_for_test().await.epoch.0;
+    assert!(now > first);
+    assert_eq!(done.source_epoch, Some(now));
+    s.same("an export re-read mid-copy").await;
+}
+
+/// M167 criterion 5: a failed or cancelled export says it asked to be read-only, and no
+/// index is read-only by it; a writable copy into the name says not; a dropped export
+/// takes its entry with it.
+#[tokio::test]
+async fn a_read_only_copy_that_ends_otherwise_says_so() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.export().await;
+    s.dst.cancel_replication("dst").await.unwrap();
+    let c = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(c.state, CopyState::Cancelled);
+    assert!(c.read_only);
+    assert!(s.dst.head_for_test().await.read_only.is_empty());
+    // A writable copy into the name replaces the outcome and its flag.
+    let (w, created) = s.copy().await;
+    assert!(created && !w.read_only);
+    assert!(!s.dst.head_for_test().await.exports.contains("dst"));
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert!(!s.dst.copy_status("dst").await.unwrap().unwrap().read_only);
+
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.export().await;
+    s.src.delete_index("src").await.unwrap();
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.state, CopyState::Failed);
+    assert!(f.read_only);
+    assert!(s.dst.head_for_test().await.read_only.is_empty());
+
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.export().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    s.dst.set_read_only("dst", false).await.unwrap().unwrap();
+    s.dst.delete_index("dst").await.unwrap();
+    assert!(s.dst.copy_status("dst").await.unwrap().is_none());
+    assert!(!s.dst.head_for_test().await.exports.contains("dst"));
+}
+
+/// M167 criterion 6: a repeated export matches only the flag it asked, the cleared flag
+/// too; a writable copy of the same source does not.
+#[tokio::test]
+async fn a_repeated_export_matches_only_its_flag() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let (first, _) = s.export().await;
+    let (again, created) = s.export().await;
+    assert!(!created);
+    assert_eq!(again, first);
+    let from = s.here.acct.as_tenant(DST);
+    refused(
+        s.dst.create_copy("dst", s.source.clone(), &from).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    s.dst.set_read_only("dst", false).await.unwrap().unwrap();
+    let (done, created) = s.export().await;
+    assert!(!created);
+    assert_eq!((done.state, done.run), (CopyState::Succeeded, first.run));
+    refused(
+        s.dst.create_copy("dst", s.source.clone(), &from).await,
+        &ReplicaRefusal::IndexExists("dst".to_owned()),
+    );
+    // And the other way: a writable copy is not matched by an export.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    let from = s.here.acct.as_tenant(DST);
+    refused(
+        s.dst.create_export("dst", s.source.clone(), &from).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
 }

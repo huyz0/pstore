@@ -286,6 +286,10 @@ pub struct Head {
     /// How each recent copy ended, by destination (M166): at most [`COPIES_RETAINED`],
     /// through [`Self::record_copy`].
     pub copies: BTreeMap<String, CopyOutcome>,
+    /// The copies that asked to finish read-only (M167): exports. ⚠️ The last trailing
+    /// section, after the copies; `encode` keeps a name only while [`Self::once`] (of a
+    /// replication that exists) or [`Self::copies`] holds it, so it goes with the record.
+    pub exports: BTreeSet<String>,
 }
 
 /// The most copy outcomes a tenant's HEAD keeps (M166).
@@ -646,6 +650,12 @@ impl Head {
             .iter()
             .filter(|n| self.replications.contains_key(*n))
             .collect();
+        // M167: the exports after them, only the names a live once-name or an outcome holds.
+        let exports: Vec<&String> = self
+            .exports
+            .iter()
+            .filter(|n| once.contains(n) || self.copies.contains_key(*n))
+            .collect();
         let copied = !once.is_empty() || !self.copies.is_empty();
         let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
@@ -825,6 +835,12 @@ impl Head {
                     CopyEnd::Failed(CopyFailure::SourceNotFound) => out.extend_from_slice(&[1, 0]),
                     CopyEnd::Cancelled => out.push(2),
                 }
+            }
+        }
+        if !exports.is_empty() {
+            out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
+            for name in exports {
+                put_str(&mut out, name);
             }
         }
         out
@@ -1273,7 +1289,7 @@ impl Head {
         for _ in 0..c.u32()? {
             let dest = c.string()?;
             let store = c.string()?;
-            let tenant = u128::from(c.u64()?) | (u128::from(c.u64()?) << 64);
+            let tenant = c.u128()?;
             let index = c.string()?;
             let run = c.u64()?;
             let epoch = c.u64()?;
@@ -1302,6 +1318,13 @@ impl Head {
                     end,
                 },
             );
+        }
+        // M167: and here, no exports.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.exports.insert(c.string()?);
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -1502,6 +1525,14 @@ impl Cur<'_> {
     fn u32(&mut self) -> Result<u32, EngineError> {
         Ok(u32::from_le_bytes(
             self.take(4)?
+                .try_into()
+                .map_err(|_| EngineError::CorruptHead)?,
+        ))
+    }
+    /// `u128::to_le_bytes`'s inverse (M166): one read, so no operator joins two halves.
+    fn u128(&mut self) -> Result<u128, EngineError> {
+        Ok(u128::from_le_bytes(
+            self.take(16)?
                 .try_into()
                 .map_err(|_| EngineError::CorruptHead)?,
         ))
@@ -2632,6 +2663,74 @@ mod tests {
                             "a cut at {cut} decoded copies"
                         );
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M167 criterion 7: the export names round-trip after the copies, absent or present; a
+    /// HEAD without them encodes as M166's; `encode` keeps a name only while a live once-name
+    /// or an outcome holds it; and a cut never decodes them.
+    #[test]
+    fn exports_round_trip_after_copies() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        for base in [Head::default(), sample(), every_section()] {
+            let mut m166 = base.clone();
+            m166.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            m166.once.insert("running".to_owned());
+            m166.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 10,
+                    epoch: 20,
+                    end: CopyEnd::Succeeded { source_epoch: 4 },
+                },
+            );
+            let mut with = m166.clone();
+            with.exports.insert("running".to_owned());
+            with.exports.insert("done".to_owned());
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // A name with no record, or a once-name whose replication is gone: M166's bytes.
+            let mut ghost = m166.clone();
+            ghost.exports.insert("gone".to_owned());
+            assert_eq!(hex(&ghost.encode()), hex(&m166.encode()));
+            let mut stale = m166.clone();
+            stale.once.insert("stale".to_owned());
+            let plain = stale.clone();
+            stale.exports.insert("stale".to_owned());
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            // One export alone keeps its section, after an empty copies section.
+            let mut only = base.clone();
+            only.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 1,
+                    epoch: 2,
+                    end: CopyEnd::Cancelled,
+                },
+            );
+            only.exports.insert("done".to_owned());
+            assert_eq!(Head::decode(&only.encode())?, only);
+            let mut longer = with.encode();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            let bytes = with.encode();
+            for cut in m166.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.exports.is_empty(), "a cut at {cut} decoded exports");
                 }
             }
         }

@@ -215,6 +215,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 read_only: Default::default(),
                 once: Default::default(),
                 copies: Default::default(),
+                exports: Default::default(),
             };
             store
                 .put(

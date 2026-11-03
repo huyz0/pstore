@@ -816,6 +816,8 @@ fn describe(dest: &str, r: &Replication) -> serde_json::Map<String, Value> {
 #[serde(deny_unknown_fields)]
 struct CreateBody {
     source: SourceBody,
+    /// A copy's alone (M167): finish read-only, an export.
+    read_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,7 +837,13 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from) = api.parse_source(tenant, &principal, &body, "a replication's body")?;
+    let (source, from, read_only) =
+        api.parse_source(tenant, &principal, &body, "a replication's body")?;
+    if read_only.is_some() {
+        return Err(ApiError::bad_request(
+            "read_only is a copy's: a replication follows its source and is always read-only",
+        ));
+    }
     api.engine(tenant)
         .await
         .create_replication(&dest, source, &*from)
@@ -848,16 +856,20 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
 }
 
+/// A create's source, the store to read it from, and a copy's `read_only` (M167).
+type Parsed = (ReplicaSource, Arc<dyn BlobStore>, Option<bool>);
+
 impl<S: BlobStore + 'static> Api<S> {
     /// A create's body (M22, and M166's copy): the source it names, authorized for this
-    /// principal before anything is read, and the store to read it from.
+    /// principal before anything is read, the store to read it from, and a copy's
+    /// `read_only` (M167).
     fn parse_source(
         &self,
         tenant: TenantId,
         principal: &crate::auth::Principal,
         body: &[u8],
         what: &str,
-    ) -> Result<(ReplicaSource, Arc<dyn BlobStore>), ApiError> {
+    ) -> Result<Parsed, ApiError> {
         let req: CreateBody = serde_json::from_slice(body)
             .map_err(|e| ApiError::bad_request(format!("{what}: {e}")))?;
         let Some(index) = req.source.index else {
@@ -881,7 +893,7 @@ impl<S: BlobStore + 'static> Api<S> {
             tenant: source_tenant,
             index,
         };
-        Ok((source, from))
+        Ok((source, from, req.read_only))
     }
 
     /// The copy into `dest`'s status (M166): HEAD and the worker's notes, in one round.
@@ -938,12 +950,14 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
             CopyFailure::SourceNotFound => "source_not_found",
         }),
         "last_error": last_error,
+        "read_only": s.read_only,
     })
 }
 
 /// `POST /v1/indexes/{dest}/copy` (M166): copies the source into the new `dest`, as a
 /// replication that finishes in the commit that copies. `202` when this request started it;
-/// `200` with the copy a repeated request started.
+/// `200` with the copy a repeated request started. With `read_only: true`, an export
+/// (M167): it finishes read-only.
 pub(crate) async fn copy<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(dest): Path<String>,
@@ -952,12 +966,13 @@ pub(crate) async fn copy<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from) = api.parse_source(tenant, &principal, &body, "a copy's body")?;
-    let (status, started) = api
-        .engine(tenant)
-        .await
-        .create_copy(&dest, source, &*from)
-        .await?;
+    let (source, from, read_only) = api.parse_source(tenant, &principal, &body, "a copy's body")?;
+    let engine = api.engine(tenant).await;
+    let (status, started) = if read_only == Some(true) {
+        engine.create_export(&dest, source, &*from).await?
+    } else {
+        engine.create_copy(&dest, source, &*from).await?
+    };
     if !started {
         return Ok((
             StatusCode::OK,
