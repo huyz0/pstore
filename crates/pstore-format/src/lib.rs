@@ -36,7 +36,7 @@ pub use docs::{
     Projection, decode_docs, decode_rows, decode_rows_picked, decode_rows_where, encode_docs,
     encode_rows,
 };
-pub use reader::Segment;
+pub use reader::{Segment, decode_vectors};
 pub use writer::{INDEX_BUDGET, SegmentWriter};
 
 /// A footer-addressed region of a segment.

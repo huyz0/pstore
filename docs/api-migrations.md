@@ -1,5 +1,41 @@
 # Native API migration notes
 
+## M191: folded multi-vector fields in results and exports
+
+`include_vectors` now answers every named dense field, whatever layout its segment folded
+it in. Nothing fails for a layout any more.
+
+- A field some segment stores at a varying count of vectors a row (every multi-vector
+  field, and a single-vector one some row of the segment lacks) costs **one round more**:
+  its rows' offsets are read beside the rows, then its vectors for the returned rows only.
+  This is an opt-in outside the D-34 budget, as `rerank: exact` is. A `rank_by` order
+  naming one is 5 rounds. Fields stored one vector a row keep M190's cost.
+- The vectors those returned rows would read are bounded at 64 MiB, as stored. Past it the
+  query fails `422 bad_query` naming the bytes and the bound, before any vector is read;
+  ask fewer rows (`top_k`, or page by `offset`) or fewer fields. One row always fits.
+- A row without the field still has no entry, never `[]`.
+
+## M190: named vector fields in results and exports
+
+`include_vectors` names named fields too, and a result row gains `vectors` beside `id` and
+`vector`, spelled as a write's `vectors` is.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector", "title", "tokens"]}
+```
+
+- Up to 9 names, each once: `vector` and named fields in any mix. `sparse` is not projected
+  yet; a name a named field could not have is `400`. A name the index has no field of is
+  admitted and answers nothing.
+- A row's `vectors` holds only the fields it has, each its vectors in the order written,
+  spelled by `vector_encoding`, and in the index's metric space as `vector` is. No fields,
+  no `vectors` key.
+- Folded rows answer a named field only where their segment stores it at one vector a row:
+  every row of the segment holds exactly one. Unfolded rows answer every field,
+  multi-vector ones included. M191 answers the other layout too; until then it was
+  `422 bad_query` naming the field.
+- No round is added: the fields are read beside `vector`, one request a field a segment.
+
 ## M179: stored vectors in results and exports
 
 A ranked query or a `rank_by` order takes `include_vectors: ["vector"]`, and each result
@@ -16,9 +52,9 @@ row gains `vector` beside `id`.
   under the same metric it reproduces the index's distances, not the client's bytes.
 - A row with no vector has no `vector` key. An attribute named `vector` is unaffected and
   stays under `attributes`.
-- Only `vector` is projected yet. Refused (`400`): any other name, beside `aggregate_by` or
-  `as_of`, inside a multi-query's `queries`, and above 1,000 rows (a ranked query's
-  `top_k + offset`, an order's `top_k`).
+- Only `vector` is projected yet (M190 adds named fields). Refused (`400`): any other
+  name, beside `aggregate_by` or `as_of`, inside a multi-query's `queries`, and above
+  1,000 rows (a ranked query's `top_k + offset`, an order's `top_k`).
 - An order with vectors costs one more blob round, four in all; a ranked query, none.
 
 ## M178: sparse vectors

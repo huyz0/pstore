@@ -117,5 +117,7 @@ mod uint64;
 mod upsert;
 mod upsert_columns;
 mod uuid_bytes;
+mod vectors_multi;
+mod vectors_named;
 mod vectors_out;
 mod warm;

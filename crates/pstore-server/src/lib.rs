@@ -168,6 +168,9 @@ pub struct Api<S> {
     /// Index parameters every engine is built with, when set (M54's tests cluster small
     /// segments with them).
     index_params: Mutex<Option<pstore_index::cluster::Params>>,
+    /// The most bytes of folded vectors one query projects (M191): [`MAX_PROJECTED_BYTES`],
+    /// lowered only by a test.
+    projection_bytes: std::sync::atomic::AtomicU64,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -458,6 +461,7 @@ impl<S: BlobStore + 'static> Api<S> {
             }),
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
+            projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -810,7 +814,11 @@ impl<S: BlobStore + 'static> Api<S> {
             let engine = match filter_rows {
                 Some(rows) => engine.with_filter_rows(rows),
                 None => engine,
-            };
+            }
+            .with_projection_bytes(
+                self.projection_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
@@ -892,6 +900,14 @@ impl<S: BlobStore + 'static> Api<S> {
                 })?;
         *pool = Some(created.clone());
         Ok(created)
+    }
+
+    /// Lowers the bound on a query's projected vector bytes (M191's tests), for the engines
+    /// built after it: set it before a tenant's first request.
+    #[doc(hidden)]
+    pub fn set_projection_bytes_for_test(&self, bytes: u64) {
+        self.projection_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Builds every engine from now on with `params` (M54's tests: small clustered segments).
@@ -1300,6 +1316,10 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            // M190: a projected field folded where the row fetch cannot read it.
+            EngineError::Unprojected(_) => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, "bad_query", e.to_string())
+            }
             EngineError::IndexExists(_) => {
                 Self::new(StatusCode::CONFLICT, "index_exists", e.to_string())
             }
@@ -3223,9 +3243,14 @@ enum Plan {
 /// 1,536 is about 6 MB of f32s, where `MAX_ORDERED` alone would allow ten times it.
 const MAX_VECTOR_ROWS: usize = 1_000;
 
-/// How the query's results spell their stored `vector` (M179), `None` when it asks for none,
-/// or why it cannot ask.
-fn vector_projection(req: &QueryRequest) -> Result<Option<VectorEncoding>, ApiError> {
+/// The most bytes of folded vectors of a varying layout one query reads to project (M191):
+/// `MAX_NAMED_FIELDS` fields of 1,024 vectors of width 1,537, 4 bytes a component, are
+/// about 48 MiB, so one row always fits (`vector` is never read this way).
+const MAX_PROJECTED_BYTES: u64 = 64 << 20;
+
+/// What the query's results project (M179, M190), `None` when it asks for nothing, or why it
+/// cannot ask.
+fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError> {
     let bad = |why: &str| ApiError::bad_request(format!("include_vectors: {why}"));
     let Some(raw) = &req.include_vectors else {
         if req.vector_encoding.is_some() {
@@ -3239,13 +3264,36 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<VectorEncoding>, ApiEr
         .as_array()
         .filter(|a| !a.is_empty())
         .ok_or_else(|| bad("a list of the vector fields to project, [\"vector\"]"))?;
-    if let Some(other) = names
-        .iter()
-        .find(|n| n.as_str() != Some(pstore_format::DEFAULT_FIELD))
-    {
+    // M190: a per-query bound, the most fields one document holds.
+    if names.len() > 1 + MAX_NAMED_FIELDS {
         return Err(bad(&format!(
-            "{other} is not projected: only `vector` is, a named field's vectors are later"
+            "{} names: at most {} fields are projected, `vector` and {MAX_NAMED_FIELDS} named",
+            names.len(),
+            1 + MAX_NAMED_FIELDS
         )));
+    }
+    let (mut vector, mut named) = (false, Vec::new());
+    for n in names {
+        let name = n
+            .as_str()
+            .ok_or_else(|| bad(&format!("{n} is not a vector field's name")))?;
+        if name == pstore_format::DEFAULT_FIELD {
+            if vector {
+                return Err(bad(&format!("{name:?} is named twice")));
+            }
+            vector = true;
+            continue;
+        }
+        if name == "sparse" {
+            return Err(bad(
+                "`sparse` is not projected: a sparse field's vectors are later",
+            ));
+        }
+        let name = named_field(name).map_err(|e| bad(&e.message))?;
+        if named.contains(&name) {
+            return Err(bad(&format!("{name:?} is named twice")));
+        }
+        named.push(name);
     }
     let encoding = match req.vector_encoding.as_deref() {
         None | Some("float") => VectorEncoding::Float,
@@ -3273,7 +3321,45 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<VectorEncoding>, ApiEr
              ranked query's offset)"
         )));
     }
-    Ok(Some(encoding))
+    Ok(Some(Projecting {
+        encoding,
+        vector,
+        named,
+    }))
+}
+
+/// What a query projects (M179, M190): `vector`, named fields, and their spelling.
+#[derive(Debug, Clone)]
+struct Projecting {
+    encoding: VectorEncoding,
+    vector: bool,
+    named: Vec<String>,
+}
+
+impl Projecting {
+    /// A row's `vector`, spelled, when the query names it.
+    fn vector(&self, v: Option<&[f32]>) -> Option<types::VectorOut> {
+        self.vector.then(|| self.encoding.spell(v)).flatten()
+    }
+
+    /// A row's named fields, spelled; `None`, never `{}`, when it holds none of them.
+    fn fields<'a>(
+        &self,
+        fields: impl IntoIterator<Item = (&'a str, &'a [Vec<f32>])>,
+    ) -> Option<std::collections::BTreeMap<String, Vec<types::VectorOut>>> {
+        let out: std::collections::BTreeMap<String, Vec<types::VectorOut>> = fields
+            .into_iter()
+            .filter(|(name, _)| self.named.iter().any(|n| n == name))
+            .map(|(name, vs)| {
+                let spelled = vs
+                    .iter()
+                    .filter_map(|v| self.encoding.spell(Some(v)))
+                    .collect();
+                (name.to_owned(), spelled)
+            })
+            .collect();
+        (!out.is_empty()).then_some(out)
+    }
 }
 
 /// How a projected vector is spelled (M179).
@@ -3715,15 +3801,17 @@ async fn run<E: BlobStore>(
         }
         Plan::Ordered(by, filter) => {
             // M179: the page's vectors, one round after selection, only when asked.
-            let got = if projected.is_some() {
+            let got = if let Some(p) = &projected {
                 engine
-                    .ordered_vectors(
+                    .ordered_projected(
                         index,
                         by,
                         filter.as_ref(),
                         req.offset.unwrap_or(0),
                         req.top_k,
                         consistency,
+                        p.vector,
+                        &p.named,
                     )
                     .await?
             } else {
@@ -3753,7 +3841,10 @@ async fn run<E: BlobStore>(
                     .rows
                     .into_iter()
                     .map(|d| ResultRow {
-                        vector: projected.and_then(|e| e.spell(stored_vector(&d))),
+                        vector: projected.as_ref().and_then(|p| p.vector(stored_vector(&d))),
+                        vectors: projected.as_ref().and_then(|p| {
+                            p.fields(d.vectors.iter().map(|(n, f)| (&**n, f.as_dense())))
+                        }),
                         attributes: selected(req, &d.attrs),
                         id: d.id,
                         score: None,
@@ -3793,9 +3884,13 @@ async fn run<E: BlobStore>(
         }
         // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.) M179:
         // and a projection's, in the same fetch.
+        // M190: and its named fields.
         None if diversify.is_some() || projected.is_some() => {
+            let (vector, named) = projected
+                .as_ref()
+                .map_or((false, &[][..]), |p| (p.vector, p.named.as_slice()));
             engine
-                .query_split_vectors(
+                .query_split_projected(
                     index,
                     &legs,
                     filter.as_ref(),
@@ -3803,6 +3898,8 @@ async fn run<E: BlobStore>(
                     top_k,
                     consistency,
                     peers.map(|p| p as &dyn pstore_engine::Peers),
+                    vector || diversify.is_some(),
+                    named,
                 )
                 .await?
         }
@@ -3828,7 +3925,7 @@ async fn run<E: BlobStore>(
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
     // than HEAD's segments -- M5f's finding, where keying on the row alone merged two
     // unrelated documents into one.
-    let mut paired = engine.resolve_rows_with_vectors(&answer);
+    let mut paired = engine.resolve_rows_projected(&answer);
     if let Some(b) = &boost {
         for ((_, score, attrs, _), _) in &mut paired {
             *score = b.score(*score, attrs);
@@ -3841,9 +3938,9 @@ async fn run<E: BlobStore>(
         let scores: Vec<f64> = paired.iter().map(|r| f64::from(r.0.1)).collect();
         // M179: copied, not taken, when the picked rows answer theirs.
         let vectors: Vec<Option<Vec<f32>>> = if projected.is_some() {
-            paired.iter().map(|r| r.1.clone()).collect()
+            paired.iter().map(|r| r.1.vector.clone()).collect()
         } else {
-            paired.iter_mut().map(|r| r.1.take()).collect()
+            paired.iter_mut().map(|r| r.1.vector.take()).collect()
         };
         let k = req.top_k;
         let order =
@@ -3913,8 +4010,13 @@ async fn run<E: BlobStore>(
     Ok(Answered {
         results: rows
             .into_iter()
-            .map(|((id, score, attrs, dist), vector)| ResultRow {
-                vector: projected.and_then(|e| e.spell(vector.as_deref())),
+            .map(|((id, score, attrs, dist), p)| ResultRow {
+                vector: projected
+                    .as_ref()
+                    .and_then(|e| e.vector(p.vector.as_deref())),
+                vectors: projected.as_ref().and_then(|e| {
+                    e.fields(p.fields.iter().map(|(n, vs)| (n.as_str(), vs.as_slice())))
+                }),
                 highlight: marks
                     .as_ref()
                     .filter(|(h, _)| h.structure.is_none())
