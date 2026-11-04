@@ -81,4 +81,10 @@ exclude_re = [
     # column: a moved or NEW `|` reappears as MISSED rather than hiding under this line. (M8m)
     'pstore-format/src/sparse\.rs:(467:21|467:30|471:21|478:22|487:21|495:21|497:10|497:31): replace \| with \^ in f32_to_f16$',
     'pstore-format/src/sparse\.rs:(511:18|511:39|513:22|513:36|514:19|514:46): replace \| with \^ in f16_to_f32$',
+    # The door keeps a HEAD's counted names only when its epoch is newer; `>=` also re-stores
+    # them at an equal epoch. A HEAD's epoch names one CAS-committed object, so two HEADs of one
+    # epoch are the same HEAD and re-storing them stores the same set: no input tells the two
+    # apart, so no test backs this. What pins the rule is `a_stale_door_rereads_before_refusing`
+    # (a newer HEAD replaces the names). Named by line and column, as above. (M169)
+    'pstore-engine/src/index_limit\.rs:49:58: replace > with >= in Engine<S>::remember_counted',
 ]

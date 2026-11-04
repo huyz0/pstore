@@ -291,6 +291,28 @@ fn every_duty_id_is_a_lower_case_token() {
 }
 
 #[test]
+fn indexes_per_tenant_parses() {
+    // M169: `PSTORE_INDEXES_PER_TENANT`, `0` for unbounded.
+    let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
+    assert_eq!(c.indexes_per_tenant, 10_000);
+    let c = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_INDEXES_PER_TENANT", "0"),
+    ]))
+    .unwrap();
+    assert_eq!(c.indexes_per_tenant, 0);
+    let e = Config::from_vars(vars(&[
+        ("PSTORE_LANE", "1"),
+        ("PSTORE_INDEXES_PER_TENANT", "-1"),
+    ]));
+    assert!(
+        e.unwrap_err()
+            .to_string()
+            .contains("PSTORE_INDEXES_PER_TENANT=-1")
+    );
+}
+
+#[test]
 fn the_engine_cap_defaults_to_ten_thousand_and_refuses_a_non_count() {
     // M26: `PSTORE_ENGINES`, `0` for unbounded.
     let c = Config::from_vars(vars(&[("PSTORE_LANE", "1")])).unwrap();
