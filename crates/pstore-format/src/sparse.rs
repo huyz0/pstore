@@ -89,6 +89,9 @@ pub struct Postings {
     pub section: Vec<u8>,
     /// The sibling dictionary object.
     pub dictionary: Vec<u8>,
+    /// The `SparseRows` section (M193): each row's pairs, forward, so one row is read without
+    /// the field. See [`rows_section`].
+    pub rows: Vec<u8>,
 }
 
 /// Where one dimension's postings are, and what they are scaled by.
@@ -199,7 +202,66 @@ pub fn build(docs: &[Document], field: &str, encoding: ImpactEncoding) -> Postin
     Postings {
         section,
         dictionary,
+        rows: rows_section(docs, field),
     }
+}
+
+/// The `SparseRows` section (M193): an offsets table of `rows + 1` `u64`s, relative to the
+/// pairs that follow it, then each row's pairs in key byte order, each a `u16` key length,
+/// the key and its weight as the F16 [`DEFAULT_ENCODING`] stores, so a pair answers the
+/// bits the postings hold. Rows are `docs`' order, the segment's **data** rows; a row
+/// without the field has an empty range. The layout of a dense field folded at a varying
+/// count, so one reader finds both.
+///
+/// ⚠️ F16 whatever `encoding` the postings use: only a public field (F16 since M178) is
+/// projected, and `U8`'s per-key scale is not a row's own.
+#[must_use]
+pub fn rows_section(docs: &[Document], field: &str) -> Vec<u8> {
+    let mut pairs: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u64> = Vec::with_capacity(docs.len() + 1);
+    offsets.push(0);
+    for d in docs {
+        if let Some(VectorField::Sparse(row)) = d.vectors.get(field) {
+            let mut row: Vec<&(String, crate::Impact)> = row.iter().collect();
+            row.sort_by(|a, b| a.0.cmp(&b.0));
+            for (key, impact) in row {
+                // `check_storable` bounds a key at `SPARSE_KEY_MAX`, which is `u16::MAX`.
+                #[expect(clippy::cast_possible_truncation, reason = "bounded at u16::MAX")]
+                pairs.extend_from_slice(&(key.len() as u16).to_le_bytes());
+                pairs.extend_from_slice(key.as_bytes());
+                pairs.extend_from_slice(&f32_to_f16(impact.get()).to_le_bytes());
+            }
+        }
+        offsets.push(pairs.len() as u64);
+    }
+    let mut out = Vec::with_capacity(offsets.len() * 8 + pairs.len());
+    for o in offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+    out.extend_from_slice(&pairs);
+    out
+}
+
+/// `w` as a public sparse field stores it (M178, M193): its nearest f16, widened. What a
+/// projection answers for a row folded or not, so the two never differ.
+#[must_use]
+pub fn stored_weight(w: f32) -> f32 {
+    f16_to_f32(f32_to_f16(w))
+}
+
+/// One row's pairs from its range of a `SparseRows` section (M193), in key byte order;
+/// `None` for bytes that are not whole pairs.
+#[must_use]
+pub fn decode_pairs(mut raw: &[u8]) -> Option<Vec<(String, crate::Impact)>> {
+    let mut out = Vec::new();
+    while !raw.is_empty() {
+        let len = u16::from_le_bytes(raw.get(..2)?.try_into().ok()?) as usize;
+        let key = std::str::from_utf8(raw.get(2..2 + len)?).ok()?;
+        let w = u16::from_le_bytes(raw.get(2 + len..4 + len)?.try_into().ok()?);
+        out.push((key.to_owned(), crate::Impact::new(f16_to_f32(w))));
+        raw = raw.get(4 + len..)?;
+    }
+    Some(out)
 }
 
 /// Every row's `(key, impact)` pairs, reconstructed from a whole postings section.

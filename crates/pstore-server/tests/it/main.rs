@@ -123,4 +123,5 @@ mod uuid_bytes;
 mod vectors_multi;
 mod vectors_named;
 mod vectors_out;
+mod vectors_sparse;
 mod warm;

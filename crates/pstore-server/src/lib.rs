@@ -171,6 +171,9 @@ pub struct Api<S> {
     /// The most bytes of folded vectors one query projects (M191): [`MAX_PROJECTED_BYTES`],
     /// lowered only by a test.
     projection_bytes: std::sync::atomic::AtomicU64,
+    /// Whether a fold writes each row's sparse pairs (M193): always, but for a test that
+    /// folds a segment as a build before M193 did.
+    sparse_rows: std::sync::atomic::AtomicBool,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -468,6 +471,7 @@ impl<S: BlobStore + 'static> Api<S> {
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
             projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
+            sparse_rows: std::sync::atomic::AtomicBool::new(true),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -838,6 +842,7 @@ impl<S: BlobStore + 'static> Api<S> {
                 self.projection_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
+            .with_sparse_rows(self.sparse_rows.load(std::sync::atomic::Ordering::Relaxed))
             .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
@@ -920,6 +925,14 @@ impl<S: BlobStore + 'static> Api<S> {
                 })?;
         *pool = Some(created.clone());
         Ok(created)
+    }
+
+    /// Folds sparse fields without each row's pairs, as a build before M193 did (M193's
+    /// tests), for the engines built after it: set it before a tenant's first request.
+    #[doc(hidden)]
+    pub fn set_sparse_rows_for_test(&self, write: bool) {
+        self.sparse_rows
+            .store(write, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Lowers the bound on a query's projected vector bytes (M191's tests), for the engines
@@ -3327,15 +3340,16 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError>
         .as_array()
         .filter(|a| !a.is_empty())
         .ok_or_else(|| bad("a list of the vector fields to project, [\"vector\"]"))?;
-    // M190: a per-query bound, the most fields one document holds.
-    if names.len() > 1 + MAX_NAMED_FIELDS {
+    // M190: a per-query bound, the most fields one document holds; M193: `sparse` beside them.
+    let dense = names.len() - usize::from(names.iter().any(|n| n.as_str() == Some(SPARSE_FIELD)));
+    if dense > 1 + MAX_NAMED_FIELDS {
         return Err(bad(&format!(
-            "{} names: at most {} fields are projected, `vector` and {MAX_NAMED_FIELDS} named",
-            names.len(),
+            "{dense} names: at most {} fields are projected, `vector` and {MAX_NAMED_FIELDS} \
+             named, beside `sparse`",
             1 + MAX_NAMED_FIELDS
         )));
     }
-    let (mut vector, mut named) = (false, Vec::new());
+    let (mut vector, mut named, mut sparse) = (false, Vec::new(), false);
     for n in names {
         let name = n
             .as_str()
@@ -3347,10 +3361,12 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError>
             vector = true;
             continue;
         }
-        if name == "sparse" {
-            return Err(bad(
-                "`sparse` is not projected: a sparse field's vectors are later",
-            ));
+        if name == SPARSE_FIELD {
+            if sparse {
+                return Err(bad(&format!("{name:?} is named twice")));
+            }
+            sparse = true;
+            continue;
         }
         let name = named_field(name).map_err(|e| bad(&e.message))?;
         if named.contains(&name) {
@@ -3388,6 +3404,7 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError>
         encoding,
         vector,
         named,
+        sparse,
     }))
 }
 
@@ -3397,12 +3414,23 @@ struct Projecting {
     encoding: VectorEncoding,
     vector: bool,
     named: Vec<String>,
+    /// The sparse field's pairs (M193).
+    sparse: bool,
 }
 
 impl Projecting {
     /// A row's `vector`, spelled, when the query names it.
     fn vector(&self, v: Option<&[f32]>) -> Option<types::VectorOut> {
         self.vector.then(|| self.encoding.spell(v)).flatten()
+    }
+
+    /// A row's sparse pairs (M193) when the query names `sparse` and the row holds them.
+    fn sparse<'a>(
+        &self,
+        pairs: Option<impl IntoIterator<Item = (&'a str, f32)>>,
+    ) -> Option<std::collections::BTreeMap<String, f32>> {
+        let pairs = pairs.filter(|_| self.sparse)?;
+        Some(pairs.into_iter().map(|(k, w)| (k.to_owned(), w)).collect())
     }
 
     /// A row's named fields, spelled; `None`, never `{}`, when it holds none of them.
@@ -3875,6 +3903,7 @@ async fn run<E: BlobStore>(
                         consistency,
                         p.vector,
                         &p.named,
+                        p.sparse,
                     )
                     .await?
             } else {
@@ -3907,6 +3936,14 @@ async fn run<E: BlobStore>(
                         vector: projected.as_ref().and_then(|p| p.vector(stored_vector(&d))),
                         vectors: projected.as_ref().and_then(|p| {
                             p.fields(d.vectors.iter().map(|(n, f)| (&**n, f.as_dense())))
+                        }),
+                        sparse: projected.as_ref().and_then(|p| {
+                            p.sparse(d.vectors.values().find_map(|f| match f {
+                                pstore_format::VectorField::Sparse(pairs) => {
+                                    Some(pairs.iter().map(|(k, w)| (k.as_str(), w.get())))
+                                }
+                                pstore_format::VectorField::Dense(_) => None,
+                            }))
                         }),
                         attributes: selected(req, &d.attrs),
                         id: d.id,
@@ -3949,9 +3986,9 @@ async fn run<E: BlobStore>(
         // and a projection's, in the same fetch.
         // M190: and its named fields.
         None if diversify.is_some() || projected.is_some() => {
-            let (vector, named) = projected
-                .as_ref()
-                .map_or((false, &[][..]), |p| (p.vector, p.named.as_slice()));
+            let (vector, named, sparse) = projected.as_ref().map_or((false, &[][..], false), |p| {
+                (p.vector, p.named.as_slice(), p.sparse)
+            });
             engine
                 .query_split_projected(
                     index,
@@ -3963,6 +4000,7 @@ async fn run<E: BlobStore>(
                     peers.map(|p| p as &dyn pstore_engine::Peers),
                     vector || diversify.is_some(),
                     named,
+                    sparse,
                 )
                 .await?
         }
@@ -4079,6 +4117,13 @@ async fn run<E: BlobStore>(
                     .and_then(|e| e.vector(p.vector.as_deref())),
                 vectors: projected.as_ref().and_then(|e| {
                     e.fields(p.fields.iter().map(|(n, vs)| (n.as_str(), vs.as_slice())))
+                }),
+                sparse: projected.as_ref().and_then(|e| {
+                    e.sparse(
+                        p.sparse
+                            .as_ref()
+                            .map(|pairs| pairs.iter().map(|(k, w)| (k.as_str(), *w))),
+                    )
                 }),
                 highlight: marks
                     .as_ref()

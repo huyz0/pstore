@@ -57,6 +57,29 @@ HEAD gains a trailing section. A process older than M166 refuses a HEAD that car
 so every node is upgraded before copies are offered. Evidence is in
 [M166 verification](milestones/M166/VERIFIED.md).
 
+## M193: sparse vectors in results and exports
+
+`include_vectors` admits `"sparse"`, and a row holding the field gains `sparse` beside
+`id`, spelled as a write's `sparse` is.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector", "sparse"]}
+```
+
+- Each weight is the f16 the index stores, as a JSON number, keys in byte order; a signed
+  zero is `-0.0`. `vector_encoding` does not apply. A row without the field has no
+  `sparse` key, never `{}`.
+- `sparse` is named once, beside up to 9 other names. `vectors.sparse` stays refused.
+- It costs M191's one round more, shared: naming `sparse` and a multi-vector field is one
+  round, not two. A `rank_by` order naming it is 5 rounds. Its pairs count toward M191's
+  64 MiB bound, as stored (4 bytes and the key's a pair).
+- **Segments folded before M193** do not store a row's pairs. A query projecting `sparse`
+  whose results include any row of such a segment fails `422 bad_query` naming the field;
+  a compaction or a reindex rewrites it. Exports of an old index need one first. A segment
+  with no sparse field is unaffected.
+- A fold writes a new section, which builds before M193 skip. A build before M193 that
+  compacts writes a segment without it, which refuses again until the next rewrite.
+
 ## M191: folded multi-vector fields in results and exports
 
 `include_vectors` now answers every named dense field, whatever layout its segment folded
@@ -82,7 +105,7 @@ it in. Nothing fails for a layout any more.
 ```
 
 - Up to 9 names, each once: `vector` and named fields in any mix. `sparse` is not projected
-  yet; a name a named field could not have is `400`. A name the index has no field of is
+  yet (M193 projects it); a name a named field could not have is `400`. A name the index has no field of is
   admitted and answers nothing.
 - A row's `vectors` holds only the fields it has, each its vectors in the order written,
   spelled by `vector_encoding`, and in the index's metric space as `vector` is. No fields,

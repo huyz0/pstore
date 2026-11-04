@@ -561,7 +561,8 @@ async fn names_that_cannot_be_projected_are_refused_naming_the_rule() {
         ),
         (json!(["a\u{0}b"]), "may not contain a NUL byte"),
         (json!(["title$fde"]), "may not end `$fde`"),
-        (json!(["sparse"]), "`sparse` is not projected"),
+        // M193 projects `sparse`, refused only as every name is.
+        (json!(["sparse", "sparse"]), "\"sparse\" is named twice"),
         (json!(["title", "title"]), "\"title\" is named twice"),
         (json!(["vector", "vector"]), "\"vector\" is named twice"),
         (json!([1]), "1 is not a vector field's name"),

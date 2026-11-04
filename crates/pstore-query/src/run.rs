@@ -110,6 +110,13 @@ pub enum QueryError {
     /// the first such field by name. A typo, or a field never declared.
     #[error("no segment carries the text field `{0}`")]
     UnknownTextField(String),
+    /// A projected sparse field held by a segment folded before its rows' pairs were stored
+    /// (M193): only its postings say what a row holds, and they are never read for it.
+    #[error(
+        "include_vectors: `{0}` is held by a segment folded before its rows' pairs were \
+         stored: a compaction or a reindex rewrites it"
+    )]
+    SparseUnstored(String),
     /// The projected vectors of a varying layout the hits hold would read more bytes than the
     /// query may (M191): refused before any of them is read.
     #[error(
@@ -137,6 +144,8 @@ pub struct Projection<'a> {
     pub folded: usize,
     /// The most bytes the varying fields' vectors may read (M191).
     pub max_bytes: u64,
+    /// The sparse field's pairs (M193), read in the segments before `folded` only.
+    pub sparse: bool,
 }
 
 impl Default for Projection<'_> {
@@ -148,6 +157,7 @@ impl Default for Projection<'_> {
             named: &[],
             folded: 0,
             max_bytes: u64::MAX,
+            sparse: false,
         }
     }
 }
@@ -1590,8 +1600,14 @@ async fn mask<S: BlobStore>(
 pub(crate) type Spans =
     std::collections::BTreeMap<(usize, usize), Vec<(String, std::ops::Range<u64>)>>;
 
-/// Each row's, by `(segment, row)`, varying fields' vectors as [`read_spans`] read them.
-pub(crate) type Varying = std::collections::BTreeMap<(usize, usize), Vec<(String, Vec<Vec<f32>>)>>;
+/// Each row's, by `(segment, row)`, varying fields as [`read_spans`] read them: dense
+/// vectors, or a sparse field's pairs (M193).
+pub(crate) type Varying =
+    std::collections::BTreeMap<(usize, usize), Vec<(String, pstore_format::VectorField)>>;
+
+/// The rows, by `(segment, row)`, of segments that hold a sparse field but no `SparseRows`
+/// (folded before M193), and that field's name: a projection of it refuses them.
+pub(crate) type Stale = std::collections::BTreeMap<(usize, usize), String>;
 
 /// The vectors' ranges [`read_spans`] reads in one segment: each row, its field and range.
 type Wanted<'a> = Vec<(usize, &'a String, std::ops::Range<u64>)>;
@@ -1603,6 +1619,8 @@ struct Known {
     docs: std::collections::BTreeMap<(usize, usize), Document>,
     /// Each row's varying fields' byte ranges, by field: read by [`read_spans`] for the hits.
     spans: Spans,
+    /// Rows whose sparse pairs cannot be read (M193).
+    stale: Stale,
 }
 
 impl Known {
@@ -1621,6 +1639,7 @@ impl Known {
     fn extend(&mut self, other: Self) {
         self.docs.extend(other.docs);
         self.spans.extend(other.spans);
+        self.stale.extend(other.stale);
     }
 }
 
@@ -1648,7 +1667,7 @@ async fn fetch_rows<S: BlobStore>(
             // ⚠️ The segment is **already open** — `run` opened every one of them in its
             // first round. Re-opening here is what made depth `3 + 2N`.
             let (Some(t), Some(o)) = (targets.get(*segment), opened.get(*segment)) else {
-                return Ok::<_, QueryError>((*segment, Vec::new(), Vec::new()));
+                return Ok::<_, QueryError>((*segment, Vec::new(), Vec::new(), None));
             };
             // ⚠️ Only a segment whose `Vectors` section IS the `vector` field: another dense
             // field in it, or several vectors a row, would read as misaligned floats.
@@ -1677,11 +1696,20 @@ async fn fetch_rows<S: BlobStore>(
                     let got = o.segment.field_spans(store, &t.segment, name, rows).await?;
                     Ok::<_, QueryError>((name, got))
                 }));
-            let (docs, vectors, named, spans) = futures_util::future::try_join4(
+            // M193: the sparse field's offsets too, in the same round.
+            let sparse = sparse_spans(
+                store,
+                t,
+                &o.segment,
+                rows,
+                with_vectors.sparse && *segment < with_vectors.folded,
+            );
+            let (docs, vectors, named, spans, sparse) = futures_util::future::try_join5(
                 async { Ok(o.segment.rows_at(store, &t.segment, rows).await?) },
                 async { Ok(vectors.await?) },
                 named,
                 spans,
+                sparse,
             )
             .await?;
             let mut docs = docs;
@@ -1702,31 +1730,91 @@ async fn fetch_rows<S: BlobStore>(
                     }
                 }
             }
+            let spans: Vec<(String, _)> = spans
+                .into_iter()
+                .map(|(name, got)| (name.clone(), got))
+                .collect();
             Ok((
                 *segment,
                 rows.iter().copied().zip(docs).collect::<Vec<_>>(),
                 spans,
+                sparse,
             ))
         },
     ))
     .await?;
     let mut out = Known::new();
-    for (segment, pairs, spans) in resolved {
-        for (row, doc) in pairs {
+    for (segment, pairs, spans, sparse) in resolved {
+        for (row, doc) in &pairs {
             if let Some(doc) = doc {
-                out.docs.insert((segment, row), doc);
+                out.docs.insert((segment, *row), doc.clone());
             }
         }
-        for (name, got) in spans {
-            for (row, span) in got {
-                out.spans
-                    .entry((segment, row))
-                    .or_default()
-                    .push((name.clone(), span));
-            }
-        }
+        held(
+            &mut out.spans,
+            &mut out.stale,
+            segment,
+            spans,
+            sparse,
+            || pairs.iter().map(|(row, _)| *row),
+        );
     }
     Ok(out)
+}
+
+/// The sparse field's rows' ranges in `segment` (M193), when `asked` and the segment holds
+/// one: `Some((name, None))` for a segment folded before `SparseRows`.
+pub(crate) async fn sparse_spans<S: BlobStore>(
+    store: &S,
+    t: &Target,
+    segment: &Segment,
+    rows: &[usize],
+    asked: bool,
+) -> Result<Option<SparseHeld>, QueryError> {
+    let Some(name) = segment.sparse_field().filter(|_| asked) else {
+        return Ok(None);
+    };
+    let got = segment.sparse_spans(store, &t.segment, rows).await?;
+    Ok(Some((name.to_owned(), got)))
+}
+
+/// A segment's sparse field and its rows' ranges, or `None` for no `SparseRows` (M193).
+pub(crate) type SparseHeld = (
+    String,
+    Option<std::collections::BTreeMap<usize, std::ops::Range<u64>>>,
+);
+
+/// Records one segment's varying fields' ranges and its sparse field's (M191, M193) into
+/// `spans`, or each of `rows` into `stale` when the sparse field cannot be read.
+pub(crate) fn held<I: Iterator<Item = usize>>(
+    spans: &mut Spans,
+    stale: &mut Stale,
+    segment: usize,
+    varying: Vec<(
+        String,
+        std::collections::BTreeMap<usize, std::ops::Range<u64>>,
+    )>,
+    sparse: Option<SparseHeld>,
+    rows: impl FnOnce() -> I,
+) {
+    let mut varying = varying;
+    match sparse {
+        Some((name, Some(got))) => varying.push((name, got)),
+        Some((name, None)) => {
+            for row in rows() {
+                stale.insert((segment, row), name.clone());
+            }
+        }
+        None => {}
+    }
+    for (name, got) in varying {
+        for (row, span) in got {
+            spans
+                .entry((segment, row))
+                .or_default()
+                .push((name.clone(), span));
+        }
+    }
 }
 
 /// The projected named fields `segment` holds as dense ones (M190): those it stores at one
@@ -1758,8 +1846,13 @@ pub(crate) async fn read_spans<S: BlobStore>(
     segments: &[&Segment],
     at: &[(usize, usize)],
     spans: &Spans,
+    stale: &Stale,
     max_bytes: u64,
 ) -> Result<Varying, QueryError> {
+    // M193: a row whose sparse pairs a segment never stored refuses before anything is read.
+    if let Some(field) = at.iter().find_map(|key| stale.get(key)) {
+        return Err(QueryError::SparseUnstored(field.clone()));
+    }
     let mut per_segment: std::collections::BTreeMap<usize, Wanted<'_>> =
         std::collections::BTreeMap::new();
     let mut bytes = 0u64;
@@ -1793,12 +1886,18 @@ pub(crate) async fn read_spans<S: BlobStore>(
                     .map_err(pstore_format::FormatError::from)?;
                 let mut out = Vec::with_capacity(wanted.len());
                 for ((row, name, _), raw) in wanted.into_iter().zip(bufs) {
-                    let dims = segment.field_layout(name).map_or(0, |f| f.dims as usize);
-                    out.push((
-                        (i, row),
-                        name.clone(),
-                        pstore_format::decode_vectors(&raw, dims),
-                    ));
+                    let field = match segment.field_layout(name) {
+                        // M193: a sparse field's range holds its pairs.
+                        Some(f) if f.kind == 1 => pstore_format::VectorField::Sparse(
+                            pstore_format::sparse::decode_pairs(&raw)
+                                .ok_or(FormatError::Corrupt("sparse rows"))?,
+                        ),
+                        f => pstore_format::VectorField::Dense(pstore_format::decode_vectors(
+                            &raw,
+                            f.map_or(0, |f| f.dims as usize),
+                        )),
+                    };
+                    out.push(((i, row), name.clone(), field));
                 }
                 Ok::<_, QueryError>(out)
             })
@@ -1839,14 +1938,14 @@ async fn resolve_rows<S: BlobStore>(
         &segments,
         &at,
         &known.spans,
+        &known.stale,
         with_vectors.max_bytes,
     )
     .await?;
     for (key, fields) in read {
         if let Some(doc) = known.docs.get_mut(&key) {
-            for (name, vs) in fields {
-                doc.vectors
-                    .insert(name.as_str().into(), pstore_format::VectorField::Dense(vs));
+            for (name, field) in fields {
+                doc.vectors.insert(name.as_str().into(), field);
             }
         }
     }
