@@ -472,6 +472,29 @@ async fn the_pairs_count_toward_the_bound_with_the_varying_fields() {
 }
 
 #[tokio::test]
+async fn unfolded_rows_pairs_are_answered_from_memory_outside_the_bound() {
+    // Criterion 3: an unfolded row's pairs are in memory, never read from its fresh segment
+    // (which a fold's builder gives the section), so they count nothing against the bound.
+    let store = MemoryStore::new();
+    let a = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
+    write(&a, "f", json!({"documents": docs(&rows(0, 20, 7, |_| 0))})).await;
+    fold(&a).await;
+    let cold = Api::unsecured(Accounted::new(store.clone()), LaneId(2)).unwrap();
+    cold.set_projection_bytes_for_test(0);
+    let fresh = rows(20, 23, 8, |i| 1 + i % 3);
+    write(&cold, "f", json!({"documents": docs(&fresh)})).await;
+    let q = json!({"vector": vec![1.0_f32; 8], "top_k": 23, "exact": true,
+        "include_vectors": ["sparse"]});
+    let (s, b) = ask(&cold, "f", &q).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b).len(), 23, "{b}");
+    for r in b["results"].as_array().unwrap() {
+        let id = r["id"].as_str().unwrap();
+        assert_eq!(sparse_of(r), fresh.get(id).and_then(stored), "{id}: {r}");
+    }
+}
+
+#[tokio::test]
 async fn a_segment_folded_without_the_section_refuses_until_rewritten() {
     // Criterion 3: a segment as a build before M193 folded it.
     let store = MemoryStore::new();

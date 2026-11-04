@@ -35,6 +35,7 @@ run is claimed.
    green. Killed: the order never asking for the pairs, unfolded order rows without them.
 3. `vectors_sparse::the_pairs_count_toward_the_bound_with_the_varying_fields`,
    `vectors_sparse::a_segment_folded_without_the_section_refuses_until_rewritten`,
+   `vectors_sparse::unfolded_rows_pairs_are_answered_from_memory_outside_the_bound`,
    `vectors_named::names_that_cannot_be_projected_are_refused_naming_the_rule`,
    `vectors_out::what_cannot_be_projected_is_refused_naming_the_rule`, and
    `sparse_rows::a_pages_pairs_are_read_and_unreadable_ones_refused` (query) and
@@ -43,7 +44,10 @@ run is claimed.
    bound, `>` as `>=`, an old segment answered as no field, its rows not recorded as
    unreadable, refused only for rows holding spans, the refusal answered as a 500 (ranked
    and order), the hidden hook ignored, `sparse` counted toward the name cap, `sparse`
-   admitted twice, a corrupt row's pairs answered as none, an empty span read. A
+   admitted twice, a corrupt row's pairs answered as none, an empty span read. And (CI's mutants on the PR
+   found it, then the test was added and killed it here) the fresh segment's pairs read
+   rather than taken from memory: unfolded hits projecting `sparse` are admitted under a
+   bound of 0. A
    compaction has no path of its own: it builds through the fold's `assemble`, so the
    section never written is the compaction dropping it too, and the test's compaction of
    an old segment with a new one answers every row's pairs.
