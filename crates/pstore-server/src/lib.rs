@@ -188,6 +188,8 @@ struct Slot<S> {
 struct Registry {
     /// `PSTORE_ENGINES`: past it, idle engines are dropped. `0` for unbounded.
     cap: usize,
+    /// `PSTORE_INDEXES_PER_TENANT` (M169): the most indexes a tenant may hold. `0` for none.
+    index_limit: usize,
     /// Whether a reap loop runs: only then does a reapable commit keep an engine.
     reaping: bool,
     /// `PSTORE_APPLIED_WRITES=1` (M129): every node of the deployment folds applied writes.
@@ -800,9 +802,9 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
-        let (recheck, keys, filter_rows) = {
+        let (recheck, keys, filter_rows, index_limit) = {
             let r = self.registry_mut();
-            (r.lane_recheck, r.idempotency, r.filter_rows)
+            (r.lane_recheck, r.idempotency, r.filter_rows, r.index_limit)
         };
         let params = *self
             .index_params
@@ -835,7 +837,8 @@ impl<S: BlobStore + 'static> Api<S> {
             .with_projection_bytes(
                 self.projection_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),
-            );
+            )
+            .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
@@ -1026,6 +1029,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// the eviction loop drops the least recently used idle engines.
     pub fn limit_engines(&self, cap: usize) {
         self.registry_mut().cap = cap;
+    }
+
+    /// Refuses a request that would give a tenant more than `limit` indexes, `0` for unbounded
+    /// (M169, `PSTORE_INDEXES_PER_TENANT`). Meant to be called once at startup: an engine
+    /// already built keeps the limit it was built with.
+    pub fn limit_indexes(&self, limit: usize) {
+        self.registry_mut().index_limit = limit;
     }
 
     /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
@@ -1342,6 +1352,10 @@ impl From<EngineError> for ApiError {
             }
             EngineError::IndexReadOnly(_) => {
                 Self::new(StatusCode::CONFLICT, "index_read_only", e.to_string())
+            }
+            // M169: the tenant's state refuses it, and a drop is the remedy.
+            EngineError::IndexLimit { .. } => {
+                Self::new(StatusCode::CONFLICT, "index_limit", e.to_string())
             }
             // M162: sized before any segment read; fewer queries fit.
             EngineError::RecallTooLarge { .. } => {
@@ -6105,6 +6119,9 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// The engine registry's cap, from `PSTORE_ENGINES` (M26): 10 000 by default, `0` for none.
     pub engines: usize,
+    /// The most indexes a tenant may hold, from `PSTORE_INDEXES_PER_TENANT` (M169): 10 000 by
+    /// default, `0` for none.
+    pub indexes_per_tenant: usize,
     /// The servers a query's vector legs may run on, from `PSTORE_PEERS` (M54).
     pub peers: Option<PeerConfig>,
     /// Or a SWIM membership to take them from, `PSTORE_PEER_GOSSIP_*` (M56).
@@ -6114,6 +6131,10 @@ pub struct Config {
     /// `PSTORE_EXTERNAL_SOURCES=allow` and `PSTORE_EXTERNAL_PREFIXES`.
     pub external_sources: Option<Vec<String>>,
 }
+
+/// `PSTORE_INDEXES_PER_TENANT` unset (M169): below M7b's ~29,700, where a whole-HEAD read
+/// stops being cheaper than a round trip, and above the thousands `scripts/index-scale.sh` checks.
+pub const DEFAULT_INDEXES_PER_TENANT: usize = 10_000;
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
 /// through its S3 interoperability endpoint.
@@ -6310,6 +6331,9 @@ pub enum ConfigError {
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
+    /// `PSTORE_INDEXES_PER_TENANT` that is not a count (M169).
+    #[error("PSTORE_INDEXES_PER_TENANT={0} is refused: a count of indexes, 0 for unbounded")]
+    IndexesPerTenant(String),
     /// A `PSTORE_EXTERNAL_SOURCES` that is neither `allow` nor `off` (M86).
     #[error("PSTORE_EXTERNAL_SOURCES={0} is refused: `allow` or `off`")]
     ExternalSources(String),
@@ -6383,6 +6407,10 @@ impl Config {
             engines: match get("PSTORE_ENGINES") {
                 None => 10_000,
                 Some(v) => v.parse().map_err(|_| ConfigError::Engines(v))?,
+            },
+            indexes_per_tenant: match get("PSTORE_INDEXES_PER_TENANT") {
+                None => DEFAULT_INDEXES_PER_TENANT,
+                Some(v) => v.parse().map_err(|_| ConfigError::IndexesPerTenant(v))?,
             },
         })
     }

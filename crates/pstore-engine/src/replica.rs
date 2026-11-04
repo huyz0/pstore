@@ -368,6 +368,7 @@ impl<S: BlobStore> Engine<S> {
                     dest.to_owned(),
                 )));
             }
+            self.refuse_past_limit(now, dest)?;
             next.replications.insert(
                 dest.to_owned(),
                 Replication {
