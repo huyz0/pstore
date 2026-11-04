@@ -92,9 +92,6 @@ No `cargo mutants` run is claimed. CI's mutation shards are the check.
    `scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95` ran here (see above).
    `scripts/mutants.sh` is left to CI's shards.
 
-Code review (`scripts/review.sh context m194`) passed in round 1 with no blocker or major. Its
-two gate failures were not the diff's: the link check ran on the staged tree before this file
-was added, and the full `cargo test` fails only on the two IPv6 tests this container cannot
-run. Of three minors, two were wording, and the spec is amended for them (AC 3's earlier copy
-is a failed one; AC 5 bounds by the wall clock). The third is left as a known choice: an ended
-record holding 0, which only a corrupt writer could produce, reports `Some(0)`.
+
+Code review: the review packet was prepared (`scripts/review.sh context m194`), and the review is
+pending. This line is replaced by its outcome before merge.

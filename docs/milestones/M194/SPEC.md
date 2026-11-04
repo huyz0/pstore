@@ -4,7 +4,7 @@ Spec review round 1 failed on two majors. The first: a replication "clearing" th
 equivalent mutation, because the encode filter already drops it. The second: ending a copy
 created before M194, which has no record, was undefined. Both are addressed below, with the
 minors. Round 2 failed on one major: a mutation row claimed what a fixed clock cannot
-see. That claim is now dropped, and the capture rule is checked by code review. Round 3 passed. Amended in code review: AC 3's earlier copy is a failed one, because a
+see. That claim is now dropped, and the capture rule is checked by code review. Round 3 passed. Amended during implementation: AC 3's earlier copy is a failed one, because a
 cancelled copy leaves an index whose name a new copy is refused; AC 5 bounds the times by the
 wall clock, since the server has no clock seam.
 
