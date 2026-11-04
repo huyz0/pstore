@@ -19,7 +19,8 @@ pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
     COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, Dicts, ExternalKind, ExternalRef, Head,
-    HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
+    HeadAt, IndexSchema, MAX_TEXTS, Metric, Reindex, ReplicaSource, Replication, SegmentRef,
+    TimeTravel,
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
