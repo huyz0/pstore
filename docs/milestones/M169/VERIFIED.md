@@ -29,7 +29,9 @@ treated as new; the door refusing from its cache alone; the door reading on ever
 door unchecked; externals or replications left out of the count; create, branch, replication,
 external register and external copy each unchecked; the server's error arm removed; the
 server's limit not applied; the default changed. Not tested: the limit re-checked when an
-external register loses its CAS, which no test makes lose. No `cargo mutants` run is claimed.
+external register loses its CAS, which no test makes lose. CI's `cargo mutants` diff run found one survivor, `>` as `>=` in `remember_counted`: an
+equal epoch is the same HEAD, so it is equivalent and excluded by line and column in
+`.cargo/mutants.toml`, with its reason.
 
 1. PASS: `a_create_past_the_limit_is_refused`: at three indexes a create is `IndexLimit` and
    HEAD's epoch and names are unchanged; a create whose first attempt read two indexes, and
