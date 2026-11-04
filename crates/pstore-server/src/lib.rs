@@ -3984,8 +3984,9 @@ async fn run<E: BlobStore>(
         }
         // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.) M179:
         // and a projection's, in the same fetch.
-        // M190: and its named fields.
-        None if diversify.is_some() || projected.is_some() => {
+        // M190: and its named fields. M193: one arm, because asking for nothing is the plain
+        // query: the guard that chose between the two had no input to tell them apart.
+        None => {
             let (vector, named, sparse) = projected.as_ref().map_or((false, &[][..], false), |p| {
                 (p.vector, p.named.as_slice(), p.sparse)
             });
@@ -4001,19 +4002,6 @@ async fn run<E: BlobStore>(
                     vector || diversify.is_some(),
                     named,
                     sparse,
-                )
-                .await?
-        }
-        None => {
-            engine
-                .query_split_as(
-                    index,
-                    &legs,
-                    filter.as_ref(),
-                    fusion,
-                    top_k,
-                    consistency,
-                    peers.map(|p| p as &dyn pstore_engine::Peers),
                 )
                 .await?
         }
