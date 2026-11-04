@@ -382,6 +382,22 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
 - ⚠️ **Polling costs requests over time.** Each held tenant reads each of its distinct sources'
   HEADs once per sync interval -- one GET a minute when idle -- billed to the replica's tenant.
   Every worker also reads one register shard per `SCAN`, with or without work.
+- **Bounded lag, opt-in** ([M192](milestones/M192/SPEC.md)). With
+  `PSTORE_REPLICATION_MAX_LAG_S=L`, the worker holding a replica folds its source every `L/2`
+  and syncs at once, so a write the source acknowledged reaches the replica within about `L`
+  even when the source's own fold would wait an hour. A source in a **remote** bucket is not
+  bounded: its credentials are read-only. `GET …/replication` adds `max_lag_ms`, `fresh_ms`
+  (the start of the last source fold the replica is current through), `lag_ms` and
+  `lag_exceeded`; `/metrics` adds `pstore_replication_source_fold_total{outcome}`,
+  `pstore_replication_lag_exceeded_total` and the gauge `pstore_replication_lagging`.
+  ⚠️ The folds cost requests over time, **billed to the source tenant** (about 4 GETs per
+  `L/2` per idle source with 2 lanes), and a small `L` makes small segments for compaction.
+  `fresh_ms` is a status note written at most once per `TTL/3`, so `lag_ms` can read high by
+  that much; `lag_exceeded` is written at once.
+- **Sync now.** `POST /v1/indexes/{dest}/replication/sync` folds the source (when it is in this
+  bucket) and syncs before answering, with `source_folded` and `fresh_ms`: read-your-writes on
+  a replica, without waiting for the worker. `409 replication_paused` on a paused job, `503`
+  when the fold or the sync fails. It needs `write` scope and the source's authority.
 - ⚠️ **Every server must name the same sources.** A worker without the store a job names
   records `unknown_store` in that job's `last_error` and keeps the claim.
 - Source reads require signed authority for the exact tenant/store pair, or
@@ -585,6 +601,7 @@ Fleet quotas remain incomplete: `pstore-meter` exists and is not wired.
 | `PSTORE_REPLICATION_MAX` | `64` | Tenants one worker holds at most. |
 | `PSTORE_INDEXES_PER_TENANT` | `10000` | The most indexes one tenant may hold (M169, above); `0` for no cap. |
 | `PSTORE_REPLICATION_IDLE_S` | `60` | The sync interval of a tenant whose sources do not change. |
+| `PSTORE_REPLICATION_MAX_LAG_S` | — | Bounds a replica's lag behind a source in this bucket ([M192](milestones/M192/SPEC.md)): the worker folds the source every half of it. At least `2`. Set it on every server. |
 | `PSTORE_REPLICATION_SHARDS` | `64` | The register's shard count, **fixed when the register is first created**: about 2,000 tenants with jobs per shard. |
 | `PSTORE_SOURCES` | — | Comma-separated names of remote source stores, each configured by the variables below. |
 | `PSTORE_SOURCE_<NAME>_ENDPOINT` / `_BUCKET` | — | Required for each name. |

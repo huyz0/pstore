@@ -119,6 +119,18 @@ pub struct SyncState {
 }
 
 impl SyncState {
+    /// M192: each running replication's source, by dest, copies (M166) left out: `None` until
+    /// a sync has read the plan.
+    #[must_use]
+    pub fn sources(&self) -> Option<BTreeMap<String, ReplicaSource>> {
+        self.plan.as_ref().map(|p| {
+            p.iter()
+                .filter(|(d, _)| !self.once.contains(*d))
+                .map(|(d, r)| (d.clone(), r.source.clone()))
+                .collect()
+        })
+    }
+
     /// Forgets the plan, so the next sync re-reads the dest HEAD: for a holder that saw the
     /// register's generation change.
     pub fn invalidate(&mut self) {
@@ -572,10 +584,10 @@ impl<S: BlobStore> Engine<S> {
 
     /// One sync of every running replication of this tenant. See the spec's § Sync.
     ///
-    /// ⚠️ **One at a time per engine.** Two concurrent calls derive the same copy keys (same
-    /// lane, same epoch), and one burying a key the other is about to commit lets a GC reap it
-    /// -- the lane-key hazard `bury_abandoned` documents for compaction. The worker runs one
-    /// sync per tenant at a time; two processes have two lanes.
+    /// ⚠️ **One at a time per engine**, by its own gate (M192). Two concurrent calls derive the
+    /// same copy keys (same lane, same epoch), and one burying a key the other is about to
+    /// commit lets a GC reap it -- the lane-key hazard `bury_abandoned` documents for
+    /// compaction. A second call waits; two processes have two lanes.
     ///
     /// # Errors
     /// Only what stops every replication: the dest HEAD unreadable, or every commit lost.
@@ -620,6 +632,8 @@ impl<S: BlobStore> Engine<S> {
         interfere: Option<impl Future<Output = ()> + Send>,
     ) -> Result<Synced, EngineError> {
         require_fencing(&*self.store)?;
+        // M192: held to the end, so a second sync here starts from what this one committed.
+        let _one = self.sync_gate.lock().await;
         let mut out = Synced::default();
         // The plan: the running replications, from the dest HEAD when not already known.
         let mut first = None;
