@@ -38,6 +38,9 @@ No `cargo mutants` run is claimed.
    `without_a_bound_it_waits_for_the_fold`: without the bound it does not within 100 s.
 2. PASS: `an_idle_source_stays_bounded`: after 300 idle seconds a write still arrives within
    `L`, and the source was folded 55-70 times in ~310 s (every `L/2`).
+   `a_busy_source_is_folded_every_half_of_the_bound_not_every_sync`: with a write every second
+   and the replica syncing every second, 5-7 source folds in 30 s. Added after CI's mutation
+   shard found "fold at every sync" missed; that mutant now fails it (30 folds).
 3. PASS: `status_reports_the_lag`: `max_lag_ms` 10,000, `fresh_ms` set, `lag_ms` within `L`
    and advancing with the clock, `lag_exceeded` false. `a_remote_source_is_not_bounded`:
    `max_lag_ms` and `fresh_ms` null, the remote write not folded, no source fold counted.

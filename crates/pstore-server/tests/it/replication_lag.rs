@@ -569,3 +569,42 @@ fn replication_max_lag_is_validated() {
         );
     }
 }
+
+/// The source is folded every half of the bound and no more often, even while it changes and
+/// the replica syncs every second.
+#[tokio::test(start_paused = true)]
+async fn a_busy_source_is_folded_every_half_of_the_bound_not_every_sync() {
+    let world = World::new();
+    let worker = world.api(2, Some(L));
+    let writer = replicated(&world, &worker).await;
+    let mut w = Worker::default();
+    run(&worker, &mut w, 3).await;
+    let folds = |api: &A| {
+        let api = Arc::clone(api);
+        async move {
+            let mut n = 0;
+            for o in ["folded", "nothing", "failed"] {
+                n += metric(
+                    &api,
+                    &format!("pstore_replication_source_fold_total{{outcome=\"{o}\"}}"),
+                )
+                .await;
+            }
+            n
+        }
+    };
+    let before = folds(&worker).await;
+    let mut synced = 0;
+    for i in 0..30 {
+        write(&writer, 10 + i..11 + i).await;
+        synced += u64::try_from(worker.replication_tick(&mut w).await.synced).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let n = folds(&worker).await - before;
+    assert!((5..=7).contains(&n), "{n} source folds in 30 s");
+    assert!(
+        synced > n,
+        "{synced} syncs, {n} folds: the test needs syncs between folds"
+    );
+    assert!(rows(&worker, "dst").await.len() >= 30);
+}
