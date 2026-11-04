@@ -4,7 +4,9 @@ Spec review round 1 failed on two majors. The first: a replication "clearing" th
 equivalent mutation, because the encode filter already drops it. The second: ending a copy
 created before M194, which has no record, was undefined. Both are addressed below, with the
 minors. Round 2 failed on one major: a mutation row claimed what a fixed clock cannot
-see. That claim is now dropped, and the capture rule is checked by code review. Round 3 passed.
+see. That claim is now dropped, and the capture rule is checked by code review. Round 3 passed. Amended in code review: AC 3's earlier copy is a failed one, because a
+cancelled copy leaves an index whose name a new copy is refused; AC 5 bounds the times by the
+wall clock, since the server has no clock seam.
 
 ## Serves
 Workstream H of [the delivery plan](../../comparisons/turbopuffer-next-plan.md), row
@@ -74,7 +76,7 @@ replication status route.
    none) and is then cancelled reports `None` for both times. A copy cancelled with the clock
    at 0 reports `ended_ms = Some(1)`.
 3. **A record never leaks**:
-   - (engine) A copy into a name whose earlier copy was cancelled reports its own
+   - (engine) A copy into a name whose earlier copy failed reports its own
      `created_ms` and `ended_ms = None`.
    - (engine) A replication created into a name whose earlier copy failed leaves no
      `copy_times` record for that name in HEAD as read back.
@@ -83,9 +85,10 @@ replication status route.
 4. **HEAD** (unit): the section round-trips alone and after every earlier one. A HEAD whose names
    have no record encodes byte-for-byte as M168's. A HEAD cut short never decodes the section.
    A record for a name neither `once` nor `copies` holds is not encoded.
-5. **Server:** with the clock fixed, a copy's `POST` answer and its `GET` report `created_at`
-   as the RFC 3339 form of the create's clock, and `ended_at` as `null` while running. After
-   the sync, `ended_at` is the RFC 3339 form of the finishing commit's clock.
+5. **Server:** a copy's `POST` answer and its `GET` report `created_at` as an RFC 3339
+   millisecond time within the wall-clock bounds of the `POST`, and `ended_at` as `null` while
+   running. After the sync, `ended_at` is such a time between `created_at` and the read. The
+   server has no clock seam, so the bounds stand in for a fixed clock.
 6. **Gates:** fmt, clippy, suite, coverage 95/95, mutants.
 
 ## Test plan

@@ -94,6 +94,10 @@ GET  /v1/indexes/{dest}/copy
   to branch on. `epoch` is the commit that ended it; `source_epoch` the source epoch a
   success holds; `code` is `source_not_found` for the one failure (the source held no
   folded segment, never retried); `last_error` is the worker's latest note while it runs.
+- `created_at` is when the copy was created, and `ended_at` when it ended, `null` while it
+  runs or is paused (M194). Both are RFC 3339 in milliseconds, as an index summary's times
+  are, and each is the wall clock of the node whose commit made it. A pause or resume, or a
+  repeated `POST`, keeps `created_at`. A copy created before M194 reports `null` for both.
 - A success is never partial: `dest` holds every segment of the source at `source_epoch` or
   none. After it, `dest` is an ordinary writable index that answers without the source, its
   tenant's objects or its store.
