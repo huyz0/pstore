@@ -19,14 +19,13 @@ has no wall-clock time and no size: HEAD records neither, and epochs are not tim
 
 After:
 - **HEAD gains one trailing section**, `times`: per index, `(created_ms, written_ms)`,
-  Unix milliseconds, `created_ms` 0 meaning unknown. It follows `keys_since` and forces
-  every optional section before it, by the rule each section since M15.2 follows. When
-  `times` is non-empty, `keys_since` is written as a marker byte (0 absent, 1 present)
-  followed by its value when present, then the `times` count and entries. An empty
-  `times` is never written, so a HEAD without it encodes byte for byte as M147's. The
-  decoder tells the forms apart after the outcomes: exactly 8 bytes left is M147's raw
-  `keys_since`; anything else is the marker form, which with one entry is at least 21
-  bytes. Absent means no index has a time (a HEAD from before M148).
+  Unix milliseconds, `created_ms` 0 meaning unknown. It follows M173's recorded types
+  and forces every optional section before it, by the rule each section since M15.2
+  follows: the recorded types' count is written (0 when none), and so are M152's further
+  text fields' count and `keys_since` (`u64::MAX` for none, as M152 forces it), then the
+  `times` count and entries. An empty `times` is never written, so a HEAD without it
+  encodes byte for byte as before M148. End of buffer after the recorded types means no
+  index has a time (a HEAD from before M148).
 - **The invariant**: the keys of `times` are a subset of the indexes that exist in the
   HEAD being written (an index made before M148 and not written since has none), existence as drop and create decide it (a key of `indexes`,
   `schema_rejects` or `quarantine`). It is enforced in one place, `Head::encode`, which
@@ -63,8 +62,9 @@ After:
   Nothing is read for it beyond the one HEAD the summary already reads.
 
 Not changed: query, write and list behaviour; `updated_epoch`; the request counts of every
-route; HEAD's other sections. Mixed-version clusters: a node from M132 to M147 refuses a
-HEAD with this section as corrupt (its decoder requires the end after `keys_since`), so
+route; HEAD's other sections. Mixed-version clusters: a node from M132 up to M148 refuses
+a HEAD with this section as corrupt (its decoder requires the end after `keys_since`,
+from M152 after the further text fields, or from M173 after the recorded types), so
 every node of a deployment runs M148 before any of them commits; as M129 states for its
 section, that is the operator's step, and rollback after a commit is not supported. A node
 from M129 to M131 does not check for the end: it drops `keys_since` and `times` when it
@@ -90,15 +90,16 @@ re-commits.
 8. Gates: clippy, the workspace suite, coverage 95/95, mutation of the changed code.
 
 ## Test plan
-- Engine: `times_round_trip_beside_keys_since` (6) kills a marker that confuses absent and
-  present `keys_since`, or `times` not forcing the sections before it.
+- Engine: `times_round_trip_beside_keys_since` (6) kills a `keys_since` that confuses
+  absent and present, or `times` not forcing the sections before it.
 - Engine: `fold_sets_written_time_only_for_its_indexes` (2), `compaction_sets_no_time` (2),
   `first_fold_creates_the_time` (3), `an_index_from_before_m148_has_no_created_time` (3),
   `branch_and_drop_times` (3), `times_never_outlive_their_index` (3: delete-only fold,
   discarded quarantine, re-creation) and `a_duplicate_key_moves_no_time` (3) kill each
   setter removed or misplaced, the invariant not enforced, and existence read from the
-  times entry rather than the HEAD. A clock is injected (`Engine::with_clock_for_test`) so (5) can run a
-  process behind the last writer and kill a non-monotonic `max`.
+  times entry rather than the HEAD. A clock is injected (`Engine::set_clock_for_test`) so (5) can run a
+  process behind the last writer and kill a non-monotonic `max`
+  (`a_slow_clock_never_moves_a_time_back`).
 - Server: `summary_reports_times_and_bytes` (1, 4, 7) kills a byte sum that skips a
   segment or reports 0 for an unknown length.
 - A replica test (3) kills a sync that sets no time.

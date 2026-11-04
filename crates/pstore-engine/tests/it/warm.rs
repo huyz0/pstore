@@ -159,8 +159,16 @@ fn doc(id: String, x: f32, full: bool) -> Document {
         d.vectors.insert(
             "s".into(),
             VectorField::Sparse(vec![
-                (3, Impact::new(0.5)),
-                ((x as u32) % 7, Impact::new(0.25)),
+                ("3".to_owned(), Impact::new(0.5)),
+                // M177: dimension 3 once; `x % 7` landing on it moves to 7, unused.
+                (
+                    match (x as u32) % 7 {
+                        3 => 7,
+                        n => n,
+                    }
+                    .to_string(),
+                    Impact::new(0.25),
+                ),
             ]),
         );
         d.attrs.insert(
@@ -242,7 +250,7 @@ async fn every_query(e: &Engine<Cached>, full: bool) {
     }
     let sparse = vec![Prefetch::Sparse {
         field: "s".to_owned(),
-        query: vec![(3, 1.0)],
+        query: vec![("3".to_owned(), 1.0)],
         limit: 5,
     }];
     e.query("idx", &sparse, Fusion::default(), 5).await.unwrap();
@@ -499,8 +507,10 @@ async fn an_index_without_dense_vectors_has_no_centroids_to_ask_for() {
     let docs = (0..THRESHOLD)
         .map(|i| {
             let mut d = Document::new(format!("z{i}"), vec![]);
-            d.vectors
-                .insert("s".into(), VectorField::Sparse(vec![(1, Impact::new(0.5))]));
+            d.vectors.insert(
+                "s".into(),
+                VectorField::Sparse(vec![("1".to_owned(), Impact::new(0.5))]),
+            );
             d
         })
         .collect();

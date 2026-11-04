@@ -6,7 +6,9 @@ mod bundle;
 mod external;
 mod filter_rows;
 mod head;
+mod index_limit;
 pub mod lanes;
+mod recall;
 mod replica;
 
 pub use applied::{
@@ -16,11 +18,12 @@ pub use applied::{
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
-    Dicts, ExternalKind, ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource,
-    Replication, SegmentRef, TimeTravel,
+    COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, Dicts, ExternalKind, ExternalRef, Head,
+    HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
 };
 pub use pstore_format::typed::Kind;
-pub use replica::{ReplicaRefusal, Sources, SyncState, Synced};
+pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
+pub use replica::{CopyState, CopyStatus, ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
@@ -360,6 +363,10 @@ pub enum EngineError {
     /// A request the engine will not carry out, and why (M16): a client's error.
     #[error("{0}")]
     Refused(String),
+    /// A projected field the index's data cannot answer in the query's rounds (M190): the
+    /// request is well formed, and naming the field elsewhere would not mend it.
+    #[error("{0}")]
+    Unprojected(String),
     /// A replication rule refused the request (M22), by name, so a server can map each to
     /// its status.
     #[error("{0}")]
@@ -446,6 +453,28 @@ pub enum EngineError {
     /// quarantine or rows held unfolded, or is an external index's.
     #[error("the index {0:?} exists")]
     IndexExists(String),
+    /// A write, or a drop, named an index its owner made read-only (M149).
+    #[error("the index {0:?} is read-only")]
+    IndexReadOnly(String),
+    /// A request would add an index to a tenant that holds `limit` already (M169).
+    #[error(
+        "the tenant holds {limit} indexes, its limit: a new index is refused until one is dropped"
+    )]
+    IndexLimit {
+        /// The limit the tenant is at.
+        limit: usize,
+    },
+    /// A recall request would score more rows than [`RECALL_ROW_BUDGET`] (M162).
+    #[error("recall would score {rows} rows, over the budget of {budget}")]
+    RecallTooLarge {
+        /// The rows it would score.
+        rows: u64,
+        /// [`RECALL_ROW_BUDGET`].
+        budget: u64,
+    },
+    /// A recall request named an index with no default vectors to search (M162).
+    #[error("the index {0:?} has no default vector field to measure recall over")]
+    RecallNeedsVectors(String),
     /// The epoch asked for cannot be reconstructed.
     #[error(transparent)]
     TimeTravel(#[from] head::TimeTravel),
@@ -1035,6 +1064,10 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
             .quarantine
             .get(index)
             .map_or(0, |q| q.iter().map(|(_, n)| u64::from(*n)).sum()),
+        created_ms: h.times.get(index).map(|t| t.0).filter(|c| *c > 0),
+        written_ms: h.times.get(index).map(|t| t.1),
+        bytes: refs.iter().map(|r| r.len).sum(),
+        read_only: h.read_only.contains(index) || h.replications.contains_key(index),
     })
 }
 
@@ -1252,7 +1285,7 @@ fn patch_attrs(p: Patch) -> Result<BTreeMap<String, pstore_format::Value>, Engin
     {
         return Err(EngineError::Format(format!(
             "patch of {}: attribute `{name}` is reserved",
-            p.id
+            pstore_format::id::shown(&p.id)
         )));
     }
     let mut attrs = p.set;
@@ -1261,7 +1294,9 @@ fn patch_attrs(p: Patch) -> Result<BTreeMap<String, pstore_format::Value>, Engin
         vectors: BTreeMap::new(),
         attrs: attrs.clone(),
     })
-    .map_err(|e| EngineError::Format(format!("patch of {}: {e}", p.id)))?;
+    .map_err(|e| {
+        EngineError::Format(format!("patch of {}: {e}", pstore_format::id::shown(&p.id)))
+    })?;
     attrs.insert(OP_ATTR.to_owned(), pstore_format::Value::Int(OP_PATCH));
     if !p.unset.is_empty() {
         attrs.insert(
@@ -1540,6 +1575,26 @@ fn type_conflict(index: &str, name: &str, expected: Kind, got: Kind) -> EngineEr
         what: "an attribute's type",
         expected: format!("`{name}` as {}", expected.name()),
         got: format!("`{name}` as {}", got.name()),
+    }
+}
+
+/// The name an index's id kind is recorded under among its types (M176): `id`, which no
+/// attribute can take.
+pub const ID_KIND: &str = "id";
+
+/// An id-kind conflict (M176), from the kind known and the row's id, named as written; `None`
+/// is a string.
+fn id_conflict(index: &str, expected: Option<Kind>, id: &str) -> EngineError {
+    let name = |k: Option<Kind>| k.map_or("string", Kind::name);
+    EngineError::SchemaConflict {
+        index: index.to_owned(),
+        what: "the id's kind",
+        expected: format!("`id` as {}", name(expected)),
+        got: format!(
+            "id {:?} as {}",
+            pstore_format::id::shown(id),
+            name(pstore_format::id::kind(id))
+        ),
     }
 }
 
@@ -2017,6 +2072,21 @@ pub struct Answer {
     /// no readable `vector`. **Empty** for every query that did not ask for them, which is
     /// every query but [`Engine::query_split_vectors`].
     pub vectors: Vec<Option<Vec<f32>>>,
+    /// Each hit's projected named fields (M190), in client space, by name: one entry a hit,
+    /// holding only the fields its row has. **Empty** for every query that names none.
+    pub fields: Vec<Fields>,
+}
+
+/// A row's named dense fields, each its vectors in the order written (M190).
+pub type Fields = BTreeMap<String, Vec<Vec<f32>>>;
+
+/// A resolved row's projected vectors (M179, M190): its `vector`, and its named fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Projected {
+    /// Its `vector` in client space, or `None`.
+    pub vector: Option<Vec<f32>>,
+    /// Its named fields in client space; empty when it holds none of those asked.
+    pub fields: Fields,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -2098,6 +2168,9 @@ struct Scope {
     /// The further text fields whose token predicates bind to their own analyzers (M156), by
     /// the same rule.
     texts: BTreeMap<String, FullText>,
+    /// The index's metric, by the rule a relevance query uses (M179): its schema's, else its
+    /// unfolded rows'.
+    metric: Metric,
 }
 
 /// What [`Engine::warm`] did (M21).
@@ -2157,6 +2230,30 @@ pub struct Scored {
     pub scores: Vec<f64>,
 }
 
+/// An index's durable operations no fold has committed yet, across every lane (M160).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    /// The HEAD the counts are relative to.
+    pub epoch: Epoch,
+    /// Operations -- upserts, patches, deletes, by-filter operations -- in the bundles past
+    /// that HEAD's watermarks that name the index.
+    pub rows: u64,
+    /// Their encoded bytes.
+    pub bytes: u64,
+    /// Whether every unfolded bundle was read. `false` past [`PROGRESS_BUNDLES`]: the counts
+    /// are then a lower bound.
+    pub exact: bool,
+    /// Whether HEAD holds the index (M160): one it does not, whose operations are only in
+    /// unfolded bundles, is durable and not yet indexed.
+    pub held: bool,
+}
+
+/// The most unfolded bundles one [`Engine::progress`] reads (M160).
+pub const PROGRESS_BUNDLES: usize = 64;
+
+/// The tail of a bundle read for its directory (M160); a longer directory takes one more.
+const PROGRESS_TAIL: u64 = 4096;
+
 /// What HEAD knows about one index, without reading a single segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStats {
@@ -2178,6 +2275,16 @@ pub struct IndexStats {
     pub rejected_rows: u64,
     /// Of those, the rows still set aside (M25): exportable, until discarded.
     pub quarantined_rows: u64,
+    /// When it came into being, Unix milliseconds (M148): `None` without a recorded time, as
+    /// for an index made before M148.
+    pub created_ms: Option<u64>,
+    /// When a commit last wrote it -- a fold of its rows, its create, branch or sync, never a
+    /// compaction -- Unix milliseconds (M148), or `None` without a recorded time.
+    pub written_ms: Option<u64>,
+    /// The summed lengths of its segment objects (M148), or `None` when one is not recorded.
+    pub bytes: Option<u64>,
+    /// Whether it takes no writes (M149): its owner's flag, or a replica's replication.
+    pub read_only: bool,
 }
 
 /// One writer's view of one tenant.
@@ -2205,11 +2312,20 @@ pub struct Engine<S> {
     /// `schemas` and by the same rule: an early refusal at zero requests, re-read before it
     /// stands.
     replica_names: Mutex<std::collections::BTreeSet<String>>,
+    /// The most indexes this tenant may hold (M169), `0` for unbounded.
+    index_limit: usize,
+    /// The names the last HEAD this process read counts against `index_limit` (M169), by
+    /// `schemas`' rule: monotonic by epoch, an early refusal re-read before it stands. Kept
+    /// only while a limit is set.
+    counted: Mutex<Option<(Epoch, std::collections::BTreeSet<String>)>>,
     /// The attribute types this process's own writes declared and no schema it has read
     /// records yet, per index (M173): what the door reads beside the recorded ones. An entry
     /// leaves when a schema this process reads records its name, whatever kind it records,
     /// or drops its index after the epoch this process had read when it declared it.
     unfolded_types: Mutex<BTreeMap<String, (Epoch, Types)>>,
+    /// M149: the read-only names of the newest HEAD this process read, which the write door
+    /// refuses by, as it refuses a replica's.
+    read_only_names: Mutex<std::collections::BTreeSet<String>>,
     /// The last HEAD a `bounded` read fetched, and the instant **before** its GET (M11.2).
     /// Filled by nothing else, so no other read pays to clone HEAD.
     ///
@@ -2232,6 +2348,9 @@ pub struct Engine<S> {
     lane_recheck: Option<std::time::Duration>,
     /// The most rows one by-filter operation may admit (M136): `filter_rows::FILTER_ROWS`.
     filter_rows: usize,
+    /// The most bytes one query's varying fields' vectors may read (M191), unbounded unless
+    /// the server sets it.
+    projection_bytes: u64,
     /// How many whole rows the last fold's scans kept for deferred operations (M136), for a
     /// test to read.
     kept: std::sync::atomic::AtomicUsize,
@@ -2259,6 +2378,9 @@ pub struct Engine<S> {
     /// M129: an applied request folds, and reads outcome objects, only through this, so
     /// concurrent ones share a fold and its reads.
     fold_gate: tokio::sync::Mutex<()>,
+    /// M192: one replication sync at a time on this engine. Two derive the same copy keys
+    /// (same lane, same epoch), and one burying a key the other commits lets a GC reap it.
+    pub(crate) sync_gate: tokio::sync::Mutex<()>,
     /// M129: one HEAD read refreshes a stale mark for every request waiting on it.
     mark_gate: tokio::sync::Mutex<()>,
     /// M129: the highest-epoch HEAD this engine has read or committed.
@@ -2267,6 +2389,9 @@ pub struct Engine<S> {
     outcome_cache: Mutex<BTreeMap<String, Arc<applied::Decided>>>,
     /// M132: this engine initialises HEAD's `keys_since` on every commit.
     keys_on: std::sync::atomic::AtomicBool,
+    /// M148: the clock a commit stamps index times with, in Unix milliseconds; `None` is
+    /// the system's. Set only by a test, to run a process behind the last writer.
+    clock: Mutex<Option<u64>>,
     /// The memtable sealed into an in-memory segment, and the generation it was built from.
     ///
     /// ⚠️ **The memtable becomes a SEGMENT rather than being scored separately**, so there is
@@ -2401,12 +2526,16 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(None),
             schemas: Mutex::new(None),
             replica_names: Mutex::new(std::collections::BTreeSet::new()),
+            index_limit: 0,
+            counted: Mutex::new(None),
             unfolded_types: Mutex::new(BTreeMap::new()),
+            read_only_names: Mutex::new(std::collections::BTreeSet::new()),
             head_cache: Mutex::new(None),
             flushing: tokio::sync::Mutex::new(()),
             lane_seen: std::sync::atomic::AtomicU64::new(0),
             lane_recheck: None,
             filter_rows: filter_rows::FILTER_ROWS,
+            projection_bytes: u64::MAX,
             kept: std::sync::atomic::AtomicUsize::new(0),
             lane_read: Mutex::new(None),
             waived: std::sync::atomic::AtomicBool::new(false),
@@ -2415,10 +2544,12 @@ impl<S: BlobStore> Engine<S> {
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fold_gate: tokio::sync::Mutex::new(()),
+            sync_gate: tokio::sync::Mutex::new(()),
             mark_gate: tokio::sync::Mutex::new(()),
             observed: Mutex::new(Observed::default()),
             outcome_cache: Mutex::new(BTreeMap::new()),
             keys_on: std::sync::atomic::AtomicBool::new(false),
+            clock: Mutex::new(None),
             fresh: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             // ⚠️ **`replicas: 0`, and it is a measured default rather than the clamp it
             // replaces.** At `Query::default()`'s probe width of 8, replication buys 0.0000
@@ -2483,6 +2614,14 @@ impl<S: BlobStore> Engine<S> {
         self
     }
 
+    /// The most bytes a projection of fields folded at a varying count of vectors a row may
+    /// read in one query (M191); above it the query is refused before any vector is read.
+    #[must_use]
+    pub fn with_projection_bytes(mut self, bytes: u64) -> Self {
+        self.projection_bytes = bytes;
+        self
+    }
+
     fn lane_read(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
         self.lane_read
             .lock()
@@ -2532,7 +2671,15 @@ impl<S: BlobStore> Engine<S> {
             if !names.iter().eq(head.replications.keys()) {
                 *names = head.replications.keys().cloned().collect();
             }
+            let mut flagged = self
+                .read_only_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *flagged != head.read_only {
+                flagged.clone_from(&head.read_only);
+            }
         }
+        self.remember_counted(head);
     }
 
     /// Refuses a write into a replica index (M22): by what this process last read, at zero
@@ -2543,11 +2690,16 @@ impl<S: BlobStore> Engine<S> {
     /// recorded schema. Before, a process that had never read accepted a wrong width, and then
     /// refused every correct write to that index against the wrong row it held.
     async fn refuse_replica(&self, index: &str) -> Result<(), EngineError> {
+        // M149: and a read-only index, by the same rule.
         let named = |e: &Self| {
             e.replica_names
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(index)
+                || e.read_only_names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(index)
         };
         let at = if named(self) {
             head::read(&*self.store, self.tenant).await?
@@ -2567,6 +2719,9 @@ impl<S: BlobStore> Engine<S> {
             return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
                 index.to_owned(),
             )));
+        }
+        if at.head.read_only.contains(index) {
+            return Err(EngineError::IndexReadOnly(index.to_owned()));
         }
         Ok(())
     }
@@ -2769,6 +2924,11 @@ impl<S: BlobStore> Engine<S> {
         // schema. A conditional upsert is a full row and is checked as any upsert is.
         if is_rowless(doc) {
             return None;
+        }
+        // M176: one id kind, the recorded one, a string when none.
+        let want = schema.types.get(ID_KIND).copied();
+        if pstore_format::id::kind(&doc.id) != want {
+            return Some(id_conflict(index, want, &doc.id));
         }
         // M173: a type its write gave a name, and every value under a recorded name.
         if let Some((name, got, want)) = types_of(doc).into_iter().find_map(|(name, got)| {
@@ -3193,6 +3353,48 @@ impl<S: BlobStore> Engine<S> {
         let at = head::read(&*self.store, self.tenant).await?;
         self.observe(&at.head);
         Ok(key.e0() <= at.head.epoch.0)
+    }
+
+    /// Makes this engine's clock read `ms` (M148), or the system's again with `None`.
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&self, ms: Option<u64>) {
+        *self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ms;
+    }
+
+    fn now_ms(&self) -> u64 {
+        let fixed = *self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fixed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        })
+    }
+
+    /// Stamps each of `names` as written by the commit of `next` on `at` (M148): its
+    /// `written_ms` moves to now, never back, and an index `at` did not hold gets
+    /// `created_ms` now, one it held without a time (made before M148) 0, unknown.
+    pub(crate) fn stamp_times<'a>(
+        &self,
+        at: &Head,
+        next: &mut Head,
+        names: impl IntoIterator<Item = &'a str>,
+    ) {
+        let now = self.now_ms();
+        for n in names {
+            let existed = at.indexes.contains_key(n)
+                || at.schema_rejects.contains_key(n)
+                || at.quarantine.contains_key(n);
+            let prev = at.times.get(n).copied();
+            let created = prev.map_or(if existed { 0 } else { now }, |(c, _)| c);
+            let written = prev.map_or(now, |(_, w)| w.max(now));
+            next.times.insert(n.to_owned(), (created, written));
+        }
     }
 
     /// Commits `next` on `at`. M132: an engine set for keys initialises `keys_since` on a HEAD
@@ -3733,6 +3935,7 @@ impl<S: BlobStore> Engine<S> {
         declared: &Declared,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
+        self.refuse_past_limit_at_door(index).await?;
         // `id` is no attribute a segment stores, so a sketch of it would describe nothing --
         // or a user attribute of that name, and prune `id` filters by it (code review, M15).
         if declared
@@ -3769,7 +3972,7 @@ impl<S: BlobStore> Engine<S> {
             if let Some(name) = d.attrs.keys().find(|k| k.starts_with('$')) {
                 return Err(EngineError::Format(format!(
                     "document {}: attribute `{name}` is reserved: names beginning `$` are",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
             if let Some(name) = d
@@ -3780,7 +3983,7 @@ impl<S: BlobStore> Engine<S> {
                 return Err(EngineError::Format(format!(
                     "document {}: vector field `{name}` is reserved: names ending `{}` hold an \
                      encoding the engine derives",
-                    d.id,
+                    pstore_format::id::shown(&d.id),
                     pstore_format::fde::FIELD_SUFFIX
                 )));
             }
@@ -3789,14 +3992,17 @@ impl<S: BlobStore> Engine<S> {
             if let Some(name) = d.vectors.keys().find(|k| k.contains('\0')) {
                 return Err(EngineError::Format(format!(
                     "document {}: vector field {name:?} contains a NUL byte, which is reserved",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
             for field in d.vectors.values_mut() {
                 if let pstore_format::VectorField::Dense(vs) = field {
                     for v in vs.iter_mut() {
                         *v = transform_stored(metric, v).ok_or_else(|| {
-                            EngineError::Unmeasurable(format!("document {}", d.id))
+                            EngineError::Unmeasurable(format!(
+                                "document {}",
+                                pstore_format::id::shown(&d.id)
+                            ))
                         })?;
                     }
                 }
@@ -3875,7 +4081,7 @@ impl<S: BlobStore> Engine<S> {
             if d.attrs.contains_key(TOMBSTONE) {
                 return Err(EngineError::Format(format!(
                     "document {}: an attribute with an empty name is reserved",
-                    d.id
+                    pstore_format::id::shown(&d.id)
                 )));
             }
         }
@@ -4003,6 +4209,23 @@ impl<S: BlobStore> Engine<S> {
             .find(|d| !is_rowless(d))
             .or_else(|| docs.iter().find(|d| !is_rowless(d)))
             .map(|d| (metric_of(d), d.vector().len()));
+        // M176: one id kind, the first held row's or the batch's own first row's.
+        if let Some(want) = m
+            .pending
+            .get(index)
+            .into_iter()
+            .flatten()
+            .chain(m.durable_rows(index))
+            .chain(docs.iter())
+            .find(|d| !is_rowless(d))
+            .map(|d| pstore_format::id::kind(&d.id))
+            && let Some(odd) = docs
+                .iter()
+                .filter(|d| !is_rowless(d))
+                .find(|d| pstore_format::id::kind(&d.id) != want)
+        {
+            return Some(id_conflict(index, want, &odd.id));
+        }
         // M14: and one analyzer, on the same rung -- the first row that DECLARES one, since an
         // undeclared row has no opinion to compare.
         let declared = m
@@ -4190,6 +4413,15 @@ impl<S: BlobStore> Engine<S> {
     /// If HEAD cannot be read. An absent HEAD is an empty list, not an error: a tenant that
     /// has never committed owns no indexes, which is a fact rather than a failure.
     pub async fn indexes(&self) -> Result<Vec<String>, EngineError> {
+        Ok(self.indexes_at().await?.1)
+    }
+
+    /// [`Self::indexes`] with the epoch of the HEAD they were read from, 0 when there is
+    /// none (M161): what a list page reports so a walk can tell its pages' HEADs apart.
+    ///
+    /// # Errors
+    /// If HEAD cannot be read.
+    pub async fn indexes_at(&self) -> Result<(Epoch, Vec<String>), EngineError> {
         let at = head::read(&*self.store, self.tenant).await?;
         // Every path that reads HEAD warms the door's schema cache, so the check costs a
         // request only for a process that has never read one.
@@ -4201,7 +4433,7 @@ impl<S: BlobStore> Engine<S> {
         names.extend(at.head.quarantine.into_keys());
         names.sort_unstable();
         names.dedup();
-        Ok(names)
+        Ok((at.head.epoch, names))
     }
 
     /// Segment count, document count and epoch for one index, or `None` if HEAD does not
@@ -4335,6 +4567,16 @@ impl<S: BlobStore> Engine<S> {
     /// survived resolving, so a hit whose row vanished cannot misalign the rest.
     #[must_use]
     pub fn resolve_rows_with_vectors(&self, answer: &Answer) -> Vec<(Resolved, Option<Vec<f32>>)> {
+        self.resolve_rows_projected(answer)
+            .into_iter()
+            .map(|(row, p)| (row, p.vector))
+            .collect()
+    }
+
+    /// [`Self::resolve_rows_with_vectors`], each row beside its named fields too (M190), from
+    /// [`Answer::fields`].
+    #[must_use]
+    pub fn resolve_rows_projected(&self, answer: &Answer) -> Vec<(Resolved, Projected)> {
         answer
             .hits
             .iter()
@@ -4355,7 +4597,8 @@ impl<S: BlobStore> Engine<S> {
                 };
                 let dist = answer.dists.get(i).copied().flatten();
                 let vector = answer.vectors.get(i).cloned().flatten();
-                row.map(|(id, attrs)| ((id, h.score, attrs, dist), vector))
+                let fields = answer.fields.get(i).cloned().unwrap_or_default();
+                row.map(|(id, attrs)| ((id, h.score, attrs, dist), Projected { vector, fields }))
             })
             .collect()
     }
@@ -5029,6 +5272,7 @@ impl<S: BlobStore> Engine<S> {
                      would hide its past; branch to another name, or after GC"
                 )));
             }
+            self.refuse_past_limit(&at.head, dest)?;
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
@@ -5052,6 +5296,9 @@ impl<S: BlobStore> Engine<S> {
                 next.schemas.insert(dest.to_owned(), schema.clone());
             }
             next.branched.insert(dest.to_owned(), next.epoch.0);
+            // M166: a new operation into `dest` replaces how its last copy ended.
+            next.copies.remove(dest);
+            self.stamp_times(&at.head, &mut next, [dest]);
             // A lost attempt's copies were never live: buried under their own epochs, as a
             // compaction buries its losers, so GC reaps them and `as_of` never finds them.
             for k in &stale {
@@ -5173,11 +5420,13 @@ impl<S: BlobStore> Engine<S> {
             {
                 return Err(EngineError::IndexExists(index.to_owned()));
             }
+            self.refuse_past_limit(&at.head, index)?;
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
             next.indexes.insert(index.to_owned(), Vec::new());
             next.schemas.insert(index.to_owned(), schema.clone());
+            self.stamp_times(&at.head, &mut next, [index]);
             if let Some(f) = interfere.take() {
                 f.await;
             }
@@ -5187,6 +5436,139 @@ impl<S: BlobStore> Engine<S> {
                     self.record_commit(epoch);
                     self.remember_schemas(&next);
                     return Ok(epoch);
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// How far `index`'s durable writes are from being indexed (M160): every lane's bundles
+    /// past HEAD's watermark, counted from their directories. Reads only.
+    ///
+    /// ⚠️ **A constant depth, whatever the backlog**: HEAD and the registry; one `head` per
+    /// lane at its watermark; one round probing the present lanes' next keys, sharing
+    /// [`PROGRESS_BUNDLES`]; one range read per bundle's tail; one more for a long
+    /// directory. No doubling probe, so a stalled fold makes the answer inexact, not slow.
+    pub async fn progress(&self, index: &str) -> Result<Progress, EngineError> {
+        let (at, live) = futures_util::future::try_join(
+            head::read(&*self.store, self.tenant),
+            lanes::live(&*self.store, self.tenant),
+        )
+        .await?;
+        let held = quarantine_exists(&at.head, index);
+        let len_of = |lane: LaneId, seq: u64| {
+            let key = bundle_key(self.tenant, lane, Seq(seq));
+            async move {
+                match self.store.head(&key).await {
+                    Ok(len) => Ok(Some((key, len))),
+                    Err(pstore_blob::BlobError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(EngineError::from(e)),
+                }
+            }
+        };
+        let from = |lane: &LaneId| at.head.watermarks.get(&lane.0).copied().unwrap_or(0);
+        let first =
+            futures_util::future::try_join_all(live.iter().map(|lane| len_of(*lane, from(lane))))
+                .await?;
+        let mut present: Vec<(LaneId, (Key, u64))> = live
+            .iter()
+            .copied()
+            .zip(first)
+            .filter_map(|(lane, got)| got.map(|g| (lane, g)))
+            .collect();
+        // More present lanes than the budget leaves `more` at 0, so every lane read is
+        // marked inexact below: a lane with no probe may hold more.
+        let mut exact = true;
+        present.truncate(PROGRESS_BUNDLES);
+        let more = PROGRESS_BUNDLES
+            .checked_div(present.len())
+            .unwrap_or(0)
+            .saturating_sub(1) as u64;
+        let next = futures_util::future::try_join_all(present.iter().map(|(lane, _)| {
+            let base = from(lane);
+            futures_util::future::try_join_all((1..=more).map(move |k| len_of(*lane, base + k)))
+        }))
+        .await?;
+        let mut bundles: Vec<(Key, u64)> = Vec::new();
+        for ((_, head), tail) in present.into_iter().zip(next) {
+            bundles.push(head);
+            // A lane is dense: its count stops at the first absent key.
+            let found: Vec<_> = tail.into_iter().map_while(|b| b).collect();
+            if found.len() as u64 == more {
+                exact = false;
+            }
+            bundles.extend(found);
+        }
+        let dirs =
+            futures_util::future::try_join_all(bundles.iter().map(|(key, len)| async move {
+                let tail = self
+                    .store
+                    .get_range(key, len.saturating_sub(PROGRESS_TAIL)..*len)
+                    .await?;
+                match bundle::directory_from_tail(&tail, *len)? {
+                    bundle::Directory::Read(d) => Ok::<_, EngineError>(d),
+                    bundle::Directory::Needs(range) => {
+                        bundle::directory(&self.store.get_range(key, range).await?)
+                    }
+                }
+            }))
+            .await?;
+        let (mut rows, mut bytes) = (0u64, 0u64);
+        for dir in &dirs {
+            if let Some(e) = dir.get(index) {
+                rows += u64::from(e.docs);
+                bytes += u64::from(e.len);
+            }
+        }
+        Ok(Progress {
+            epoch: at.head.epoch,
+            rows,
+            bytes,
+            exact,
+            held,
+        })
+    }
+
+    /// Makes `index` read-only, or writable again (M149): one HEAD read and, when the value
+    /// changes, one CAS commit; the value it already has commits nothing and answers that
+    /// HEAD's epoch. `None` when HEAD does not hold the index, by the rule `Head::encode`
+    /// keeps a flag by, so a flag answered is a flag written. A replica is read-only by its
+    /// replication and refused here.
+    pub async fn set_read_only(&self, index: &str, on: bool) -> Result<Option<Epoch>, EngineError> {
+        require_fencing(&*self.store)?;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+            if at.head.replications.contains_key(index) {
+                return Err(EngineError::Replica(replica::ReplicaRefusal::ReadOnly(
+                    index.to_owned(),
+                )));
+            }
+            if !quarantine_exists(&at.head, index) {
+                return Ok(None);
+            }
+            if at.head.read_only.contains(index) == on {
+                return Ok(Some(at.head.epoch));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            if on {
+                next.read_only.insert(index.to_owned());
+            } else {
+                next.read_only.remove(index);
+            }
+            match self.commit_head(&at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    self.remember_schemas(&next);
+                    return Ok(Some(epoch));
                 }
                 Err(EngineError::Lost | EngineError::Contended)
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
@@ -5351,6 +5733,10 @@ impl<S: BlobStore> Engine<S> {
                         x.to_owned(),
                     )));
                 }
+                // M149: a read-only index is dropped by clearing its flag first.
+                if at.head.read_only.contains(x) {
+                    return Err(EngineError::IndexReadOnly(x.to_owned()));
+                }
                 let rows = |docs: Option<&Vec<Document>>| {
                     docs.is_some_and(|d| d.iter().any(|d| !is_rowless(d)))
                 };
@@ -5386,9 +5772,30 @@ impl<S: BlobStore> Engine<S> {
                     true
                 }
             });
+            // M149: a read-only index takes no writes either. Its rows that slipped past a
+            // door which had not read this HEAD are set aside, never dropped: every kind goes
+            // to its quarantine below and is counted as a reject, before the reject pass so
+            // none of them implies a schema.
+            let mut flagged_rows: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+            by_index.retain(|idx, docs| {
+                if at.head.read_only.contains(idx) {
+                    for d in docs.iter() {
+                        tally.rejected(d);
+                    }
+                    flagged_rows.insert(idx.clone(), std::mem::take(docs));
+                    false
+                } else {
+                    true
+                }
+            });
             // M132: a fold whose operations were all discarded still commits: its verdicts
             // are what the attempts' waiters read, and its watermarks move past them.
-            if by_index.is_empty() && drop.is_none() && replica_rows.is_empty() && !discarded {
+            if by_index.is_empty()
+                && drop.is_none()
+                && replica_rows.is_empty()
+                && flagged_rows.is_empty()
+                && !discarded
+            {
                 self.prune_to(&at.head);
                 return Ok(Folded::Nothing(at.head.epoch));
             }
@@ -5407,6 +5814,10 @@ impl<S: BlobStore> Engine<S> {
             let mut rejects: BTreeMap<String, u64> = BTreeMap::new();
             // M25: the rows themselves, quarantined below rather than dropped.
             let mut rejected: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+            for (idx, docs) in flagged_rows {
+                rejects.insert(idx.clone(), docs.len() as u64);
+                rejected.insert(idx, docs);
+            }
             // ⚠️ **A new index's schema is implied BEFORE the pass, and the pass runs against it**
             // (M9d, spec review): skipping the pass for a new index sealed two writers' first
             // rows together whatever they disagreed on -- same width, different metrics, and
@@ -5433,6 +5844,16 @@ impl<S: BlobStore> Engine<S> {
                 // before the declaring one too -- is judged by one type.
                 for (name, kind) in docs.iter().flat_map(types_of) {
                     schema.types.entry(name).or_insert(kind);
+                }
+                // M176: the id kind, only by the fold creating the schema, never later: the
+                // first upsert's in lane order, superseded or deleted ones included.
+                if created.contains_key(idx)
+                    && let Some(kind) = docs
+                        .iter()
+                        .find(|d| !is_rowless(d))
+                        .and_then(|d| pstore_format::id::kind(&d.id))
+                {
+                    schema.types.insert(ID_KIND.to_owned(), kind);
                 }
                 typed.insert(idx.clone(), schema.types.clone());
                 let schema = &self.filled(idx, schema, docs);
@@ -5608,6 +6029,11 @@ impl<S: BlobStore> Engine<S> {
             // computed from would otherwise share a tag. Derived from the epoch and lane,
             // so it is deterministic and needs no clock.
             next.nonce = nonce_for(next.epoch, self.lane);
+            // M148: every index this fold writes, its rejects included. A name that does not
+            // exist after the commit keeps no time: `encode` writes only existing ones.
+            let written: std::collections::BTreeSet<String> =
+                touched.keys().chain(rejects.keys()).cloned().collect();
+            self.stamp_times(&at.head, &mut next, written.iter().map(String::as_str));
 
             for (idx, ids) in &touched {
                 let prepared = match prepared_for.remove(idx) {
@@ -5792,6 +6218,8 @@ impl<S: BlobStore> Engine<S> {
                     grave.push(head::burial(x, &r.key));
                 }
                 next.schema_rejects.remove(x);
+                // M166: and how a copy into it ended, so a copy there is never the old one.
+                next.copies.remove(x);
                 // M25: its quarantine, which was live, buried at this epoch like its segments.
                 for (key, _) in next.quarantine.remove(x).unwrap_or_default() {
                     grave.push(key);
@@ -7077,7 +7505,7 @@ impl<S: BlobStore> Engine<S> {
             top_k,
             consistency,
             peers,
-            false,
+            pstore_query::Projection::default(),
         )
         .await
     }
@@ -7102,7 +7530,7 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         peers: Option<&dyn Peers>,
     ) -> Result<Answer, EngineError> {
-        self.query_split_inner(
+        self.query_split_projected(
             index,
             prefetch,
             filter,
@@ -7111,6 +7539,48 @@ impl<S: BlobStore> Engine<S> {
             consistency,
             peers,
             true,
+            &[],
+        )
+        .await
+    }
+
+    /// [`Self::query_split_as`], and each hit's `vector` when `vector` asks (M64) and its
+    /// `named` dense fields in [`Answer::fields`] (M190), all read in the same fetch as its
+    /// row; an unfolded hit's named fields from memory.
+    ///
+    /// # Errors
+    /// As [`Self::query_split_as`], and [`EngineError::Unprojected`] when the hits' fields
+    /// folded at a varying count of vectors a row hold more than the projection bound (M191).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, where to split it, and what it projects"
+    )]
+    pub async fn query_split_projected(
+        &self,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        consistency: Consistency,
+        peers: Option<&dyn Peers>,
+        vector: bool,
+        named: &[String],
+    ) -> Result<Answer, EngineError> {
+        self.query_split_inner(
+            index,
+            prefetch,
+            filter,
+            fusion,
+            top_k,
+            consistency,
+            peers,
+            pstore_query::Projection {
+                vector,
+                named,
+                folded: 0,
+                max_bytes: self.projection_bytes,
+            },
         )
         .await
     }
@@ -7128,7 +7598,7 @@ impl<S: BlobStore> Engine<S> {
         top_k: usize,
         consistency: Consistency,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         // ⚠️ A read served from the `bounded` cache that fails is retried once from a fresh
         // HEAD (M11.2): `gc` may have reaped a segment the cached HEAD still names.
@@ -7184,7 +7654,7 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         // ⚠️ HEAD and the unfolded rows must agree on what is folded (M9c.1): a HEAD older than
         // a prune this engine already did would be paired with rows missing what it lacks.
@@ -7286,7 +7756,7 @@ impl<S: BlobStore> Engine<S> {
         fusion: pstore_query::Fusion,
         top_k: usize,
         peers: Option<&dyn Peers>,
-        vectors: bool,
+        vectors: pstore_query::Projection<'_>,
     ) -> Result<Answer, EngineError> {
         self.remember_schemas(&at.head);
         // ⚠️ Derived, never discovered: a segment's centroid table is at its own key, and
@@ -7317,6 +7787,10 @@ impl<S: BlobStore> Engine<S> {
             }
             None => (Arc::default(), None, Arc::default(), None, None, None),
         };
+        // M165: the fresh segment holds this process's unfolded rows, not a folded segment.
+        // It is the target at `unfolded_at` when there is one; past the targets, the ordinal
+        // names none.
+        pstore_query::explain::fresh(Some(unfolded_at));
         // M14: the same rule as the metric's, and the fresh segment was built by it.
         let fts = at
             .head
@@ -7371,6 +7845,7 @@ impl<S: BlobStore> Engine<S> {
                 staleness: std::time::Duration::ZERO,
                 fts,
                 vectors: Vec::new(),
+                fields: Vec::new(),
             });
         }
 
@@ -7402,12 +7877,21 @@ impl<S: BlobStore> Engine<S> {
             }
             _ => Vec::new(),
         };
+        // M190: the unfolded rows' named fields are in memory, and their fresh segment folds
+        // a field of several vectors a row at a varying count: nothing is read for them.
+        let projection = pstore_query::Projection {
+            folded: unfolded_at,
+            ..vectors
+        };
         let resolved = pstore_query::query_rows_split_texts(
-            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere, vectors,
+            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere,
+            projection,
         )
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;
-        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, vectors);
+        let fields = projected_fields(&resolved, &unfolded, unfolded_at, metric, vectors.named);
+        let (hits, ids, attributes, dists, vectors) =
+            split_rows(resolved, metric, q2, vectors.vector);
         Ok(Answer {
             hits,
             ids,
@@ -7422,6 +7906,7 @@ impl<S: BlobStore> Engine<S> {
             staleness: std::time::Duration::ZERO,
             fts,
             vectors,
+            fields,
         })
     }
 
@@ -7683,6 +8168,35 @@ impl<S: BlobStore> Engine<S> {
             )));
         }
         let then = at.head.as_of(epoch)?;
+        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
+        // (M9f.2).
+        let recorded = schema_recorded_at(&at.head, index, epoch);
+        self.query_head(
+            &then, recorded, index, prefetch, filter, fusion, top_k, false,
+        )
+        .await
+    }
+
+    /// One search against a HEAD already read (M162): `then`'s segments and delete vectors,
+    /// no freshness layer, and no HEAD read of its own, so several searches answer at one
+    /// snapshot for one read. `recorded` is the index's schema at that HEAD's epoch, if one
+    /// was recorded (M170). With `vectors`, each hit's vector in client space, as
+    /// [`Self::query_split_vectors`] gives.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the query's own parameters, and the HEAD it runs against"
+    )]
+    async fn query_head(
+        &self,
+        then: &Head,
+        recorded: Option<head::IndexSchema>,
+        index: &str,
+        prefetch: &[pstore_query::Prefetch],
+        filter: Option<&pstore_query::Predicate>,
+        fusion: pstore_query::Fusion,
+        top_k: usize,
+        vectors: bool,
+    ) -> Result<Answer, EngineError> {
         let refs: Vec<SegmentRef> = then.indexes.get(index).cloned().unwrap_or_default();
         // The delete vectors as they stood at the epoch (`Head::as_of`), and no shadow: the
         // unfolded rows are newer than any past epoch.
@@ -7693,9 +8207,7 @@ impl<S: BlobStore> Engine<S> {
             false,
             self.params.exact_scan_threshold,
         );
-        // A schema is immutable while its index lives (M9d); across a drop, the dropped one
-        // (M9f.2). Read before the empty return, which reports its analyzer too (M63).
-        let recorded = schema_recorded_at(&at.head, index, epoch);
+        // Read before the empty return, which reports its analyzer too (M63).
         let schema = recorded.clone().unwrap_or_default();
         if targets.is_empty() {
             return Ok(Answer {
@@ -7712,6 +8224,7 @@ impl<S: BlobStore> Engine<S> {
                 staleness: std::time::Duration::ZERO,
                 fts: schema.fts,
                 vectors: Vec::new(),
+                fields: Vec::new(),
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -7727,7 +8240,7 @@ impl<S: BlobStore> Engine<S> {
         let filter = bound.as_ref();
         vectors_recorded(recorded.map(|s| s.dims), index, prefetch)?;
         let (prefetch, q2) = scored_by(metric, prefetch)?;
-        let resolved = pstore_query::query_rows_filtered_texts(
+        let resolved = pstore_query::query_rows_split_texts(
             &self.store,
             &targets,
             &prefetch,
@@ -7737,10 +8250,12 @@ impl<S: BlobStore> Engine<S> {
             &std::collections::HashSet::new(),
             fusion,
             top_k,
+            Vec::new(),
+            pstore_query::Projection::vector(vectors),
         )
         .await
         .map_err(|e| query_error(metric, &prefetch, e))?;
-        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, false);
+        let (hits, ids, attributes, dists, vectors) = split_rows(resolved, metric, q2, vectors);
         Ok(Answer {
             hits,
             ids,
@@ -7756,6 +8271,7 @@ impl<S: BlobStore> Engine<S> {
             staleness: std::time::Duration::ZERO,
             fts: schema.fts,
             vectors,
+            fields: Vec::new(),
         })
     }
 
@@ -7810,6 +8326,94 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
+        self.ordered_at(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            as_of,
+            consistency,
+            pstore_query::Projection::default(),
+        )
+        .await
+    }
+
+    /// [`Self::ordered_as`] at the latest epoch, each row carrying its `vector` in client space
+    /// (M179), read in **one round more**, after selection, from the segments selection
+    /// already opened; an unfolded row's from memory. A row with no `vector` carries none.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_as`], and a vector range that cannot be read.
+    pub async fn ordered_vectors(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        consistency: Consistency,
+    ) -> Result<Ordered, EngineError> {
+        self.ordered_projected(index, by, filter, offset, limit, consistency, true, &[])
+            .await
+    }
+
+    /// [`Self::ordered_vectors`], each row carrying its `vector` when `vector` asks and its
+    /// `named` dense fields (M190), all in client space, read in the same one round more; an
+    /// unfolded row's from memory.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_vectors`], and [`EngineError::Unprojected`] when the page rows'
+    /// fields folded at a varying count of vectors a row hold more than the projection bound.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, and what it projects"
+    )]
+    pub async fn ordered_projected(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        consistency: Consistency,
+        vector: bool,
+        named: &[String],
+    ) -> Result<Ordered, EngineError> {
+        let projection = pstore_query::Projection {
+            vector,
+            named,
+            folded: 0,
+            max_bytes: self.projection_bytes,
+        };
+        self.ordered_at(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            None,
+            consistency,
+            projection,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, its level, and whether it reads vectors"
+    )]
+    async fn ordered_at(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        as_of: Option<Epoch>,
+        consistency: Consistency,
+        vectors: pstore_query::Projection<'_>,
+    ) -> Result<Ordered, EngineError> {
         // A past epoch is what it is (M9i.2): a strong read of one would check nothing.
         if as_of.is_some() && consistency == Consistency::Strong {
             return Err(EngineError::Query(
@@ -7829,6 +8433,7 @@ impl<S: BlobStore> Engine<S> {
                 as_of,
                 consistency,
                 true,
+                vectors,
                 &mut hit,
             )
             .await;
@@ -7843,6 +8448,7 @@ impl<S: BlobStore> Engine<S> {
                     as_of,
                     consistency,
                     false,
+                    vectors,
                     &mut hit,
                 )
                 .await
@@ -7853,7 +8459,7 @@ impl<S: BlobStore> Engine<S> {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the order's own parameters, its level, and the cache's say"
+        reason = "the order's own parameters, its level, the cache's say, and its vectors"
     )]
     async fn ordered_once(
         &self,
@@ -7865,6 +8471,7 @@ impl<S: BlobStore> Engine<S> {
         as_of: Option<Epoch>,
         consistency: Consistency,
         allow_hit: bool,
+        vectors: pstore_query::Projection<'_>,
         hit: &mut bool,
     ) -> Result<Ordered, EngineError> {
         let Scope {
@@ -7878,6 +8485,7 @@ impl<S: BlobStore> Engine<S> {
             settle,
             fts,
             texts,
+            metric,
             ..
         } = self
             .scope(index, as_of, consistency, allow_hit, hit)
@@ -7887,11 +8495,11 @@ impl<S: BlobStore> Engine<S> {
         let filter = bound.as_ref();
         let mut selector = pstore_query::Selector::new(by.clone(), offset.saturating_add(limit));
         let (selected, settled) = futures_util::future::join(
-            pstore_query::select(&*self.store, &targets, filter, &shadow, &mut selector),
+            pstore_query::select_held(&*self.store, &targets, filter, &shadow, &mut selector),
             self.settled_scope(settle.as_ref()),
         )
         .await;
-        selected.map_err(|e| EngineError::Query(e.to_string()))?;
+        let segments = selected.map_err(|e| EngineError::Query(e.to_string()))?;
         if !settled? {
             return Err(EngineError::NotFolded);
         }
@@ -7905,18 +8513,68 @@ impl<S: BlobStore> Engine<S> {
             if filter.is_none_or(|f| f.admits(&d.id, &d.attrs)) {
                 // As a block's rows are: attributes, no vectors -- copied only for a row the
                 // filter admits, the rows being shared with the fresh cache (M122).
+                // M179: its stored `vector` when asked, as the folded rows' are read below.
+                let vector = vectors
+                    .vector
+                    .then(|| d.vectors.get(pstore_format::DEFAULT_FIELD))
+                    .flatten()
+                    .and_then(|f| match f.as_dense() {
+                        [v] => Some(client_space(metric, v)),
+                        _ => None,
+                    })
+                    .filter(|v| !v.is_empty());
+                // M190: and its named fields, from memory.
+                let mut held = with_vector(vector);
+                held.extend(
+                    fields_of(d, metric, vectors.named)
+                        .into_iter()
+                        .map(|(name, vs)| (name.into(), pstore_format::VectorField::Dense(vs))),
+                );
                 selector.offer(Document {
                     id: d.id.clone(),
-                    vectors: BTreeMap::new(),
+                    vectors: held,
                     attrs: d.attrs.clone(),
                 });
             }
         }
-        let rows: Vec<Document> = selector
-            .into_sorted()
+        let page: Vec<(Document, Option<pstore_query::Located>)> = selector
+            .into_sorted_at()
             .into_iter()
             .skip(offset)
             .take(limit)
+            .collect();
+        // M179: the page's folded rows' vectors, one fan-out over the segments selection
+        // opened -- the order's fourth round, and only when asked.
+        // M190: and their named fields, in the same fan-out.
+        let mut read = if vectors.vector || !vectors.named.is_empty() {
+            let wanted: Vec<pstore_query::Located> =
+                page.iter().filter_map(|(_, at)| *at).collect();
+            pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted, vectors)
+                .await
+                .map_err(|e| match e {
+                    pstore_query::QueryError::ProjectionTooLarge { .. } => {
+                        EngineError::Unprojected(e.to_string())
+                    }
+                    e => EngineError::Query(e.to_string()),
+                })?
+        } else {
+            BTreeMap::new()
+        };
+        let rows: Vec<Document> = page
+            .into_iter()
+            .map(|(mut d, at)| {
+                if let Some(fields) = at.and_then(|at| read.remove(&at)) {
+                    // Every vector read is one a write measured, so none is empty.
+                    d.vectors = fields
+                        .into_iter()
+                        .map(|(name, vs)| {
+                            let vs = vs.iter().map(|v| client_space(metric, v)).collect();
+                            (name.into(), pstore_format::VectorField::Dense(vs))
+                        })
+                        .collect();
+                }
+                d
+            })
             .collect();
         // A row is unfolded exactly when its id has an unfolded operation: the segment's
         // version of such an id was shadowed.
@@ -8086,6 +8744,9 @@ impl<S: BlobStore> Engine<S> {
         allow_hit: bool,
         hit: &mut bool,
     ) -> Result<Scope, EngineError> {
+        // M179: an index not yet folded has its metric in its unfolded view, as a relevance
+        // query reads it; its rows are stripped of it.
+        let mut fresh_metric = None;
         let (head, epoch, settle, staleness, unfolded, shadow, shadowed, (fts, texts)) = match as_of
         {
             Some(epoch) => {
@@ -8123,7 +8784,10 @@ impl<S: BlobStore> Engine<S> {
                 let settle = got.lanes.map(|lanes| (at.head.clone(), lanes));
                 let (rows, shadow, fresh_fts) = got.fresh.map_or_else(
                     || (Arc::default(), Arc::default(), None),
-                    |v| (v.rows, v.shadow, Some((v.fts, v.texts))),
+                    |v| {
+                        fresh_metric = v.metric;
+                        (v.rows, v.shadow, Some((v.fts, v.texts)))
+                    },
                 );
                 let fts = at
                     .head
@@ -8166,7 +8830,14 @@ impl<S: BlobStore> Engine<S> {
                 u64::from(r.rows.saturating_sub(gone))
             })
             .sum();
+        let metric = head
+            .schemas
+            .get(index)
+            .map(|s| s.metric)
+            .or(fresh_metric)
+            .unwrap_or_default();
         Ok(Scope {
+            metric,
             named: head.indexes.contains_key(index),
             targets,
             unfolded,
@@ -8695,6 +9366,61 @@ fn client_space(metric: Metric, stored: &[f32]) -> Vec<f32> {
         .to_vec()
 }
 
+/// A row's vectors as an order answers them (M179): its `vector` alone when it has one.
+fn with_vector(
+    vector: Option<Vec<f32>>,
+) -> BTreeMap<pstore_format::Field, pstore_format::VectorField> {
+    vector
+        .map(|v| {
+            (
+                pstore_format::DEFAULT_FIELD.into(),
+                pstore_format::VectorField::Dense(vec![v]),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Each resolved hit's `named` fields in client space (M190), empty when none is named: an
+/// unfolded hit's from its row in memory, any other's from the row fetch.
+fn projected_fields(
+    resolved: &[(pstore_query::Hit, Option<Document>, Option<f32>)],
+    unfolded: &[Document],
+    unfolded_at: usize,
+    metric: Metric,
+    named: &[String],
+) -> Vec<Fields> {
+    if named.is_empty() {
+        return Vec::new();
+    }
+    resolved
+        .iter()
+        .map(|(h, d, _)| {
+            let row = if h.segment == unfolded_at {
+                unfolded.get(h.row)
+            } else {
+                d.as_ref()
+            };
+            row.map(|d| fields_of(d, metric, named)).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// `d`'s dense fields among `named`, each vector in client space (M190). A field it lacks has
+/// no entry; a write admits none of no vectors (M61).
+fn fields_of(d: &Document, metric: Metric, named: &[String]) -> Fields {
+    named
+        .iter()
+        .filter_map(|name| {
+            let vs = d.vectors.get(name.as_str())?.as_dense();
+            Some((
+                name.clone(),
+                vs.iter().map(|v| client_space(metric, v)).collect(),
+            ))
+        })
+        .collect()
+}
+
 /// A resolved ranking, as `Answer`'s parallel columns: hits, ids, attributes, `$dist`, and --
 /// when `vectors` asks (M64) -- each hit's vector in client space, else none at all.
 #[expect(
@@ -8882,6 +9608,10 @@ fn query_error(
         (pstore_query::QueryError::UnknownTextField(field), _) => {
             EngineError::UnknownTextField(field)
         }
+        // M191: and a projection past its bound.
+        (e @ pstore_query::QueryError::ProjectionTooLarge { .. }, _) => {
+            EngineError::Unprojected(e.to_string())
+        }
         (
             pstore_query::QueryError::Format(pstore_format::FormatError::UnknownField),
             Some(field),
@@ -8928,7 +9658,7 @@ mod query_error_tests {
     fn only_a_known_width_of_zero_refuses_a_vector_leg() {
         let text = Prefetch::Sparse {
             field: "t".to_owned(),
-            query: vec![(1, 1.0)],
+            query: vec![("1".to_owned(), 1.0)],
             limit: 1,
         };
         assert!(matches!(

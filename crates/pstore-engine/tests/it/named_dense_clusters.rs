@@ -233,3 +233,39 @@ async fn a_nul_in_a_field_name_is_refused() {
     let err = e.write("x", vec![d]).await.unwrap_err().to_string();
     assert!(err.contains("NUL"), "{err}");
 }
+
+/// M165: a dense leg over a clustered named field reports its probes, capped at the field's
+/// lists, and the exact scan reports none.
+#[tokio::test]
+async fn explain_reports_a_named_fields_probes() {
+    let (e, _, store) = engine(false).await;
+    let head = e.head_for_test().await;
+    let seg = Key::new(head.indexes["big"][0].key.clone());
+    let set = pstore_index::fde_clusters::FdeSet::open(&*store, &seg)
+        .await
+        .unwrap();
+    let lists = set
+        .field(&pstore_index::fde_clusters::dense_name("tag"))
+        .unwrap()
+        .0
+        .lists();
+    assert!(lists > 1, "{lists}");
+    let plan = |p: usize, exact: bool| {
+        let e = &e;
+        async move {
+            let (got, x) = pstore_query::explain::collect(e.query(
+                "big",
+                &[leg(p, exact)],
+                Fusion::default(),
+                10,
+            ))
+            .await;
+            got.unwrap();
+            let l = &x.legs[0];
+            (l.approximate_segments, l.exact_segments, l.probes)
+        }
+    };
+    assert_eq!(plan(1, false).await, (1, 0, 1));
+    assert_eq!(plan(1 << 20, false).await, (1, 0, lists));
+    assert_eq!(plan(8, true).await, (0, 1, 0));
+}

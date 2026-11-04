@@ -175,6 +175,7 @@ async fn run<S: BlobStore + 'static>(
         }
     };
     api.limit_engines(config.engines);
+    api.limit_indexes(config.indexes_per_tenant);
     // M129: `durability: "applied"` only once the operator says every node runs a release
     // that folds it. Any other value, or none, leaves it refused.
     // M129: `1` serves applied writes; M130: `2` also serves their affected ids.

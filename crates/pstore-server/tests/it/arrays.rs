@@ -240,7 +240,8 @@ async fn delete_by_filter_takes_any_comparisons() {
 async fn what_an_array_cannot_hold_is_refused() {
     for attrs in [
         json!({"n": [[1]]}),
-        json!({"n": [1, null]}),
+        // M175: `[1, null]` holds a null element now, accepted:
+        // `null_elements::null_elements_answer_in_place_everywhere`.
         json!({"n": [{"k": 1}]}),
         serde_json::from_str::<Value>(r#"{"n": [9223372036854775808]}"#).unwrap(),
         // M150: an array of strings is text now; one holding anything else is not.

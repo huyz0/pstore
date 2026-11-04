@@ -15,6 +15,7 @@
 mod aggregate;
 pub mod condition;
 pub mod deletes;
+pub mod explain;
 mod expr;
 mod filter;
 mod fuse;
@@ -30,9 +31,9 @@ pub use filter::{
     Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Needle, Op, Pattern, PatternKind, Predicate, TokenOp,
 };
 pub use fuse::{Fusion, Hit, MAX_LEGS, Weights, fuse};
-pub use order::{MAX_KEYS, Order, OrderBy, Selector, select};
+pub use order::{Located, MAX_KEYS, Order, OrderBy, Selector, select, select_held, vectors_at};
 pub use run::{
-    Elsewhere, FieldStats, OpenPart, PartHits, Prefetch, QueryError, Share, SumCut, Target, Texts,
-    only, open_part, part, query, query_rows_filtered, query_rows_filtered_texts, query_rows_split,
-    query_rows_split_texts, query_with, query_with_texts, scan_part, splittable,
+    Elsewhere, FieldStats, OpenPart, PartHits, Prefetch, Projection, QueryError, Share, SumCut,
+    Target, Texts, only, open_part, part, query, query_rows_filtered, query_rows_filtered_texts,
+    query_rows_split, query_rows_split_texts, query_with, query_with_texts, scan_part, splittable,
 };

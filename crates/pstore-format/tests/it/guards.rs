@@ -35,7 +35,7 @@ fn a_sparse_document_is_refused_even_when_another_section_is_attached() {
     let mut d = Document::new("d0".to_owned(), vec![1.0, 2.0]);
     d.vectors.insert(
         "body_sparse".into(),
-        VectorField::Sparse(vec![(3, Impact::new(0.5))]),
+        VectorField::Sparse(vec![("3".to_owned(), Impact::new(0.5))]),
     );
 
     let mut w = SegmentWriter::new(4);

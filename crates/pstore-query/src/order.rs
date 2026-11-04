@@ -7,7 +7,10 @@ use crate::run::{QueryError, Target};
 use pstore_blob::BlobStore;
 use pstore_format::{Document, Number, Segment, Value, cmp_numbers};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+
+/// Where a folded row is (M179): its target's index in the targets given, and its row there.
+pub type Located = (usize, usize);
 
 /// What to order by: an attribute name, or `id`, and the direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +169,8 @@ fn group_of(by: &OrderBy, value: Option<&Value>) -> u8 {
         Some(Value::Str(_)) => 3,
         Some(Value::Uuid(_)) => 4,
         Some(Value::Bytes(_)) => 5,
-        Some(Value::Array(_)) => 6,
+        // M175: a null is only ever an array's element, never a key's value.
+        Some(Value::Array(_) | Value::Null) => 6,
         None => 7,
     };
     if by.desc && group < 7 {
@@ -235,9 +239,9 @@ impl PartialOrd for Rank {
     }
 }
 
-/// A row and its rank, ordered by the rank alone.
+/// A row and its rank, ordered by the rank alone, and where it was read when it was (M179).
 #[derive(Debug)]
-struct Ranked(Rank, Document);
+struct Ranked(Rank, Document, Option<Located>);
 
 impl PartialEq for Ranked {
     fn eq(&self, other: &Self) -> bool {
@@ -282,6 +286,11 @@ impl Selector {
     /// Offers a row. Among rows of equal rank -- only possible for one id offered twice -- the
     /// first offered is kept.
     pub fn offer(&mut self, doc: Document) {
+        self.offer_at(doc, None);
+    }
+
+    /// [`Self::offer`], with where the row was read (M179): kept beside it, never compared.
+    pub fn offer_at(&mut self, doc: Document, at: Option<Located>) {
         if self.cap == 0 {
             return;
         }
@@ -315,7 +324,7 @@ impl Selector {
             }
         }
         let rank = Rank::of(&self.by, &doc);
-        self.kept.push(Ranked(rank, doc));
+        self.kept.push(Ranked(rank, doc, at));
     }
 
     /// How many rows it holds: what the bound is asserted on.
@@ -327,10 +336,16 @@ impl Selector {
     /// The rows kept, in order.
     #[must_use]
     pub fn into_sorted(self) -> Vec<Document> {
+        self.into_sorted_at().into_iter().map(|(d, _)| d).collect()
+    }
+
+    /// [`Self::into_sorted`], each row beside where it was read (M179).
+    #[must_use]
+    pub fn into_sorted_at(self) -> Vec<(Document, Option<Located>)> {
         self.kept
             .into_sorted_vec()
             .into_iter()
-            .map(|Ranked(_, d)| d)
+            .map(|Ranked(_, d, at)| (d, at))
             .collect()
     }
 }
@@ -351,23 +366,139 @@ pub async fn select<S: BlobStore>(
     shadow: &HashSet<String>,
     selector: &mut Selector,
 ) -> Result<(), QueryError> {
+    select_held(store, targets, filter, shadow, selector)
+        .await
+        .map(drop)
+}
+
+/// [`select`], each kept row beside where it was read ([`Selector::into_sorted_at`]), and the
+/// segments its first round opened, in target order (M179): what [`vectors_at`] reads a page's
+/// vectors from, one round more and no segment opened again.
+///
+/// # Errors
+/// As [`select`].
+pub async fn select_held<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    filter: Option<&Predicate>,
+    shadow: &HashSet<String>,
+    selector: &mut Selector,
+) -> Result<Vec<Segment>, QueryError> {
     let (by, cap) = (selector.by.clone(), selector.cap);
     // ⚠️ **A selector per segment**, merged after: collecting a segment's admitted rows and
     // selecting afterwards would hold the whole segment decoded, which is the sort this exists
     // not to do.
-    let per_segment = visit(
+    let (per_segment, segments) = visit_held(
         store,
         targets,
         filter,
         shadow,
         || Selector::new(by.clone(), cap),
-        Selector::offer,
+        |s: &mut Selector, at, doc| s.offer_at(doc, Some(at)),
     )
     .await?;
-    for doc in per_segment.into_iter().flat_map(Selector::into_sorted) {
-        selector.offer(doc);
+    for (doc, at) in per_segment.into_iter().flat_map(Selector::into_sorted_at) {
+        selector.offer_at(doc, at);
     }
-    Ok(())
+    Ok(segments)
+}
+
+/// The full-precision vectors `projection` names of each `wanted` row, by field, in **one
+/// fan-out** over the `segments` [`select_held`] opened (M179), never one segment after
+/// another: `vector` (under its name, one vector) where the segment's `Vectors` section is
+/// `vector` (as `fetch_rows`'s M64 rule), and each named dense field (M190) joined with it in
+/// the same round. A field a segment folded at a varying count of vectors a row has its
+/// rows' offsets read in that round and its vectors in one more (M191), bounded by
+/// `projection.max_bytes` before it. A row holding none of them has no entry.
+///
+/// # Errors
+/// A vector range that cannot be read; [`QueryError::ProjectionTooLarge`] when the wanted
+/// rows' varying fields hold more than the bound.
+pub async fn vectors_at<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    segments: &[Segment],
+    wanted: &[Located],
+    projection: crate::Projection<'_>,
+) -> Result<BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>>, QueryError> {
+    let mut per_segment: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (segment, row) in wanted {
+        per_segment.entry(*segment).or_default().push(*row);
+    }
+    let read =
+        futures_util::future::try_join_all(per_segment.into_iter().filter_map(|(i, rows)| {
+            let (t, segment) = (targets.get(i)?, segments.get(i)?);
+            Some(async move {
+                let (fixed, varying) = crate::run::named_fields(segment, projection.named);
+                let vector = async {
+                    if projection.vector && segment.reads_vector_rows() {
+                        segment.vector_rows(store, &t.segment, &rows).await
+                    } else {
+                        Ok(BTreeMap::new())
+                    }
+                };
+                let fields = futures_util::future::try_join_all(fixed.into_iter().map(|name| {
+                    let rows = &rows;
+                    async move {
+                        let got = segment.field_rows(store, &t.segment, name, rows).await?;
+                        Ok::<_, QueryError>((name, got))
+                    }
+                }));
+                let spans = futures_util::future::try_join_all(varying.into_iter().map(|name| {
+                    let rows = &rows;
+                    async move {
+                        let got = segment.field_spans(store, &t.segment, name, rows).await?;
+                        Ok::<_, QueryError>((name, got))
+                    }
+                }));
+                let (vector, fields, spans) = futures_util::future::try_join3(
+                    async { Ok::<_, QueryError>(vector.await?) },
+                    fields,
+                    spans,
+                )
+                .await?;
+                let mut out: BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>> = BTreeMap::new();
+                for (row, v) in vector {
+                    out.entry((i, row))
+                        .or_default()
+                        .insert(pstore_format::DEFAULT_FIELD.to_owned(), vec![v]);
+                }
+                for (name, got) in fields {
+                    for (row, vs) in got {
+                        out.entry((i, row)).or_default().insert(name.clone(), vs);
+                    }
+                }
+                let mut held = crate::run::Spans::new();
+                for (name, got) in spans {
+                    for (row, span) in got {
+                        held.entry((i, row)).or_default().push((name.clone(), span));
+                    }
+                }
+                Ok::<_, QueryError>((out, held))
+            })
+        }))
+        .await?;
+    let (mut out, mut spans) = (BTreeMap::new(), crate::run::Spans::new());
+    for (fields, held) in read {
+        out.extend(fields);
+        spans.extend(held);
+    }
+    // M191: the page's varying fields, one round more, bounded over every segment at once.
+    let opened: Vec<&Segment> = segments.iter().collect();
+    let varying = crate::run::read_spans(
+        store,
+        targets,
+        &opened,
+        wanted,
+        &spans,
+        projection.max_bytes,
+    )
+    .await?;
+    for (key, fields) in varying {
+        let row: &mut BTreeMap<String, Vec<Vec<f32>>> = out.entry(key).or_default();
+        row.extend(fields);
+    }
+    Ok(out)
 }
 
 /// The visiting [`select`] and [`crate::aggregate`] share (M12): every admitted row of every
@@ -387,8 +518,30 @@ where
     N: Fn() -> T,
     O: Fn(&mut T, Document),
 {
+    visit_held(store, targets, filter, shadow, new, |t: &mut T, _, doc| {
+        offer(t, doc);
+    })
+    .await
+    .map(|(sinks, _)| sinks)
+}
+
+/// [`visit`], offering each row with where it was read, and returning the segments it opened.
+async fn visit_held<S, T, N, O>(
+    store: &S,
+    targets: &[Target],
+    filter: Option<&Predicate>,
+    shadow: &HashSet<String>,
+    new: N,
+    offer: O,
+) -> Result<(Vec<T>, Vec<Segment>), QueryError>
+where
+    S: BlobStore,
+    N: Fn() -> T,
+    O: Fn(&mut T, Located, Document),
+{
     let opened = open(store, targets, false).await?;
-    visit_opened(store, targets, &opened, filter, shadow, new, offer).await
+    let sinks = visit_opened_at(store, targets, &opened, filter, shadow, new, offer).await?;
+    Ok((sinks, opened.into_iter().map(|o| o.segment).collect()))
 }
 
 /// One target opened for a visit: its footer, its delete vector, and -- when asked for and
@@ -462,25 +615,54 @@ where
     N: Fn() -> T,
     O: Fn(&mut T, Document),
 {
+    visit_opened_at(
+        store,
+        targets,
+        opened,
+        filter,
+        shadow,
+        new,
+        |t: &mut T, _, doc| offer(t, doc),
+    )
+    .await
+}
+
+/// [`visit_opened`], offering each row with where it was read.
+async fn visit_opened_at<S, T, N, O>(
+    store: &S,
+    targets: &[Target],
+    opened: &[Opened],
+    filter: Option<&Predicate>,
+    shadow: &HashSet<String>,
+    new: N,
+    offer: O,
+) -> Result<Vec<T>, QueryError>
+where
+    S: BlobStore,
+    N: Fn() -> T,
+    O: Fn(&mut T, Located, Document),
+{
     let (new, offer) = (&new, &offer);
-    futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
-        let mut local = new();
-        o.segment
-            .visit_rows_where(
-                store,
-                &t.segment,
-                |zones| filter.is_none_or(|f| f.could_admit(zones)),
-                |row, doc| {
-                    let hidden =
-                        o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
-                    if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
-                        offer(&mut local, doc);
-                    }
-                },
-            )
-            .await?;
-        Ok::<_, QueryError>(local)
-    }))
+    futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().map(
+        |(i, (o, t))| async move {
+            let mut local = new();
+            o.segment
+                .visit_rows_where(
+                    store,
+                    &t.segment,
+                    |zones| filter.is_none_or(|f| f.could_admit(zones)),
+                    |row, doc| {
+                        let hidden =
+                            o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
+                        if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
+                            offer(&mut local, (i, row), doc);
+                        }
+                    },
+                )
+                .await?;
+            Ok::<_, QueryError>(local)
+        },
+    ))
     .await
 }
 
@@ -606,14 +788,17 @@ mod tests {
         let a = Ranked(
             Rank::of(&by(false), &doc("a", Some(Value::Int(1)))),
             doc("a", None),
+            None,
         );
         let same = Ranked(
             Rank::of(&by(false), &doc("a", Some(Value::Int(1)))),
             doc("z", None),
+            None,
         );
         let other = Ranked(
             Rank::of(&by(false), &doc("b", Some(Value::Int(1)))),
             doc("a", None),
+            None,
         );
         assert!(
             a == same,

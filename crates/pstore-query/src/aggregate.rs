@@ -67,6 +67,8 @@ pub enum Key {
     Bytes(Vec<u8>),
     /// An array, lexicographically, a proper prefix first.
     Array(Vec<Key>),
+    /// A null array element (M175): equal only to another, after every other kind.
+    Null,
     /// No value.
     Absent,
 }
@@ -87,6 +89,7 @@ impl Key {
             Some(Value::Uuid(u)) => Self::Uuid(*u),
             Some(Value::Bytes(b)) => Self::Bytes(b.clone()),
             Some(Value::Array(a)) => Self::Array(a.iter().map(|v| Self::of(Some(v))).collect()),
+            Some(Value::Null) => Self::Null,
         }
     }
 
@@ -99,7 +102,8 @@ impl Key {
             Self::Uuid(_) => 4,
             Self::Bytes(_) => 5,
             Self::Array(_) => 6,
-            Self::Absent => 7,
+            Self::Null => 7,
+            Self::Absent => 8,
         }
     }
 
@@ -116,6 +120,7 @@ impl Key {
             Self::Uuid(u) => Some(Value::Uuid(*u)),
             Self::Bytes(b) => Some(Value::Bytes(b.clone())),
             Self::Array(a) => Some(Value::Array(a.iter().filter_map(Self::value).collect())),
+            Self::Null => Some(Value::Null),
             Self::Absent => None,
         }
     }
@@ -507,6 +512,10 @@ mod tests {
     fn keys_order_and_unify_as_stated() {
         let keys = [
             Key::of(None),
+            // M175: a null element after every other kind, an array's only.
+            Key::of(Some(&Value::Array(vec![Value::Null, Value::Null]))),
+            Key::of(Some(&Value::Array(vec![Value::Null]))),
+            Key::of(Some(&Value::Array(vec![Value::Int(1), Value::Null]))),
             Key::of(Some(&Value::Array(vec![Value::Int(1), Value::Int(2)]))),
             Key::of(Some(&Value::Array(vec![Value::Float(1.0)]))),
             // M171: UUIDs then bytes, after strings and before arrays.
@@ -542,6 +551,10 @@ mod tests {
             Key::of(Some(&Value::Int(5))),
             Key::of(Some(&Value::DateTime(5)))
         );
+        // M175: a null element equals only another, and reports itself.
+        let nulls = Value::Array(vec![Value::Null]);
+        assert_eq!(Key::of(Some(&nulls)), Key::of(Some(&nulls.clone())));
+        assert_eq!(Key::of(Some(&nulls)).value(), Some(nulls));
         // Within a group, by value: two datetimes, bools, strings, UUIDs or bytes are not one key.
         for (lo, hi) in [
             (Value::DateTime(1), Value::DateTime(5)),

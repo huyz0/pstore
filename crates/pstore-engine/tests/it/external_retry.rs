@@ -9,7 +9,7 @@
 
 //! M86: a registration or a drop that meets a contended HEAD retries, lands, and gives up with
 //! `Contended` -- not `Lost` -- after exactly the attempts every commit loop here makes. M147: so
-//! does a create.
+//! does a create. M149: so does setting a flag.
 
 use pstore_blob::{BlobStore, Key, MemoryStore};
 use pstore_engine::{Engine, EngineError, ExternalKind, ExternalRefusal};
@@ -261,4 +261,18 @@ async fn a_create_that_keeps_contending_reports_contention_after_every_attempt()
     assert_eq!(store.refused.load(SeqCst), ATTEMPTS);
     store.left.store(0, SeqCst);
     assert!(!e.head_for_test().await.indexes.contains_key("c"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flag_that_keeps_contending_reports_contention_after_every_attempt() {
+    let (store, e) = engine(0).await;
+    e.create_index("c", 2, pstore_engine::Metric::CosineDistance)
+        .await
+        .unwrap();
+    store.left.store(u32::MAX, SeqCst);
+    let err = e.set_read_only("c", true).await.unwrap_err();
+    assert!(matches!(err, EngineError::Contended), "{err:?}");
+    assert_eq!(store.refused.load(SeqCst), ATTEMPTS);
+    store.left.store(0, SeqCst);
+    assert!(e.head_for_test().await.read_only.is_empty());
 }

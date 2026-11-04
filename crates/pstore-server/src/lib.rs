@@ -32,6 +32,7 @@ pub use auth::{Auth, AuthError};
 mod body;
 mod boost;
 mod diversify;
+mod explain;
 mod external;
 mod facets;
 mod highlight;
@@ -57,8 +58,9 @@ pub use peers::{GossipConfig, PeerConfig, PeerGossip, peer_list_of};
 pub use replication::{ReplicationPolicy, Worker, WorkerTick, run_replication};
 pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
-    IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta, QueryRequest,
-    QueryResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
+    IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta,
+    QueryRequest, QueryResponse, ReadOnlyResponse, RecallGroundTruth, RecallNeighbor,
+    RecallResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -166,6 +168,9 @@ pub struct Api<S> {
     /// Index parameters every engine is built with, when set (M54's tests cluster small
     /// segments with them).
     index_params: Mutex<Option<pstore_index::cluster::Params>>,
+    /// The most bytes of folded vectors one query projects (M191): [`MAX_PROJECTED_BYTES`],
+    /// lowered only by a test.
+    projection_bytes: std::sync::atomic::AtomicU64,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -183,6 +188,8 @@ struct Slot<S> {
 struct Registry {
     /// `PSTORE_ENGINES`: past it, idle engines are dropped. `0` for unbounded.
     cap: usize,
+    /// `PSTORE_INDEXES_PER_TENANT` (M169): the most indexes a tenant may hold. `0` for none.
+    index_limit: usize,
     /// Whether a reap loop runs: only then does a reapable commit keep an engine.
     reaping: bool,
     /// `PSTORE_APPLIED_WRITES=1` (M129): every node of the deployment folds applied writes.
@@ -299,6 +306,10 @@ struct Http {
     refusals: std::collections::BTreeMap<&'static str, u64>,
     /// `outcome -> count` for scheduled folds (M9i.1).
     folds: std::collections::BTreeMap<&'static str, u64>,
+    /// `outcome -> count` for folds of a replica's source (M192).
+    source_folds: std::collections::BTreeMap<&'static str, u64>,
+    /// Times a bounded replication went past its bound (M192).
+    lag_exceeded: u64,
 }
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -456,6 +467,7 @@ impl<S: BlobStore + 'static> Api<S> {
             }),
             held: Mutex::new(peers::Holder::default()),
             index_params: Mutex::new(None),
+            projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -692,7 +704,9 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/indexes/{index}", Read.on(get(index_summary::<S>)))
             .route(
                 "/v1/indexes/{index}",
-                Write.on(axum::routing::delete(delete_index::<S>).put(create_index::<S>)),
+                Write.on(axum::routing::delete(delete_index::<S>)
+                    .put(create_index::<S>)
+                    .patch(patch_index::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/documents",
@@ -700,6 +714,11 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .route("/v1/indexes/{index}/query", Read.on(post(query_index::<S>)))
             .route("/v1/indexes/{index}/warm", Read.on(post(warm_index::<S>)))
+            // M162: the index's recall, measured at one snapshot.
+            .route(
+                "/v1/indexes/{index}/recall",
+                Read.on(post(recall_index::<S>)),
+            )
             // M132: a key that makes an applied write's retry safe.
             .route(
                 "/v1/indexes/{index}/idempotency-keys",
@@ -736,6 +755,15 @@ impl<S: BlobStore + 'static> Api<S> {
                 "/v1/indexes/{index}/replication",
                 Read.on(get(replication::status::<S>)),
             )
+            // M166: an isolated copy, as an operation with a status.
+            .route(
+                "/v1/indexes/{index}/copy",
+                Write.on(post(replication::copy::<S>)),
+            )
+            .route(
+                "/v1/indexes/{index}/copy",
+                Read.on(get(replication::copy_status::<S>)),
+            )
             .route(
                 "/v1/indexes/{index}/replication/pause",
                 Write.on(post(replication::pause::<S>)),
@@ -743,6 +771,10 @@ impl<S: BlobStore + 'static> Api<S> {
             .route(
                 "/v1/indexes/{index}/replication/resume",
                 Write.on(post(replication::resume::<S>)),
+            )
+            .route(
+                "/v1/indexes/{index}/replication/sync",
+                Write.on(post(replication::sync_now::<S>)),
             )
             .route(
                 "/v1/indexes/{index}/schema",
@@ -770,9 +802,9 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
-        let (recheck, keys, filter_rows) = {
+        let (recheck, keys, filter_rows, index_limit) = {
             let r = self.registry_mut();
-            (r.lane_recheck, r.idempotency, r.filter_rows)
+            (r.lane_recheck, r.idempotency, r.filter_rows, r.index_limit)
         };
         let params = *self
             .index_params
@@ -801,7 +833,12 @@ impl<S: BlobStore + 'static> Api<S> {
             let engine = match filter_rows {
                 Some(rows) => engine.with_filter_rows(rows),
                 None => engine,
-            };
+            }
+            .with_projection_bytes(
+                self.projection_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
@@ -883,6 +920,14 @@ impl<S: BlobStore + 'static> Api<S> {
                 })?;
         *pool = Some(created.clone());
         Ok(created)
+    }
+
+    /// Lowers the bound on a query's projected vector bytes (M191's tests), for the engines
+    /// built after it: set it before a tenant's first request.
+    #[doc(hidden)]
+    pub fn set_projection_bytes_for_test(&self, bytes: u64) {
+        self.projection_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Builds every engine from now on with `params` (M54's tests: small clustered segments).
@@ -984,6 +1029,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// the eviction loop drops the least recently used idle engines.
     pub fn limit_engines(&self, cap: usize) {
         self.registry_mut().cap = cap;
+    }
+
+    /// Refuses a request that would give a tenant more than `limit` indexes, `0` for unbounded
+    /// (M169, `PSTORE_INDEXES_PER_TENANT`). Meant to be called once at startup: an engine
+    /// already built keeps the limit it was built with.
+    pub fn limit_indexes(&self, limit: usize) {
+        self.registry_mut().index_limit = limit;
     }
 
     /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
@@ -1291,9 +1343,29 @@ impl From<EngineError> for ApiError {
             EngineError::Unmeasurable(_) => Self::bad_request(e.to_string()),
             // M16: the client asked for a branch the engine will not make.
             EngineError::Refused(_) => Self::bad_request(e.to_string()),
+            // M190: a projected field folded where the row fetch cannot read it.
+            EngineError::Unprojected(_) => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, "bad_query", e.to_string())
+            }
             EngineError::IndexExists(_) => {
                 Self::new(StatusCode::CONFLICT, "index_exists", e.to_string())
             }
+            EngineError::IndexReadOnly(_) => {
+                Self::new(StatusCode::CONFLICT, "index_read_only", e.to_string())
+            }
+            // M169: the tenant's state refuses it, and a drop is the remedy.
+            EngineError::IndexLimit { .. } => {
+                Self::new(StatusCode::CONFLICT, "index_limit", e.to_string())
+            }
+            // M162: sized before any segment read; fewer queries fit.
+            EngineError::RecallTooLarge { .. } => {
+                Self::new(StatusCode::BAD_REQUEST, "recall_too_large", e.to_string())
+            }
+            EngineError::RecallNeedsVectors(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "recall_needs_vectors",
+                e.to_string(),
+            ),
             // M22: each replication rule by its own name.
             EngineError::Replica(r) => {
                 use pstore_engine::ReplicaRefusal as R;
@@ -1438,6 +1510,38 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
+    // M192: folds of a replica's source, and replications past their lag bound.
+    out.push_str(
+        "# HELP pstore_replication_source_fold_total Folds of a replica's source by outcome \
+         (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_source_fold_total counter\n");
+    for outcome in ["folded", "nothing", "failed"] {
+        out.push_str(&format!(
+            "pstore_replication_source_fold_total{{outcome=\"{outcome}\"}} {}\n",
+            http.source_folds.get(outcome).copied().unwrap_or(0)
+        ));
+    }
+    out.push_str(
+        "# HELP pstore_replication_lag_exceeded_total Times a bounded replication's lag went \
+         past the bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lag_exceeded_total counter\n");
+    out.push_str(&format!(
+        "pstore_replication_lag_exceeded_total {}\n",
+        http.lag_exceeded
+    ));
+    out.push_str(
+        "# HELP pstore_replication_lagging Bounded replications this worker holds past their \
+         lag bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lagging gauge\n");
+    out.push_str(&format!(
+        "pstore_replication_lagging {}\n",
+        api.replicating
+            .lagging
+            .load(std::sync::atomic::Ordering::SeqCst)
+    ));
     // M54: parts of queries sent to peers, those that failed, and those run for peers. M56:
     // and how many servers the list holds now, this one included.
     let (sent, failed, servers) = api
@@ -1635,7 +1739,7 @@ fn name_refusal(name: &str) -> Option<&'static str> {
 
 /// The document fields a column of `upsert_columns` may name; every other column is an
 /// attribute.
-const DOCUMENT_COLUMNS: [&str; 3] = ["vector", "vectors", "text"];
+const DOCUMENT_COLUMNS: [&str; 4] = ["vector", "vectors", "text", SPARSE_FIELD];
 
 /// A write's upserts as one list (M174): `documents`, then the rows of `upsert_columns`, each
 /// read as a `documents` entry is, with every `null` attribute left out -- an upsert replaces
@@ -1665,9 +1769,8 @@ fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
             }
         }
         for id in ids {
-            let serde_json::Value::String(id) = id else {
-                return Err(bad("ids are strings".to_owned()));
-            };
+            // M176: a string or an integer, as a row's id is; the row reads it again.
+            let shown = types::Id::of(&id).map_err(bad)?;
             let mut attrs = serde_json::Map::new();
             let mut row = serde_json::Map::new();
             // Each column's cells in id order, one a row. A null cell is left to the row's
@@ -1684,9 +1787,9 @@ fn upserts_of(req: &mut WriteRequest) -> Result<(), ApiError> {
                 to.insert(name.to_owned(), v);
             }
             row.insert("attributes".to_owned(), attrs.into());
-            row.insert("id".to_owned(), id.clone().into());
+            row.insert("id".to_owned(), id);
             let doc = serde_json::from_value(row.into())
-                .map_err(|e| bad(format!("document {id}: {e}")))?;
+                .map_err(|e| bad(format!("document {shown}: {e}")))?;
             req.documents.push(doc);
         }
     }
@@ -1724,15 +1827,17 @@ fn patch_rows_of(
             .ok_or_else(|| ApiError::bad_request("a patch is {\"id\", \"attributes\"}"))?;
         let id = o
             .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ApiError::bad_request("a patch needs a string id"))?
-            .to_owned();
+            .ok_or_else(|| "a patch needs an id".to_owned())
+            .and_then(types::Id::of)
+            .map_err(ApiError::bad_request)?;
         if let Some(k) = o.keys().find(|k| *k != "id" && *k != "attributes") {
-            return Err(ApiError::bad_request(if k == "vector" {
-                format!("patch of {id}: a patch carries no vector; upsert the row to change it")
-            } else {
-                format!("patch of {id}: unknown field {k}")
-            }));
+            return Err(ApiError::bad_request(
+                if k == "vector" || k == SPARSE_FIELD {
+                    format!("patch of {id}: a patch carries no {k}; upsert the row to change it")
+                } else {
+                    format!("patch of {id}: unknown field {k}")
+                },
+            ));
         }
         let attrs = match o.remove("attributes") {
             None => serde_json::Map::new(),
@@ -1756,10 +1861,10 @@ fn patch_rows_of(
         };
         let mut columns = Vec::new();
         for (name, col) in std::mem::take(cols) {
-            if name == "vector" {
-                return Err(bad(
-                    "a patch carries no vector; upsert the rows to change them",
-                ));
+            if name == "vector" || name == SPARSE_FIELD {
+                return Err(bad(&format!(
+                    "a patch carries no {name}; upsert the rows to change them"
+                )));
             }
             let col = match col {
                 serde_json::Value::Array(c) if c.len() == ids.len() => c,
@@ -1768,16 +1873,91 @@ fn patch_rows_of(
             columns.push((name, col.into_iter()));
         }
         for id in &ids {
-            let id = id.as_str().ok_or_else(|| bad("ids are strings"))?;
+            let id = types::Id::of(id).map_err(|e| bad(&e))?;
             // Each column's cells in id order, one a row, moved.
             let attrs = columns
                 .iter_mut()
                 .filter_map(|(name, col)| col.next().map(|v| (name.clone(), v)))
                 .collect();
-            rows.push((id.to_owned(), attrs));
+            rows.push((id, attrs));
         }
     }
     Ok(rows)
+}
+
+/// Every id a write names read by the index's id kind (M176), `Some(None)` a string and
+/// `None` unknown: a string as a `uuid`'s form under `uuid`, refused when it spells none; an
+/// id of another kind refused as a conflict; and ids of two kinds refused. Under no known
+/// kind the engine judges the rows. Rewrites the ids only with `apply`, so a refusal by a
+/// stale kind can be judged again by a fresh one.
+fn typed_ids(
+    docs: &mut [types::DocumentIn],
+    patches: &mut [RawPatch],
+    deletes: &mut [types::Id],
+    kind: Option<Option<pstore_format::typed::Kind>>,
+    apply: bool,
+) -> Result<(), ApiError> {
+    use pstore_format::typed::Kind;
+    let name = |k: Option<Kind>| k.map_or("string", Kind::name);
+    // An id of another kind than the index's is a conflict with its schema, as the engine
+    // names one; a string spelling no uuid is malformed.
+    let conflict = |id: &types::Id, want: Option<Kind>| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!("id {id} is not a {0}; this index's ids are {0}", name(want)),
+        )
+    };
+    let ids = docs
+        .iter_mut()
+        .map(|d| &mut d.id)
+        .chain(patches.iter_mut().map(|(id, _)| id))
+        .chain(deletes.iter_mut());
+    let mut first = None;
+    for id in ids {
+        let held = pstore_format::id::kind(id.as_str());
+        let k = match kind {
+            Some(Some(Kind::Uuid)) if held.is_none() => {
+                let u = pstore_format::typed::parse_uuid(id.as_str())
+                    .ok_or_else(|| ApiError::bad_request(format!("id {id} is not a uuid")))?;
+                if apply {
+                    id.0 = pstore_format::id::uuid(&u);
+                }
+                Some(Kind::Uuid)
+            }
+            Some(want) if held != want => return Err(conflict(id, want)),
+            _ => held,
+        };
+        match first {
+            None => first = Some(k),
+            Some(f) if f != k => {
+                return Err(ApiError::bad_request(format!(
+                    "id {id} is of another kind than the write's first id: an index's ids are \
+                     all strings, all uint64 or all uuid"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The id kind a write reads its ids by (M176), from `dated` (the known kinds and the
+/// request's declarations) and whether the request declares `id: string`.
+fn id_kind(
+    dated: &typed::Declarations,
+    declared_string: bool,
+) -> Result<Option<Option<pstore_format::typed::Kind>>, ApiError> {
+    match (dated.get(pstore_engine::ID_KIND), declared_string) {
+        (Some(k), true) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "schema_conflict",
+            format!("id is declared string; this index's ids are {}", k.name()),
+        )),
+        (Some(k), false) => Ok(Some(Some(*k))),
+        (None, true) => Ok(Some(None)),
+        (None, false) => Ok(None),
+    }
 }
 
 /// A write's documents, patches and by-filter patch, their attributes read by `dated`.
@@ -1808,7 +1988,7 @@ fn typed_ops(
 }
 
 /// A patch as a request spells it: its id and its attributes, not yet read by any type.
-type RawPatch = (String, serde_json::Map<String, serde_json::Value>);
+type RawPatch = (types::Id, serde_json::Map<String, serde_json::Value>);
 
 /// The patches `rows` spell, their attributes read by `dated` (M173: the known types, so
 /// after the HEAD read a refusal of the request's shape never pays for).
@@ -1827,7 +2007,7 @@ fn patches_of(
 /// One patch of `id`: `attributes` converted as a document's are, `null` removing one.
 /// Refusals name `who`.
 fn patch_of(
-    id: String,
+    id: types::Id,
     who: &str,
     attrs: serde_json::Map<String, serde_json::Value>,
     dated: &typed::Declarations,
@@ -1848,6 +2028,7 @@ fn patch_of(
         vector: None,
         vectors: std::collections::BTreeMap::new(),
         text: None,
+        sparse: None,
         attributes: set.into_iter().collect(),
     };
     for name in &unset {
@@ -1859,7 +2040,7 @@ fn patch_of(
     }
     let doc = to_document(as_doc, dated)?;
     Ok(pstore_engine::Patch {
-        id,
+        id: id.0,
         set: doc.attrs,
         unset,
     })
@@ -1907,7 +2088,7 @@ fn patch_by_filter_attrs(
     dated: &typed::Declarations,
 ) -> Result<pstore_engine::Patch, ApiError> {
     // Refusals from the document conversion name no operation, so they are prefixed here.
-    patch_of(String::new(), "patch_by_filter", attrs, dated).map_err(|e| {
+    patch_of(types::Id(String::new()), "patch_by_filter", attrs, dated).map_err(|e| {
         if e.message.starts_with("patch_by_filter") {
             e
         } else {
@@ -2161,19 +2342,57 @@ async fn write_documents<S: BlobStore + 'static>(
         || patch_by
             .as_ref()
             .is_some_and(|(_, attrs)| !attrs.is_empty());
-    let mut dated = if valued {
+    // M176: and every id by the index's id kind -- needed only to read a string spelling a
+    // uuid as one, so a write naming none reads nothing more: any other id of the wrong kind
+    // is the engine's to refuse, at zero requests, as M141's bound needs.
+    let uuids = req
+        .documents
+        .iter()
+        .map(|d| &d.id)
+        .chain(patches.iter().map(|(id, _)| id))
+        .chain(req.deletes.iter())
+        .any(|id| pstore_format::typed::parse_uuid(id.as_str()).is_some());
+    let mut dated = if valued || uuids {
         engine.known_types(&index).await
     } else {
         pstore_engine::Types::new()
     };
     dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
+    let mut patches = patches;
+    let declared_string = req
+        .schema
+        .as_ref()
+        .and_then(|s| s.get(pstore_query::ID_ATTRIBUTE))
+        .is_some_and(|ty| ty == "string");
+    // A refusal by a kind the request did not declare re-reads HEAD once before it stands,
+    // as an attribute type's does (M173): the kind held may be a dropped index's.
+    if let Err(e) = id_kind(&dated, declared_string)
+        .and_then(|k| typed_ids(&mut req.documents, &mut patches, &mut req.deletes, k, false))
+    {
+        if !dated.contains_key(pstore_engine::ID_KIND) || types.contains_key(pstore_engine::ID_KIND)
+        {
+            return Err(e);
+        }
+        dated = engine.reread_types(&index).await?;
+        dated.extend(types.iter().map(|(n, k)| (n.clone(), *k)));
+    }
+    typed_ids(
+        &mut req.documents,
+        &mut patches,
+        &mut req.deletes,
+        id_kind(&dated, declared_string)?,
+        true,
+    )?;
     // ⚠️ Every document converted BEFORE the engine sees any: a refusal must leave nothing
     // buffered, not the half of the batch that came before the bad attribute.
     // Moved, not copied (M119): the documents are not read again -- unless a type this
     // request did not declare reads them. A refusal by one re-reads HEAD once before it
     // stands (M9f.2), because the type held may be a dropped index's, and the read needs
     // the request as it came.
-    let kept = (dated.len() > types.len())
+    // The id's kind reads no attribute (M176), so it alone asks for no copy.
+    let kept = dated
+        .keys()
+        .any(|n| n != pstore_engine::ID_KIND && !types.contains_key(n))
         .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
     let (docs, patches, patch_by) = match (
         typed_ops(
@@ -2211,7 +2430,10 @@ async fn write_documents<S: BlobStore + 'static>(
         Some(_) => Some(engine.mark().await?),
         None => None,
     };
-    let deletes = std::mem::take(&mut req.deletes);
+    let deletes: Vec<String> = std::mem::take(&mut req.deletes)
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
     // M141: the whole request's share of the tenant's buffer, before anything is buffered.
     let need = write_footprint(
         &docs,
@@ -2550,7 +2772,7 @@ fn affected_ids_bounded(
         .documents
         .iter()
         .map(|d| d.id.as_str())
-        .chain(req.deletes.iter().map(String::as_str))
+        .chain(req.deletes.iter().map(types::Id::as_str))
         .chain(patches.iter().map(|(id, _)| id.as_str()))
         .collect();
     if named.len() > AFFECTED_IDS_MAX {
@@ -2672,30 +2894,34 @@ async fn query_index<S: BlobStore + 'static>(
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
-        let (got, faceted) = match facet {
-            None => {
-                let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
-                (api.requesting(tenant, ranked.await).await?, None)
-            }
-            Some((freq, _)) => {
-                // ⚠️ Together, never one after the other: depth is the deeper of the two
-                // (M65). M131: and from one snapshot, unless the query reads a past epoch;
-                // planned inside, so a pinned retry can run both again.
-                let (req, freq, token, peers, engine, index) =
-                    (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
-                let both = move || async move {
-                    let ranked = run(engine, index, req, crate::plan(req)?, token, peers);
-                    let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
-                    futures_util::future::try_join(ranked, beside).await
-                };
-                let both = match pinnable(std::slice::from_ref(req), token)? {
-                    Some(level) => engine.pinned(index, level, both).await,
-                    None => both().await,
-                };
-                let (got, faceted) = api.requesting(tenant, both).await?;
-                (got, Some(faceted))
-            }
-        };
+        let explaining = req.explain;
+        let ((got, faceted), explained) = explain::collect(explaining, async {
+            Ok::<_, ApiError>(match facet {
+                None => {
+                    let ranked = run(&engine, &index, &req, plan, &token, peers.as_ref());
+                    (api.requesting(tenant, ranked.await).await?, None)
+                }
+                Some((freq, _)) => {
+                    // ⚠️ Together, never one after the other: depth is the deeper of the two
+                    // (M65). M131: and from one snapshot, unless the query reads a past epoch;
+                    // planned inside, so a pinned retry can run both again.
+                    let (req, freq, token, peers, engine, index) =
+                        (&req, &freq, &token, peers.as_ref(), &engine, index.as_str());
+                    let both = move || async move {
+                        let ranked = run(engine, index, req, crate::plan(req)?, token, peers);
+                        let beside = run(engine, index, freq, crate::plan(freq)?, token, None);
+                        futures_util::future::try_join(ranked, beside).await
+                    };
+                    let both = match pinnable(std::slice::from_ref(req), token)? {
+                        Some(level) => engine.pinned(index, level, both).await,
+                        None => both().await,
+                    };
+                    let (got, faceted) = api.requesting(tenant, both).await?;
+                    (got, Some(faceted))
+                }
+            })
+        })
+        .await?;
         let facets_epoch = faceted.as_ref().map(|f| f.epoch);
         let facets = faceted.map(|f| facets::render(f.aggregations, f.aggregation_groups));
         let session = got.token.encode();
@@ -2713,6 +2939,7 @@ async fn query_index<S: BlobStore + 'static>(
                     consistency: got.consistency,
                     session: session.clone(),
                     staleness_ms: got.staleness_ms,
+                    explain: explained,
                 },
             }),
             &session,
@@ -2860,6 +3087,12 @@ fn checked_query(req: QueryRequest) -> Result<QueryRequest, ApiError> {
             "top_k may be at most {MAX_ORDERED} for a query leg"
         )));
     }
+    // M165: a plan is a ranked query's legs, and an order or an aggregation runs none.
+    if req.explain && (req.rank_by.is_some() || req.aggregate_by.is_some()) {
+        return Err(ApiError::bad_request(
+            "explain describes a ranked query's legs: rank_by and aggregate_by run none",
+        ));
+    }
     Ok(req)
 }
 
@@ -2913,7 +3146,22 @@ fn multi_query(
             if q.get("queries").is_some() {
                 return Err(ApiError::bad_request("a query inside queries may not nest"));
             }
-            parse_query(q)
+            // M179: a multi-query's rows are fused and merged; their vectors are later.
+            if q.get("include_vectors").is_some() {
+                return Err(ApiError::bad_request(
+                    "include_vectors is a single query's: a query inside queries cannot \
+                     project vectors yet",
+                ));
+            }
+            // M165: the sub-queries run together on one task, so one plan cannot be told
+            // from another's.
+            let q = parse_query(q)?;
+            if q.explain {
+                return Err(ApiError::bad_request(
+                    "explain is a query's alone: a query inside queries may not ask for it",
+                ));
+            }
+            Ok(q)
         })
         .collect::<Result<Vec<QueryRequest>, _>>()?;
     // M164: fusion ranks rows, and an aggregation has none.
@@ -2938,11 +3186,13 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
         ("vector", req.vector.is_some()),
         ("multi", req.multi.is_some()),
         ("text", req.text.is_some()),
+        ("sparse", req.sparse.is_some()),
         ("rank_by", req.rank_by.is_some()),
         ("offset", req.offset.is_some()),
         ("fusion", req.fusion.is_some()),
         ("include_attributes", req.include_attributes.is_some()),
         ("exclude_attributes", req.exclude_attributes.is_some()),
+        ("include_vectors", req.include_vectors.is_some()),
     ] {
         if present {
             return Err(ApiError::bad_request(format!(
@@ -3054,6 +3304,160 @@ enum Plan {
     ),
 }
 
+/// The most rows one query projects vectors for (M179): a page of 1,000 vectors of width
+/// 1,536 is about 6 MB of f32s, where `MAX_ORDERED` alone would allow ten times it.
+const MAX_VECTOR_ROWS: usize = 1_000;
+
+/// The most bytes of folded vectors of a varying layout one query reads to project (M191):
+/// `MAX_NAMED_FIELDS` fields of 1,024 vectors of width 1,537, 4 bytes a component, are
+/// about 48 MiB, so one row always fits (`vector` is never read this way).
+const MAX_PROJECTED_BYTES: u64 = 64 << 20;
+
+/// What the query's results project (M179, M190), `None` when it asks for nothing, or why it
+/// cannot ask.
+fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError> {
+    let bad = |why: &str| ApiError::bad_request(format!("include_vectors: {why}"));
+    let Some(raw) = &req.include_vectors else {
+        if req.vector_encoding.is_some() {
+            return Err(ApiError::bad_request(
+                "vector_encoding spells projected vectors: the query has no include_vectors",
+            ));
+        }
+        return Ok(None);
+    };
+    let names = raw
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| bad("a list of the vector fields to project, [\"vector\"]"))?;
+    // M190: a per-query bound, the most fields one document holds.
+    if names.len() > 1 + MAX_NAMED_FIELDS {
+        return Err(bad(&format!(
+            "{} names: at most {} fields are projected, `vector` and {MAX_NAMED_FIELDS} named",
+            names.len(),
+            1 + MAX_NAMED_FIELDS
+        )));
+    }
+    let (mut vector, mut named) = (false, Vec::new());
+    for n in names {
+        let name = n
+            .as_str()
+            .ok_or_else(|| bad(&format!("{n} is not a vector field's name")))?;
+        if name == pstore_format::DEFAULT_FIELD {
+            if vector {
+                return Err(bad(&format!("{name:?} is named twice")));
+            }
+            vector = true;
+            continue;
+        }
+        if name == "sparse" {
+            return Err(bad(
+                "`sparse` is not projected: a sparse field's vectors are later",
+            ));
+        }
+        let name = named_field(name).map_err(|e| bad(&e.message))?;
+        if named.contains(&name) {
+            return Err(bad(&format!("{name:?} is named twice")));
+        }
+        named.push(name);
+    }
+    let encoding = match req.vector_encoding.as_deref() {
+        None | Some("float") => VectorEncoding::Float,
+        Some("base64") => VectorEncoding::Base64,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "vector_encoding: {other:?} is not float or base64"
+            )));
+        }
+    };
+    if req.as_of.is_some() {
+        return Err(bad(
+            "a past epoch's vectors are later: it cannot be combined with as_of",
+        ));
+    }
+    // A ranked query's row fetch covers its whole page; an order reads only the page's rows.
+    let rows = if req.rank_by.is_some() {
+        req.top_k
+    } else {
+        page_end(req)
+    };
+    if rows > MAX_VECTOR_ROWS {
+        return Err(bad(&format!(
+            "{rows} rows: vectors are projected for at most {MAX_VECTOR_ROWS} (top_k, and a \
+             ranked query's offset)"
+        )));
+    }
+    Ok(Some(Projecting {
+        encoding,
+        vector,
+        named,
+    }))
+}
+
+/// What a query projects (M179, M190): `vector`, named fields, and their spelling.
+#[derive(Debug, Clone)]
+struct Projecting {
+    encoding: VectorEncoding,
+    vector: bool,
+    named: Vec<String>,
+}
+
+impl Projecting {
+    /// A row's `vector`, spelled, when the query names it.
+    fn vector(&self, v: Option<&[f32]>) -> Option<types::VectorOut> {
+        self.vector.then(|| self.encoding.spell(v)).flatten()
+    }
+
+    /// A row's named fields, spelled; `None`, never `{}`, when it holds none of them.
+    fn fields<'a>(
+        &self,
+        fields: impl IntoIterator<Item = (&'a str, &'a [Vec<f32>])>,
+    ) -> Option<std::collections::BTreeMap<String, Vec<types::VectorOut>>> {
+        let out: std::collections::BTreeMap<String, Vec<types::VectorOut>> = fields
+            .into_iter()
+            .filter(|(name, _)| self.named.iter().any(|n| n == name))
+            .map(|(name, vs)| {
+                let spelled = vs
+                    .iter()
+                    .filter_map(|v| self.encoding.spell(Some(v)))
+                    .collect();
+                (name.to_owned(), spelled)
+            })
+            .collect();
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// How a projected vector is spelled (M179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorEncoding {
+    Float,
+    Base64,
+}
+
+impl VectorEncoding {
+    /// `v` as this encoding spells it, or nothing for a row with no vector. The engine
+    /// answers none, never an empty one, for a row of a width-0 index.
+    fn spell(self, v: Option<&[f32]>) -> Option<types::VectorOut> {
+        use base64::Engine as _;
+        let v = v?;
+        Some(match self {
+            Self::Float => types::VectorOut::Float(v.to_vec()),
+            Self::Base64 => {
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                types::VectorOut::Base64(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+        })
+    }
+}
+
+/// A document's `vector`, as an order's rows carry it (M179).
+fn stored_vector(d: &pstore_format::Document) -> Option<&[f32]> {
+    match d.vectors.get(pstore_format::DEFAULT_FIELD)?.as_dense() {
+        [v] => Some(v),
+        _ => None,
+    }
+}
+
 /// Where a relevance query's page ends: `top_k` past its `offset` (M163).
 fn page_end(req: &QueryRequest) -> usize {
     req.top_k.saturating_add(req.offset.unwrap_or(0))
@@ -3061,6 +3465,7 @@ fn page_end(req: &QueryRequest) -> usize {
 
 fn plan(req: &QueryRequest) -> Result<Plan, ApiError> {
     level(req)?;
+    vector_projection(req)?;
     // M63: checked first, before an aggregation or an order returns, so every refusal names it.
     let highlight = req
         .highlight
@@ -3412,6 +3817,7 @@ async fn run<E: BlobStore>(
             after_read(engine, level, token, served, watermarks)
         }
     };
+    let projected = vector_projection(req)?;
     let (legs, filter, fusion, boost, highlight, diversify, limit_per) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
@@ -3462,17 +3868,33 @@ async fn run<E: BlobStore>(
             });
         }
         Plan::Ordered(by, filter) => {
-            let got = engine
-                .ordered_as(
-                    index,
-                    by,
-                    filter.as_ref(),
-                    req.offset.unwrap_or(0),
-                    req.top_k,
-                    req.as_of.map(pstore_types::Epoch),
-                    consistency,
-                )
-                .await?;
+            // M179: the page's vectors, one round after selection, only when asked.
+            let got = if let Some(p) = &projected {
+                engine
+                    .ordered_projected(
+                        index,
+                        by,
+                        filter.as_ref(),
+                        req.offset.unwrap_or(0),
+                        req.top_k,
+                        consistency,
+                        p.vector,
+                        &p.named,
+                    )
+                    .await?
+            } else {
+                engine
+                    .ordered_as(
+                        index,
+                        by,
+                        filter.as_ref(),
+                        req.offset.unwrap_or(0),
+                        req.top_k,
+                        req.as_of.map(pstore_types::Epoch),
+                        consistency,
+                    )
+                    .await?
+            };
             // ⚠️ Before "no such index": the session's unfolded write may be what creates it.
             let token = checked(got.epoch.0, &got.watermarks)?;
             if !got.exists {
@@ -3487,6 +3909,10 @@ async fn run<E: BlobStore>(
                     .rows
                     .into_iter()
                     .map(|d| ResultRow {
+                        vector: projected.as_ref().and_then(|p| p.vector(stored_vector(&d))),
+                        vectors: projected.as_ref().and_then(|p| {
+                            p.fields(d.vectors.iter().map(|(n, f)| (&**n, f.as_dense())))
+                        }),
                         attributes: selected(req, &d.attrs),
                         id: d.id,
                         score: None,
@@ -3501,6 +3927,14 @@ async fn run<E: BlobStore>(
             });
         }
         Plan::Scored(expr, filter) => {
+            // M179's projection is an order's and a ranking's; an expression's rows carry
+            // attributes only, so asking for vectors is refused rather than ignored.
+            if projected.is_some() {
+                return Err(ApiError::bad_request(
+                    "include_vectors projects an order's or a ranking's rows: it cannot be \
+                     combined with a rank_by expression",
+                ));
+            }
             let got = engine
                 .scored_as(
                     index,
@@ -3528,6 +3962,8 @@ async fn run<E: BlobStore>(
                     .into_iter()
                     .zip(got.scores)
                     .map(|(d, score)| ResultRow {
+                        vector: None,
+                        vectors: None,
                         attributes: selected(req, &d.attrs),
                         id: d.id,
                         // The wire's f32, narrowed from the f64 the rows were ordered by.
@@ -3570,10 +4006,15 @@ async fn run<E: BlobStore>(
                 )
                 .await?
         }
-        // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.)
-        None if diversify.is_some() => {
+        // M64: the candidates' vectors ride the row fetch. (`as_of` is refused with it.) M179:
+        // and a projection's, in the same fetch.
+        // M190: and its named fields.
+        None if diversify.is_some() || projected.is_some() => {
+            let (vector, named) = projected
+                .as_ref()
+                .map_or((false, &[][..]), |p| (p.vector, p.named.as_slice()));
             engine
-                .query_split_vectors(
+                .query_split_projected(
                     index,
                     &legs,
                     filter.as_ref(),
@@ -3581,6 +4022,8 @@ async fn run<E: BlobStore>(
                     top_k,
                     consistency,
                     peers.map(|p| p as &dyn pstore_engine::Peers),
+                    vector || diversify.is_some(),
+                    named,
                 )
                 .await?
         }
@@ -3606,7 +4049,7 @@ async fn run<E: BlobStore>(
     // ⚠️ `Answer` is explicit that a hit at `unfolded_at` indexes the unfolded rows rather
     // than HEAD's segments -- M5f's finding, where keying on the row alone merged two
     // unrelated documents into one.
-    let mut paired = engine.resolve_rows_with_vectors(&answer);
+    let mut paired = engine.resolve_rows_projected(&answer);
     if let Some(b) = &boost {
         for ((_, score, attrs, _), _) in &mut paired {
             *score = b.score(*score, attrs);
@@ -3617,7 +4060,12 @@ async fn run<E: BlobStore>(
     if let Some(d) = diversify {
         // M64: the pick is `top_k × window × dims` multiply-adds, off the runtime's workers.
         let scores: Vec<f64> = paired.iter().map(|r| f64::from(r.0.1)).collect();
-        let vectors: Vec<Option<Vec<f32>>> = paired.iter_mut().map(|r| r.1.take()).collect();
+        // M179: copied, not taken, when the picked rows answer theirs.
+        let vectors: Vec<Option<Vec<f32>>> = if projected.is_some() {
+            paired.iter().map(|r| r.1.vector.clone()).collect()
+        } else {
+            paired.iter_mut().map(|r| r.1.vector.take()).collect()
+        };
         let k = req.top_k;
         let order =
             tokio::task::spawn_blocking(move || diversify::select(&scores, &vectors, d.lambda, k))
@@ -3638,7 +4086,7 @@ async fn run<E: BlobStore>(
     // M163: the page is cut at its end, then its first `offset` rows skipped.
     paired.truncate(page_end(req));
     paired.drain(..req.offset.unwrap_or(0).min(paired.len()));
-    let rows: Vec<pstore_engine::Resolved> = paired.into_iter().map(|(row, _)| row).collect();
+    let rows = paired;
     let unfolded_hits =
         if boost.is_none() && diversify.is_none() && limit_per.is_none() && req.offset.is_none() {
             answer
@@ -3657,7 +4105,7 @@ async fn run<E: BlobStore>(
                 .filter_map(|h| answer.unfolded.get(h.row).map(|d| d.id.as_str()))
                 .collect();
             rows.iter()
-                .filter(|(id, ..)| fresh.contains(id.as_str()))
+                .filter(|((id, ..), _)| fresh.contains(id.as_str()))
                 .count()
         };
     // M63: the query's terms, under the analyzer the ranking used; marked on the final rows
@@ -3686,7 +4134,13 @@ async fn run<E: BlobStore>(
     Ok(Answered {
         results: rows
             .into_iter()
-            .map(|(id, score, attrs, dist)| ResultRow {
+            .map(|((id, score, attrs, dist), p)| ResultRow {
+                vector: projected
+                    .as_ref()
+                    .and_then(|e| e.vector(p.vector.as_deref())),
+                vectors: projected.as_ref().and_then(|e| {
+                    e.fields(p.fields.iter().map(|(n, vs)| (n.as_str(), vs.as_slice())))
+                }),
                 highlight: marks
                     .as_ref()
                     .filter(|(h, _)| h.structure.is_none())
@@ -3789,6 +4243,12 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
         "sum" | "max" if req.vector.is_some() || req.multi.is_some() => Err(bad(&format!(
             "{kind} combines text legs' scores; a dense or multi leg's can be negative"
         ))),
+        // M178: a sparse dot product can be negative too, so it is summed with nothing; alone,
+        // its score is the leg's own.
+        "sum" | "max" if req.sparse.is_some() && req.text.is_some() => Err(bad(&format!(
+            "{kind} combines text legs' scores; a sparse leg's can be negative, so it takes \
+             {kind} only alone"
+        ))),
         // `k` is RRF's alone, and a parameter is never accepted to be ignored (code review).
         "sum" | "max" if params.contains_key("k") => {
             Err(bad(&format!("k is rrf's parameter, not {kind}'s")))
@@ -3812,14 +4272,35 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
 async fn index_summary<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
     Path(index): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<axum::Json<IndexSummary>, ApiError> {
     let tenant = tenant_of(&headers)?;
+    // M160: opt-in, so the summary without it keeps its one read.
+    let progress = match params.get("progress").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "progress must be true or false, not {other:?}"
+            )));
+        }
+    };
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let (served, stats) = engine.index_stats_at(&index).await?;
+    // Beside the stats' HEAD read, not after it: no round added.
+    let ((served, stats), progress) =
+        futures_util::future::try_join(engine.index_stats_at(&index), async {
+            match progress {
+                true => engine.progress(&index).await.map(Some),
+                false => Ok(None),
+            }
+        })
+        .await?;
     let unfolded = engine.pending_indexes().await.iter().any(|i| i == &index);
-    if stats.is_none() && !unfolded {
+    // A name only unfolded bundles hold is durable, not yet indexed (M160).
+    let durable = progress.as_ref().is_some_and(|p| p.rows > 0);
+    if stats.is_none() && !unfolded && !durable {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "index_not_found",
@@ -3835,6 +4316,10 @@ async fn index_summary<S: BlobStore + 'static>(
         rejected_rows: 0,
         quarantined_rows: 0,
         updated_epoch: None,
+        created_ms: None,
+        written_ms: None,
+        bytes: Some(0),
+        read_only: false,
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -3858,14 +4343,44 @@ async fn index_summary<S: BlobStore + 'static>(
                 .into_iter()
                 .map(|(n, w)| (n, w.saturating_sub(sc.metric.extra() as u32)))
                 .collect(),
-            attributes: sc.types.into_iter().map(|(n, k)| (n, k.name())).collect(),
+            // M176: the id's kind is recorded among the types, under a name no attribute has.
+            id: sc
+                .types
+                .get(pstore_engine::ID_KIND)
+                .map_or("string", |k| k.name()),
+            attributes: sc
+                .types
+                .into_iter()
+                .filter(|(n, _)| n != pstore_engine::ID_KIND)
+                .map(|(n, k)| (n, k.name()))
+                .collect(),
         }),
         rejected_rows: s.rejected_rows,
         quarantined_rows: s.quarantined_rows,
         updated_epoch: s.updated_epoch.map(|e| e.0),
         approx_row_count: s.documents,
+        created_at: s.created_ms.map(rfc3339_ms),
+        updated_at: s.written_ms.map(rfc3339_ms),
+        approx_logical_bytes: s.bytes,
+        read_only: s.read_only,
+        progress: progress.map(|p| IndexProgress {
+            status: if p.rows > 0 { "updating" } else { "up-to-date" },
+            unindexed_rows: p.rows,
+            unindexed_bytes: p.bytes,
+            exact: p.exact,
+            as_of_epoch: p.epoch.0,
+        }),
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// Unix milliseconds as RFC 3339 UTC, always with three fractional digits (M148).
+fn rfc3339_ms(ms: u64) -> String {
+    // `u64::MAX / 1000` fits an `i64`, so the fallback never runs; a far future saturates in
+    // `format`'s microseconds.
+    let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
+    let whole = pstore_format::datetime::format(secs.saturating_mul(1_000_000));
+    format!("{}.{:03}Z", whole.trim_end_matches('Z'), ms % 1000)
 }
 
 fn no_index(index: &str) -> ApiError {
@@ -3917,7 +4432,8 @@ async fn export_quarantine<S: BlobStore + 'static>(
                 .collect();
             serde_json::json!({
                 "document": {
-                    "id": r.document.id,
+                    // M176: a typed id answered as written.
+                    "id": to_json(&pstore_format::id::value(&r.document.id)),
                     "vector": r.document.vector(),
                     "attributes": attrs,
                 },
@@ -3984,7 +4500,7 @@ async fn list_indexes<S: BlobStore + 'static>(
     let before = api.spend(tenant);
     // ⚠️ **One read, never a LIST.** A LIST over the tenant's prefix is the obvious
     // implementation, is correct, and is priced like a PUT while returning at most 1000 keys.
-    let mut names = engine.indexes().await?;
+    let (epoch, mut names) = engine.indexes_at().await?;
     names.extend(engine.pending_indexes().await);
     names.sort_unstable();
     names.dedup();
@@ -4005,6 +4521,7 @@ async fn list_indexes<S: BlobStore + 'static>(
     Ok(axum::Json(IndexList {
         indexes: page,
         next_cursor,
+        epoch: epoch.0,
         cost: api.spend(tenant).since(before),
     }))
 }
@@ -4173,6 +4690,115 @@ async fn create_index<S: BlobStore + 'static>(
     }))
 }
 
+/// `PATCH /v1/indexes/{index}` (M149): makes the index read-only, or writable again.
+async fn patch_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<ReadOnlyResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let req: PatchIndexRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed index patch: {e}")))?;
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let Some(epoch) = engine.set_read_only(&index, req.read_only).await? else {
+        // HEAD does not hold it. One this process holds unfolded, which its summary
+        // reports, is not absent: it can be flagged once folded.
+        if engine.pending_indexes().await.iter().any(|i| i == &index) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "index_not_folded",
+                format!("the index {index} has rows not yet folded; retry after the fold"),
+            ));
+        }
+        return Err(no_index(&index));
+    };
+    Ok(axum::Json(ReadOnlyResponse {
+        epoch: epoch.0,
+        read_only: req.read_only,
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// `POST /v1/indexes/{index}/recall` (M162): ANN against exhaustive search, for queries
+/// sampled by `seed` near one probe, at the one HEAD the request reads.
+async fn recall_index<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<RecallResponse>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let raw: RecallBody = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("malformed recall request: {e}")))?;
+    let num = raw.num.unwrap_or(10);
+    if !(1..=25).contains(&num) {
+        return Err(ApiError::bad_request(format!(
+            "num is from 1 to 25, not {num}"
+        )));
+    }
+    let top_k = raw.top_k.unwrap_or(10);
+    if !(1..=100).contains(&top_k) {
+        return Err(ApiError::bad_request(format!(
+            "top_k is from 1 to 100, not {top_k}"
+        )));
+    }
+    let filter = raw.filters.as_ref().map(predicate).transpose()?;
+    let req = pstore_engine::RecallRequest {
+        num,
+        top_k,
+        filter,
+        seed: raw.seed.unwrap_or(0),
+        ground_truth: raw.include_ground_truth.unwrap_or(false),
+    };
+    let engine = api.engine(tenant).await;
+    let before = api.spend(tenant);
+    let r = engine
+        .recall(&index, &req)
+        .await?
+        .ok_or_else(|| no_index(&index))?;
+    Ok(axum::Json(RecallResponse {
+        avg_recall: r.avg_recall,
+        avg_ann_count: r.avg_ann_count,
+        avg_exhaustive_count: r.avg_exhaustive_count,
+        num: r.num,
+        epoch: r.epoch.0,
+        ground_truth: req.ground_truth.then(|| {
+            r.ground_truth
+                .into_iter()
+                .map(|g| RecallGroundTruth {
+                    query_vector: g.query_vector,
+                    nearest_neighbors: g
+                        .nearest_neighbors
+                        .into_iter()
+                        .map(|(id, dist)| RecallNeighbor { id, dist })
+                        .collect(),
+                })
+                .collect()
+        }),
+        cost: api.spend(tenant).since(before),
+    }))
+}
+
+/// What `POST /v1/indexes/{index}/recall` carries (M162). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecallBody {
+    num: Option<usize>,
+    top_k: Option<usize>,
+    filters: Option<serde_json::Value>,
+    seed: Option<u64>,
+    include_ground_truth: Option<bool>,
+}
+
+/// What `PATCH /v1/indexes/{index}` carries (M149). Anything else is refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchIndexRequest {
+    read_only: bool,
+}
+
 /// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4257,6 +4883,7 @@ fn order_by(req: &QueryRequest) -> Result<Option<RankBy>, ApiError> {
     if req.vector.is_some()
         || req.multi.is_some()
         || req.text.is_some()
+        || req.sparse.is_some()
         || req.field.is_some()
         || req.exact
         || req.fusion.is_some()
@@ -4264,11 +4891,11 @@ fn order_by(req: &QueryRequest) -> Result<Option<RankBy>, ApiError> {
         return Err(ApiError::bad_request(match by {
             RankBy::Order(_) => {
                 "rank_by orders by an attribute; it cannot be combined with vector, multi, \
-                 text, field, exact or fusion"
+                 text, sparse, field, exact or fusion"
             }
             RankBy::Expr(_) => {
                 "rank_by scores by an expression; it cannot be combined with vector, multi, \
-                 text, field, exact or fusion"
+                 text, sparse, field, exact or fusion"
             }
         }));
     }
@@ -4487,9 +5114,19 @@ fn prefetch(req: &QueryRequest, limit: usize) -> Result<Vec<pstore_query::Prefet
             last_as_prefix,
         });
     }
+    // M178: after the text legs, so a positional fusion weight names it last.
+    if let Some(s) = &req.sparse {
+        let query =
+            sparse_pairs(s).map_err(|why| ApiError::bad_request(format!("sparse: {why}")))?;
+        legs.push(pstore_query::Prefetch::Sparse {
+            field: SPARSE_FIELD.to_owned(),
+            query,
+            limit,
+        });
+    }
     if legs.is_empty() {
         return Err(ApiError::bad_request(
-            "a query must name a vector, multi, text, or several",
+            "a query must name a vector, multi, text, sparse, or several",
         ));
     }
     if legs.len() > pstore_query::MAX_LEGS {
@@ -4605,6 +5242,11 @@ fn named_field(name: &str) -> Result<String, ApiError> {
             "`vector` is the dense field: a named vector field takes another name",
         ));
     }
+    if name == SPARSE_FIELD {
+        return Err(ApiError::bad_request(
+            "`sparse` is the sparse field (M178): a named vector field takes another name",
+        ));
+    }
     Ok(name.to_owned())
 }
 
@@ -4644,6 +5286,22 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         .ok_or_else(|| bad("an object of attribute names to types".to_owned()))?;
     let mut out = typed::Declarations::new();
     for (name, ty) in schema {
+        // M176: the ids' kind, which no document carries as an attribute; `string` is the
+        // default, so it declares nothing to remember.
+        // An object (full text, regex) falls through, to be refused as any reserved name is.
+        if name == pstore_query::ID_ATTRIBUTE && !ty.is_object() {
+            match ty.as_str() {
+                Some("string") => {}
+                Some("uint64") => _ = out.insert(name.clone(), pstore_format::typed::Kind::Uint64),
+                Some("uuid") => _ = out.insert(name.clone(), pstore_format::typed::Kind::Uuid),
+                _ => {
+                    return Err(bad(format!(
+                        "\"id\" is declared {ty}; an id is string, uint64 or uuid"
+                    )));
+                }
+            }
+            continue;
+        }
         // An object naming `full_text_search` is a full-text declaration (M14), which
         // `declared_fts` reads; any other object is refused below, with a datetime's message.
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
@@ -5036,9 +5694,10 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         vector,
         vectors,
         text,
+        sparse,
         attributes,
     } = d;
-    let mut doc = Document::new(id.clone(), vector.unwrap_or_default());
+    let mut doc = Document::new(id.0.clone(), vector.unwrap_or_default());
     let refuse = |name: &str, why: &str| {
         ApiError::bad_request(format!("document {id}: attribute `{name}` {why}"))
     };
@@ -5050,9 +5709,13 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
             // M9h.3, M171: a declared type is read from a string, or an array of them.
             (Some(d), _) => typed::read(*d, value),
             // M9h.2: an array of scalars; an element that is not one is refused, never dropped.
+            // M175: an element may be null; a filter literal may not, so not `scalar`'s.
             (None, serde_json::Value::Array(items)) => items
                 .iter()
-                .map(|i| scalar(i).map_err(|why| format!("holds an element that {why}")))
+                .map(|i| match i {
+                    serde_json::Value::Null => Ok(pstore_format::Value::Null),
+                    _ => scalar(i).map_err(|why| format!("holds an element that {why}")),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(pstore_format::Value::Array),
             (None, _) => scalar(value),
@@ -5093,6 +5756,19 @@ fn to_document(d: types::DocumentIn, dated: &typed::Declarations) -> Result<Docu
         doc.vectors
             .insert(name.into(), pstore_format::VectorField::Dense(vs));
     }
+    if let Some(s) = sparse {
+        let pairs = sparse_pairs(&s)
+            .map_err(|why| ApiError::bad_request(format!("document {id}: sparse: {why}")))?;
+        doc.vectors.insert(
+            SPARSE_FIELD.into(),
+            pstore_format::VectorField::Sparse(
+                pairs
+                    .into_iter()
+                    .map(|(k, w)| (k, pstore_format::Impact::new(w)))
+                    .collect(),
+            ),
+        );
+    }
     if let Some(t) = text {
         // `attributes.text` and top-level `text` are one field spelled twice; which one
         // wins would be a rule nobody wrote down.
@@ -5122,6 +5798,54 @@ fn predicate(v: &serde_json::Value) -> Result<pstore_query::Predicate, ApiError>
         )));
     }
     Ok(p)
+}
+
+/// The one sparse field a document carries and a query searches (M178). A name of its own
+/// rather than one a caller picks: a segment holds one sparse field's postings (M177).
+const SPARSE_FIELD: &str = "sparse";
+/// The most keys a sparse vector holds, a document's or a query's.
+const MAX_SPARSE_KEYS: usize = 1_024;
+/// The longest sparse key, in bytes.
+const MAX_SPARSE_KEY: usize = 256;
+/// The largest sparse weight's magnitude: f16's largest finite value, as a weight is stored
+/// in f16 (M178), and a larger one would be infinite.
+const MAX_SPARSE_WEIGHT: f64 = 65_504.0;
+
+/// A sparse vector's `(key, weight)` pairs, or why `v` is not one (M178): an object of 1 to
+/// [`MAX_SPARSE_KEYS`] keys of 1 to [`MAX_SPARSE_KEY`] bytes, each weight a number no larger in
+/// magnitude than [`MAX_SPARSE_WEIGHT`]. A key spelled twice is its last weight, as a JSON
+/// object is read everywhere here.
+fn sparse_pairs(v: &serde_json::Value) -> Result<Vec<(String, f32)>, String> {
+    let serde_json::Value::Object(m) = v else {
+        return Err("an object of key to weight".to_owned());
+    };
+    if m.is_empty() || m.len() > MAX_SPARSE_KEYS {
+        return Err(format!(
+            "{} keys: a sparse vector holds 1 to {MAX_SPARSE_KEYS}",
+            m.len()
+        ));
+    }
+    m.iter()
+        .map(|(k, w)| {
+            if k.is_empty() || k.len() > MAX_SPARSE_KEY {
+                return Err(format!(
+                    "a key of {} bytes: a key is 1 to {MAX_SPARSE_KEY}",
+                    k.len()
+                ));
+            }
+            match w.as_f64() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "bounded by f16's range, inside f32's"
+                )]
+                Some(x) if x.abs() <= MAX_SPARSE_WEIGHT => Ok((k.clone(), x as f32)),
+                _ => Err(format!(
+                    "key {k:?}'s weight {w} is not a number of magnitude at most \
+                     {MAX_SPARSE_WEIGHT}"
+                )),
+            }
+        })
+        .collect()
 }
 
 /// The most `Glob`, `IGlob`, `Regex` and `Fuzzy` clauses one filter may hold (M15).
@@ -5490,6 +6214,7 @@ fn to_json(v: &pstore_format::Value) -> serde_json::Value {
             serde_json::Value::from(pstore_format::typed::format_bytes(b))
         }
         pstore_format::Value::Uint(n) => serde_json::Value::from(*n),
+        pstore_format::Value::Null => serde_json::Value::Null,
     }
 }
 
@@ -5578,6 +6303,9 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// The engine registry's cap, from `PSTORE_ENGINES` (M26): 10 000 by default, `0` for none.
     pub engines: usize,
+    /// The most indexes a tenant may hold, from `PSTORE_INDEXES_PER_TENANT` (M169): 10 000 by
+    /// default, `0` for none.
+    pub indexes_per_tenant: usize,
     /// The servers a query's vector legs may run on, from `PSTORE_PEERS` (M54).
     pub peers: Option<PeerConfig>,
     /// Or a SWIM membership to take them from, `PSTORE_PEER_GOSSIP_*` (M56).
@@ -5587,6 +6315,10 @@ pub struct Config {
     /// `PSTORE_EXTERNAL_SOURCES=allow` and `PSTORE_EXTERNAL_PREFIXES`.
     pub external_sources: Option<Vec<String>>,
 }
+
+/// `PSTORE_INDEXES_PER_TENANT` unset (M169): below M7b's ~29,700, where a whole-HEAD read
+/// stops being cheaper than a round trip, and above the thousands `scripts/index-scale.sh` checks.
+pub const DEFAULT_INDEXES_PER_TENANT: usize = 10_000;
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
 /// through its S3 interoperability endpoint.
@@ -5783,6 +6515,9 @@ pub enum ConfigError {
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
+    /// `PSTORE_INDEXES_PER_TENANT` that is not a count (M169).
+    #[error("PSTORE_INDEXES_PER_TENANT={0} is refused: a count of indexes, 0 for unbounded")]
+    IndexesPerTenant(String),
     /// A `PSTORE_EXTERNAL_SOURCES` that is neither `allow` nor `off` (M86).
     #[error("PSTORE_EXTERNAL_SOURCES={0} is refused: `allow` or `off`")]
     ExternalSources(String),
@@ -5856,6 +6591,10 @@ impl Config {
             engines: match get("PSTORE_ENGINES") {
                 None => 10_000,
                 Some(v) => v.parse().map_err(|_| ConfigError::Engines(v))?,
+            },
+            indexes_per_tenant: match get("PSTORE_INDEXES_PER_TENANT") {
+                None => DEFAULT_INDEXES_PER_TENANT,
+                Some(v) => v.parse().map_err(|_| ConfigError::IndexesPerTenant(v))?,
             },
         })
     }
@@ -5937,6 +6676,18 @@ fn replication_policy(
             .map_or(d.max, |n| usize::try_from(n).unwrap_or(usize::MAX)),
         idle: positive("PSTORE_REPLICATION_IDLE_S")?.map_or(d.idle, secs),
         shards,
+        // M192: the source is folded every half of it, by a loop that looks once a second.
+        max_lag: match positive("PSTORE_REPLICATION_MAX_LAG_S")? {
+            None => None,
+            Some(n) if n < 2 => {
+                return Err(ConfigError::Replication(
+                    "PSTORE_REPLICATION_MAX_LAG_S",
+                    n.to_string(),
+                    "at least 2: the source is folded every half of it",
+                ));
+            }
+            Some(n) => Some(secs(n)),
+        },
         ..d
     };
     Ok(on.then_some(policy))
@@ -6452,6 +7203,13 @@ mod tests {
         assert!(scalar(&serde_json::json!(u64::MAX)).is_err());
     }
 
+    #[test]
+    fn times_are_rfc3339_at_millisecond_precision() {
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_ms(1_500), "1970-01-01T00:00:01.500Z");
+        assert_eq!(rfc3339_ms(1_761_609_600_007), "2025-10-28T00:00:00.007Z");
+    }
+
     /// Bodies the fast parse must answer exactly as the tree does (M120): valid ones of every
     /// shape, and each way a typed parse and a tree disagree.
     pub(crate) fn bodies() -> Vec<Vec<u8>> {
@@ -6642,6 +7400,21 @@ mod tests {
         // patch by filter's patch (2 + 8), and the stamp on each of five operations.
         assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
         assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
+    }
+
+    #[test]
+    fn recall_refusals_are_named() {
+        // M162: a budget no API test's corpus reaches, and an index with no default vectors.
+        let too = ApiError::from(EngineError::RecallTooLarge { rows: 3, budget: 2 });
+        assert_eq!(
+            (too.status, too.code),
+            (StatusCode::BAD_REQUEST, "recall_too_large")
+        );
+        let bare = ApiError::from(EngineError::RecallNeedsVectors("t".to_owned()));
+        assert_eq!(
+            (bare.status, bare.code),
+            (StatusCode::BAD_REQUEST, "recall_needs_vectors")
+        );
     }
 
     #[test]

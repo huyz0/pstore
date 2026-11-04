@@ -165,7 +165,8 @@ async fn null_in_an_upsert_is_absent_and_in_a_patch_removes() {
     );
 
     let refused = [
-        json!({"documents": [{"id": "y", "vector": [1.0, 0.5], "attributes": {"a": [1, null]}}]}),
+        // M175: `[1, null]` holds a null element now, accepted:
+        // `null_elements::null_elements_answer_in_place_everywhere`.
         json!({"documents": [{"id": "y", "vector": [1.0, 0.5], "attributes": {"$x": null}}]}),
         json!({"schema": {"at": "datetime"},
                "documents": [{"id": "y", "vector": [1.0, 0.5], "attributes": {"at": null}}]}),

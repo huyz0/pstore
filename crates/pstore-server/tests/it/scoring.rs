@@ -370,6 +370,8 @@ async fn scoring_expressions_over_http() {
         ("boost", json!({"attribute": "n"})),
         ("aggregate_by", json!({"c": ["Count", "id"]})),
         ("highlight", json!(true)),
+        ("include_vectors", json!(["vector"])),
+        ("sparse", json!({"a": 1.0})),
     ];
     for (k, v) in beside {
         let mut body = rank(&bm);

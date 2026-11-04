@@ -36,6 +36,7 @@ async fn signed_sources_permit_real_branch_replication_and_external_copy() {
             period: Duration::from_secs(1),
             idle: Duration::from_secs(60),
             shards: 4,
+            max_lag: None,
         },
         BTreeMap::from([("far".to_owned(), far)]),
     );
@@ -164,6 +165,7 @@ async fn source_grants_fence_branch_replication_and_external_copy() {
             period: Duration::from_secs(1),
             idle: Duration::from_secs(60),
             shards: 4,
+            max_lag: None,
         },
         BTreeMap::from([("far".to_owned(), far)]),
     );
@@ -198,10 +200,20 @@ async fn source_grants_fence_branch_replication_and_external_copy() {
                 "/v1/indexes/destination/external/copy",
                 json!({"index":"source", "tenant":tenant, "store":name}),
             ),
+            // M166: a copy is authorized on the source side as a replication is.
+            (
+                "/v1/indexes/destination/copy",
+                json!({"source":{"index":"source", "tenant":tenant, "store":name}}),
+            ),
         ] {
             let before = requests(&store);
             let far_before = requests(&remote);
-            let got = send(&api, "PUT", path, Some(&pairs), None, &body).await;
+            let method = if path.ends_with("/copy") && !path.contains("external") {
+                "POST"
+            } else {
+                "PUT"
+            };
+            let got = send(&api, method, path, Some(&pairs), None, &body).await;
             assert_eq!(
                 got.status,
                 StatusCode::FORBIDDEN,
@@ -236,4 +248,87 @@ async fn source_grants_fence_branch_replication_and_external_copy() {
             got.text
         );
     }
+}
+
+/// M192: a sync now folds the source, so it needs the source's authority as a create does,
+/// checked again on every call; destination `write` alone is refused before the source is
+/// touched.
+#[tokio::test(start_paused = true)]
+async fn a_sync_now_needs_the_sources_authority() {
+    let (api, store) = api(&config(&[("current", &KEY)], "current"));
+    let owner = token("10", &["read", "write", "admin"]);
+    let got = send(
+        &api,
+        "PUT",
+        "/v1/indexes/source/documents",
+        Some(&owner),
+        None,
+        &json!({"durability":"durable", "documents":[{"id":"a", "vector":[1]}]}),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.text);
+    let got = send(
+        &api,
+        "POST",
+        "/v1/admin/fold",
+        Some(&owner),
+        None,
+        &json!(null),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.text);
+    let mut c = claims("9", &["read", "write"]);
+    c["sources"] = json!([{"tenant":"10", "store":""}]);
+    let grant = sign(&c, Some("current"), Algorithm::HS256, &KEY);
+    let got = send(
+        &api,
+        "PUT",
+        "/v1/indexes/replica/replication",
+        Some(&grant),
+        None,
+        &json!({"source":{"index":"source", "tenant":"10"}}),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::CREATED, "{}", got.text);
+    let got = send(
+        &api,
+        "PUT",
+        "/v1/indexes/source/documents",
+        Some(&owner),
+        None,
+        &json!({"durability":"durable", "documents":[{"id":"b", "vector":[1]}]}),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.text);
+    let source = |c| store.count(TenantId(10), c);
+    let before = [pstore_blob::OpClass::Read, pstore_blob::OpClass::Write].map(source);
+    let write = token("9", &["write"]);
+    let got = send(
+        &api,
+        "POST",
+        "/v1/indexes/replica/replication/sync",
+        Some(&write),
+        None,
+        &json!(null),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::FORBIDDEN, "{}", got.text);
+    assert_eq!(got.body["error"]["code"], "forbidden");
+    assert_eq!(
+        [pstore_blob::OpClass::Read, pstore_blob::OpClass::Write].map(source),
+        before,
+        "the source was touched on a refusal"
+    );
+    let got = send(
+        &api,
+        "POST",
+        "/v1/indexes/replica/replication/sync",
+        Some(&grant),
+        None,
+        &json!(null),
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.text);
+    assert_eq!(got.body["source_folded"], true, "{}", got.text);
+    assert_eq!(got.body["rows"], 2, "{}", got.text);
 }

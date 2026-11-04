@@ -13,12 +13,15 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use pstore_blob::{Accounted, BlobError, BlobStore, Key, TenantView};
-use pstore_engine::{EngineError, ReplicaSource, Replication, Sources, SyncState};
+use pstore_engine::{
+    CopyFailure, CopyState, CopyStatus, EngineError, ReplicaRefusal, ReplicaSource, Replication,
+    Sources, SyncState,
+};
 use pstore_jobs::{Claim, Entry, JobsError, Register};
 use pstore_types::TenantId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -45,6 +48,9 @@ pub struct ReplicationPolicy {
     pub idle: Duration,
     /// The register's shard count, honoured only when the register is first created.
     pub shards: u16,
+    /// The bound on a replica's lag behind a source in this store (M192): its source is
+    /// folded every half of it. `None`: no bound, and the source folds on its own triggers.
+    pub max_lag: Option<Duration>,
 }
 
 impl Default for ReplicationPolicy {
@@ -56,6 +62,7 @@ impl Default for ReplicationPolicy {
             period: Duration::from_secs(1),
             idle: Duration::from_secs(60),
             shards: 64,
+            max_lag: None,
         }
     }
 }
@@ -74,6 +81,8 @@ pub(crate) struct Replicating<S> {
     worker: AtomicBool,
     /// How many tenants it holds.
     held: AtomicUsize,
+    /// M192: bounded replications it holds whose lag is past the bound, at its last tick.
+    pub(crate) lagging: AtomicUsize,
     /// Tenants a control call claimed for this process's worker, which it adopts next tick.
     adopted: Mutex<Vec<(TenantId, u16, u64)>>,
     /// The clock claims are written in: wall time at start, advanced by tokio's clock, so a
@@ -91,6 +100,7 @@ impl<S> Default for Replicating<S> {
             register: tokio::sync::OnceCell::new(),
             worker: AtomicBool::new(false),
             held: AtomicUsize::new(0),
+            lagging: AtomicUsize::new(0),
             adopted: Mutex::new(Vec::new()),
             start: (wall, Instant::now()),
         }
@@ -111,7 +121,48 @@ impl<S> std::fmt::Debug for Replicating<S> {
 struct Note {
     last_commit_ms: Option<u64>,
     last_error: Option<String>,
+    /// M192: the start of the last source fold this replication is known current through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fresh_ms: Option<u64>,
+    /// M192: the bound the worker holds it to; `None` when it holds it to none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_lag_ms: Option<u64>,
+    /// M192: its lag was past the bound at the worker's last look.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lag_exceeded: bool,
 }
+
+/// The replications whose lag is past their bound, by these notes.
+fn exceeded(notes: &Notes) -> BTreeSet<&String> {
+    notes
+        .iter()
+        .filter(|(_, n)| n.lag_exceeded)
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// What a status must not wait `ttl / 3` to see (M192): which replications are past their
+/// bound, and which have a fresh time at all.
+fn urgent(notes: &Notes) -> (BTreeSet<&String>, BTreeSet<&String>) {
+    let known = notes
+        .iter()
+        .filter(|(_, n)| n.fresh_ms.is_some())
+        .map(|(d, _)| d)
+        .collect();
+    (exceeded(notes), known)
+}
+
+/// Whole milliseconds, saturating.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What a source fold's failure is recorded as, which its next success clears.
+const FOLD_ERROR: &str = "source fold: ";
+
+/// Each bounded replication's fold: when it started, as an instant and as wall time, or why
+/// it failed.
+type Folded = BTreeMap<String, Result<(Instant, u64), String>>;
 
 type Notes = BTreeMap<String, Note>;
 
@@ -201,6 +252,63 @@ struct Held {
     interval: Duration,
     notes: Notes,
     written: Option<(Instant, Notes)>,
+    /// M192: when this worker first saw each bounded replication: its lag's base before any
+    /// fold. Per replication, so one created on a held tenant does not start late.
+    seen: BTreeMap<String, Instant>,
+    /// M192: when its sources are folded next.
+    fold_due: Instant,
+    /// M192: each bounded replication's fresh time, as an instant and as wall time.
+    fresh: BTreeMap<String, (Instant, u64)>,
+}
+
+impl Held {
+    /// M192: after one sync, each bounded replication's fresh time, note and verdict. A
+    /// replication is bounded when its source is in this store; `ok` are those the sync
+    /// committed or found current. Answers how many went past the bound.
+    fn judge(
+        &mut self,
+        sources: &BTreeMap<String, ReplicaSource>,
+        folded: Option<&Folded>,
+        ok: &BTreeSet<String>,
+        lag: Duration,
+        now: Instant,
+    ) -> u64 {
+        // Only what runs now: a cancelled name re-created must not inherit its past.
+        self.seen.retain(|d, _| sources.contains_key(d));
+        self.fresh.retain(|d, _| sources.contains_key(d));
+        let mut into = 0;
+        for d in sources
+            .iter()
+            .filter(|(_, s)| s.store.is_empty())
+            .map(|(d, _)| d)
+        {
+            let n = self.notes.entry(d.clone()).or_default();
+            match folded.and_then(|f| f.get(d)) {
+                Some(Ok(at)) if ok.contains(d) => {
+                    self.fresh.insert(d.clone(), *at);
+                    if n.last_error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(FOLD_ERROR))
+                    {
+                        n.last_error = None;
+                    }
+                }
+                Some(Err(e)) => n.last_error = Some(clipped(&format!("{FOLD_ERROR}{e}"))),
+                _ => {}
+            }
+            let first = *self.seen.entry(d.clone()).or_insert(now);
+            let fresh = self.fresh.get(d);
+            let base = fresh.map_or(first, |(i, _)| *i);
+            let past = now.saturating_duration_since(base) > lag;
+            if past && !n.lag_exceeded {
+                into += 1;
+            }
+            n.lag_exceeded = past;
+            n.fresh_ms = fresh.map(|(_, w)| *w);
+            n.max_lag_ms = Some(ms(lag));
+        }
+        into
+    }
 }
 
 /// One process's replication worker: what it holds and when it next looks.
@@ -254,6 +362,52 @@ impl<S: BlobStore + 'static> Api<S> {
     fn now_ms(&self) -> u64 {
         let (wall, at) = self.replicating.start;
         wall.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Folds `tenant` through this process's engine for it (M192), counted by outcome. Any
+    /// process may fold any tenant: the commit is a CAS on its HEAD.
+    async fn fold_source(&self, tenant: TenantId) -> Result<(), String> {
+        let out = self.engine(tenant).await.fold_committed().await;
+        let outcome = match &out {
+            Ok(true) => "folded",
+            Ok(false) => "nothing",
+            Err(_) => "failed",
+        };
+        *self
+            .http
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .source_folds
+            .entry(outcome)
+            .or_default() += 1;
+        out.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Folds each distinct source tenant in this store, together (M192), and answers each
+    /// replication's outcome by its source tenant. A source in a remote store is not folded:
+    /// its credentials are read-only, and [`Held::judge`] never reads a remote one's entry.
+    async fn fold_sources(&self, sources: &BTreeMap<String, ReplicaSource>) -> Folded {
+        let started = (Instant::now(), self.now_ms());
+        let tenants: BTreeSet<TenantId> = sources
+            .values()
+            .filter(|s| s.store.is_empty())
+            .map(|s| s.tenant)
+            .collect();
+        let outcomes: BTreeMap<TenantId, Result<(), String>> = futures_util::future::join_all(
+            tenants
+                .into_iter()
+                .map(|t| async move { (t, self.fold_source(t).await) }),
+        )
+        .await
+        .into_iter()
+        .collect();
+        sources
+            .iter()
+            .filter_map(|(d, s)| {
+                let out = outcomes.get(&s.tenant)?.clone();
+                Some((d.clone(), out.map(|()| started)))
+            })
+            .collect()
     }
 
     /// The register, opened on first use: one GET of its `CONFIG` (and one CAS, the first
@@ -536,6 +690,7 @@ impl<S: BlobStore + 'static> Api<S> {
             .map(|(t, _)| *t)
             .collect();
         let mut gone = Vec::new();
+        let mut ended = Vec::new();
         for tenant in due {
             // Before every sync, not once a tick: a long copy must not let every other claim
             // lapse behind it (code review M2).
@@ -548,9 +703,25 @@ impl<S: BlobStore + 'static> Api<S> {
                 remotes: &self.replication().1,
                 tenant,
             };
+            // M192: the sources folded first, every half of the bound, so the sync carries
+            // everything they acknowledged before the fold began.
+            let folded = match (policy.max_lag, h.st.sources()) {
+                (Some(lag), Some(srcs)) if now >= h.fold_due => {
+                    h.fold_due = now + lag / 2;
+                    Some(self.fold_sources(&srcs).await)
+                }
+                _ => None,
+            };
+            let mut ok = BTreeSet::new();
             tick.synced += 1;
             let changed = match engine.replicate(&sources, &mut h.st).await {
                 Ok(out) => {
+                    ok.extend(out.committed.iter().cloned());
+                    ok.extend(out.current.iter().cloned());
+                    // M166: a copy that ended no longer runs: the register's `gen` says so.
+                    if !out.finished.is_empty() {
+                        ended.push(tenant);
+                    }
                     let ran = !(out.idle
                         && out.committed.is_empty()
                         && out.current.is_empty()
@@ -598,11 +769,22 @@ impl<S: BlobStore + 'static> Api<S> {
                 (h.interval * 2).min(policy.idle)
             };
             h.due = now + h.interval;
-            // Notes: only when they changed, and at most once per `ttl / 3`.
-            let stale = h
-                .written
-                .as_ref()
-                .is_none_or(|(at, n)| *n != h.notes && now >= *at + renew_every);
+            if let (Some(lag), Some(srcs)) = (policy.max_lag, h.st.sources()) {
+                let into = h.judge(&srcs, folded.as_ref(), &ok, lag, Instant::now());
+                self.http
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lag_exceeded += into;
+                if srcs.values().any(|s| s.store.is_empty()) {
+                    h.due = h.due.min(h.fold_due);
+                }
+            }
+            // Notes: only when they changed, and at most once per `ttl / 3` -- except a
+            // replication going past its bound or back, or getting its first fresh time,
+            // which is written at once (M192).
+            let stale = h.written.as_ref().is_none_or(|(at, n)| {
+                *n != h.notes && (now >= *at + renew_every || urgent(n) != urgent(&h.notes))
+            });
             if stale
                 && !h.notes.is_empty()
                 && let Ok(body) = serde_json::to_vec(&h.notes)
@@ -616,6 +798,11 @@ impl<S: BlobStore + 'static> Api<S> {
                 h.written = Some((now, h.notes.clone()));
             }
         }
+        for tenant in ended {
+            if !gone.contains(&tenant) {
+                let _ = self.reconcile(tenant, false).await;
+            }
+        }
         for tenant in gone {
             if w.held.remove(&tenant).is_some() {
                 self.release(1);
@@ -626,6 +813,10 @@ impl<S: BlobStore + 'static> Api<S> {
         // reserves its slot mid-tick, and a count rewritten from what the worker holds would
         // drop that reservation and let the next claim past `max`. Kept exact at each change.
         tick.held = w.held.len();
+        self.replicating.lagging.store(
+            w.held.values().map(|h| exceeded(&h.notes).len()).sum(),
+            Ordering::SeqCst,
+        );
         tick
     }
 
@@ -764,6 +955,14 @@ impl<S: BlobStore + 'static> Api<S> {
         );
         out.insert("last_commit_ms".to_owned(), json!(note.last_commit_ms));
         out.insert("last_error".to_owned(), json!(note.last_error));
+        // M192: what the worker bounds it to, and how far behind it was last known to be.
+        out.insert("max_lag_ms".to_owned(), json!(note.max_lag_ms));
+        out.insert("fresh_ms".to_owned(), json!(note.fresh_ms));
+        out.insert(
+            "lag_ms".to_owned(),
+            json!(note.fresh_ms.map(|f| self.now_ms().saturating_sub(f))),
+        );
+        out.insert("lag_exceeded".to_owned(), json!(note.lag_exceeded));
         Ok(Value::Object(out))
     }
 }
@@ -777,6 +976,9 @@ fn held(shard: u16, generation: u64, now: Instant, period: Duration) -> Held {
         interval: period,
         notes: Notes::new(),
         written: None,
+        seen: BTreeMap::new(),
+        fold_due: now,
+        fresh: BTreeMap::new(),
     }
 }
 
@@ -804,6 +1006,8 @@ fn describe(dest: &str, r: &Replication) -> serde_json::Map<String, Value> {
 #[serde(deny_unknown_fields)]
 struct CreateBody {
     source: SourceBody,
+    /// A copy's alone (M167): finish read-only, an export.
+    read_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -823,29 +1027,13 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let req: CreateBody = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(format!("a replication's body: {e}")))?;
-    let Some(index) = req.source.index else {
-        return Err(ApiError::bad_request("source.index is required"));
-    };
-    let source_tenant = match req.source.tenant {
-        None => tenant,
-        Some(t) => TenantId(t.parse::<u128>().map_err(|_| {
-            ApiError::bad_request(format!("source.tenant {t:?} is not a tenant id"))
-        })?),
-    };
-    let store = req.source.store.unwrap_or_default();
-    principal.source(source_tenant, &store)?;
-    let Some(from) = api.source_store(tenant, &store) else {
-        return Err(ApiError::bad_request(format!(
-            "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"
-        )));
-    };
-    let source = ReplicaSource {
-        store,
-        tenant: source_tenant,
-        index,
-    };
+    let (source, from, read_only) =
+        api.parse_source(tenant, &principal, &body, "a replication's body")?;
+    if read_only.is_some() {
+        return Err(ApiError::bad_request(
+            "read_only is a copy's: a replication follows its source and is always read-only",
+        ));
+    }
     api.engine(tenant)
         .await
         .create_replication(&dest, source, &*from)
@@ -856,6 +1044,149 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     let _ = api.reconcile(tenant, true).await;
     let out = api.status_of(tenant, &dest, false).await?;
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
+}
+
+/// A create's source, the store to read it from, and a copy's `read_only` (M167).
+type Parsed = (ReplicaSource, Arc<dyn BlobStore>, Option<bool>);
+
+impl<S: BlobStore + 'static> Api<S> {
+    /// A create's body (M22, and M166's copy): the source it names, authorized for this
+    /// principal before anything is read, the store to read it from, and a copy's
+    /// `read_only` (M167).
+    fn parse_source(
+        &self,
+        tenant: TenantId,
+        principal: &crate::auth::Principal,
+        body: &[u8],
+        what: &str,
+    ) -> Result<Parsed, ApiError> {
+        let req: CreateBody = serde_json::from_slice(body)
+            .map_err(|e| ApiError::bad_request(format!("{what}: {e}")))?;
+        let Some(index) = req.source.index else {
+            return Err(ApiError::bad_request("source.index is required"));
+        };
+        let source_tenant = match req.source.tenant {
+            None => tenant,
+            Some(t) => TenantId(t.parse::<u128>().map_err(|_| {
+                ApiError::bad_request(format!("source.tenant {t:?} is not a tenant id"))
+            })?),
+        };
+        let store = req.source.store.unwrap_or_default();
+        principal.source(source_tenant, &store)?;
+        let Some(from) = self.source_store(tenant, &store) else {
+            return Err(ApiError::bad_request(format!(
+                "this server has no source store named {store:?}; configure it with PSTORE_SOURCES"
+            )));
+        };
+        let source = ReplicaSource {
+            store,
+            tenant: source_tenant,
+            index,
+        };
+        Ok((source, from, req.read_only))
+    }
+
+    /// The copy into `dest`'s status (M166): HEAD and the worker's notes, in one round.
+    async fn copy_status_of(&self, tenant: TenantId, dest: &str) -> Result<Value, ApiError> {
+        let engine = self.engine(tenant).await;
+        let store = self.store.as_tenant(tenant);
+        let (status, notes) = futures_util::future::join(engine.copy_status(dest), async {
+            match store.get(&notes_key(tenant)).await {
+                Ok(b) => Ok(serde_json::from_slice::<Notes>(&b).unwrap_or_default()),
+                Err(BlobError::NotFound(_)) => Ok(Notes::new()),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        let Some(status) = status? else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "copy_not_found",
+                format!("the index {dest:?} has no copy running and no recent outcome"),
+            ));
+        };
+        let mut notes = notes.map_err(|e| EngineError::Blob(e.to_string()))?;
+        let last_error = match status.state {
+            CopyState::Running | CopyState::Paused => notes
+                .remove(dest)
+                .or_else(|| notes.remove(TENANT_NOTE))
+                .and_then(|n| n.last_error),
+            CopyState::Succeeded | CopyState::Failed | CopyState::Cancelled => None,
+        };
+        Ok(describe_copy(dest, &status, last_error))
+    }
+}
+
+/// A copy's status as the wire says it (M166): `state` is the machine state.
+fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Value {
+    json!({
+        "index": dest,
+        "state": match s.state {
+            CopyState::Running => "running",
+            CopyState::Paused => "paused",
+            CopyState::Succeeded => "succeeded",
+            CopyState::Failed => "failed",
+            CopyState::Cancelled => "cancelled",
+        },
+        "run": s.run,
+        "source": {
+            "store": s.source.store,
+            "tenant": s.source.tenant.0.to_string(),
+            "index": s.source.index,
+        },
+        "epoch": s.epoch,
+        "source_epoch": s.source_epoch,
+        "code": s.failure.map(|f| match f {
+            CopyFailure::SourceNotFound => "source_not_found",
+        }),
+        "last_error": last_error,
+        "read_only": s.read_only,
+    })
+}
+
+/// `POST /v1/indexes/{dest}/copy` (M166): copies the source into the new `dest`, as a
+/// replication that finishes in the commit that copies. `202` when this request started it;
+/// `200` with the copy a repeated request started. With `read_only: true`, an export
+/// (M167): it finishes read-only.
+pub(crate) async fn copy<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::auth::Principal>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let (source, from, read_only) = api.parse_source(tenant, &principal, &body, "a copy's body")?;
+    let engine = api.engine(tenant).await;
+    let (status, started) = if read_only == Some(true) {
+        engine.create_export(&dest, source, &*from).await?
+    } else {
+        engine.create_copy(&dest, source, &*from).await?
+    };
+    if !started {
+        return Ok((
+            StatusCode::OK,
+            axum::Json(describe_copy(&dest, &status, None)),
+        )
+            .into_response());
+    }
+    // As a create's: the change has happened, whatever the register says.
+    let _ = api.reconcile(tenant, true).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(describe_copy(&dest, &status, None)),
+    )
+        .into_response())
+}
+
+/// `GET /v1/indexes/{dest}/copy` (M166).
+pub(crate) async fn copy_status<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    Ok(axum::Json(api.copy_status_of(tenant, &dest).await?))
 }
 
 /// `GET /v1/indexes/{dest}/replication`.
@@ -911,6 +1242,69 @@ pub(crate) async fn cancel<S: BlobStore + 'static>(
     Ok(axum::Json(json!({"index": dest, "epoch": epoch.0})))
 }
 
+/// `POST /v1/indexes/{dest}/replication/sync` (M192): folds the source when it is in this
+/// store, then syncs the tenant's replications at once. With the source folded and `dest`
+/// current, every write the source acknowledged before the call is on the replica, and
+/// `fresh_ms` says from when.
+pub(crate) async fn sync_now<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::auth::Principal>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let engine = api.engine(tenant).await;
+    let Some((r, _, _)) = engine.replication_status(&dest).await? else {
+        return Err(EngineError::Replica(ReplicaRefusal::NotFound(dest)).into());
+    };
+    if !r.running {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "replication_paused",
+            format!("the replication into {dest:?} is paused: resume it to sync it"),
+        ));
+    }
+    // As a create's: the source's authority, before the source is touched.
+    principal.source(r.source.tenant, &r.source.store)?;
+    let unavailable =
+        |why: String| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable", why);
+    let fresh = if r.source.store.is_empty() {
+        let at = api.now_ms();
+        api.fold_source(r.source.tenant)
+            .await
+            .map_err(|e| unavailable(format!("{FOLD_ERROR}{e}")))?;
+        Some(at)
+    } else {
+        None
+    };
+    let sources = TenantSources {
+        remotes: &api.replication().1,
+        tenant,
+    };
+    let out = engine
+        .replicate(&sources, &mut SyncState::default())
+        .await?;
+    if let Some(why) = out.failed.get(&dest) {
+        return Err(unavailable(format!("sync: {why}")));
+    }
+    let mut v = if out.finished.contains(&dest) {
+        // A copy (M166) this sync ended: its entry goes, and its outcome is the answer.
+        let _ = api.reconcile(tenant, false).await;
+        api.copy_status_of(tenant, &dest).await?
+    } else {
+        api.status_of(tenant, &dest, false).await?
+    };
+    if let Value::Object(m) = &mut v {
+        m.insert("source_folded".to_owned(), json!(fresh.is_some()));
+        let current = out.committed.contains(&dest) || out.current.contains(&dest);
+        if let Some(at) = fresh.filter(|_| current) {
+            m.insert("fresh_ms".to_owned(), json!(at));
+            m.insert("lag_ms".to_owned(), json!(api.now_ms().saturating_sub(at)));
+        }
+    }
+    Ok(axum::Json(v))
+}
+
 /// `GET /v1/replications`: the tenant's replications, after one HEAD read.
 pub(crate) async fn list<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -955,7 +1349,58 @@ pub async fn run_replication<S: BlobStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTE_BYTES, clipped};
+    use super::{BTreeMap, BTreeSet, Duration, Folded, Instant, NOTE_BYTES, clipped, held};
+    use pstore_engine::ReplicaSource;
+    use pstore_types::TenantId;
+
+    /// M192: the verdict at the bound and just past it, counted once, and a fold that was not
+    /// followed by a current sync moving nothing.
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a missing note is the test failing"
+    )]
+    fn judge_marks_past_the_bound_once_and_only_from_a_current_fold() {
+        let t0 = Instant::now();
+        let lag = Duration::from_secs(10);
+        let mut h = held(0, 1, t0, Duration::from_secs(1));
+        let srcs = BTreeMap::from([
+            ("d".to_owned(), ReplicaSource::local(TenantId(1), "s")),
+            (
+                "far".to_owned(),
+                ReplicaSource {
+                    store: "far".to_owned(),
+                    tenant: TenantId(1),
+                    index: "s".to_owned(),
+                },
+            ),
+        ]);
+        let ok = BTreeSet::from(["d".to_owned(), "far".to_owned()]);
+        let folded: Folded = BTreeMap::from([
+            ("d".to_owned(), Ok((t0, 1_000))),
+            ("far".to_owned(), Ok((t0, 1_000))),
+        ]);
+        assert_eq!(h.judge(&srcs, Some(&folded), &ok, lag, t0), 0);
+        assert_eq!(h.notes["d"].fresh_ms, Some(1_000));
+        // A remote source is never bounded, whatever a fold of its tenant id said.
+        assert!(!h.notes.contains_key("far"));
+        // Exactly at the bound: not past it.
+        assert_eq!(h.judge(&srcs, None, &ok, lag, t0 + lag), 0);
+        assert!(!h.notes["d"].lag_exceeded);
+        // Past it: counted once, however many syncs see it.
+        let late = t0 + lag + Duration::from_millis(1);
+        assert_eq!(h.judge(&srcs, None, &ok, lag, late), 1);
+        assert_eq!(h.judge(&srcs, None, &ok, lag, late), 0);
+        assert!(h.notes["d"].lag_exceeded);
+        // A fold whose sync did not find `d` current moves nothing.
+        let refold: Folded = BTreeMap::from([("d".to_owned(), Ok((late, 2_000)))]);
+        h.judge(&srcs, Some(&refold), &BTreeSet::new(), lag, late);
+        assert_eq!(h.notes["d"].fresh_ms, Some(1_000));
+        assert!(h.notes["d"].lag_exceeded);
+        h.judge(&srcs, Some(&refold), &ok, lag, late);
+        assert_eq!(h.notes["d"].fresh_ms, Some(2_000));
+        assert!(!h.notes["d"].lag_exceeded);
+    }
 
     #[test]
     fn a_note_is_clipped_at_a_char_boundary_below_the_limit() {

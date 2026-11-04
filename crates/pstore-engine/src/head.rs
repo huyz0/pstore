@@ -8,7 +8,7 @@
 use crate::EngineError;
 use pstore_blob::{BlobStore, CasError, Key, Precondition};
 use pstore_types::{CasTag, Epoch, LaneId, Seq};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One committed segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +271,63 @@ pub struct Head {
     /// engine set for idempotency keys, raised by every fold that drops a listed pair. ⚠️ The
     /// last trailing section, after the outcomes: absent means `None`.
     pub keys_since: Option<u64>,
+    /// Per index, `(created_ms, written_ms)` in Unix milliseconds (M148): when it came into
+    /// being, 0 when unknown (made before M148), and the last commit that wrote it. ⚠️ A
+    /// trailing section after `keys_since`, and `encode` writes only the entries of indexes
+    /// that exist, so it never outlives its index.
+    pub times: BTreeMap<String, (u64, u64)>,
+    /// The indexes an owner made read-only (M149). ⚠️ A trailing section after `times`, and
+    /// `encode` writes only the names of indexes that exist.
+    pub read_only: BTreeSet<String>,
+    /// The replications that are copies (M166): one-shot, finishing in the commit that
+    /// copies. ⚠️ With [`Self::copies`], the last trailing section, after `read_only`;
+    /// `encode` writes only the names of replications that exist.
+    pub once: BTreeSet<String>,
+    /// How each recent copy ended, by destination (M166): at most [`COPIES_RETAINED`],
+    /// through [`Self::record_copy`].
+    pub copies: BTreeMap<String, CopyOutcome>,
+    /// The copies that asked to finish read-only (M167): exports. ⚠️ The last trailing
+    /// section, after the copies; `encode` keeps a name only while [`Self::once`] (of a
+    /// replication that exists) or [`Self::copies`] holds it, so it goes with the record.
+    pub exports: BTreeSet<String>,
+}
+
+/// The most copy outcomes a tenant's HEAD keeps (M166).
+pub const COPIES_RETAINED: usize = 64;
+
+/// How a copy ended (M166).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOutcome {
+    /// What it copied.
+    pub source: ReplicaSource,
+    /// The epoch of its latest start: the operation's token. A resume after a
+    /// pause starts it again, under a new run.
+    pub run: u64,
+    /// The epoch that ended it.
+    pub epoch: u64,
+    /// How.
+    pub end: CopyEnd,
+}
+
+/// A copy's terminal state (M166).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyEnd {
+    /// The destination holds the source's folded state at `source_epoch`.
+    Succeeded {
+        /// The source's epoch the copy holds.
+        source_epoch: u64,
+    },
+    /// Never retried.
+    Failed(CopyFailure),
+    /// Cancelled before it finished.
+    Cancelled,
+}
+
+/// Why a copy failed (M166): a code, never free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFailure {
+    /// The source held no folded segment.
+    SourceNotFound,
 }
 
 /// Where a replica's source index lives (M22).
@@ -547,7 +604,7 @@ impl Head {
             .iter()
             .filter(|(_, _, s, _)| !s.fields.is_empty())
             .collect();
-        // M152: the further text fields are last, and force `keys_since`, which has no
+        // M152: the further text fields follow `keys_since` and force it, though it has no
         // presence marker: a forced `None` is written as `u64::MAX`, which no epoch reaches.
         let texts: Vec<_> = all
             .iter()
@@ -559,13 +616,49 @@ impl Head {
         );
         // M129: the applied outcomes follow, and force the widths.
         // M132: `keys_since` follows, and forces the outcomes.
-        // M173: the recorded types are last, and force the text fields' section (empty if
+        // M173: the recorded types follow the text fields, and force their section (empty if
         // none), which forces `keys_since`.
+        // M148: the times follow the types, only those of indexes that exist, and force the types'
+        // count (0 when none), and so everything before it.
         let typed: Vec<_> = all
             .iter()
             .filter(|(_, _, s, _)| !s.types.is_empty())
             .collect();
-        let types = !typed.is_empty();
+        let times: Vec<_> = self
+            .times
+            .iter()
+            .filter(|(n, _)| {
+                self.indexes.contains_key(*n)
+                    || self.schema_rejects.contains_key(*n)
+                    || self.quarantine.contains_key(*n)
+            })
+            .collect();
+        // M149: the read-only names are last, only those of indexes that exist, and force
+        // the times (a count of 0 when none) and so everything before them.
+        let flagged: Vec<&String> = self
+            .read_only
+            .iter()
+            .filter(|n| {
+                self.indexes.contains_key(*n)
+                    || self.schema_rejects.contains_key(*n)
+                    || self.quarantine.contains_key(*n)
+            })
+            .collect();
+        // M166: the copies last, forcing the read-only count (0 when none) before them.
+        let once: Vec<&String> = self
+            .once
+            .iter()
+            .filter(|n| self.replications.contains_key(*n))
+            .collect();
+        // M167: the exports after them, only the names a live once-name or an outcome holds.
+        let exports: Vec<&String> = self
+            .exports
+            .iter()
+            .filter(|n| once.contains(n) || self.copies.contains_key(*n))
+            .collect();
+        let copied = !once.is_empty() || !self.copies.is_empty();
+        let timed = !times.is_empty() || !flagged.is_empty() || copied;
+        let types = !typed.is_empty() || timed;
         let texted = !texts.is_empty() || types;
         let since = self.keys_since.is_some() || texted;
         let outs = !self.outcomes.is_empty() || since;
@@ -707,7 +800,67 @@ impl Head {
                 }
             }
         }
+        if timed {
+            out.extend_from_slice(&(times.len() as u32).to_le_bytes());
+            for (name, (created, written)) in times {
+                put_str(&mut out, name);
+                out.extend_from_slice(&created.to_le_bytes());
+                out.extend_from_slice(&written.to_le_bytes());
+            }
+        }
+        if !flagged.is_empty() || copied {
+            out.extend_from_slice(&(flagged.len() as u32).to_le_bytes());
+            for name in flagged {
+                put_str(&mut out, name);
+            }
+        }
+        if copied {
+            out.extend_from_slice(&(once.len() as u32).to_le_bytes());
+            for name in once {
+                put_str(&mut out, name);
+            }
+            out.extend_from_slice(&(self.copies.len() as u32).to_le_bytes());
+            for (dest, o) in &self.copies {
+                put_str(&mut out, dest);
+                put_str(&mut out, &o.source.store);
+                out.extend_from_slice(&o.source.tenant.0.to_le_bytes());
+                put_str(&mut out, &o.source.index);
+                out.extend_from_slice(&o.run.to_le_bytes());
+                out.extend_from_slice(&o.epoch.to_le_bytes());
+                match &o.end {
+                    CopyEnd::Succeeded { source_epoch } => {
+                        out.push(0);
+                        out.extend_from_slice(&source_epoch.to_le_bytes());
+                    }
+                    CopyEnd::Failed(CopyFailure::SourceNotFound) => out.extend_from_slice(&[1, 0]),
+                    CopyEnd::Cancelled => out.push(2),
+                }
+            }
+        }
+        if !exports.is_empty() {
+            out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
+            for name in exports {
+                put_str(&mut out, name);
+            }
+        }
         out
+    }
+
+    /// Records how the copy into `dest` ended (M166), replacing `dest`'s last outcome and
+    /// evicting the smallest `epoch` past [`COPIES_RETAINED`].
+    pub fn record_copy(&mut self, dest: &str, outcome: CopyOutcome) {
+        self.copies.insert(dest.to_owned(), outcome);
+        while self.copies.len() > COPIES_RETAINED {
+            let Some(oldest) = self
+                .copies
+                .iter()
+                .min_by_key(|(_, o)| o.epoch)
+                .map(|(d, _)| d.clone())
+            else {
+                break;
+            };
+            self.copies.remove(&oldest);
+        }
     }
 
     /// A digest of the running replications' `(name, run)` set, or `None` when none runs
@@ -1109,6 +1262,70 @@ impl Head {
                 schema.types.insert(attr, k);
             }
         }
+        // M148: and here, no times. A decoder from before it refuses anything after the
+        // recorded types, so every node reads this before any writes it.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let created = c.u64()?;
+            h.times.insert(name, (created, c.u64()?));
+        }
+        // M149: and here, no read-only names.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.read_only.insert(c.string()?);
+        }
+        // M166: and here, no copies.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.once.insert(c.string()?);
+        }
+        for _ in 0..c.u32()? {
+            let dest = c.string()?;
+            let store = c.string()?;
+            let tenant = c.u128()?;
+            let index = c.string()?;
+            let run = c.u64()?;
+            let epoch = c.u64()?;
+            let end = match c.u8()? {
+                0 => CopyEnd::Succeeded {
+                    source_epoch: c.u64()?,
+                },
+                1 => match c.u8()? {
+                    0 => CopyEnd::Failed(CopyFailure::SourceNotFound),
+                    _ => return Err(EngineError::CorruptHead),
+                },
+                2 => CopyEnd::Cancelled,
+                _ => return Err(EngineError::CorruptHead),
+            };
+            let source = ReplicaSource {
+                store,
+                tenant: pstore_types::TenantId(tenant),
+                index,
+            };
+            h.copies.insert(
+                dest,
+                CopyOutcome {
+                    source,
+                    run,
+                    epoch,
+                    end,
+                },
+            );
+        }
+        // M167: and here, no exports.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            h.exports.insert(c.string()?);
+        }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
         }
@@ -1308,6 +1525,14 @@ impl Cur<'_> {
     fn u32(&mut self) -> Result<u32, EngineError> {
         Ok(u32::from_le_bytes(
             self.take(4)?
+                .try_into()
+                .map_err(|_| EngineError::CorruptHead)?,
+        ))
+    }
+    /// `u128::to_le_bytes`'s inverse (M166): one read, so no operator joins two halves.
+    fn u128(&mut self) -> Result<u128, EngineError> {
+        Ok(u128::from_le_bytes(
+            self.take(16)?
                 .try_into()
                 .map_err(|_| EngineError::CorruptHead)?,
         ))
@@ -2245,5 +2470,295 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// M148 criterion 6: `times` round-trips beside an absent and a present `keys_since`,
+    /// with and without outcomes; a HEAD without it encodes as M147's; and `encode` keeps
+    /// only the entries of indexes that exist (rows, rejects or a quarantine).
+    #[test]
+    fn times_round_trip_beside_keys_since() -> Result<(), EngineError> {
+        for (keys_since, outcomes) in [
+            (None, vec![]),
+            (Some(4), vec![]),
+            (None, vec![(3, "o3".to_owned())]),
+            (Some(4), vec![(3, "o3".to_owned())]),
+        ] {
+            let mut m147 = Head {
+                keys_since,
+                outcomes,
+                ..sample()
+            };
+            m147.indexes.insert("a".to_owned(), Vec::new());
+            m147.schema_rejects.insert("r".to_owned(), 1);
+            m147.quarantine
+                .insert("q".to_owned(), vec![("k".to_owned(), 1)]);
+            let mut with = m147.clone();
+            for (i, n) in ["a", "r", "q"].into_iter().enumerate() {
+                with.times.insert(n.to_owned(), (i as u64, 10 + i as u64));
+            }
+            let back = Head::decode(&with.encode())?;
+            assert_eq!(back, with, "{keys_since:?}");
+            // Without times, M147's bytes exactly: the times entry of a name that does not
+            // exist is never written.
+            let mut ghost = m147.clone();
+            ghost.times.insert("gone".to_owned(), (1, 2));
+            assert_eq!(hex(&ghost.encode()), hex(&m147.encode()), "{keys_since:?}");
+            assert_eq!(Head::decode(&m147.encode())?, m147);
+            // A ghost beside a real entry is dropped, the real one kept.
+            let mut both = with.clone();
+            both.times.insert("gone".to_owned(), (1, 2));
+            assert_eq!(Head::decode(&both.encode())?, with);
+            let bytes = with.encode();
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            for cut in m147.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                // A cut leaving exactly M147's form is M147's HEAD; every other is refused.
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.times.is_empty(), "a cut at {cut} decoded times");
+                }
+            }
+        }
+        // After M152's further text fields, live and dropped.
+        for keys_since in [None, Some(17)] {
+            let mut h = texted(keys_since);
+            h.times.insert("a".to_owned(), (5, 6));
+            let back = Head::decode(&h.encode())?;
+            assert_eq!(back, h, "{keys_since:?}");
+            assert_eq!(back.times.len(), 1);
+        }
+        // After M173's recorded types, live and dropped, which the times follow.
+        let mut h = every_section();
+        assert!(h.indexes.contains_key("a"));
+        assert!(h.schemas.get("a").is_some_and(|s| !s.types.is_empty()));
+        h.times.insert("a".to_owned(), (7, 8));
+        let back = Head::decode(&h.encode())?;
+        assert_eq!(back, h);
+        assert_eq!(back.times.len(), 1);
+        Ok(())
+    }
+
+    /// M149 criterion 7: `read_only` round-trips beside every combination of absent and
+    /// present `keys_since` and `times`; a HEAD without it encodes as M148's; and `encode`
+    /// keeps only the names of indexes that exist.
+    #[test]
+    fn read_only_round_trips_beside_times() -> Result<(), EngineError> {
+        for keys_since in [None, Some(4)] {
+            for timed in [false, true] {
+                let mut m148 = Head {
+                    keys_since,
+                    ..sample()
+                };
+                m148.indexes.insert("a".to_owned(), Vec::new());
+                m148.schema_rejects.insert("r".to_owned(), 1);
+                m148.quarantine
+                    .insert("q".to_owned(), vec![("k".to_owned(), 1)]);
+                if timed {
+                    m148.times.insert("a".to_owned(), (1, 2));
+                }
+                let mut with = m148.clone();
+                for n in ["a", "r", "q"] {
+                    with.read_only.insert(n.to_owned());
+                }
+                assert_eq!(
+                    Head::decode(&with.encode())?,
+                    with,
+                    "{keys_since:?} {timed}"
+                );
+                let mut ghost = m148.clone();
+                ghost.read_only.insert("gone".to_owned());
+                assert_eq!(hex(&ghost.encode()), hex(&m148.encode()));
+                let mut both = with.clone();
+                both.read_only.insert("gone".to_owned());
+                assert_eq!(Head::decode(&both.encode())?, with);
+                let mut longer = with.encode();
+                longer.push(0);
+                assert!(Head::decode(&longer).is_err());
+                let bytes = with.encode();
+                for cut in m148.encode().len()..bytes.len() {
+                    let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                    if let Ok(h) = Head::decode(part) {
+                        assert!(h.read_only.is_empty(), "a cut at {cut} decoded flags");
+                    }
+                }
+            }
+        }
+        // After M173's recorded types, live and dropped, with and without times.
+        for timed in [false, true] {
+            let mut h = every_section();
+            if timed {
+                h.times.insert("a".to_owned(), (3, 4));
+            }
+            h.read_only.insert("a".to_owned());
+            assert_eq!(Head::decode(&h.encode())?, h, "{timed}");
+        }
+        Ok(())
+    }
+
+    /// M166 criterion 9: the once-names and copy outcomes round-trip after every earlier
+    /// section, absent or present; a HEAD without them encodes as M149's; `encode` keeps only
+    /// the once-names of replications that exist; and a cut never decodes them.
+    #[test]
+    fn copies_round_trip_after_every_section() -> Result<(), EngineError> {
+        let source = ReplicaSource {
+            store: "eu".to_owned(),
+            tenant: pstore_types::TenantId(7 | (3 << 64)),
+            index: "src".to_owned(),
+        };
+        let outcomes = [
+            CopyEnd::Succeeded { source_epoch: 41 },
+            CopyEnd::Failed(CopyFailure::SourceNotFound),
+            CopyEnd::Cancelled,
+        ];
+        for base in [Head::default(), sample(), every_section()] {
+            for flagged in [false, true] {
+                let mut m149 = base.clone();
+                if flagged {
+                    m149.indexes.insert("a".to_owned(), Vec::new());
+                    m149.read_only.insert("a".to_owned());
+                }
+                let mut with = m149.clone();
+                with.replications.insert(
+                    "running".to_owned(),
+                    Replication {
+                        source: source.clone(),
+                        running: true,
+                        run: 9,
+                        applied: None,
+                        rejected: 0,
+                    },
+                );
+                let replicated = with.clone();
+                with.once.insert("running".to_owned());
+                for (i, end) in outcomes.iter().enumerate() {
+                    let i = i as u64;
+                    with.copies.insert(
+                        format!("done{i}"),
+                        CopyOutcome {
+                            source: source.clone(),
+                            run: 10 + i,
+                            epoch: 20 + i,
+                            end: end.clone(),
+                        },
+                    );
+                }
+                assert_eq!(Head::decode(&with.encode())?, with, "{flagged}");
+                // No outcome and no live once-name: M149's bytes.
+                let mut ghost = replicated.clone();
+                ghost.once.insert("gone".to_owned());
+                assert_eq!(hex(&ghost.encode()), hex(&replicated.encode()));
+                let mut once = replicated.clone();
+                once.once.insert("running".to_owned());
+                assert_eq!(Head::decode(&once.encode())?, once);
+                let mut longer = with.encode();
+                longer.push(0);
+                assert!(Head::decode(&longer).is_err());
+                let bytes = with.encode();
+                for cut in replicated.encode().len()..bytes.len() {
+                    let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                    if let Ok(h) = Head::decode(part) {
+                        assert!(
+                            h.copies.is_empty() && h.once.is_empty(),
+                            "a cut at {cut} decoded copies"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M167 criterion 7: the export names round-trip after the copies, absent or present; a
+    /// HEAD without them encodes as M166's; `encode` keeps a name only while a live once-name
+    /// or an outcome holds it; and a cut never decodes them.
+    #[test]
+    fn exports_round_trip_after_copies() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        for base in [Head::default(), sample(), every_section()] {
+            let mut m166 = base.clone();
+            m166.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            m166.once.insert("running".to_owned());
+            m166.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 10,
+                    epoch: 20,
+                    end: CopyEnd::Succeeded { source_epoch: 4 },
+                },
+            );
+            let mut with = m166.clone();
+            with.exports.insert("running".to_owned());
+            with.exports.insert("done".to_owned());
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // A name with no record, or a once-name whose replication is gone: M166's bytes.
+            let mut ghost = m166.clone();
+            ghost.exports.insert("gone".to_owned());
+            assert_eq!(hex(&ghost.encode()), hex(&m166.encode()));
+            let mut stale = m166.clone();
+            stale.once.insert("stale".to_owned());
+            let plain = stale.clone();
+            stale.exports.insert("stale".to_owned());
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            // One export alone keeps its section, after an empty copies section.
+            let mut only = base.clone();
+            only.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 1,
+                    epoch: 2,
+                    end: CopyEnd::Cancelled,
+                },
+            );
+            only.exports.insert("done".to_owned());
+            assert_eq!(Head::decode(&only.encode())?, only);
+            let mut longer = with.encode();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            let bytes = with.encode();
+            for cut in m166.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.exports.is_empty(), "a cut at {cut} decoded exports");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M166 criterion 6: at most [`COPIES_RETAINED`] outcomes; one more evicts the smallest
+    /// `epoch`, and an outcome recorded for a held name replaces it.
+    #[test]
+    fn copy_outcomes_are_bounded() {
+        let outcome = |epoch| CopyOutcome {
+            source: ReplicaSource::local(pstore_types::TenantId(1), "s"),
+            run: epoch - 1,
+            epoch,
+            end: CopyEnd::Cancelled,
+        };
+        let mut h = Head::default();
+        // Recorded out of order, so the eviction cannot be by name or by insertion.
+        for i in (0..COPIES_RETAINED as u64).rev() {
+            h.record_copy(&format!("d{i:03}"), outcome(100 + i));
+        }
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        h.record_copy("d000", outcome(500));
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        assert_eq!(h.copies.get("d000").map(|o| o.epoch), Some(500));
+        h.record_copy("new", outcome(501));
+        assert_eq!(h.copies.len(), COPIES_RETAINED);
+        assert!(!h.copies.contains_key("d001"), "the smallest epoch was 101");
+        assert!(h.copies.contains_key("d002") && h.copies.contains_key("new"));
     }
 }

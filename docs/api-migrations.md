@@ -1,5 +1,189 @@
 # Native API migration notes
 
+## M167: an export is a read-only copy, and a restore is a copy of it
+
+An export is M166's copy with `"read_only": true` in its body:
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71"}, "read_only": true}
+```
+
+- The commit that finishes the copy also makes `dest` read-only, as `PATCH` with
+  `{"read_only": true}` would (M149). Writes, deletes and the drop are refused with
+  `409 index_read_only` until a `PATCH` clears the flag.
+- The status gains `read_only`, the flag asked for, in every state. A repeated `POST` matches
+  only the same flag, including after a `PATCH` cleared it. The other flag answers `409`.
+  A replication's body refuses the field (`400`).
+- An export holds the source's **folded** rows at `source_epoch`: the source HEAD the sync
+  copied, which may be later than the `POST`. Unfolded writes are not in it, so fold first
+  (`POST /v1/admin/fold`). A past `as_of` epoch cannot be exported.
+- A restore is a copy whose source is the export, into any tenant or store the principal may
+  read; without `read_only` it is writable. It keeps answering once the export and its store
+  are gone. Evidence is in [M167 verification](milestones/M167/VERIFIED.md).
+
+## M166: an isolated copy, as an operation with a status
+
+`copy_from_namespace` is a **branch**: the new index shares its source's segment objects,
+in the same tenant. It is not an isolated copy, and dropping or losing the source's objects
+affects it. The isolated copy is a new route:
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71", "store": "far"}}
+GET  /v1/indexes/{dest}/copy
+```
+
+- The body and its authorization are a replication's (`tenant` defaults to the caller's,
+  `store` to this server's own; the principal must hold the source tenant and store). The
+  copy is a one-shot replication: the worker copies the source's folded segments and delete
+  vectors under `dest`'s own keys and finishes in that same commit.
+- `202` answers the status; its `run` is the operation's token, and a resume after a pause
+  starts a new run. The same `POST` again answers `200` with the copy it started while it
+  runs or is paused, and after it succeeded while `dest` is still an index, even once the
+  source is gone.
+- `state` is `running`, `paused`, `succeeded`, `failed` or `cancelled`, and the only field
+  to branch on. `epoch` is the commit that ended it; `source_epoch` the source epoch a
+  success holds; `code` is `source_not_found` for the one failure (the source held no
+  folded segment, never retried); `last_error` is the worker's latest note while it runs.
+- A success is never partial: `dest` holds every segment of the source at `source_epoch` or
+  none. After it, `dest` is an ordinary writable index that answers without the source, its
+  tenant's objects or its store.
+- `DELETE /v1/indexes/{dest}/replication` cancels a copy (`cancelled`). A running copy also
+  appears in `/v1/replications`, and pause and resume act on it.
+- A tenant keeps the last 64 outcomes; dropping `dest` removes its outcome, and a new
+  copy, replication or branch into `dest` replaces it. `404 copy_not_found` otherwise.
+- Not provided: wall-clock times, progress, encryption, or charging for the copied bytes.
+
+HEAD gains a trailing section. A process older than M166 refuses a HEAD that carries one,
+so every node is upgraded before copies are offered. Evidence is in
+[M166 verification](milestones/M166/VERIFIED.md).
+
+## M191: folded multi-vector fields in results and exports
+
+`include_vectors` now answers every named dense field, whatever layout its segment folded
+it in. Nothing fails for a layout any more.
+
+- A field some segment stores at a varying count of vectors a row (every multi-vector
+  field, and a single-vector one some row of the segment lacks) costs **one round more**:
+  its rows' offsets are read beside the rows, then its vectors for the returned rows only.
+  This is an opt-in outside the D-34 budget, as `rerank: exact` is. A `rank_by` order
+  naming one is 5 rounds. Fields stored one vector a row keep M190's cost.
+- The vectors those returned rows would read are bounded at 64 MiB, as stored. Past it the
+  query fails `422 bad_query` naming the bytes and the bound, before any vector is read;
+  ask fewer rows (`top_k`, or page by `offset`) or fewer fields. One row always fits.
+- A row without the field still has no entry, never `[]`.
+
+## M190: named vector fields in results and exports
+
+`include_vectors` names named fields too, and a result row gains `vectors` beside `id` and
+`vector`, spelled as a write's `vectors` is.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector", "title", "tokens"]}
+```
+
+- Up to 9 names, each once: `vector` and named fields in any mix. `sparse` is not projected
+  yet; a name a named field could not have is `400`. A name the index has no field of is
+  admitted and answers nothing.
+- A row's `vectors` holds only the fields it has, each its vectors in the order written,
+  spelled by `vector_encoding`, and in the index's metric space as `vector` is. No fields,
+  no `vectors` key.
+- Folded rows answer a named field only where their segment stores it at one vector a row:
+  every row of the segment holds exactly one. Unfolded rows answer every field,
+  multi-vector ones included. M191 answers the other layout too; until then it was
+  `422 bad_query` naming the field.
+- No round is added: the fields are read beside `vector`, one request a field a segment.
+
+## M179: stored vectors in results and exports
+
+A ranked query or a `rank_by` order takes `include_vectors: ["vector"]`, and each result
+row gains `vector` beside `id`.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector"], "vector_encoding": "base64"}
+```
+
+- `vector_encoding` is `"float"` (a JSON array, the default) or `"base64"` (standard,
+  padded, little-endian f32 bytes, the spelling a write accepts).
+- The value is the vector as the index stores it: exactly what was written under
+  `dot_product` and `euclidean_squared`, normalized under `cosine_distance`. Written back
+  under the same metric it reproduces the index's distances, not the client's bytes.
+- A row with no vector has no `vector` key. An attribute named `vector` is unaffected and
+  stays under `attributes`.
+- Only `vector` is projected yet (M190 adds named fields). Refused (`400`): any other
+  name, beside `aggregate_by` or `as_of`, inside a multi-query's `queries`, and above
+  1,000 rows (a ranked query's `top_k + offset`, an order's `top_k`).
+- An order with vectors costs one more blob round, four in all; a ranked query, none.
+
+## M178: sparse vectors
+
+A document, an `upsert_columns` column and a query take `sparse`, an object of string key
+to weight.
+
+```json
+{"documents": [{"id": "a", "sparse": {"cat": 0.7, "dog": 1.5}}]}
+{"sparse": {"cat": 1.0}, "top_k": 10}
+```
+
+- 1 to 1,024 keys of 1 to 256 bytes; each weight a number of magnitude at most 65,504,
+  stored as f16 (the nearest f16 answers). Anything else is `400`, naming the document and
+  the bound; past 1,024 keys the body's own shape bound answers `413` first. A key spelled
+  twice in one object is its last weight.
+- A query's `sparse` is a leg: alone, rows rank by the dot product over the keys they share
+  with it (`"fusion": {"sum": {}}` reports it as the score); with other legs it fuses after
+  them, so a positional fusion weight names it last. Its score can be negative, so `sum`
+  and `max` take it only alone, never beside `text`; `rank_by` and `aggregate_by` refuse it; `facets` take it as their ranking.
+- `sparse` is reserved: `vectors.sparse`, a dense or `multi` query's `field: "sparse"`, a
+  patch's or `patch_columns`' `sparse` are refused. An attribute named `sparse` stays one.
+  A patch keeps the row's sparse field; an upsert replaces it.
+- **Changed**: an `upsert_columns` column named `sparse` was an attribute before M178 and is
+  now this field, each cell an object or `null`; a client writing an attribute of that name
+  by column renames it. A document's `attributes.sparse` is unchanged.
+- No result or export returns it yet.
+- A write holding `sparse` writes its index's WAL run in a version builds before M177 refuse:
+  do not roll back past M177 while one is unfolded.
+
+## M176: typed document ids
+
+An index's ids are of one kind: `string` (as before), `uint64` or `uuid`.
+
+```json
+{"schema": {"id": "uuid"}, "documents": [{"id": "6F1E2D3C-4B5A-4968-8776-655443322110", ...}]}
+{"documents": [{"id": 18446744073709551615, ...}]}
+```
+
+- A new index's first write of JSON-integer ids makes it `uint64`; `uuid` is only declared,
+  so no existing string id is reread. `schema.id` in the index summary answers the kind.
+- Integers answer as exact JSON integers (above 2^53 too); uuids lowercase. `rank_by: id`
+  and id ranges order by value: `2` before `10`.
+- Every id a write names (rows, columns, patches, deletes) must be of the index's kind: one
+  of another kind is `400 schema_conflict`; a write mixing kinds, or a string id beginning
+  with NUL, is `400 bad_request`. `schema: {"id": "string"}` refuses integer ids.
+- Upgrade every server before writing a typed id: a fold by a build before M176 records no
+  kind and seals rows of both kinds together.
+- A filter compares `id` as a typed attribute compares: an integer literal against a
+  `uint64` id, a uuid string in any case against a `uuid` one; anything else matches nothing.
+  On a string index an integer literal matches nothing, as before.
+- The kind is recorded by the fold that gives the index its schema, from its first upsert in
+  lane order; rows of another kind are quarantined. Rows hold typed ids in a form a build
+  before M176 answers raw: do not roll back past it once a typed id is written.
+- M174's "a non-string id is refused" in `upsert_columns` now reads: an id that is neither a
+  string nor an integer in `0..=u64::MAX`.
+
+## M175: null elements in arrays
+
+An array attribute may hold `null` elements: `{"tags": ["a", null, "b"]}`, stored and
+answered in place, order kept. Under a declared or recorded type, the other elements are
+read by it (`["6f1e…", null]` as a `uuid` array).
+
+- A null element matches no filter: `Contains`, `Any*` and their negations read it as a
+  value equal to nothing, so `NotContains 1` holds for `[null]`.
+- `group_by`, facets and `limit_per` key arrays element by element: a null element equals
+  only a null element, and sorts after every other kind.
+- Unchanged: a `null` attribute is absent (M174); a filter literal holding `null`, or an
+  array literal, is still refused; the text field's elements are strings.
+- The format gains value tag 9, inside arrays only. A reader before M175 refuses it: upgrade
+  readers first.
+
 ## M174: column upserts, and `null` in an upsert
 
 A write may give its upserts in columns, as `patch_columns` gives patches:
@@ -183,6 +367,168 @@ A relevance query may carry `limit_per`:
 
 Queries without `limit_per` answer as before. The
 [M146 verification](milestones/M146/VERIFIED.md) records the evidence.
+
+## M165: a query explains the plan it ran
+
+A ranked query (`POST /v1/indexes/{index}/query`) may carry `"explain": true`.
+
+**What it adds.** The response then carries `meta.explain`:
+
+```
+{"segments", "shadow", "remote_segments", "filter", "fusion",
+ "legs": [{"kind", "field", "limit", "mode", "requested", "candidates", "kept"}]}
+```
+
+The fields:
+
+- `segments`: the folded segments the query targeted.
+- `shadow`: the unfolded ids each folded segment was widened by.
+- `remote_segments`: the segments a peer server answered. A share that failed and ran
+  here counts as local.
+- `filter`: whether a filter applied.
+- `fusion`: `rrf`, `weighted_rrf`, `sum` or `max`.
+
+Each entry of `legs` covers the segments scored on this server, in request order:
+
+- `mode` is `limited`, `widened` (asked for more, to survive deleted and superseded
+  rows) or `exhaustive`. An exhaustive leg also carries `exhaustive_because`, which is
+  `filter` or `sum`.
+- `requested` is the rows asked of each segment, summed.
+- `candidates` is the hits the segments returned.
+- `kept` is the hits left after the filter, deletes and each segment's cut.
+- A `dense` leg also carries `approximate_segments`, `exact_segments` and `probes`, the
+  lists its approximate searches probed.
+
+**What it costs.** Nothing: the results and `meta.cost` are those of the same query
+without it. Without `explain`, or with `false`, the response is unchanged.
+
+**What it refuses.** `explain` answers `400` when:
+
+- it is not a boolean;
+- it is set with `rank_by` or `aggregate_by`;
+- it is set inside a multi-query's `queries`.
+
+**What it leaves out.** The rows of this process's own unfolded writes are in no figure.
+
+Nothing stored changes. Evidence is in [M165 verification](milestones/M165/VERIFIED.md).
+
+## M162: an index measures its own recall, online, at one snapshot
+
+`POST /v1/indexes/{index}/recall` (scope `read`) with `{"num", "top_k", "filters",
+"seed", "include_ground_truth"}`, every field optional (`num` 1 to 25, default 10;
+`top_k` 1 to 100, default 10; `seed` default 0), answers `{"avg_recall",
+"avg_ann_count", "avg_exhaustive_count", "num", "epoch", "cost"}` and, with
+`include_ground_truth`, `ground_truth: [{"query_vector", "nearest_neighbors": [{"id",
+"dist"}]}]`.
+
+It reads HEAD once. The queries are the vectors of the documents nearest a probe drawn
+from `seed`, so a seed over the same snapshot measures the same queries; they are not a
+uniform sample of the index. Each is searched as a default query searches and
+exhaustively, both at that snapshot and with `filters`; rows no fold has committed are
+not measured, and `epoch` names the snapshot. With `filters` every list is probed, so a
+filtered recall measures only the compressed scoring, not missed lists.
+
+The exhaustive searches read every vector of the index, and `cost` says so. A request
+that would score more than 2,000,000 rows (`num` times the index's rows, twice that with
+`filters`) is `400 recall_too_large` before any segment read: ask for fewer queries. An
+index with no default vector field is `400 recall_needs_vectors`, and a replica is
+`409 replica_no_history`. No other route changes.
+
+Nothing stored changes. Evidence is in [M162 verification](milestones/M162/VERIFIED.md).
+
+## M161: index list pages state what a walk sees while names change
+
+Each page of `GET /v1/indexes` adds `epoch`: the epoch of the HEAD the page was read
+from, 0 for a tenant that has none. Nothing else changes, and a page still costs one
+read and no LIST. A walk of pages is not a snapshot; the guarantees it does give are in
+[the deploy guide](deploy.md#listing-indexes-while-they-change). A client that wants a
+snapshot of the stored names checks that every page reported the same `epoch`, and
+walks again when they differ.
+
+Nothing stored changes. Evidence is in [M161 verification](milestones/M161/VERIFIED.md).
+
+## M160: an index reports its indexing progress across every writer
+
+`GET /v1/indexes/{index}?progress=true` adds a `progress` object:
+`{"status", "unindexed_rows", "unindexed_bytes", "exact", "as_of_epoch"}`. It counts
+the operations every server has made durable for the index and no fold has indexed yet,
+read from the write-ahead log's own bundles rather than from the answering server's
+memory. `status` is `updating` while there are any, else `up-to-date`.
+`unindexed_rows` counts operations (upserts, patches, deletes and by-filter
+operations), not resulting rows. `as_of_epoch` is the HEAD the counts are relative to.
+
+Without the parameter, or with `progress=false`, the summary is unchanged and costs one
+read. With it, the reads are bounded whatever the backlog: one probe per server that has
+ever written the tenant, at most 64 bundles read, and at most five round trips. Past 64
+unfolded bundles, `exact` is `false` and the counts are a lower bound. Rows a server
+holds only in memory are not durable and are not counted. `unfolded` still reports the
+answering server's own.
+
+With `progress=true`, an index no fold has created yet, whose operations are durable in
+another server's log, answers `200` as an empty index with `status` `updating`, where
+the plain summary is `404`. If those operations are all deletes it is `404` again after
+the fold. Any other value of `progress` is `400`.
+
+Nothing stored changes. Evidence is in [M160 verification](milestones/M160/VERIFIED.md).
+
+## M149: an index can be made read-only
+
+`PATCH /v1/indexes/{index}` (scope `write`) with `{"read_only": true}` makes the index
+read-only, and `{"read_only": false}` makes it writable again. No other field is
+accepted. It answers `200 {"epoch", "read_only", "cost"}`: one HEAD read and one commit,
+or no commit when the index already has that value. It answers `404 index_not_found`
+for a name the store does not hold, `409 index_not_folded` for one this process holds
+only unfolded (retry after the fold), and `409 replica_read_only` for a replica, which
+is read-only by its replication. The summary adds `"read_only"`, true for a replica too.
+
+While the flag is set, every document write (upserts, patches, deletes, conditional and
+by-filter operations) and the index's drop answer `409 index_read_only` and write
+nothing. Queries, compaction, warming, quarantine export and discard, branching from
+it, and replicating from it are unchanged. A branch of a read-only index is writable.
+A dropped index's flag goes with it, so a name created again is writable.
+
+⚠️ **Rows already accepted are set aside, not indexed.** A server that has not yet read
+the flag accepts a write, and rows acknowledged before the flag and not yet folded are
+folded after it. In both cases the fold puts the rows in the index's quarantine, counts
+them in `rejected_rows`, and reports them rejected to an applied write. They are not
+replayed when the flag is cleared. Their export carries `reason: null` unless they also
+conflict with the schema. Until that fold, the server that accepted them still serves
+them as buffered rows.
+
+⚠️ **Mixed versions.** HEAD gains a trailing section, written only while some index is
+read-only. A node from M132 to M148 refuses such a HEAD as corrupt, so every node runs
+M149 before the first flag is set. A node from M129 to M131 drops the section when it
+re-commits, clearing every flag.
+
+Evidence is in [M149 verification](milestones/M149/VERIFIED.md).
+
+## M148: an index reports its bytes and when it was created and last written
+
+`GET /v1/indexes/{index}` adds three fields, all read from the one HEAD the summary
+already reads:
+
+- `created_at`: when the index came into being (a create, a branch, the first fold of a
+  write, or the first sync of a replica), as RFC 3339 UTC with milliseconds, such as
+  `2026-10-28T00:50:30.832Z`. `null` for an index made before M148, which has no record.
+- `updated_at`: when a commit last wrote the index, in the same form. A fold of its rows
+  (deletes and rejected rows included), its create, its branch, and a replica's sync move
+  it; a compaction, GC and replication controls do not. It is when the write was folded,
+  not when it was acknowledged, so it lags an acknowledged write by up to a fold interval.
+  A node whose clock is behind the last writer's never moves it back. `null` for an
+  index made before M148 until its next write.
+- `approx_logical_bytes`: the sum of the index's segment object lengths. That covers rows,
+  index structures and dictionaries, not delete vectors or the quarantine. Deleted rows
+  count until a compaction, and a branch's shared segments count in each index that names
+  them. `0` for an index with no segment, `null` when a segment's length is not recorded
+  (written before M45).
+
+⚠️ **Mixed versions.** HEAD gains a trailing section. A node from M132 up to M148 refuses a
+HEAD carrying it as corrupt, so every node of a deployment runs M148 before any of them
+commits. Rollback after a commit is not supported. A node from M129 to M131 drops the
+section when it re-commits: `created_at` is then `null` for good, and `updated_at` until
+the next write.
+
+Evidence is in [M148 verification](milestones/M148/VERIFIED.md).
 
 ## M147: an index can be created empty
 

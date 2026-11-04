@@ -1,5 +1,6 @@
 //! Running the legs — concurrently, over one open segment.
 
+use crate::explain::{self, Strategy};
 use crate::filter::{Mask, Predicate};
 use crate::fuse::{Fusion, Hit, Weights, fuse};
 use pstore_blob::{BlobStore, Key};
@@ -28,8 +29,8 @@ pub enum Prefetch {
     Sparse {
         /// The field to search.
         field: String,
-        /// `(dimension, impact)` pairs.
-        query: Vec<(u32, f32)>,
+        /// `(key, impact)` pairs (M177: a key is its string).
+        query: Vec<(String, f32)>,
         /// Rows this leg contributes at most.
         limit: usize,
     },
@@ -112,6 +113,57 @@ pub enum QueryError {
     /// A scoring expression outside its limits (M182).
     #[error("{0}")]
     Expression(String),
+    /// The projected vectors of a varying layout the hits hold would read more bytes than the
+    /// query may (M191): refused before any of them is read.
+    #[error(
+        "include_vectors: the rows' vectors would read {bytes} bytes, more than the {bound} a \
+         query may project: ask fewer rows or fields"
+    )]
+    ProjectionTooLarge {
+        /// The bytes the hits' spans hold, as stored.
+        bytes: u64,
+        /// The most a query may read.
+        bound: u64,
+    },
+}
+
+/// What a row fetch reads beside each row's id and attributes (M64, M190).
+#[derive(Debug, Clone, Copy)]
+pub struct Projection<'a> {
+    /// The `vector` field's vectors (M64).
+    pub vector: bool,
+    /// Named dense fields' vectors (M190), read in the segments before `folded` only.
+    pub named: &'a [String],
+    /// The first segment whose rows the caller holds whole, documents and vectors, so
+    /// nothing is read for their named fields: the unfolded rows' fresh segment, which
+    /// stores a field of several vectors a row at a varying count.
+    pub folded: usize,
+    /// The most bytes the varying fields' vectors may read (M191).
+    pub max_bytes: u64,
+}
+
+impl Default for Projection<'_> {
+    /// Nothing projected, and no bound on what a projection reads: a caller that names
+    /// fields sets `max_bytes`, the server to `MAX_PROJECTED_BYTES`.
+    fn default() -> Self {
+        Self {
+            vector: false,
+            named: &[],
+            folded: 0,
+            max_bytes: u64::MAX,
+        }
+    }
+}
+
+impl Projection<'_> {
+    /// `vector` alone, or nothing (M64).
+    #[must_use]
+    pub fn vector(vector: bool) -> Self {
+        Self {
+            vector,
+            ..Self::default()
+        }
+    }
 }
 
 /// One segment and the centroid table that belongs to it.
@@ -357,7 +409,7 @@ pub async fn query_with_texts<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
-        false,
+        Projection::default(),
     )
     .await?
     .0)
@@ -710,11 +762,26 @@ async fn candidates<S: BlobStore + Clone>(
         });
         for &(j, r) in legs.iter().filter(|(j, _)| runs(i, *j)) {
             let hidden = o.deleted.len() + if t.shadowed { shadow } else { 0 };
+            let limit = r.limit();
             let r = if filter.is_some() || whole {
                 r.exhaustive(o.segment.index_row_count())
             } else {
                 r.widened(hidden, o.segment.row_count())
             };
+            // M165: the leg this segment runs, as rewritten.
+            let asked = r.limit();
+            explain::record(|e, fresh| {
+                if let Some(l) = e.legs.get_mut(j).filter(|_| fresh != Some(i)) {
+                    l.requested += asked;
+                    if filter.is_some() {
+                        l.exhaustive = Some(explain::Because::Filter);
+                    } else if whole {
+                        l.exhaustive = Some(explain::Because::Sum);
+                    } else if asked > limit {
+                        l.widened = true;
+                    }
+                }
+            });
             let owned = r.owned();
             let (store, key, stats, texts) = (
                 store.clone(),
@@ -726,9 +793,10 @@ async fn candidates<S: BlobStore + Clone>(
             tasks.0.push(tokio::spawn(async move {
                 // Cannot fail: `legs` holds only legs this build runs, refused before any I/O.
                 let r = Runnable::try_from(&owned)?;
-                leg(&store, &key, &opened, &r, i, &stats, &texts)
+                let mut strategy = None;
+                leg(&store, &key, &opened, &r, i, &stats, &texts, &mut strategy)
                     .await
-                    .map(|hits| (i, j, hits))
+                    .map(|hits| (i, j, hits, strategy))
             }));
         }
     }
@@ -758,7 +826,8 @@ async fn candidates<S: BlobStore + Clone>(
         items.iter().map(|&(i, t, o)| (i, (t, o))).collect();
     Ok(per_segment
         .into_iter()
-        .map(|(i, j, hits)| {
+        .map(|(i, j, hits, strategy)| {
+            let found = hits.len();
             let admitted = masks.get(&i);
             let deleted = by_ordinal.get(&i).map(|(_, o)| &o.deleted);
             // ⚠️ **Cut to what can survive the shadow**, before its documents are fetched
@@ -782,7 +851,22 @@ async fn candidates<S: BlobStore + Clone>(
                 .filter(|h| filter.is_none() || admitted.is_some_and(|m| m.contains(&h.row)))
                 .filter(|h| deleted.is_none_or(|d| !d.contains(&h.row)))
                 .take(room)
-                .collect();
+                .collect::<Vec<_>>();
+            // M165: what the segment returned, and what goes on to fusion.
+            explain::record(|e, fresh| {
+                if let Some(l) = e.legs.get_mut(j).filter(|_| fresh != Some(i)) {
+                    l.candidates += found;
+                    l.kept += kept.len();
+                    match strategy {
+                        Some(explain::Strategy::Exact) => l.exact_segments += 1,
+                        Some(explain::Strategy::Approximate { probes }) => {
+                            l.approximate_segments += 1;
+                            l.probes += probes;
+                        }
+                        None => {}
+                    }
+                }
+            });
             (i, j, kept)
         })
         .collect())
@@ -807,7 +891,7 @@ async fn run<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     // ⚠️ A retriever this build cannot RUN is refused before any I/O, and refused once:
     // `Runnable` has no `Trigram` variant, so an arm falling through to `Ok(vec![])` cannot
@@ -821,6 +905,17 @@ async fn run<S: BlobStore + Clone>(
         .iter()
         .map(Runnable::try_from)
         .collect::<Result<Vec<_>, _>>()?;
+    // M165: this run's plan, afresh: an earlier attempt's figures are not this one's.
+    explain::record(|e, fresh| {
+        *e = explain::Explain {
+            segments: targets.len() - usize::from(fresh.is_some_and(|f| f < targets.len())),
+            shadow: shadow.len(),
+            remote_segments: 0,
+            filter: filter.is_some(),
+            fusion: fusion.name(),
+            legs: prefetch.iter().map(explain::Leg::of).collect(),
+        };
+    });
     // M153: every field the text legs read, each scored by its own statistics -- which a
     // phased share answers a field each (M157).
     let text_fields = text_fields_of(prefetch);
@@ -1085,7 +1180,10 @@ async fn run<S: BlobStore + Clone>(
     let mut failed_phased: Vec<(usize, Target)> = Vec::new();
     for (share, got) in scanned_targets.iter().zip(seconds) {
         match got {
-            Ok(hits) => candidates_found.extend(hits),
+            Ok(hits) => {
+                explain::record(|e, _| e.remote_segments += share.len());
+                candidates_found.extend(hits);
+            }
             Err(_) => failed_phased.extend(
                 share
                     .iter()
@@ -1096,7 +1194,10 @@ async fn run<S: BlobStore + Clone>(
     let mut failed_hits: Vec<(usize, Target)> = Vec::new();
     for (share, got) in hit_targets.iter().zip(shared) {
         match got {
-            Ok(hits) => candidates_found.extend(hits),
+            Ok(hits) => {
+                explain::record(|e, _| e.remote_segments += share.len());
+                candidates_found.extend(hits);
+            }
             Err(_) => failed_hits.extend(
                 share
                     .iter()
@@ -1181,7 +1282,7 @@ async fn run<S: BlobStore + Clone>(
             .collect();
         fetch_rows(store, targets, &opened, &wanted, with_vectors).await?
     } else {
-        std::collections::BTreeMap::new()
+        Known::new()
     };
     let per_segment = candidates.into_iter().map(|(i, j, hits)| {
         let shadowed = targets.get(i).is_some_and(|t| t.shadowed);
@@ -1255,7 +1356,7 @@ async fn summed<S: BlobStore>(
     shadow: &std::collections::HashSet<String>,
     fusion: Fusion,
     top_k: usize,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<(Vec<Hit>, Vec<Opened>, Known, Dense), QueryError> {
     let mut legs: Vec<Vec<Hit>> = vec![Vec::new(); leg_count];
     for (_, j, hits) in candidates {
@@ -1363,7 +1464,7 @@ pub async fn query_rows_filtered_texts<S: BlobStore + Clone>(
         fusion,
         top_k,
         Vec::new(),
-        false,
+        Projection::default(),
     )
     .await
 }
@@ -1402,7 +1503,7 @@ pub async fn query_rows_split<S: BlobStore + Clone>(
         fusion,
         top_k,
         elsewhere,
-        with_vectors,
+        Projection::vector(with_vectors),
     )
     .await
 }
@@ -1426,7 +1527,7 @@ pub async fn query_rows_split_texts<S: BlobStore + Clone>(
     fusion: Fusion,
     top_k: usize,
     elsewhere: Vec<Elsewhere<'_>>,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Vec<(Hit, Option<Document>, Option<f32>)>, QueryError> {
     let (hits, opened, known, dense) = run(
         store,
@@ -1487,8 +1588,44 @@ async fn mask<S: BlobStore>(
     Ok(admitted.into_iter().collect())
 }
 
-/// Documents already fetched this query, by `(segment, row)`.
-type Known = std::collections::BTreeMap<(usize, usize), Document>;
+/// Each row's, by `(segment, row)`, projected fields of a varying layout (M191): where each
+/// keeps its vectors, by field.
+pub(crate) type Spans =
+    std::collections::BTreeMap<(usize, usize), Vec<(String, std::ops::Range<u64>)>>;
+
+/// Each row's, by `(segment, row)`, varying fields' vectors as [`read_spans`] read them.
+pub(crate) type Varying = std::collections::BTreeMap<(usize, usize), Vec<(String, Vec<Vec<f32>>)>>;
+
+/// The vectors' ranges [`read_spans`] reads in one segment: each row, its field and range.
+type Wanted<'a> = Vec<(usize, &'a String, std::ops::Range<u64>)>;
+
+/// Documents already fetched this query, by `(segment, row)`, and where each one's projected
+/// fields of a varying layout keep their vectors (M191), not yet read.
+#[derive(Debug, Default)]
+struct Known {
+    docs: std::collections::BTreeMap<(usize, usize), Document>,
+    /// Each row's varying fields' byte ranges, by field: read by [`read_spans`] for the hits.
+    spans: Spans,
+}
+
+impl Known {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, at: &(usize, usize)) -> Option<&Document> {
+        self.docs.get(at)
+    }
+
+    fn contains_key(&self, at: &(usize, usize)) -> bool {
+        self.docs.contains_key(at)
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.docs.extend(other.docs);
+        self.spans.extend(other.spans);
+    }
+}
 
 /// The documents at `(segment, row)` pairs: one fan-out round over the segments holding them.
 ///
@@ -1500,7 +1637,7 @@ async fn fetch_rows<S: BlobStore>(
     targets: &[Target],
     opened: &[Opened],
     wanted: &[(usize, usize)],
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Known, QueryError> {
     let mut rows_per_segment: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -1514,42 +1651,165 @@ async fn fetch_rows<S: BlobStore>(
             // ⚠️ The segment is **already open** — `run` opened every one of them in its
             // first round. Re-opening here is what made depth `3 + 2N`.
             let (Some(t), Some(o)) = (targets.get(*segment), opened.get(*segment)) else {
-                return Ok::<_, QueryError>((*segment, Vec::new()));
+                return Ok::<_, QueryError>((*segment, Vec::new(), Vec::new()));
             };
             // ⚠️ Only a segment whose `Vectors` section IS the `vector` field: another dense
             // field in it, or several vectors a row, would read as misaligned floats.
             let vectors = async {
-                if with_vectors && o.segment.reads_vector_rows() {
+                if with_vectors.vector && o.segment.reads_vector_rows() {
                     o.segment.vector_rows(store, &t.segment, rows).await
                 } else {
                     Ok(std::collections::BTreeMap::new())
                 }
             };
-            let (docs, vectors) = futures_util::future::try_join(
-                async { o.segment.rows_at(store, &t.segment, rows).await },
-                vectors,
+            // M190: each named field's rows, joined with the rows' own read, never after it.
+            // M191: a varying field's offsets only, in the same round; its vectors wait for
+            // the hits.
+            let (fixed, varying) = if *segment < with_vectors.folded {
+                named_fields(&o.segment, with_vectors.named)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let named =
+                futures_util::future::try_join_all(fixed.into_iter().map(|name| async move {
+                    let got = o.segment.field_rows(store, &t.segment, name, rows).await?;
+                    Ok::<_, QueryError>((name, got))
+                }));
+            let spans =
+                futures_util::future::try_join_all(varying.into_iter().map(|name| async move {
+                    let got = o.segment.field_spans(store, &t.segment, name, rows).await?;
+                    Ok::<_, QueryError>((name, got))
+                }));
+            let (docs, vectors, named, spans) = futures_util::future::try_join4(
+                async { Ok(o.segment.rows_at(store, &t.segment, rows).await?) },
+                async { Ok(vectors.await?) },
+                named,
+                spans,
             )
             .await?;
             let mut docs = docs;
             for (row, doc) in rows.iter().zip(docs.iter_mut()) {
-                if let (Some(doc), Some(v)) = (doc.as_mut(), vectors.get(row)) {
+                let Some(doc) = doc.as_mut() else { continue };
+                if let Some(v) = vectors.get(row) {
                     doc.vectors.insert(
                         pstore_format::DEFAULT_FIELD.into(),
                         pstore_format::VectorField::Dense(vec![v.clone()]),
                     );
                 }
+                for (name, got) in &named {
+                    if let Some(vs) = got.get(row) {
+                        doc.vectors.insert(
+                            name.as_str().into(),
+                            pstore_format::VectorField::Dense(vs.clone()),
+                        );
+                    }
+                }
             }
-            Ok((*segment, rows.iter().copied().zip(docs).collect::<Vec<_>>()))
+            Ok((
+                *segment,
+                rows.iter().copied().zip(docs).collect::<Vec<_>>(),
+                spans,
+            ))
         },
     ))
     .await?;
     let mut out = Known::new();
-    for (segment, pairs) in resolved {
+    for (segment, pairs, spans) in resolved {
         for (row, doc) in pairs {
             if let Some(doc) = doc {
-                out.insert((segment, row), doc);
+                out.docs.insert((segment, row), doc);
             }
         }
+        for (name, got) in spans {
+            for (row, span) in got {
+                out.spans
+                    .entry((segment, row))
+                    .or_default()
+                    .push((name.clone(), span));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The projected named fields `segment` holds as dense ones (M190): those it stores at one
+/// vector a row, which one ranged read a row fetches, and those it stores at a varying count
+/// (M191), whose rows' offsets come first. A field it lacks, or holds sparse, has no rows.
+pub(crate) fn named_fields<'a>(
+    segment: &Segment,
+    named: &'a [String],
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    let (mut fixed, mut varying) = (Vec::new(), Vec::new());
+    for name in named {
+        match segment.field_layout(name) {
+            Some(f) if f.kind == 0 && f.per_row == 0 => varying.push(name),
+            Some(f) if f.kind == 0 => fixed.push(name),
+            _ => {}
+        }
+    }
+    (fixed, varying)
+}
+
+/// Reads the varying fields' vectors of the rows at `at` from their `spans` (M191), one fan-out
+/// over the segments holding them, and gives each row its fields. The round the opt-in adds
+/// (the owner's decision, 2026-10-30); none when no span holds a byte. Refused before any
+/// read when the spans hold more than `max_bytes`, counted as stored, before coalescing.
+/// `at` names each row once, as a query's hits and an order's page do.
+pub(crate) async fn read_spans<S: BlobStore>(
+    store: &S,
+    targets: &[Target],
+    segments: &[&Segment],
+    at: &[(usize, usize)],
+    spans: &Spans,
+    max_bytes: u64,
+) -> Result<Varying, QueryError> {
+    let mut per_segment: std::collections::BTreeMap<usize, Wanted<'_>> =
+        std::collections::BTreeMap::new();
+    let mut bytes = 0u64;
+    for key in at {
+        for (name, span) in spans.get(key).into_iter().flatten() {
+            // An empty span is neither fetched nor returned: the row has no entry.
+            if span.start < span.end {
+                bytes = bytes.saturating_add(span.end - span.start);
+                per_segment
+                    .entry(key.0)
+                    .or_default()
+                    .push((key.1, name, span.clone()));
+            }
+        }
+    }
+    if bytes > max_bytes {
+        return Err(QueryError::ProjectionTooLarge {
+            bytes,
+            bound: max_bytes,
+        });
+    }
+    let read =
+        futures_util::future::try_join_all(per_segment.into_iter().filter_map(|(i, wanted)| {
+            let (t, segment) = (targets.get(i)?, *segments.get(i)?);
+            Some(async move {
+                let ranges: Vec<std::ops::Range<u64>> =
+                    wanted.iter().map(|(_, _, r)| r.clone()).collect();
+                let bufs = store
+                    .get_ranges(&t.segment, &ranges)
+                    .await
+                    .map_err(pstore_format::FormatError::from)?;
+                let mut out = Vec::with_capacity(wanted.len());
+                for ((row, name, _), raw) in wanted.into_iter().zip(bufs) {
+                    let dims = segment.field_layout(name).map_or(0, |f| f.dims as usize);
+                    out.push((
+                        (i, row),
+                        name.clone(),
+                        pstore_format::decode_vectors(&raw, dims),
+                    ));
+                }
+                Ok::<_, QueryError>(out)
+            })
+        }))
+        .await?;
+    let mut out = Varying::new();
+    for (key, name, vs) in read.into_iter().flatten() {
+        out.entry(key).or_default().push((name, vs));
     }
     Ok(out)
 }
@@ -1561,7 +1821,7 @@ async fn resolve_rows<S: BlobStore>(
     opened: &[Opened],
     hits: &[Hit],
     mut known: Known,
-    with_vectors: bool,
+    with_vectors: Projection<'_>,
 ) -> Result<Vec<(Hit, Option<Document>)>, QueryError> {
     // Only what the shadow check did not already fetch (M9c.2): when it ran, this is nothing.
     let missing: Vec<(usize, usize)> = hits
@@ -1571,6 +1831,27 @@ async fn resolve_rows<S: BlobStore>(
         .collect();
     if !missing.is_empty() {
         known.extend(fetch_rows(store, targets, opened, &missing, with_vectors).await?);
+    }
+    // M191: the hits' varying fields, one round more -- the hits only, never every candidate
+    // the shadow check fetched.
+    let at: Vec<(usize, usize)> = hits.iter().map(|h| (h.segment, h.row)).collect();
+    let segments: Vec<&Segment> = opened.iter().map(|o| &*o.segment).collect();
+    let read = read_spans(
+        store,
+        targets,
+        &segments,
+        &at,
+        &known.spans,
+        with_vectors.max_bytes,
+    )
+    .await?;
+    for (key, fields) in read {
+        if let Some(doc) = known.docs.get_mut(&key) {
+            for (name, vs) in fields {
+                doc.vectors
+                    .insert(name.as_str().into(), pstore_format::VectorField::Dense(vs));
+            }
+        }
     }
     Ok(hits
         .iter()
@@ -1595,7 +1876,7 @@ enum Runnable<'a> {
     },
     Sparse {
         field: &'a str,
-        query: &'a [(u32, f32)],
+        query: &'a [(String, f32)],
         limit: usize,
     },
     Multi {
@@ -1975,7 +2256,7 @@ async fn maybe<S: BlobStore>(store: &S, key: Option<Key>) -> Option<bytes::Bytes
 struct Tasks<T>(Vec<tokio::task::JoinHandle<Result<T, QueryError>>>);
 
 /// One `(segment, leg)` pair's candidates.
-type LegHits = (usize, usize, Vec<Hit>);
+type LegHits = (usize, usize, Vec<Hit>, Option<explain::Strategy>);
 
 impl<T> Tasks<T> {
     /// Every task's result, in the order the tasks were made, as `try_join_all` returned the
@@ -2069,7 +2350,140 @@ fn maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> Option<f32> {
     )
 }
 
-/// One retriever's ranked answer.
+/// A dense leg over one segment, and how its search went (M165): the strategy is what the
+/// search did, never what the request asked.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the leg's parts, as `leg` holds them"
+)]
+async fn dense<S: BlobStore>(
+    store: &S,
+    key: &Key,
+    opened: &Opened,
+    field: &str,
+    query: &[f32],
+    limit: usize,
+    tune: vec_index::Query,
+    segment: usize,
+) -> Result<(Vec<Hit>, Strategy), QueryError> {
+    // ⚠️ **The dimension comes from the SEGMENT, never from the query.** Passing
+    // `query.len()` here let the index take its idea of the dimension from the
+    // caller, so a two-dimensional query over a four-dimensional segment came back
+    // with scored, ranked, plausible rows and a `200`. The exact path has always
+    // refused it (`Segment::search` compares against the row it read); the
+    // approximate one did not, and the two disagreeing is worse than either.
+    // Found through the API in M7c.
+    // ⚠️ A field of several vectors a row is MaxSim's (M61): searched as dense it would
+    // read another field's codes, and its offset table as vectors.
+    // M77: a named field is scanned exactly, over its own vectors. `search_field` would
+    // search `vector`'s codes and centroids and answer with another field's rows.
+    if field != pstore_format::DEFAULT_FIELD {
+        // A segment without the field has nothing to probe, and scans nothing.
+        let Some(layout) = opened.segment.field_layout(field) else {
+            return Ok((Vec::new(), Strategy::Exact));
+        };
+        if layout.kind != 0 {
+            return Err(FormatError::UnknownField.into());
+        }
+        if layout.dims as usize != query.len() {
+            return Err(pstore_format::FormatError::DimensionMismatch {
+                expected: layout.dims as usize,
+                got: query.len(),
+            }
+            .into());
+        }
+        // M83: the best `p` lists of the field's clusters, scored exactly, when the
+        // segment clustered it and the caller did not ask for the exact scan.
+        if !tune.exact
+            && let Some(raw) = &opened.fde
+        {
+            let set = pstore_index::fde_clusters::FdeSet::decode(raw)
+                .ok_or(FormatError::Corrupt("damaged cluster sidecar"))?;
+            let name = pstore_index::fde_clusters::dense_name(field);
+            if let Some((c, base)) = set.field(&name) {
+                let (hits, probes) = c
+                    .search_vector_probed(store, key, base, query, tune.p, limit)
+                    .await?;
+                return Ok((
+                    hits.into_iter()
+                        .map(|(row, score)| Hit {
+                            segment,
+                            row,
+                            score,
+                        })
+                        .collect(),
+                    Strategy::Approximate { probes },
+                ));
+            }
+        }
+        let rows = opened.segment.field_vectors(store, key, field).await?;
+        // ⚠️ A field some documents lack is stored with an offset table, as a field of
+        // several vectors is: a row of none is skipped, a row of several is `multi`'s.
+        if rows.iter().any(|d| d.len() > 1) {
+            return Err(QueryError::Unimplemented(
+                "a dense leg over a field of several vectors a document: search it with `multi`",
+            ));
+        }
+        let mut scored: Vec<(usize, f32)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, d)| {
+                d.first()
+                    .map(|v| (row, v.iter().zip(query.iter()).map(|(a, b)| a * b).sum()))
+            })
+            .collect();
+        pstore_index::top::top_k_by(&mut scored, limit, pstore_index::top::best_first);
+        return Ok((
+            scored
+                .into_iter()
+                .map(|(row, score)| Hit {
+                    segment,
+                    row,
+                    score,
+                })
+                .collect(),
+            Strategy::Exact,
+        ));
+    }
+    let dim = opened
+        .segment
+        .field_layout(field)
+        .map_or(query.len(), |f| f.dims as usize);
+    let idx =
+        VecIndex::from_shared_parts(Arc::clone(&opened.segment), opened.centroids.clone(), dim);
+    if dim != query.len() {
+        return Err(pstore_format::FormatError::DimensionMismatch {
+            expected: dim,
+            got: query.len(),
+        }
+        .into());
+    }
+    let (hits, probed) = idx
+        .search_field_probed(
+            store,
+            key,
+            field,
+            query,
+            vec_index::Query { k: limit, ..tune },
+        )
+        .await?;
+    Ok((
+        hits.into_iter()
+            .map(|(row, score)| Hit {
+                segment,
+                row,
+                score,
+            })
+            .collect(),
+        probed.map_or(Strategy::Exact, |probes| Strategy::Approximate { probes }),
+    ))
+}
+
+/// One retriever's ranked answer. A dense leg also sets how it searched (M165).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "M165's strategy is an out-parameter: a dense leg's alone, set from one arm"
+)]
 async fn leg<S: BlobStore>(
     store: &S,
     key: &Key,
@@ -2078,6 +2492,7 @@ async fn leg<S: BlobStore>(
     segment: usize,
     stats: &FieldStats,
     texts: &Texts,
+    strategy: &mut Option<Strategy>,
 ) -> Result<Vec<Hit>, QueryError> {
     match r {
         Runnable::Text {
@@ -2137,112 +2552,10 @@ async fn leg<S: BlobStore>(
             limit,
             tune,
         } => {
-            // ⚠️ **The dimension comes from the SEGMENT, never from the query.** Passing
-            // `query.len()` here let the index take its idea of the dimension from the
-            // caller, so a two-dimensional query over a four-dimensional segment came back
-            // with scored, ranked, plausible rows and a `200`. The exact path has always
-            // refused it (`Segment::search` compares against the row it read); the
-            // approximate one did not, and the two disagreeing is worse than either.
-            // Found through the API in M7c.
-            // ⚠️ A field of several vectors a row is MaxSim's (M61): searched as dense it would
-            // read another field's codes, and its offset table as vectors.
-            // M77: a named field is scanned exactly, over its own vectors. `search_field` would
-            // search `vector`'s codes and centroids and answer with another field's rows.
-            if *field != pstore_format::DEFAULT_FIELD {
-                let Some(layout) = opened.segment.field_layout(field) else {
-                    return Ok(Vec::new());
-                };
-                if layout.kind != 0 {
-                    return Err(FormatError::UnknownField.into());
-                }
-                if layout.dims as usize != query.len() {
-                    return Err(pstore_format::FormatError::DimensionMismatch {
-                        expected: layout.dims as usize,
-                        got: query.len(),
-                    }
-                    .into());
-                }
-                // M83: the best `p` lists of the field's clusters, scored exactly, when the
-                // segment clustered it and the caller did not ask for the exact scan.
-                if !tune.exact
-                    && let Some(raw) = &opened.fde
-                {
-                    let set = pstore_index::fde_clusters::FdeSet::decode(raw)
-                        .ok_or(FormatError::Corrupt("damaged cluster sidecar"))?;
-                    let name = pstore_index::fde_clusters::dense_name(field);
-                    if let Some((c, base)) = set.field(&name) {
-                        let hits = c
-                            .search_vector_at(store, key, base, query, tune.p, *limit)
-                            .await?;
-                        return Ok(hits
-                            .into_iter()
-                            .map(|(row, score)| Hit {
-                                segment,
-                                row,
-                                score,
-                            })
-                            .collect());
-                    }
-                }
-                let rows = opened.segment.field_vectors(store, key, field).await?;
-                // ⚠️ A field some documents lack is stored with an offset table, as a field of
-                // several vectors is: a row of none is skipped, a row of several is `multi`'s.
-                if rows.iter().any(|d| d.len() > 1) {
-                    return Err(QueryError::Unimplemented(
-                        "a dense leg over a field of several vectors a document: search it with `multi`",
-                    ));
-                }
-                let mut scored: Vec<(usize, f32)> = rows
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(row, d)| {
-                        d.first()
-                            .map(|v| (row, v.iter().zip(query.iter()).map(|(a, b)| a * b).sum()))
-                    })
-                    .collect();
-                pstore_index::top::top_k_by(&mut scored, *limit, pstore_index::top::best_first);
-                return Ok(scored
-                    .into_iter()
-                    .map(|(row, score)| Hit {
-                        segment,
-                        row,
-                        score,
-                    })
-                    .collect());
-            }
-            let dim = opened
-                .segment
-                .field_layout(field)
-                .map_or(query.len(), |f| f.dims as usize);
-            let idx = VecIndex::from_shared_parts(
-                Arc::clone(&opened.segment),
-                opened.centroids.clone(),
-                dim,
-            );
-            if dim != query.len() {
-                return Err(pstore_format::FormatError::DimensionMismatch {
-                    expected: dim,
-                    got: query.len(),
-                }
-                .into());
-            }
-            let hits = idx
-                .search_field(
-                    store,
-                    key,
-                    field,
-                    query,
-                    vec_index::Query { k: *limit, ..*tune },
-                )
-                .await?;
-            Ok(hits
-                .into_iter()
-                .map(|(row, score)| Hit {
-                    segment,
-                    row,
-                    score,
-                })
-                .collect())
+            let (hits, how) =
+                dense(store, key, opened, field, query, *limit, *tune, segment).await?;
+            *strategy = Some(how);
+            Ok(hits)
         }
         Runnable::Multi {
             field,

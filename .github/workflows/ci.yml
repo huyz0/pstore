@@ -144,6 +144,9 @@ jobs:
       # M51: the gossip cost bound per loss pattern, at every phase. Here for depth.sh's
       # reason: 50 Sim runs take minutes, and a sweep reruns the suite per mutant.
       - run: ./scripts/gossip-loss.sh
+      # M169: thousands of active indexes in one tenant, through one server. Here for
+      # depth.sh's reason: 5,000 indexes written, folded and queried take minutes.
+      - run: ./scripts/index-scale.sh
 
   # Coverage says a line ran; mutation says a test would have noticed if it changed.
   # Only the second one makes 95% mean something (D-111).

@@ -48,8 +48,9 @@ pub enum Fusion {
         weights: Weights,
     },
     /// The weighted **sum of raw leg scores** (M9g.2): a leg that did not score a row adds
-    /// nothing, which is its score -- BM25 is never negative. ⚠️ **Text legs only**, and the
-    /// caller enforces it (the server refuses a dense leg): a dense or sparse score can be
+    /// nothing, which is its score -- BM25 is never negative. ⚠️ **Text legs only**, or one
+    /// sparse leg alone, and the caller enforces it (the server refuses a dense leg, and a
+    /// sparse one beside a text leg, M178): a dense or sparse score can be
     /// negative, and a row that leg retrieved would then rank below one it never found. Its
     /// legs are whole, not cut at their limit: see `run`.
     Sum {
@@ -63,6 +64,19 @@ pub enum Fusion {
         /// One per leg, in leg order.
         weights: Weights,
     },
+}
+
+impl Fusion {
+    /// How a response names it (M165): `rrf`, `weighted_rrf`, `sum` or `max`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Rrf { .. } => "rrf",
+            Self::WeightedRrf { .. } => "weighted_rrf",
+            Self::Sum { .. } => "sum",
+            Self::Max { .. } => "max",
+        }
+    }
 }
 
 /// The most legs a query may fuse (M9g.1): one dense leg and fifteen text legs, turbopuffer's

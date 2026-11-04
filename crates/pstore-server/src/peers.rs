@@ -904,7 +904,7 @@ enum WireLeg {
     Sparse {
         j: usize,
         field: String,
-        query: Vec<(u32, u32)>,
+        query: Vec<(String, u32)>,
         limit: usize,
     },
     /// M94: MaxSim over a field of several vectors a document.
@@ -1059,7 +1059,10 @@ impl WirePart {
                     } => Some(WireLeg::Sparse {
                         j: *j,
                         field: field.clone(),
-                        query: query.iter().map(|(d, x)| (*d, x.to_bits())).collect(),
+                        query: query
+                            .iter()
+                            .map(|(d, x)| (d.clone(), x.to_bits()))
+                            .collect(),
                         limit: *limit,
                     }),
                     // M180: a prefix leg is never split (`shareable_fields`), so the wire
@@ -1881,7 +1884,15 @@ mod tests {
                     2,
                     Prefetch::Sparse {
                         field: "sparse".to_owned(),
-                        query: vec![(4, 0.7), (9, -2.5)],
+                        // M177: keys a number, a hash or a normalization would merge.
+                        query: vec![
+                            ("4".to_owned(), 0.7),
+                            ("04".to_owned(), -2.5),
+                            ("\u{e9}".to_owned(), 1.0),
+                            ("e\u{301}".to_owned(), 0.5),
+                            (format!("{}a", "k".repeat(199)), 0.25),
+                            (format!("{}b", "k".repeat(199)), -0.0),
+                        ],
                         limit: 4,
                     },
                 ),

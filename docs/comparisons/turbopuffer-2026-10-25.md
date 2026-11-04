@@ -67,7 +67,7 @@ row is therefore not a claim that an existing turbopuffer SDK works against psto
 | Affected counts | Actual affected counts and optional affected IDs | Submitted upsert/patch/delete counts, not actual applied counts; filter effects not represented by those counts | Clients cannot infer which conditional actions succeeded from current counters |
 | Invalid schema writes | Typed schema and write validation | Some conflicts across folds/writers are acknowledged then rejected/quarantined at fold | Durable bytes do not imply that every submitted row became searchable |
 | Multi-query | Documented atomic shared snapshot | One snapshot for legs at one level ([M131](../milestones/M131/VERIFIED.md)), aggregations and facets included ([M164](../milestones/M164/VERIFIED.md)); mixed levels or `as_of` run apart | Count and hits differ only across sub-queries at mixed levels |
-| Copy | Physical isolation, cross-region/org source configuration, optional new encryption | `copy_from_namespace` is a branch alias sharing immutable objects | Do not sell it as an isolated backup or encryption boundary |
+| Copy | Physical isolation, cross-region/org source configuration, optional new encryption | `copy_from_namespace` is a branch alias sharing immutable objects; `POST /v1/indexes/{dest}/copy` is a physical, isolated copy from any tenant or store ([M166](../milestones/M166/VERIFIED.md)) | The branch is not a backup; the copy is not an encryption boundary (I) |
 | Tenant identity | Bearer API key; service resolves authorization | Caller supplies `X-Pstore-Tenant`; no native authentication or quota wiring | An untrusted client must not be allowed to select another tenant through a header |
 
 Sources: [guarantees](https://turbopuffer.com/docs/guarantees), pinned OpenAPI;
@@ -85,19 +85,19 @@ write into branch/copy and query into multi-query.
 
 | Vendor method and route | pstore counterpart | Status and consequential difference | Plan |
 |---|---|---|---|
-| `GET /v1/namespaces` | `GET /v1/indexes` | Equivalent pagination/prefix; response is strings under `indexes`, not objects under `namespaces`; union includes local unfolded indexes | B |
+| `GET /v1/namespaces` | `GET /v1/indexes` | Equivalent pagination/prefix; response is strings under `indexes`, not objects under `namespaces`; union includes local unfolded indexes; each page reports its HEAD `epoch` and the walk's concurrent-update model is documented ([M161](../milestones/M161/VERIFIED.md)) | B |
 | `GET /v1/namespaces/{namespace}/schema` | Summary's `schema` | Partial: no standalone schema read; not a general typed attribute schema | D |
 | `POST /v1/namespaces/{namespace}/schema` | `PATCH /v1/indexes/{index}/schema` | Missing evolution: current PATCH always returns `schema_immutable` | D, G |
 | `GET /v2/namespaces/{namespace}/metadata` | `GET /v1/indexes/{index}` | Partial metadata; see route conflict above | G |
-| `PATCH /v1/namespaces/{namespace}/metadata` | None | Missing general read-only and pinning controls | G, I |
-| `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial: synchronous process-local metadata warm, rather than accepted asynchronous hint | H |
-| `POST /v1/namespaces/{namespace}/_debug/recall` | Offline `scripts/recall.sh` | Missing online sampled recall/ground truth endpoint | H |
+| `PATCH /v1/namespaces/{namespace}/metadata` | `PATCH /v1/indexes/{index}` with `read_only` ([M149](../milestones/M149/SPEC.md)) | Partial: read-only only; pinning missing | I |
+| `GET /v1/namespaces/{namespace}/hint_cache_warm` | `POST /v1/indexes/{index}/warm` | Partial by decision: synchronous process-local metadata warm, rather than accepted asynchronous hint; bulk vector data is never warmed (D-44, kept 2026-11-03) | H |
+| `POST /v1/namespaces/{namespace}/_debug/recall` | `POST /v1/indexes/{index}/recall` ([M162](../milestones/M162/VERIFIED.md)) | Online recall at one snapshot with `num`, `top_k`, `filters`, `seed` and ground truth; queries sampled near a seeded probe, no `rank_by`; a row budget refuses oversized requests | H |
 | `POST /v2/namespaces/{namespace}` | `PUT /v1/indexes/{index}/documents` | Partial write contract; separate field matrix below | B, C, D |
 | `DELETE /v2/namespaces/{namespace}` | `DELETE /v1/indexes/{index}` | Equivalent logical deletion; retention/GC and response differ | B, G |
 | `POST /v2/namespaces/{namespace}/query` | `POST /v1/indexes/{index}/query` | Partial query contract; separate expression matrix below | B, E, F |
-| `POST /v2/namespaces/{namespace}/async` | Replication jobs only | Missing one-shot async copy; replication is a different lifecycle | H |
+| `POST /v2/namespaces/{namespace}/async` | `POST`/`GET /v1/indexes/{dest}/copy` ([M166](../milestones/M166/VERIFIED.md)) | Partial: a one-shot copy with a token and machine state; no other operation kinds | H |
 | `GET /v1/namespaces/{namespace}/operations/{token}` | Replication status only | Missing generic token-based copy operation polling | H |
-| `POST /v2/namespaces/{namespace}/explain_query` | None | Missing query explanation (`plan_text`) | H |
+| `POST /v2/namespaces/{namespace}/explain_query` | `"explain": true` on `POST /v1/indexes/{index}/query` ([M165](../milestones/M165/VERIFIED.md)) | The plan the query ran, as structured counts in `meta.explain` beside its results, not a separate route or `plan_text`; ranked queries only | H |
 
 The spec deliberately omits deprecated `GET /v1/namespaces/{namespace}` export and
 `HEAD /v1/namespaces/{namespace}`. Current export is ordered query pagination; schema
@@ -126,7 +126,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | `distance_metric` | Dot product default, cosine distance, squared Euclidean | Partial contract: vendor enum is cosine/squared Euclidean; no implicit metric equivalence; B/D |
 | `schema` | Request-scoped datetime conversion; index FTS/regex declarations | Partial typed schema; D/E |
 | `branch_from_namespace` | Same-tenant source string, alone in request, folded state | Partial source/visibility/inheritance contract; G |
-| `copy_from_namespace` | Same branch operation | Missing isolated copy; H |
+| `copy_from_namespace` | Same branch operation; the isolated copy is `POST /v1/indexes/{dest}/copy` ([M166](../milestones/M166/VERIFIED.md)) | Partial: no encryption on copy (I) |
 | `delete_by_filter` | Deferred predicate; executed after other operations | Partial with different ordering/completion; C |
 | `delete_by_filter_allow_partial` | Same name; needs `durability: "applied"`, answers `applied.rows_remaining` ([M137](../milestones/M137/SPEC.md)) | Partial (applied only); C |
 | `patch_by_filter` | `{filters, attributes}` instead of `{filters, patch}` | Partial, after explicit deletes, before filter delete; C |
@@ -143,7 +143,7 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 
 | Surface | turbopuffer contract | pstore implementation | Assessment |
 |---|---|---|---|
-| IDs | uint64, UUID, bounded string | JSON string only, no matching public 64-byte ID contract | Partial; D |
+| IDs | uint64, UUID, bounded string | String, `uint64` or `uuid` per index (M176); no 64-byte bound on a string id | Partial; D |
 | Row layout | ID plus attribute/vector columns on the row | Required default `vector`; attributes nested | Text-only documents are currently refused, including an empty default vector; D |
 | Scalar attributes | string, int, uint, float, uuid, datetime, bool, bytes | i64, finite float, string, bool, request-declared RFC3339 datetime | Missing uint64/UUID/bytes types and persistent declarations; D |
 | Arrays | Typed scalar arrays; `[]string` can be FTS | Arrays of accepted scalars; text field must be one string | No homogeneous schema contract or array FTS parity; D/E |
@@ -152,8 +152,8 @@ configuration. Formal names and shapes come from the pinned OpenAPI.
 | Dense vectors | f32/f16/i8 schema types, array/base64 transport | f32 array/base64 input; internal quantization is an index mechanism | Internal int8 reranking does not establish i8/f16 public schema support; D |
 | Multiple dense attributes | Per-attribute ANN configuration | Up to 8 named fields in addition to required default vector; named dense search scans exactly | Partial indexing and wire semantics; D |
 | Multi-vector attributes | Vector arrays and late-interaction ANN configuration | Named arrays, exact MaxSim or opt-in FDE, optional exact rerank/probes | Equivalent family with different scoring/configuration contract; D/F |
-| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | Library vector field uses u32 dimensions; no public sparse write/query | Library capability, missing API and lossless string vocabulary mapping; D |
-| Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | Ordinary native result projection only walks scalar attributes, not stored vector fields; no corresponding response encoding control | Missing public round-trip/export capability; B/D/H |
+| Sparse vectors | String dimension names and f16 weights, `SparseKNN` dot product | One public field, `sparse`: string keys (M177) and f16 weights, written in rows or columns and queried as a dot-product leg (M178); not returned in results | One field per document rather than per-attribute schema; D |
+| Returned vectors | Vector attribute projection and `vector_encoding` float/base64 | `include_vectors: ["vector"]` on a ranked query or a `rank_by` export, float or base64, up to 1,000 rows ([M179](../milestones/M179/VERIFIED.md)); named fields under `vectors` ([M190](../milestones/M190/VERIFIED.md)), folded multi-vector ones at one round more ([M191](../milestones/M191/VERIFIED.md)); cosine answers the normalized vector | Sparse fields not projected; the request names vectors apart from `include_attributes`; D/H |
 | Nested JSON objects | Not counted as available; vendor roadmap item | Public scalar parser refuses nested objects | Neither side has established current general nested-attribute parity |
 
 Source: [conversion and parsers](../../crates/pstore-server/src/lib.rs),
@@ -181,7 +181,7 @@ vector and BM25 searches use separate fields.
 | `compute_attributes` | No general computation map; separate single-string highlight feature | E, F |
 | `distance_metric` | Metric selected on write/index, no per-query wire override | B, D |
 | `limit` | No integer/object alias on a single query (`top_k`); `Limit.per` is served as a top-level `limit_per` over a relevance window ([M146](../milestones/M146/VERIFIED.md)) | B |
-| `vector_encoding` | No float/base64 response option | B, D |
+| `vector_encoding` | `float` or `base64` beside `include_vectors` ([M179](../milestones/M179/VERIFIED.md)) | D |
 | `consistency.level` | Different shape: string modes; default eventual; session/bounded are extra | B, C |
 | single-query `rerank_by` | Windowed hand-written boosting/MMR, no model configuration `{model,attribute,query}` | F, J |
 | multi-query `queries` | 1..16 queries, entire root body; aggregations and facets per sub-query ([M164](../milestones/M164/VERIFIED.md)); no nested multi | F |
@@ -200,7 +200,7 @@ contract fixtures, rather than assuming identical validation.
 | `ANN` / `kNN`, scalar dense vector | Default ANN, `exact` option | Different transport; named dense fields scanned exactly; vendor documents filters for kNN |
 | `ANN` / `kNN`, vector array | Exact MaxSim and opt-in FDE | Existing mechanism must be evaluated against vendor late-interaction semantics/quality, not just matching labels |
 | ANN/kNN `Embed` expression, optional `model` | None | Model integration; J |
-| `SparseKNN` | Index/query library only | Expose string-key sparse vectors first; D |
+| `SparseKNN` | A query's `sparse` leg, exact dot product over f16 weights (M178) | Spelled as a leg, not a `rank_by`; D |
 | `BM25` string | `text` query on default text field | Single-field only |
 | `BM25` token array and `last_as_prefix` | A text leg object's `query` may be an array of tokens (M158) and carry `"last_as_prefix": true` (M180) | Equivalent, scored 1.0 once a row. The prefix meets analyzed terms, so under stemming a complete word also expands through its stem; a prefix query is not split across servers |
 | `Sum`, `Max` | `rank_by` expression (M182), nested, over any full-text field | Equivalent; a whole-corpus scan, limited to 16 clauses, 64 nodes and depth 8 |
@@ -241,7 +241,7 @@ Sources: [query planning](../../crates/pstore-server/src/lib.rs),
 | Vendor operators | pstore support | Compatibility issue |
 |---|---|---|
 | `Eq`, `NotEq` | Present, null maps to absent/present | Mixed types, arrays, nulls and unknown attributes need conformance fixtures |
-| `In`, `NotIn` | Present | Typed IDs/UUID/uint limitations remain |
+| `In`, `NotIn` | Present | Present on `uint64` and `uuid` ids too (M176) |
 | `Contains`, `NotContains`, `ContainsAny`, `NotContainsAny` | Present | Same type limitations; do not infer array ordering predicates |
 | `Lt`, `Lte`, `Gt`, `Gte` | Present | Scalar semantics only for the compatible subset |
 | `AnyLt`, `AnyLte`, `AnyGt`, `AnyGte` | Missing from HTTP parser | E |
@@ -284,10 +284,10 @@ Source: [predicate parser](../../crates/pstore-server/src/lib.rs),
 | `ErrorResponse.status`, `error` | Native nested `error` has code/message/retryable; not vendor error shape |
 | Warm `status`, `message` | Native warm metadata/cost; synchronous semantics |
 | Delete `status` | Native epoch/cost response |
-| List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `cost` |
-| Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | Offline recall output only |
-| Explain `plan_text` | Missing |
-| Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Missing general copy job contract |
+| List `namespaces[{id}]`, `next_cursor` | `indexes: [string]`, `next_cursor`, `epoch`, `cost` |
+| Recall `avg_recall`, `avg_exhaustive_count`, `avg_ann_count`, `ground_truth[{query_vector,nearest_neighbors}]` | The same four, plus `num`, `epoch` and `cost` ([M162](../milestones/M162/VERIFIED.md)) |
+| Explain `plan_text` | `meta.explain`: structured per-leg mode, segments, probes and row counts, no text ([M165](../milestones/M165/VERIFIED.md)) |
+| Async start `token`; operation `status`, `start_time`, `progress`, `finish_time`, `result` | Partial: a copy's `run`, `state`, finishing `epoch` and typed `code` ([M166](../milestones/M166/VERIFIED.md)); no wall-clock times or progress |
 | Operation `result.success` (WriteResult) or `result.error.{status_code,detail}` | Replication status has different fields and lifecycle |
 
 Native cost fields are `blob_reads`, `blob_writes`, `blob_lists`, `bytes_read`, and
@@ -306,7 +306,7 @@ effects also need a published accounting definition.
 | `full_text_search` | Default text field only; not arbitrary string/string-array attributes | E |
 | `ann.distance_metric` | Index metric, not general per-field schema | D |
 | `ann.late_interaction` | Exact/FDE multi-vector query options | Different configuration surface; D/F |
-| `sparse_knn.distance_metric` | Library sparse index, dot-product family | Missing public schema; D |
+| `sparse_knn.distance_metric` | Dot product only, no declaration (M178) | No metric choice or schema entry; D |
 | `embed.{attribute,model,dims}` | No native model integration | J |
 | Schema `drop` | PATCH always refuses | G |
 
@@ -330,13 +330,13 @@ does not establish token-stream equivalence.
 |---|---|---|
 | `schema` | dims, metric, text field, FTS, regex fields, named-vector widths | Partial, not typed attributes |
 | `approx_row_count` | Alias of folded `documents` count | Partial freshness/count definition |
-| `approx_logical_bytes` | None | G |
-| `created_at`, `updated_at` | Epoch and `updated_epoch`, not wall-clock timestamps | G |
-| `index.status`, `unindexed_bytes`, `unindexed_rows` | Process-local `unfolded` boolean | No global indexing progress contract; G |
+| `approx_logical_bytes` | Summed segment object lengths ([M148](../milestones/M148/SPEC.md)); deleted rows count until compaction, delete vectors do not | Partial; G |
+| `created_at`, `updated_at` | RFC 3339 times from HEAD ([M148](../milestones/M148/SPEC.md)); `updated_at` is fold time and compaction does not move it | Yes |
+| `index.status`, `unindexed_bytes`, `unindexed_rows` | `progress` with `?progress=true` ([M160](../milestones/M160/SPEC.md)): durable unfolded operations across every writer, bounded reads, `exact` past 64 bundles | Partial: opt-in, operations rather than rows |
 | `encryption.mode`, `key_name` | Bucket deployment configuration only | I |
 | `pinning` boolean/config, `replicas`, `pinning.status.{updated_at,ready_replicas,replicas,utilization}` | No namespace capacity reservation | I |
 | `sharding.num_shards` | No namespace shard configuration | I |
-| `read_only` | Replication destination is read-only, no generic user toggle | G |
+| `read_only` | `PATCH /v1/indexes/{index}` `{"read_only": bool}` ([M149](../milestones/M149/SPEC.md)); a replica is read-only by its replication | Yes |
 | Docs-only `last_write_at`, `branching.parent` | Not in pinned spec; no matching API metadata | Resolve vendor contract, then G |
 
 [Branching](https://turbopuffer.com/docs/branching) and physical copies must remain separate
@@ -368,7 +368,7 @@ execution. pstore's absence of a public limit is a contract gap, not unlimited c
 | Attribute names/namespace | 1024 | No matching public cap found |
 | Vector columns | 8 | Required default plus at most 8 named fields; not identical counting |
 | Dense dimensions | 10,752 | No matching advertised/validated ceiling |
-| Sparse nonzeros | 1024 | Public sparse API absent |
+| Sparse nonzeros | 1024 | 1,024 a document or query, keys of 256 bytes (M178) |
 | Embedded attributes | 4 | Native embeddings absent |
 | Embedded upsert rows/batch | 256 | Native embeddings absent |
 | Full-text query length | 8192 | No matching public text-query cap |
@@ -469,7 +469,7 @@ Sources: [router](../../crates/pstore-server/src/lib.rs),
 | Namespace sharding | Fixed configured shards with a shared write log and consistent strong snapshot | Distributing segment work does not establish independent persistent shard capacity/resharding semantics |
 | Storage backends | Managed cloud regions; [Azure preview](https://turbopuffer.com/docs/regions), BYOC by arrangement | Server entry wires memory/S3/Azure; GCS library support is not an exposed production server backend |
 | Caching | Managed memory/NVMe, warm hint, reserved pinning | Cache implementation and persistent local cache configuration; warm only serving process metadata; no replica reservation API |
-| Read-only | General namespace flag | Replication-only restriction; generic control missing |
+| Read-only | General namespace flag | Per-index flag ([M149](../milestones/M149/SPEC.md)); rows a stale server accepted are set aside into the quarantine |
 | Availability/scaling | Managed operations and commercial SLA | No equivalent externally demonstrated SLA, fleet-scale failure history, or autoscaling capacity guarantee |
 | Auth/quotas | API keys, organization controls, limits | Native server trusts tenant header; meter library not wired; blob concurrency admission is not tenant rate/memory admission |
 | Transport/isolation | Documented TLS and service tenant isolation | Operator perimeter required; admin/internal routes need separate authorization |

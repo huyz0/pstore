@@ -292,6 +292,100 @@ async fn field_rows_reads_only_the_named_rows() {
     );
 }
 
+// ---- M191: Segment::field_spans and decode_vectors ---------------------------------------
+
+#[tokio::test]
+async fn field_spans_locate_only_a_varying_fields_named_rows() {
+    let store = MemoryStore::new();
+    let mut w = SegmentWriter::new(4);
+    let mut all = Vec::new();
+    let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+    for i in 0..50usize {
+        let mut d = Document::new(format!("d{i:02}"), vec![i as f32, 1.0, 0.0, 0.5]);
+        let n = if i % 7 == 3 { 0 } else { 1 + i % 4 };
+        let vs: Vec<Vec<f32>> = (0..n)
+            .map(|j| (0..6).map(|k| (i * 10 + j * 3 + k) as f32).collect())
+            .collect();
+        want.push(vs.clone());
+        if !vs.is_empty() {
+            d.vectors.insert("late".into(), VectorField::Dense(vs));
+        }
+        d.vectors
+            .insert("one".into(), VectorField::Dense(vec![vec![i as f32; 3]]));
+        d.vectors.insert(
+            "terms".into(),
+            VectorField::Sparse(vec![("3".to_owned(), pstore_format::Impact::new(1.0))]),
+        );
+        all.push(d.clone());
+        w.push(d);
+    }
+    let postings =
+        pstore_format::sparse::build(&all, "terms", pstore_format::sparse::DEFAULT_ENCODING);
+    let key = Key::new("t/idx/s.seg");
+    let bytes = w
+        .with_section(Section::SparsePostings, postings.section)
+        .try_finish()
+        .unwrap();
+    store.put(&key, bytes).await.unwrap();
+    let seg = Segment::open(&store, &key).await.unwrap();
+
+    let rows = [3usize, 4, 10, 49, 4, 50, 1000];
+    let spans = seg.field_spans(&store, &key, "late", &rows).await.unwrap();
+    assert_eq!(
+        spans.keys().copied().collect::<Vec<_>>(),
+        [3, 4, 10, 49],
+        "a duplicate and rows at and past the end are left out"
+    );
+    let section = seg.field_section("late", Section::Vectors).unwrap();
+    for (row, span) in &spans {
+        assert!(
+            section.start <= span.start && span.end <= section.end,
+            "row {row}"
+        );
+        if want[*row].is_empty() {
+            assert_eq!(span.start, span.end, "row {row} holds none: an empty range");
+            continue;
+        }
+        let raw = store.get_range(&key, span.clone()).await.unwrap();
+        assert_eq!(
+            pstore_format::decode_vectors(&raw, 6),
+            want[*row],
+            "row {row}"
+        );
+    }
+    assert!(spans[&3].is_empty() && spans[&10].is_empty());
+    // A fixed, a sparse field, or nothing asked has no offsets; an unknown field is an error.
+    for (name, rows) in [("one", &[0usize, 1][..]), ("terms", &[0, 1]), ("late", &[])] {
+        assert!(
+            seg.field_spans(&store, &key, name, rows)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{name}"
+        );
+    }
+    assert!(seg.field_spans(&store, &key, "nope", &[0]).await.is_err());
+}
+
+#[test]
+fn decode_vectors_reads_whole_vectors_of_its_width_only() {
+    let raw: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0, 5.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    assert_eq!(
+        pstore_format::decode_vectors(&raw, 2),
+        [vec![1.0, 2.0], vec![3.0, 4.0]],
+        "a trailing partial vector is dropped"
+    );
+    assert_eq!(
+        pstore_format::decode_vectors(&raw, 5),
+        [vec![1.0, 2.0, 3.0, 4.0, 5.0]]
+    );
+    assert!(pstore_format::decode_vectors(&raw, 0).is_empty());
+    assert!(pstore_format::decode_vectors(&[], 3).is_empty());
+}
+
 #[tokio::test]
 async fn field_rows_refuses_a_corrupt_table_and_skips_a_sparse_field() {
     let store = MemoryStore::new();
@@ -304,8 +398,8 @@ async fn field_rows_refuses_a_corrupt_table_and_skips_a_sparse_field() {
         d.vectors.insert(
             "terms".into(),
             VectorField::Sparse(vec![
-                (3, pstore_format::Impact::new(1.0)),
-                (9, pstore_format::Impact::new(2.0)),
+                ("3".to_owned(), pstore_format::Impact::new(1.0)),
+                ("9".to_owned(), pstore_format::Impact::new(2.0)),
             ]),
         );
         all.push(d.clone());
@@ -521,7 +615,7 @@ async fn a_zero_width_field_has_no_layout_and_a_sparse_one_has_no_width() {
             .insert("flat".into(), VectorField::Dense(vec![Vec::new()]));
         d.vectors.insert(
             "terms".into(),
-            VectorField::Sparse(vec![(1, pstore_format::Impact::new(1.0))]),
+            VectorField::Sparse(vec![("1".to_owned(), pstore_format::Impact::new(1.0))]),
         );
         all.push(d.clone());
         w.push(d);

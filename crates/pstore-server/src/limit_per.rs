@@ -148,6 +148,7 @@ mod tests {
             Some(Value::DateTime(t)) => format!("t{t}"),
             Some(Value::Uuid(u)) => format!("u{u:?}"),
             Some(Value::Bytes(b)) => format!("y{b:?}"),
+            Some(Value::Null) => "null".to_owned(),
             Some(Value::Array(a)) => format!(
                 "[{}]",
                 a.iter()

@@ -40,12 +40,92 @@ pub enum Durability {
     Applied,
 }
 
+/// A document's id as a write names it (M176): a JSON string, held as written, or an integer
+/// in `0..=u64::MAX`, held in `uint64`'s form (`pstore_format::id`). A `uuid` is a string
+/// until the index's kind is known. Displayed as written, never in its held form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Id(pub String);
+
+impl Id {
+    /// The id as held.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// An id from a JSON value, or why it is none.
+    ///
+    /// # Errors
+    /// Anything but a string not beginning with NUL or an integer in `0..=u64::MAX`.
+    pub fn of(v: &serde_json::Value) -> Result<Self, String> {
+        match v {
+            serde_json::Value::String(s) => Self::string(s.clone()),
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .map(|n| Self(pstore_format::id::uint(n)))
+                .ok_or_else(|| not_an_id(n)),
+            other => Err(not_an_id(other)),
+        }
+    }
+
+    fn string(s: String) -> Result<Self, String> {
+        if pstore_format::id::is_string(&s) {
+            Ok(Self(s))
+        } else {
+            Err(format!("id {s:?} begins with NUL, which no id may"))
+        }
+    }
+}
+
+fn not_an_id(v: &dyn std::fmt::Display) -> String {
+    format!("id {v} is neither a string nor an integer in 0..=18446744073709551615")
+}
+
+/// A held id as answered (M176): a `uint64` a JSON integer, a `uuid` lowercase and
+/// hyphenated, a string as written. Only at serialization: fusion and windows order by the
+/// held form, which orders as the values do.
+fn id_out<S: serde::Serializer>(id: &str, s: S) -> Result<S::Ok, S::Error> {
+    match pstore_format::id::value(id) {
+        pstore_format::Value::Uint(n) => s.serialize_u64(n),
+        pstore_format::Value::Uuid(u) => s.serialize_str(&pstore_format::typed::format_uuid(&u)),
+        _ => s.serialize_str(id),
+    }
+}
+
+/// [`id_out`] over a list.
+fn ids_out<S: serde::Serializer>(ids: &[String], s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    struct One<'a>(&'a str);
+    impl Serialize for One<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            id_out(self.0, s)
+        }
+    }
+    let mut seq = s.serialize_seq(Some(ids.len()))?;
+    for id in ids {
+        seq.serialize_element(&One(id))?;
+    }
+    seq.end()
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&pstore_format::id::shown(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::of(&serde_json::Value::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// One document, as a client sends it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentIn {
-    /// The client's identifier.
-    pub id: String,
+    /// The client's identifier (M176: a string or an integer).
+    pub id: Id,
     /// The dense vector: a JSON array, or base64 of little-endian `f32`s (M9d). Absent for a
     /// document of an index with no vectors (M170).
     #[serde(default, deserialize_with = "some_vector")]
@@ -57,6 +137,10 @@ pub struct DocumentIn {
     /// Free-text attribute, indexed for BM25 when the engine's text field names it.
     #[serde(default)]
     pub text: Option<String>,
+    /// The sparse vector (M178): `{"key": weight, ...}`, read by `lib.rs`'s `sparse_pairs`
+    /// so a refusal names its document and its bound. `null` is absent.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
     /// Typed attributes: a JSON integer (`i64`) or string each (M9a), a float or bool
     /// (M9h.1), an array of those (M9h.2), or a datetime the write's `schema` declares
     /// (M9h.3). Anything else is refused at the door rather than coerced — see `lib.rs`'s
@@ -79,7 +163,7 @@ pub struct WriteRequest {
     pub documents: Vec<DocumentIn>,
     /// Ids to delete, applied **after** `documents` (M9c). Either list may be empty, not both.
     #[serde(default)]
-    pub deletes: Vec<String>,
+    pub deletes: Vec<Id>,
     /// How the index compares vectors (M9d): `cosine_distance`, `euclidean_squared`, or
     /// `dot_product`, the default and every index's metric before M9d. Refused if unknown.
     #[serde(default)]
@@ -130,8 +214,9 @@ pub struct WriteRequest {
     /// every segment. **Alone** in its request.
     #[serde(default)]
     pub branch_from_namespace: Option<String>,
-    /// The same operation as `branch_from_namespace` (M16): segments are immutable, so a
-    /// physical copy would buy nothing a branch does not.
+    /// The same operation as `branch_from_namespace` (M16): the new index shares its
+    /// source's segments, in this tenant. Not an isolated copy, which is
+    /// `POST /v1/indexes/{dest}/copy` (M166).
     #[serde(default)]
     pub copy_from_namespace: Option<String>,
     /// An applied write's ask for the ids its operations changed (M130). Refused beside any
@@ -373,10 +458,13 @@ pub struct AppliedOut {
 #[derive(Debug, Clone, Serialize)]
 pub struct AffectedIds {
     /// Ids an upsert wrote.
+    #[serde(serialize_with = "ids_out")]
     pub upserted: Vec<String>,
     /// Ids a delete removed.
+    #[serde(serialize_with = "ids_out")]
     pub deleted: Vec<String>,
     /// Ids a patch changed.
+    #[serde(serialize_with = "ids_out")]
     pub patched: Vec<String>,
 }
 
@@ -393,6 +481,13 @@ pub struct QueryRequest {
     /// A window of the ranking diversified by maximal marginal relevance (M64).
     #[serde(default)]
     pub diversify: Option<serde_json::Value>,
+    /// The stored vector fields each result carries (M179): `["vector"]`, the only one yet.
+    /// Parsed by `lib.rs`'s `vector_projection`.
+    #[serde(default)]
+    pub include_vectors: Option<serde_json::Value>,
+    /// How a projected vector is spelled (M179): `"float"`, the default, or `"base64"`.
+    #[serde(default)]
+    pub vector_encoding: Option<String>,
     /// `{"attributes": [...], "limit": m, "window": w}`: at most `m` rows of each group of
     /// the window's ranking (M146). Parsed by `limit_per.rs`.
     #[serde(default)]
@@ -409,6 +504,9 @@ pub struct QueryRequest {
     /// The `multi` leg (M61): MaxSim over a named field of several vectors a document.
     #[serde(default)]
     pub multi: Option<MultiIn>,
+    /// The sparse leg (M178): `{"key": weight, ...}`, as a document's `sparse` is spelled.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
     /// The BM25 leg's query text -- or several, each its own leg (M9g).
     #[serde(default)]
     pub text: Option<TextIn>,
@@ -462,6 +560,9 @@ pub struct QueryRequest {
     /// so a string or a fraction is refused rather than coerced.
     #[serde(default)]
     pub max_staleness_ms: Option<serde_json::Value>,
+    /// The plan the query ran, in `meta.explain` (M165). A ranked query's alone.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// `include_attributes`: `false`, `true`, or a list of names — turbopuffer's spelling.
@@ -481,7 +582,8 @@ fn default_top_k() -> usize {
 /// One ranked result.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResultRow {
-    /// The document's id.
+    /// The document's id, held (M176).
+    #[serde(serialize_with = "id_out")]
     pub id: String,
     /// Its fused score. Absent for a `rank_by` order (M9e), which has none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -502,6 +604,24 @@ pub struct ResultRow {
     /// `fragment_by`, `fragment_limit` or `include_offsets`. Then `$highlight` is absent.
     #[serde(rename = "$highlights", skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<HighlightMatch>>,
+    /// Its stored `vector`, when the query's `include_vectors` names it and the row has one
+    /// (M179).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorOut>,
+    /// Its stored named fields that `include_vectors` names, each its vectors in the order
+    /// written (M190); absent, never `{}`, when it holds none of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<std::collections::BTreeMap<String, Vec<VectorOut>>>,
+}
+
+/// A projected vector as `vector_encoding` spells it (M179).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum VectorOut {
+    /// A JSON array of numbers, each an f32's shortest spelling.
+    Float(Vec<f32>),
+    /// The standard-alphabet, padded base64 of its little-endian f32 bytes.
+    Base64(String),
 }
 
 /// One fragment of a structured highlight (M159). Ranges are `[start, end)` into the
@@ -546,6 +666,9 @@ pub struct QueryMeta {
     /// two concurrent reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets_epoch: Option<u64>,
+    /// The plan the query ran, when it asked (M165): see `explain::render`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<serde_json::Value>,
 }
 
 /// A query's text: one string, or several, each a BM25 leg (M9g). An entry of several may
@@ -726,6 +849,8 @@ pub struct Schema {
     /// Each named dense field's width, as a client writes it (M98); absent when none is known.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vectors: std::collections::BTreeMap<String, u32>,
+    /// The ids' kind (M176): `string`, `uint64` or `uuid`.
+    pub id: &'static str,
     /// Each attribute's recorded type (M173): `datetime`, `uuid`, `bytes` or `uint64`; `{}`
     /// when none is recorded.
     pub attributes: std::collections::BTreeMap<String, &'static str>,
@@ -758,8 +883,93 @@ pub struct IndexSummary {
     pub updated_epoch: Option<u64>,
     /// `documents`, under turbopuffer's name (M9f).
     pub approx_row_count: u64,
+    /// When it came into being (M148), RFC 3339 UTC, or `null` when not recorded: an index
+    /// made before M148.
+    pub created_at: Option<String>,
+    /// When a commit last wrote its rows (M148): its fold, create, branch or sync, never a
+    /// compaction, so up to a fold interval after a write was acknowledged. `null` when not
+    /// recorded.
+    pub updated_at: Option<String>,
+    /// The summed lengths of its segment objects (M148): rows, index structures and
+    /// dictionaries, deleted rows until a compaction, and a branch's shared segments in each
+    /// index naming them; not delete vectors or the quarantine. `null` when a segment's
+    /// length is not recorded.
+    pub approx_logical_bytes: Option<u64>,
+    /// Whether it takes no writes (M149): its owner made it read-only, or it is a replica.
+    pub read_only: bool,
+    /// Its indexing progress across every writer (M160), only when asked for with
+    /// `progress=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgress>,
     /// What the summary cost.
     pub cost: Cost,
+}
+
+/// An index's durable operations no fold has committed yet, across every writer (M160).
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexProgress {
+    /// `updating` while any such operation exists, else `up-to-date`.
+    pub status: &'static str,
+    /// The operations: upserts, patches, deletes and by-filter operations, not resulting
+    /// rows, so a delete of an absent id counts.
+    pub unindexed_rows: u64,
+    /// Their encoded bytes.
+    pub unindexed_bytes: u64,
+    /// Whether every unfolded bundle was read; when `false`, the counts are a lower bound.
+    pub exact: bool,
+    /// The HEAD epoch the counts are relative to.
+    pub as_of_epoch: u64,
+}
+
+/// What `PATCH /v1/indexes/{index}` answers (M149).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadOnlyResponse {
+    /// The HEAD that holds the flag: the commit that set it, or the HEAD read when it
+    /// already had that value.
+    pub epoch: u64,
+    /// The flag as it now is.
+    pub read_only: bool,
+    /// What it cost.
+    pub cost: Cost,
+}
+
+/// What `POST /v1/indexes/{index}/recall` answers (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallResponse {
+    /// The mean share of each sampled query's exhaustive results its approximate search also
+    /// returned, over the queries whose exhaustive search returned any; `null` when none did.
+    pub avg_recall: Option<f64>,
+    /// The mean count of approximate results.
+    pub avg_ann_count: f64,
+    /// The mean count of exhaustive results.
+    pub avg_exhaustive_count: f64,
+    /// The queries sampled.
+    pub num: usize,
+    /// The HEAD every search answered at: rows no fold had committed are not measured.
+    pub epoch: u64,
+    /// Each sampled query and its exhaustive results, with `include_ground_truth`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_truth: Option<Vec<RecallGroundTruth>>,
+    /// What it cost: the exhaustive searches read every vector of the index.
+    pub cost: Cost,
+}
+
+/// One sampled query of a recall response (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallGroundTruth {
+    /// A document's vector in client space (normalized under `cosine_distance`).
+    pub query_vector: Vec<f32>,
+    /// The exhaustive results, in rank order.
+    pub nearest_neighbors: Vec<RecallNeighbor>,
+}
+
+/// One exhaustive result of a sampled query (M162).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallNeighbor {
+    /// The document's id.
+    pub id: String,
+    /// Its distance, as a query reports it.
+    pub dist: f32,
 }
 
 /// `GET /v1/indexes?prefix=&cursor=&page_size=` (M9f).
@@ -785,6 +995,17 @@ pub struct IndexList {
     pub indexes: Vec<String>,
     /// The cursor for the next page -- the last name on this one -- or `null` on the last.
     pub next_cursor: Option<String>,
+    /// The epoch of the HEAD this page was read from, 0 when the tenant has none (M161).
+    ///
+    /// ⚠️ **A page is a keyset page by name, not a snapshot.** Each page reads HEAD again.
+    /// Over a walk (the pages from no cursor until `next_cursor` is null, with one
+    /// `prefix`): no name is listed twice; a name present at every page's read is listed
+    /// exactly once; a name that appears or vanishes during the walk is listed at most
+    /// once; and a cursor whose index is gone is still a position. When every page
+    /// reports the same epoch, the walk's HEAD names are that HEAD's. The serving
+    /// process's unfolded names are in no HEAD and are not marked, so pages served by
+    /// different processes may differ in them. `docs/deploy.md` states the same model.
+    pub epoch: u64,
     /// What the enumeration cost. Zero LISTs, which is the claim worth reporting.
     pub cost: Cost,
 }

@@ -24,10 +24,11 @@ already finds such writes for a `strong` read (M9i.2): it reads the lane registr
 HEAD and probes each lane's next bundle at HEAD's watermark, without a LIST.
 
 After:
-- **`GET /v1/indexes/{index}?progress=true`** adds an `index` object:
+- **`GET /v1/indexes/{index}?progress=true`** adds a `progress` object (not `index`, which
+  the summary already uses for the index's name):
   `{"status": "up-to-date" | "updating", "unindexed_rows": n, "unindexed_bytes": n,
   "exact": bool, "as_of_epoch": e}`. Without the parameter the summary is unchanged,
-  `index` is absent, and its cost is the one HEAD read it is today. Any other value of
+  `progress` is absent, and its cost is the one HEAD read it is today. Any other value of
   `progress` than `true` or `false` is `400`.
 - **What it counts.** Every durable bundle of every registered lane past HEAD's
   watermark for that lane, as of the HEAD read: for each, the bundle's own directory
@@ -69,7 +70,7 @@ After:
   holds it or this process holds rows for it unfolded. With `progress=true`, a name
   that neither holds but whose name has an entry in a bundle directory read answers
   200, as an empty index (0 segments, 0 documents, no schema, null times) with
-  `index.status` `updating`. A directory does not say whether its operations are rows
+  `progress.status` `updating`. A directory does not say whether its operations are rows
   or deletes, so a name whose unfolded operations are all deletes answers so too, and
   is 404 again after the fold, which (M9f.2) makes no index of deletes alone. Otherwise
   404.

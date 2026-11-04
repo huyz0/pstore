@@ -78,6 +78,8 @@ fn put_value(b: &mut Vec<u8>, v: &Value) {
             b.push(8);
             b.extend(n.to_le_bytes());
         }
+        // M175: a null array element, the tag alone.
+        Value::Null => b.push(9),
         Value::Array(items) => {
             b.push(5);
             b.extend((items.len() as u32).to_le_bytes());
@@ -262,6 +264,8 @@ impl Reader<'_> {
                 Value::Bytes(self.take(n)?.to_vec())
             }
             8 => Value::Uint(self.u64()?),
+            // M175: only inside an array.
+            9 if !array => Value::Null,
             5 if array => {
                 let n = self.u32()?;
                 let mut items = Vec::with_capacity(n.min(1024));
@@ -401,7 +405,14 @@ mod tests {
             Predicate::Cmp(a(), Op::Gt, Value::Bool(true)),
             Predicate::Cmp(a(), Op::Gte, Value::DateTime(i64::MIN)),
             Predicate::Absent(a()),
-            Predicate::In(a(), vec![Value::Int(1), Value::Array(vec![Value::Int(2)])]),
+            // M175: an array may hold a null element.
+            Predicate::In(
+                a(),
+                vec![
+                    Value::Int(1),
+                    Value::Array(vec![Value::Null, Value::Int(2)]),
+                ],
+            ),
             Predicate::ContainsAny(a(), vec![Value::Str(String::new())]),
             Predicate::AnyCmp(a(), Op::Lt, Value::Int(3)),
             Predicate::AnyCmp(a(), Op::Lte, Value::Str("é".into())),
@@ -538,6 +549,9 @@ mod tests {
         ] {
             assert_eq!(decode(&bad), None, "{bad}");
         }
+        // M175: a null outside an array.
+        let null = Predicate::Cmp("a".to_owned(), Op::Eq, Value::Null);
+        assert_eq!(decode(&encode(&null)), None);
         // An array inside an array: a value no filter writes (M13 sweep).
         let nested = format!("00{}61{}05{}05{}", "01000000", "00", "01000000", "00000000");
         assert_eq!(decode(&nested), None, "{nested}");

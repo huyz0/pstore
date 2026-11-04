@@ -58,8 +58,8 @@ fn hybrid_doc(i: usize) -> Document {
     d.vectors.insert(
         SPARSE.into(),
         VectorField::Sparse(vec![
-            (i as u32 % 23, Impact::new(0.9)),
-            (50 + (i as u32 % 7), Impact::new(0.4)),
+            ((i as u32 % 23).to_string(), Impact::new(0.9)),
+            ((50 + (i as u32 % 7)).to_string(), Impact::new(0.4)),
         ]),
     );
     d.attrs.insert(
@@ -145,7 +145,7 @@ fn legs(docs: &[Document]) -> Vec<Prefetch> {
         },
         Prefetch::Sparse {
             field: SPARSE.to_owned(),
-            query: vec![(7, 1.0), (50, 0.5)],
+            query: vec![("7".to_owned(), 1.0), ("50".to_owned(), 0.5)],
             limit: 20,
         },
     ]
@@ -292,7 +292,7 @@ async fn an_empty_leg_is_not_an_error() {
     let mut l = legs(&docs);
     l[1] = Prefetch::Sparse {
         field: SPARSE.to_owned(),
-        query: vec![(900_000, 1.0)],
+        query: vec![("900000".to_owned(), 1.0)],
         limit: 20,
     };
     let hits = query(&store, &one(&seg, &cen), &l, Fusion::default(), 10)
@@ -305,7 +305,7 @@ async fn an_empty_leg_is_not_an_error() {
         &one(&seg, &cen),
         &[Prefetch::Sparse {
             field: SPARSE.to_owned(),
-            query: vec![(900_000, 1.0)],
+            query: vec![("900000".to_owned(), 1.0)],
             limit: 20,
         }],
         Fusion::default(),

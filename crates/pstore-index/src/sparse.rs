@@ -107,7 +107,7 @@ impl SparseIndex {
 
     /// Bytes of postings the query's own lists occupy — what a fetch may legitimately move.
     #[must_use]
-    pub fn list_bytes(&self, query: &[(u32, f32)]) -> u64 {
+    pub fn list_bytes(&self, query: &[(String, f32)]) -> u64 {
         self.entries(query)
             .iter()
             .map(|(e, _)| u64::from(e.bytes))
@@ -119,15 +119,23 @@ impl SparseIndex {
     /// ⚠️ A dimension the vocabulary does not contain is dropped **here**, before any range
     /// exists. It is the common case — a query term the corpus never used — and it must cost
     /// no request, no byte and no error.
-    fn entries(&self, query: &[(u32, f32)]) -> Vec<(Entry, f32)> {
+    fn entries(&self, query: &[(String, f32)]) -> Vec<(Entry, f32)> {
         let mut out: Vec<(Entry, f32)> = query
             .iter()
-            .filter_map(|(dim, w)| self.dict.lookup(*dim).map(|e| (e, *w)))
+            .filter_map(|(key, w)| self.dict.lookup(key).map(|e| (e, *w)))
             .collect();
         // Ascending, so the coalescer sees the runs it can merge. Unsorted ranges cost the
         // same requests and make the plan unreadable.
         out.sort_by_key(|(e, _)| e.offset);
-        out.dedup_by_key(|(e, _)| e.dim);
+        // M177: a key named twice is one dimension, its weights summed -- the query as a
+        // vector. Each key's list starts at its own offset, so equal offsets are one key.
+        out.dedup_by(|(later, w), (kept, sum)| {
+            let same = later.offset == kept.offset;
+            if same {
+                *sum += *w;
+            }
+            same
+        });
         out
     }
 
@@ -140,7 +148,7 @@ impl SparseIndex {
         &self,
         store: &S,
         key: &Key,
-        query: &[(u32, f32)],
+        query: &[(String, f32)],
         k: usize,
     ) -> Result<Vec<(usize, f32)>, FormatError> {
         let entries = self.entries(query);

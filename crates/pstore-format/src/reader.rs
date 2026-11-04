@@ -21,6 +21,23 @@ pub struct Segment {
     text_fields: Vec<String>,
 }
 
+/// A dense field's stored bytes as its vectors of `dims` components each, little-endian f32s
+/// (M191: what [`Segment::field_spans`]' ranges hold). A trailing partial vector is dropped;
+/// `dims` of 0 is no vectors.
+#[must_use]
+pub fn decode_vectors(raw: &[u8], dims: usize) -> Vec<Vec<f32>> {
+    if dims == 0 {
+        return Vec::new();
+    }
+    raw.chunks_exact(dims * 4)
+        .map(|v| {
+            v.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                .collect()
+        })
+        .collect()
+}
+
 impl Segment {
     /// Opens a segment knowing only its key.
     ///
@@ -434,15 +451,7 @@ impl Segment {
             return Ok(BTreeMap::new());
         }
         let width = (dims * 4) as u64;
-        let decode = |raw: &[u8]| -> Vec<Vec<f32>> {
-            raw.chunks_exact(dims * 4)
-                .map(|v| {
-                    v.chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                        .collect()
-                })
-                .collect()
-        };
+        let decode = |raw: &[u8]| decode_vectors(raw, dims);
         let mut out = BTreeMap::new();
         if f.per_row != 0 {
             let ranges: Vec<std::ops::Range<u64>> = wanted
@@ -457,6 +466,70 @@ impl Segment {
             }
             return Ok(out);
         }
+        let spans = self.spans_of(store, key, span, n, &wanted).await?;
+        // An empty range is neither fetched nor returned, so a row with no vectors is skipped
+        // here and read as empty below, never paired with another row's bytes.
+        let nonempty: Vec<(usize, std::ops::Range<u64>)> =
+            spans.into_iter().filter(|(_, r)| r.start < r.end).collect();
+        let fetch: Vec<std::ops::Range<u64>> = nonempty.iter().map(|(_, r)| r.clone()).collect();
+        let bufs = if fetch.is_empty() {
+            Vec::new()
+        } else {
+            store.get_ranges(key, &fetch).await?
+        };
+        for row in &wanted {
+            out.insert(*row, Vec::new());
+        }
+        for ((row, _), raw) in nonempty.into_iter().zip(bufs) {
+            out.insert(row, decode(&raw));
+        }
+        Ok(out)
+    }
+
+    /// Where the named rows of a dense field stored at a varying count of vectors a row
+    /// (`per_row` 0) keep their vectors (M191): each row's absolute byte range, from its two
+    /// offsets, read in one request run. [`Self::field_rows`]'s first read, apart, so a caller
+    /// can read many fields' and segments' offsets in one round, weigh the bytes, and read
+    /// the vectors in the next. A row past the end is left out; a row with no vectors has an
+    /// empty range. Empty for a fixed or sparse field, which has no offsets.
+    ///
+    /// # Errors
+    /// [`FormatError::UnknownField`] for a field this segment lacks; a store failure; or a
+    /// corrupt offset table.
+    pub async fn field_spans<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        name: &str,
+        rows: &[usize],
+    ) -> Result<BTreeMap<usize, std::ops::Range<u64>>, FormatError> {
+        let f = self.field_layout(name).ok_or(FormatError::UnknownField)?;
+        let n = self.rows as usize;
+        // A row asked twice is one key of the map returned.
+        let wanted: Vec<usize> = rows.iter().copied().filter(|r| *r < n).collect();
+        // A fixed or sparse field has no offsets; a zero-width one has no layout, above.
+        if f.kind != 0 || f.per_row != 0 {
+            return Ok(BTreeMap::new());
+        }
+        let Some(span) = self.field_section(name, Section::Vectors) else {
+            return Ok(BTreeMap::new());
+        };
+        Ok(self
+            .spans_of(store, key, span, n, &wanted)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    /// `wanted`'s (in range) vector ranges in a varying field's section, in `wanted`'s order.
+    async fn spans_of<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        span: std::ops::Range<u64>,
+        n: usize,
+        wanted: &[usize],
+    ) -> Result<Vec<(usize, std::ops::Range<u64>)>, FormatError> {
         let table = (n as u64 + 1) * 8;
         let pairs: Vec<std::ops::Range<u64>> = wanted
             .iter()
@@ -466,7 +539,7 @@ impl Segment {
             })
             .collect();
         let mut ranges = Vec::with_capacity(wanted.len());
-        for raw in store.get_ranges(key, &pairs).await? {
+        for (row, raw) in wanted.iter().zip(store.get_ranges(key, &pairs).await?) {
             let (lo, hi) = raw
                 .get(..8)
                 .zip(raw.get(8..16))
@@ -486,31 +559,13 @@ impl Segment {
                     .and_then(|t| t.checked_add(hi)),
             );
             match (from, to) {
-                (Some(from), Some(to)) if lo <= hi && to <= span.end => ranges.push(from..to),
+                (Some(from), Some(to)) if lo <= hi && to <= span.end => {
+                    ranges.push((*row, from..to));
+                }
                 _ => return Err(FormatError::Truncated),
             }
         }
-        // An empty range is neither fetched nor returned, so a row with no vectors is skipped
-        // here and read as empty below, never paired with another row's bytes.
-        let nonempty: Vec<(usize, std::ops::Range<u64>)> = wanted
-            .iter()
-            .copied()
-            .zip(ranges)
-            .filter(|(_, r)| r.start < r.end)
-            .collect();
-        let fetch: Vec<std::ops::Range<u64>> = nonempty.iter().map(|(_, r)| r.clone()).collect();
-        let bufs = if fetch.is_empty() {
-            Vec::new()
-        } else {
-            store.get_ranges(key, &fetch).await?
-        };
-        for row in &wanted {
-            out.insert(*row, Vec::new());
-        }
-        for ((row, _), raw) in nonempty.into_iter().zip(bufs) {
-            out.insert(row, decode(&raw));
-        }
-        Ok(out)
+        Ok(ranges)
     }
 
     /// The byte offset just past the last data block.
@@ -885,11 +940,11 @@ impl Segment {
             let (b, read) = futures_util::future::join(store.get_ranges(key, &all), fields).await;
             (b?, None, read)
         };
-        // Row -> its `(dimension, impact)` pairs. Empty unless this segment carries a sparse
+        // Row -> its `(key, impact)` pairs. Empty unless this segment carries a sparse
         // field AND its dictionary was reachable; a missing sidecar is a read that cannot
         // reconstruct, and returning the field as *absent* would be the silent loss this
         // whole path exists to prevent.
-        let sparse_rows: Vec<Vec<(u32, crate::Impact)>> = match (&postings_at, &dict_raw) {
+        let mut sparse_rows: Vec<Vec<(String, crate::Impact)>> = match (&postings_at, &dict_raw) {
             (Some(at), Some(raw)) => {
                 let dict = crate::sparse::Dictionary::decode(raw)
                     .ok_or(FormatError::Corrupt("sparse dictionary"))?;
@@ -950,13 +1005,15 @@ impl Segment {
                     }
                 }
                 if let Some(name) = &sparse_name
-                    && let Some(pairs) = sparse_rows.get(start + r)
+                    && let Some(pairs) = sparse_rows.get_mut(start + r)
                 {
                     // ⚠️ Overwrites whatever the `extra` loop left, which for a sparse field
                     // is an empty dense vector: a field present-but-empty is not the same
                     // document as the one that was written.
-                    doc.vectors
-                        .insert(name.clone(), crate::VectorField::Sparse(pairs.clone()));
+                    doc.vectors.insert(
+                        name.clone(),
+                        crate::VectorField::Sparse(std::mem::take(pairs)),
+                    );
                 }
                 if filter.is_none_or(|f| f.matches(&doc)) {
                     out.push(doc);

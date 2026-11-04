@@ -174,7 +174,19 @@ fn doc(i: u32) -> Document {
     );
     d.vectors.insert(
         "s".into(),
-        VectorField::Sparse(vec![(3, Impact::new(0.5)), (i % 7, Impact::new(0.25))]),
+        // M177: dimension 3 once; `i % 7` landing on it moves to 7, unused, as a field
+        // names a dimension once.
+        VectorField::Sparse(vec![
+            ("3".to_owned(), Impact::new(0.5)),
+            (
+                match i % 7 {
+                    3 => 7,
+                    n => n,
+                }
+                .to_string(),
+                Impact::new(0.25),
+            ),
+        ]),
     );
     d
 }
@@ -208,7 +220,7 @@ fn legs() -> [Vec<Prefetch>; 3] {
         }],
         vec![Prefetch::Sparse {
             field: "s".to_owned(),
-            query: vec![(3, 1.0), (2, 0.5)],
+            query: vec![("3".to_owned(), 1.0), ("2".to_owned(), 0.5)],
             limit: 5,
         }],
     ]

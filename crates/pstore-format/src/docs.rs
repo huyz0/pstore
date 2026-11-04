@@ -64,6 +64,8 @@ fn encode_value(e: &mut Enc, v: &Value) {
             e.u8(8);
             e.u64(*n);
         }
+        // M175: a null array element, the tag alone.
+        Value::Null => e.u8(9),
         // M9h.2: a count, then each element with its own tag.
         Value::Array(items) => {
             e.u8(4);
@@ -130,6 +132,8 @@ fn skip_value(d: &mut Dec<'_>, array: bool) -> Result<(), FormatError> {
             }
         }
         4 => return Err(FormatError::Corrupt("an array inside an array")),
+        9 if !array => {}
+        9 => return Err(FormatError::Corrupt("a null outside an array")),
         _ => return Err(FormatError::Corrupt("unknown value tag")),
     }
     Ok(())
@@ -161,6 +165,9 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
         6 => Value::Uuid(d.uuid()?),
         7 => Value::Bytes(d.bytes()?.to_vec()),
         8 => Value::Uint(d.u64()?),
+        // M175: only an array element is null; at the top level an attribute is absent.
+        9 if !array => Value::Null,
+        9 => return Err(FormatError::Corrupt("a null outside an array")),
         // A tag from a future version. Refused, not guessed: a mistyped attribute is
         // one a filter later reads as the wrong thing.
         _ => return Err(FormatError::Corrupt("unknown value tag")),
@@ -176,6 +183,14 @@ fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
 /// so refusing one is a replay failure rather than durable loss.
 pub(crate) const DOCS_VERSION: u16 = 2;
 
+/// M177: a run holding a sparse field, whose keys are strings (kind 2).
+///
+/// ⚠️ Only such a run is version 3. A binary before M177 read every kind but 0 as `u32`
+/// pairs, so a kind-2 field in a version-2 run would be read as numbers out of key bytes; at
+/// version 3 it refuses the run instead. A run with no sparse field stays version 2, so a
+/// rollback still replays it.
+pub(crate) const SPARSE_KEYS_VERSION: u16 = 3;
+
 /// Encodes documents **with every named field**, for the WAL bundle.
 ///
 /// ⚠️ Unlike a segment block, a bundle is the durable record of a write before anything has
@@ -187,7 +202,16 @@ pub(crate) const DOCS_VERSION: u16 = 2;
 #[must_use]
 pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u16(DOCS_VERSION);
+    let sparse = docs.iter().any(|d| {
+        d.vectors
+            .values()
+            .any(|f| matches!(f, crate::VectorField::Sparse(_)))
+    });
+    e.u16(if sparse {
+        SPARSE_KEYS_VERSION
+    } else {
+        DOCS_VERSION
+    });
     e.u32(docs.len() as u32);
     for d in docs {
         e.bytes(d.id.as_bytes());
@@ -206,10 +230,10 @@ pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
                     }
                 }
                 crate::VectorField::Sparse(pairs) => {
-                    e.u8(1);
+                    e.u8(2);
                     e.u32(pairs.len() as u32);
-                    for (dim, impact) in pairs {
-                        e.u32(*dim);
+                    for (key, impact) in pairs {
+                        e.bytes(key.as_bytes());
                         e.f32(impact.get());
                     }
                 }
@@ -224,7 +248,7 @@ pub fn encode_docs(docs: &[Document]) -> Vec<u8> {
 pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
     let mut d = Dec::new(buf);
     let version = d.u16()?;
-    if version != DOCS_VERSION {
+    if version != DOCS_VERSION && version != SPARSE_KEYS_VERSION {
         return Err(FormatError::UnsupportedVersion(version));
     }
     let n = d.u32()? as usize;
@@ -238,24 +262,38 @@ pub fn decode_docs(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
             let name: crate::Field = d.str()?.into();
             let kind = d.u8()?;
             let count = d.u32()? as usize;
-            let field = if kind == 0 {
-                let mut vs = Vec::with_capacity(count.min(1 << 12));
-                for _ in 0..count {
-                    let dims = d.u32()? as usize;
-                    let mut v = Vec::with_capacity(dims.min(1 << 16));
-                    for _ in 0..dims {
-                        v.push(d.f32()?);
+            let field = match (kind, version) {
+                (0, _) => {
+                    let mut vs = Vec::with_capacity(count.min(1 << 12));
+                    for _ in 0..count {
+                        let dims = d.u32()? as usize;
+                        let mut v = Vec::with_capacity(dims.min(1 << 16));
+                        for _ in 0..dims {
+                            v.push(d.f32()?);
+                        }
+                        vs.push(v);
                     }
-                    vs.push(v);
+                    crate::VectorField::Dense(vs)
                 }
-                crate::VectorField::Dense(vs)
-            } else {
-                let mut pairs = Vec::with_capacity(count.min(1 << 20));
-                for _ in 0..count {
-                    let dim = d.u32()?;
-                    pairs.push((dim, crate::Impact::new(d.f32()?)));
+                // Before M177 a dimension was a `u32`: it reads as its decimal spelling, the
+                // one key a query for it names.
+                (1, DOCS_VERSION) => {
+                    let mut pairs = Vec::with_capacity(count.min(1 << 20));
+                    for _ in 0..count {
+                        let dim = d.u32()?;
+                        pairs.push((dim.to_string(), crate::Impact::new(d.f32()?)));
+                    }
+                    crate::VectorField::Sparse(pairs)
                 }
-                crate::VectorField::Sparse(pairs)
+                (2, SPARSE_KEYS_VERSION) => {
+                    let mut pairs = Vec::with_capacity(count.min(1 << 20));
+                    for _ in 0..count {
+                        let key = d.string()?;
+                        pairs.push((key, crate::Impact::new(d.f32()?)));
+                    }
+                    crate::VectorField::Sparse(pairs)
+                }
+                _ => return Err(FormatError::Corrupt("unknown vector field kind")),
             };
             vectors.insert(name, field);
         }
@@ -389,6 +427,11 @@ mod tests {
         b.attrs.insert("u".to_owned(), Value::Uuid([0x5a; 16]));
         // M172: a uint64 at its maximum, scalar and in an array.
         b.attrs.insert("big".to_owned(), Value::Uint(u64::MAX));
+        // M175: null elements, first, between and last.
+        b.attrs.insert(
+            "nulls".to_owned(),
+            Value::Array(vec![Value::Null, Value::Int(1), Value::Null]),
+        );
         b.attrs.insert(
             "bigs".to_owned(),
             Value::Array(vec![Value::Uint(0), Value::Uint(1 << 63)]),
@@ -474,6 +517,11 @@ mod tests {
         let back = decode_rows(&encode_rows(&docs)).unwrap();
         let attrs = |ds: &[Document]| ds.iter().map(|d| d.attrs.clone()).collect::<Vec<_>>();
         assert_eq!(attrs(&back), attrs(&docs));
+        // M175: and through the bundle's encoding, which shares the value tags.
+        assert_eq!(
+            attrs(&decode_docs(&encode_docs(&docs)).unwrap()),
+            attrs(&docs)
+        );
         for v in [
             Value::Uuid([7; 16]),
             Value::Bytes(vec![1, 2, 3]),
@@ -489,6 +537,28 @@ mod tests {
                 assert!(decode_rows(short).is_err(), "{v:?} cut by {cut} was read");
             }
         }
+    }
+
+    /// M175: a null is an array's element only; at the top level each decoder refuses it,
+    /// whether it builds the value or reads past it.
+    #[test]
+    fn a_null_outside_an_array_is_refused() {
+        let mut d = Document::new("x", Vec::new());
+        d.attrs.insert("v".to_owned(), Value::Null);
+        d.attrs.insert("w".to_owned(), Value::Int(1));
+        let buf = encode_rows(std::slice::from_ref(&d));
+        // The message, not only the refusal: without its own arm a top-level null is still
+        // refused, as an unknown tag, which misnames the corruption.
+        let null_outside = |r: Result<(), FormatError>| {
+            matches!(r, Err(FormatError::Corrupt("a null outside an array")))
+        };
+        assert!(null_outside(decode_rows(&buf).map(drop)));
+        let only_w = |name: &str| name == "w";
+        let p = Projection {
+            id: false,
+            attrs: &only_w,
+        };
+        assert!(null_outside(decode_rows_where(&buf, &p).map(drop)));
     }
 
     #[test]

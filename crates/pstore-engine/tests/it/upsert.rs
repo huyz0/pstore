@@ -235,7 +235,7 @@ async fn best_three_deleted() -> Engine<MemoryStore> {
             d.vectors.insert(
                 "sparse".into(),
                 pstore_format::VectorField::Sparse(vec![(
-                    1,
+                    "1".to_owned(),
                     pstore_format::Impact::new(0.05 * (i + 1) as f32),
                 )]),
             );
@@ -280,7 +280,7 @@ async fn text_and_sparse_legs_are_widened_past_deleted_rows_too() {
         &e,
         Prefetch::Sparse {
             field: "sparse".to_owned(),
-            query: vec![(1, 1.0)],
+            query: vec![("1".to_owned(), 1.0)],
             limit: 5,
         },
     )

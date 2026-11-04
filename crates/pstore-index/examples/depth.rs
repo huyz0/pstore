@@ -65,7 +65,7 @@ fn sparse_corpus(rows: usize, vocab: u32, nnz: usize) -> Vec<Document> {
     };
     (0..rows)
         .map(|i| {
-            let mut pairs: Vec<(u32, Impact)> = Vec::new();
+            let mut pairs: Vec<(String, Impact)> = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
             while seen.len() < nnz {
                 // Zipf-ish: squaring the uniform draw makes low dimensions dominate, which
@@ -73,10 +73,13 @@ fn sparse_corpus(rows: usize, vocab: u32, nnz: usize) -> Vec<Document> {
                 let u = (next() % 1_000_000) as f64 / 1_000_000.0;
                 let d = ((u * u) * f64::from(vocab)) as u32;
                 if seen.insert(d) {
-                    pairs.push((d, Impact::new((next() % 900) as f32 / 1000.0 + 0.1)));
+                    pairs.push((
+                        d.to_string(),
+                        Impact::new((next() % 900) as f32 / 1000.0 + 0.1),
+                    ));
                 }
             }
-            pairs.sort_by_key(|(d, _)| *d);
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
             Document {
                 id: format!("d{i:05}"),
                 vectors: std::collections::BTreeMap::from([(
@@ -120,7 +123,7 @@ async fn sparse_gate() {
     let VectorField::Sparse(pairs) = &docs[7].vectors[SPARSE_FIELD] else {
         panic!("fixture is not sparse")
     };
-    let query: Vec<(u32, f32)> = pairs.iter().map(|(d, w)| (*d, w.get())).collect();
+    let query: Vec<(String, f32)> = pairs.iter().map(|(d, w)| (d.clone(), w.get())).collect();
 
     // Depth, on the same corpus, through a counting store.
     let counting = DepthCounting::new(MemoryStore::with_coalesce_gap(GAP));

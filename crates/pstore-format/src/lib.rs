@@ -21,6 +21,7 @@ mod docs;
 pub mod external;
 pub mod fde;
 pub mod geo;
+pub mod id;
 pub mod lance;
 pub mod parquet;
 mod reader;
@@ -35,7 +36,7 @@ pub use docs::{
     Projection, decode_docs, decode_rows, decode_rows_picked, decode_rows_where, encode_docs,
     encode_rows,
 };
-pub use reader::Segment;
+pub use reader::{Segment, decode_vectors};
 pub use writer::{INDEX_BUDGET, SegmentWriter};
 
 /// A footer-addressed region of a segment.
@@ -226,12 +227,16 @@ pub enum Value {
     /// An unsigned integer (M172), declared `uint64`: a number, compared with ints and floats
     /// by exact value. Zone maps prune on it.
     Uint(u64),
+    /// A null **array element** (M175), never an attribute's value: [`check_storable`] refuses
+    /// one at the top level, where a null is an absent attribute. Equal only to itself, ordered
+    /// by no comparison, and after every other kind.
+    Null,
 }
 
 impl Value {
     /// The bytes [`Document::footprint`] counts for this value: 8 for a number, bool or
-    /// instant, 16 for a UUID, a string's or byte string's bytes, and an array's elements
-    /// summed.
+    /// instant, 16 for a UUID, a string's or byte string's bytes, 1 for a null element (M175),
+    /// and an array's elements summed.
     #[must_use]
     pub fn footprint(&self) -> u64 {
         match self {
@@ -240,6 +245,8 @@ impl Value {
             Self::Array(vs) => vs.iter().map(Self::footprint).sum(),
             Self::Uuid(_) => 16,
             Self::Bytes(b) => b.len() as u64,
+            // M175: a null element is its tag alone.
+            Self::Null => 1,
         }
     }
 
@@ -254,6 +261,7 @@ impl Value {
             Self::Uuid(_) => 6,
             Self::Bytes(_) => 7,
             Self::Uint(_) => 8,
+            Self::Null => 9,
         }
     }
 }
@@ -313,7 +321,8 @@ impl Number {
             | Value::Array(_)
             | Value::DateTime(_)
             | Value::Uuid(_)
-            | Value::Bytes(_) => None,
+            | Value::Bytes(_)
+            | Value::Null => None,
         }
     }
 }
@@ -391,6 +400,12 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
     let out_of_range =
         |v: &Value| matches!(v, Value::DateTime(t) if !(datetime::MIN..=datetime::MAX).contains(t));
     for v in d.attrs.values() {
+        // M175: a null is an array's element only; an attribute that is null is absent.
+        if matches!(v, Value::Null) {
+            return Err(FormatError::Unsupported(
+                "a null is an array element only: an absent attribute is left out",
+            ));
+        }
         let inside: &[Value] = match v {
             Value::Array(items) => items,
             _ => std::slice::from_ref(v),
@@ -412,6 +427,11 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
             ));
         }
     }
+    for f in d.vectors.values() {
+        if let VectorField::Sparse(pairs) = f {
+            check_sparse_keys(pairs)?;
+        }
+    }
     if d.vectors
         .values()
         .filter(|f| matches!(f, VectorField::Sparse(_)))
@@ -421,6 +441,30 @@ pub fn check_storable(d: &Document) -> Result<(), FormatError> {
         return Err(FormatError::Unsupported(
             "a document may carry at most one sparse field: a second needs its own section \
              id pair (deferred by M5a)",
+        ));
+    }
+    Ok(())
+}
+
+/// The longest sparse key a dictionary can name: its length is a `u16` (M177).
+pub const SPARSE_KEY_MAX: usize = u16::MAX as usize;
+
+/// M177: a field's keys are each non-empty, at most [`SPARSE_KEY_MAX`] bytes, and distinct --
+/// one weight a dimension, as a `u32` dimension was one entry of its dictionary.
+fn check_sparse_keys(pairs: &[(String, Impact)]) -> Result<(), FormatError> {
+    if pairs.iter().any(|(k, _)| k.is_empty()) {
+        return Err(FormatError::Unsupported("a sparse key is empty"));
+    }
+    if pairs.iter().any(|(k, _)| k.len() > SPARSE_KEY_MAX) {
+        return Err(FormatError::Unsupported(
+            "a sparse key is longer than 65,535 bytes",
+        ));
+    }
+    let mut keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort_unstable();
+    if keys.windows(2).any(|w| w.first() == w.get(1)) {
+        return Err(FormatError::Unsupported(
+            "a sparse key is repeated: a dimension has one weight",
         ));
     }
     Ok(())
@@ -463,12 +507,12 @@ impl Impact {
 pub enum VectorField {
     /// One vector for a dense field; several for late interaction (D-28).
     Dense(Vec<Vec<f32>>),
-    /// `(dimension, impact)` pairs (D-72).
+    /// `(dimension, impact)` pairs (D-72), a dimension being its key's bytes (M177).
     ///
-    /// ⚠️ Representable in v1 and **refused by the writer** — the shape must exist now, the
-    /// retriever is M5a. `modalities-and-sequencing.md` §3: "the shape must exist in v1 even
-    /// if only `dense` is implemented".
-    Sparse(Vec<(u32, Impact)>),
+    /// ⚠️ A string, not a `u32`: a vocabulary mapped to numbers needs one mapping every
+    /// writer agrees on, which takes a lock or a shared table, and a hash into 32 bits
+    /// collides. The key itself needs neither. Keys compare as bytes, unnormalized.
+    Sparse(Vec<(String, Impact)>),
 }
 
 impl VectorField {
@@ -656,7 +700,8 @@ impl Document {
     }
 
     /// A deterministic estimate of the bytes this row holds in memory (M141): the id's
-    /// bytes, 4 per dense component, 8 per sparse pair, and per attribute its key's bytes
+    /// bytes, 4 per dense component, a sparse pair's key bytes plus 4 (M177), and per
+    /// attribute its key's bytes
     /// plus its value's. Not RSS: allocator and map overhead are
     /// not counted.
     #[must_use]
@@ -665,8 +710,8 @@ impl Document {
             .vectors
             .values()
             .map(|field| match field {
-                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum(),
-                VectorField::Sparse(pairs) => 8 * pairs.len(),
+                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum::<usize>(),
+                VectorField::Sparse(pairs) => pairs.iter().map(|(k, _)| k.len() + 4).sum(),
             })
             .sum();
         let attrs: u64 = self
@@ -743,7 +788,8 @@ impl Filter {
                 | Value::DateTime(_)
                 | Value::Uuid(_)
                 | Value::Bytes(_)
-                | Value::Uint(_),
+                | Value::Uint(_)
+                | Value::Null,
             ) => true,
             Self::Gt(_, n) => max > *n,
             Self::Lt(_, n) => min < *n,

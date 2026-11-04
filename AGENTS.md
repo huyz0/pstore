@@ -95,6 +95,7 @@ that does not exist; `scripts/` is the truth on the day you read it.
 | `scripts/ndcg.sh` | ranking quality above its floor (D-31) — **and a control ranker below it**, so a judged set we generated cannot pass everything |
 | `scripts/depth.sh` | round-trip depth and query bytes **at gate scale** (20,000 rows). Outside `cargo test` for the same reason `recall.sh` is: a sweep reruns the suite once per mutant |
 | `scripts/gossip-loss.sh` | the gossip cost bound for each (members, loss rate) **at every phase** of the drop pattern (M51): the suite's single point is its row's maximum, and other phases read up to 16% lower. Outside `cargo test` for `depth.sh`'s reason |
+| `scripts/index-scale.sh` | thousands of active indexes in one tenant, through one server (M169): at 50, 1,000 and 5,000 indexes, a query's and a fold's request counts equal, HEAD within 256 B an index, and the per-tenant index limit refusing at the count. Outside `cargo test` for `depth.sh`'s reason |
 | `git config core.hooksPath scripts/githooks` | **run once per clone.** Refuses a commit whose tree is red — the rule AGENTS.md already states, moved from an instruction to a predicate |
 <!-- index:gates:end -->
 
@@ -115,7 +116,8 @@ reasoning, with numbers and sources, is in `INDEX.md`.
   time per index**. Requests scale with nodes and bytes.
 - Never put a **data-dependent chain** of blob fetches on a user-facing path. The budget
   is three sequential round trips to rank, and one more to fetch the rows ranked (D-34,
-  restated by M47 by the owner's decision); `rerank: exact` is an opt-in outside it.
+  restated by M47 by the owner's decision); `rerank: exact`, and projecting a field folded
+  at a varying count of vectors a row (M191, the owner's decision), are opt-ins outside it.
   Fan-out within a round is free, depth is not.
 - Never add a **lock, lease, or leader election** for correctness. CAS on a blob is the
   fencing mechanism — a paused or partitioned writer is already safe.

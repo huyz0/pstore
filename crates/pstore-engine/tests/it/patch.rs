@@ -24,7 +24,10 @@ async fn a_patch_keeps_the_rows_sparse_and_dense_vectors() {
     let mut d = Document::new("x", vec![1.0, 0.5]);
     d.vectors.insert(
         "s".into(),
-        VectorField::Sparse(vec![(3, Impact::new(0.5)), (9, Impact::new(0.25))]),
+        VectorField::Sparse(vec![
+            ("3".to_owned(), Impact::new(0.5)),
+            ("9".to_owned(), Impact::new(0.25)),
+        ]),
     );
     d.attrs.insert("a".to_owned(), Value::Int(1));
     e.write("idx", vec![d.clone(), Document::new("y", vec![0.0, 1.0])])

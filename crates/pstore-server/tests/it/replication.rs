@@ -34,6 +34,7 @@ fn policy() -> ReplicationPolicy {
         period: Duration::from_secs(1),
         idle: Duration::from_secs(60),
         shards: 4,
+        max_lag: None,
     }
 }
 
@@ -1306,4 +1307,567 @@ async fn status_notes_are_written_at_most_once_a_renewal_period() {
     }
     let (_, b) = status(&api, DST, "dst").await;
     assert!(b["last_commit_ms"].as_u64().unwrap() > first, "{b}");
+}
+
+/// M162: a replica has no history to measure a snapshot's recall in, as it has no `as_of`.
+#[tokio::test(start_paused = true)]
+async fn a_replica_has_no_recall() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..3).await;
+    let (status, created) = create(
+        &api,
+        DST,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 2, Duration::from_secs(1)).await;
+    assert!(rows(&api, DST, "dst").await.is_some(), "the replica synced");
+    let (s, b) = send(&api, DST, "POST", "/v1/indexes/dst/recall", &json!({})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    assert_eq!(b["error"]["code"], "replica_no_history", "{b}");
+}
+
+// M166: an isolated copy, as an operation with a status.
+
+async fn copy(api: &A, dest: &str, source: Value) -> (StatusCode, Value) {
+    send(
+        api,
+        DST,
+        "POST",
+        &format!("/v1/indexes/{dest}/copy"),
+        &json!({ "source": source }),
+    )
+    .await
+}
+
+async fn copy_status(api: &A, dest: &str) -> (StatusCode, Value) {
+    send(
+        api,
+        DST,
+        "GET",
+        &format!("/v1/indexes/{dest}/copy"),
+        &Value::Null,
+    )
+    .await
+}
+
+/// A dense top-k, a filtered one and an id lookup: what a copy must answer as its source did.
+async fn answers(api: &A, tenant: u64, index: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for body in [
+        json!({"vector": [0.5, 1.0], "top_k": 5}),
+        json!({"vector": [0.5, 1.0], "top_k": 5, "filters": ["n", "Gt", 10]}),
+        json!({"rank_by": ["id", "asc"], "filters": ["id", "Eq", "d0003"], "include_attributes": ["n"]}),
+    ] {
+        let (s, b) = send(
+            api,
+            tenant,
+            "POST",
+            &format!("/v1/indexes/{index}/query"),
+            &body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        out.push(b["results"].clone());
+    }
+    out
+}
+
+/// Every object under `index`'s segment prefix in `tenant`.
+async fn segment_objects(store: &Accounted<MemoryStore>, tenant: u64, index: &str) -> usize {
+    let t = u128::from(tenant);
+    let prefix = format!("{:04x}/tnt/{t}/idx/{index}/seg/", t as u16);
+    store
+        .as_tenant(TenantId(0))
+        .list_unrestricted(&pstore_blob::Key::new(prefix))
+        .await
+        .unwrap()
+        .len()
+}
+
+/// M166 criterion 1: a copy from another tenant and from another store succeeds after one
+/// sync, answers as its source, keeps answering once the source is dropped and reaped and
+/// the store forgotten, and takes writes after.
+#[tokio::test(start_paused = true)]
+async fn a_copy_succeeds_and_is_independent() {
+    for remote in [false, true] {
+        let world = World::new();
+        let api = world.api(1);
+        let far = world.far_api();
+        let (src_api, src_store, source) = if remote {
+            (
+                &far,
+                &world.far,
+                json!({"index": "src", "tenant": SRC.to_string(), "store": "far"}),
+            )
+        } else {
+            (
+                &api,
+                &world.acct,
+                json!({"index": "src", "tenant": SRC.to_string()}),
+            )
+        };
+        write(src_api, SRC, "src", 0..20).await;
+        write(src_api, SRC, "src", 20..40).await;
+        let (s, b) = send(
+            src_api,
+            SRC,
+            "PUT",
+            "/v1/indexes/src/documents",
+            &json!({"durability": "durable", "deletes": ["d0007"]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        send(src_api, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+        let want = answers(src_api, SRC, "src").await;
+        let (s, started) = copy(&api, "dst", source.clone()).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+        assert_eq!(started["state"], "running");
+        let mut workers = vec![(Arc::clone(&api), Worker::default())];
+        run(&mut workers, 1, Duration::from_secs(1)).await;
+        let (s, done) = copy_status(&api, "dst").await;
+        assert_eq!(s, StatusCode::OK, "{done}");
+        assert_eq!(done["state"], "succeeded", "{remote}: {done}");
+        assert_eq!(done["run"], started["run"]);
+        assert_eq!(done["code"], Value::Null);
+        assert_eq!(done["last_error"], Value::Null);
+        assert!(done["source_epoch"].as_u64().is_some());
+        assert_eq!(answers(&api, DST, "dst").await, want, "{remote}");
+        // The source dropped and reaped until its segments are gone, and its store forgotten.
+        let (s, b) = send(src_api, SRC, "DELETE", "/v1/indexes/src", &Value::Null).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        for _ in 0..3 {
+            send(
+                src_api,
+                SRC,
+                "POST",
+                "/v1/admin/gc?retention=0",
+                &Value::Null,
+            )
+            .await;
+        }
+        assert_eq!(segment_objects(src_store, SRC, "src").await, 0, "{remote}");
+        // A process with no source store at all answers the copy, and writes it.
+        let bare = Api::unsecured(world.acct.clone(), LaneId(2)).unwrap();
+        bare.configure_replication(policy(), BTreeMap::new());
+        assert_eq!(answers(&bare, DST, "dst").await, want, "{remote}");
+        write(&bare, DST, "dst", 100..101).await;
+        assert!(
+            rows(&bare, DST, "dst")
+                .await
+                .unwrap()
+                .contains(&"d0100".to_owned())
+        );
+    }
+}
+
+/// M166 criterion 3 (server): a store the worker lacks keeps the copy running, with the
+/// worker's note as `last_error`, never as a state.
+#[tokio::test(start_paused = true)]
+async fn a_copy_that_cannot_read_its_store_runs_and_says_why() {
+    let world = World::new();
+    let far = world.far_api();
+    write(&far, SRC, "src", 0..5).await;
+    let api = world.api(1);
+    let (s, b) = copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string(), "store": "far"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+    // Worked by a process without "far".
+    let bare = Api::unsecured(world.acct.clone(), LaneId(2)).unwrap();
+    bare.configure_replication(policy(), BTreeMap::new());
+    let mut workers = vec![(Arc::clone(&bare), Worker::default())];
+    let ticks = usize::try_from((policy().ttl / 3).as_secs()).unwrap() + 2;
+    run(&mut workers, ticks, Duration::from_secs(1)).await;
+    let (s, b) = copy_status(&api, "dst").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["state"], "running");
+    assert!(b["last_error"].as_str().is_some(), "{b}");
+    assert_eq!(copy_status(&api, "nothing").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        copy_status(&api, "nothing").await.1["error"]["code"],
+        "copy_not_found"
+    );
+}
+
+/// M166 criterion 5 (server): a repeated POST answers the copy it started.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_post_returns_the_same_operation() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    write(&api, SRC, "other", 0..5).await;
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let (s, first) = copy(&api, "dst", source.clone()).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{first}");
+    let (s, again) = copy(&api, "dst", source.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again, first);
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    send(&api, SRC, "DELETE", "/v1/indexes/src", &Value::Null).await;
+    let (s, done) = copy(&api, "dst", source).await;
+    assert_eq!(s, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "succeeded");
+    assert_eq!(done["run"], first["run"]);
+    let (s, b) = copy(
+        &api,
+        "dst",
+        json!({"index": "other", "tenant": SRC.to_string()}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+}
+
+/// M166 criterion 7 (server): a finished copy releases its tenant, register entry included.
+#[tokio::test(start_paused = true)]
+async fn a_finished_copy_releases_the_tenant() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    write(&api, SRC, "other", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    // Beside a replication that keeps running: the entry's `gen` follows the copy's end.
+    create(
+        &api,
+        DST,
+        "follower",
+        json!({"index": "other", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let before = api.replication_entry_for_test(D).await.unwrap().0;
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    assert_eq!(copy_status(&api, "dst").await.1["state"], "succeeded");
+    let after = api.replication_entry_for_test(D).await.unwrap().0;
+    assert_ne!(after, before, "the entry still counts the finished copy");
+    // A status call repairs a stale entry: none was left to repair.
+    status(&api, DST, "follower").await;
+    assert_eq!(api.replication_entry_for_test(D).await.unwrap().0, after);
+    // And alone: the tenant is let go.
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 3, Duration::from_secs(1)).await;
+    assert_eq!(copy_status(&api, "dst").await.1["state"], "succeeded");
+    assert!(api.replication_entry_for_test(D).await.is_none());
+    assert_eq!(api.replication_tick(&mut workers[0].1).await.held, 0);
+}
+
+/// M166 criterion 10: a status is one round of two reads: HEAD and the notes.
+#[tokio::test(start_paused = true)]
+async fn a_copy_status_costs_two_reads() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..5).await;
+    copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    for _ in 0..2 {
+        let before = world.acct.count(D, OpClass::Read);
+        let before_list = world.acct.count(D, OpClass::List);
+        let (s, b) = copy_status(&api, "dst").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(world.acct.count(D, OpClass::Read) - before, 2);
+        assert_eq!(world.acct.count(D, OpClass::List), before_list);
+        let mut workers = vec![(Arc::clone(&api), Worker::default())];
+        run(&mut workers, 1, Duration::from_secs(1)).await;
+    }
+}
+
+// M167: an export is a copy that finishes read-only; a restore is a copy of it.
+
+/// Every row of `index`: its id, attributes and vector, in id order.
+async fn digest(api: &A, tenant: u64, index: &str) -> Value {
+    let (s, b) = send(
+        api,
+        tenant,
+        "POST",
+        &format!("/v1/indexes/{index}/query"),
+        &json!({"rank_by": ["id", "asc"], "top_k": 1_000,
+                "include_attributes": true, "include_vectors": ["vector"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(
+        b["results"].as_array().is_some_and(|r| !r.is_empty()),
+        "{b}"
+    );
+    b["results"].clone()
+}
+
+async fn copy_into(
+    api: &A,
+    tenant: u64,
+    dest: &str,
+    source: Value,
+    read_only: Option<bool>,
+) -> (StatusCode, Value) {
+    let mut body = json!({ "source": source });
+    if let Some(on) = read_only {
+        body["read_only"] = json!(on);
+    }
+    send(
+        api,
+        tenant,
+        "POST",
+        &format!("/v1/indexes/{dest}/copy"),
+        &body,
+    )
+    .await
+}
+
+async fn gc_until_gone(api: &A, store: &Accounted<MemoryStore>, tenant: u64, index: &str) {
+    for _ in 0..3 {
+        send(
+            api,
+            tenant,
+            "POST",
+            "/v1/admin/gc?retention=0",
+            &Value::Null,
+        )
+        .await;
+    }
+    assert_eq!(segment_objects(store, tenant, index).await, 0, "{index}");
+}
+
+/// M167 criterion 1: an export is read-only once it succeeds, refusing writes, deletes and
+/// the drop with M149's error, until `PATCH` clears it; a copy without the flag is writable.
+#[tokio::test(start_paused = true)]
+async fn an_export_is_read_only_until_cleared() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..20).await;
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let (s, started) = copy_into(&api, DST, "dst", source.clone(), Some(true)).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+    assert_eq!(started["read_only"], true);
+    let (s, plain) = copy_into(&api, DST, "plain", source.clone(), Some(false)).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{plain}");
+    assert_eq!(plain["read_only"], false);
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(
+        (done["state"].clone(), done["read_only"].clone()),
+        (json!("succeeded"), json!(true))
+    );
+    let (s, summary) = send(&api, DST, "GET", "/v1/indexes/dst", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    assert_eq!(summary["read_only"], true);
+    let doc = json!({"durability": "durable", "documents": [{"id": "new", "vector": [1.0, 0.0]}]});
+    for (method, uri, body) in [
+        ("PUT", "/v1/indexes/dst/documents", doc.clone()),
+        (
+            "PUT",
+            "/v1/indexes/dst/documents",
+            json!({"durability": "durable", "deletes": ["d0001"]}),
+        ),
+        ("DELETE", "/v1/indexes/dst", Value::Null),
+    ] {
+        let (s, b) = send(&api, DST, method, uri, &body).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{method} {uri}: {b}");
+        assert_eq!(b["error"]["code"], "index_read_only", "{b}");
+    }
+    // The plain copy takes a write.
+    let (s, b) = send(&api, DST, "PUT", "/v1/indexes/plain/documents", &doc).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(
+        &api,
+        DST,
+        "PATCH",
+        "/v1/indexes/dst",
+        &json!({"read_only": false}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    write(&api, DST, "dst", 100..101).await;
+    assert!(
+        rows(&api, DST, "dst")
+            .await
+            .unwrap()
+            .contains(&"d0100".to_owned())
+    );
+    // The status still names the flag asked, and a repeated export still matches it.
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(done["read_only"], true);
+    let (s, again) = copy_into(&api, DST, "dst", source.clone(), Some(true)).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    let (s, b) = copy_into(&api, DST, "dst", source, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    // A replication has no such flag.
+    let (s, b) = send(
+        &api,
+        DST,
+        "PUT",
+        "/v1/indexes/rep/replication",
+        &json!({"source": {"index": "src", "tenant": SRC.to_string()}, "read_only": true}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+}
+
+/// M167 criterion 3: the restore drill. A's store `main` holds S; B serves `far` and reads
+/// `main`. B exports S's index into X; A drops and collects S's; A restores X's export from
+/// `far` into a fresh R; B clears, drops and collects the export; and a process without
+/// `far` answers R as S answered.
+#[tokio::test(start_paused = true)]
+async fn an_export_restores_into_a_fresh_tenant() {
+    const X: u64 = 73;
+    const R: u64 = 74;
+    let world = World::new();
+    let a = world.api(1);
+    let b = Api::unsecured(world.far.clone(), LaneId(51)).unwrap();
+    let main: Arc<dyn BlobStore> = Arc::new(world.acct.as_tenant(TenantId(0)));
+    b.configure_replication(policy(), BTreeMap::from([("main".to_owned(), main)]));
+    // S: two folded segments, a delete vector, typed attributes and a text field.
+    for ids in [0..20_u32, 20..40] {
+        let docs: Vec<Value> = ids
+            .map(|i| {
+                json!({"id": format!("d{i:04}"), "vector": [f64::from(i).sin(), 1.0],
+                       "text": if i % 3 == 0 { "red fox" } else { "blue whale" },
+                       "attributes": {"n": i, "tag": format!("t{}", i % 4), "ok": i % 2 == 0}})
+            })
+            .collect();
+        let body = json!({"durability": "durable", "documents": docs,
+                          "schema": {"text": {"type": "string", "full_text_search": true}}});
+        let (s, r) = send(&a, SRC, "PUT", "/v1/indexes/src/documents", &body).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        send(&a, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+    }
+    let (s, r) = send(
+        &a,
+        SRC,
+        "PUT",
+        "/v1/indexes/src/documents",
+        &json!({"durability": "durable", "deletes": ["d0007"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    send(&a, SRC, "POST", "/v1/admin/fold", &Value::Null).await;
+    let text = json!({"text": "fox", "top_k": 5});
+    let query_text = |api: &A, tenant: u64, index: &'static str| {
+        let api = Arc::clone(api);
+        let text = text.clone();
+        async move {
+            let (s, r) = send(
+                &api,
+                tenant,
+                "POST",
+                &format!("/v1/indexes/{index}/query"),
+                &text,
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            r["results"].clone()
+        }
+    };
+    let want = (
+        answers(&a, SRC, "src").await,
+        query_text(&a, SRC, "src").await,
+    );
+    let want_digest = digest(&a, SRC, "src").await;
+    // On B: the export.
+    let (s, r) = copy_into(
+        &b,
+        X,
+        "exp",
+        json!({"index": "src", "tenant": SRC.to_string(), "store": "main"}),
+        Some(true),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    let mut workers = vec![(Arc::clone(&b), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (s, r) = send(&b, X, "GET", "/v1/indexes/exp/copy", &Value::Null).await;
+    assert_eq!(
+        (s, r["state"].clone()),
+        (StatusCode::OK, json!("succeeded")),
+        "{r}"
+    );
+    assert_eq!(r["read_only"], true, "{r}");
+    let (s, r) = send(
+        &b,
+        X,
+        "PUT",
+        "/v1/indexes/exp/documents",
+        &json!({"durability": "durable", "deletes": ["d0001"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "an export is read-only: {r}");
+    let export_digest = digest(&b, X, "exp").await;
+    assert_eq!(export_digest, want_digest);
+    // On A: the source dropped and collected.
+    let (s, r) = send(&a, SRC, "DELETE", "/v1/indexes/src", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    gc_until_gone(&a, &world.acct, SRC, "src").await;
+    // On A: the restore, from `far`.
+    let (s, r) = copy_into(
+        &a,
+        R,
+        "back",
+        json!({"index": "exp", "tenant": X.to_string(), "store": "far"}),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    let mut workers = vec![(Arc::clone(&a), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (s, r) = send(&a, R, "GET", "/v1/indexes/back/copy", &Value::Null).await;
+    assert_eq!(
+        (s, r["state"].clone(), r["read_only"].clone()),
+        (StatusCode::OK, json!("succeeded"), json!(false)),
+        "{r}"
+    );
+    // On B: the export cleared, dropped and collected.
+    let (s, r) = send(
+        &b,
+        X,
+        "PATCH",
+        "/v1/indexes/exp",
+        &json!({"read_only": false}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let (s, r) = send(&b, X, "DELETE", "/v1/indexes/exp", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    gc_until_gone(&b, &world.far, X, "exp").await;
+    // A process without `far` answers R as S answered.
+    let bare = Api::unsecured(world.acct.clone(), LaneId(2)).unwrap();
+    bare.configure_replication(policy(), BTreeMap::new());
+    assert_eq!(digest(&bare, R, "back").await, want_digest);
+    let got = (
+        answers(&bare, R, "back").await,
+        query_text(&bare, R, "back").await,
+    );
+    assert_eq!(got, want);
+    write(&bare, R, "back", 100..101).await;
+    assert!(
+        rows(&bare, R, "back")
+            .await
+            .unwrap()
+            .contains(&"d0100".to_owned())
+    );
 }

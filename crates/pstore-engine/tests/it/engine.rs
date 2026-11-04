@@ -409,7 +409,10 @@ async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     for name in ["s1", "s2"] {
         two.vectors.insert(
             name.into(),
-            pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
+            pstore_format::VectorField::Sparse(vec![(
+                "1".to_owned(),
+                pstore_format::Impact::new(0.5),
+            )]),
         );
     }
     assert!(
@@ -424,7 +427,7 @@ async fn a_write_the_format_cannot_store_is_refused_at_the_door() {
     let mut one = pstore_format::Document::new("d2", vec![1.0]);
     one.vectors.insert(
         "s1".into(),
-        pstore_format::VectorField::Sparse(vec![(1, pstore_format::Impact::new(0.5))]),
+        pstore_format::VectorField::Sparse(vec![("1".to_owned(), pstore_format::Impact::new(0.5))]),
     );
     e.write("idx", vec![one]).await.unwrap();
     e.flush().await.unwrap();

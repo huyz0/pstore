@@ -51,8 +51,8 @@ fn doc(i: u32) -> Document {
     d.vectors.insert(
         "s".into(),
         VectorField::Sparse(vec![
-            (3, Impact::new(0.5 + (i % 4) as f32 * 0.1)),
-            (i % 7 + 10, Impact::new(0.25)),
+            ("3".to_owned(), Impact::new(0.5 + (i % 4) as f32 * 0.1)),
+            ((i % 7 + 10).to_string(), Impact::new(0.25)),
         ]),
     );
     d
@@ -229,7 +229,7 @@ fn dense(field: &str, q: Vec<f32>) -> Prefetch {
 fn sparse() -> Prefetch {
     Prefetch::Sparse {
         field: "s".to_owned(),
-        query: vec![(3, 1.0), (12, 0.5)],
+        query: vec![("3".to_owned(), 1.0), ("12".to_owned(), 0.5)],
         limit: 10,
     }
 }
