@@ -44,6 +44,7 @@ mod gc_batch;
 mod head;
 mod idempotency;
 mod idle;
+mod index_limit;
 mod invariants;
 mod lane_taken;
 mod lanes;

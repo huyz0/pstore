@@ -2895,3 +2895,39 @@ async fn a_reindex_drops_what_it_leaves_out() {
     );
     assert_eq!(digest(&s.dst, "dst").await, digest(&s.src, "src").await);
 }
+
+/// M192: a second sync on one engine waits for the first. Two would derive the same copy keys,
+/// and one burying a key the other commits lets a GC reap it.
+#[tokio::test]
+async fn a_second_sync_waits_for_the_first() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let second_done = std::sync::atomic::AtomicBool::new(false);
+    let (mut st1, mut st2) = (SyncState::default(), SyncState::default());
+    let first = s
+        .dst
+        .replicate_with_interference_for_test(&s.remotes, &mut st1, async {
+            rx.await.unwrap();
+        });
+    let second = async {
+        let out = s.dst.replicate(&s.remotes, &mut st2).await;
+        second_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        out
+    };
+    let release = async {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let early = second_done.load(std::sync::atomic::Ordering::SeqCst);
+        tx.send(()).unwrap();
+        early
+    };
+    let (a, b, early) = tokio::join!(first, second, release);
+    assert!(!early, "the second sync ran while the first was mid-sync");
+    assert_eq!(a.unwrap().committed, vec!["dst".to_owned()]);
+    assert_eq!(b.unwrap().current, vec!["dst".to_owned()]);
+    s.same("after two syncs on one engine").await;
+    assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
+}

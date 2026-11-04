@@ -14,13 +14,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use pstore_blob::{Accounted, BlobError, BlobStore, Key, TenantView};
 use pstore_engine::{
-    CopyFailure, CopyState, CopyStatus, EngineError, ReplicaSource, Replication, Sources, SyncState,
+    CopyFailure, CopyState, CopyStatus, EngineError, ReplicaRefusal, ReplicaSource, Replication,
+    Sources, SyncState,
 };
 use pstore_jobs::{Claim, Entry, JobsError, Register};
 use pstore_types::TenantId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -47,6 +48,9 @@ pub struct ReplicationPolicy {
     pub idle: Duration,
     /// The register's shard count, honoured only when the register is first created.
     pub shards: u16,
+    /// The bound on a replica's lag behind a source in this store (M192): its source is
+    /// folded every half of it. `None`: no bound, and the source folds on its own triggers.
+    pub max_lag: Option<Duration>,
 }
 
 impl Default for ReplicationPolicy {
@@ -58,6 +62,7 @@ impl Default for ReplicationPolicy {
             period: Duration::from_secs(1),
             idle: Duration::from_secs(60),
             shards: 64,
+            max_lag: None,
         }
     }
 }
@@ -76,6 +81,8 @@ pub(crate) struct Replicating<S> {
     worker: AtomicBool,
     /// How many tenants it holds.
     held: AtomicUsize,
+    /// M192: bounded replications it holds whose lag is past the bound, at its last tick.
+    pub(crate) lagging: AtomicUsize,
     /// Tenants a control call claimed for this process's worker, which it adopts next tick.
     adopted: Mutex<Vec<(TenantId, u16, u64)>>,
     /// The clock claims are written in: wall time at start, advanced by tokio's clock, so a
@@ -93,6 +100,7 @@ impl<S> Default for Replicating<S> {
             register: tokio::sync::OnceCell::new(),
             worker: AtomicBool::new(false),
             held: AtomicUsize::new(0),
+            lagging: AtomicUsize::new(0),
             adopted: Mutex::new(Vec::new()),
             start: (wall, Instant::now()),
         }
@@ -113,7 +121,48 @@ impl<S> std::fmt::Debug for Replicating<S> {
 struct Note {
     last_commit_ms: Option<u64>,
     last_error: Option<String>,
+    /// M192: the start of the last source fold this replication is known current through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fresh_ms: Option<u64>,
+    /// M192: the bound the worker holds it to; `None` when it holds it to none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_lag_ms: Option<u64>,
+    /// M192: its lag was past the bound at the worker's last look.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lag_exceeded: bool,
 }
+
+/// The replications whose lag is past their bound, by these notes.
+fn exceeded(notes: &Notes) -> BTreeSet<&String> {
+    notes
+        .iter()
+        .filter(|(_, n)| n.lag_exceeded)
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// What a status must not wait `ttl / 3` to see (M192): which replications are past their
+/// bound, and which have a fresh time at all.
+fn urgent(notes: &Notes) -> (BTreeSet<&String>, BTreeSet<&String>) {
+    let known = notes
+        .iter()
+        .filter(|(_, n)| n.fresh_ms.is_some())
+        .map(|(d, _)| d)
+        .collect();
+    (exceeded(notes), known)
+}
+
+/// Whole milliseconds, saturating.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What a source fold's failure is recorded as, which its next success clears.
+const FOLD_ERROR: &str = "source fold: ";
+
+/// Each bounded replication's fold: when it started, as an instant and as wall time, or why
+/// it failed.
+type Folded = BTreeMap<String, Result<(Instant, u64), String>>;
 
 type Notes = BTreeMap<String, Note>;
 
@@ -203,6 +252,63 @@ struct Held {
     interval: Duration,
     notes: Notes,
     written: Option<(Instant, Notes)>,
+    /// M192: when this worker first saw each bounded replication: its lag's base before any
+    /// fold. Per replication, so one created on a held tenant does not start late.
+    seen: BTreeMap<String, Instant>,
+    /// M192: when its sources are folded next.
+    fold_due: Instant,
+    /// M192: each bounded replication's fresh time, as an instant and as wall time.
+    fresh: BTreeMap<String, (Instant, u64)>,
+}
+
+impl Held {
+    /// M192: after one sync, each bounded replication's fresh time, note and verdict. A
+    /// replication is bounded when its source is in this store; `ok` are those the sync
+    /// committed or found current. Answers how many went past the bound.
+    fn judge(
+        &mut self,
+        sources: &BTreeMap<String, ReplicaSource>,
+        folded: Option<&Folded>,
+        ok: &BTreeSet<String>,
+        lag: Duration,
+        now: Instant,
+    ) -> u64 {
+        // Only what runs now: a cancelled name re-created must not inherit its past.
+        self.seen.retain(|d, _| sources.contains_key(d));
+        self.fresh.retain(|d, _| sources.contains_key(d));
+        let mut into = 0;
+        for d in sources
+            .iter()
+            .filter(|(_, s)| s.store.is_empty())
+            .map(|(d, _)| d)
+        {
+            let n = self.notes.entry(d.clone()).or_default();
+            match folded.and_then(|f| f.get(d)) {
+                Some(Ok(at)) if ok.contains(d) => {
+                    self.fresh.insert(d.clone(), *at);
+                    if n.last_error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(FOLD_ERROR))
+                    {
+                        n.last_error = None;
+                    }
+                }
+                Some(Err(e)) => n.last_error = Some(clipped(&format!("{FOLD_ERROR}{e}"))),
+                _ => {}
+            }
+            let first = *self.seen.entry(d.clone()).or_insert(now);
+            let fresh = self.fresh.get(d);
+            let base = fresh.map_or(first, |(i, _)| *i);
+            let past = now.saturating_duration_since(base) > lag;
+            if past && !n.lag_exceeded {
+                into += 1;
+            }
+            n.lag_exceeded = past;
+            n.fresh_ms = fresh.map(|(_, w)| *w);
+            n.max_lag_ms = Some(ms(lag));
+        }
+        into
+    }
 }
 
 /// One process's replication worker: what it holds and when it next looks.
@@ -256,6 +362,52 @@ impl<S: BlobStore + 'static> Api<S> {
     fn now_ms(&self) -> u64 {
         let (wall, at) = self.replicating.start;
         wall.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Folds `tenant` through this process's engine for it (M192), counted by outcome. Any
+    /// process may fold any tenant: the commit is a CAS on its HEAD.
+    async fn fold_source(&self, tenant: TenantId) -> Result<(), String> {
+        let out = self.engine(tenant).await.fold_committed().await;
+        let outcome = match &out {
+            Ok(true) => "folded",
+            Ok(false) => "nothing",
+            Err(_) => "failed",
+        };
+        *self
+            .http
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .source_folds
+            .entry(outcome)
+            .or_default() += 1;
+        out.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Folds each distinct source tenant in this store, together (M192), and answers each
+    /// replication's outcome by its source tenant. A source in a remote store is not folded:
+    /// its credentials are read-only, and [`Held::judge`] never reads a remote one's entry.
+    async fn fold_sources(&self, sources: &BTreeMap<String, ReplicaSource>) -> Folded {
+        let started = (Instant::now(), self.now_ms());
+        let tenants: BTreeSet<TenantId> = sources
+            .values()
+            .filter(|s| s.store.is_empty())
+            .map(|s| s.tenant)
+            .collect();
+        let outcomes: BTreeMap<TenantId, Result<(), String>> = futures_util::future::join_all(
+            tenants
+                .into_iter()
+                .map(|t| async move { (t, self.fold_source(t).await) }),
+        )
+        .await
+        .into_iter()
+        .collect();
+        sources
+            .iter()
+            .filter_map(|(d, s)| {
+                let out = outcomes.get(&s.tenant)?.clone();
+                Some((d.clone(), out.map(|()| started)))
+            })
+            .collect()
     }
 
     /// The register, opened on first use: one GET of its `CONFIG` (and one CAS, the first
@@ -551,9 +703,21 @@ impl<S: BlobStore + 'static> Api<S> {
                 remotes: &self.replication().1,
                 tenant,
             };
+            // M192: the sources folded first, every half of the bound, so the sync carries
+            // everything they acknowledged before the fold began.
+            let folded = match (policy.max_lag, h.st.sources()) {
+                (Some(lag), Some(srcs)) if now >= h.fold_due => {
+                    h.fold_due = now + lag / 2;
+                    Some(self.fold_sources(&srcs).await)
+                }
+                _ => None,
+            };
+            let mut ok = BTreeSet::new();
             tick.synced += 1;
             let changed = match engine.replicate(&sources, &mut h.st).await {
                 Ok(out) => {
+                    ok.extend(out.committed.iter().cloned());
+                    ok.extend(out.current.iter().cloned());
                     // M166: a copy that ended no longer runs: the register's `gen` says so.
                     if !out.finished.is_empty() {
                         ended.push(tenant);
@@ -605,11 +769,22 @@ impl<S: BlobStore + 'static> Api<S> {
                 (h.interval * 2).min(policy.idle)
             };
             h.due = now + h.interval;
-            // Notes: only when they changed, and at most once per `ttl / 3`.
-            let stale = h
-                .written
-                .as_ref()
-                .is_none_or(|(at, n)| *n != h.notes && now >= *at + renew_every);
+            if let (Some(lag), Some(srcs)) = (policy.max_lag, h.st.sources()) {
+                let into = h.judge(&srcs, folded.as_ref(), &ok, lag, Instant::now());
+                self.http
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lag_exceeded += into;
+                if srcs.values().any(|s| s.store.is_empty()) {
+                    h.due = h.due.min(h.fold_due);
+                }
+            }
+            // Notes: only when they changed, and at most once per `ttl / 3` -- except a
+            // replication going past its bound or back, or getting its first fresh time,
+            // which is written at once (M192).
+            let stale = h.written.as_ref().is_none_or(|(at, n)| {
+                *n != h.notes && (now >= *at + renew_every || urgent(n) != urgent(&h.notes))
+            });
             if stale
                 && !h.notes.is_empty()
                 && let Ok(body) = serde_json::to_vec(&h.notes)
@@ -638,6 +813,10 @@ impl<S: BlobStore + 'static> Api<S> {
         // reserves its slot mid-tick, and a count rewritten from what the worker holds would
         // drop that reservation and let the next claim past `max`. Kept exact at each change.
         tick.held = w.held.len();
+        self.replicating.lagging.store(
+            w.held.values().map(|h| exceeded(&h.notes).len()).sum(),
+            Ordering::SeqCst,
+        );
         tick
     }
 
@@ -776,6 +955,14 @@ impl<S: BlobStore + 'static> Api<S> {
         );
         out.insert("last_commit_ms".to_owned(), json!(note.last_commit_ms));
         out.insert("last_error".to_owned(), json!(note.last_error));
+        // M192: what the worker bounds it to, and how far behind it was last known to be.
+        out.insert("max_lag_ms".to_owned(), json!(note.max_lag_ms));
+        out.insert("fresh_ms".to_owned(), json!(note.fresh_ms));
+        out.insert(
+            "lag_ms".to_owned(),
+            json!(note.fresh_ms.map(|f| self.now_ms().saturating_sub(f))),
+        );
+        out.insert("lag_exceeded".to_owned(), json!(note.lag_exceeded));
         Ok(Value::Object(out))
     }
 }
@@ -789,6 +976,9 @@ fn held(shard: u16, generation: u64, now: Instant, period: Duration) -> Held {
         interval: period,
         notes: Notes::new(),
         written: None,
+        seen: BTreeMap::new(),
+        fold_due: now,
+        fresh: BTreeMap::new(),
     }
 }
 
@@ -1076,6 +1266,69 @@ pub(crate) async fn cancel<S: BlobStore + 'static>(
     Ok(axum::Json(json!({"index": dest, "epoch": epoch.0})))
 }
 
+/// `POST /v1/indexes/{dest}/replication/sync` (M192): folds the source when it is in this
+/// store, then syncs the tenant's replications at once. With the source folded and `dest`
+/// current, every write the source acknowledged before the call is on the replica, and
+/// `fresh_ms` says from when.
+pub(crate) async fn sync_now<S: BlobStore + 'static>(
+    State(api): State<Arc<Api<S>>>,
+    Path(dest): Path<String>,
+    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::auth::Principal>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let tenant = tenant_of(&headers)?;
+    let engine = api.engine(tenant).await;
+    let Some((r, _, _)) = engine.replication_status(&dest).await? else {
+        return Err(EngineError::Replica(ReplicaRefusal::NotFound(dest)).into());
+    };
+    if !r.running {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "replication_paused",
+            format!("the replication into {dest:?} is paused: resume it to sync it"),
+        ));
+    }
+    // As a create's: the source's authority, before the source is touched.
+    principal.source(r.source.tenant, &r.source.store)?;
+    let unavailable =
+        |why: String| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable", why);
+    let fresh = if r.source.store.is_empty() {
+        let at = api.now_ms();
+        api.fold_source(r.source.tenant)
+            .await
+            .map_err(|e| unavailable(format!("{FOLD_ERROR}{e}")))?;
+        Some(at)
+    } else {
+        None
+    };
+    let sources = TenantSources {
+        remotes: &api.replication().1,
+        tenant,
+    };
+    let out = engine
+        .replicate(&sources, &mut SyncState::default())
+        .await?;
+    if let Some(why) = out.failed.get(&dest) {
+        return Err(unavailable(format!("sync: {why}")));
+    }
+    let mut v = if out.finished.contains(&dest) {
+        // A copy (M166) this sync ended: its entry goes, and its outcome is the answer.
+        let _ = api.reconcile(tenant, false).await;
+        api.copy_status_of(tenant, &dest).await?
+    } else {
+        api.status_of(tenant, &dest, false).await?
+    };
+    if let Value::Object(m) = &mut v {
+        m.insert("source_folded".to_owned(), json!(fresh.is_some()));
+        let current = out.committed.contains(&dest) || out.current.contains(&dest);
+        if let Some(at) = fresh.filter(|_| current) {
+            m.insert("fresh_ms".to_owned(), json!(at));
+            m.insert("lag_ms".to_owned(), json!(api.now_ms().saturating_sub(at)));
+        }
+    }
+    Ok(axum::Json(v))
+}
+
 /// `GET /v1/replications`: the tenant's replications, after one HEAD read.
 pub(crate) async fn list<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -1120,7 +1373,58 @@ pub async fn run_replication<S: BlobStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTE_BYTES, clipped};
+    use super::{BTreeMap, BTreeSet, Duration, Folded, Instant, NOTE_BYTES, clipped, held};
+    use pstore_engine::ReplicaSource;
+    use pstore_types::TenantId;
+
+    /// M192: the verdict at the bound and just past it, counted once, and a fold that was not
+    /// followed by a current sync moving nothing.
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a missing note is the test failing"
+    )]
+    fn judge_marks_past_the_bound_once_and_only_from_a_current_fold() {
+        let t0 = Instant::now();
+        let lag = Duration::from_secs(10);
+        let mut h = held(0, 1, t0, Duration::from_secs(1));
+        let srcs = BTreeMap::from([
+            ("d".to_owned(), ReplicaSource::local(TenantId(1), "s")),
+            (
+                "far".to_owned(),
+                ReplicaSource {
+                    store: "far".to_owned(),
+                    tenant: TenantId(1),
+                    index: "s".to_owned(),
+                },
+            ),
+        ]);
+        let ok = BTreeSet::from(["d".to_owned(), "far".to_owned()]);
+        let folded: Folded = BTreeMap::from([
+            ("d".to_owned(), Ok((t0, 1_000))),
+            ("far".to_owned(), Ok((t0, 1_000))),
+        ]);
+        assert_eq!(h.judge(&srcs, Some(&folded), &ok, lag, t0), 0);
+        assert_eq!(h.notes["d"].fresh_ms, Some(1_000));
+        // A remote source is never bounded, whatever a fold of its tenant id said.
+        assert!(!h.notes.contains_key("far"));
+        // Exactly at the bound: not past it.
+        assert_eq!(h.judge(&srcs, None, &ok, lag, t0 + lag), 0);
+        assert!(!h.notes["d"].lag_exceeded);
+        // Past it: counted once, however many syncs see it.
+        let late = t0 + lag + Duration::from_millis(1);
+        assert_eq!(h.judge(&srcs, None, &ok, lag, late), 1);
+        assert_eq!(h.judge(&srcs, None, &ok, lag, late), 0);
+        assert!(h.notes["d"].lag_exceeded);
+        // A fold whose sync did not find `d` current moves nothing.
+        let refold: Folded = BTreeMap::from([("d".to_owned(), Ok((late, 2_000)))]);
+        h.judge(&srcs, Some(&refold), &BTreeSet::new(), lag, late);
+        assert_eq!(h.notes["d"].fresh_ms, Some(1_000));
+        assert!(h.notes["d"].lag_exceeded);
+        h.judge(&srcs, Some(&refold), &ok, lag, late);
+        assert_eq!(h.notes["d"].fresh_ms, Some(2_000));
+        assert!(!h.notes["d"].lag_exceeded);
+    }
 
     #[test]
     fn a_note_is_clipped_at_a_char_boundary_below_the_limit() {

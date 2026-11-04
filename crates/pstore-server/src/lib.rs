@@ -188,6 +188,8 @@ struct Slot<S> {
 struct Registry {
     /// `PSTORE_ENGINES`: past it, idle engines are dropped. `0` for unbounded.
     cap: usize,
+    /// `PSTORE_INDEXES_PER_TENANT` (M169): the most indexes a tenant may hold. `0` for none.
+    index_limit: usize,
     /// Whether a reap loop runs: only then does a reapable commit keep an engine.
     reaping: bool,
     /// `PSTORE_APPLIED_WRITES=1` (M129): every node of the deployment folds applied writes.
@@ -304,6 +306,10 @@ struct Http {
     refusals: std::collections::BTreeMap<&'static str, u64>,
     /// `outcome -> count` for scheduled folds (M9i.1).
     folds: std::collections::BTreeMap<&'static str, u64>,
+    /// `outcome -> count` for folds of a replica's source (M192).
+    source_folds: std::collections::BTreeMap<&'static str, u64>,
+    /// Times a bounded replication went past its bound (M192).
+    lag_exceeded: u64,
 }
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -767,6 +773,10 @@ impl<S: BlobStore + 'static> Api<S> {
                 Write.on(post(replication::resume::<S>)),
             )
             .route(
+                "/v1/indexes/{index}/replication/sync",
+                Write.on(post(replication::sync_now::<S>)),
+            )
+            .route(
                 "/v1/indexes/{index}/schema",
                 Write.on(axum::routing::patch(patch_schema)),
             )
@@ -792,9 +802,9 @@ impl<S: BlobStore + 'static> Api<S> {
 
     /// The engine for `tenant`, built on first use.
     async fn engine(&self, tenant: TenantId) -> Arc<Tenant<S>> {
-        let (recheck, keys, filter_rows) = {
+        let (recheck, keys, filter_rows, index_limit) = {
             let r = self.registry_mut();
-            (r.lane_recheck, r.idempotency, r.filter_rows)
+            (r.lane_recheck, r.idempotency, r.filter_rows, r.index_limit)
         };
         let params = *self
             .index_params
@@ -827,7 +837,8 @@ impl<S: BlobStore + 'static> Api<S> {
             .with_projection_bytes(
                 self.projection_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),
-            );
+            )
+            .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
                 Some(prefixes) => engine.with_external_sources(prefixes.clone()),
@@ -1018,6 +1029,13 @@ impl<S: BlobStore + 'static> Api<S> {
     /// the eviction loop drops the least recently used idle engines.
     pub fn limit_engines(&self, cap: usize) {
         self.registry_mut().cap = cap;
+    }
+
+    /// Refuses a request that would give a tenant more than `limit` indexes, `0` for unbounded
+    /// (M169, `PSTORE_INDEXES_PER_TENANT`). Meant to be called once at startup: an engine
+    /// already built keeps the limit it was built with.
+    pub fn limit_indexes(&self, limit: usize) {
+        self.registry_mut().index_limit = limit;
     }
 
     /// Every engine built from now on re-reads HEAD on a flush whose last read of its lane is
@@ -1335,6 +1353,10 @@ impl From<EngineError> for ApiError {
             EngineError::IndexReadOnly(_) => {
                 Self::new(StatusCode::CONFLICT, "index_read_only", e.to_string())
             }
+            // M169: the tenant's state refuses it, and a drop is the remedy.
+            EngineError::IndexLimit { .. } => {
+                Self::new(StatusCode::CONFLICT, "index_limit", e.to_string())
+            }
             // M162: sized before any segment read; fewer queries fit.
             EngineError::RecallTooLarge { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "recall_too_large", e.to_string())
@@ -1488,6 +1510,38 @@ async fn metrics<S: BlobStore + 'static>(State(api): State<Arc<Api<S>>>) -> Resp
             http.folds.get(outcome).copied().unwrap_or(0)
         ));
     }
+    // M192: folds of a replica's source, and replications past their lag bound.
+    out.push_str(
+        "# HELP pstore_replication_source_fold_total Folds of a replica's source by outcome \
+         (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_source_fold_total counter\n");
+    for outcome in ["folded", "nothing", "failed"] {
+        out.push_str(&format!(
+            "pstore_replication_source_fold_total{{outcome=\"{outcome}\"}} {}\n",
+            http.source_folds.get(outcome).copied().unwrap_or(0)
+        ));
+    }
+    out.push_str(
+        "# HELP pstore_replication_lag_exceeded_total Times a bounded replication's lag went \
+         past the bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lag_exceeded_total counter\n");
+    out.push_str(&format!(
+        "pstore_replication_lag_exceeded_total {}\n",
+        http.lag_exceeded
+    ));
+    out.push_str(
+        "# HELP pstore_replication_lagging Bounded replications this worker holds past their \
+         lag bound (M192).\n",
+    );
+    out.push_str("# TYPE pstore_replication_lagging gauge\n");
+    out.push_str(&format!(
+        "pstore_replication_lagging {}\n",
+        api.replicating
+            .lagging
+            .load(std::sync::atomic::Ordering::SeqCst)
+    ));
     // M54: parts of queries sent to peers, those that failed, and those run for peers. M56:
     // and how many servers the list holds now, this one included.
     let (sent, failed, servers) = api
@@ -6136,6 +6190,9 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// The engine registry's cap, from `PSTORE_ENGINES` (M26): 10 000 by default, `0` for none.
     pub engines: usize,
+    /// The most indexes a tenant may hold, from `PSTORE_INDEXES_PER_TENANT` (M169): 10 000 by
+    /// default, `0` for none.
+    pub indexes_per_tenant: usize,
     /// The servers a query's vector legs may run on, from `PSTORE_PEERS` (M54).
     pub peers: Option<PeerConfig>,
     /// Or a SWIM membership to take them from, `PSTORE_PEER_GOSSIP_*` (M56).
@@ -6145,6 +6202,10 @@ pub struct Config {
     /// `PSTORE_EXTERNAL_SOURCES=allow` and `PSTORE_EXTERNAL_PREFIXES`.
     pub external_sources: Option<Vec<String>>,
 }
+
+/// `PSTORE_INDEXES_PER_TENANT` unset (M169): below M7b's ~29,700, where a whole-HEAD read
+/// stops being cheaper than a round trip, and above the thousands `scripts/index-scale.sh` checks.
+pub const DEFAULT_INDEXES_PER_TENANT: usize = 10_000;
 
 /// One named remote store a replication may read (M22): read-only and S3-compatible -- GCS
 /// through its S3 interoperability endpoint.
@@ -6341,6 +6402,9 @@ pub enum ConfigError {
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
+    /// `PSTORE_INDEXES_PER_TENANT` that is not a count (M169).
+    #[error("PSTORE_INDEXES_PER_TENANT={0} is refused: a count of indexes, 0 for unbounded")]
+    IndexesPerTenant(String),
     /// A `PSTORE_EXTERNAL_SOURCES` that is neither `allow` nor `off` (M86).
     #[error("PSTORE_EXTERNAL_SOURCES={0} is refused: `allow` or `off`")]
     ExternalSources(String),
@@ -6414,6 +6478,10 @@ impl Config {
             engines: match get("PSTORE_ENGINES") {
                 None => 10_000,
                 Some(v) => v.parse().map_err(|_| ConfigError::Engines(v))?,
+            },
+            indexes_per_tenant: match get("PSTORE_INDEXES_PER_TENANT") {
+                None => DEFAULT_INDEXES_PER_TENANT,
+                Some(v) => v.parse().map_err(|_| ConfigError::IndexesPerTenant(v))?,
             },
         })
     }
@@ -6495,6 +6563,18 @@ fn replication_policy(
             .map_or(d.max, |n| usize::try_from(n).unwrap_or(usize::MAX)),
         idle: positive("PSTORE_REPLICATION_IDLE_S")?.map_or(d.idle, secs),
         shards,
+        // M192: the source is folded every half of it, by a loop that looks once a second.
+        max_lag: match positive("PSTORE_REPLICATION_MAX_LAG_S")? {
+            None => None,
+            Some(n) if n < 2 => {
+                return Err(ConfigError::Replication(
+                    "PSTORE_REPLICATION_MAX_LAG_S",
+                    n.to_string(),
+                    "at least 2: the source is folded every half of it",
+                ));
+            }
+            Some(n) => Some(secs(n)),
+        },
         ..d
     };
     Ok(on.then_some(policy))

@@ -6,6 +6,7 @@ mod bundle;
 mod external;
 mod filter_rows;
 mod head;
+mod index_limit;
 pub mod lanes;
 mod recall;
 mod replica;
@@ -456,6 +457,14 @@ pub enum EngineError {
     /// A write, or a drop, named an index its owner made read-only (M149).
     #[error("the index {0:?} is read-only")]
     IndexReadOnly(String),
+    /// A request would add an index to a tenant that holds `limit` already (M169).
+    #[error(
+        "the tenant holds {limit} indexes, its limit: a new index is refused until one is dropped"
+    )]
+    IndexLimit {
+        /// The limit the tenant is at.
+        limit: usize,
+    },
     /// A recall request would score more rows than [`RECALL_ROW_BUDGET`] (M162).
     #[error("recall would score {rows} rows, over the budget of {budget}")]
     RecallTooLarge {
@@ -2295,6 +2304,12 @@ pub struct Engine<S> {
     /// `schemas` and by the same rule: an early refusal at zero requests, re-read before it
     /// stands.
     replica_names: Mutex<std::collections::BTreeSet<String>>,
+    /// The most indexes this tenant may hold (M169), `0` for unbounded.
+    index_limit: usize,
+    /// The names the last HEAD this process read counts against `index_limit` (M169), by
+    /// `schemas`' rule: monotonic by epoch, an early refusal re-read before it stands. Kept
+    /// only while a limit is set.
+    counted: Mutex<Option<(Epoch, std::collections::BTreeSet<String>)>>,
     /// The attribute types this process's own writes declared and no schema it has read
     /// records yet, per index (M173): what the door reads beside the recorded ones. An entry
     /// leaves when a schema this process reads records its name, whatever kind it records,
@@ -2355,6 +2370,9 @@ pub struct Engine<S> {
     /// M129: an applied request folds, and reads outcome objects, only through this, so
     /// concurrent ones share a fold and its reads.
     fold_gate: tokio::sync::Mutex<()>,
+    /// M192: one replication sync at a time on this engine. Two derive the same copy keys
+    /// (same lane, same epoch), and one burying a key the other commits lets a GC reap it.
+    pub(crate) sync_gate: tokio::sync::Mutex<()>,
     /// M129: one HEAD read refreshes a stale mark for every request waiting on it.
     mark_gate: tokio::sync::Mutex<()>,
     /// M129: the highest-epoch HEAD this engine has read or committed.
@@ -2500,6 +2518,8 @@ impl<S: BlobStore> Engine<S> {
             seq: Mutex::new(None),
             schemas: Mutex::new(None),
             replica_names: Mutex::new(std::collections::BTreeSet::new()),
+            index_limit: 0,
+            counted: Mutex::new(None),
             unfolded_types: Mutex::new(BTreeMap::new()),
             read_only_names: Mutex::new(std::collections::BTreeSet::new()),
             head_cache: Mutex::new(None),
@@ -2516,6 +2536,7 @@ impl<S: BlobStore> Engine<S> {
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fold_gate: tokio::sync::Mutex::new(()),
+            sync_gate: tokio::sync::Mutex::new(()),
             mark_gate: tokio::sync::Mutex::new(()),
             observed: Mutex::new(Observed::default()),
             outcome_cache: Mutex::new(BTreeMap::new()),
@@ -2650,6 +2671,7 @@ impl<S: BlobStore> Engine<S> {
                 flagged.clone_from(&head.read_only);
             }
         }
+        self.remember_counted(head);
     }
 
     /// Refuses a write into a replica index (M22): by what this process last read, at zero
@@ -3905,6 +3927,7 @@ impl<S: BlobStore> Engine<S> {
         declared: &Declared,
     ) -> Result<(), EngineError> {
         self.refuse_replica(index).await?;
+        self.refuse_past_limit_at_door(index).await?;
         // `id` is no attribute a segment stores, so a sketch of it would describe nothing --
         // or a user attribute of that name, and prune `id` filters by it (code review, M15).
         if declared
@@ -5241,6 +5264,7 @@ impl<S: BlobStore> Engine<S> {
                      would hide its past; branch to another name, or after GC"
                 )));
             }
+            self.refuse_past_limit(&at.head, dest)?;
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
@@ -5388,6 +5412,7 @@ impl<S: BlobStore> Engine<S> {
             {
                 return Err(EngineError::IndexExists(index.to_owned()));
             }
+            self.refuse_past_limit(&at.head, index)?;
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
