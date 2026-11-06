@@ -2137,3 +2137,54 @@ async fn a_reindex_body_is_checked() {
         "{f}"
     );
 }
+
+/// Wall-clock now, in milliseconds.
+fn wall_ms() -> u64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    u64::try_from(d.as_millis()).unwrap()
+}
+
+/// An RFC 3339 time in milliseconds, as milliseconds.
+fn rfc_ms(v: &Value) -> u64 {
+    let s = v.as_str().unwrap_or_else(|| panic!("not a time: {v}"));
+    let frac = s.rsplit_once('.').unwrap().1;
+    assert_eq!(frac.len(), 4, "millisecond precision: {s}");
+    u64::try_from(pstore_format::datetime::parse(s).unwrap() / 1000).unwrap()
+}
+
+/// M194 criterion 5: a copy's answer and status carry `created_at`, and `ended_at` once it
+/// has ended, as RFC 3339 times.
+#[tokio::test(start_paused = true)]
+async fn a_copy_status_has_wall_clock_times() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..20).await;
+    let lo = wall_ms();
+    let (s, started) = copy(
+        &api,
+        "dst",
+        json!({"index": "src", "tenant": SRC.to_string()}),
+    )
+    .await;
+    let hi = wall_ms();
+    assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+    let created = rfc_ms(&started["created_at"]);
+    assert!((lo..=hi).contains(&created), "{lo} <= {created} <= {hi}");
+    assert_eq!(started["ended_at"], Value::Null, "{started}");
+    let (_, running) = copy_status(&api, "dst").await;
+    assert_eq!(running["created_at"], started["created_at"], "{running}");
+    assert_eq!(running["ended_at"], Value::Null, "{running}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let after = wall_ms();
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert_eq!(done["created_at"], started["created_at"], "{done}");
+    let ended = rfc_ms(&done["ended_at"]);
+    assert!(
+        (created..=after).contains(&ended),
+        "{created} <= {ended} <= {after}"
+    );
+}

@@ -100,6 +100,10 @@ pub struct CopyStatus {
     pub read_only: bool,
     /// The options it rebuilds under (M168): a reindex. `None` for a byte copy.
     pub reindex: Option<Reindex>,
+    /// The clock of the commit that created it (M194); `None` for a copy made before M194.
+    pub created_ms: Option<u64>,
+    /// The clock of the commit that ended it (M194); `None` while it runs or is paused.
+    pub ended_ms: Option<u64>,
 }
 
 /// What a copy asks besides its source (M166, M167, M168).
@@ -354,7 +358,8 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
     ) -> Result<Epoch, EngineError> {
-        self.create_inner(dest, source, from, None, &mut None).await
+        self.create_inner(dest, source, from, None, &mut None, &mut None)
+            .await
     }
 
     /// [`Self::create_replication`], a copy when `once` is `Some` (M166), an export when it
@@ -367,6 +372,7 @@ impl<S: BlobStore> Engine<S> {
         from: &R,
         once: Option<&Ask>,
         matched: &mut Option<CopyStatus>,
+        created: &mut Option<u64>,
     ) -> Result<Epoch, EngineError> {
         let refuse = |r| Err(EngineError::Replica(r));
         for n in [dest, source.index.as_str()] {
@@ -434,8 +440,13 @@ impl<S: BlobStore> Engine<S> {
             );
             // M166: a new operation into `dest` replaces how its last copy ended.
             next.copies.remove(dest);
+            // M194: a copy's create records when, as the winning attempt's answer reports it. A
+            // replication writes no time: the encode filter drops a stale record for its name.
             if once.is_some() {
                 next.once.insert(dest.to_owned());
+                let now_ms = self.now_ms();
+                next.copy_times.insert(dest.to_owned(), (now_ms, 0));
+                *created = Some(now_ms);
             } else {
                 next.once.remove(dest);
             }
@@ -528,9 +539,16 @@ impl<S: BlobStore> Engine<S> {
         if let Some(s) = same_copy(&at.head, dest, &source, &ask) {
             return Ok((s, false));
         }
-        let mut matched = None;
+        let (mut matched, mut created) = (None, None);
         let epoch = self
-            .create_inner(dest, source.clone(), from, Some(&ask), &mut matched)
+            .create_inner(
+                dest,
+                source.clone(),
+                from,
+                Some(&ask),
+                &mut matched,
+                &mut created,
+            )
             .await?;
         if let Some(s) = matched {
             return Ok((s, false));
@@ -545,6 +563,8 @@ impl<S: BlobStore> Engine<S> {
                 failure: None,
                 read_only: ask.read_only,
                 reindex: ask.reindex,
+                created_ms: created,
+                ended_ms: None,
             },
             true,
         ))
@@ -627,6 +647,7 @@ impl<S: BlobStore> Engine<S> {
                         end: CopyEnd::Cancelled,
                     },
                 );
+                self.stamp_end(next, dest);
             }
             Ok(Some(()))
         })
@@ -942,6 +963,7 @@ impl<S: BlobStore> Engine<S> {
                         end,
                     };
                     next.record_copy(d, outcome);
+                    self.stamp_end(&mut next, d);
                     ended.push(d.clone());
                 }
             }
@@ -959,6 +981,7 @@ impl<S: BlobStore> Engine<S> {
                         end: CopyEnd::Failed(*failure),
                     };
                     next.record_copy(d, outcome);
+                    self.stamp_end(&mut next, d);
                     ended.push(d.clone());
                 }
             }
@@ -1553,6 +1576,18 @@ impl<S: BlobStore> Engine<S> {
     }
 }
 
+impl<S: BlobStore> Engine<S> {
+    /// Stamps the copy into `dest` as ended by the commit of `next` (M194), at this clock and
+    /// never at 0, which reads as not ended. Only a record that exists: a copy made before
+    /// M194 has none, and ends with none.
+    fn stamp_end(&self, next: &mut Head, dest: &str) {
+        let now_ms = self.now_ms().max(1);
+        if let Some((_, ended)) = next.copy_times.get_mut(dest) {
+            *ended = now_ms;
+        }
+    }
+}
+
 /// The copy into `dest`'s status in `h` (M166): its running or paused replication, or else
 /// how it ended.
 fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
@@ -1572,6 +1607,8 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
             failure: None,
             read_only: h.exports.contains(dest),
             reindex: h.reindexes.get(dest).cloned(),
+            created_ms: h.copy_times.get(dest).map(|(c, _)| *c),
+            ended_ms: None,
         });
     }
     let o = h.copies.get(dest)?;
@@ -1589,6 +1626,9 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
         failure,
         read_only: h.exports.contains(dest),
         reindex: h.reindexes.get(dest).cloned(),
+        created_ms: h.copy_times.get(dest).map(|(c, _)| *c),
+        // An ended copy's record is always stamped, never 0 (`stamp_end`).
+        ended_ms: h.copy_times.get(dest).map(|(_, e)| *e),
     })
 }
 
