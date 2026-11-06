@@ -19,7 +19,8 @@ pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
     COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, Dicts, ExternalKind, ExternalRef, Head,
-    HeadAt, IndexSchema, MAX_TEXTS, Metric, ReplicaSource, Replication, SegmentRef, TimeTravel,
+    HeadAt, IndexSchema, MAX_TEXTS, Metric, Reindex, ReplicaSource, Replication, SegmentRef,
+    TimeTravel,
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
@@ -2075,7 +2076,14 @@ pub struct Answer {
     /// Each hit's projected named fields (M190), in client space, by name: one entry a hit,
     /// holding only the fields its row has. **Empty** for every query that names none.
     pub fields: Vec<Fields>,
+    /// Each hit's sparse pairs (M193) as stored, in key order: one entry a hit, `None` for a
+    /// row without the field. **Empty** for every query that does not project it.
+    pub sparse: Vec<Option<Sparse>>,
 }
+
+/// A row's sparse pairs as a projection answers them (M193): each weight as stored, in key
+/// byte order.
+pub type Sparse = Vec<(String, f32)>;
 
 /// A row's named dense fields, each its vectors in the order written (M190).
 pub type Fields = BTreeMap<String, Vec<Vec<f32>>>;
@@ -2087,6 +2095,8 @@ pub struct Projected {
     pub vector: Option<Vec<f32>>,
     /// Its named fields in client space; empty when it holds none of those asked.
     pub fields: Fields,
+    /// Its sparse pairs as stored (M193), or `None`.
+    pub sparse: Option<Sparse>,
 }
 
 /// One resolved hit: its id, fused score, attributes, and `$dist` when the dense leg scored it.
@@ -2619,6 +2629,15 @@ impl<S: BlobStore> Engine<S> {
     #[must_use]
     pub fn with_projection_bytes(mut self, bytes: u64) -> Self {
         self.projection_bytes = bytes;
+        self
+    }
+
+    /// Folds without each row's sparse pairs when `write` is false, as a build before M193
+    /// did: a test's way to hold such a segment.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_sparse_rows(mut self, write: bool) -> Self {
+        self.params.sparse_rows = write;
         self
     }
 
@@ -4598,7 +4617,17 @@ impl<S: BlobStore> Engine<S> {
                 let dist = answer.dists.get(i).copied().flatten();
                 let vector = answer.vectors.get(i).cloned().flatten();
                 let fields = answer.fields.get(i).cloned().unwrap_or_default();
-                row.map(|(id, attrs)| ((id, h.score, attrs, dist), Projected { vector, fields }))
+                let sparse = answer.sparse.get(i).cloned().flatten();
+                row.map(|(id, attrs)| {
+                    (
+                        (id, h.score, attrs, dist),
+                        Projected {
+                            vector,
+                            fields,
+                            sparse,
+                        },
+                    )
+                })
             })
             .collect()
     }
@@ -7540,6 +7569,7 @@ impl<S: BlobStore> Engine<S> {
             peers,
             true,
             &[],
+            false,
         )
         .await
     }
@@ -7566,6 +7596,7 @@ impl<S: BlobStore> Engine<S> {
         peers: Option<&dyn Peers>,
         vector: bool,
         named: &[String],
+        sparse: bool,
     ) -> Result<Answer, EngineError> {
         self.query_split_inner(
             index,
@@ -7580,6 +7611,7 @@ impl<S: BlobStore> Engine<S> {
                 named,
                 folded: 0,
                 max_bytes: self.projection_bytes,
+                sparse,
             },
         )
         .await
@@ -7846,6 +7878,7 @@ impl<S: BlobStore> Engine<S> {
                 fts,
                 vectors: Vec::new(),
                 fields: Vec::new(),
+                sparse: Vec::new(),
             });
         }
 
@@ -7890,6 +7923,7 @@ impl<S: BlobStore> Engine<S> {
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;
         let fields = projected_fields(&resolved, &unfolded, unfolded_at, metric, vectors.named);
+        let sparse = projected_sparse(&resolved, &unfolded, unfolded_at, vectors.sparse);
         let (hits, ids, attributes, dists, vectors) =
             split_rows(resolved, metric, q2, vectors.vector);
         Ok(Answer {
@@ -7907,6 +7941,7 @@ impl<S: BlobStore> Engine<S> {
             fts,
             vectors,
             fields,
+            sparse,
         })
     }
 
@@ -8225,6 +8260,7 @@ impl<S: BlobStore> Engine<S> {
                 fts: schema.fts,
                 vectors: Vec::new(),
                 fields: Vec::new(),
+                sparse: Vec::new(),
             });
         }
         // ⚠️ **One past the last segment, never zero.** `unfolded_at` is the ordinal the
@@ -8272,6 +8308,7 @@ impl<S: BlobStore> Engine<S> {
             fts: schema.fts,
             vectors,
             fields: Vec::new(),
+            sparse: Vec::new(),
         })
     }
 
@@ -8354,8 +8391,18 @@ impl<S: BlobStore> Engine<S> {
         limit: usize,
         consistency: Consistency,
     ) -> Result<Ordered, EngineError> {
-        self.ordered_projected(index, by, filter, offset, limit, consistency, true, &[])
-            .await
+        self.ordered_projected(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            consistency,
+            true,
+            &[],
+            false,
+        )
+        .await
     }
 
     /// [`Self::ordered_vectors`], each row carrying its `vector` when `vector` asks and its
@@ -8379,12 +8426,14 @@ impl<S: BlobStore> Engine<S> {
         consistency: Consistency,
         vector: bool,
         named: &[String],
+        sparse: bool,
     ) -> Result<Ordered, EngineError> {
         let projection = pstore_query::Projection {
             vector,
             named,
             folded: 0,
             max_bytes: self.projection_bytes,
+            sparse,
         };
         self.ordered_at(
             index,
@@ -8530,6 +8579,15 @@ impl<S: BlobStore> Engine<S> {
                         .into_iter()
                         .map(|(name, vs)| (name.into(), pstore_format::VectorField::Dense(vs))),
                 );
+                // M193: and its sparse field, as a fold stores it.
+                if vectors.sparse {
+                    held.extend(sparse_pairs_of(d).map(|(name, pairs)| {
+                        (
+                            name,
+                            pstore_format::VectorField::Sparse(stored_pairs(pairs)),
+                        )
+                    }));
+                }
                 selector.offer(Document {
                     id: d.id.clone(),
                     vectors: held,
@@ -8546,13 +8604,14 @@ impl<S: BlobStore> Engine<S> {
         // M179: the page's folded rows' vectors, one fan-out over the segments selection
         // opened -- the order's fourth round, and only when asked.
         // M190: and their named fields, in the same fan-out.
-        let mut read = if vectors.vector || !vectors.named.is_empty() {
+        let mut read = if vectors.vector || !vectors.named.is_empty() || vectors.sparse {
             let wanted: Vec<pstore_query::Located> =
                 page.iter().filter_map(|(_, at)| *at).collect();
             pstore_query::vectors_at(&*self.store, &targets, &segments, &wanted, vectors)
                 .await
                 .map_err(|e| match e {
-                    pstore_query::QueryError::ProjectionTooLarge { .. } => {
+                    pstore_query::QueryError::ProjectionTooLarge { .. }
+                    | pstore_query::QueryError::SparseUnstored(_) => {
                         EngineError::Unprojected(e.to_string())
                     }
                     e => EngineError::Query(e.to_string()),
@@ -8567,9 +8626,19 @@ impl<S: BlobStore> Engine<S> {
                     // Every vector read is one a write measured, so none is empty.
                     d.vectors = fields
                         .into_iter()
-                        .map(|(name, vs)| {
-                            let vs = vs.iter().map(|v| client_space(metric, v)).collect();
-                            (name.into(), pstore_format::VectorField::Dense(vs))
+                        .map(|(name, field)| {
+                            let field = match field {
+                                pstore_format::VectorField::Dense(vs) => {
+                                    pstore_format::VectorField::Dense(
+                                        vs.iter().map(|v| client_space(metric, v)).collect(),
+                                    )
+                                }
+                                // M193: as stored, in key order.
+                                pstore_format::VectorField::Sparse(pairs) => {
+                                    pstore_format::VectorField::Sparse(stored_pairs(&pairs))
+                                }
+                            };
+                            (name.into(), field)
                         })
                         .collect();
                 }
@@ -9406,6 +9475,63 @@ fn projected_fields(
         .collect()
 }
 
+/// Each resolved hit's sparse pairs as stored (M193), its row read or, unfolded, from
+/// memory; empty unless `asked`.
+fn projected_sparse(
+    resolved: &[(pstore_query::Hit, Option<Document>, Option<f32>)],
+    unfolded: &[Document],
+    unfolded_at: usize,
+    asked: bool,
+) -> Vec<Option<Sparse>> {
+    if !asked {
+        return Vec::new();
+    }
+    resolved
+        .iter()
+        .map(|(h, d, _)| {
+            let row = if h.segment == unfolded_at {
+                unfolded.get(h.row)
+            } else {
+                d.as_ref()
+            };
+            row.and_then(sparse_pairs_of).map(|(_, pairs)| {
+                stored_pairs(pairs)
+                    .into_iter()
+                    .map(|(k, w)| (k, w.get()))
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// `d`'s sparse field and its pairs (M193): one a document at most (M178).
+fn sparse_pairs_of(
+    d: &Document,
+) -> Option<(pstore_format::Field, &[(String, pstore_format::Impact)])> {
+    d.vectors.iter().find_map(|(name, f)| match f {
+        pstore_format::VectorField::Sparse(pairs) => Some((name.clone(), pairs.as_slice())),
+        pstore_format::VectorField::Dense(_) => None,
+    })
+}
+
+/// `pairs` as a fold stores them (M193): each weight its f16, in key byte order.
+fn stored_pairs<P: std::borrow::Borrow<(String, pstore_format::Impact)>>(
+    pairs: impl IntoIterator<Item = P>,
+) -> Vec<(String, pstore_format::Impact)> {
+    let mut out: Vec<(String, pstore_format::Impact)> = pairs
+        .into_iter()
+        .map(|p| {
+            let (k, w) = p.borrow();
+            (
+                k.clone(),
+                pstore_format::Impact::new(pstore_format::sparse::stored_weight(w.get())),
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// `d`'s dense fields among `named`, each vector in client space (M190). A field it lacks has
 /// no entry; a write admits none of no vectors (M61).
 fn fields_of(d: &Document, metric: Metric, named: &[String]) -> Fields {
@@ -9609,9 +9735,11 @@ fn query_error(
             EngineError::UnknownTextField(field)
         }
         // M191: and a projection past its bound.
-        (e @ pstore_query::QueryError::ProjectionTooLarge { .. }, _) => {
-            EngineError::Unprojected(e.to_string())
-        }
+        (
+            e @ (pstore_query::QueryError::ProjectionTooLarge { .. }
+            | pstore_query::QueryError::SparseUnstored(_)),
+            _,
+        ) => EngineError::Unprojected(e.to_string()),
         (
             pstore_query::QueryError::Format(pstore_format::FormatError::UnknownField),
             Some(field),

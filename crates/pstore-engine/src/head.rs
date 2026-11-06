@@ -290,6 +290,40 @@ pub struct Head {
     /// section, after the copies; `encode` keeps a name only while [`Self::once`] (of a
     /// replication that exists) or [`Self::copies`] holds it, so it goes with the record.
     pub exports: BTreeSet<String>,
+    /// The copies that rebuild under changed text and regex options (M168): reindexes, with
+    /// what each asked. ⚠️ The last trailing section, after the exports; `encode` keeps a name
+    /// only as it keeps an export's.
+    pub reindexes: BTreeMap<String, Reindex>,
+}
+
+/// What a reindex asks (M168): the text and regex options `dest` is rebuilt under, applied
+/// to the source's schema by [`Reindex::apply`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reindex {
+    /// The primary text field's options, replacing the source's; `None` keeps them.
+    pub fts: Option<pstore_format::text::FullText>,
+    /// The further text fields, replacing the source's whole set.
+    pub texts: BTreeMap<String, pstore_format::text::FullText>,
+    /// The regex attributes, replacing the source's whole set: sorted, each once.
+    pub trigram: Vec<String>,
+}
+
+impl Reindex {
+    /// `source` with these options. `own` is the text field a primary declaration names
+    /// when `source` records none yet: the field this process seals text under.
+    #[must_use]
+    pub fn apply(&self, source: &IndexSchema, own: &str) -> IndexSchema {
+        let mut s = source.clone();
+        if let Some(fts) = self.fts {
+            s.fts = fts;
+            if s.text_field.is_empty() {
+                own.clone_into(&mut s.text_field);
+            }
+        }
+        s.texts.clone_from(&self.texts);
+        s.trigram.clone_from(&self.trigram);
+        s
+    }
 }
 
 /// The most copy outcomes a tenant's HEAD keeps (M166).
@@ -328,6 +362,9 @@ pub enum CopyEnd {
 pub enum CopyFailure {
     /// The source held no folded segment.
     SourceNotFound,
+    /// A reindex's rows could not be sealed under its options (M168): a refusal that is the
+    /// same on every retry.
+    RebuildRefused,
 }
 
 /// Where a replica's source index lives (M22).
@@ -656,6 +693,12 @@ impl Head {
             .iter()
             .filter(|n| once.contains(n) || self.copies.contains_key(*n))
             .collect();
+        // M168: the reindexes after the exports, by the same rule, forcing the exports' count.
+        let reindexes: Vec<(&String, &Reindex)> = self
+            .reindexes
+            .iter()
+            .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
+            .collect();
         let copied = !once.is_empty() || !self.copies.is_empty();
         let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
@@ -833,14 +876,37 @@ impl Head {
                         out.extend_from_slice(&source_epoch.to_le_bytes());
                     }
                     CopyEnd::Failed(CopyFailure::SourceNotFound) => out.extend_from_slice(&[1, 0]),
+                    CopyEnd::Failed(CopyFailure::RebuildRefused) => out.extend_from_slice(&[1, 1]),
                     CopyEnd::Cancelled => out.push(2),
                 }
             }
         }
-        if !exports.is_empty() {
+        if !exports.is_empty() || !reindexes.is_empty() {
             out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
             for name in exports {
                 put_str(&mut out, name);
+            }
+        }
+        if !reindexes.is_empty() {
+            out.extend_from_slice(&(reindexes.len() as u32).to_le_bytes());
+            for (name, r) in reindexes {
+                put_str(&mut out, name);
+                match &r.fts {
+                    Some(f) => {
+                        out.push(1);
+                        put_str(&mut out, &f.encode());
+                    }
+                    None => out.push(0),
+                }
+                out.extend_from_slice(&(r.texts.len() as u32).to_le_bytes());
+                for (field, f) in &r.texts {
+                    put_str(&mut out, field);
+                    put_str(&mut out, &f.encode());
+                }
+                out.extend_from_slice(&(r.trigram.len() as u32).to_le_bytes());
+                for n in &r.trigram {
+                    put_str(&mut out, n);
+                }
             }
         }
         out
@@ -1299,6 +1365,7 @@ impl Head {
                 },
                 1 => match c.u8()? {
                     0 => CopyEnd::Failed(CopyFailure::SourceNotFound),
+                    1 => CopyEnd::Failed(CopyFailure::RebuildRefused),
                     _ => return Err(EngineError::CorruptHead),
                 },
                 2 => CopyEnd::Cancelled,
@@ -1325,6 +1392,32 @@ impl Head {
         }
         for _ in 0..c.u32()? {
             h.exports.insert(c.string()?);
+        }
+        // M168: and here, no reindexes.
+        if c.at_end() {
+            return Ok(h);
+        }
+        let fts = |c: &mut Cur<'_>| {
+            pstore_format::text::FullText::decode(&c.string()?).ok_or(EngineError::CorruptHead)
+        };
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let mut r = Reindex {
+                fts: match c.u8()? {
+                    0 => None,
+                    1 => Some(fts(&mut c)?),
+                    _ => return Err(EngineError::CorruptHead),
+                },
+                ..Reindex::default()
+            };
+            for _ in 0..c.u32()? {
+                let field = c.string()?;
+                r.texts.insert(field, fts(&mut c)?);
+            }
+            for _ in 0..c.u32()? {
+                r.trigram.push(c.string()?);
+            }
+            h.reindexes.insert(name, r);
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2735,6 +2828,108 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// M168 criterion 9: the reindexes round-trip after the exports, absent or present; a
+    /// HEAD without them encodes as M167's; `encode` keeps a name only while a live once-name
+    /// or an outcome holds it; a cut never decodes them; and the new failure code round-trips.
+    #[test]
+    fn reindexes_round_trip_after_exports() -> Result<(), EngineError> {
+        use pstore_format::text::FullText;
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        let mut stemmed = FullText::default();
+        stemmed.analyzer.stemming = true;
+        stemmed.k1 = 0.5;
+        let asked = Reindex {
+            fts: Some(stemmed),
+            texts: [("body".to_owned(), FullText::default())].into(),
+            trigram: vec!["tag".to_owned(), "zz".to_owned()],
+        };
+        for base in [Head::default(), sample(), every_section()] {
+            let mut m167 = base.clone();
+            m167.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            m167.once.insert("running".to_owned());
+            m167.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 10,
+                    epoch: 20,
+                    end: CopyEnd::Failed(CopyFailure::RebuildRefused),
+                },
+            );
+            assert_eq!(Head::decode(&m167.encode())?, m167);
+            let mut with = m167.clone();
+            with.reindexes.insert("running".to_owned(), asked.clone());
+            with.reindexes.insert("done".to_owned(), Reindex::default());
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // And after exports.
+            let mut both = with.clone();
+            both.exports.insert("done".to_owned());
+            assert_eq!(Head::decode(&both.encode())?, both);
+            // A name with no record, or a once-name whose replication is gone: M167's bytes.
+            let mut ghost = m167.clone();
+            ghost.reindexes.insert("gone".to_owned(), asked.clone());
+            assert_eq!(hex(&ghost.encode()), hex(&m167.encode()));
+            let mut stale = m167.clone();
+            stale.once.insert("stale".to_owned());
+            let plain = stale.clone();
+            stale.reindexes.insert("stale".to_owned(), asked.clone());
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            let mut longer = with.encode();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            let bytes = with.encode();
+            for cut in m167.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.reindexes.is_empty(), "a cut at {cut} decoded reindexes");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M168: a reindex replaces the further fields and the regex set whole, the primary's
+    /// options only when asked, and names the primary only when the source records none.
+    #[test]
+    fn a_reindex_replaces_what_it_names() {
+        use pstore_format::text::FullText;
+        let mut stemmed = FullText::default();
+        stemmed.analyzer.stemming = true;
+        let mut src = IndexSchema {
+            dims: 2,
+            text_field: "text".to_owned(),
+            trigram: vec!["old".to_owned()],
+            texts: [("title".to_owned(), FullText::default())].into(),
+            ..IndexSchema::default()
+        };
+        let keep = Reindex::default().apply(&src, "mine");
+        assert_eq!(keep.fts, src.fts);
+        assert!(keep.texts.is_empty() && keep.trigram.is_empty());
+        assert_eq!((keep.dims, keep.text_field.as_str()), (2, "text"));
+        let r = Reindex {
+            fts: Some(stemmed),
+            texts: [("body".to_owned(), stemmed)].into(),
+            trigram: vec!["tag".to_owned()],
+        };
+        let out = r.apply(&src, "mine");
+        assert_eq!(out.fts, stemmed);
+        assert_eq!(out.texts.keys().collect::<Vec<_>>(), ["body"]);
+        assert_eq!(out.trigram, ["tag"]);
+        assert_eq!(out.text_field, "text");
+        src.text_field.clear();
+        assert_eq!(r.apply(&src, "mine").text_field, "mine");
+        assert_eq!(Reindex::default().apply(&src, "mine").text_field, "");
     }
 
     /// M166 criterion 6: at most [`COPIES_RETAINED`] outcomes; one more evicts the smallest

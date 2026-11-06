@@ -190,6 +190,10 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
         fields: (1..=3)
             .map(|i| BTreeMap::from([("t".to_owned(), vec![vec![i as f32 * 10.0]])]))
             .collect(),
+        // M193: and the sparse pairs.
+        sparse: (1..=3)
+            .map(|i| Some(vec![(format!("k{i}"), i as f32)]))
+            .collect(),
     };
     let got = e.resolve_rows_with_vectors(&answer);
     let pairs: Vec<(String, Option<Vec<f32>>)> = got
@@ -215,4 +219,81 @@ fn a_hit_whose_row_vanished_does_not_misalign_the_vectors() {
             ("c".to_owned(), vec![vec![30.0]])
         ]
     );
+    let sparse: Vec<(String, Option<pstore_engine::Sparse>)> = e
+        .resolve_rows_projected(&answer)
+        .into_iter()
+        .map(|((id, ..), p)| (id, p.sparse))
+        .collect();
+    assert_eq!(
+        sparse,
+        [
+            ("a".to_owned(), Some(vec![("k1".to_owned(), 1.0)])),
+            ("c".to_owned(), Some(vec![("k3".to_owned(), 3.0)]))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sparse_pairs_answer_in_key_order_rounded_folded_or_not() {
+    // M193: written out of key order, at weights f16 rounds; a row answers them as stored.
+    let written = || {
+        docs()
+            .into_iter()
+            .map(|mut d| {
+                d.vectors.insert(
+                    "sparse".into(),
+                    pstore_format::VectorField::Sparse(vec![
+                        ("zeta".to_owned(), pstore_format::Impact::new(0.1)),
+                        ("alpha".to_owned(), pstore_format::Impact::new(-1.0 / 3.0)),
+                    ]),
+                );
+                d
+            })
+            .collect::<Vec<_>>()
+    };
+    let want = vec![
+        (
+            "alpha".to_owned(),
+            pstore_format::sparse::stored_weight(-1.0 / 3.0),
+        ),
+        ("zeta".to_owned(), pstore_format::sparse::stored_weight(0.1)),
+    ];
+    assert_ne!(
+        want[1].1.to_bits(),
+        0.1_f32.to_bits(),
+        "the weight is one f16 rounds"
+    );
+    let acct = Arc::new(Accounted::new(MemoryStore::new()));
+    let store = Arc::new(acct.as_tenant(T));
+    let e = Engine::new(Arc::clone(&store), T, LaneId(1));
+    e.write_as("folded", written(), Metric::DotProduct)
+        .await
+        .unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+    e.write_as("fresh", written(), Metric::DotProduct)
+        .await
+        .unwrap();
+    for index in ["folded", "fresh"] {
+        let a = e
+            .query_split_projected(
+                index,
+                &leg(),
+                None,
+                Fusion::default(),
+                20,
+                Consistency::Eventual,
+                None,
+                false,
+                &[],
+                true,
+            )
+            .await
+            .unwrap();
+        let got = e.resolve_rows_projected(&a);
+        assert_eq!(got.len(), 10, "{index}");
+        for ((id, ..), p) in got {
+            assert_eq!(p.sparse.as_ref(), Some(&want), "{index} {id}");
+        }
+    }
 }

@@ -1,5 +1,55 @@
 # Native API migration notes
 
+## M168: a reindex is a copy that rebuilds text and regex options, and the support matrix
+
+A reindex is M166's copy with a `schema` in its body: the map a write declares, holding only
+`full_text_search` and `regex` entries (a `type` of `string` or `[]string` beside them).
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src"},
+                                "schema": {"text": {"full_text_search": {"stemming": true}},
+                                           "body": {"type": "string", "full_text_search": true},
+                                           "tag":  {"type": "string", "regex": true}}}
+```
+
+- `dest`'s schema is the source's with: `text`'s options replaced when the map declares `text`,
+  kept otherwise; the further text fields replaced by exactly the others it declares
+  `full_text_search` on; the regex set replaced by exactly the names it declares
+  `"regex": true` on. Leaving a field out drops it. Dims, metric, named-field widths, types and
+  the id kind are the source's.
+- Every source segment is rebuilt, not copied: its live rows are sealed under `dest`'s schema,
+  with no delete vector. The rest is the copy's: one source epoch of **folded** rows
+  (`source_epoch`), published by the one commit that finishes it, `read_only` for an export,
+  pause, cancel and the status. Writes after it go to the source alone; moving clients to
+  `dest` is the caller's.
+- A rebuild the format refuses ends the copy `failed` with code `rebuild_refused`. A store
+  failure is `last_error` and retried, as a copy's.
+- A repeated `POST` matches only the same `schema` (absent included); another is `409`.
+- Refused with `400`: `schema` on a replication; a type declaration or any key but `type`,
+  `full_text_search` and `regex`; `regex` on `id`; more than 8 further text fields; invalid
+  options; a field or regex attribute named as the source's primary text field, or as an
+  attribute the source types other than string.
+
+**What changes how.** "In place" is a write or a `PATCH` on the index itself; "reindex" is this
+copy into a new index; "re-write" means writing the rows again into a new index.
+
+| Change | How | Where |
+|---|---|---|
+| Add an attribute | In place: a write that carries it | M9a |
+| An attribute's first type (`datetime`, `uuid`, `bytes`, `uint64`) | In place: the first write declaring it records it | M173 |
+| Change an attribute's recorded type | Re-write | M173: `schema_conflict` |
+| Drop an attribute | Not a schema change: an untyped attribute has no schema entry, and a patch with `null` removes it from a row | M13 |
+| Read-only on or off | In place: `PATCH /v1/indexes/{index}` | M149 |
+| The primary text field's analyzer or BM25 parameters | Reindex | M168 (in place: `schema_conflict`, M14) |
+| Add or drop a further text field, or change its options | Reindex | M168 (in place: `schema_conflict`, M155) |
+| Add or drop a regex attribute | Reindex | M168 (in place: `schema_conflict`, M15.2) |
+| Dims, distance metric, a named vector field's width | Re-write | M9d, M98 |
+| The id kind | Re-write | M176 |
+
+Not offered: a reindex in place under the same name, progress beyond the state, and a reindex
+that changes dims, metric, types or the id kind. Evidence is in
+[M168 verification](milestones/M168/VERIFIED.md).
+
 ## M167: an export is a read-only copy, and a restore is a copy of it
 
 An export is M166's copy with `"read_only": true` in its body:
@@ -57,6 +107,29 @@ HEAD gains a trailing section. A process older than M166 refuses a HEAD that car
 so every node is upgraded before copies are offered. Evidence is in
 [M166 verification](milestones/M166/VERIFIED.md).
 
+## M193: sparse vectors in results and exports
+
+`include_vectors` admits `"sparse"`, and a row holding the field gains `sparse` beside
+`id`, spelled as a write's `sparse` is.
+
+```json
+{"rank_by": ["id", "asc"], "top_k": 500, "include_vectors": ["vector", "sparse"]}
+```
+
+- Each weight is the f16 the index stores, as a JSON number, keys in byte order; a signed
+  zero is `-0.0`. `vector_encoding` does not apply. A row without the field has no
+  `sparse` key, never `{}`.
+- `sparse` is named once, beside up to 9 other names. `vectors.sparse` stays refused.
+- It costs M191's one round more, shared: naming `sparse` and a multi-vector field is one
+  round, not two. A `rank_by` order naming it is 5 rounds. Its pairs count toward M191's
+  64 MiB bound, as stored (4 bytes and the key's a pair).
+- **Segments folded before M193** do not store a row's pairs. A query projecting `sparse`
+  whose results include any row of such a segment fails `422 bad_query` naming the field;
+  a compaction or a reindex rewrites it. Exports of an old index need one first. A segment
+  with no sparse field is unaffected.
+- A fold writes a new section, which builds before M193 skip. A build before M193 that
+  compacts writes a segment without it, which refuses again until the next rewrite.
+
 ## M191: folded multi-vector fields in results and exports
 
 `include_vectors` now answers every named dense field, whatever layout its segment folded
@@ -82,7 +155,7 @@ it in. Nothing fails for a layout any more.
 ```
 
 - Up to 9 names, each once: `vector` and named fields in any mix. `sparse` is not projected
-  yet; a name a named field could not have is `400`. A name the index has no field of is
+  yet (M193 projects it); a name a named field could not have is `400`. A name the index has no field of is
   admitted and answers nothing.
 - A row's `vectors` holds only the fields it has, each its vectors in the order written,
   spelled by `vector_encoding`, and in the index's metric space as `vector` is. No fields,

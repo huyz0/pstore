@@ -125,6 +125,12 @@ pub enum Section {
     /// ⚠️ **Absent means nothing is sketched**: every segment before M15, every segment with no
     /// declared attribute, and every one whose block index left no room. It prunes nothing.
     TrigramSketch = 16,
+    /// Each row's sparse pairs, forward (M193): see [`sparse::rows_section`]. What a
+    /// projection of a sparse field reads, so it never reads the field's postings.
+    ///
+    /// ⚠️ **Absent means the segment predates it** when the segment has a sparse field: a
+    /// projection of that field over such a segment is refused, never answered as empty.
+    SparseRows = 17,
 }
 
 /// Where the third and later dense fields' vector sections are numbered from (M61): field `k`

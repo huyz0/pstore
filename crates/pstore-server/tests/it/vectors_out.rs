@@ -411,9 +411,9 @@ async fn what_cannot_be_projected_is_refused_naming_the_rule() {
     let v = json!(["vector"]);
     let cases = [
         (
-            // M190: a named field is projected; `sparse` is not yet.
-            plus(&ranked, json!({"include_vectors": ["sparse"]})),
-            "include_vectors: `sparse` is not projected",
+            // M190: a named field is projected; M193: `sparse` too, once.
+            plus(&ranked, json!({"include_vectors": ["sparse", "sparse"]})),
+            "include_vectors: \"sparse\" is named twice",
         ),
         (
             plus(&ranked, json!({"include_vectors": []})),

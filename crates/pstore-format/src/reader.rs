@@ -521,6 +521,38 @@ impl Segment {
             .collect())
     }
 
+    /// Where the named rows keep their sparse pairs (M193): each row's absolute byte range
+    /// in [`Section::SparseRows`], from its two offsets, read in one request run, as
+    /// [`Self::field_spans`] reads a varying dense field's. A row past the end is left out; a
+    /// row without the field has an empty range. Empty for a segment with no sparse field.
+    /// `None` for a segment with one and no `SparseRows`, folded before M193: whether a row
+    /// holds the field, only its postings say.
+    ///
+    /// # Errors
+    /// A store failure, or a corrupt offset table.
+    pub async fn sparse_spans<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        rows: &[usize],
+    ) -> Result<Option<BTreeMap<usize, std::ops::Range<u64>>>, FormatError> {
+        if self.sparse_field().is_none() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let Some(span) = self.section(Section::SparseRows) else {
+            return Ok(None);
+        };
+        let n = self.rows as usize;
+        // A row asked twice is one key of the map returned.
+        let wanted: Vec<usize> = rows.iter().copied().filter(|r| *r < n).collect();
+        Ok(Some(
+            self.spans_of(store, key, span, n, &wanted)
+                .await?
+                .into_iter()
+                .collect(),
+        ))
+    }
+
     /// `wanted`'s (in range) vector ranges in a varying field's section, in `wanted`'s order.
     async fn spans_of<S: BlobStore>(
         &self,
