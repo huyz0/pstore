@@ -104,6 +104,19 @@ pub struct CopyStatus {
     pub created_ms: Option<u64>,
     /// The clock of the commit that ended it (M194); `None` while it runs or is paused.
     pub ended_ms: Option<u64>,
+    /// The past source epoch it copies (M196), or `None` for the source's present.
+    pub as_of: Option<u64>,
+}
+
+/// What a copy asks besides its source (M196): [`Engine::create_copy_with`]'s options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyOptions {
+    /// Finish read-only (M167): an export.
+    pub read_only: bool,
+    /// Rebuild every segment under these options (M168): a reindex.
+    pub reindex: Option<Reindex>,
+    /// Copy the source as it stood at this past epoch (M196), not its present.
+    pub as_of: Option<u64>,
 }
 
 /// What a copy asks besides its source (M166, M167, M168).
@@ -111,6 +124,7 @@ pub struct CopyStatus {
 struct Ask {
     read_only: bool,
     reindex: Option<Reindex>,
+    as_of: Option<u64>,
 }
 
 /// The named remote stores a sync may read (M22): the server's configured sources.
@@ -127,6 +141,8 @@ pub struct SyncState {
     plan: Option<BTreeMap<String, Replication>>,
     /// Which of the plan's replications are copies (M166), read with it.
     once: BTreeSet<String>,
+    /// M196: each copy's past epoch, read with it.
+    as_of: BTreeMap<String, u64>,
     /// `(dest, run)` to the source fingerprint it last committed or found current.
     known: BTreeMap<(String, u64), u64>,
 }
@@ -241,6 +257,9 @@ struct Copies {
     built: BTreeMap<(String, u64), Option<SegmentRef>>,
     /// `(dest segment, g)` to the dest vector key holding it.
     dvs: BTreeMap<(String, u64), String>,
+    /// M196: each copied segment's rows (its footer's) and length, and each copied vector's
+    /// count, by dest key: what an `as_of` copy's refs say, since its view's do not.
+    counts: BTreeMap<String, (u32, u64)>,
     /// Every segment and vector key written, recorded before its PUT, so one that fails
     /// partway is buried too (M19). A segment's sidecars follow it to GC.
     written: Vec<String>,
@@ -258,7 +277,7 @@ struct Mapped {
 }
 
 /// One segment copy's outcome: its source hash, its dest key, and the sidecars it lacked.
-type Copied = (u64, String, Result<bool, CopyErr>);
+type Copied = (u64, String, Result<(bool, u32, u64), CopyErr>);
 
 /// Why copying one source segment did not finish.
 enum CopyErr {
@@ -289,6 +308,32 @@ enum MirrorErr {
     Failed(String),
     /// A reindex's seal was refused: the copy ends `rebuild_refused`.
     Refused,
+    /// The past epoch it copies is no longer answerable (M196): the copy ends
+    /// `epoch_unavailable`.
+    Unavailable,
+}
+
+/// The source HEAD a copy reads (M196): `h` itself, or `h` as it stood at `as_of`, with the
+/// schema `index` had then (a query `as_of`'s), and none when none was recorded.
+fn view(h: Head, index: &str, as_of: Option<u64>) -> Result<Head, head::TimeTravel> {
+    let Some(e) = as_of else {
+        return Ok(h);
+    };
+    let mut v = h.as_of(Epoch(e))?;
+    match crate::schema_recorded_at(&h, index, Epoch(e)) {
+        Some(s) => {
+            v.schemas.insert(index.to_owned(), s);
+        }
+        None => {
+            v.schemas.remove(index);
+        }
+    }
+    Ok(v)
+}
+
+/// Whether `h` can still answer `epoch`: [`Head::as_of`]'s two refusals, without its copy.
+fn answerable(h: &Head, epoch: u64) -> bool {
+    epoch <= h.epoch.0 && epoch >= h.reaped_before
 }
 
 /// A delete vector as HEAD names it: its key and how many rows it deletes.
@@ -387,13 +432,24 @@ impl<S: BlobStore> Engine<S> {
                 "an index cannot replicate itself".to_owned(),
             ));
         }
+        let as_of = once.and_then(|a| a.as_of);
+        if as_of.is_some() && once.is_some_and(|a| a.reindex.is_some()) {
+            return refuse(ReplicaRefusal::Invalid(
+                "as_of is a copy's or an export's: reindex the export".to_owned(),
+            ));
+        }
         let there = head::read(from, source.tenant).await?;
-        if fingerprint(&there.head, &source.index).is_none() {
+        // M196: a past epoch is refused as a query `as_of` it is.
+        if as_of.is_some() && there.head.replications.contains_key(&source.index) {
+            return refuse(ReplicaRefusal::NoHistory(source.index));
+        }
+        let there = view(there.head, &source.index, as_of)?;
+        if fingerprint(&there, &source.index).is_none() {
             return refuse(ReplicaRefusal::SourceNotFound(source.index));
         }
         // M168: a reindex's names, against the schema it read, before any segment is.
         if let Some(r) = once.and_then(|a| a.reindex.as_ref()) {
-            check_reindex(r, there.head.schemas.get(&source.index))
+            check_reindex(r, there.schemas.get(&source.index))
                 .map_err(|why| EngineError::Replica(ReplicaRefusal::Invalid(why)))?;
         }
         self.commit_change(|now, next| {
@@ -447,6 +503,15 @@ impl<S: BlobStore> Engine<S> {
                 let now_ms = self.now_ms();
                 next.copy_times.insert(dest.to_owned(), (now_ms, 0));
                 *created = Some(now_ms);
+                // M196: and the past epoch it copies, or none: never a stale one.
+                match as_of {
+                    Some(e) => {
+                        next.copy_as_of.insert(dest.to_owned(), e);
+                    }
+                    None => {
+                        next.copy_as_of.remove(dest);
+                    }
+                }
             } else {
                 next.once.remove(dest);
             }
@@ -498,7 +563,7 @@ impl<S: BlobStore> Engine<S> {
     ) -> Result<(CopyStatus, bool), EngineError> {
         let ask = Ask {
             read_only: true,
-            reindex: None,
+            ..Ask::default()
         };
         self.copy_inner(dest, source, from, ask).await
     }
@@ -516,14 +581,45 @@ impl<S: BlobStore> Engine<S> {
         source: ReplicaSource,
         from: &R,
         read_only: bool,
-        mut reindex: Reindex,
+        reindex: Reindex,
     ) -> Result<(CopyStatus, bool), EngineError> {
-        // Sorted, each once, as a schema's set is: two spellings of one set are one ask.
-        reindex.trigram.sort_unstable();
-        reindex.trigram.dedup();
+        self.create_copy_with(
+            dest,
+            source,
+            from,
+            CopyOptions {
+                read_only,
+                reindex: Some(reindex),
+                as_of: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Self::create_copy`] with every option (M196): read-only, a reindex, or a past epoch.
+    ///
+    /// # Errors
+    /// As [`Self::create_reindex`], and, with `as_of`, as a query `as_of` that epoch:
+    /// [`EngineError::TimeTravel`] for an epoch the source cannot answer, and
+    /// [`ReplicaRefusal::NoHistory`] for a source that is a replica; `as_of` with a reindex is
+    /// [`ReplicaRefusal::Invalid`].
+    pub async fn create_copy_with<R: BlobStore + ?Sized>(
+        &self,
+        dest: &str,
+        source: ReplicaSource,
+        from: &R,
+        opts: CopyOptions,
+    ) -> Result<(CopyStatus, bool), EngineError> {
+        let mut reindex = opts.reindex;
+        if let Some(r) = reindex.as_mut() {
+            // Sorted, each once, as a schema's set is: two spellings of one set are one ask.
+            r.trigram.sort_unstable();
+            r.trigram.dedup();
+        }
         let ask = Ask {
-            read_only,
-            reindex: Some(reindex),
+            read_only: opts.read_only,
+            reindex,
+            as_of: opts.as_of,
         };
         self.copy_inner(dest, source, from, ask).await
     }
@@ -565,6 +661,7 @@ impl<S: BlobStore> Engine<S> {
                 reindex: ask.reindex,
                 created_ms: created,
                 ended_ms: None,
+                as_of: ask.as_of,
             },
             true,
         ))
@@ -763,6 +860,7 @@ impl<S: BlobStore> Engine<S> {
             st.known
                 .retain(|(d, run), _| plan.get(d).is_some_and(|r| r.run == *run));
             st.once = at.head.once.clone();
+            st.as_of = at.head.copy_as_of.clone();
             st.plan = Some(plan);
             first = Some(at);
         }
@@ -806,6 +904,18 @@ impl<S: BlobStore> Engine<S> {
                 .get(&(r.source.store.clone(), r.source.tenant))
                 .cloned()
                 .unwrap_or_else(|| Err("no read of this source".to_owned()));
+            // M196: a copy of a past epoch reads its view.
+            let as_of = st.as_of.get(d).copied();
+            let read = match read {
+                Ok(h) => match view(h, &r.source.index, as_of) {
+                    Ok(v) => Ok(v),
+                    Err(_) => {
+                        gone.push((d.clone(), r.clone(), CopyFailure::EpochUnavailable));
+                        continue;
+                    }
+                },
+                Err(e) => Err(e),
+            };
             match &read {
                 Err(e) => {
                     out.failed.insert(d.clone(), e.clone());
@@ -904,10 +1014,12 @@ impl<S: BlobStore> Engine<S> {
                             self.rebuild(&src, &r.source, src_head, d, e, &mut copies, ask)
                                 .await
                         }
-                        _ => self
-                            .mirror(&src, &r.source, src_head, d, &at.head, e, &mut copies)
-                            .await
-                            .map_err(MirrorErr::Failed),
+                        _ => {
+                            let as_of = st.as_of.get(d.as_str()).copied();
+                            let to = (d.as_str(), &at.head);
+                            self.mirror(&src, &r.source, src_head, to, e, &mut copies, as_of)
+                                .await
+                        }
                     };
                     match got {
                         Ok(m) => {
@@ -919,6 +1031,10 @@ impl<S: BlobStore> Engine<S> {
                         }
                         Err(MirrorErr::Refused) => {
                             gone.push((d.clone(), r.clone(), CopyFailure::RebuildRefused));
+                            continue;
+                        }
+                        Err(MirrorErr::Unavailable) => {
+                            gone.push((d.clone(), r.clone(), CopyFailure::EpochUnavailable));
                             continue;
                         }
                     }
@@ -1021,6 +1137,43 @@ impl<S: BlobStore> Engine<S> {
             if let Some(f) = interfere.take() {
                 f.await;
             }
+            // M196: GC deletes before it commits its horizon, so a copy of a past epoch checks
+            // it again before it publishes: in this attempt's own HEAD for a source in it, else
+            // in a fresh read of the source's. One that lapsed ends in the next attempt.
+            let mut lapsed = false;
+            for (d, _) in &included {
+                let (Some(epoch), Some(r)) = (st.as_of.get(d.as_str()), plan.get(d.as_str()))
+                else {
+                    continue;
+                };
+                let here = r.source.store.is_empty() && r.source.tenant == self.tenant;
+                let ok = if here {
+                    Ok(answerable(&at.head, *epoch))
+                } else {
+                    match self.source_of(sources, &r.source.store) {
+                        Some(src) => src
+                            .head(r.source.tenant)
+                            .await
+                            .map(|h| answerable(&h.head, *epoch))
+                            .map_err(|e| e.to_string()),
+                        None => Err("unknown_store".to_owned()),
+                    }
+                };
+                match ok {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        gone.push((d.clone(), r.clone(), CopyFailure::EpochUnavailable));
+                        lapsed = true;
+                    }
+                    Err(why) => {
+                        out.failed.insert(d.clone(), why);
+                        lapsed = true;
+                    }
+                }
+            }
+            if lapsed {
+                continue;
+            }
             match self.commit_head(&at, &next).await {
                 Ok(epoch) => {
                     self.record_commit(epoch);
@@ -1121,16 +1274,18 @@ impl<S: BlobStore> Engine<S> {
         src: &Src<'_, S>,
         source: &ReplicaSource,
         src_head: &mut Head,
-        dest: &str,
-        dest_head: &Head,
+        (dest, dest_head): (&str, &Head),
         e: u64,
         copies: &mut Copies,
-    ) -> Result<Mapped, String> {
+        as_of: Option<u64>,
+    ) -> Result<Mapped, MirrorErr> {
         let index = source.index.as_str();
         let mut stalls = 0;
         loop {
             let Some(fp) = fingerprint(src_head, index) else {
-                return Err(format!("the source index {index:?} does not exist"));
+                return Err(MirrorErr::Failed(format!(
+                    "the source index {index:?} does not exist"
+                )));
             };
             let refs = src_head.indexes.get(index).cloned().unwrap_or_default();
             let have: BTreeMap<u64, String> = dest_head
@@ -1176,15 +1331,16 @@ impl<S: BlobStore> Engine<S> {
             let mut absent: Vec<u64> = Vec::new();
             for (h, to, r) in results {
                 match r {
-                    Ok(lacked) => {
+                    Ok((lacked, rows, len)) => {
                         progress += 1;
+                        copies.counts.insert(to.clone(), (rows, len));
                         copies.segs.insert((dest.to_owned(), h), to);
                         if lacked {
                             absent.push(h);
                         }
                     }
                     Err(CopyErr::Missing) => missing = true,
-                    Err(CopyErr::Failed(why)) => return Err(why),
+                    Err(CopyErr::Failed(why)) => return Err(MirrorErr::Failed(why)),
                 }
             }
             // The delete vectors: copied when the source's key differs from the one the
@@ -1192,19 +1348,25 @@ impl<S: BlobStore> Engine<S> {
             // in one round of GETs and PUTs (code review M2).
             let mut dvs = BTreeMap::new();
             let mut mapped = Vec::new();
-            let mut fetch: Vec<(String, u64, String, u32, String)> = Vec::new();
+            let mut fetch: Vec<(String, u64, String, String)> = Vec::new();
             for r in &refs {
                 let h = fnv1a(r.key.as_bytes());
                 let Some(seg) = dest_of(h, copies) else {
                     continue;
                 };
+                // M196: what the copied bytes hold, since a view's ref says no rows and no
+                // length. A present ref says the same, or no length before M45.
+                let (rows, len) = copies
+                    .counts
+                    .get(&seg)
+                    .map_or((r.rows, r.len), |(rows, len)| (*rows, Some(*len)));
                 mapped.push(SegmentRef {
                     key: seg.clone(),
-                    rows: r.rows,
+                    rows,
                     // M32: the copy's sidecars are the source's.
                     dicts: r.dicts,
                     // M45: and its bytes, so its length.
-                    len: r.len,
+                    len,
                 });
                 let want = src_head.deletes.get(&head::dv_ref(index, &r.key)).cloned();
                 let Some((k, n)) = want else {
@@ -1218,41 +1380,46 @@ impl<S: BlobStore> Engine<S> {
                     continue;
                 }
                 if let Some(d) = copies.dvs.get(&(seg.clone(), g)) {
+                    // M196: the count its bytes hold; a view's is not kept.
+                    let n = copies.counts.get(d).map_or(n, |(deletes, _)| *deletes);
                     dvs.insert(seg, Some((d.clone(), n)));
                     continue;
                 }
                 let to = format!("{seg}.{e:020}-{:016x}-{g:016x}.dv", self.lane.0);
-                fetch.push((seg, g, k, n, to));
+                fetch.push((seg, g, k, to));
             }
             copies
                 .written
                 .extend(fetch.iter().map(|(.., to)| to.clone()));
-            let got: Vec<_> = futures_util::stream::iter(fetch.into_iter().map(
-                |(seg, g, k, n, to)| async move {
+            let got: Vec<_> =
+                futures_util::stream::iter(fetch.into_iter().map(|(seg, g, k, to)| async move {
                     let r = match src.get(&Key::new(k)).await {
-                        Ok(bytes) => self
-                            .store
-                            .put(&Key::new(to.clone()), bytes)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| CopyErr::Failed(e.to_string())),
+                        Ok(bytes) => {
+                            // M196: the rows it deletes, for a view whose count is not kept.
+                            let deletes = pstore_query::deletes::decode(&bytes).len() as u32;
+                            self.store
+                                .put(&Key::new(to.clone()), bytes)
+                                .await
+                                .map(|_| deletes)
+                                .map_err(|e| CopyErr::Failed(e.to_string()))
+                        }
                         Err(e) => Err(CopyErr::from(e)),
                     };
-                    (seg, g, n, to, r)
-                },
-            ))
-            .buffer_unordered(IN_FLIGHT)
-            .collect()
-            .await;
-            for (seg, g, n, to, r) in got {
+                    (seg, g, to, r)
+                }))
+                .buffer_unordered(IN_FLIGHT)
+                .collect()
+                .await;
+            for (seg, g, to, r) in got {
                 match r {
-                    Ok(()) => {
+                    Ok(deletes) => {
                         progress += 1;
+                        copies.counts.insert(to.clone(), (deletes, 0));
                         copies.dvs.insert((seg.clone(), g), to.clone());
-                        dvs.insert(seg, Some((to, n)));
+                        dvs.insert(seg, Some((to, deletes)));
                     }
                     Err(CopyErr::Missing) => missing = true,
-                    Err(CopyErr::Failed(why)) => return Err(why),
+                    Err(CopyErr::Failed(why)) => return Err(MirrorErr::Failed(why)),
                 }
             }
             if !missing && absent.is_empty() {
@@ -1269,8 +1436,10 @@ impl<S: BlobStore> Engine<S> {
             let fresh = src
                 .head(source.tenant)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| MirrorErr::Failed(e.to_string()))?
                 .head;
+            // M196: a past epoch remaps against the fresh HEAD's view of it.
+            let fresh = view(fresh, index, as_of).map_err(|_| MirrorErr::Unavailable)?;
             let still: BTreeSet<u64> = fresh
                 .indexes
                 .get(index)
@@ -1294,9 +1463,9 @@ impl<S: BlobStore> Engine<S> {
             *src_head = fresh;
             stalls = if progress == 0 { stalls + 1 } else { 0 };
             if stalls >= MAX_STALLS {
-                return Err(format!(
+                return Err(MirrorErr::Failed(format!(
                     "the source index {index:?} kept changing: {MAX_STALLS} remaps copied nothing"
-                ));
+                )));
             }
         }
     }
@@ -1539,7 +1708,7 @@ impl<S: BlobStore> Engine<S> {
         from: &str,
         to: &str,
         written: &Mutex<Vec<String>>,
-    ) -> Result<bool, CopyErr> {
+    ) -> Result<(bool, u32, u64), CopyErr> {
         let (from, to) = (Key::new(from), Key::new(to));
         let (seg, side) = futures_util::future::join(
             src.get(&from),
@@ -1549,6 +1718,11 @@ impl<S: BlobStore> Engine<S> {
         )
         .await;
         let seg = seg?;
+        // M196: its rows and length, from the bytes themselves.
+        let counts = (
+            pstore_format::footer_rows(&seg).unwrap_or_default(),
+            seg.len() as u64,
+        );
         let mut puts = vec![(to.clone(), seg)];
         let mut absent = false;
         for (r, k) in side.into_iter().zip(sidecars(&to)) {
@@ -1572,7 +1746,7 @@ impl<S: BlobStore> Engine<S> {
         if let Some(Err(e)) = put.into_iter().find(Result::is_err) {
             return Err(CopyErr::Failed(e.to_string()));
         }
-        Ok(absent)
+        Ok((absent, counts.0, counts.1))
     }
 }
 
@@ -1609,6 +1783,7 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
             reindex: h.reindexes.get(dest).cloned(),
             created_ms: h.copy_times.get(dest).map(|(c, _)| *c),
             ended_ms: None,
+            as_of: h.copy_as_of.get(dest).copied(),
         });
     }
     let o = h.copies.get(dest)?;
@@ -1629,6 +1804,7 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
         created_ms: h.copy_times.get(dest).map(|(c, _)| *c),
         // An ended copy's record is always stamped, never 0 (`stamp_end`).
         ended_ms: h.copy_times.get(dest).map(|(_, e)| *e),
+        as_of: h.copy_as_of.get(dest).copied(),
     })
 }
 
@@ -1673,6 +1849,7 @@ fn same_copy(h: &Head, dest: &str, source: &ReplicaSource, ask: &Ask) -> Option<
         &s.source == source
             && s.read_only == ask.read_only
             && s.reindex == ask.reindex
+            && s.as_of == ask.as_of
             && match s.state {
                 CopyState::Running | CopyState::Paused => true,
                 CopyState::Succeeded => h.indexes.contains_key(dest),
@@ -1684,6 +1861,21 @@ fn same_copy(h: &Head, dest: &str, source: &ReplicaSource, ask: &Ask) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M196: `answerable` agrees with `Head::as_of` at every epoch, both edges included.
+    #[test]
+    fn answerable_is_what_as_of_answers() {
+        let h = Head {
+            epoch: Epoch(10),
+            reaped_before: 5,
+            ..Head::default()
+        };
+        for e in 0..13 {
+            assert_eq!(answerable(&h, e), h.as_of(Epoch(e)).is_ok(), "epoch {e}");
+        }
+        assert!(answerable(&h, 5) && answerable(&h, 10));
+        assert!(!answerable(&h, 4) && !answerable(&h, 11));
+    }
 
     /// M166: a succeeded outcome answers a repeated request only while `dest` is an index --
     /// however the index stopped being one.

@@ -300,6 +300,9 @@ pub struct Head {
     /// holds it, so a record never outlives its copy. The map in memory may still hold a
     /// dropped, branched, evicted or replicated name; nothing reads it, and `encode` drops it.
     pub copy_times: BTreeMap<String, (u64, u64)>,
+    /// Each copy's past source epoch (M196), by its dest: what it holds instead of the
+    /// present. ⚠️ The last trailing section, after the copy times, filtered as they are.
+    pub copy_as_of: BTreeMap<String, u64>,
 }
 
 /// What a reindex asks (M168): the text and regex options `dest` is rebuilt under, applied
@@ -371,6 +374,8 @@ pub enum CopyFailure {
     /// A reindex's rows could not be sealed under its options (M168): a refusal that is the
     /// same on every retry.
     RebuildRefused,
+    /// The past epoch it copies is no longer answerable (M196): GC's horizon passed it.
+    EpochUnavailable,
 }
 
 /// Where a replica's source index lives (M22).
@@ -711,6 +716,12 @@ impl Head {
             .iter()
             .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
             .collect();
+        // M196: the past epochs after the copy times, by the same rule, forcing every count.
+        let copy_as_of: Vec<(&String, &u64)> = self
+            .copy_as_of
+            .iter()
+            .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
+            .collect();
         let copied = !once.is_empty() || !self.copies.is_empty();
         let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
@@ -889,17 +900,24 @@ impl Head {
                     }
                     CopyEnd::Failed(CopyFailure::SourceNotFound) => out.extend_from_slice(&[1, 0]),
                     CopyEnd::Failed(CopyFailure::RebuildRefused) => out.extend_from_slice(&[1, 1]),
+                    CopyEnd::Failed(CopyFailure::EpochUnavailable) => {
+                        out.extend_from_slice(&[1, 2]);
+                    }
                     CopyEnd::Cancelled => out.push(2),
                 }
             }
         }
-        if !exports.is_empty() || !reindexes.is_empty() || !copy_times.is_empty() {
+        if !exports.is_empty()
+            || !reindexes.is_empty()
+            || !copy_times.is_empty()
+            || !copy_as_of.is_empty()
+        {
             out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
             for name in exports {
                 put_str(&mut out, name);
             }
         }
-        if !reindexes.is_empty() || !copy_times.is_empty() {
+        if !reindexes.is_empty() || !copy_times.is_empty() || !copy_as_of.is_empty() {
             out.extend_from_slice(&(reindexes.len() as u32).to_le_bytes());
             for (name, r) in reindexes {
                 put_str(&mut out, name);
@@ -921,12 +939,19 @@ impl Head {
                 }
             }
         }
-        if !copy_times.is_empty() {
+        if !copy_times.is_empty() || !copy_as_of.is_empty() {
             out.extend_from_slice(&(copy_times.len() as u32).to_le_bytes());
             for (name, (created, ended)) in copy_times {
                 put_str(&mut out, name);
                 out.extend_from_slice(&created.to_le_bytes());
                 out.extend_from_slice(&ended.to_le_bytes());
+            }
+        }
+        if !copy_as_of.is_empty() {
+            out.extend_from_slice(&(copy_as_of.len() as u32).to_le_bytes());
+            for (name, epoch) in copy_as_of {
+                put_str(&mut out, name);
+                out.extend_from_slice(&epoch.to_le_bytes());
             }
         }
         out
@@ -1386,6 +1411,7 @@ impl Head {
                 1 => match c.u8()? {
                     0 => CopyEnd::Failed(CopyFailure::SourceNotFound),
                     1 => CopyEnd::Failed(CopyFailure::RebuildRefused),
+                    2 => CopyEnd::Failed(CopyFailure::EpochUnavailable),
                     _ => return Err(EngineError::CorruptHead),
                 },
                 2 => CopyEnd::Cancelled,
@@ -1447,6 +1473,14 @@ impl Head {
             let name = c.string()?;
             let created = c.u64()?;
             h.copy_times.insert(name, (created, c.u64()?));
+        }
+        // M196: and here, no past epochs.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            h.copy_as_of.insert(name, c.u64()?);
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2984,6 +3018,68 @@ mod tests {
                 let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
                 if let Ok(h) = Head::decode(part) {
                     assert!(h.copy_times.is_empty(), "a cut at {cut} decoded copy times");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M196 criterion 5: the `as_of` section after the copy times, forcing every earlier count.
+    #[test]
+    fn copy_as_of_round_trips_after_copy_times() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        for base in [Head::default(), sample(), every_section()] {
+            let mut m194 = base.clone();
+            m194.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            m194.once.insert("running".to_owned());
+            m194.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 10,
+                    epoch: 20,
+                    end: CopyEnd::Failed(CopyFailure::EpochUnavailable),
+                },
+            );
+            assert_eq!(Head::decode(&m194.encode())?, m194);
+            // Alone: no export, reindex or copy time before it.
+            let mut with = m194.clone();
+            with.copy_as_of.insert("running".to_owned(), 3);
+            with.copy_as_of.insert("done".to_owned(), u64::MAX);
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // And after each earlier one.
+            let mut all = with.clone();
+            all.exports.insert("done".to_owned());
+            all.reindexes
+                .insert("running".to_owned(), Reindex::default());
+            all.copy_times.insert("running".to_owned(), (1_000, 0));
+            assert_eq!(Head::decode(&all.encode())?, all);
+            // A name with no record, or a once-name whose replication is gone: M194's bytes.
+            let mut ghost = m194.clone();
+            ghost.copy_as_of.insert("gone".to_owned(), 1);
+            assert_eq!(hex(&ghost.encode()), hex(&m194.encode()));
+            let mut stale = m194.clone();
+            stale.once.insert("stale".to_owned());
+            let plain = stale.clone();
+            stale.copy_as_of.insert("stale".to_owned(), 1);
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            let mut longer = with.encode();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            let bytes = with.encode();
+            for cut in m194.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.copy_as_of.is_empty(), "a cut at {cut} decoded an as_of");
                 }
             }
         }

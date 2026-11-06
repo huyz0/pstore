@@ -1010,6 +1010,8 @@ struct CreateBody {
     read_only: Option<bool>,
     /// A copy's alone (M168): the text and regex options to rebuild under, a reindex.
     schema: Option<Value>,
+    /// A copy's alone (M196): the past source epoch to copy.
+    as_of: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1029,8 +1031,13 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from, read_only, schema) =
+    let (source, from, read_only, schema, as_of) =
         api.parse_source(tenant, &principal, &body, "a replication's body")?;
+    if as_of.is_some() {
+        return Err(ApiError::bad_request(
+            "as_of is a copy's: a replication follows its source's present",
+        ));
+    }
     if read_only.is_some() {
         return Err(ApiError::bad_request(
             "read_only is a copy's: a replication follows its source and is always read-only",
@@ -1053,13 +1060,14 @@ pub(crate) async fn create<S: BlobStore + 'static>(
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
 }
 
-/// A create's source, the store to read it from, and a copy's `read_only` (M167) and
-/// `schema` (M168).
+/// A create's source, the store to read it from, and a copy's `read_only` (M167), `schema`
+/// (M168) and `as_of` (M196).
 type Parsed = (
     ReplicaSource,
     Arc<dyn BlobStore>,
     Option<bool>,
     Option<pstore_engine::Reindex>,
+    Option<u64>,
 );
 
 impl<S: BlobStore + 'static> Api<S> {
@@ -1098,7 +1106,7 @@ impl<S: BlobStore + 'static> Api<S> {
             tenant: source_tenant,
             index,
         };
-        Ok((source, from, req.read_only, schema))
+        Ok((source, from, req.read_only, schema, req.as_of))
     }
 
     /// The copy into `dest`'s status (M166): HEAD and the worker's notes, in one round.
@@ -1154,12 +1162,15 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
         "code": s.failure.map(|f| match f {
             CopyFailure::SourceNotFound => "source_not_found",
             CopyFailure::RebuildRefused => "rebuild_refused",
+            CopyFailure::EpochUnavailable => "epoch_unavailable",
         }),
         "last_error": last_error,
         "read_only": s.read_only,
         // M194: wall-clock times, as the summary's (M148).
         "created_at": s.created_ms.map(crate::rfc3339_ms),
         "ended_at": s.ended_ms.map(crate::rfc3339_ms),
+        // M196: the past source epoch it copies, or `null` for the present.
+        "as_of": s.as_of,
     })
 }
 
@@ -1176,20 +1187,17 @@ pub(crate) async fn copy<S: BlobStore + 'static>(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let (source, from, read_only, schema) =
+    let (source, from, read_only, reindex, as_of) =
         api.parse_source(tenant, &principal, &body, "a copy's body")?;
     let engine = api.engine(tenant).await;
-    let read_only = read_only == Some(true);
-    let (status, started) = match schema {
-        // M168: a reindex rebuilds under the options; read-only at its finish when asked.
-        Some(r) => {
-            engine
-                .create_reindex(&dest, source, &*from, read_only, r)
-                .await?
-        }
-        None if read_only => engine.create_export(&dest, source, &*from).await?,
-        None => engine.create_copy(&dest, source, &*from).await?,
+    // M168: a reindex rebuilds under the options; M167: read-only at its finish when asked;
+    // M196: of a past epoch.
+    let opts = pstore_engine::CopyOptions {
+        read_only: read_only == Some(true),
+        reindex,
+        as_of,
     };
+    let (status, started) = engine.create_copy_with(&dest, source, &*from, opts).await?;
     if !started {
         return Ok((
             StatusCode::OK,
@@ -1376,7 +1384,31 @@ pub async fn run_replication<S: BlobStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{BTreeMap, BTreeSet, Duration, Folded, Instant, NOTE_BYTES, clipped, held};
+    /// M196: an `as_of` copy that GC passed says so by its code.
+    #[test]
+    fn an_unavailable_epoch_has_its_code() {
+        let s = CopyStatus {
+            state: CopyState::Failed,
+            run: 1,
+            source: ReplicaSource::local(TenantId(1), "src"),
+            epoch: Some(2),
+            source_epoch: None,
+            failure: Some(CopyFailure::EpochUnavailable),
+            read_only: false,
+            reindex: None,
+            created_ms: None,
+            ended_ms: None,
+            as_of: Some(1),
+        };
+        let v = describe_copy("dst", &s, None);
+        assert_eq!(v.get("code"), Some(&serde_json::json!("epoch_unavailable")));
+        assert_eq!(v.get("as_of"), Some(&serde_json::json!(1)));
+    }
+
+    use super::{
+        BTreeMap, BTreeSet, CopyFailure, CopyState, CopyStatus, Duration, Folded, Instant,
+        NOTE_BYTES, clipped, describe_copy, held,
+    };
     use pstore_engine::ReplicaSource;
     use pstore_types::TenantId;
 

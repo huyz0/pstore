@@ -24,7 +24,7 @@ pub use head::{
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
-pub use replica::{CopyState, CopyStatus, ReplicaRefusal, Sources, SyncState, Synced};
+pub use replica::{CopyOptions, CopyState, CopyStatus, ReplicaRefusal, Sources, SyncState, Synced};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
@@ -9605,7 +9605,11 @@ fn schema_at(head: &Head, index: &str, epoch: Epoch) -> head::IndexSchema {
 
 /// The schema `index` had at `epoch`, if one was recorded (M170: a HEAD older than M7d
 /// records none, and that is not a width of 0).
-fn schema_recorded_at(head: &Head, index: &str, epoch: Epoch) -> Option<head::IndexSchema> {
+pub(crate) fn schema_recorded_at(
+    head: &Head,
+    index: &str,
+    epoch: Epoch,
+) -> Option<head::IndexSchema> {
     head.dropped
         .iter()
         // `>` and `>=` agree: `as_of` the drop's own epoch finds no segment of the index to

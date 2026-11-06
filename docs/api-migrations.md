@@ -1,5 +1,27 @@
 # Native API migration notes
 
+## M196: a copy or export of a past epoch
+
+A copy or an export takes `as_of`, a past epoch of its source, and holds the source index as a
+query `as_of` that epoch reads it:
+
+```json
+POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71"}, "as_of": 41, "read_only": true}
+```
+
+- It holds that epoch's folded rows, delete vectors and schema. An index dropped since can be
+  restored this way while GC's horizon has not passed the epoch.
+- The status gains `as_of` (`null` for the present). A succeeded copy's `source_epoch` is it. A
+  repeated `POST` matches only the same `as_of`; another is `409`.
+- Refused, as a query `as_of` is: an epoch after the present or below the reap horizon is `400
+  time_travel_horizon`; a source that is a replica is `409 replica_no_history`; an epoch with no
+  segment of the index is `source_not_found`. `as_of` with `schema` is `400`: export the epoch,
+  then reindex the export. A replication's body refuses `as_of` (`400`).
+- If GC's horizon passes the epoch before the copy publishes, it ends `failed` with code
+  `epoch_unavailable`; it is never published as another epoch. Nothing holds GC off an epoch a
+  copy is reading, so copy well inside the retention window. Evidence is in
+  [M196 verification](milestones/M196/VERIFIED.md).
+
 ## M168: a reindex is a copy that rebuilds text and regex options, and the support matrix
 
 A reindex is M166's copy with a `schema` in its body: the map a write declares, holding only
@@ -66,7 +88,7 @@ POST /v1/indexes/{dest}/copy   {"source": {"index": "src", "tenant": "71"}, "rea
   A replication's body refuses the field (`400`).
 - An export holds the source's **folded** rows at `source_epoch`: the source HEAD the sync
   copied, which may be later than the `POST`. Unfolded writes are not in it, so fold first
-  (`POST /v1/admin/fold`). A past `as_of` epoch cannot be exported.
+  (`POST /v1/admin/fold`). A past epoch is exported with `as_of` (M196).
 - A restore is a copy whose source is the export, into any tenant or store the principal may
   read; without `read_only` it is writable. It keeps answering once the export and its store
   are gone. Evidence is in [M167 verification](milestones/M167/VERIFIED.md).
