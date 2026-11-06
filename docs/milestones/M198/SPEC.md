@@ -38,21 +38,28 @@ decision is reopened; D-34's budget is unchanged.
   set (always, for a HEAD this code writes with a folded segment), forcing the earlier optional
   sections as M15.2's rule does. It holds one entry for each index with a known ref, even when
   every set is empty: the index's name, a table of the field names its refs name, then per
-  ref, in ref order, a count byte (`0xFF` unknown) and that many one-byte ordinals into the
-  table. An index with no entry, a HEAD written before M198, a ref resurrected for `as_of`, a
+  ref, in ref order (the table's and the refs' counts are varints too, and the table must be
+  exactly the sorted names the refs use; amended after code review), a varint count (`0` unknown, `k + 1` for `k` fields) and `k` varint
+  ordinals into the table (amended while the code was written: varints, so no table size
+  needs a cap). An index with no entry, a HEAD written before M198, a ref resurrected for `as_of`, a
   ref re-encoded by a node before M198, and an external index's refs (M86) are unknown.
   Malformed input (a count of refs that disagrees with the index's, an ordinal past the table,
-  a duplicate name or a duplicate index, an index HEAD does not name) is `CorruptHead`, as the
+  a duplicate name or a duplicate index, an index HEAD does not name, one field twice in a
+  ref) is `CorruptHead`, as the
   M32 section's is.
 - **Refs that move keep it.** A branch, a copy, a replica's sync and a compaction that keeps
   a segment carry the ref's set with it, as they carry `dicts` and `len`.
 - **Answer.** `GET /v1/indexes/{id}` answers `vector_search`, one entry per dense field the
   schema records (`vector` when `dims > 0`, and each key of `schema.vectors`):
   `{"approximate_rows": a, "exact_rows": e, "unknown_rows": u}`, where each is the summed
-  `rows` of the folded segments whose set names the field, whose set is known and does not,
+  live rows (a segment's rows less its deleted ones, as `documents` counts them; amended
+  while the code was written, so the three always sum to `documents`) of the folded segments whose set names the field, whose set is known and does not,
   and whose set is unknown. `exact_rows` counts a segment's rows even when some of them lack
   the field: what it says is that a query on the field scans that segment exactly. Absent
-  before the first fold, like `schema`. Unfolded rows are in none of them, and the docs say
+  before the first fold, like `schema`. Each entry is a dense leg's (`vector`, or a named
+  field through `field`); a `multi` leg's FDE clusters (M67, opt-in by `mode: "fde"`) are not
+  counted, and the docs say so (amended after code review: `schema.vectors` names
+  multi-vector fields too, and their FDE clusters are a different leg's index). Unfolded rows are in none of them, and the docs say
   they are scored exactly. Under a filter every leg is exhaustive and probes every list
   (M9b): a segment still counts as approximate there, as `explain` counts it, and the docs say
   so.
@@ -87,8 +94,13 @@ decision is reopened; D-34's budget is unchanged.
    `scripts/index-scale.sh` stays green (HEAD within its 256 bytes an index at 5,000 indexes).
 
 ## Test plan
-Server tests in `crates/pstore-server/tests/it/vector_search.rs`, engine HEAD tests beside
-`the_dicts_section_round_trips_and_refuses_malformed_input`. Red first: on the parent the
+Server tests in `crates/pstore-server/tests/it/vector_search.rs`, an engine test in
+`crates/pstore-engine/tests/it/ann_fields.rs`, the HEAD test
+`the_ann_section_round_trips_and_refuses_malformed_input` beside M32's, and the replica
+tests `a_replica_records_its_sources_dictionaries` and
+`a_reindex_keeps_live_rows_and_no_deletes` extended. The server cannot reach a clustered
+segment at its default params, so its approximate case writes HEAD's sets directly; the
+engine test reaches both thresholds. Red first: on the parent the
 summary has no `vector_search`, and the engine tests call what the parent does not have.
 
 Mutations, each to be killed:
@@ -130,3 +142,13 @@ engine test lowers `vector`'s. Minors taken: the replica rebuild and external re
 growth, the filter docs line, and the end-check citation. Declined: a bit in the `Dicts` byte
 for `vector`, since a pre-M198 ref with known dicts would then read as exact; the new
 section's presence is what says a ref's set is known.
+
+Code review round 1 (a subagent given the review packet, no edits, no cargo): no blocker. Two
+majors: the ledger was not yet written (it is, below); and a multi-vector field's entry always
+read exact although a `multi` leg with `mode: "fde"` probes its encoding clusters, taken by
+scoping `vector_search` to dense legs in the spec and the docs (the derived encoding is named
+by the field itself, so recording it would mark a single-vector field approximate where a
+dense query scans it). Minors taken: the entry's two counts are varints, which took the
+section from 49 to 43 bytes on the pinned one-segment HEAD and widened `index-scale.sh`'s
+margin; the decoder refuses a table that is not exactly the refs' sorted names; and the docs'
+named-field rule now matches the code.

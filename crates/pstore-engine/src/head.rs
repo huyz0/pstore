@@ -25,6 +25,11 @@ pub struct SegmentRef {
     /// `as_of`. A known length opens by an absolute range; unknown, by the suffix read that
     /// Azure has no form of (C-14).
     pub len: Option<u64>,
+    /// The dense fields a query searches by clusters in this segment (M198): `vector` when
+    /// its seal wrote a centroid table, and each named field its written `FdeSet` names. Fixed
+    /// when it is sealed. `None` when HEAD does not say: a HEAD from before M198 or rewritten
+    /// by a node from before it, a ref resurrected for `as_of`, or an external index's.
+    pub ann: Option<BTreeSet<String>>,
 }
 
 /// Which dictionary sidecars a segment has (M32). Fixed when it is sealed, never changed.
@@ -722,7 +727,14 @@ impl Head {
             .iter()
             .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
             .collect();
-        let copied = !once.is_empty() || !self.copies.is_empty();
+        // M198: the ANN sets last, written whenever any ref's is known, forcing every count
+        // before them.
+        let ann = self.indexes.values().flatten().any(|r| r.ann.is_some());
+        let as_of = !copy_as_of.is_empty() || ann;
+        let copy_timed = !copy_times.is_empty() || as_of;
+        let reindexed = !reindexes.is_empty() || copy_timed;
+        let exported = !exports.is_empty() || reindexed;
+        let copied = !once.is_empty() || !self.copies.is_empty() || ann;
         let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
         let texted = !texts.is_empty() || types;
@@ -907,17 +919,13 @@ impl Head {
                 }
             }
         }
-        if !exports.is_empty()
-            || !reindexes.is_empty()
-            || !copy_times.is_empty()
-            || !copy_as_of.is_empty()
-        {
+        if exported {
             out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
             for name in exports {
                 put_str(&mut out, name);
             }
         }
-        if !reindexes.is_empty() || !copy_times.is_empty() || !copy_as_of.is_empty() {
+        if reindexed {
             out.extend_from_slice(&(reindexes.len() as u32).to_le_bytes());
             for (name, r) in reindexes {
                 put_str(&mut out, name);
@@ -939,7 +947,7 @@ impl Head {
                 }
             }
         }
-        if !copy_times.is_empty() || !copy_as_of.is_empty() {
+        if copy_timed {
             out.extend_from_slice(&(copy_times.len() as u32).to_le_bytes());
             for (name, (created, ended)) in copy_times {
                 put_str(&mut out, name);
@@ -947,12 +955,15 @@ impl Head {
                 out.extend_from_slice(&ended.to_le_bytes());
             }
         }
-        if !copy_as_of.is_empty() {
+        if as_of {
             out.extend_from_slice(&(copy_as_of.len() as u32).to_le_bytes());
             for (name, epoch) in copy_as_of {
                 put_str(&mut out, name);
                 out.extend_from_slice(&epoch.to_le_bytes());
             }
+        }
+        if ann {
+            put_ann(&mut out, &self.indexes);
         }
         out
     }
@@ -1005,6 +1016,7 @@ impl Head {
                     rows: c.u32()?,
                     dicts: None,
                     len: None,
+                    ann: None,
                 });
             }
             h.indexes.insert(name, segs);
@@ -1482,6 +1494,11 @@ impl Head {
             let name = c.string()?;
             h.copy_as_of.insert(name, c.u64()?);
         }
+        // M198: and here, no ANN set known.
+        if c.at_end() {
+            return Ok(h);
+        }
+        get_ann(&mut c, &mut h.indexes)?;
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
         }
@@ -1556,6 +1573,7 @@ impl Head {
                             rows: 0,
                             dicts: None,
                             len: None,
+                            ann: None,
                         });
                     }
                     continue;
@@ -1574,6 +1592,7 @@ impl Head {
                         rows: 0,
                         dicts: None,
                         len: None,
+                        ann: None,
                     });
                 }
             }
@@ -1659,6 +1678,85 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 struct Cur<'a> {
     b: &'a [u8],
     i: usize,
+}
+
+/// M198's section: one entry for each index with a known ref, holding its name, a varint
+/// count and table of the field names its refs name (sorted, each named by some ref), a
+/// varint count of its refs, and per ref, in ref order, a varint count (`0` unknown, `k + 1`
+/// for `k` fields) and `k` varint ordinals into the table. Varints, not the other sections'
+/// `u32` counts: an entry is paid by every index with a folded segment, and
+/// `index-scale.sh` bounds HEAD at 256 bytes an index.
+fn put_ann(out: &mut Vec<u8>, indexes: &BTreeMap<String, Vec<SegmentRef>>) {
+    let known: Vec<_> = indexes
+        .iter()
+        .filter(|(_, refs)| refs.iter().any(|r| r.ann.is_some()))
+        .collect();
+    out.extend_from_slice(&(known.len() as u32).to_le_bytes());
+    for (name, refs) in known {
+        put_str(out, name);
+        let table: BTreeSet<&String> = refs.iter().flat_map(|r| r.ann.iter().flatten()).collect();
+        put_varint(out, table.len() as u64);
+        for f in &table {
+            put_str(out, f);
+        }
+        put_varint(out, refs.len() as u64);
+        for r in refs {
+            let Some(set) = &r.ann else {
+                put_varint(out, 0);
+                continue;
+            };
+            put_varint(out, set.len() as u64 + 1);
+            for f in set {
+                // Every name of every set is in the table, which is sorted as the set is.
+                let at = table.iter().position(|t| *t == f).unwrap_or_default();
+                put_varint(out, at as u64);
+            }
+        }
+    }
+}
+
+/// Reads [`put_ann`]'s section into `indexes`' refs, refusing what it would not write: a
+/// table out of order or naming a field no ref does, a count that disagrees, an ordinal past
+/// the table, one field twice in a ref, an index twice or one HEAD does not name.
+fn get_ann(
+    c: &mut Cur<'_>,
+    indexes: &mut BTreeMap<String, Vec<SegmentRef>>,
+) -> Result<(), EngineError> {
+    let mut seen = BTreeSet::new();
+    for _ in 0..c.u32()? {
+        let name = c.string()?;
+        let mut table: Vec<String> = Vec::new();
+        for _ in 0..c.varint()? {
+            table.push(c.string()?);
+        }
+        let n = usize::try_from(c.varint()?).map_err(|_| EngineError::CorruptHead)?;
+        let refs = indexes.get_mut(&name).ok_or(EngineError::CorruptHead)?;
+        if refs.len() != n || !seen.insert(name) {
+            return Err(EngineError::CorruptHead);
+        }
+        for r in refs.iter_mut() {
+            let Some(k) = c.varint()?.checked_sub(1) else {
+                r.ann = None;
+                continue;
+            };
+            let mut set = BTreeSet::new();
+            for _ in 0..k {
+                let at = usize::try_from(c.varint()?).map_err(|_| EngineError::CorruptHead)?;
+                let f = table.get(at).ok_or(EngineError::CorruptHead)?;
+                if !set.insert(f.clone()) {
+                    return Err(EngineError::CorruptHead);
+                }
+            }
+            r.ann = Some(set);
+        }
+        // The table is exactly the names its refs use, in order, as the encoder writes it:
+        // one comparison refuses a table out of order, a duplicate and an unused name alike.
+        let used: BTreeSet<&String> = refs.iter().flat_map(|r| r.ann.iter().flatten()).collect();
+        if !used.into_iter().eq(table.iter()) {
+            return Err(EngineError::CorruptHead);
+        }
+    }
+    Ok(())
 }
 
 impl Cur<'_> {
@@ -1894,12 +1992,14 @@ mod tests {
                         fde: false,
                     }),
                     len: None,
+                    ann: None,
                 },
                 SegmentRef {
                     key: "k/2.seg".to_owned(),
                     rows: 5,
                     dicts: None,
                     len: None,
+                    ann: None,
                 },
             ],
         );
@@ -1977,6 +2077,145 @@ mod tests {
         // Truncated at the section, as a decoder from before M32 re-encodes it: unknown.
         let old = Head::decode(body)?;
         assert!(old.indexes.values().flatten().all(|r| r.dicts.is_none()));
+        Ok(())
+    }
+
+    /// M198: [`with_dicts`]' index with ANN sets `sets`, in its segments' order.
+    fn with_ann(sets: [Option<&[&str]>; 2]) -> Head {
+        let mut h = with_dicts();
+        for (r, s) in h.indexes.values_mut().flatten().zip(sets) {
+            r.ann = s.map(|s| s.iter().map(|f| (*f).to_owned()).collect());
+        }
+        h
+    }
+
+    /// One index's entry in M198's section: its name, its table, and per ref a count and
+    /// ordinals.
+    type AnnEntry<'a> = (&'a str, &'a [&'a str], &'a [&'a [u8]]);
+
+    /// M198's section for `entries`.
+    fn ann_section(entries: &[AnnEntry<'_>]) -> Vec<u8> {
+        let mut b = (entries.len() as u32).to_le_bytes().to_vec();
+        for (name, table, refs) in entries {
+            put_str(&mut b, name);
+            put_varint(&mut b, table.len() as u64);
+            for f in *table {
+                put_str(&mut b, f);
+            }
+            put_varint(&mut b, refs.len() as u64);
+            for r in *refs {
+                b.extend_from_slice(r);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn the_ann_section_round_trips_and_refuses_malformed_input() -> Result<(), EngineError> {
+        // M198 criterion 2: round-trips, alone and beside every other optional section.
+        let h = with_ann([Some(&["vector", "t"]), None]);
+        assert_eq!(Head::decode(&h.encode())?, h);
+        let mut all = every_section();
+        all.indexes = h.indexes.clone();
+        assert_eq!(Head::decode(&all.encode())?, all);
+        // A known empty set is not an unknown one: an index whose sets are all empty keeps
+        // its entry.
+        let empty = with_ann([Some(&[]), Some(&[])]);
+        let back = Head::decode(&empty.encode())?;
+        assert_eq!(back, empty);
+        assert!(
+            back.indexes
+                .values()
+                .flatten()
+                .all(|r| r.ann == Some(BTreeSet::new()))
+        );
+
+        // The section is last: a table sorted by name, then per ref a count (0 unknown, k + 1
+        // for k fields) and ordinals.
+        let good = h.encode();
+        let want = ann_section(&[("a", &["t", "vector"], &[&[3, 0, 1], &[0]])]);
+        assert!(good.ends_with(&want), "{}", hex(&good));
+        let body = good
+            .get(..good.len() - want.len())
+            .ok_or(EngineError::CorruptHead)?;
+        let with = |section: Vec<u8>| {
+            let mut b = body.to_vec();
+            b.extend(section);
+            b
+        };
+        assert_eq!(Head::decode(&with(want.clone()))?, h);
+        // The count, not the table, says what a ref holds.
+        let one = Head::decode(&with(ann_section(&[("a", &["vector"], &[&[2, 0], &[1]])])))?;
+        let sets: Vec<_> = one
+            .indexes
+            .values()
+            .flatten()
+            .map(|r| r.ann.clone())
+            .collect();
+        assert_eq!(
+            sets,
+            vec![
+                Some(BTreeSet::from(["vector".to_owned()])),
+                Some(BTreeSet::new())
+            ]
+        );
+        for (why, bad) in [
+            (
+                "a ref count that disagrees",
+                ann_section(&[("a", &["t"], &[&[1]])]),
+            ),
+            (
+                "a ref count above the segments'",
+                ann_section(&[("a", &["t"], &[&[1], &[1], &[1]])]),
+            ),
+            (
+                "an ordinal past the table",
+                ann_section(&[("a", &["t"], &[&[2, 1], &[0]])]),
+            ),
+            (
+                "a duplicate name",
+                ann_section(&[("a", &["t", "t"], &[&[2, 0], &[0]])]),
+            ),
+            (
+                "a table out of order",
+                ann_section(&[("a", &["vector", "t"], &[&[3, 0, 1], &[0]])]),
+            ),
+            (
+                "a name no ref names",
+                ann_section(&[("a", &["t", "vector"], &[&[2, 1], &[0]])]),
+            ),
+            (
+                "a duplicate index",
+                ann_section(&[
+                    ("a", &["t"], &[&[2, 0], &[0]]),
+                    ("a", &["t"], &[&[2, 0], &[0]]),
+                ]),
+            ),
+            (
+                "an index HEAD does not name",
+                ann_section(&[("b", &["t"], &[&[2, 0], &[0]])]),
+            ),
+            (
+                "a ref naming one field twice",
+                ann_section(&[("a", &["t"], &[&[3, 0, 0], &[0]])]),
+            ),
+        ] {
+            assert!(
+                matches!(Head::decode(&with(bad)), Err(EngineError::CorruptHead)),
+                "{why} was accepted"
+            );
+        }
+
+        // Truncated at the section, as a decoder from before M198 re-encodes it: unknown.
+        let old = Head::decode(body)?;
+        assert!(old.indexes.values().flatten().all(|r| r.ann.is_none()));
+        // And nothing known writes no section: the HEAD before M198, byte for byte.
+        let mut none = h.clone();
+        for r in none.indexes.values_mut().flatten() {
+            r.ann = None;
+        }
+        assert!(!none.encode().ends_with(&want));
+        assert_eq!(Head::decode(&none.encode())?, none);
         Ok(())
     }
 
@@ -2073,6 +2312,7 @@ mod tests {
                     rows: 10,
                     dicts: Some(Dicts::default()),
                     len,
+                    ann: None,
                 })
                 .collect::<Vec<_>>()
         };

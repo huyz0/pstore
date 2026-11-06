@@ -379,6 +379,7 @@ mod tests {
                 rows: 1,
                 dicts: None,
                 len: None,
+                ann: None,
             }],
         );
         assert!(taken(&h));

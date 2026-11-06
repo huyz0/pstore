@@ -30,7 +30,7 @@ use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
 use pstore_format::{Document, Filter, Segment};
 use pstore_types::{Epoch, LaneId, Seq, TenantId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The key one lane's bundle lives at. **Derived**, so a successor computes it rather than
@@ -100,6 +100,17 @@ fn dense_rows(docs: &[Document], order: &[usize]) -> Vec<(String, Vec<Vec<f32>>)
                 .then(|| (pstore_index::fde_clusters::dense_name(field), rows))
         })
         .collect()
+}
+
+/// The named dense fields of the fields a written `FdeSet` is built of (M198): M83's, named
+/// by `dense_name`, each of which the set holds clusters of, which is what a dense leg over
+/// the field checks before it probes.
+fn named_ann(fields: &[(String, Vec<Vec<f32>>)]) -> impl Iterator<Item = String> + '_ {
+    let prefix = pstore_index::fde_clusters::dense_name("");
+    fields
+        .iter()
+        .filter_map(move |(name, _)| name.strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
 }
 
 /// Every multi-vector field the segment's documents carry the encoding of, and the encodings in
@@ -1033,7 +1044,20 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
         None if quarantine_exists(h, index) => &Vec::new(),
         None => return None,
     };
+    // Live rows: a segment's deleted rows are not documents (M9c.2).
+    let live = |r: &SegmentRef| {
+        let gone = h
+            .deletes
+            .get(&head::dv_ref(index, &r.key))
+            .map_or(0, |(_, n)| *n);
+        u64::from(r.rows.saturating_sub(gone))
+    };
     Some(IndexStats {
+        vector_search: h
+            .schemas
+            .get(index)
+            .map(|s| vector_search(s, refs, live))
+            .unwrap_or_default(),
         // The newest commit that rewrote its segments or their delete vectors (M9f): both
         // keys carry the epoch they were written at, and a retry re-derives them.
         updated_epoch: refs
@@ -1047,17 +1071,7 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
             .max()
             .map(Epoch),
         segments: refs.len() as u64,
-        // Live rows: a segment's deleted rows are not documents (M9c.2).
-        documents: refs
-            .iter()
-            .map(|r| {
-                let gone = h
-                    .deletes
-                    .get(&head::dv_ref(index, &r.key))
-                    .map_or(0, |(_, n)| *n);
-                u64::from(r.rows.saturating_sub(gone))
-            })
-            .sum(),
+        documents: refs.iter().map(live).sum(),
         epoch: h.epoch,
         schema: h.schemas.get(index).cloned(),
         rejected_rows: h.schema_rejects.get(index).copied().unwrap_or(0),
@@ -1070,6 +1084,32 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
         bytes: refs.iter().map(|r| r.len).sum(),
         read_only: h.read_only.contains(index) || h.replications.contains_key(index),
     })
+}
+
+/// Each dense field `schema` records -- `vector` when it has a width, and each named one --
+/// to how a query on it searches `refs`' live rows (M198).
+fn vector_search(
+    schema: &head::IndexSchema,
+    refs: &[SegmentRef],
+    live: impl Fn(&SegmentRef) -> u64,
+) -> BTreeMap<String, VectorSearch> {
+    let primary = (schema.dims > 0).then_some(pstore_format::DEFAULT_FIELD);
+    primary
+        .into_iter()
+        .chain(schema.fields.keys().map(String::as_str))
+        .map(|field| {
+            let mut out = VectorSearch::default();
+            for r in refs {
+                let n = live(r);
+                match &r.ann {
+                    Some(set) if set.contains(field) => out.approximate_rows += n,
+                    Some(_) => out.exact_rows += n,
+                    None => out.unknown_rows += n,
+                }
+            }
+            (field.to_owned(), out)
+        })
+        .collect()
 }
 
 fn is_rowless(d: &Document) -> bool {
@@ -2362,6 +2402,21 @@ pub struct IndexStats {
     pub bytes: Option<u64>,
     /// Whether it takes no writes (M149): its owner's flag, or a replica's replication.
     pub read_only: bool,
+    /// Each dense field the schema records, to how a query on it searches the live rows
+    /// (M198); empty before the schema is.
+    pub vector_search: BTreeMap<String, VectorSearch>,
+}
+
+/// How a query on one dense field searches an index's folded live rows (M198), by segment:
+/// by its clusters, by the exact scan, or not recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorSearch {
+    /// Rows of segments a query on the field searches by clusters.
+    pub approximate_rows: u64,
+    /// Rows of segments it scans exactly, whether or not each row carries the field.
+    pub exact_rows: u64,
+    /// Rows of segments HEAD does not say of.
+    pub unknown_rows: u64,
 }
 
 /// One writer's view of one tenant.
@@ -3564,7 +3619,7 @@ impl<S: BlobStore> Engine<S> {
         fts: &FullText,
         texts: &BTreeMap<String, FullText>,
         trigram: &[String],
-    ) -> Result<(Key, Dicts, u64), EngineError> {
+    ) -> Result<(Key, Dicts, u64, BTreeSet<String>), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
         let text_field = text_field.filter(|f| docs.iter().any(|d| has_text(d, f)));
@@ -3607,11 +3662,15 @@ impl<S: BlobStore> Engine<S> {
             sidecars.push((pstore_format::text::dict_key, bytes::Bytes::from(d)));
             dicts.text = true;
         }
+        // M198: what HEAD records of the fields a query searches by clusters, from what this
+        // seal writes: `vector`'s centroid table, and the named fields of a written set.
+        let mut ann = BTreeSet::new();
         if let Some(c) = &built.centroids {
             sidecars.push((
                 pstore_index::vec_index::centroid_key,
                 bytes::Bytes::from(c.encode()),
             ));
+            ann.insert(pstore_format::DEFAULT_FIELD.to_owned());
         }
         // M71.2: the multi-vector encoding clustered, when the segment is big enough to have
         // more than one list. `built.order` repeats a replicated row, so the segment's own rows
@@ -3625,6 +3684,7 @@ impl<S: BlobStore> Engine<S> {
                 pstore_index::cluster::Params::default(),
             );
             if set.worth_writing() {
+                ann.extend(named_ann(&fields));
                 sidecars.push((
                     pstore_index::fde_clusters::key,
                     bytes::Bytes::from(set.encode()),
@@ -3660,7 +3720,7 @@ impl<S: BlobStore> Engine<S> {
                 }
                 if all {
                     // M45: the length HEAD records, so an open never needs a suffix read.
-                    return Ok((key, dicts, built.segment.len() as u64));
+                    return Ok((key, dicts, built.segment.len() as u64, ann));
                 }
             }
             refused += 1;
@@ -6227,7 +6287,7 @@ impl<S: BlobStore> Engine<S> {
                 }
                 // M14: under the index's analyzer, which this fold may have just recorded.
                 let schema = next.schemas.get(idx).cloned().unwrap_or_default();
-                let (seg_key, dicts, len) = self
+                let (seg_key, dicts, len, ann) = self
                     .seal(
                         names,
                         &self.segment_key(next.epoch, idx),
@@ -6248,6 +6308,7 @@ impl<S: BlobStore> Engine<S> {
                         rows: docs.len() as u32,
                         dicts: Some(dicts),
                         len: Some(len),
+                        ann: Some(ann),
                     });
             }
             // ⚠️ **Each named field's width the fold judged by is recorded** (M98), whether or
@@ -7157,9 +7218,10 @@ impl<S: BlobStore> Engine<S> {
         let empty = rows.is_empty();
         let mut out_dicts = Dicts::default();
         let mut out_len = None;
+        let mut out_ann = BTreeSet::new();
         if !empty {
             let len;
-            (out_key, out_dicts, len) = self
+            (out_key, out_dicts, len, out_ann) = self
                 .seal(names, &out_key, &rows, text_field, &fts, &texts, &trigram)
                 .await?;
             out_len = Some(len);
@@ -7180,7 +7242,7 @@ impl<S: BlobStore> Engine<S> {
             // refused, and comparing keys would re-seal on every retry at an unchanged epoch.
             let want = at.head.epoch.next();
             if want != sealed_at && !empty {
-                let (key, dicts, len) = self
+                let (key, dicts, len, ann) = self
                     .seal(
                         names,
                         &self.compacted_key(want, index),
@@ -7193,6 +7255,7 @@ impl<S: BlobStore> Engine<S> {
                     .await?;
                 out_key = key;
                 out_dicts = dicts;
+                out_ann = ann;
                 // ⚠️ M45: the re-seal's length, never the abandoned attempt's.
                 out_len = Some(len);
                 sealed_at = want;
@@ -7202,6 +7265,7 @@ impl<S: BlobStore> Engine<S> {
                 rows: rows.len() as u32,
                 dicts: Some(out_dicts),
                 len: out_len,
+                ann: Some(out_ann.clone()),
             };
             let current: Vec<SegmentRef> = at.head.indexes.get(index).cloned().unwrap_or_default();
             // ⚠️ The discard condition. If any input is no longer named by HEAD, another

@@ -172,6 +172,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                                 rows: 64,
                                 dicts: None,
                                 len: None,
+                                ann: None,
                             }],
                         )
                     })

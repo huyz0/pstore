@@ -4378,6 +4378,7 @@ async fn index_summary<S: BlobStore + 'static>(
         written_ms: None,
         bytes: Some(0),
         read_only: false,
+        vector_search: std::collections::BTreeMap::new(),
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -4385,6 +4386,20 @@ async fn index_summary<S: BlobStore + 'static>(
         documents: s.documents,
         epoch: s.epoch.0,
         unfolded,
+        // M198: beside the schema, from the same HEAD read.
+        vector_search: s.schema.is_some().then(|| {
+            s.vector_search
+                .iter()
+                .map(|(f, v)| {
+                    let out = types::VectorSearch {
+                        approximate_rows: v.approximate_rows,
+                        exact_rows: v.exact_rows,
+                        unknown_rows: v.unknown_rows,
+                    };
+                    (f.clone(), out)
+                })
+                .collect()
+        }),
         schema: s.schema.map(|sc| SchemaOut {
             // M195: each field recorded f16 or i8, at its client width.
             vector_types: sc

@@ -377,9 +377,11 @@ async fn a_plain_fold_reads_what_it_did_before_m13() {
     // 18 more, its lengths section: a count, the name `docs`, a count, and one 2-byte varint.
     // M148 adds 56, its times section: the zero counts of the three sections it forces (12),
     // a forced `keys_since` (8), the further text fields' and M173's recorded types' zero
-    // counts (8), a count (4), the name `docs` (8) and two times (16).
+    // counts (8), a count (4), the name `docs` (8) and two times (16). M198 adds 43, its ANN section: the zero counts of the seven sections it forces (28), a
+    // count (4), the name `docs` (8), and three 1-byte varints: an empty table's count, a ref
+    // count and the one segment's count of no fields.
     assert_eq!(f["cost"]["blob_reads"], 13, "{f}");
-    assert_eq!(f["cost"]["bytes_read"], 896 + 18 + 56, "{f}");
+    assert_eq!(f["cost"]["bytes_read"], 896 + 18 + 56 + 43, "{f}");
 }
 
 #[tokio::test]
