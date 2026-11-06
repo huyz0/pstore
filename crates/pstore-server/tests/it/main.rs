@@ -82,6 +82,7 @@ mod restart;
 mod scheduled_fold;
 mod scheduled_reap;
 mod schema;
+mod scoring;
 mod served_epoch;
 mod session;
 mod shape;

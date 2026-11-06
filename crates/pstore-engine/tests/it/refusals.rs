@@ -96,10 +96,20 @@ async fn a_strong_read_of_a_past_epoch_is_refused() {
         matches!(a, Err(EngineError::Query(ref m)) if m.contains("strong with as_of")),
         "{a:?}"
     );
+    let every = pstore_query::Expr::Filter(pstore_query::Predicate::Absent("x".to_owned()));
+    let s = e.scored_as("idx", &every, None, 0, 10, past, strong).await;
+    assert!(
+        matches!(s, Err(EngineError::Query(ref m)) if m.contains("strong with as_of")),
+        "{s:?}"
+    );
     // Either alone is a read.
     e.ordered_as("idx", &by, None, 0, 10, past, Consistency::Eventual)
         .await
         .unwrap();
+    for (at, level) in [(past, Consistency::Eventual), (None, strong)] {
+        let s = e.scored_as("idx", &every, None, 0, 10, at, level).await;
+        assert_eq!(s.unwrap().ordered.rows.len(), 1, "{at:?} {level:?}");
+    }
     e.aggregate_as("idx", spec, None, None, strong)
         .await
         .unwrap();

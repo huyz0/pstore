@@ -204,3 +204,83 @@ async fn two_keys_order_across_segments_a_delete_vector_and_unfolded_rows() {
     let page = e.ordered("idx", order, None, 1, 3, None).await.unwrap();
     assert_eq!(ids(page.rows), ["r6", "r4", "r3"]);
 }
+
+/// M182 criterion 5: a scoring expression is an order's three rounds, its term dictionaries
+/// riding the open round, and reads no posting list: the requests are counted exactly.
+#[tokio::test]
+async fn an_expression_query_takes_three_rounds() {
+    use pstore_engine::Consistency;
+    use pstore_query::Expr;
+    let text = |id: &str, k: i64, t: &str| {
+        let mut d = doc(id, k);
+        d.attrs.insert("text".to_owned(), Value::Str(t.to_owned()));
+        d
+    };
+    let expr = Expr::Sum(vec![
+        Expr::Bm25 {
+            field: "text".to_owned(),
+            query: "fox".to_owned(),
+            last_as_prefix: false,
+        },
+        Expr::Product(
+            0.5,
+            Box::new(Expr::Filter(Predicate::Cmp(
+                "k".to_owned(),
+                Op::Gt,
+                Value::Int(2),
+            ))),
+        ),
+    ]);
+    for segments in [1usize, 8] {
+        let store = Arc::new(DepthCounting::new(MemoryStore::new()));
+        let e = Engine::new(Arc::clone(&store), TenantId(42), LaneId(1));
+        for s in 0..segments {
+            e.write(
+                "idx",
+                (0..5)
+                    .map(|i| {
+                        text(
+                            &format!("s{s}-{i}"),
+                            i,
+                            if i % 2 == 0 { "a fox" } else { "a dog" },
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+            e.flush().await.unwrap();
+            e.fold().await.unwrap();
+        }
+        e.delete("idx", vec!["s0-0".to_owned()]).await.unwrap();
+        e.flush().await.unwrap();
+        e.fold().await.unwrap();
+        for unfolded in [false, true] {
+            if unfolded {
+                e.write("idx", vec![text("late", 9, "fox fox fox")])
+                    .await
+                    .unwrap();
+            }
+            store.reset();
+            let got = e
+                .scored_as("idx", &expr, None, 0, 3, None, Consistency::Eventual)
+                .await
+                .unwrap();
+            assert_eq!(store.depth(), 3, "{segments} segments, unfolded {unfolded}");
+            // Exactly: HEAD; each segment's suffix and term dictionary, and the one delete
+            // vector; one coalesced block plan per segment. No posting list.
+            assert_eq!(
+                store.requests(),
+                2 + 3 * segments,
+                "{segments} segments, unfolded {unfolded}"
+            );
+            assert_eq!(got.ordered.rows[0].id == "late", unfolded);
+            assert_eq!(got.scores.len(), 3);
+            assert!(
+                got.scores.windows(2).all(|w| w[0] >= w[1]),
+                "{:?}",
+                got.scores
+            );
+        }
+    }
+}

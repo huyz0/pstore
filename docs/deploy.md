@@ -327,6 +327,40 @@ always. The primary takes it by naming `"field": "text"`, since a string leg has
 - A query with a prefix leg is answered by the server that received it, never split across
   servers.
 
+## Scoring expressions
+
+`rank_by` may hold a scoring expression instead of an order
+([M182](milestones/M182/SPEC.md)), in the vendor's spelling:
+
+```json
+{"rank_by": ["Sum", [["Product", 2, ["title", "BM25", "quick fox"]],
+                     ["content", "BM25", "quick fox"],
+                     ["species", "Eq", "whale"]]],
+ "filters": ["year", "Gte", 2020], "top_k": 10}
+```
+
+- `["Sum", [e, ...]]` adds, `["Max", [e, ...]]` takes the largest, and `["Product", w, e]` or
+  `["Product", e, w]` multiplies by `w`. A filter scores 1 where it admits the row, else 0.
+  `[field, "BM25", query]` is the score the text leg over that field gives the row, with the
+  same analyzer, `k1`, `b` and statistics; it takes a token array and
+  `{"last_as_prefix": bool}` as a leg does.
+- Rows scoring exactly 0 are left out. The rest come by score, then id, each with its
+  `score`.
+- A weight is 0 or from 0.001 to 1000. A `Sum` or `Max` has 1 to 16 clauses, and a tree at
+  most 64 nodes, 8 deep. A `BM25` field must be the index's `text` or a declared full-text
+  field.
+- An `[attribute, "asc" | "desc"]` pair, or a list of them, is still an order.
+- ⚠️ **It is a scan, as an unfiltered `rank_by` order is.** Three round trips: HEAD; each
+  segment's footer, delete vector and term dictionary; its admitted blocks. No posting list
+  is read: each row's text is analyzed again. Every admitted block is fetched, so a broad
+  expression over a large index costs the index's bytes; `filters` narrow it.
+- Not with `vector`, `multi`, `text`, `field`, `exact`, `fusion`, `boost`, `aggregate_by`
+  or `highlight`. `top_k + offset` is at most 10,000. A query with an expression is
+  answered by the server that received it.
+- `Attribute`, `Saturate`, `Decay` and `Dist` are not supported yet.
+- Inside `rank_by`, a filter on an attribute named `Sum`, `Max` or `Product` reads as that
+  operator; filter such an attribute in `filters`.
+
 ## Tokenizers and a token length limit
 
 `full_text_search.tokenizer` names how a string becomes tokens
