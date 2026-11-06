@@ -70,6 +70,69 @@ impl Stats {
     }
 }
 
+/// A term's idf over `n` rows, `df` of which hold it.
+fn idf(n: f32, df: f32) -> f32 {
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+/// One term's BM25 in a row of length `len` that holds it `tf` times.
+fn term_score(idf: f32, tf: f32, len: f32, avgdl: f32, k1: f32, b: f32) -> f32 {
+    // ⚠️ The length term is DROPPED when there is no average, not divided by one:
+    // substituting 1.0 makes the norm depend on raw document length in a corpus that has no
+    // scale, which is a different score rather than a degenerate one.
+    let norm = if avgdl > 0.0 {
+        k1 * (1.0 - b + b * len / avgdl)
+    } else {
+        k1 * (1.0 - b)
+    };
+    idf * (tf * (k1 + 1.0)) / (tf + norm)
+}
+
+/// One row's score under [`TextIndex::search_prefixed`] (M182), from the row's own terms
+/// (`row`, as [`pstore_format::text::value_terms`] makes them) rather than from postings:
+/// the same arithmetic in the same order -- each query term once, in byte order, then the
+/// prefixes' 1.0 -- so the two agree to the bit.
+#[must_use]
+pub fn row_score(
+    terms: &[String],
+    prefixes: &[String],
+    row: &[String],
+    stats: &Stats,
+    k1: f32,
+    b: f32,
+) -> f32 {
+    let mut terms: Vec<&String> = terms.iter().collect();
+    terms.sort_unstable();
+    terms.dedup();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "BM25 is arithmetic on counts; all of them are far below f32's exact range"
+    )]
+    let (n, len) = (stats.doc_count as f32, row.len() as f32);
+    let avgdl = stats.avgdl();
+    let mut score = 0.0_f32;
+    for term in terms {
+        let tf = row.iter().filter(|t| *t == term).count();
+        // A row holding the term is in a segment whose dictionary counted it.
+        let (Some(df), true) = (stats.df.get(term), tf > 0) else {
+            continue;
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "BM25 is arithmetic on counts; all of them are far below f32's exact range"
+        )]
+        let (df, tf) = (*df as f32, tf as f32);
+        score += term_score(idf(n, df), tf, len, avgdl, k1, b);
+    }
+    if row
+        .iter()
+        .any(|t| prefixes.iter().any(|p| t.starts_with(p.as_str())))
+    {
+        score += 1.0;
+    }
+    score
+}
+
 /// An opened text index: the segment's directory and the term dictionary.
 #[derive(Debug)]
 pub struct TextIndex {
@@ -386,21 +449,11 @@ impl TextIndex {
                 // entry's own df is what a single-segment caller does, and it is the same
                 // number then.
                 let df = *stats.df.get(term).unwrap_or(&e.df) as f32;
-                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                let idf = idf(n, df);
                 for (row, tf) in self.dict.decode_list(e, buf) {
                     let len =
                         pstore_format::text::norm_at(&norms, row as usize).unwrap_or(0) as f32;
-                    // ⚠️ The length term is DROPPED when there is no average, not divided by
-                    // one: substituting 1.0 makes the norm depend on raw document length in a
-                    // corpus that has no scale, which is a different score rather than a
-                    // degenerate one.
-                    let norm = if avgdl > 0.0 {
-                        k1 * (1.0 - b + b * len / avgdl)
-                    } else {
-                        k1 * (1.0 - b)
-                    };
-                    let tf = tf as f32;
-                    scores.add(row, idf * (tf * (k1 + 1.0)) / (tf + norm));
+                    scores.add(row, term_score(idf, tf as f32, len, avgdl, k1, b));
                 }
             }
             // M180: 1.0 a row the prefixes match, once however many terms or forms match it.
