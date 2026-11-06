@@ -243,3 +243,39 @@ fn every_width_near_the_budget_seals() {
         );
     }
 }
+
+/// M196: a footer's row count, read from the bytes alone, as the segment's own open reads
+/// it; refused without the magic at either end, or too short to hold a footer.
+#[tokio::test]
+async fn footer_rows_reads_the_count_the_open_reads() {
+    let mut w = SegmentWriter::new(1);
+    for i in 0..37 {
+        w.push(Document {
+            id: format!("d{i:03}"),
+            vectors: BTreeMap::new(),
+            attrs: BTreeMap::new(),
+        });
+    }
+    let bytes = w.try_finish().unwrap();
+    let store = MemoryStore::new();
+    let key = Key::new("rows.seg");
+    store.put(&key, bytes.clone()).await.unwrap();
+    let open = Segment::open(&store, &key).await.unwrap();
+    assert_eq!(pstore_format::footer_rows(&bytes), Some(37));
+    assert_eq!(open.row_count(), 37);
+    let mut head = bytes.to_vec();
+    head[bytes.len() - 42] ^= 1;
+    assert_eq!(pstore_format::footer_rows(&head), None, "the leading magic");
+    let mut tail = bytes.to_vec();
+    *tail.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        pstore_format::footer_rows(&tail),
+        None,
+        "the trailing magic"
+    );
+    assert_eq!(pstore_format::footer_rows(&bytes[bytes.len() - 41..]), None);
+    assert_eq!(
+        pstore_format::footer_rows(&bytes[bytes.len() - 42..]),
+        Some(37)
+    );
+}

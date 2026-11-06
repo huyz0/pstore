@@ -16,8 +16,8 @@ use pstore_blob::{
     Precondition, PutOutcome, TenantView,
 };
 use pstore_engine::{
-    CopyFailure, CopyState, Engine, EngineError, Reindex, ReplicaRefusal, ReplicaSource, Sources,
-    SyncState, Synced,
+    CopyFailure, CopyOptions, CopyState, Engine, EngineError, Reindex, ReplicaRefusal,
+    ReplicaSource, Sources, SyncState, Synced,
 };
 use pstore_format::text::FullText;
 use pstore_format::{Document, Impact, Value, VectorField};
@@ -3088,4 +3088,329 @@ async fn a_copy_time_never_outlives_its_copy() {
     let h = s.dst.head_for_test().await;
     assert!(h.replications.contains_key("dst"));
     assert!(!h.copy_times.contains_key("dst"), "{:?}", h.copy_times);
+}
+
+// M196: a copy or export of a past epoch.
+
+impl Setup {
+    async fn copy_with(
+        &self,
+        dest: &str,
+        opts: CopyOptions,
+    ) -> Result<(pstore_engine::CopyStatus, bool), EngineError> {
+        let from: Arc<dyn BlobStore> = match self.source.store.as_str() {
+            "" => Arc::new(self.here.acct.as_tenant(DST)),
+            _ => self.remotes.store("far").unwrap(),
+        };
+        self.dst
+            .create_copy_with(dest, self.source.clone(), &*from, opts)
+            .await
+    }
+    async fn copy_as_of(&self, dest: &str, epoch: u64) -> pstore_engine::CopyStatus {
+        let opts = CopyOptions {
+            as_of: Some(epoch),
+            ..CopyOptions::default()
+        };
+        self.copy_with(dest, opts).await.unwrap().0
+    }
+}
+
+/// The epoch of `e`'s HEAD.
+async fn epoch_of(e: &E) -> u64 {
+    e.head_for_test().await.epoch.0
+}
+
+/// M196 criterion 1: an export of a past epoch holds that epoch -- after a delete, a
+/// replacement, a compaction that buries its segments and the source's drop -- with each
+/// ref's rows and length read from the bytes it copied.
+#[tokio::test]
+async fn an_export_holds_a_past_epoch() {
+    for kind in [Kind::SameTenant, Kind::CrossTenant, Kind::Remote] {
+        let s = setup(kind);
+        write(&s.src, "src", 0..30).await;
+        write(&s.src, "src", 30..60).await;
+        // A delete vector alive at the epoch, buried after it.
+        s.src.delete("src", vec!["d0010".to_owned()]).await.unwrap();
+        fold(&s.src).await;
+        let at = epoch_of(&s.src).await;
+        let want = answers(&s.src, "src").await;
+        let rows = digest(&s.src, "src").await;
+        let stats = s.src.index_stats("src").await.unwrap().unwrap();
+        let schema = s.src.head_for_test().await.schemas.get("src").cloned();
+        assert_eq!(stats.documents, 59);
+        // After it: a delete, a replacement, a compaction, and the drop.
+        s.src.delete("src", vec!["d0003".to_owned()]).await.unwrap();
+        fold(&s.src).await;
+        s.src.write("src", vec![doc("d0005", 99.0)]).await.unwrap();
+        fold(&s.src).await;
+        s.src.compact("src").await.unwrap();
+        s.src.delete_index("src").await.unwrap();
+        assert!(answers(&s.src, "src").await.is_none(), "{kind:?}");
+
+        let opts = CopyOptions {
+            read_only: true,
+            as_of: Some(at),
+            ..CopyOptions::default()
+        };
+        let (started, created) = s.copy_with("dst", opts).await.unwrap();
+        assert!(created);
+        assert_eq!(started.as_of, Some(at));
+        let mut st = SyncState::default();
+        assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+        let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(done.state, CopyState::Succeeded, "{kind:?}");
+        assert_eq!(done.source_epoch, Some(at));
+        assert_eq!(done.as_of, Some(at));
+        assert!(done.read_only);
+        assert_eq!(answers(&s.dst, "dst").await, want, "{kind:?}: the answers");
+        assert_eq!(digest(&s.dst, "dst").await, rows, "{kind:?}: the rows");
+        let got = s.dst.index_stats("dst").await.unwrap().unwrap();
+        assert_eq!(
+            (got.documents, got.segments),
+            (stats.documents, stats.segments),
+            "{kind:?}: the stats"
+        );
+        let head = s.dst.head_for_test().await;
+        assert_eq!(
+            head.schemas.get("dst").cloned(),
+            schema,
+            "{kind:?}: the schema"
+        );
+        for r in head.indexes.get("dst").unwrap() {
+            let key = Key::new(r.key.clone());
+            let bytes = s.here.hooked.inner.get(&key).await.unwrap();
+            let seg = pstore_format::Segment::open(&s.here.hooked.inner, &key)
+                .await
+                .unwrap();
+            assert_eq!(r.rows as usize, seg.row_count(), "{kind:?}: {}", r.key);
+            assert_eq!(r.len, Some(bytes.len() as u64), "{kind:?}: {}", r.key);
+        }
+    }
+}
+
+/// M196 criterion 1: a remap keeps the counts the copy's bytes gave -- a delete vector
+/// copied before it is reused with the rows it deletes, not the view's 0.
+#[tokio::test]
+async fn a_remapped_past_epoch_keeps_its_counts() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    s.src.delete("src", vec!["d0010".to_owned()]).await.unwrap();
+    fold(&s.src).await;
+    let at = epoch_of(&s.src).await;
+    let rows = digest(&s.src, "src").await;
+    s.src.compact("src").await.unwrap();
+    // The segment with no delete vector reads 404 once, so the first round copies the vector
+    // and the remap's round reuses it.
+    let then = s.src.head_for_test().await.as_of(Epoch(at)).unwrap();
+    let refs = then.indexes.get("src").unwrap();
+    assert_eq!(refs.len(), 2);
+    let plain = refs
+        .iter()
+        .find(|r| !then.deletes.values().any(|(k, _)| k.starts_with(&r.key)))
+        .unwrap();
+    s.here
+        .hooked
+        .missing
+        .lock()
+        .unwrap()
+        .insert(plain.key.clone(), 1);
+    s.copy_as_of("dst", at).await;
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    assert!(
+        s.here
+            .hooked
+            .missing
+            .lock()
+            .unwrap()
+            .values()
+            .all(|n| *n == 0)
+    );
+    let got = s.dst.index_stats("dst").await.unwrap().unwrap();
+    assert_eq!(got.documents, 59);
+    assert_eq!(digest(&s.dst, "dst").await, rows);
+}
+
+/// M196 criterion 2: refused at the create as a query `as_of` is, writing nothing.
+#[tokio::test]
+async fn a_past_epoch_is_refused_as_a_query_refuses_it() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "other", 0..5).await;
+    let before_src = epoch_of(&s.src).await;
+    write(&s.src, "src", 0..30).await;
+    write(&s.src, "src", 30..60).await;
+    let dst_epoch = epoch_of(&s.dst).await;
+    let now = epoch_of(&s.src).await;
+    let opts = |as_of| CopyOptions {
+        as_of: Some(as_of),
+        ..CopyOptions::default()
+    };
+    // After the present.
+    assert!(matches!(
+        s.copy_with("dst", opts(now + 1)).await,
+        Err(EngineError::TimeTravel(_))
+    ));
+    // No segment of the index at that epoch.
+    refused(
+        s.copy_with("dst", opts(before_src)).await,
+        &ReplicaRefusal::SourceNotFound("src".to_owned()),
+    );
+    // With a reindex.
+    refused(
+        s.copy_with(
+            "dst",
+            CopyOptions {
+                reindex: Some(stemmed()),
+                as_of: Some(now),
+                ..CopyOptions::default()
+            },
+        )
+        .await,
+        &ReplicaRefusal::Invalid("as_of is a copy's or an export's: reindex the export".to_owned()),
+    );
+    // Below the horizon.
+    s.src.compact("src").await.unwrap();
+    s.src.gc(0).await.unwrap();
+    let horizon = s.src.reap_horizon().await.unwrap();
+    assert!(horizon > before_src + 1);
+    assert!(matches!(
+        s.copy_with("dst", opts(horizon - 1)).await,
+        Err(EngineError::TimeTravel(_))
+    ));
+    // A replica source.
+    let from: Arc<dyn BlobStore> = Arc::new(s.here.acct.as_tenant(SRC));
+    s.src
+        .create_replication("rep", ReplicaSource::local(SRC, "src"), &*from)
+        .await
+        .unwrap();
+    let mut st = SyncState::default();
+    s.src.replicate(&s.remotes, &mut st).await.unwrap();
+    let rep = ReplicaSource::local(SRC, "rep");
+    refused(
+        s.dst
+            .create_copy_with("dst", rep, &*from, opts(epoch_of(&s.src).await))
+            .await,
+        &ReplicaRefusal::NoHistory("rep".to_owned()),
+    );
+    assert_eq!(epoch_of(&s.dst).await, dst_epoch, "a refusal wrote HEAD");
+}
+
+/// M196 criterion 3: a GC whose horizon passes the epoch ends the copy typed, before a sync
+/// and between a sync's copies and its commit; a present copy in the same sync succeeds.
+#[tokio::test]
+async fn a_reaped_epoch_ends_a_copy_typed() {
+    for kind in [Kind::SameTenant, Kind::CrossTenant, Kind::Remote] {
+        let s = setup(kind);
+        write(&s.src, "src", 0..30).await;
+        let at = epoch_of(&s.src).await;
+        write(&s.src, "src", 30..60).await;
+        s.src.compact("src").await.unwrap();
+        s.dst.set_clock_for_test(Some(4_000));
+        s.copy_as_of("dst", at).await;
+        s.copy_with("plain", CopyOptions::default()).await.unwrap();
+        s.src.gc(0).await.unwrap();
+        let mut st = SyncState::default();
+        let out = s.sync(&mut st).await;
+        assert_eq!(out.committed, vec!["plain".to_owned()], "{kind:?}");
+        let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(f.state, CopyState::Failed, "{kind:?}");
+        assert_eq!(f.failure, Some(CopyFailure::EpochUnavailable));
+        assert_eq!(f.ended_ms, Some(4_000));
+        assert_eq!(f.as_of, Some(at));
+        assert!(!s.dst.head_for_test().await.indexes.contains_key("dst"));
+        let p = s.dst.copy_status("plain").await.unwrap().unwrap();
+        assert_eq!(p.state, CopyState::Succeeded, "{kind:?}");
+
+        // Between its copies and its commit.
+        let s = setup(kind);
+        write(&s.src, "src", 0..30).await;
+        let at = epoch_of(&s.src).await;
+        write(&s.src, "src", 30..60).await;
+        s.src.compact("src").await.unwrap();
+        s.copy_as_of("dst", at).await;
+        let src = &s.src;
+        let mut st = SyncState::default();
+        let out = s
+            .dst
+            .replicate_with_interference_for_test(&s.remotes, &mut st, async {
+                src.gc(0).await.unwrap();
+            })
+            .await
+            .unwrap();
+        assert!(out.committed.is_empty(), "{kind:?}: {out:?}");
+        let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(
+            f.failure,
+            Some(CopyFailure::EpochUnavailable),
+            "{kind:?}: {f:?}"
+        );
+        assert!(!s.dst.head_for_test().await.indexes.contains_key("dst"));
+    }
+
+    // During its copies: the first segment read collects, so the remap's view fails.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let at = epoch_of(&s.src).await;
+    write(&s.src, "src", 30..60).await;
+    s.src.compact("src").await.unwrap();
+    s.copy_as_of("dst", at).await;
+    let src = Arc::new(s.here.engine(SRC, 8));
+    *s.here.hooked.hook.lock().unwrap() = Some((
+        format!("tnt/{}/idx/src/seg/", SRC.0),
+        Box::new(move || {
+            Box::pin(async move {
+                src.gc(0).await.unwrap();
+            })
+        }),
+    ));
+    let mut st = SyncState::default();
+    let out = s.sync(&mut st).await;
+    assert!(out.committed.is_empty(), "{out:?}");
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.failure, Some(CopyFailure::EpochUnavailable), "{f:?}");
+}
+
+/// M196 criterion 4: a repeated request matches only its own epoch, and a new copy into a
+/// failed one's name copies the present.
+#[tokio::test]
+async fn an_as_of_never_outlives_its_copy() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    let at = epoch_of(&s.src).await;
+    write(&s.src, "src", 30..60).await;
+    s.src.compact("src").await.unwrap();
+    let first = s.copy_as_of("dst", at).await;
+    let opts = |as_of| CopyOptions {
+        as_of,
+        ..CopyOptions::default()
+    };
+    let (again, created) = s.copy_with("dst", opts(Some(at))).await.unwrap();
+    assert!(!created);
+    assert_eq!(again, first);
+    refused(
+        s.copy_with("dst", opts(Some(at + 1))).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    refused(
+        s.copy_with("dst", opts(None)).await,
+        &ReplicaRefusal::Exists("dst".to_owned()),
+    );
+    s.src.gc(0).await.unwrap();
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    assert_eq!(
+        s.dst.copy_status("dst").await.unwrap().unwrap().failure,
+        Some(CopyFailure::EpochUnavailable)
+    );
+    let (fresh, created) = s.copy_with("dst", opts(None)).await.unwrap();
+    assert!(created);
+    assert_eq!(fresh.as_of, None);
+    assert_eq!(s.dst.copy_status("dst").await.unwrap().unwrap().as_of, None);
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(done.as_of, None);
+    assert_eq!(done.source_epoch, Some(epoch_of(&s.src).await));
+    assert_eq!(answers(&s.dst, "dst").await, answers(&s.src, "src").await);
 }

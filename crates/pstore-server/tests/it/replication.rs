@@ -2188,3 +2188,65 @@ async fn a_copy_status_has_wall_clock_times() {
         "{created} <= {ended} <= {after}"
     );
 }
+
+/// M196 criterion 6: a copy takes `as_of`, reports it, and holds that epoch; the refusals a
+/// query `as_of` and a replication have.
+#[tokio::test(start_paused = true)]
+async fn a_copy_takes_an_as_of_epoch() {
+    let world = World::new();
+    let api = world.api(1);
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    write(&api, SRC, "src", 0..20).await;
+    // A present copy, which says which epoch that was.
+    let (s, plain) = copy(&api, "then", source.clone()).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{plain}");
+    assert_eq!(plain["as_of"], Value::Null, "{plain}");
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, then) = copy_status(&api, "then").await;
+    assert_eq!(then["state"], "succeeded", "{then}");
+    assert_eq!(then["as_of"], Value::Null, "{then}");
+    let at = then["source_epoch"].as_u64().unwrap();
+    write(&api, SRC, "src", 20..40).await;
+
+    let body = |as_of: u64| json!({"source": source.clone(), "as_of": as_of, "read_only": true});
+    let post = |dest: &str, b: Value| {
+        let api = Arc::clone(&api);
+        let uri = format!("/v1/indexes/{dest}/copy");
+        async move { send(&api, DST, "POST", &uri, &b).await }
+    };
+    // After the present.
+    let (s, b) = post("dst", body(at + 1_000)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "time_travel_horizon", "{b}");
+    // With a schema.
+    let mut with = body(at);
+    with["schema"] = json!({"full_text_search": {"stemming": true}});
+    let (s, b) = post("dst", with).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    // On a replication.
+    let (s, b) = send(
+        &api,
+        DST,
+        "PUT",
+        "/v1/indexes/rep/replication",
+        &json!({"source": source.clone(), "as_of": at}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+
+    let (s, started) = post("dst", body(at)).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+    assert_eq!(started["as_of"], at, "{started}");
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert_eq!(done["source_epoch"], at, "{done}");
+    assert_eq!(done["as_of"], at, "{done}");
+    assert_eq!(rows(&api, DST, "dst").await, rows(&api, DST, "then").await);
+    assert_eq!(
+        answers(&api, DST, "dst").await,
+        answers(&api, DST, "then").await
+    );
+    assert_ne!(rows(&api, DST, "dst").await, rows(&api, SRC, "src").await);
+}

@@ -179,6 +179,21 @@ pub fn index_section_len(segment: &[u8]) -> Option<usize> {
     Some(u32::from_le_bytes(lo.try_into().ok()?) as usize)
 }
 
+/// The row count a segment's footer records (M196): what a copy of a segment whose HEAD
+/// ref no longer says (an `as_of` view's) reads from the bytes it already holds. `None`
+/// for bytes too short, or without the footer's magic at both ends.
+#[must_use]
+pub fn footer_rows(segment: &[u8]) -> Option<u32> {
+    let foot = segment.len().checked_sub(FOOTER_LEN)?;
+    let f = segment.get(foot..)?;
+    if f.get(..8)? != MAGIC || f.get(FOOTER_LEN - 8..)? != MAGIC {
+        return None;
+    }
+    // MAGIC(8) VERSION(2) index_offset(8) index_len(4) rows(4)
+    let rows = f.get(22..26)?;
+    Some(u32::from_le_bytes(rows.try_into().ok()?))
+}
+
 use std::collections::BTreeMap;
 
 /// Bytes fetched by the opening suffix read.
