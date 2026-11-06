@@ -855,6 +855,9 @@ pub struct Schema {
     pub vectors: std::collections::BTreeMap<String, u32>,
     /// The ids' kind (M176): `string`, `uint64` or `uuid`.
     pub id: &'static str,
+    /// Each vector field recorded f16 or i8 (M195), to `[N]f16` or `[N]i8`; absent when none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vector_types: std::collections::BTreeMap<String, String>,
     /// Each attribute's recorded type (M173): `datetime`, `uuid`, `bytes` or `uint64`; `{}`
     /// when none is recorded.
     pub attributes: std::collections::BTreeMap<String, &'static str>,

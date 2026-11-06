@@ -2344,6 +2344,26 @@ async fn write_documents<S: BlobStore + 'static>(
     };
     widths_agree(&req)?;
     let engine = api.engine(tenant).await;
+    // M195: `[N]f32` declared for a field another type is known for is that type's conflict,
+    // never a silent rounding. Read only for a write declaring f32, so no other write pays.
+    for field in declared_f32(&req) {
+        let key = pstore_format::typed::vector_key(&field);
+        let mut known = engine.known_types(&index).await;
+        if known.get(&key).is_some_and(|k| k.is_vector()) {
+            known = engine.reread_types(&index).await?;
+        }
+        if let Some(k) = known.get(&key).filter(|k| k.is_vector()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "schema_conflict",
+                format!(
+                    "index {index:?}: a vector field's type: `{field}` as {} is known, and the \
+                     write declares `{field}` as f32",
+                    k.name()
+                ),
+            ));
+        }
+    }
     let before = api.spend(tenant);
     // M173: every attribute is read by its known type -- recorded, or declared by this
     // process's unfolded writes -- and by the request's own; the engine refuses a declaration
@@ -2405,7 +2425,11 @@ async fn write_documents<S: BlobStore + 'static>(
     // The id's kind reads no attribute (M176), so it alone asks for no copy.
     let kept = dated
         .keys()
-        .any(|n| n != pstore_engine::ID_KIND && !types.contains_key(n))
+        .any(|n| {
+            n != pstore_engine::ID_KIND
+                && !n.starts_with(pstore_format::typed::VECTOR_PREFIX)
+                && !types.contains_key(n)
+        })
         .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
     let (docs, patches, patch_by) = match (
         typed_ops(
@@ -4362,6 +4386,27 @@ async fn index_summary<S: BlobStore + 'static>(
         epoch: s.epoch.0,
         unfolded,
         schema: s.schema.map(|sc| SchemaOut {
+            // M195: each field recorded f16 or i8, at its client width.
+            vector_types: sc
+                .types
+                .iter()
+                .filter_map(|(n, k)| {
+                    let field = n.strip_prefix(pstore_format::typed::VECTOR_PREFIX)?;
+                    // A field whose width the schema does not hold (its first row set aside
+                    // for its width) is answered without one, never dropped.
+                    let width = if field == pstore_format::DEFAULT_FIELD {
+                        Some(sc.client_dims())
+                    } else {
+                        sc.fields
+                            .get(field)
+                            .map(|w| w.saturating_sub(sc.metric.extra() as u32))
+                    };
+                    Some((
+                        field.to_owned(),
+                        width.map_or_else(|| k.name().to_owned(), |w| format!("[{w}]{}", k.name())),
+                    ))
+                })
+                .collect(),
             dims: sc.client_dims(),
             distance_metric: sc.metric.name(),
             text_field: sc.text_field,
@@ -4385,7 +4430,10 @@ async fn index_summary<S: BlobStore + 'static>(
             attributes: sc
                 .types
                 .into_iter()
-                .filter(|(n, _)| n != pstore_engine::ID_KIND)
+                .filter(|(n, _)| {
+                    n != pstore_engine::ID_KIND
+                        && !n.starts_with(pstore_format::typed::VECTOR_PREFIX)
+                })
                 .map(|(n, k)| (n, k.name()))
                 .collect(),
         }),
@@ -5341,7 +5389,14 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         if ty.get("full_text_search").is_some() || ty.get("regex").is_some() {
             continue;
         }
-        let Some(declared) = typed::named(ty) else {
+        // M195: a vector field's element type, `[N]f32`, `[N]f16` or `[N]i8`.
+        if let Some(vector) = vector_declaration(req, name, ty).map_err(bad)? {
+            if let Some(kind) = vector {
+                out.insert(pstore_format::typed::vector_key(name), kind);
+            }
+            continue;
+        }
+        let Some(declared) = typed::named(ty).filter(|k| !k.is_vector()) else {
             return Err(bad(format!(
                 "{name:?} is declared {ty}; a write declares datetime, uuid, bytes or uint64"
             )));
@@ -5361,6 +5416,95 @@ fn declared_types(req: &WriteRequest) -> Result<typed::Declarations, ApiError> {
         out.insert(name.clone(), declared);
     }
     Ok(out)
+}
+
+/// The vector fields a write declares `[N]f32` (M195), which record nothing.
+fn declared_f32(req: &WriteRequest) -> Vec<String> {
+    let Some(schema) = req.schema.as_ref().and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    schema
+        .iter()
+        .filter(|(name, ty)| matches!(vector_declaration(req, name, ty), Ok(Some(None))))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// A vector field's declared element type (M195): `Ok(None)` when `name` is not a vector
+/// field and `ty` is not a vector type, so the caller reads it as an attribute's;
+/// `Ok(Some(None))` for `[N]f32`, which records nothing; `Ok(Some(Some(kind)))` for f16 or
+/// i8; or why the declaration is refused. A vector field is `vector` or a named field some
+/// document of the request carries.
+fn vector_declaration(
+    req: &WriteRequest,
+    name: &str,
+    ty: &serde_json::Value,
+) -> Result<Option<Option<pstore_format::typed::Kind>>, String> {
+    let parsed = ty.as_str().and_then(|t| {
+        let (n, kind) = t.strip_prefix('[')?.split_once(']')?;
+        let n: usize = n.parse().ok().filter(|n| *n > 0)?;
+        let kind = match kind {
+            "f32" => None,
+            "f16" => Some(pstore_format::typed::Kind::F16),
+            "i8" => Some(pstore_format::typed::Kind::I8),
+            _ => return None,
+        };
+        Some((n, kind))
+    });
+    let named = name != pstore_format::DEFAULT_FIELD
+        && req.documents.iter().any(|d| d.vectors.contains_key(name));
+    let is_field = name == pstore_format::DEFAULT_FIELD || named;
+    if name == SPARSE_FIELD {
+        return match parsed {
+            Some(_) => Err(format!(
+                "{name:?} is declared {ty}; the sparse field takes no vector type"
+            )),
+            None => Ok(None),
+        };
+    }
+    let Some((n, kind)) = parsed else {
+        return if is_field {
+            Err(format!(
+                "{name:?} is a vector field and is declared {ty}; a vector field is declared \
+                 [N]f32, [N]f16 or [N]i8"
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    if !is_field {
+        return Err(format!(
+            "{name:?} is declared {ty}, a vector type, and no document carries it as a vector \
+             field"
+        ));
+    }
+    let widths = req.documents.iter().flat_map(|d| -> Vec<usize> {
+        if name == pstore_format::DEFAULT_FIELD {
+            d.vector.iter().map(Vec::len).collect()
+        } else {
+            d.vectors
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(Vec::len)
+                .collect()
+        }
+    });
+    let mut carried = false;
+    for w in widths {
+        carried = true;
+        if w != n {
+            return Err(format!(
+                "{name:?} is declared {ty} and a document carries a vector of width {w}"
+            ));
+        }
+    }
+    if !carried {
+        return Err(format!(
+            "{name:?} is declared {ty} and no document carries it"
+        ));
+    }
+    Ok(Some(kind))
 }
 
 /// The full-text schema a write declares (M14): `{"<text field>": {"type": "string",

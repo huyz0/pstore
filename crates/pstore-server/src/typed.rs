@@ -59,6 +59,11 @@ fn one(kind: Declared, x: &serde_json::Value) -> Result<Value, String> {
             .and_then(bounded),
         // `as_u64` is `None` for a negative integer and for whatever serde_json read as
         // a float, `5.0` and `1e3` among them.
+        // M195: a vector field's type, which no attribute is read by.
+        Declared::F16 | Declared::I8 => Err(format!(
+            "is declared {}, a vector field's element type, not an attribute's",
+            kind.name()
+        )),
         Declared::Uint64 => x.as_u64().map(Value::Uint).ok_or_else(|| {
             format!(
                 "is declared uint64 and {x} is not one: an integer from 0 to {}",

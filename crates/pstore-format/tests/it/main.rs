@@ -33,3 +33,4 @@ mod text_fields;
 mod tokenizers;
 mod typed_values;
 mod vector_fields;
+mod vector_types;
