@@ -21,11 +21,46 @@ pub enum Kind {
     Bytes,
     /// A JSON integer in `0..=u64::MAX`: [`crate::Value::Uint`].
     Uint64,
+    /// A vector field's components as binary16 values (M195), recorded under
+    /// [`vector_key`]'s name, never an attribute's.
+    F16,
+    /// A vector field's components as integers from -128 to 127 (M195), as [`Self::F16`].
+    I8,
 }
+
+/// The name a vector field's element type is recorded under among an index's types (M195):
+/// `$vector.<field>`, which no attribute can take (they cannot begin with `$`).
+#[must_use]
+pub fn vector_key(field: &str) -> String {
+    format!("{VECTOR_PREFIX}{field}")
+}
+
+/// A vector component as a field of `kind` stores it (M195), or `None` when it is not one:
+/// under f16 its nearest binary16 (ties to even), refused when that is not finite; under i8
+/// itself when it is an integer from -128 to 127 (a negative zero is stored as zero, which i8
+/// has no other spelling of); any other kind keeps it.
+#[must_use]
+pub fn component(kind: Kind, x: f32) -> Option<f32> {
+    match kind {
+        Kind::F16 => Some(crate::sparse::stored_weight(x)).filter(|r| r.is_finite()),
+        Kind::I8 => (x.fract() == 0.0 && (-128.0..=127.0).contains(&x)).then_some(x + 0.0),
+        Kind::DateTime | Kind::Uuid | Kind::Bytes | Kind::Uint64 => Some(x),
+    }
+}
+
+/// The prefix of [`vector_key`]'s names.
+pub const VECTOR_PREFIX: &str = "$vector.";
 
 impl Kind {
     /// Every kind, in code order.
-    pub const ALL: [Self; 4] = [Self::DateTime, Self::Uuid, Self::Bytes, Self::Uint64];
+    pub const ALL: [Self; 6] = [
+        Self::DateTime,
+        Self::Uuid,
+        Self::Bytes,
+        Self::Uint64,
+        Self::F16,
+        Self::I8,
+    ];
 
     /// The name a write declares and a schema answers.
     #[must_use]
@@ -35,7 +70,15 @@ impl Kind {
             Self::Uuid => "uuid",
             Self::Bytes => "bytes",
             Self::Uint64 => "uint64",
+            Self::F16 => "f16",
+            Self::I8 => "i8",
         }
+    }
+
+    /// Whether this is a vector field's element type (M195) rather than an attribute's.
+    #[must_use]
+    pub fn is_vector(self) -> bool {
+        matches!(self, Self::F16 | Self::I8)
     }
 
     /// The kind a name declares, or `None`.

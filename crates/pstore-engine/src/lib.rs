@@ -1569,8 +1569,75 @@ fn stamp_types(known: &Types, attrs: &mut BTreeMap<String, pstore_format::Value>
     }
 }
 
+/// Rounds or refuses each vector of a field `known` types f16 or i8 (M195), and answers those
+/// fields with their kinds, by field name, for the row's `$types`.
+fn typed_vectors(
+    known: &Types,
+    vectors: &mut BTreeMap<pstore_format::Field, pstore_format::VectorField>,
+) -> Result<Vec<(String, Kind)>, String> {
+    let mut out = Vec::new();
+    for (name, field) in vectors.iter_mut() {
+        let Some(&kind) = known
+            .get(&pstore_format::typed::vector_key(name))
+            .filter(|k| k.is_vector())
+        else {
+            continue;
+        };
+        if let pstore_format::VectorField::Dense(vs) = field {
+            for v in vs.iter_mut() {
+                for (j, x) in v.iter_mut().enumerate() {
+                    *x = pstore_format::typed::component(kind, *x).ok_or_else(|| {
+                        let rule = match kind {
+                            Kind::F16 => "a finite binary16 value, within ±65,504 once rounded",
+                            _ => "an integer from -128 to 127",
+                        };
+                        format!(
+                            "vector field `{name}` is declared {}: component {j} ({x}) is not \
+                             one; each must be {rule}",
+                            kind.name()
+                        )
+                    })?;
+                }
+            }
+            out.push((name.to_string(), kind));
+        }
+    }
+    Ok(out)
+}
+
+/// Adds each typed vector field to a row's `$types` (M195), under its
+/// [`pstore_format::typed::vector_key`].
+fn stamp_vector_types(
+    typed: &[(String, Kind)],
+    attrs: &mut BTreeMap<String, pstore_format::Value>,
+) {
+    if typed.is_empty() {
+        return;
+    }
+    let mut held = match attrs.remove(TYPES_ATTR) {
+        Some(pstore_format::Value::Array(xs)) => xs,
+        _ => Vec::new(),
+    };
+    for (field, kind) in typed {
+        held.push(pstore_format::Value::Str(pstore_format::typed::vector_key(
+            field,
+        )));
+        held.push(pstore_format::Value::Str(kind.name().to_owned()));
+    }
+    attrs.insert(TYPES_ATTR.to_owned(), pstore_format::Value::Array(held));
+}
+
 /// An attribute-type conflict (M173), from the kind known and the kind a write gives.
 fn type_conflict(index: &str, name: &str, expected: Kind, got: Kind) -> EngineError {
+    // M195: a vector field's type, recorded under its reserved name, is named as its field.
+    if let Some(field) = name.strip_prefix(pstore_format::typed::VECTOR_PREFIX) {
+        return EngineError::SchemaConflict {
+            index: index.to_owned(),
+            what: "a vector field's type",
+            expected: format!("`{field}` as {}", expected.name()),
+            got: format!("`{field}` as {}", got.name()),
+        };
+    }
     EngineError::SchemaConflict {
         index: index.to_owned(),
         what: "an attribute's type",
@@ -2947,6 +3014,25 @@ impl<S: BlobStore> Engine<S> {
         }) {
             return Some(type_conflict(index, &name, want, got));
         }
+        // M195: a vector field recorded f16 or i8 holds rows its write typed so: a row from a
+        // writer that had not read the type was never rounded, and a stored vector (normalized,
+        // or extended) cannot be judged by its values.
+        let stamped = types_of(doc);
+        if let Some((field, &want)) = schema.types.iter().find_map(|(name, kind)| {
+            let field = name.strip_prefix(pstore_format::typed::VECTOR_PREFIX)?;
+            let held = doc
+                .vectors
+                .get(field)
+                .is_some_and(|f| !f.as_dense().is_empty());
+            (held && !stamped.iter().any(|(n, _)| n == name)).then_some((field, kind))
+        }) {
+            return Some(EngineError::SchemaConflict {
+                index: index.to_owned(),
+                what: "a vector field's type",
+                expected: format!("`{field}` as {}", want.name()),
+                got: format!("`{field}` as f32"),
+            });
+        }
         if let Some((name, &want)) = schema
             .types
             .iter()
@@ -4005,6 +4091,14 @@ impl<S: BlobStore> Engine<S> {
                     pstore_format::id::shown(&d.id)
                 )));
             }
+            // M195: a field of a known f16 or i8 type holds that type's values, rounded or
+            // refused before the metric's transform; its rows carry the type in `$types`.
+            let vector_types = typed_vectors(&known, &mut d.vectors).map_err(|why| {
+                EngineError::Refused(format!(
+                    "document {}: {why}",
+                    pstore_format::id::shown(&d.id)
+                ))
+            })?;
             for field in d.vectors.values_mut() {
                 if let pstore_format::VectorField::Dense(vs) = field {
                     for v in vs.iter_mut() {
@@ -4060,6 +4154,7 @@ impl<S: BlobStore> Engine<S> {
                 );
             }
             stamp_types(&known, &mut d.attrs);
+            stamp_vector_types(&vector_types, &mut d.attrs);
             if let Some(t) = &declared.texts {
                 d.attrs.insert(
                     TEXTS_ATTR.to_owned(),

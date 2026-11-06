@@ -155,3 +155,26 @@ is stamped; readers skipping `$vector.`; an old fold's silent drop; the quaranti
 M170's no-vector write; a field no document carries; attribute or vector field; columns;
 f32 double rounding; the f16 bound's values; scores compared with an undeclared index
 written rounded, not an independent summation; `N` as `client_dims`.
+
+Amended while the tests were written:
+- **Base64 stays f32 bytes for every type**, in and out (M9d's transport, decoded before the
+  types are known, as today): a base64 vector under f16 or i8 is read as f32s and then
+  rounded or refused as an array is. A narrower transport, with the narrower output, is the
+  later increment's. So the "decoded after the known types" rule and the "base64 of the
+  wrong length for its type" refusal are withdrawn; criterion 2 checks a base64 f32 vector
+  rounded under f16 and refused under i8 instead.
+- **A vector field is `vector` or a key of some document's `vectors` in the request.** A
+  declaration on any other name is an attribute's; a vector type there is refused (with no
+  document carrying it as a vector field, the same message as a field no document
+  carries), so the recorded fields are not consulted.
+- **Criterion 4's HEAD bytes** are checked as an f32 declaration and no declaration costing
+  the same requests (pinned) and recording nothing (`vector_types` absent); no HEAD byte
+  count is pinned.
+- **`[N]f32` on a field typed f16 or i8** (recorded, or declared by this process's unfolded
+  writes) is `400 schema_conflict` naming both, after one HEAD re-read as M173's refusals
+  make; the server reads the known types for a write declaring f32 only. Before, it would
+  have been rounded silently (code review).
+- A recorded type whose field's width the schema does not hold is answered without a
+  width (`"f16"`), never dropped (code review).
+- Tests: `crates/pstore-server/tests/it/vector_types.rs` and
+  `crates/pstore-format/tests/it/vector_types.rs`.

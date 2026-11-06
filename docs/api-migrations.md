@@ -107,6 +107,32 @@ HEAD gains a trailing section. A process older than M166 refuses a HEAD that car
 so every node is upgraded before copies are offered. Evidence is in
 [M166 verification](milestones/M166/VERIFIED.md).
 
+## M195: f16 and i8 vector types
+
+A write's `schema` may give `vector`, or a named dense field, an element type:
+
+```json
+{"schema": {"vector": "[768]f16", "tokens": "[128]i8"}, "documents": [...]}
+```
+
+- `[N]f16`: each component is rounded to the nearest binary16 (ties to even) and stored as
+  that value; one past ±65,504 once rounded (65,520), or a non-finite one, is `400`.
+  `[N]i8`: each component must be an integer from -128 to 127, else `400`. `[N]f32` is the
+  default. `N` is the field's width as written; another is `400`.
+- The type is recorded at the fold, as M173 records an attribute's: later writes from any
+  process are read by it, another type is `400 schema_conflict`, and rows a writer sent
+  before it had read the type are quarantined. `GET /v1/indexes/{id}` answers
+  `schema.vector_types`. `[N]f32` on a field typed otherwise is a conflict too.
+- The type holds for rows written from the declaration on: rows sealed before it keep
+  their f32 values, as M173's do. Rows a process wrote undeclared and still holds unfolded
+  when it declares the type are quarantined at that fold with the rest.
+- Scores are the metric over the stored values, and `include_vectors` answers them exactly
+  (under cosine, normalized, as before). Base64 stays little-endian f32 in and out.
+- ⚠️ **Storage is unchanged**: a declared f16 field costs what an f32 one does. Narrower
+  storage and transport are a later increment.
+- A reader before M195 refuses a HEAD holding a vector type, and a fold before it drops the
+  declaration: upgrade every reader and folder first, and there is no rollback after.
+
 ## M193: sparse vectors in results and exports
 
 `include_vectors` admits `"sparse"`, and a row holding the field gains `sparse` beside

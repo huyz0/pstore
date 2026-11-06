@@ -120,6 +120,7 @@ mod uint64;
 mod upsert;
 mod upsert_columns;
 mod uuid_bytes;
+mod vector_types;
 mod vectors_multi;
 mod vectors_named;
 mod vectors_out;
