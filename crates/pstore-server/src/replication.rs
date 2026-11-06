@@ -1157,6 +1157,9 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
         }),
         "last_error": last_error,
         "read_only": s.read_only,
+        // M194: wall-clock times, as the summary's (M148).
+        "created_at": s.created_ms.map(crate::rfc3339_ms),
+        "ended_at": s.ended_ms.map(crate::rfc3339_ms),
     })
 }
 

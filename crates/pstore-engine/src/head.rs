@@ -294,6 +294,12 @@ pub struct Head {
     /// what each asked. ⚠️ The last trailing section, after the exports; `encode` keeps a name
     /// only as it keeps an export's.
     pub reindexes: BTreeMap<String, Reindex>,
+    /// When each copy was created and ended (M194): `(created_ms, ended_ms)`, an `ended_ms`
+    /// of 0 not ended. ⚠️ The last trailing section, after the reindexes; `encode` keeps a
+    /// name only while [`Self::once`] (of a replication that exists) or [`Self::copies`]
+    /// holds it, so a record never outlives its copy. The map in memory may still hold a
+    /// dropped, branched, evicted or replicated name; nothing reads it, and `encode` drops it.
+    pub copy_times: BTreeMap<String, (u64, u64)>,
 }
 
 /// What a reindex asks (M168): the text and regex options `dest` is rebuilt under, applied
@@ -699,6 +705,12 @@ impl Head {
             .iter()
             .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
             .collect();
+        // M194: the copy times after the reindexes, by the same rule, forcing both counts.
+        let copy_times: Vec<(&String, &(u64, u64))> = self
+            .copy_times
+            .iter()
+            .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
+            .collect();
         let copied = !once.is_empty() || !self.copies.is_empty();
         let timed = !times.is_empty() || !flagged.is_empty() || copied;
         let types = !typed.is_empty() || timed;
@@ -881,13 +893,13 @@ impl Head {
                 }
             }
         }
-        if !exports.is_empty() || !reindexes.is_empty() {
+        if !exports.is_empty() || !reindexes.is_empty() || !copy_times.is_empty() {
             out.extend_from_slice(&(exports.len() as u32).to_le_bytes());
             for name in exports {
                 put_str(&mut out, name);
             }
         }
-        if !reindexes.is_empty() {
+        if !reindexes.is_empty() || !copy_times.is_empty() {
             out.extend_from_slice(&(reindexes.len() as u32).to_le_bytes());
             for (name, r) in reindexes {
                 put_str(&mut out, name);
@@ -907,6 +919,14 @@ impl Head {
                 for n in &r.trigram {
                     put_str(&mut out, n);
                 }
+            }
+        }
+        if !copy_times.is_empty() {
+            out.extend_from_slice(&(copy_times.len() as u32).to_le_bytes());
+            for (name, (created, ended)) in copy_times {
+                put_str(&mut out, name);
+                out.extend_from_slice(&created.to_le_bytes());
+                out.extend_from_slice(&ended.to_le_bytes());
             }
         }
         out
@@ -1418,6 +1438,15 @@ impl Head {
                 r.trigram.push(c.string()?);
             }
             h.reindexes.insert(name, r);
+        }
+        // M194: and here, no copy times.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let created = c.u64()?;
+            h.copy_times.insert(name, (created, c.u64()?));
         }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
@@ -2896,6 +2925,93 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// M194 criterion 4: the copy times round-trip after the reindexes, absent or present;
+    /// a HEAD whose names have no record encodes as M168's.
+    #[test]
+    fn copy_times_round_trip_after_reindexes() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        for base in [Head::default(), sample(), every_section()] {
+            let mut m168 = base.clone();
+            m168.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            m168.once.insert("running".to_owned());
+            m168.copies.insert(
+                "done".to_owned(),
+                CopyOutcome {
+                    source: source.clone(),
+                    run: 10,
+                    epoch: 20,
+                    end: CopyEnd::Cancelled,
+                },
+            );
+            assert_eq!(Head::decode(&m168.encode())?, m168);
+            // Alone: no export and no reindex before it.
+            let mut with = m168.clone();
+            with.copy_times.insert("running".to_owned(), (1_000, 0));
+            with.copy_times.insert("done".to_owned(), (2_000, u64::MAX));
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // And after the exports and the reindexes.
+            let mut all = with.clone();
+            all.exports.insert("done".to_owned());
+            all.reindexes
+                .insert("running".to_owned(), Reindex::default());
+            assert_eq!(Head::decode(&all.encode())?, all);
+            // A name with no record, or a once-name whose replication is gone: M168's bytes.
+            let mut ghost = m168.clone();
+            ghost.copy_times.insert("gone".to_owned(), (1, 2));
+            assert_eq!(hex(&ghost.encode()), hex(&m168.encode()));
+            let mut stale = m168.clone();
+            stale.once.insert("stale".to_owned());
+            let plain = stale.clone();
+            stale.copy_times.insert("stale".to_owned(), (1, 2));
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            let mut longer = with.encode();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            let bytes = with.encode();
+            for cut in m168.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(h.copy_times.is_empty(), "a cut at {cut} decoded copy times");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M194 criterion 3: a copy `record_copy` evicts takes its times with it.
+    #[test]
+    fn evicted_copy_times_are_not_encoded() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        let mut h = Head::default();
+        for i in 0..=COPIES_RETAINED as u64 {
+            let name = format!("d{i:03}");
+            h.copy_times.insert(name.clone(), (i + 1, i + 2));
+            h.record_copy(
+                &name,
+                CopyOutcome {
+                    source: source.clone(),
+                    run: i,
+                    epoch: 100 + i,
+                    end: CopyEnd::Cancelled,
+                },
+            );
+        }
+        let back = Head::decode(&h.encode())?;
+        assert!(!back.copies.contains_key("d000"));
+        assert!(!back.copy_times.contains_key("d000"));
+        assert_eq!(back.copy_times.len(), COPIES_RETAINED);
         Ok(())
     }
 
