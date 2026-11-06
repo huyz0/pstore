@@ -9,7 +9,7 @@ How to run the tests: `cargo test -p pstore-server --test it -- vector_types::` 
 Red run: on the parent, with the tests and none of the source, a vector type in `schema` is
 `400`, so the five server tests failed there (5 of 5). The format tests call what the parent
 does not have (`Kind::F16`, `component`, `vector_key`) and do not compile on it. Then each
-mutation below, applied one at a time by a script and reverted: 23 killed. Two survived at
+mutation below, applied one at a time by a script and reverted: 23 killed, and 2 more from CI's run. Two survived at
 first: a named field's answered width taken as stored (euclidean's extra component left on)
 and `[N]f32` recording a type; the refusal test's closing cases were added and kill both. No
 `cargo mutants` run is claimed.
@@ -49,7 +49,10 @@ and `[N]f32` recording a type; the refusal test's closing cases were added and k
    its width. And (code review found the path, then the cases were added) `[N]f32` declared
    on a field recorded f16, or unfolded i8, is `400 schema_conflict` naming both, after one
    HEAD re-read that lets the f32 declaration through once the typed index was dropped by
-   another process. Killed: the f32 conflict missed, the re-read skipped.
+   another process. Killed: the f32 conflict missed, the re-read skipped. And (CI's mutants on the PR found them, then the cases
+   were added and kill both here) a vector type declared beside an attribute type keeps both
+   stamps, so the fold records `t` as datetime too; and an f16 refusal names the binary16 rule,
+   not i8's.
 4. `vector_types::a_declared_index_costs_what_an_undeclared_one_does`: green. A write, its
    fold, a fresh process's first vector-only write and a cold query cost the same depth and
    requests declared f16, declared f32 and undeclared, pinned at (5, 13), (6, 13), (5, 13)

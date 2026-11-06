@@ -344,7 +344,10 @@ async fn what_a_type_cannot_hold_is_refused_naming_the_rule() {
     let a = Api::unsecured(Accounted::new(store.clone()), LaneId(1)).unwrap();
     let decl = |kind: &str, v: Value| json!({"schema": {"vector": format!("[2]{kind}")}, "documents": [{"id": "x", "vector": v}]});
     let cases = [
-        (decl("f16", json!([65520.0, 0.0])), "component 0"),
+        (
+            decl("f16", json!([65520.0, 0.0])),
+            "component 0 (65520) is not one; each must be a finite binary16 value",
+        ),
         (decl("f16", json!([0.0, -65520.0])), "component 1"),
         (decl("i8", json!([3.5, 0.0])), "integer from -128 to 127"),
         (decl("i8", json!([0.0, 128.0])), "component 1"),
@@ -627,6 +630,30 @@ async fn a_recorded_type_holds_for_every_later_write() {
         "{meta}"
     );
     assert_eq!(meta["quarantined_rows"], 1, "{meta}");
+
+    // A vector type declared beside an attribute type: the row is stamped with both, and the
+    // fold records both.
+    write(
+        &a,
+        "t",
+        json!({"schema": {"vector": "[2]f16", "t": "datetime"},
+            "documents": [{"id": "t0", "vector": [1.0, 0.0],
+                "attributes": {"t": "2024-05-01T14:30:00Z"}}]}),
+    )
+    .await;
+    fold(&a).await;
+    let meta = summary(&a, "t").await;
+    assert_eq!(
+        meta["schema"]["vector_types"],
+        json!({"vector": "[2]f16"}),
+        "{meta}"
+    );
+    assert_eq!(
+        meta["schema"]["attributes"],
+        json!({"t": "datetime"}),
+        "{meta}"
+    );
+    assert_eq!(meta["quarantined_rows"], 0, "{meta}");
 }
 
 /// A write, a fold and a query's `(depth, requests)`, each, on a fresh store.
