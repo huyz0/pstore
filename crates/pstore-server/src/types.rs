@@ -612,6 +612,10 @@ pub struct ResultRow {
     /// written (M190); absent, never `{}`, when it holds none of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vectors: Option<std::collections::BTreeMap<String, Vec<VectorOut>>>,
+    /// Its sparse field's pairs as stored, when `include_vectors` names `sparse` and the row
+    /// holds it (M193): spelled as a write's `sparse`, keys in byte order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse: Option<std::collections::BTreeMap<String, f32>>,
 }
 
 /// A projected vector as `vector_encoding` spells it (M179).

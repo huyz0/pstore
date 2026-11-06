@@ -12,7 +12,10 @@ A segment stores a sparse field only as postings, an inverted index by key
 reads the whole field and its dictionary: bytes in proportion to the segment, not to the
 rows asked. A fold therefore also writes each row's pairs, forward, in a new section, and a
 projection reads only the rows it answers. This is the layout of M191's varying dense
-field, so it costs the same one round, the opt-in the owner admitted for M191.
+field, so it costs the same one round as M191's opt-in. A query projecting `sparse` alone
+takes that round too, so it is an opt-in outside D-34 of its own: the owner chose it on
+2026-11-04, asked "How should results return sparse vectors?" and answering "Per-row
+sparse section, +1 round" over rebuilding rows from the postings.
 
 ## Delta
 - **Format.** `Section::SparseRows` (17): an offsets table of `rows + 1` `u64`s indexed by
@@ -100,7 +103,9 @@ Mutations, each to be killed:
 ## RA budget
 - Without `sparse` projected: unchanged.
 - With it: the M191 round, shared. Its requests are a coalesced run or more per segment
-  holding a hit, beside the offsets' runs in the existing round.
+  holding a hit, beside the offsets' runs in the existing round. The offsets are read for
+  every row the row fetch reads, as M191's are (the candidates, where an unfolded write
+  makes the fetch read them before fusion); only the hits' pairs are read and bounded.
 - A fold writes `8 × (rows + 1)` bytes of offsets plus `key + 4` bytes a pair, beside
   postings that hold a row id and an F16 a pair, and their keys once in the dictionary. A
   long key costs more here than in the postings; this is the price of a projection that
@@ -129,3 +134,15 @@ the stored F16 kept as its bits, a signed zero, the meta region's width, a spars
 rolling deploys and branches. Not taken: a checked-in pre-M193 segment fixture; the hidden
 hook writes the same bytes without the section, which is what such a build wrote. The
 replicated-segment case is not tested: replication is off by default (`replicas: 0`).
+
+Amended while the tests were written:
+- M179's `vectors_out` refused `["sparse"]` too; both its and M190's case now ask
+  `["sparse", "sparse"]`, refused as a name twice.
+- The name cap is counted as M190 counts it over the dense names (`vector` and named
+  fields, at most `1 + MAX_NAMED_FIELDS`), with `sparse` admitted once beside them: the
+  same `2 + MAX_NAMED_FIELDS` in all, and ten dense names still `400`.
+- An unfolded row answers its pairs from memory as a fold would store them: weights rounded
+  to f16 and keys in byte order, so a row answers the same before and after its fold.
+- The hidden hook is `Params::sparse_rows` (the index crate), set by
+  `Engine::with_sparse_rows` and the server's `set_sparse_rows_for_test`.
+- Format tests are `crates/pstore-format/tests/it/sparse_rows.rs`.
