@@ -682,6 +682,17 @@ fn expressions_out_of_bounds_are_refused() {
         Expr::Product(1.0, Box::new(deep)).check().is_err(),
         "depth 9"
     );
+    // Sum and Max nest as Product does: one clause each, 9 deep.
+    let mut deep = leaf();
+    for _ in 0..7 {
+        deep = Expr::Sum(vec![deep]);
+    }
+    assert!(
+        Expr::Max(vec![deep.clone()]).check().is_err(),
+        "Max at depth 9"
+    );
+    assert!(deep.check().is_ok(), "Sum at depth 8");
+    assert!(Expr::Sum(vec![deep]).check().is_err(), "Sum at depth 9");
     // 1 + 16 * (1 + 3) = 65 nodes, at depth 3.
     let wide = Expr::Sum(vec![Expr::Sum(vec![leaf(); 3]); 16]);
     let why = wide.check().unwrap_err();

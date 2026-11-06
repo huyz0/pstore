@@ -347,6 +347,9 @@ async fn scoring_expressions_over_http() {
         json!(["Sum", []]),
         json!(["Max", vec![bm.clone(); 17]]),
         json!(["Sum", bm]),
+        // No operator but Sum and Max takes a bare clause list.
+        json!(["Min", [bm]]),
+        json!(["Product", [bm]]),
         wide,
         deep,
         json!(["species", "BM25", "fox"]),
@@ -385,6 +388,18 @@ async fn scoring_expressions_over_http() {
     for w in [json!(0), json!(1e-3), json!(1000)] {
         ok(&api, &rank(&json!(["Product", w, bm]))).await;
     }
+
+    // Every filter of an expression together holds at most 16 patterns, as `filters` do.
+    let globs = |n: usize| {
+        let any: Vec<Value> = (0..n)
+            .map(|i| json!(["species", "Glob", format!("{i}*")]))
+            .collect();
+        json!(["Sum", [bm, ["Or", any]]])
+    };
+    ok(&api, &rank(&globs(16))).await;
+    let (s, b) = query(&api, &rank(&globs(17))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("16 patterns"), "{b}");
 
     // The params object: `last_as_prefix` is the leg's, and `{}` is no option.
     let prefixed = rows(

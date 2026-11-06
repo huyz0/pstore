@@ -287,3 +287,45 @@ async fn other_levels_and_indexes_bypass_the_pin() {
     assert_eq!(heads - before.0, 4);
     assert_eq!(lanes - before.1, 1);
 }
+
+/// M182: a scored query retries a cached HEAD naming a reaped segment once, fresh, as the
+/// other legs do -- and an error that came from no cached HEAD is not retried.
+#[tokio::test]
+async fn a_scored_query_retries_only_a_cached_snapshot() {
+    let every = pstore_query::Expr::Filter(pstore_query::Predicate::Absent("x".to_owned()));
+    let level = Consistency::Bounded(Duration::from_secs(60));
+    let (store, r) = world().await;
+    store.rival.fold().await.unwrap();
+    // Cached: a HEAD naming the segments `a, b` and `c` live in.
+    let first = r
+        .scored_as("idx", &every, None, 0, 10, None, level)
+        .await
+        .unwrap();
+    assert_eq!(first.ordered.rows.len(), 3, "{first:?}");
+    let w = Engine::new(Arc::clone(&store.inner), T, LaneId(1));
+    w.compact("idx").await.unwrap();
+    assert!(w.gc(0).await.unwrap() > 0, "nothing reaped");
+    let before = store.reads().0;
+    let got = r
+        .scored_as("idx", &every, None, 0, 10, None, level)
+        .await
+        .unwrap();
+    assert_eq!(store.reads().0 - before, 1, "{got:?}");
+    let ids: Vec<_> = got.ordered.rows.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "c"], "{got:?}");
+    // A BM25 clause over no text field fails on a fresh HEAD: one read, no retry.
+    let unknown = pstore_query::Expr::Bm25 {
+        field: "zzz".to_owned(),
+        query: "q".to_owned(),
+        last_as_prefix: false,
+    };
+    let before = store.reads().0;
+    let refused = r
+        .scored_as("idx", &unknown, None, 0, 10, None, Consistency::Eventual)
+        .await;
+    assert!(
+        matches!(refused, Err(EngineError::UnknownTextField(ref f)) if f == "zzz"),
+        "{refused:?}"
+    );
+    assert_eq!(store.reads().0 - before, 1, "retried");
+}

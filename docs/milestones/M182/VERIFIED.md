@@ -66,3 +66,15 @@ and `{}`, and the deleted arm fails it). A later shard missed `Expr::check_at`'s
 and as `>=`: no tree had exactly 64 nodes. `expressions_out_of_bounds_are_refused` now
 accepts one and names the limit in the 65-node refusal; both mutants fail it, which is that
 test's first observed red.
+
+After the merge with main, CI's shards missed eight more mutants, each now killed by hand as
+above: `scored_as`'s strong-with-`as_of` refusal as `!=` and as `||` (no test asked a scored
+query for it: `a_strong_read_of_a_past_epoch_is_refused` now does, and runs both levels that
+are allowed); its retry guard `hit` as `false` and as `true` (killed by
+`a_scored_query_retries_only_a_cached_snapshot`, which reaps a cached HEAD's segment and
+counts one HEAD read on the retry, then counts one, not two, for an unknown text field);
+`Expr::check_at`'s `depth + 1` as `depth * 1` for Sum and Max (only Product was nested 9
+deep: `expressions_out_of_bounds_are_refused` now nests Sum and Max too); and in the server,
+the expression's pattern cap `>` as `==` and `>=`, `Expr::filters` as `vec![]`, and the
+`Max` guard as `true` (`scoring_expressions_over_http` now accepts 16 patterns, refuses 17
+naming the limit, and refuses `["Min", [e]]` and `["Product", [e]]`).
