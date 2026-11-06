@@ -2931,3 +2931,161 @@ async fn a_second_sync_waits_for_the_first() {
     s.same("after two syncs on one engine").await;
     assert_eq!(leaked(&s.here, &s.dst, "dst").await, BTreeSet::new());
 }
+
+// ---- M194: a copy reports when it was created and when it ended ----
+
+/// `(created_ms, ended_ms)` of the copy into `dest`.
+async fn copy_times(e: &E, dest: &str) -> (Option<u64>, Option<u64>) {
+    let c = e.copy_status(dest).await.unwrap().unwrap();
+    (c.created_ms, c.ended_ms)
+}
+
+/// M194 criterion 1: created at the create's clock, through pause, resume and a repeated
+/// request; ended at the finishing commit's.
+#[tokio::test]
+async fn a_copy_reports_when_it_was_created_and_ended() {
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.dst.set_clock_for_test(Some(1_000));
+    let (started, _) = s.copy().await;
+    assert_eq!((started.created_ms, started.ended_ms), (Some(1_000), None));
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(1_000), None));
+    s.dst.set_clock_for_test(Some(2_000));
+    s.dst.pause_replication("dst").await.unwrap();
+    assert_eq!(s.state().await, Some(CopyState::Paused));
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(1_000), None));
+    s.dst.set_clock_for_test(Some(3_000));
+    s.dst.resume_replication("dst").await.unwrap();
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(1_000), None));
+    s.dst.set_clock_for_test(Some(5_000));
+    let mut st = SyncState::default();
+    assert_eq!(s.sync(&mut st).await.committed, vec!["dst".to_owned()]);
+    assert_eq!(s.state().await, Some(CopyState::Succeeded));
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(1_000), Some(5_000)));
+    s.dst.set_clock_for_test(Some(6_000));
+    let (again, created) = s.copy().await;
+    assert!(!created);
+    assert_eq!(
+        (again.created_ms, again.ended_ms),
+        (Some(1_000), Some(5_000))
+    );
+}
+
+/// M194 criterion 2: a cancel, a refused rebuild and a missing source each stamp their end;
+/// a copy with no record ends with none; an end at clock 0 is still an end.
+#[tokio::test]
+async fn every_copy_end_is_stamped() {
+    // Cancelled.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.dst.set_clock_for_test(Some(6_500));
+    s.copy().await;
+    s.dst.set_clock_for_test(Some(7_000));
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert_eq!(s.state().await, Some(CopyState::Cancelled));
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(6_500), Some(7_000)));
+
+    // A refused rebuild.
+    let long = "l".repeat(pstore_format::INDEX_BUDGET + 1);
+    let s = setup(Kind::CrossTenant);
+    let mut d = doc("a", 1.0);
+    d.attrs
+        .insert(long.clone(), Value::Str("words here".to_owned()));
+    s.src.write("src", vec![d]).await.unwrap();
+    fold(&s.src).await;
+    s.dst.set_clock_for_test(Some(7_500));
+    s.reindex(Reindex {
+        texts: [(long, FullText::default())].into(),
+        ..Reindex::default()
+    })
+    .await;
+    s.dst.set_clock_for_test(Some(8_000));
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.failure, Some(CopyFailure::RebuildRefused));
+    assert_eq!((f.created_ms, f.ended_ms), (Some(7_500), Some(8_000)));
+
+    // A source dropped after the create.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.dst.set_clock_for_test(Some(8_500));
+    s.copy().await;
+    s.src.delete_index("src").await.unwrap();
+    s.dst.set_clock_for_test(Some(9_000));
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(f.failure, Some(CopyFailure::SourceNotFound));
+    assert_eq!((f.created_ms, f.ended_ms), (Some(8_500), Some(9_000)));
+
+    // A copy with no record (as one made before M194) ends with none.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.copy().await;
+    s.dst
+        .commit_head_for_test(|h| {
+            h.copy_times.clear();
+        })
+        .await
+        .unwrap();
+    assert_eq!(copy_times(&s.dst, "dst").await, (None, None));
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert_eq!(s.state().await, Some(CopyState::Cancelled));
+    assert_eq!(copy_times(&s.dst, "dst").await, (None, None));
+    assert!(s.dst.head_for_test().await.copy_times.is_empty());
+
+    // An end at clock 0.
+    let s = setup(Kind::CrossTenant);
+    write(&s.src, "src", 0..30).await;
+    s.dst.set_clock_for_test(Some(0));
+    s.copy().await;
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(0), Some(1)));
+}
+
+/// M194 criterion 3: a new copy into a name whose copy failed gets its own times, and a
+/// replication into such a name leaves no record of the copy.
+#[tokio::test]
+async fn a_copy_time_never_outlives_its_copy() {
+    // A copy that fails, its source dropped after the create.
+    let failed = || async {
+        let s = setup(Kind::CrossTenant);
+        write(&s.src, "src", 0..30).await;
+        s.dst.set_clock_for_test(Some(1_000));
+        s.copy().await;
+        s.src.delete_index("src").await.unwrap();
+        s.dst.set_clock_for_test(Some(2_000));
+        let mut st = SyncState::default();
+        s.sync(&mut st).await;
+        assert_eq!(s.state().await, Some(CopyState::Failed));
+        assert_eq!(copy_times(&s.dst, "dst").await, (Some(1_000), Some(2_000)));
+        s
+    };
+    let s = failed().await;
+    s.src.write("src2", vec![doc("a", 1.0)]).await.unwrap();
+    fold(&s.src).await;
+    s.dst.set_clock_for_test(Some(3_000));
+    let from = s.here.acct.as_tenant(DST);
+    let (again, created) = s
+        .dst
+        .create_copy("dst", ReplicaSource::local(SRC, "src2"), &from)
+        .await
+        .unwrap();
+    assert!(created);
+    assert_eq!((again.created_ms, again.ended_ms), (Some(3_000), None));
+    assert_eq!(copy_times(&s.dst, "dst").await, (Some(3_000), None));
+
+    let s = failed().await;
+    assert!(s.dst.head_for_test().await.copy_times.contains_key("dst"));
+    let from = s.here.acct.as_tenant(DST);
+    s.src.write("src2", vec![doc("a", 1.0)]).await.unwrap();
+    fold(&s.src).await;
+    s.dst
+        .create_replication("dst", ReplicaSource::local(SRC, "src2"), &from)
+        .await
+        .unwrap();
+    let h = s.dst.head_for_test().await;
+    assert!(h.replications.contains_key("dst"));
+    assert!(!h.copy_times.contains_key("dst"), "{:?}", h.copy_times);
+}
