@@ -297,7 +297,8 @@ pub struct Head {
     /// When each copy was created and ended (M194): `(created_ms, ended_ms)`, an `ended_ms`
     /// of 0 not ended. ⚠️ The last trailing section, after the reindexes; `encode` keeps a
     /// name only while [`Self::once`] (of a replication that exists) or [`Self::copies`]
-    /// holds it, so a record never outlives its copy.
+    /// holds it, so a record never outlives its copy. The map in memory may still hold a
+    /// dropped, branched, evicted or replicated name; nothing reads it, and `encode` drops it.
     pub copy_times: BTreeMap<String, (u64, u64)>,
 }
 

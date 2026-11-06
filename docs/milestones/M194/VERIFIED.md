@@ -93,5 +93,10 @@ No `cargo mutants` run is claimed. CI's mutation shards are the check.
    `scripts/mutants.sh` is left to CI's shards.
 
 
-Code review: the review packet was prepared (`scripts/review.sh context m194`), and the review is
-pending. This line is replaced by its outcome before merge.
+Code review (packet from `scripts/review.sh context m194`, reviewed on 2026-11-06) passed in
+round 1 with no blocker or major. Two minors:
+- The `copy_times` field's doc now says that the in-memory map may hold stale names, which
+  `encode` drops.
+- An ended record holding 0 reports `Some(0)`. No write the engine makes can produce one, and
+  the filter that hid it was removed as dead code (see the mutations above). It is left as it
+  is.
