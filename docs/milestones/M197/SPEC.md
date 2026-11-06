@@ -1,5 +1,20 @@
 # M197: a reindex in place, under the index's own name
 
+⚠️ **On hold.** Spec review round 1 failed on two blockers and three majors, all of design:
+- Rebuilt segments are keyed at the plan's epoch, so a query `as_of` an epoch between that one
+  and the swap reads every row twice. The swap would have to re-seal at its commit epoch, as
+  compaction does.
+- A write that still declares the old options is refused after the swap, and unfolded rows
+  that declared them are quarantined. So clients must switch their declared options at the
+  swap, which is the same cutover a new name already needs.
+- Without a schema history, a query `as_of` an epoch before the swap analyzes the old segments
+  under the new options.
+- The fingerprint leaves out the recorded types and further text fields.
+- A cancel can lose to a sync that is already running.
+
+Whether to build it, or to keep M168's reindex into a new name plus a client cutover as the
+answer, is the owner's call. Nothing below is implemented.
+
 ## Serves
 Workstream G of [the delivery plan](../../comparisons/turbopuffer-next-plan.md): "Backfill
 publishes a version atomically; a failed worker does not expose half an index", the "in-place
