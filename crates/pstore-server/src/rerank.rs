@@ -143,6 +143,7 @@ pub(crate) fn fuse_outer(lists: Vec<Vec<ResultRow>>, outer: &Outer) -> Vec<Resul
                             highlights: None,
                             vector: None,
                             vectors: None,
+                            sparse: None,
                         },
                     ));
                 }
@@ -192,6 +193,7 @@ mod tests {
             highlights: None,
             vector: None,
             vectors: None,
+            sparse: None,
         }
     }
 

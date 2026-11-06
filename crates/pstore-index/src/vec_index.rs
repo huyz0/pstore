@@ -568,6 +568,10 @@ fn assemble(
         .with_section(Section::Sq8, eights);
     if let Some(p) = sparse {
         w = w.with_section(Section::SparsePostings, p.section);
+        // M193: each row's pairs, so a projection reads the rows it answers, not the field.
+        if params.sparse_rows {
+            w = w.with_section(Section::SparseRows, p.rows);
+        }
     }
     if let Some(t) = text {
         w = w

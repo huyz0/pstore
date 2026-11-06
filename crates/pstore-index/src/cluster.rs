@@ -62,6 +62,10 @@ pub struct Params {
     /// small fixture. The **default is the stated number**; a test that lowers it is
     /// testing the switch, not moving it.
     pub exact_scan_threshold: usize,
+    /// Whether a segment with a sparse field carries each row's pairs, `SparseRows` (M193).
+    /// Always, but for a test that stands in for a build before M193.
+    #[doc(hidden)]
+    pub sparse_rows: bool,
 }
 
 impl Default for Params {
@@ -90,6 +94,7 @@ impl Default for Params {
             replicas: 1,
             boundary: 0.05,
             exact_scan_threshold: crate::vec_index::EXACT_SCAN_THRESHOLD,
+            sparse_rows: true,
         }
     }
 }

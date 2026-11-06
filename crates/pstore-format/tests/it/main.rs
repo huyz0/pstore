@@ -27,6 +27,7 @@ mod segment;
 mod sketch;
 mod sparse;
 mod sparse_keys;
+mod sparse_rows;
 mod text;
 mod text_fields;
 mod tokenizers;

@@ -409,18 +409,21 @@ pub async fn select_held<S: BlobStore>(
 /// `vector` (as `fetch_rows`'s M64 rule), and each named dense field (M190) joined with it in
 /// the same round. A field a segment folded at a varying count of vectors a row has its
 /// rows' offsets read in that round and its vectors in one more (M191), bounded by
-/// `projection.max_bytes` before it. A row holding none of them has no entry.
+/// `projection.max_bytes` before it. The sparse field's pairs (M193) are read as such a
+/// field is, from `SparseRows`, in the same rounds. A row holding none of them has no entry.
 ///
 /// # Errors
 /// A vector range that cannot be read; [`QueryError::ProjectionTooLarge`] when the wanted
-/// rows' varying fields hold more than the bound.
+/// rows' varying fields hold more than the bound; [`QueryError::SparseUnstored`] when
+/// `projection.sparse` and a wanted row's segment holds a sparse field but no `SparseRows`.
 pub async fn vectors_at<S: BlobStore>(
     store: &S,
     targets: &[Target],
     segments: &[Segment],
     wanted: &[Located],
     projection: crate::Projection<'_>,
-) -> Result<BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>>, QueryError> {
+) -> Result<BTreeMap<Located, BTreeMap<String, pstore_format::VectorField>>, QueryError> {
+    type Fields = BTreeMap<Located, BTreeMap<String, pstore_format::VectorField>>;
     let mut per_segment: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (segment, row) in wanted {
         per_segment.entry(*segment).or_default().push(*row);
@@ -448,42 +451,52 @@ pub async fn vectors_at<S: BlobStore>(
                     let rows = &rows;
                     async move {
                         let got = segment.field_spans(store, &t.segment, name, rows).await?;
-                        Ok::<_, QueryError>((name, got))
+                        Ok::<_, QueryError>((name.clone(), got))
                     }
                 }));
-                let (vector, fields, spans) = futures_util::future::try_join3(
+                // M193: the sparse field's offsets too, in the same round.
+                let sparse = crate::run::sparse_spans(store, t, segment, &rows, projection.sparse);
+                let (vector, fields, spans, sparse) = futures_util::future::try_join4(
                     async { Ok::<_, QueryError>(vector.await?) },
                     fields,
                     spans,
+                    sparse,
                 )
                 .await?;
-                let mut out: BTreeMap<Located, BTreeMap<String, Vec<Vec<f32>>>> = BTreeMap::new();
+                let mut out = Fields::new();
                 for (row, v) in vector {
-                    out.entry((i, row))
-                        .or_default()
-                        .insert(pstore_format::DEFAULT_FIELD.to_owned(), vec![v]);
+                    out.entry((i, row)).or_default().insert(
+                        pstore_format::DEFAULT_FIELD.to_owned(),
+                        pstore_format::VectorField::Dense(vec![v]),
+                    );
                 }
                 for (name, got) in fields {
                     for (row, vs) in got {
-                        out.entry((i, row)).or_default().insert(name.clone(), vs);
+                        out.entry((i, row))
+                            .or_default()
+                            .insert(name.clone(), pstore_format::VectorField::Dense(vs));
                     }
                 }
-                let mut held = crate::run::Spans::new();
-                for (name, got) in spans {
-                    for (row, span) in got {
-                        held.entry((i, row)).or_default().push((name.clone(), span));
-                    }
-                }
-                Ok::<_, QueryError>((out, held))
+                let (mut held, mut stale) = (crate::run::Spans::new(), crate::run::Stale::new());
+                crate::run::held(&mut held, &mut stale, i, spans, sparse, || {
+                    rows.iter().copied()
+                });
+                Ok::<_, QueryError>((out, held, stale))
             })
         }))
         .await?;
-    let (mut out, mut spans) = (BTreeMap::new(), crate::run::Spans::new());
-    for (fields, held) in read {
+    let (mut out, mut spans, mut stale) = (
+        Fields::new(),
+        crate::run::Spans::new(),
+        crate::run::Stale::new(),
+    );
+    for (fields, held, unstored) in read {
         out.extend(fields);
         spans.extend(held);
+        stale.extend(unstored);
     }
-    // M191: the page's varying fields, one round more, bounded over every segment at once.
+    // M191: the page's varying fields, one round more, bounded over every segment at once;
+    // M193: the sparse field's pairs in it too.
     let opened: Vec<&Segment> = segments.iter().collect();
     let varying = crate::run::read_spans(
         store,
@@ -491,12 +504,12 @@ pub async fn vectors_at<S: BlobStore>(
         &opened,
         wanted,
         &spans,
+        &stale,
         projection.max_bytes,
     )
     .await?;
     for (key, fields) in varying {
-        let row: &mut BTreeMap<String, Vec<Vec<f32>>> = out.entry(key).or_default();
-        row.extend(fields);
+        out.entry(key).or_default().extend(fields);
     }
     Ok(out)
 }
