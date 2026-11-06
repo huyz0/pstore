@@ -863,6 +863,18 @@ pub struct Schema {
     pub attributes: std::collections::BTreeMap<String, &'static str>,
 }
 
+/// How a query on one dense field searches an index's folded live rows (M198), by segment.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct VectorSearch {
+    /// Rows of segments a query on the field searches by an ANN index: `vector`'s centroid
+    /// table, or a named field's clusters. ⚠️ Under a filter every list is probed (M9b).
+    pub approximate_rows: u64,
+    /// Rows of segments a query on the field scans exactly, whether or not each carries it.
+    pub exact_rows: u64,
+    /// Rows of segments HEAD does not say of: sealed before M198, until compacted.
+    pub unknown_rows: u64,
+}
+
 /// One index, as `GET /v1/indexes/{id}` reports it.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexSummary {
@@ -878,6 +890,12 @@ pub struct IndexSummary {
     pub unfolded: bool,
     /// What its rows must look like. `null` until its first fold records it.
     pub schema: Option<Schema>,
+    /// Each dense field the schema records, to how a dense query on it searches the folded
+    /// live rows (M198); absent while `schema` is `null`. A `multi` leg's FDE clusters are
+    /// not counted. Unfolded rows are in no count: they are
+    /// scored exactly, in memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_search: Option<std::collections::BTreeMap<String, VectorSearch>>,
     /// ⚠️ Rows that were **acknowledged and then discarded** at a fold because they
     /// contradicted the schema. Reported because a discard nobody can see is indistinguishable
     /// from a bug — and because the alternative to discarding was stopping the tenant.

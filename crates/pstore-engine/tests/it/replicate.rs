@@ -1644,7 +1644,20 @@ async fn a_replica_records_its_sources_dictionaries() {
             fde: keys.contains(&format!("{}.fdec", r.key)),
         };
         assert_eq!(r.dicts, Some(want), "{}", r.key);
+        // M198: and so are the fields its segments search by clusters.
+        let ann = r.ann.as_ref().expect("a replica's set is unknown");
+        assert_eq!(
+            ann.contains(pstore_format::DEFAULT_FIELD),
+            keys.contains(&format!("{}.cen", r.key)),
+            "{}",
+            r.key
+        );
     }
+    let src = s.src.head_for_test().await;
+    let src_sets: Vec<_> = src.indexes["src"].iter().map(|r| r.ann.clone()).collect();
+    let sets: Vec<_> = refs.iter().map(|r| r.ann.clone()).collect();
+    assert_eq!(sets, src_sets);
+    assert!(sets.iter().flatten().any(|s| !s.is_empty()), "{sets:?}");
 }
 
 #[tokio::test]
@@ -2364,6 +2377,15 @@ async fn a_reindex_keeps_live_rows_and_no_deletes() {
         assert_eq!(
             d.sparse,
             exists(pstore_format::sparse::dict_key(&key)).await
+        );
+        // M198: a rebuilt segment's set is what its own seal built.
+        assert_eq!(
+            r.ann
+                .as_ref()
+                .map(|a| a.contains(pstore_format::DEFAULT_FIELD)),
+            Some(exists(pstore_index::vec_index::centroid_key(&key)).await),
+            "{}",
+            r.key
         );
         rows += r.rows as usize;
     }

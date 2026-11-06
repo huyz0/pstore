@@ -1367,6 +1367,8 @@ impl<S: BlobStore> Engine<S> {
                     dicts: r.dicts,
                     // M45: and its bytes, so its length.
                     len,
+                    // M198: and the fields it searches by clusters.
+                    ann: r.ann.clone(),
                 });
                 let want = src_head.deletes.get(&head::dv_ref(index, &r.key)).cloned();
                 let Some((k, n)) = want else {
@@ -1688,11 +1690,12 @@ impl<S: BlobStore> Engine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(names.written);
         match sealed {
-            Ok((key, dicts, len)) => Ok(Some(SegmentRef {
+            Ok((key, dicts, len, ann)) => Ok(Some(SegmentRef {
                 key: key.as_str().to_owned(),
                 rows: rows.len() as u32,
                 dicts: Some(dicts),
                 len: Some(len),
+                ann: Some(ann),
             })),
             Err(EngineError::Format(_)) => Err(BuildErr::Refused),
             Err(e) => Err(CopyErr::Failed(e.to_string()).into()),
@@ -1912,6 +1915,7 @@ mod tests {
                 rows: 1,
                 dicts: None,
                 len: None,
+                ann: None,
             }],
         );
         h.schemas

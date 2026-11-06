@@ -109,13 +109,15 @@ async fn a_read_only_process_reports_the_epoch_it_served() {
     // name `docs`, a count, and the one segment's 2-byte length. M148 adds 56, its times
     // section: the zero counts of the three sections it forces (12), a forced `keys_since`
     // (8), the further text fields' and M173's recorded types' zero counts (8), a count (4),
-    // the name `docs` (8) and two times (16).
+    // the name `docs` (8) and two times (16). M198 adds 43, its ANN section: the zero counts of the seven sections it forces (28), a
+    // count (4), the name `docs` (8), and three 1-byte varints: an empty table's count, a ref
+    // count and the one segment's count of no fields.
     let reads: Vec<_> = costs.iter().map(|c| c["blob_reads"].clone()).collect();
     let bytes: Vec<_> = costs.iter().map(|c| c["bytes_read"].clone()).collect();
     assert_eq!(json!(reads), json!([4, 3, 6]));
     assert_eq!(
         json!(bytes),
-        json!([582 + 18 + 56, 574 + 18 + 56, 590 + 18 + 56])
+        json!([582 + 18 + 56 + 43, 574 + 18 + 56 + 43, 590 + 18 + 56 + 43])
     );
     assert!(costs.iter().all(|c| c["blob_lists"] == 0));
     for q in [relevance(), ordered(), strong] {

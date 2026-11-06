@@ -1003,3 +1003,34 @@ flush their valid rows. No stored-data migration is needed. Native write/read de
 remain batched/eventual; this change does not add authentication or change mutation
 completion guarantees. The [M126 verification ledger](milestones/M126/VERIFIED.md)
 records the evidence and any checks still pending.
+
+## M198: which vector fields are searched by ANN
+
+`GET /v1/indexes/{id}` answers `vector_search`, one entry for each dense field the schema
+records (`vector` when it has a width, and each named field):
+
+```json
+{"vector_search": {"vector": {"approximate_rows": 120000, "exact_rows": 4000, "unknown_rows": 0},
+                   "title": {"approximate_rows": 0, "exact_rows": 124000, "unknown_rows": 0}}}
+```
+
+- A query on a field searches a segment by an ANN index only where the segment's seal built
+  one, and each count is the live rows of such segments. `vector` has one in a segment of
+  more than 25,000 rows (`exact_scan_threshold`). A named field has one in a segment where
+  every row carries it with one vector and the segment wrote its clusters, which a segment of
+  more than 4,000 rows does. Every other segment is scanned exactly: `exact_rows` counts all its rows, whether or
+  not each row carries the field.
+- `unknown_rows` counts segments sealed before M198, until a compaction rewrites them.
+  Unfolded rows are in no count: they are always scored exactly. `exact: true` on a query
+  scans every field exactly. Under a filter every list of an ANN index is probed (M9b), and
+  the segment still counts as approximate. A query's `explain` (M165) reports per leg what
+  it did.
+- Each entry is a dense query's: `vector`, or a named field through `field`. A `multi`
+  query over a field of several vectors a row is exact by default, and with `mode: "fde"`
+  probes that field's encoding clusters where a segment wrote them, which `vector_search`
+  does not count.
+- Absent before the first fold, as `schema` is `null` then.
+
+HEAD gains a trailing section. A process older than M198 refuses a HEAD that carries one,
+so every node is upgraded before this version folds. Evidence is in
+[M198 verification](milestones/M198/VERIFIED.md).
