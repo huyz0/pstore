@@ -32,15 +32,15 @@ family not supported by protocol`. fmt and clippy pass.
    lane, never having served the tenant) answers exactly the 11 durable rows after its fold,
    and none of the 5 never flushed: the batched RPO is those 5. B issued no LIST. B's two scans
    and its fold cost 21 reads and 2 writes on this build (printed by the test).
-2. PASS: the same test. B's scan before its fold answers the 10 folded rows, and the unfolded
-   durable row appears after B's fold.
+2. PASS: `a_lost_node_loses_no_durable_write`, the same test. B's scan before its fold answers
+   the 10 folded rows, and the unfolded durable row appears after B's fold.
 3. PASS: `a_lost_store_leaves_the_replica_its_last_sync`. With the source's bucket failing every
    object read, the sync names `dst` failed and commits nothing, the replica's refs are
    unchanged and it answers the 30 synced rows; the 10 rows folded after that sync are the
    RPO. Cancelling costs exactly 1 HEAD read and 1 conditional write, and the index then takes
    a write and answers 31 rows.
-4. PASS: `scripts/check-slos.py` (every new row enforced by a test that exists, or blocked
-   with its blocker named), `scripts/check-links.sh`.
+4. PASS: `./scripts/check-slos.py` (every new row enforced by a test that exists, or
+   blocked with its blocker named) and `./scripts/check-links.sh`.
 5. PASS for `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the suite and
    `scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95`, run here.
    `scripts/mutants.sh` is pending CI's shards; the diff adds no shipping code.
