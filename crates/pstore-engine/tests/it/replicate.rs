@@ -3504,6 +3504,13 @@ fn consistent(seen: &Seen, run: u64) {
             Some(*p),
             "the status reports what was written"
         );
+        let created = status
+            .created_ms
+            .expect("a copy made since M194 records its time");
+        assert!(
+            p.updated_ms >= created,
+            "a checkpoint's time is its own, after the create"
+        );
         assert!(
             p.bytes_done > bytes,
             "bytes grow: {} after {bytes}",
