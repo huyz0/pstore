@@ -61,3 +61,20 @@ here would be a WSL2 number wearing a production label.
 |---|---|---|
 | Error budget per tenant per month: the **target** | blocked | ~~A fleet-wide rollup of `Meter::usage`, which does not exist~~ — built by [M109](../../milestones/M109/VERIFIED.md). Now blocked on a real fleet's failure rate, which is what a promise to a tenant needs, and on the server calling `Meter::answer`, which it does not yet |
 | Time to detect a dead node | blocked | M4b measured detection in **gossip periods**, which is a count and not a duration until a real fleet sets the period |
+
+## Recovery objectives — counts enforced, durations blocked
+
+The counts are measured by [M202](../../milestones/M202/SPEC.md); `docs/deploy.md`'s
+"Recovery objectives" states them for an operator.
+
+| Objective | Value | Status | Gate |
+|---|---|---|---|
+| RPO on a node's loss, for `durable` and `applied` writes | 0 writes, folded or not | enforced | `a_lost_node_loses_no_durable_write` |
+| A lost node's tenant is served by another node with no recovery step | 0 LIST, the next fold | enforced | `a_lost_node_loses_no_durable_write` |
+| RPO on a bucket's loss, with a replica in another bucket | the writes after its last sync, and nothing it synced | enforced | `a_lost_store_leaves_the_replica_its_last_sync` |
+| RTO on a bucket's loss, with a replica: the replica made writable | 1 HEAD read + 1 conditional write, uncontended | enforced | `a_lost_store_leaves_the_replica_its_last_sync` |
+
+| Objective | Status | Blocked on |
+|---|---|---|
+| RPO on a bucket's loss, in seconds | blocked | a real deployment's `PSTORE_FOLD_AGE_S` and sync interval, and its fold rate under load: the formula is in `docs/deploy.md` |
+| RTO in seconds, after a node's or a bucket's loss | blocked | M0b: a real backend's request latency, and M1.13's cold start, which an in-memory store measures neither of |

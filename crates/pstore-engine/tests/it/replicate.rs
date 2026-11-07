@@ -3818,3 +3818,68 @@ async fn a_copy_inside_a_gc_pass_never_publishes() {
         );
     }
 }
+
+// M202: a replica in another bucket is a recovery point for losing the source's bucket.
+
+async fn scanned(e: &E, index: &str) -> Vec<String> {
+    let mut ids: Vec<String> = e
+        .scan(index, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn a_lost_store_leaves_the_replica_its_last_sync() {
+    let s = setup(Kind::Remote);
+    write(&s.src, "src", 0..30).await;
+    s.create().await;
+    let mut st = SyncState::default();
+    s.sync(&mut st).await;
+    let synced: Vec<String> = (0..30).map(|i| format!("d{i:04}")).collect();
+    assert_eq!(scanned(&s.dst, "dst").await, synced, "the first sync");
+
+    // Written and folded at the source, never synced: the RPO.
+    write(&s.src, "src", 30..40).await;
+    // The source's bucket is lost: every object read from it fails.
+    s.there.hooked.fail.lock().unwrap().push(String::new());
+    let before = s.dst.head_for_test().await;
+    let out = s.dst.replicate(&s.remotes, &mut st).await;
+    // The sync reached the source and failed on it: refused whole, or `dst` named failed.
+    if let Ok(o) = &out {
+        assert!(
+            o.committed.is_empty() && o.failed.contains_key("dst"),
+            "a sync from a lost store did not fail on it: {o:?}"
+        );
+    }
+    let after = s.dst.head_for_test().await;
+    assert_eq!(
+        after.indexes.get("dst"),
+        before.indexes.get("dst"),
+        "a failed sync changed the replica"
+    );
+    assert_eq!(
+        scanned(&s.dst, "dst").await,
+        synced,
+        "the replica lost rows"
+    );
+
+    // Recovery: cancel the replication, one HEAD read and one conditional write.
+    let (r, w) = (s.here.reads(DST), s.here.writes(DST));
+    s.dst.cancel_replication("dst").await.unwrap();
+    assert_eq!(
+        (s.here.reads(DST) - r, s.here.writes(DST) - w),
+        (1, 1),
+        "the cancel's cost"
+    );
+    // A normal index now, with the source's bucket still gone.
+    s.dst.write("dst", vec![doc("z0000", 1.0)]).await.unwrap();
+    fold(&s.dst).await;
+    let mut want = synced.clone();
+    want.push("z0000".to_owned());
+    assert_eq!(scanned(&s.dst, "dst").await, want, "the recovered index");
+}

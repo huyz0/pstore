@@ -11,7 +11,7 @@ piece of H's export and restore item still pending in [DELIVERY](../../compariso
   in the blob store, and any process can fold any tenant (`Engine::fold`), so a lost node's
   durable writes are reachable by every other node. A `batched` write is acknowledged from
   this process's memory. It reaches the store when the tenant's unflushed rows pass 8 MiB or
-  when a durable write comes (M160), and it is lost if the process dies first.
+  when a durable write comes (M141), and it is lost if the process dies first.
 - **The store is the only durable tier.** Losing it loses everything in it. The two
   independent recovery points are an index replica in another bucket (M22, pull-based, read
   only until cancelled, then a normal index) and an export (M167, read-only, one epoch).
@@ -29,14 +29,17 @@ piece of H's export and restore item still pending in [DELIVERY](../../compariso
 - **`docs/deploy.md` gains "Recovery objectives"**, stating for each loss what is kept, what
   may be lost, and what recovery is:
   - **Node loss.** RPO is 0 for `durable` and `applied` writes. For `batched` writes it is
-    that process's unflushed rows, at most 8 MiB a tenant. RTO is the next request on any
-    node. A durable write that was not yet folded becomes visible to other nodes at the next
+    that process's unflushed rows: usually up to `tenant_flush_bytes` (8 MiB a tenant by
+    default, M141), a soft bound that writes racing a flush can pass, and never more than
+    `tenant_buffered_bytes` (64 MiB). RTO is the next request on any node. A durable write that was not yet folded becomes visible to other nodes at the next
     fold, which any node runs.
   - **Store loss, with a replica in another bucket.** RPO is the source writes the replica's
     last sync did not reach: those not folded at the source, plus at most one sync interval.
     At the defaults that is up to about `PSTORE_FOLD_AGE_S + PSTORE_REPLICATION_IDLE_S`. The
     replica keeps answering throughout. RTO is a cancel of its replication (one HEAD read and
-    one conditional write), after which it takes writes, plus pointing clients at its bucket.
+    one conditional write, uncontended), after which it takes writes, plus pointing clients at
+    its bucket. If the server holding the replication is lost too, the job's takeover
+    (`TTL + SHARDS × SCAN`, about 13 minutes) adds to the RPO.
   - **Store loss, with an export.** RPO is everything after the export's epoch. RTO is a copy
     of the export into a writable index, whose requests scale with its bytes (M167).
   - **Store loss with neither:** everything is lost. A replica in the same bucket, or one
@@ -82,6 +85,14 @@ in VERIFIED.
 is shown to test something by a mutation of the code it covers that turns it red, applied by
 script and recorded in VERIFIED: a fold that reads only its own lane (AC 1 and 2), and a
 cancel that keeps the replication (AC 3).
+
+## Review
+Round 1 (a read-only subagent given the spec, tests and docs): FAIL, two majors, both taken.
+The batched RPO is now the soft `tenant_flush_bytes` bound and the hard
+`tenant_buffered_bytes` one, as `reserve_buffer` says; and VERIFIED.md records the recovery
+cost. Minors taken: AC 3 asserts the sync failed on the source, the cancel is said to be
+uncontended, and the replication worker's takeover is named in the RPO. Not covered, and said
+so: a node and its bucket lost together is the "neither" row.
 
 ## RA budget
 None. Tests and docs only.

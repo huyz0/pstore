@@ -67,6 +67,7 @@ mod quarantine;
 mod read_only;
 mod reap;
 mod recall;
+mod recovery;
 mod ref_new;
 mod refusals;
 mod replicate;
