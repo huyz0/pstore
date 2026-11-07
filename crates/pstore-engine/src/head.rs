@@ -308,6 +308,29 @@ pub struct Head {
     /// Each copy's past source epoch (M196), by its dest: what it holds instead of the
     /// present. ⚠️ The last trailing section, after the copy times, filtered as they are.
     pub copy_as_of: BTreeMap<String, u64>,
+    /// How far each running copy's sync has got (M200), by its dest. ⚠️ The last trailing
+    /// section, after the ANN sets; `encode` keeps a name only while [`Self::once`] holds it
+    /// and its replication has the entry's run, so a cancel, a resume, a drop or an outcome
+    /// ends it.
+    pub copy_progress: BTreeMap<String, CopyProgress>,
+}
+
+/// One sync attempt's progress through a copy, an export or a reindex (M200), as its last
+/// checkpoint wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopyProgress {
+    /// The copy's run, so a resumed or re-created copy's record is not this one's.
+    pub run: u64,
+    /// The attempt's copy epoch: a sync that starts again counts again, under a new one.
+    pub attempt: u64,
+    /// Segments the attempt has copied or rebuilt.
+    pub segments_done: u32,
+    /// Segments the attempt must copy or rebuild, growing when a remap finds new ones.
+    pub segments_total: u32,
+    /// The bytes of the segments done.
+    pub bytes_done: u64,
+    /// When the checkpoint was written, in ms since the epoch.
+    pub updated_ms: u64,
 }
 
 /// What a reindex asks (M168): the text and regex options `dest` is rebuilt under, applied
@@ -727,9 +750,17 @@ impl Head {
             .iter()
             .filter(|(n, _)| once.contains(n) || self.copies.contains_key(*n))
             .collect();
-        // M198: the ANN sets last, written whenever any ref's is known, forcing every count
-        // before them.
-        let ann = self.indexes.values().flatten().any(|r| r.ann.is_some());
+        // M200: a running copy's progress last, kept for a once-name of the same run.
+        let progress: Vec<(&String, &CopyProgress)> = self
+            .copy_progress
+            .iter()
+            .filter(|(n, p)| {
+                once.contains(n) && self.replications.get(*n).is_some_and(|r| r.run == p.run)
+            })
+            .collect();
+        // M198: the ANN sets before it, written whenever any ref's is known, forcing every
+        // count before them.
+        let ann = self.indexes.values().flatten().any(|r| r.ann.is_some()) || !progress.is_empty();
         let as_of = !copy_as_of.is_empty() || ann;
         let copy_timed = !copy_times.is_empty() || as_of;
         let reindexed = !reindexes.is_empty() || copy_timed;
@@ -964,6 +995,13 @@ impl Head {
         }
         if ann {
             put_ann(&mut out, &self.indexes);
+        }
+        if !progress.is_empty() {
+            out.extend_from_slice(&(progress.len() as u32).to_le_bytes());
+            for (name, p) in progress {
+                put_str(&mut out, name);
+                put_progress(&mut out, p);
+            }
         }
         out
     }
@@ -1499,6 +1537,17 @@ impl Head {
             return Ok(h);
         }
         get_ann(&mut c, &mut h.indexes)?;
+        // M200: and here, no copy's progress.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let p = get_progress(&mut c)?;
+            if h.copy_progress.insert(name, p).is_some() {
+                return Err(EngineError::CorruptHead);
+            }
+        }
         if !c.at_end() {
             return Err(EngineError::CorruptHead);
         }
@@ -1715,6 +1764,40 @@ fn put_ann(out: &mut Vec<u8>, indexes: &BTreeMap<String, Vec<SegmentRef>>) {
     }
 }
 
+/// One [`CopyProgress`] as varints, in its fields' order (M200).
+fn put_progress(out: &mut Vec<u8>, p: &CopyProgress) {
+    for v in [
+        p.run,
+        p.attempt,
+        u64::from(p.segments_done),
+        u64::from(p.segments_total),
+        p.bytes_done,
+        p.updated_ms,
+    ] {
+        put_varint(out, v);
+    }
+}
+
+/// Reads [`put_progress`]'s fields, refusing more done than total or a count past `u32`.
+fn get_progress(c: &mut Cur<'_>) -> Result<CopyProgress, EngineError> {
+    let run = c.varint()?;
+    let attempt = c.varint()?;
+    let count = |v: u64| u32::try_from(v).map_err(|_| EngineError::CorruptHead);
+    let segments_done = count(c.varint()?)?;
+    let segments_total = count(c.varint()?)?;
+    if segments_done > segments_total {
+        return Err(EngineError::CorruptHead);
+    }
+    Ok(CopyProgress {
+        run,
+        attempt,
+        segments_done,
+        segments_total,
+        bytes_done: c.varint()?,
+        updated_ms: c.varint()?,
+    })
+}
+
 /// Reads [`put_ann`]'s section into `indexes`' refs, refusing what it would not write: a
 /// table out of order or naming a field no ref does, a count that disagrees, an ordinal past
 /// the table, one field twice in a ref, an index twice or one HEAD does not name.
@@ -1885,6 +1968,16 @@ pub(crate) async fn commit<S: BlobStore>(
     at: &HeadAt,
     next: &Head,
 ) -> Result<Epoch, EngineError> {
+    commit_at(store, tenant, at, next).await.map(|_| next.epoch)
+}
+
+/// [`commit`], answering the tag of the HEAD it wrote (M200).
+pub(crate) async fn commit_at<S: BlobStore>(
+    store: &S,
+    tenant: pstore_types::TenantId,
+    at: &HeadAt,
+    next: &Head,
+) -> Result<CasTag, EngineError> {
     crate::require_fencing(store)?;
     // ⚠️ **The ABA guard is this check, not the nonce** (M105, OQ-6). A content-derived tag,
     // single-part or multipart, repeats exactly when the bytes do, and the epoch is what keeps
@@ -1905,7 +1998,7 @@ pub(crate) async fn commit<S: BlobStore>(
         .put_conditional(&Head::key(tenant), next.encode().into(), pre)
         .await
     {
-        Ok(_) => Ok(next.epoch),
+        Ok(put) => Ok(put.tag),
         Err(CasError::Lost) => Err(EngineError::Lost),
         Err(CasError::Contended) => Err(EngineError::Contended),
         Err(CasError::Io(e)) => Err(EngineError::Blob(e)),
@@ -3320,6 +3413,100 @@ mod tests {
                 let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
                 if let Ok(h) = Head::decode(part) {
                     assert!(h.copy_as_of.is_empty(), "a cut at {cut} decoded an as_of");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M200 criterion 5: a running copy's progress after the ANN sets, forcing every earlier
+    /// count, kept only for a once-name whose replication has the same run.
+    #[test]
+    fn copy_progress_round_trips_after_ann() -> Result<(), EngineError> {
+        let source = ReplicaSource::local(pstore_types::TenantId(7), "src");
+        let p = CopyProgress {
+            run: 9,
+            attempt: 41,
+            segments_done: 3,
+            segments_total: 10,
+            bytes_done: 300_000,
+            updated_ms: 1_700_000_000_000,
+        };
+        for base in [Head::default(), sample(), every_section()] {
+            let mut plain = base.clone();
+            plain.replications.insert(
+                "running".to_owned(),
+                Replication {
+                    source: source.clone(),
+                    running: true,
+                    run: 9,
+                    applied: None,
+                    rejected: 0,
+                },
+            );
+            plain.once.insert("running".to_owned());
+            assert_eq!(Head::decode(&plain.encode())?, plain);
+            // Alone: every earlier section empty, so each count is forced.
+            let mut with = plain.clone();
+            with.copy_progress.insert("running".to_owned(), p);
+            assert_eq!(Head::decode(&with.encode())?, with);
+            // And after each earlier one.
+            let mut all = with.clone();
+            all.reindexes
+                .insert("running".to_owned(), Reindex::default());
+            all.copy_times.insert("running".to_owned(), (1_000, 0));
+            all.copy_as_of.insert("running".to_owned(), 3);
+            assert_eq!(Head::decode(&all.encode())?, all);
+            // Not encoded: a name `once` lacks, a run that differs, a replication not `once`.
+            let mut ghost = plain.clone();
+            ghost.copy_progress.insert("gone".to_owned(), p);
+            assert_eq!(hex(&ghost.encode()), hex(&plain.encode()));
+            let mut stale = plain.clone();
+            stale
+                .copy_progress
+                .insert("running".to_owned(), CopyProgress { run: 8, ..p });
+            assert_eq!(hex(&stale.encode()), hex(&plain.encode()));
+            let mut ongoing = plain.clone();
+            ongoing.once.remove("running");
+            let ongoing_plain = ongoing.clone();
+            ongoing.copy_progress.insert("running".to_owned(), p);
+            assert_eq!(hex(&ongoing.encode()), hex(&ongoing_plain.encode()));
+            // Malformed: more done than total, a duplicate name, a trailing byte.
+            let mut over = with.clone();
+            over.copy_progress.insert(
+                "running".to_owned(),
+                CopyProgress {
+                    segments_done: 11,
+                    ..p
+                },
+            );
+            assert!(Head::decode(&over.encode()).is_err(), "done past total");
+            let bytes = with.encode();
+            let entry = {
+                let mut e = Vec::new();
+                put_str(&mut e, "running");
+                put_progress(&mut e, &p);
+                e
+            };
+            let count_at = bytes.len() - entry.len() - 4;
+            let mut twice = bytes
+                .get(..count_at)
+                .ok_or(EngineError::CorruptHead)?
+                .to_vec();
+            twice.extend_from_slice(&2_u32.to_le_bytes());
+            twice.extend_from_slice(&entry);
+            twice.extend_from_slice(&entry);
+            assert!(Head::decode(&twice).is_err(), "a name twice");
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            for cut in plain.encode().len()..bytes.len() {
+                let part = bytes.get(..cut).ok_or(EngineError::CorruptHead)?;
+                if let Ok(h) = Head::decode(part) {
+                    assert!(
+                        h.copy_progress.is_empty(),
+                        "a cut at {cut} decoded progress"
+                    );
                 }
             }
         }

@@ -1,5 +1,29 @@
 # Native API migration notes
 
+## M200: a running copy, export or reindex reports its progress
+
+`GET /v1/indexes/{dest}/copy` answers `progress` for a running or paused copy, export or
+reindex:
+
+```json
+"progress": {"segments_done": 128, "segments_total": 400, "bytes_done": 524288000,
+             "attempt": 9123, "updated_at": "2026-11-07T05:00:00.000Z"}
+```
+
+- The sync writes it to HEAD every 64 segments it copies or rebuilds, not continuously. It is
+  `null` before the first of those, for a copy of 64 segments or fewer, and once the copy has
+  ended.
+- It counts one sync's attempt. A sync that starts again (another node, or after a crash)
+  counts again from 0 under a new `attempt`, so a lower `segments_done` with a new `attempt`
+  is a restart, not a regression. `segments_total` grows when the source changes under the
+  copy. Delete vectors are copied after the last segment and are not counted.
+- A paused copy keeps the progress it had. A resume starts a new run, and its progress starts
+  again. A cancel ends it.
+- Writing it is best-effort: a checkpoint that keeps losing to the tenant's writers is skipped,
+  and the copy goes on. Each one costs a HEAD read and a conditional write. Nodes must run
+  M200 before any writes this section: an older reader refuses a HEAD holding it. Evidence is
+  in [M200 verification](milestones/M200/VERIFIED.md).
+
 ## M199: a document export at one epoch
 
 An order (`rank_by` an attribute) takes `as_of` with `include_vectors`, so a client can export

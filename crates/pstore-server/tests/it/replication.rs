@@ -2250,3 +2250,27 @@ async fn a_copy_takes_an_as_of_epoch() {
     );
     assert_ne!(rows(&api, DST, "dst").await, rows(&api, SRC, "src").await);
 }
+
+/// M200 criterion 7: a running copy reports `progress`, `null` before its first sync's
+/// first checkpoint, and `null` once it has succeeded.
+#[tokio::test(start_paused = true)]
+async fn a_running_copy_reports_progress() {
+    let world = World::new();
+    let api = world.api(1);
+    write(&api, SRC, "src", 0..20).await;
+    let source = json!({"index": "src", "tenant": SRC.to_string()});
+    let (s, started) = copy(&api, "dst", source).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{started}");
+    assert_eq!(started["progress"], Value::Null, "{started}");
+    let (_, running) = copy_status(&api, "dst").await;
+    assert_eq!(running["state"], "running", "{running}");
+    assert!(
+        running.get("progress").is_some_and(Value::is_null),
+        "{running}"
+    );
+    let mut workers = vec![(Arc::clone(&api), Worker::default())];
+    run(&mut workers, 1, Duration::from_secs(1)).await;
+    let (_, done) = copy_status(&api, "dst").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert!(done.get("progress").is_some_and(Value::is_null), "{done}");
+}
