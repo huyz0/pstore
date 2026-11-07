@@ -1,6 +1,6 @@
 # M197: a reindex in place, under the index's own name
 
-⚠️ **On hold.** Spec review round 1 failed on two blockers and three majors, all of design:
+⚠️ **Closed, not built.** Spec review round 1 failed on two blockers and three majors, all of design:
 - Rebuilt segments are keyed at the plan's epoch, so a query `as_of` an epoch between that one
   and the swap reads every row twice. The swap would have to re-seal at its commit epoch, as
   compaction does.
@@ -12,8 +12,8 @@
 - The fingerprint leaves out the recorded types and further text fields.
 - A cancel can lose to a sync that is already running.
 
-Whether to build it, or to keep M168's reindex into a new name plus a client cutover as the
-answer, is the owner's call. Nothing below is implemented.
+**Closed, not built (owner's decision, 2026-11-07):** M168's reindex into a new name, plus a
+client cutover, is G's answer. Nothing below is implemented.
 
 ## Serves
 Workstream G of [the delivery plan](../../comparisons/turbopuffer-next-plan.md): "Backfill

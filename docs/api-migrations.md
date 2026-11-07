@@ -68,7 +68,8 @@ copy into a new index; "re-write" means writing the rows again into a new index.
 | Dims, distance metric, a named vector field's width | Re-write | M9d, M98 |
 | The id kind | Re-write | M176 |
 
-Not offered: a reindex in place under the same name, progress beyond the state, and a reindex
+Not offered: a reindex in place under the same name (a reindex into a new name, then moving
+clients to it, is the way: [M197](milestones/M197/SPEC.md) records why), progress beyond the state, and a reindex
 that changes dims, metric, types or the id kind. Evidence is in
 [M168 verification](milestones/M168/VERIFIED.md).
 
