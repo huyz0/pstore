@@ -31,6 +31,7 @@ mod end_to_end;
 mod engine;
 mod engine_query;
 mod explain;
+mod export_pages;
 mod external_copy;
 mod external_index;
 mod external_retry;

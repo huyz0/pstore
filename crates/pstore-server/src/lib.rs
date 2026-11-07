@@ -3409,11 +3409,6 @@ fn vector_projection(req: &QueryRequest) -> Result<Option<Projecting>, ApiError>
             )));
         }
     };
-    if req.as_of.is_some() {
-        return Err(bad(
-            "a past epoch's vectors are later: it cannot be combined with as_of",
-        ));
-    }
     // A ranked query's row fetch covers its whole page; an order reads only the page's rows.
     let rows = if req.rank_by.is_some() {
         req.top_k
@@ -3870,6 +3865,14 @@ async fn run<E: BlobStore>(
         }
     };
     let projected = vector_projection(req)?;
+    // M199: an order's page reads its vectors at a past epoch; a ranked or a scored query's
+    // row fetch does not.
+    if projected.is_some() && req.as_of.is_some() && !matches!(plan, Plan::Ordered(..)) {
+        return Err(ApiError::bad_request(
+            "include_vectors: a ranked or scored query's vectors cannot be combined with \
+             as_of; an order (rank_by an attribute) reads a past epoch's",
+        ));
+    }
     let (legs, filter, fusion, boost, highlight, diversify, limit_per) = match plan {
         Plan::Aggregate(spec, filter) => {
             let names: Vec<String> = spec.labels.iter().map(|(l, _)| l.clone()).collect();
@@ -3921,7 +3924,21 @@ async fn run<E: BlobStore>(
         }
         Plan::Ordered(by, filter) => {
             // M179: the page's vectors, one round after selection, only when asked.
-            let got = if let Some(p) = &projected {
+            let got = if let (Some(p), Some(epoch)) = (&projected, req.as_of) {
+                engine
+                    .ordered_projected_as_of(
+                        index,
+                        by,
+                        filter.as_ref(),
+                        req.offset.unwrap_or(0),
+                        req.top_k,
+                        pstore_types::Epoch(epoch),
+                        p.vector,
+                        &p.named,
+                        p.sparse,
+                    )
+                    .await?
+            } else if let Some(p) = &projected {
                 engine
                     .ordered_projected(
                         index,

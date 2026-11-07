@@ -8587,13 +8587,6 @@ impl<S: BlobStore> Engine<S> {
         named: &[String],
         sparse: bool,
     ) -> Result<Ordered, EngineError> {
-        let projection = pstore_query::Projection {
-            vector,
-            named,
-            folded: 0,
-            max_bytes: self.projection_bytes,
-            sparse,
-        };
         self.ordered_at(
             index,
             by,
@@ -8602,9 +8595,60 @@ impl<S: BlobStore> Engine<S> {
             limit,
             None,
             consistency,
-            projection,
+            self.projection(vector, named, sparse),
         )
         .await
+    }
+
+    /// [`Self::ordered_projected`] as of `epoch` (M199): that epoch's rows, each carrying the
+    /// vectors asked for in the client space of the metric the index had then. A document
+    /// export pages it by `id > last` at one epoch.
+    ///
+    /// # Errors
+    /// As [`Self::ordered_projected`], and [`EngineError::TimeTravel`] outside the window.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the order's own parameters, its epoch, and what it projects"
+    )]
+    pub async fn ordered_projected_as_of(
+        &self,
+        index: &str,
+        by: impl Into<pstore_query::Order>,
+        filter: Option<&pstore_query::Predicate>,
+        offset: usize,
+        limit: usize,
+        epoch: Epoch,
+        vector: bool,
+        named: &[String],
+        sparse: bool,
+    ) -> Result<Ordered, EngineError> {
+        self.ordered_at(
+            index,
+            by,
+            filter,
+            offset,
+            limit,
+            Some(epoch),
+            Consistency::Eventual,
+            self.projection(vector, named, sparse),
+        )
+        .await
+    }
+
+    /// What an order projects: the fields asked for, within the engine's bound (M191).
+    const fn projection<'a>(
+        &self,
+        vector: bool,
+        named: &'a [String],
+        sparse: bool,
+    ) -> pstore_query::Projection<'a> {
+        pstore_query::Projection {
+            vector,
+            named,
+            folded: 0,
+            max_bytes: self.projection_bytes,
+            sparse,
+        }
     }
 
     #[allow(
@@ -8986,7 +9030,11 @@ impl<S: BlobStore> Engine<S> {
                     )));
                 }
                 let then = at.head.as_of(epoch)?;
-                let schema = schema_at(&at.head, index, epoch);
+                // M199: the metric the index had then, as its text schema is: a dropped
+                // index's is the first drop's after `epoch`, never the present's.
+                let schema = schema_recorded_at(&at.head, index, epoch);
+                fresh_metric = schema.as_ref().map(|s| s.metric);
+                let schema = schema.unwrap_or_default();
                 let fts = (schema.fts, schema.texts);
                 (
                     Read::Owned(Box::new(then)),
@@ -9058,12 +9106,13 @@ impl<S: BlobStore> Engine<S> {
                 u64::from(r.rows.saturating_sub(gone))
             })
             .sum();
-        let metric = head
-            .schemas
-            .get(index)
-            .map(|s| s.metric)
-            .or(fresh_metric)
-            .unwrap_or_default();
+        // A past epoch's is its own; the present's is HEAD's, or its unfolded view's.
+        let metric = if as_of.is_some() {
+            fresh_metric
+        } else {
+            head.schemas.get(index).map(|s| s.metric).or(fresh_metric)
+        }
+        .unwrap_or_default();
         Ok(Scope {
             metric,
             named: head.indexes.contains_key(index),
@@ -9754,16 +9803,11 @@ fn split_rows(
     (hits, ids, attributes, dists, vecs)
 }
 
-/// The schema `index` had at `epoch` (M9f.2): the schema of the first drop of that name after
-/// the epoch, if it was dropped since -- the present schema is then another index's, or none --
-/// and otherwise the present one. Whole: its metric, and its full-text schema (M14), which a
-/// past query analyzes and scores by.
-fn schema_at(head: &Head, index: &str, epoch: Epoch) -> head::IndexSchema {
-    schema_recorded_at(head, index, epoch).unwrap_or_default()
-}
-
-/// The schema `index` had at `epoch`, if one was recorded (M170: a HEAD older than M7d
-/// records none, and that is not a width of 0).
+/// The schema `index` had at `epoch` (M9f.2), if one was recorded (M170: a HEAD older than
+/// M7d records none, and that is not a width of 0): the schema of the first drop of that name
+/// after the epoch, if it was dropped since -- the present schema is then another index's, or
+/// none -- and otherwise the present one. Whole: its metric (M199), and its full-text schema
+/// (M14), which a past query analyzes and scores by.
 pub(crate) fn schema_recorded_at(
     head: &Head,
     index: &str,
