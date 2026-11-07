@@ -3,8 +3,8 @@
 //! own HEAD. See `docs/milestones/M22/SPEC.md`.
 
 use crate::head::{
-    self, CopyEnd, CopyFailure, CopyOutcome, Head, HeadAt, IndexSchema, Reindex, ReplicaSource,
-    Replication, fnv1a,
+    self, CopyEnd, CopyFailure, CopyOutcome, CopyProgress, Head, HeadAt, IndexSchema, Reindex,
+    ReplicaSource, Replication, fnv1a,
 };
 use crate::{
     Engine, EngineError, MAX_COMMIT_ATTEMPTS, SegmentRef, backoff, is_rowless, nonce_for,
@@ -24,6 +24,46 @@ const IN_FLIGHT: usize = 4;
 
 /// Consecutive remaps that copied nothing new before a replication fails (spec § Sync 5).
 const MAX_STALLS: u32 = 24;
+
+/// Segments a copy's sync copies or rebuilds between two progress checkpoints (M200).
+pub(crate) const COPY_CHECKPOINT: usize = 64;
+
+/// Writes one checkpoint tries before it is skipped (M200): it is best-effort.
+const CHECKPOINT_TRIES: u32 = 3;
+
+/// A checkpoint point of a copy's sync (M200), as a test hook sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// Before the checkpoint's first write.
+    Before {
+        /// The copy's dest.
+        dest: String,
+    },
+    /// After it: what it wrote, or `None` when it wrote nothing.
+    After {
+        /// The copy's dest.
+        dest: String,
+        /// The progress it committed.
+        wrote: Option<CopyProgress>,
+    },
+}
+
+/// What a [`CheckpointHook`] runs (M200): a future the sync awaits before it goes on.
+pub type CheckpointFn =
+    dyn Fn(Checkpoint) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+
+/// A test's hook at each [`Checkpoint`] (M200).
+#[derive(Clone)]
+pub struct CheckpointHook(
+    /// Runs at each checkpoint point, and is awaited before the sync goes on.
+    pub Arc<CheckpointFn>,
+);
+
+impl std::fmt::Debug for CheckpointHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CheckpointHook")
+    }
+}
 
 /// The sidecars a segment may have, each derived from its key and each optional -- by the
 /// same functions that write them and that GC derives them with, so the three never drift.
@@ -106,6 +146,9 @@ pub struct CopyStatus {
     pub ended_ms: Option<u64>,
     /// The past source epoch it copies (M196), or `None` for the source's present.
     pub as_of: Option<u64>,
+    /// How far a running or paused copy's sync has got (M200), as its last checkpoint wrote
+    /// it; `None` before the first and once it has ended.
+    pub progress: Option<CopyProgress>,
 }
 
 /// What a copy asks besides its source (M196): [`Engine::create_copy_with`]'s options.
@@ -263,6 +306,10 @@ struct Copies {
     /// Every segment and vector key written, recorded before its PUT, so one that fails
     /// partway is buried too (M19). A segment's sidecars follow it to GC.
     written: Vec<String>,
+    /// M200: each copy's progress this attempt, by dest, as its next checkpoint writes it.
+    progress: BTreeMap<String, CopyProgress>,
+    /// M200: the HEAD the last checkpoint committed, which the publish is planned on.
+    checkpointed: Option<HeadAt>,
 }
 
 /// A replication's new state, ready to commit.
@@ -662,6 +709,7 @@ impl<S: BlobStore> Engine<S> {
                 created_ms: created,
                 ended_ms: None,
                 as_of: ask.as_of,
+                progress: None,
             },
             true,
         ))
@@ -1009,14 +1057,17 @@ impl<S: BlobStore> Engine<S> {
                     };
                     // M168: a reindex rebuilds what a copy would copy. Only a copy holds a
                     // record: every create writes or clears it, so a replication never does.
+                    // M200: a copy (not a replication) checkpoints its progress under its run.
+                    let run = st.once.contains(d.as_str()).then_some(r.run);
                     let got = match at.head.reindexes.get(d.as_str()) {
                         Some(ask) => {
-                            self.rebuild(&src, &r.source, src_head, d, e, &mut copies, ask)
+                            let to = (d.as_str(), run);
+                            self.rebuild(&src, &r.source, src_head, to, e, &mut copies, ask)
                                 .await
                         }
                         _ => {
                             let as_of = st.as_of.get(d.as_str()).copied();
-                            let to = (d.as_str(), &at.head);
+                            let to = (d.as_str(), &at.head, run);
                             self.mirror(&src, &r.source, src_head, to, e, &mut copies, as_of)
                                 .await
                         }
@@ -1048,6 +1099,12 @@ impl<S: BlobStore> Engine<S> {
                     continue;
                 }
                 included.push((d.clone(), r.run));
+            }
+            // M200: a checkpoint moved HEAD, so this attempt's base is stale. The next one is
+            // planned on what the last checkpoint wrote, with no read and nothing copied again.
+            if let Some(written) = copies.checkpointed.take() {
+                first = Some(written);
+                continue;
             }
             let mut used: BTreeSet<String> = BTreeSet::new();
             for (d, _) in &included {
@@ -1274,7 +1331,7 @@ impl<S: BlobStore> Engine<S> {
         src: &Src<'_, S>,
         source: &ReplicaSource,
         src_head: &mut Head,
-        (dest, dest_head): (&str, &Head),
+        (dest, dest_head, run): (&str, &Head, Option<u64>),
         e: u64,
         copies: &mut Copies,
         as_of: Option<u64>,
@@ -1310,17 +1367,35 @@ impl<S: BlobStore> Engine<S> {
                 })
                 .collect();
             let written = Mutex::new(Vec::new());
-            let results: Vec<Copied> =
-                futures_util::stream::iter(todo.into_iter().map(|(from, h, to)| {
-                    let written = &written;
-                    async move {
-                        let r = self.copy_segment(src, &from, &to, written).await;
-                        (h, to, r)
-                    }
-                }))
-                .buffer_unordered(IN_FLIGHT)
-                .collect()
-                .await;
+            self.planned(copies, dest, run, todo.len());
+            // M200: in batches, a checkpoint between two of them.
+            let batches: Vec<Vec<(String, u64, String)>> = todo
+                .chunks(self.copy_checkpoint)
+                .map(<[_]>::to_vec)
+                .collect();
+            let last = batches.len().saturating_sub(1);
+            let mut results: Vec<Copied> = Vec::new();
+            for (i, batch) in batches.into_iter().enumerate() {
+                let got: Vec<Copied> =
+                    futures_util::stream::iter(batch.into_iter().map(|(from, h, to)| {
+                        let written = &written;
+                        async move {
+                            let r = self.copy_segment(src, &from, &to, written).await;
+                            (h, to, r)
+                        }
+                    }))
+                    .buffer_unordered(IN_FLIGHT)
+                    .collect()
+                    .await;
+                let done = got.iter().filter_map(|(.., r)| r.as_ref().ok());
+                self.tally(copies, dest, done.map(|(_, _, len)| *len));
+                if i < last
+                    && let Some(run) = run
+                {
+                    self.checkpoint(dest, run, e, copies).await;
+                }
+                results.extend(got);
+            }
             copies.written.extend(
                 written
                     .into_inner()
@@ -1481,7 +1556,7 @@ impl<S: BlobStore> Engine<S> {
         src: &Src<'_, S>,
         source: &ReplicaSource,
         src_head: &mut Head,
-        dest: &str,
+        (dest, run): (&str, Option<u64>),
         e: u64,
         copies: &mut Copies,
         ask: &Reindex,
@@ -1522,19 +1597,51 @@ impl<S: BlobStore> Engine<S> {
                 .filter(|(.., h)| !copies.built.contains_key(&(dest.to_owned(), *h)))
                 .map(|(r, dv, h)| (r.clone(), dv.clone(), *h, self.replica_seg_key(dest, e, *h)))
                 .collect();
-            let results: Vec<(u64, Result<Option<SegmentRef>, BuildErr>)> =
-                futures_util::stream::iter(todo.into_iter().map(|(r, dv, h, to)| {
-                    let (written, schema, further) = (&written, &schema, &further);
-                    async move {
-                        let out = self
-                            .rebuild_segment(src, &r, dv.as_ref(), &to, schema, further, written)
-                            .await;
-                        (h, out)
-                    }
-                }))
-                .buffer_unordered(IN_FLIGHT)
-                .collect()
-                .await;
+            self.planned(copies, dest, run, todo.len());
+            // M200: in batches, a checkpoint between two of them, as a copy's.
+            type Todo = (SegmentRef, Option<Dv>, u64, String);
+            let batches: Vec<Vec<Todo>> = todo
+                .chunks(self.copy_checkpoint)
+                .map(<[_]>::to_vec)
+                .collect();
+            let last = batches.len().saturating_sub(1);
+            let mut results: Vec<(u64, Result<Option<SegmentRef>, BuildErr>)> = Vec::new();
+            for (i, batch) in batches.into_iter().enumerate() {
+                let got: Vec<(u64, Result<Option<SegmentRef>, BuildErr>)> =
+                    futures_util::stream::iter(batch.into_iter().map(|(r, dv, h, to)| {
+                        let (written, schema, further) = (&written, &schema, &further);
+                        async move {
+                            let out = self
+                                .rebuild_segment(
+                                    src,
+                                    &r,
+                                    dv.as_ref(),
+                                    &to,
+                                    schema,
+                                    further,
+                                    written,
+                                )
+                                .await;
+                            (h, out)
+                        }
+                    }))
+                    .buffer_unordered(IN_FLIGHT)
+                    .collect()
+                    .await;
+                // A segment whose every row was deleted is rebuilt to nothing: done, 0 bytes.
+                let done = got.iter().filter_map(|(_, r)| r.as_ref().ok());
+                self.tally(
+                    copies,
+                    dest,
+                    done.map(|b| b.as_ref().and_then(|r| r.len).unwrap_or(0)),
+                );
+                if i < last
+                    && let Some(run) = run
+                {
+                    self.checkpoint(dest, run, e, copies).await;
+                }
+                results.extend(got);
+            }
             copies.written.extend(
                 written
                     .into_inner()
@@ -1757,6 +1864,91 @@ impl<S: BlobStore> Engine<S> {
     /// Stamps the copy into `dest` as ended by the commit of `next` (M194), at this clock and
     /// never at 0, which reads as not ended. Only a record that exists: a copy made before
     /// M194 has none, and ends with none.
+    /// M200: `n` more segments this attempt must copy or rebuild for `dest`, a copy's.
+    fn planned(&self, copies: &mut Copies, dest: &str, run: Option<u64>, n: usize) {
+        if let Some(run) = run {
+            let p = copies.progress.entry(dest.to_owned()).or_default();
+            p.run = run;
+            p.segments_total = p
+                .segments_total
+                .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+        }
+    }
+
+    /// M200: segments done for `dest`, each by its bytes.
+    fn tally(&self, copies: &mut Copies, dest: &str, done: impl Iterator<Item = u64>) {
+        if let Some(p) = copies.progress.get_mut(dest) {
+            for len in done {
+                p.segments_done = p.segments_done.saturating_add(1).min(p.segments_total);
+                p.bytes_done = p.bytes_done.saturating_add(len);
+            }
+        }
+    }
+
+    /// M200: commits `dest`'s progress, best-effort: only while its copy runs under `run`,
+    /// at most [`CHECKPOINT_TRIES`] writes, and never an error. What it wrote is the HEAD the
+    /// publish is planned on.
+    async fn checkpoint(&self, dest: &str, run: u64, attempt: u64, copies: &mut Copies) {
+        let Some(p) = copies.progress.get(dest).copied() else {
+            return;
+        };
+        self.hook(Checkpoint::Before {
+            dest: dest.to_owned(),
+        })
+        .await;
+        let mut wrote = None;
+        for _ in 0..CHECKPOINT_TRIES {
+            let Ok(at) = head::read(&*self.store, self.tenant).await else {
+                break;
+            };
+            let live = at.head.once.contains(dest)
+                && at
+                    .head
+                    .replications
+                    .get(dest)
+                    .is_some_and(|r| r.running && r.run == run);
+            if !live {
+                break;
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            let p = CopyProgress {
+                attempt,
+                updated_ms: self.now_ms(),
+                ..p
+            };
+            next.copy_progress.insert(dest.to_owned(), p);
+            match self.commit_head_at(&at, &next).await {
+                Ok(written) => {
+                    self.record_commit(written.head.epoch);
+                    copies.checkpointed = Some(written);
+                    wrote = Some(p);
+                    break;
+                }
+                Err(EngineError::Lost | EngineError::Contended) => {}
+                Err(_) => break,
+            }
+        }
+        self.hook(Checkpoint::After {
+            dest: dest.to_owned(),
+            wrote,
+        })
+        .await;
+    }
+
+    /// Runs the test's checkpoint hook, if one is set (M200).
+    async fn hook(&self, at: Checkpoint) {
+        let hook = self
+            .checkpoint_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)(at).await;
+        }
+    }
+
     fn stamp_end(&self, next: &mut Head, dest: &str) {
         let now_ms = self.now_ms().max(1);
         if let Some((_, ended)) = next.copy_times.get_mut(dest) {
@@ -1787,6 +1979,8 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
             created_ms: h.copy_times.get(dest).map(|(c, _)| *c),
             ended_ms: None,
             as_of: h.copy_as_of.get(dest).copied(),
+            // A stale run's entry is not decoded (`Head::encode` keeps only the record's run).
+            progress: h.copy_progress.get(dest).copied(),
         });
     }
     let o = h.copies.get(dest)?;
@@ -1808,6 +2002,7 @@ fn copy_status_in(h: &Head, dest: &str) -> Option<CopyStatus> {
         // An ended copy's record is always stamped, never 0 (`stamp_end`).
         ended_ms: h.copy_times.get(dest).map(|(_, e)| *e),
         as_of: h.copy_as_of.get(dest).copied(),
+        progress: None,
     })
 }
 

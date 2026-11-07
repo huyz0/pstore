@@ -18,13 +18,16 @@ pub use applied::{
 pub use bundle::Entry;
 pub use external::ExternalRefusal;
 pub use head::{
-    COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, Dicts, ExternalKind, ExternalRef, Head,
-    HeadAt, IndexSchema, MAX_TEXTS, Metric, Reindex, ReplicaSource, Replication, SegmentRef,
-    TimeTravel,
+    COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, CopyProgress, Dicts, ExternalKind,
+    ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, Reindex, ReplicaSource, Replication,
+    SegmentRef, TimeTravel,
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
-pub use replica::{CopyOptions, CopyState, CopyStatus, ReplicaRefusal, Sources, SyncState, Synced};
+pub use replica::{
+    Checkpoint, CheckpointFn, CheckpointHook, CopyOptions, CopyState, CopyStatus, ReplicaRefusal,
+    Sources, SyncState, Synced,
+};
 
 use pstore_blob::{BlobStore, Key};
 use pstore_format::text::FullText;
@@ -2503,6 +2506,10 @@ pub struct Engine<S> {
     /// and it ended with nothing to commit, or failed. This process's next fold commit buries
     /// them, so a fold never makes a commit of its own to bury.
     abandoned: Mutex<Vec<String>>,
+    /// Segments a copy's sync copies or rebuilds between two progress checkpoints (M200).
+    copy_checkpoint: usize,
+    /// A test's look at each checkpoint point (M200); `None` in every shipping engine.
+    checkpoint_hook: Mutex<Option<replica::CheckpointHook>>,
     /// Each commit this engine made, and when (M18): what a scheduled reap may take once it is
     /// old enough. Never a reap's own commit.
     reapable: Mutex<std::collections::VecDeque<Reapable>>,
@@ -2673,6 +2680,8 @@ impl<S: BlobStore> Engine<S> {
             waived: std::sync::atomic::AtomicBool::new(false),
             uncertain: Mutex::new(None),
             abandoned: Mutex::new(Vec::new()),
+            copy_checkpoint: replica::COPY_CHECKPOINT,
+            checkpoint_hook: Mutex::new(None),
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fold_gate: tokio::sync::Mutex::new(()),
@@ -2752,6 +2761,25 @@ impl<S: BlobStore> Engine<S> {
     pub fn with_projection_bytes(mut self, bytes: u64) -> Self {
         self.projection_bytes = bytes;
         self
+    }
+
+    /// Segments a copy, export or reindex copies or rebuilds between two of its progress
+    /// checkpoints (M200), at least 1; 64 by default.
+    #[must_use]
+    pub fn with_copy_checkpoint(mut self, segments: usize) -> Self {
+        self.copy_checkpoint = segments.max(1);
+        self
+    }
+
+    /// Runs `hook` at each checkpoint point of a copy's sync (M200): before its first write,
+    /// and after it with what it wrote. A test's way to land a write in a checkpoint's window
+    /// and to watch what each one wrote.
+    #[doc(hidden)]
+    pub fn set_checkpoint_hook_for_test(&self, hook: Option<replica::CheckpointHook>) {
+        *self
+            .checkpoint_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     /// Folds without each row's sparse pairs when `write` is false, as a build before M193
@@ -3562,6 +3590,21 @@ impl<S: BlobStore> Engine<S> {
     async fn commit_head(&self, at: &head::HeadAt, next: &Head) -> Result<Epoch, EngineError> {
         let next = initialised(next, self.keys_on().then_some(at.head.epoch.0));
         head::commit(&*self.store, self.tenant, at, &next).await
+    }
+
+    /// [`Self::commit_head`], answering the HEAD it wrote with the write's tag (M200), so the
+    /// next commit can be planned on it without a read.
+    async fn commit_head_at(
+        &self,
+        at: &head::HeadAt,
+        next: &Head,
+    ) -> Result<head::HeadAt, EngineError> {
+        let next = initialised(next, self.keys_on().then_some(at.head.epoch.0));
+        let tag = head::commit_at(&*self.store, self.tenant, at, &next).await?;
+        Ok(head::HeadAt {
+            head: next.into_owned(),
+            tag: Some(tag),
+        })
     }
 
     /// The last epoch this engine committed.

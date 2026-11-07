@@ -3436,3 +3436,325 @@ async fn an_as_of_never_outlives_its_copy() {
     assert_eq!(done.source_epoch, Some(epoch_of(&s.src).await));
     assert_eq!(answers(&s.dst, "dst").await, answers(&s.src, "src").await);
 }
+
+// M200: a running copy's progress, checkpointed into HEAD between batches of segments.
+
+fn checkpoint_hook<F, Fut>(f: F) -> pstore_engine::CheckpointHook
+where
+    F: Fn(pstore_engine::Checkpoint) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    pstore_engine::CheckpointHook(Arc::new(move |c| Box::pin(f(c))))
+}
+
+/// A cross-tenant source of 10 folded segments, its dest checkpointing every `every`.
+async fn ten_segments(every: usize) -> Setup {
+    let mut s = setup(Kind::CrossTenant);
+    s.dst = s.dst.with_copy_checkpoint(every);
+    for i in 0..10 {
+        write(&s.src, "src", i * 3..i * 3 + 3).await;
+    }
+    assert_eq!(
+        s.src.head_for_test().await.indexes["src"].len(),
+        10,
+        "the fixture's segments"
+    );
+    s
+}
+
+type Seen = Arc<Mutex<Vec<(pstore_engine::CopyProgress, pstore_engine::CopyStatus)>>>;
+
+/// Records each checkpoint that wrote, with the copy's status read right after it by
+/// another engine.
+fn watching(s: &Setup) -> Seen {
+    let seen: Seen = Arc::default();
+    let watcher = Arc::new(s.here.engine(DST, 3));
+    let out = Arc::clone(&seen);
+    s.dst
+        .set_checkpoint_hook_for_test(Some(checkpoint_hook(move |c| {
+            let (watcher, out) = (Arc::clone(&watcher), Arc::clone(&out));
+            async move {
+                if let pstore_engine::Checkpoint::After { wrote: Some(p), .. } = c {
+                    let status = watcher.copy_status("dst").await.unwrap().unwrap();
+                    out.lock().unwrap().push((p, status));
+                }
+            }
+        })));
+    seen
+}
+
+fn counts(seen: &Seen) -> Vec<(u32, u32)> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| (p.segments_done, p.segments_total))
+        .collect()
+}
+
+/// What every checkpoint seen says beside its counts: its run, a status that reports it,
+/// and more bytes each time.
+fn consistent(seen: &Seen, run: u64) {
+    let seen = seen.lock().unwrap();
+    let mut bytes = 0;
+    for (p, status) in seen.iter() {
+        assert_eq!(p.run, run, "a checkpoint names its copy's run");
+        assert_eq!(status.state, CopyState::Running);
+        assert_eq!(
+            status.progress,
+            Some(*p),
+            "the status reports what was written"
+        );
+        let created = status
+            .created_ms
+            .expect("a copy made since M194 records its time");
+        assert!(
+            p.updated_ms >= created,
+            "a checkpoint's time is its own, after the create"
+        );
+        assert!(
+            p.bytes_done > bytes,
+            "bytes grow: {} after {bytes}",
+            p.bytes_done
+        );
+        bytes = p.bytes_done;
+    }
+}
+
+/// M200 criteria 1 and 6: 10 segments, a checkpoint every 3: `(3, 10)`, `(6, 10)` and
+/// `(9, 10)` in order, then the outcome with no progress, and exactly 2 requests a checkpoint.
+#[tokio::test]
+async fn a_copy_reports_its_progress_at_each_checkpoint() {
+    let s = ten_segments(3).await;
+    let seen = watching(&s);
+    let (started, _) = s.copy().await;
+    s.sync(&mut SyncState::default()).await;
+    assert_eq!(counts(&seen), vec![(3, 10), (6, 10), (9, 10)]);
+    consistent(&seen, started.run);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(done.state, CopyState::Succeeded);
+    assert_eq!(done.progress, None, "an outcome reports no progress");
+    assert!(s.dst.head_for_test().await.copy_progress.is_empty());
+    s.same("a checkpointed copy").await;
+
+    // The cost: a copy that fits one batch against one that checkpoints 3 times.
+    let mut cost = Vec::new();
+    for every in [64, 3] {
+        let s = ten_segments(every).await;
+        s.copy().await;
+        let before = s.here.reads(DST) + s.here.writes(DST);
+        s.sync(&mut SyncState::default()).await;
+        cost.push(s.here.reads(DST) + s.here.writes(DST) - before);
+    }
+    assert_eq!(
+        cost[1],
+        cost[0] + 6,
+        "3 checkpoints, a GET and a PUT each: {cost:?}"
+    );
+}
+
+/// M200 criterion 2: a reindex counts the segments it rebuilt.
+#[tokio::test]
+async fn a_reindex_reports_segments_rebuilt() {
+    let s = ten_segments(3).await;
+    let seen = watching(&s);
+    let (started, _) = s.reindex(stemmed()).await;
+    s.sync(&mut SyncState::default()).await;
+    assert_eq!(counts(&seen), vec![(3, 10), (6, 10), (9, 10)]);
+    consistent(&seen, started.run);
+    let done = s.dst.copy_status("dst").await.unwrap().unwrap();
+    assert_eq!(done.state, CopyState::Succeeded);
+    assert_eq!(done.progress, None);
+}
+
+/// M200 criterion 3: a write of the tenant's before each checkpoint, and each checkpoint's
+/// first try lost (as to a writer that landed between its read and its write), cost it a
+/// retry, never the copy; 3 lost writes in a row skip exactly that checkpoint.
+#[tokio::test]
+async fn a_lost_checkpoint_never_fails_a_copy() {
+    let s = ten_segments(3).await;
+    let seen = watching(&s);
+    let other = Arc::new(s.here.engine(DST, 2));
+    let watch = Arc::clone(&seen);
+    let rows = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let watcher = Arc::new(s.here.engine(DST, 3));
+    let lose = s.here.hooked.clone();
+    s.dst
+        .set_checkpoint_hook_for_test(Some(checkpoint_hook(move |c| {
+            let (other, watch, rows, watcher, lose) = (
+                Arc::clone(&other),
+                Arc::clone(&watch),
+                Arc::clone(&rows),
+                Arc::clone(&watcher),
+                lose.clone(),
+            );
+            async move {
+                match c {
+                    pstore_engine::Checkpoint::Before { .. } => {
+                        let at = rows.fetch_add(5, std::sync::atomic::Ordering::SeqCst);
+                        write(&other, "elsewhere", at..at + 5).await;
+                        lose.lose_next.store(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    pstore_engine::Checkpoint::After { wrote: Some(p), .. } => {
+                        let status = watcher.copy_status("dst").await.unwrap().unwrap();
+                        watch.lock().unwrap().push((p, status));
+                    }
+                    pstore_engine::Checkpoint::After { wrote: None, .. } => {}
+                }
+            }
+        })));
+    let (started, _) = s.copy().await;
+    s.sync(&mut SyncState::default()).await;
+    assert_eq!(
+        counts(&seen),
+        vec![(3, 10), (6, 10), (9, 10)],
+        "each one retried"
+    );
+    consistent(&seen, started.run);
+    assert_eq!(s.state().await, Some(CopyState::Succeeded));
+    s.same("a copy whose checkpoints lost").await;
+
+    // 3 lost writes in a row at the first checkpoint skip it, and only it.
+    let s = ten_segments(3).await;
+    let seen = watching(&s);
+    let watcher = Arc::new(s.here.engine(DST, 3));
+    let hooked = s.here.hooked.clone();
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let watch = Arc::clone(&seen);
+    s.dst
+        .set_checkpoint_hook_for_test(Some(checkpoint_hook(move |c| {
+            let (hooked, first, watch, watcher) = (
+                hooked.clone(),
+                Arc::clone(&first),
+                Arc::clone(&watch),
+                Arc::clone(&watcher),
+            );
+            async move {
+                match c {
+                    pstore_engine::Checkpoint::Before { .. } => {
+                        if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            hooked
+                                .lose_next
+                                .store(3, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    pstore_engine::Checkpoint::After { wrote: Some(p), .. } => {
+                        let status = watcher.copy_status("dst").await.unwrap().unwrap();
+                        watch.lock().unwrap().push((p, status));
+                    }
+                    pstore_engine::Checkpoint::After { wrote: None, .. } => {}
+                }
+            }
+        })));
+    s.copy().await;
+    s.sync(&mut SyncState::default()).await;
+    assert_eq!(
+        counts(&seen),
+        vec![(6, 10), (9, 10)],
+        "exactly the first skipped"
+    );
+    assert_eq!(s.state().await, Some(CopyState::Succeeded));
+    s.same("a copy with a skipped checkpoint").await;
+}
+
+/// A checkpoint point: what it wrote, and HEAD's epoch right after it.
+type Point = (Option<pstore_engine::CopyProgress>, Epoch);
+
+/// M200 criterion 4: a cancel, or a pause, before the second checkpoint: it writes nothing
+/// (HEAD's epoch is the cancel's or the pause's own), a cancelled copy reports no progress,
+/// and a paused one the progress written before the pause.
+#[tokio::test]
+async fn a_cancel_ends_a_copys_progress() {
+    // 0 cancels, 1 pauses, 2 pauses and resumes: a new run, running again.
+    for stop in 0..3 {
+        let s = ten_segments(3).await;
+        let ctl = Arc::new(s.here.engine(DST, 2));
+        let watcher = Arc::new(s.here.engine(DST, 3));
+        let points = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stopped: Arc<Mutex<Option<Epoch>>> = Arc::default();
+        let after: Arc<Mutex<Vec<Point>>> = Arc::default();
+        let (c2, w2, p2, s2, a2) = (
+            Arc::clone(&ctl),
+            Arc::clone(&watcher),
+            Arc::clone(&points),
+            Arc::clone(&stopped),
+            Arc::clone(&after),
+        );
+        s.dst
+            .set_checkpoint_hook_for_test(Some(checkpoint_hook(move |c| {
+                let (ctl, watcher, points, stopped, after) = (
+                    Arc::clone(&c2),
+                    Arc::clone(&w2),
+                    Arc::clone(&p2),
+                    Arc::clone(&s2),
+                    Arc::clone(&a2),
+                );
+                async move {
+                    match c {
+                        pstore_engine::Checkpoint::Before { .. } => {
+                            if points.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                                let e = match stop {
+                                    0 => ctl.cancel_replication("dst").await.unwrap(),
+                                    1 => ctl.pause_replication("dst").await.unwrap(),
+                                    _ => {
+                                        ctl.pause_replication("dst").await.unwrap();
+                                        ctl.resume_replication("dst").await.unwrap()
+                                    }
+                                };
+                                *stopped.lock().unwrap() = Some(e);
+                            }
+                        }
+                        pstore_engine::Checkpoint::After { wrote, .. } => {
+                            let epoch = watcher.head_for_test().await.epoch;
+                            after.lock().unwrap().push((wrote, epoch));
+                        }
+                    }
+                }
+            })));
+        s.copy().await;
+        s.sync(&mut SyncState::default()).await;
+        let after = after.lock().unwrap().clone();
+        let stopped = stopped
+            .lock()
+            .unwrap()
+            .expect("stopped at the second checkpoint");
+        // The batches still run to the publish's plan check; no checkpoint after the stop
+        // writes.
+        assert_eq!(
+            after.len(),
+            3,
+            "a point after each batch but the last: {after:?}"
+        );
+        let first = after[0].0.expect("the first checkpoint wrote");
+        assert_eq!((first.segments_done, first.segments_total), (3, 10));
+        for later in &after[1..] {
+            assert_eq!(
+                *later,
+                (None, stopped),
+                "nothing written for a stopped copy"
+            );
+        }
+        let status = s.dst.copy_status("dst").await.unwrap().unwrap();
+        match stop {
+            0 => {
+                assert_eq!(status.state, CopyState::Cancelled);
+                assert_eq!(status.progress, None);
+            }
+            1 => {
+                assert_eq!(status.state, CopyState::Paused);
+                assert_eq!(
+                    status.progress,
+                    Some(first),
+                    "a pause keeps the last checkpoint"
+                );
+            }
+            _ => {
+                assert_eq!(status.state, CopyState::Running);
+                assert_ne!(status.run, first.run, "a resume is a new run");
+                assert_eq!(
+                    status.progress, None,
+                    "the old run's progress is not the new one's"
+                );
+            }
+        }
+    }
+}

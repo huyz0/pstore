@@ -1171,6 +1171,14 @@ fn describe_copy(dest: &str, s: &CopyStatus, last_error: Option<String>) -> Valu
         "ended_at": s.ended_ms.map(crate::rfc3339_ms),
         // M196: the past source epoch it copies, or `null` for the present.
         "as_of": s.as_of,
+        // M200: how far its sync has got, at its last checkpoint; `null` before one and after.
+        "progress": s.progress.map(|p| json!({
+            "segments_done": p.segments_done,
+            "segments_total": p.segments_total,
+            "bytes_done": p.bytes_done,
+            "attempt": p.attempt,
+            "updated_at": crate::rfc3339_ms(p.updated_ms),
+        })),
     })
 }
 
@@ -1399,10 +1407,49 @@ mod tests {
             created_ms: None,
             ended_ms: None,
             as_of: Some(1),
+            progress: None,
         };
         let v = describe_copy("dst", &s, None);
         assert_eq!(v.get("code"), Some(&serde_json::json!("epoch_unavailable")));
         assert_eq!(v.get("as_of"), Some(&serde_json::json!(1)));
+        assert_eq!(v.get("progress"), Some(&serde_json::Value::Null));
+    }
+
+    /// M200: a running copy's progress, each field by its name, its time as the others'.
+    #[test]
+    fn progress_is_described() {
+        let s = CopyStatus {
+            state: CopyState::Running,
+            run: 9,
+            source: ReplicaSource::local(TenantId(1), "src"),
+            epoch: None,
+            source_epoch: None,
+            failure: None,
+            read_only: false,
+            reindex: None,
+            created_ms: None,
+            ended_ms: None,
+            as_of: None,
+            progress: Some(pstore_engine::CopyProgress {
+                run: 9,
+                attempt: 41,
+                segments_done: 3,
+                segments_total: 10,
+                bytes_done: 300,
+                updated_ms: 1_700_000_000_000,
+            }),
+        };
+        let v = describe_copy("dst", &s, None);
+        assert_eq!(
+            v.get("progress"),
+            Some(&serde_json::json!({
+                "segments_done": 3,
+                "segments_total": 10,
+                "bytes_done": 300,
+                "attempt": 41,
+                "updated_at": crate::rfc3339_ms(1_700_000_000_000),
+            }))
+        );
     }
 
     use super::{
