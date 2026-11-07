@@ -441,6 +441,30 @@ defaults to the caller's and `store` to this server's own bucket. `GET` reads it
 A source is any S3-compatible bucket: GCS works through its S3 interoperability endpoint with
 HMAC keys. It is only ever read.
 
+## Recovery objectives
+
+What each loss keeps, what it can lose, and what recovery takes ([M202](milestones/M202/SPEC.md)).
+The counts are enforced by tests. The durations depend on this deployment's settings and
+backend, so they are stated as formulas, not promised.
+
+| Loss | RPO (what can be lost) | RTO (what recovery takes) |
+|---|---|---|
+| A node | Nothing acknowledged `durable` or `applied`. For `batched` writes, that process's unflushed rows: usually up to `tenant_flush_bytes` (8 MiB a tenant by default), a soft bound that writes racing a flush can pass, and never more than `tenant_buffered_bytes` (64 MiB) | The next request, on any node. A durable write the lost node had not folded appears at the next fold, which any node runs |
+| The bucket, with a replica in another bucket | The source writes the replica's last sync did not reach: up to about `PSTORE_FOLD_AGE_S` + `PSTORE_REPLICATION_IDLE_S` (3,660 s at the defaults) | The replica keeps answering reads. Cancel its replication (one HEAD read and one conditional write when uncontended) and it takes writes; then point clients at its bucket |
+| The bucket, with an export | Everything after the export's epoch | A copy of the export into a writable index, in requests that scale with its bytes ([M167](milestones/M167/SPEC.md)) |
+| The bucket, with neither | Everything | None |
+
+- ⚠️ **A replica in the same bucket is not a recovery point for losing that bucket**, and
+  M192's lag bound applies only to such a replica. A replica follows its source's deletions,
+  so it is no recovery point from a bad delete either: an export is.
+- A replica's RPO assumes its replication worker is alive. If the server holding the job is
+  lost too, another server takes it over within `TTL + SHARDS × SCAN` (about 13 minutes at the
+  defaults, see Replication), and the replica's RPO grows by that much meanwhile.
+- A replica's RPO assumes the source tenant keeps folding until the loss. Writes the source's
+  nodes acknowledged durable but never folded stay in the lost bucket.
+- Lower `PSTORE_FOLD_AGE_S` on a source to shorten a remote replica's RPO; each fold is a HEAD
+  commit, priced by D-39.
+
 ## An index over a customer's own file
 
 A tenant can index a column of a Parquet file or Lance dataset it already keeps in a bucket,
