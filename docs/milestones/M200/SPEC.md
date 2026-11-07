@@ -20,25 +20,40 @@ copy, so one status field answers both rows' progress. Other operation kinds sta
   batch is a segment copied (`mirror`) or a segment rebuilt (`rebuild`). `checkpoint` is an
   engine setting, default 64, set by `Engine::with_copy_checkpoint(n)`. The last batch is not
   checkpointed: the publish follows it.
-  - A checkpoint is one HEAD read and one conditional write. It is written only while HEAD's
-    record still has the run the sync planned. It leaves every other field of HEAD as read.
+  - A checkpoint is one HEAD read and one conditional write, through the engine's commit
+    (`commit_head`: a new epoch and nonce, `keys_since` initialised, every other field as read).
+    A new `head::commit_at` beside `head::commit` returns the HEAD it wrote with the write's tag
+    (`PutOutcome.tag`), so the publish can be planned on it without a read. It is written
+    only while HEAD's record is `running` with the run the sync planned.
+  - Batches are awaited, and the checkpoint is committed between two of them, so the copy
+    waits for it: one GET and one PUT, up to 3 of each.
   - It is best-effort. A conditional write that loses is retried after a fresh read, at most 3
     times in all, and then that checkpoint is skipped. A skipped or failed checkpoint never
-    fails, delays or changes the copy. The next checkpoint, or the publish, supersedes it.
+    fails or changes the copy. The next checkpoint, or the publish, supersedes it.
+  - **The publish is planned on the HEAD the last checkpoint committed**, so a checkpoint costs
+    the publish no lost write: when any checkpoint landed during an attempt, the sync starts
+    its next attempt from that HEAD (its mapping is kept, so nothing is copied again).
+  - Each copy commits its own checkpoints: a sync mirrors its copies one after another, and a
+    checkpoint names one copy.
+  - Delete vectors are copied in a final round after the last batch, and are not counted.
 - **Progress counts one sync's attempt.** `segments_total` is the segments the attempt must
   copy or rebuild, `segments_done` the ones it has. `bytes_done` is the segment bytes they hold
   (a rebuild counts the bytes it wrote). When a remap finds the source changed, the new
   segments are added to `segments_total`. A sync that starts again (another node, or after a
   crash) starts again from 0, because the earlier attempt's objects are not reused (they carry
-  its epoch). The status says which attempt by its `updated_at`.
+  its epoch). The entry names its attempt by that copy epoch (`attempt`), so a client can tell
+  a restart from a count going backwards.
 - **HEAD** gains one trailing section after M198's: `copy_progress: BTreeMap<String,
-  Progress>`, where `Progress { run: u64, segments_done: u32, segments_total: u32, bytes_done:
-  u64, updated_ms: u64 }`. Varints throughout. It is kept only for a name `once` holds whose run
-  matches, so a cancel, a drop or an outcome ends it. The publish, the failure and the cancel
+  Progress>`, where `Progress { run: u64, attempt: u64, segments_done: u32, segments_total: u32,
+  bytes_done: u64, updated_ms: u64 }`. A u32 little-endian count, as every section starts,
+  then per entry the name and the fields as varints. It is kept only for a name `once` holds
+  whose replication's run matches, so a cancel, a drop, a resume (a new run) or an outcome ends
+  it. A pause keeps it: a paused copy reports the progress its last checkpoint wrote. The publish, the failure and the cancel
   each remove it in their own commit. It forces the earlier counts, as every section does.
   Malformed input (a duplicate name, `segments_done > segments_total`, a cut) is `CorruptHead`.
 - **Status.** `CopyStatus` gains `progress: Option<Progress>`. The route's running copy answers
-  `"progress": {"segments_done", "segments_total", "bytes_done", "updated_at"}`, or `null`
+  `"progress": {"segments_done", "segments_total", "bytes_done", "attempt", "updated_at"}`, and so
+  does a paused one, or `null`
   before the first checkpoint (and for a copy of `checkpoint` segments or fewer, which goes
   straight to its outcome). An outcome answers `null`.
 - **Replications** (not `once`) are not checkpointed. They keep running, and their own status
@@ -57,23 +72,26 @@ copy, so one status field answers both rows' progress. Other operation kinds sta
    read back holds no `copy_progress` entry.
 2. **A reindex reports the same** (engine): AC 1 for a reindex with stemming. The counts are
    segments rebuilt.
-3. **Best-effort** (engine): a write to another index lands before every checkpoint's
-   conditional write (the hook writes and flushes and folds). The copy still succeeds, with the
-   rows a copy without the writes holds, and every checkpoint it reports is in order. A store
-   that refuses every conditional write of HEAD for a while (3 in a row) skips that checkpoint
-   and the copy still publishes.
-4. **Ends** (engine): a cancel between two checkpoints removes the entry in the cancel's commit,
-   and the sync's next checkpoint writes nothing (its run is gone). A copy that ends
-   `epoch_unavailable` removes it in that commit.
+3. **Best-effort** (engine): a write to another index lands before the first try of every
+   checkpoint, and none of its retries. The copy still succeeds, with the rows a copy without
+   the writes holds, and the hook sees all of `(3, 10)`, `(6, 10)` and `(9, 10)`. A store that
+   refuses 3 conditional writes of HEAD in a row at the first checkpoint skips exactly that
+   one: the hook sees `(6, 10)` and `(9, 10)` only, and the copy publishes.
+4. **Ends** (engine): a cancel lands between two checkpoints. HEAD's epoch after the sync's
+   next checkpoint point is the cancel's own (nothing was written for a run that is gone), and
+   the status is `cancelled` with no progress. A pause there likewise writes no checkpoint (HEAD's
+   epoch at that point is the pause's own), and the paused status reports the progress written
+   before it. The test hook fires at every checkpoint point with `Option<Progress>`, what it
+   wrote or `None`; AC 1 and AC 3 assert on the `Some`s. A copy that ends
+   `epoch_unavailable` reports no progress.
 5. **HEAD** (unit): the section round-trips alone and after every other section. A HEAD without
    it encodes byte for byte as before. A name `once` lacks, or a run that differs, is not
    encoded. Each malformed input above is refused. No cut decodes the section.
 6. **Cost:** a copy of `checkpoint` segments or fewer issues the requests it issues today (the
    existing replication cost tests stay green unchanged). A copy of `n` segments that writes
-   `k = ceil(n / checkpoint) - 1 > 0` checkpoints, none lost, adds exactly `2k + 2` requests:
-   each checkpoint's GET and conditional PUT, and one lost publish (the sync's publish was
-   planned on the HEAD before its checkpoints, so its first conditional PUT loses and it reads
-   HEAD again, as for any write that lands during a sync). The engine test counts them.
+   `k = ceil(n / checkpoint) - 1 > 0` checkpoints, none lost, adds exactly `2k` requests, each
+   checkpoint's GET and conditional PUT: the publish is planned on the last one's HEAD, so it
+   loses nothing. The engine test counts them, for a present-epoch copy from the same store.
 7. **Server:** `GET /v1/indexes/{dest}/copy` answers `"progress": null` for a running copy
    before its first sync, and `null` for a succeeded one. The engine field is mapped to the
    route by a unit test of `describe_copy`.
@@ -82,18 +100,19 @@ copy, so one status field answers both rows' progress. Other operation kinds sta
 ## Test plan
 | AC | Test | Mutation it catches |
 |---|---|---|
-| 1 | engine `a_copy_reports_its_progress_at_each_checkpoint` | no checkpoint; the last batch checkpointed; counts off by one; bytes not added; the entry kept after the publish |
+| 1 | engine `a_copy_reports_its_progress_at_each_checkpoint` | no checkpoint; the last batch checkpointed; counts off by one; bytes not added; the publish planned on the stale HEAD (AC 6's count) |
 | 2 | engine `a_reindex_reports_segments_rebuilt` | `rebuild` not checkpointed |
-| 3 | engine `a_lost_checkpoint_never_fails_a_copy` | a lost checkpoint failing the sync; no retry |
-| 4 | engine `a_cancel_ends_a_copys_progress` | the run not checked; the cancel not removing it |
+| 3 | engine `a_lost_checkpoint_never_fails_a_copy` | a lost checkpoint failing the sync; no retry; more than 3 tries |
+| 4 | engine `a_cancel_ends_a_copys_progress` | the run not checked; `running` not checked |
 | 5 | `head.rs` unit `copy_progress_round_trips_after_ann` | section written when empty; filter dropped; counts not forced; a malformed entry accepted |
 | 6 | in AC 1's test, the request count | a checkpoint written for a copy that fits one batch |
 | 7 | server `a_running_copy_reports_progress` and unit `progress_is_described` | field not mapped |
 
 ## RA budget
-A checkpoint is 1 HEAD GET and 1 conditional PUT, at most 3 of each when it loses, once per
-`checkpoint` segments copied, and a copy that writes any adds one lost publish (a GET and a
-conditional PUT): requests scale with the segments a copy moves, so with its bytes,
+A checkpoint is 1 HEAD GET and 1 conditional PUT of the whole HEAD, at most 3 of each when it
+loses, once per `checkpoint` segments copied. A copy `as_of` a past epoch also re-reads its
+source HEAD on each further attempt (to check the epoch still answers), so a checkpoint that
+starts a new attempt adds that GET: requests scale with the segments a copy moves, so with its bytes,
 never with records, indexes or time. Nothing is added to a write, a query, a fold, or a copy of
 `checkpoint` segments or fewer. Each running copy adds about 12 bytes plus its name to HEAD
 until it ends.
@@ -105,6 +124,16 @@ until it ends.
   outcome. `updated_at` shows how old it is.
 - `segments_total` can grow while a remap runs, so a client must not read `done / total` as
   monotone across a remap.
+
+## Review
+Round 1 (a subagent given the spec and the code, read-only): three majors, all taken. AC 3 now
+lands its write before the first try only and names the checkpoints it must see; a checkpoint
+requires `running`, and a paused copy keeps its progress; the publish is planned on the last
+checkpoint's HEAD, so AC 6 is `2k`, and the copy is said to wait for its checkpoints. Minors
+taken: the commit path, the attempt epoch, the `as_of` GET, AC 4 asserting HEAD's epoch rather
+than the entry (the filter hides it), delete vectors uncounted, the count's format, one copy a
+checkpoint. Round 2: PASS. Minors taken: `head::commit_at` returning the written HEAD and
+tag, the hook's `Option<Progress>` at every checkpoint point, and the pause's epoch named.
 
 ## Out of scope
 Progress for a replication, for a fold or a compaction, and an ETA. Reusing an earlier
