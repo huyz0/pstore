@@ -84,7 +84,12 @@ accepted, and the server field unmapped.
    times).
 8. PASS for `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the suite and
    `scripts/coverage.sh --fail-under-lines 95 --fail-under-regions 95`, run here (see above).
-   `scripts/mutants.sh` is pending CI's shards.
+   `scripts/mutants.sh` on CI's 6 shards first missed two mutants: `>` to `>=` in the
+   progress decoder (a done equal to its total was never round-tripped) and the update time deleted
+   from the checkpoint's entry (its time was never asserted). The HEAD unit test now
+   round-trips a done equal to its total, and AC 1's `consistent` asserts each checkpoint's
+   time is at or after the copy's creation. Each mutation was applied here and turned its test
+   red, and each clean tree passes. The re-run is CI's, on the PR.
 
 Code review (packet `.harness/review/m200.r1.packet`) passed with no blocker or major. Minors:
 - Taken: AC 3's first case wrote before the checkpoint's read, so no try lost. Each first try
