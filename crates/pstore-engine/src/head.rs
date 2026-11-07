@@ -3471,6 +3471,16 @@ mod tests {
             let ongoing_plain = ongoing.clone();
             ongoing.copy_progress.insert("running".to_owned(), p);
             assert_eq!(hex(&ongoing.encode()), hex(&ongoing_plain.encode()));
+            // Every segment done is a count, not a refusal (the edge of the next one).
+            let mut whole = with.clone();
+            whole.copy_progress.insert(
+                "running".to_owned(),
+                CopyProgress {
+                    segments_done: 10,
+                    ..p
+                },
+            );
+            assert_eq!(Head::decode(&whole.encode())?, whole);
             // Malformed: more done than total, a duplicate name, a trailing byte.
             let mut over = with.clone();
             over.copy_progress.insert(
