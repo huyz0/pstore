@@ -1,5 +1,21 @@
 # Native API migration notes
 
+## M201: GC announces its horizon before it deletes
+
+A copy or export `as_of` a past epoch either holds that epoch whole or ends `failed` with
+`"code": "epoch_unavailable"`. It never publishes an epoch GC was part way through deleting.
+
+- GC now commits how far it reaps to HEAD before it deletes anything. In a second commit it
+  removes from the graveyard what it deleted, or declined to delete because it is still in
+  use. A copy that checks HEAD after its reads either sees GC's horizon past its epoch, or
+  read everything before GC's first delete.
+- GC does not wait for a copy. When GC passes the epoch, ask again at a newer one.
+- Cost: one more conditional write of HEAD for each GC pass that reaps something. A pass with
+  nothing to reap is unchanged.
+- HEAD's format is unchanged. A node before M201 still deletes before it commits, so the
+  guarantee holds once every node that runs GC is on M201. Evidence is in
+  [M201 verification](milestones/M201/VERIFIED.md).
+
 ## M200: a running copy, export or reindex reports its progress
 
 `GET /v1/indexes/{dest}/copy` answers `progress` for a running or paused copy, export or

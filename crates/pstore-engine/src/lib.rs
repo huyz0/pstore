@@ -516,12 +516,75 @@ impl From<pstore_format::FormatError> for EngineError {
     }
 }
 
+/// What a GC pass reaps (M201): every graveyard pair at or below `floor`, and the objects
+/// among them that are safe to delete.
+struct ReapPlan {
+    /// Every `(epoch, key)` at or below `floor`: what the prune removes.
+    pairs: Vec<(u64, String)>,
+    /// The objects to delete, sidecars not yet added.
+    doomed: Vec<Key>,
+}
+
+/// Plans a GC pass over `head` through `floor`: the larger of its horizon and `reaped_before`,
+/// so entries an earlier pass announced and never pruned are reaped too.
+fn reap_plan(h: &Head, floor: u64) -> ReapPlan {
+    let due: Vec<u64> = h.graveyard.range(..=floor).map(|(e, _)| *e).collect();
+    let pairs = due
+        .iter()
+        .filter_map(|e| h.graveyard.get(e).map(|keys| (*e, keys)))
+        .flat_map(|(e, keys)| keys.iter().map(move |k| (e, k.clone())))
+        .collect();
+    let live: std::collections::BTreeSet<&str> = h
+        .indexes
+        .values()
+        .flatten()
+        .map(|r| r.key.as_str())
+        // And every delete vector HEAD names (M9c.2).
+        .chain(h.deletes.values().map(|(k, _)| k.as_str()))
+        // And every quarantine (M25): acknowledged rows, kept until discarded.
+        .chain(h.quarantine.values().flatten().map(|(k, _)| k.as_str()))
+        // And every listed outcome object (M129).
+        .chain(h.outcomes.iter().map(|(_, k)| k.as_str()))
+        .collect();
+    // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
+    // it is a burial of the segment.
+    let object = |k: &String| -> String {
+        match head::unscoped(k) {
+            Some((segment, _)) => segment.to_owned(),
+            _ => k.clone(),
+        }
+    };
+    // ⚠️ **A key buried again inside the window waits for that burial** (M16, spec
+    // review B1): a segment shared by a branch is buried once by each index that lets
+    // it go, and reaping it at the first would take it from a reader of the second's
+    // past.
+    let later: std::collections::BTreeSet<String> = h
+        .graveyard
+        .range(floor.saturating_add(1)..)
+        .flat_map(|(_, keys)| keys.iter().map(object))
+        .collect();
+    let doomed: Vec<Key> = due
+        .iter()
+        .filter_map(|e| h.graveyard.get(e))
+        .flatten()
+        .map(object)
+        // ⚠️ Checked against what HEAD names *now*, not against what it named when
+        // the key was buried. Cheap, and the one thing standing between a bug
+        // anywhere in the commit path and deleting live data.
+        .filter(|k| !live.contains(k.as_str()) && !later.contains(k))
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .map(Key::new)
+        .collect();
+    ReapPlan { pairs, doomed }
+}
+
 /// Refuses a backend whose recorded profile says it cannot fence.
 ///
 /// ⚠️ **Called at the doors *and* at the CAS**, which is the same pair `write` already forms
 /// with `check_storable` at the door and `try_finish` at the far end. The door call is what
-/// makes the refusal cost zero requests — `gc` in particular `delete_batch`es before it
-/// commits, so a guard only at the CAS would let it destroy objects and then refuse. The CAS
+/// makes the refusal cost zero requests — `gc` in particular `delete_batch`es before its
+/// prune commits, so a guard only at the CAS would let it destroy objects and then refuse. The CAS
 /// call is what stops a path added later from committing around the doors.
 ///
 /// The corpus says "fail loudly at startup". There is no startup object here — `Engine::new`
@@ -6775,126 +6838,118 @@ impl<S: BlobStore> Engine<S> {
 
     /// `gc`'s body, with the horizon a function of each attempt's HEAD epoch (M18), so neither
     /// form reads HEAD twice.
+    ///
+    /// ⚠️ **Announce, delete, prune** (M201). A pass first commits `record_reap(horizon)` and
+    /// keeps the graveyard, and only then deletes. Every delete therefore follows a HEAD in
+    /// which the epochs it affects are below `reaped_before`, so a reader that checks HEAD
+    /// after its GETs (an `as_of` copy, M196) either sees the announcement or read everything
+    /// before the first delete. Deleting first left a window in which a copy could read a
+    /// segment whose sidecars were gone, take them as never written, and publish.
     async fn gc_inner(&self, horizon_of: impl Fn(u64) -> u64) -> Result<usize, EngineError> {
         require_fencing(&*self.store)?;
+        let (mut at, plan) = 'announce: {
+            for attempt in 0..MAX_COMMIT_ATTEMPTS {
+                let at = head::read(&*self.store, self.tenant).await?;
+                // Everything dereferenced at an epoch this old is beyond the reach of any
+                // reader the window promises to protect.
+                let horizon = horizon_of(at.head.epoch.0).min(at.head.epoch.0);
+                let plan = reap_plan(&at.head, horizon.max(at.head.reaped_before));
+                if plan.pairs.is_empty() {
+                    return Ok(0);
+                }
+                // Already announced (a pass that died before its prune, or a wider retention):
+                // nothing new to say, so straight to the deletes.
+                if horizon <= at.head.reaped_before {
+                    break 'announce (at, plan);
+                }
+                let mut next = at.head.clone();
+                next.epoch = next.epoch.next();
+                next.nonce = nonce_for(next.epoch, self.lane);
+                next.record_reap(horizon);
+                match self.commit_head_at(&at, &next).await {
+                    Ok(written) => {
+                        self.record_commit(written.head.epoch);
+                        break 'announce (written, plan);
+                    }
+                    // Nothing is deleted yet, so a lost announcement re-plans from scratch.
+                    Err(EngineError::Lost | EngineError::Contended)
+                        if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                    {
+                        backoff(self.lane, attempt).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(EngineError::Lost);
+        };
+        let doomed = plan.doomed;
+
+        // ⚠️ And the sidecars beside each SEGMENT. The graveyard records segments and
+        // bundles alike; a sidecar is reachable only by derivation from a segment, so one
+        // reaped without its dictionaries leaves objects nothing can ever name again. The
+        // deletes are unconditional for a segment because the alternative is a HEAD
+        // request per key to find out — but a bundle never has one, and deriving them for
+        // every key would triple the batch and inflate the reaped count with objects that
+        // never existed.
+        let mut batch = doomed.clone();
+        for k in &doomed {
+            if k.as_str().ends_with(".seg") {
+                batch.push(pstore_format::sparse::dict_key(k));
+                batch.push(pstore_format::text::dict_key(k));
+                // And the centroid table (code review, M19): every segment above the
+                // exact-scan threshold has one, and GC reaped none of them.
+                batch.push(pstore_index::vec_index::centroid_key(k));
+                // M71.2: the multi-vector encoding's clusters.
+                batch.push(pstore_index::fde_clusters::key(k));
+                batch.push(pstore_index::fde_clusters::vectors_key(k));
+            }
+        }
+
+        // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
+        // Pruning first and then failing to delete loses the only record that these
+        // objects exist, and they leak with nothing left to find them by. Deleting
+        // first and then failing to prune costs a repeated delete on the next pass,
+        // which is idempotent.
+        //
+        // ⚠️ **Chunked at the backend's cap, which is read and never assumed.**
+        // `BlobStore::delete_batch` is documented "capped at `max_batch_delete`" and both
+        // implementations enforce it, while this list is the graveyard's and has no bound
+        // at all — so a tenant with more dead objects than one batch holds could not be
+        // collected on any backend. S3 takes 1000 per request and Azure 256; a constant
+        // here would be wrong on one of them.
+        let cap = self.store.capabilities().max_batch_delete.max(1);
+        for chunk in batch.chunks(cap) {
+            self.store.delete_batch(chunk).await?;
+        }
+
+        // ⚠️ **The prune removes exactly the pairs this pass decided on**, never a range: a
+        // commit landing between the announcement and the prune can file a key under the epoch
+        // it was born at (`bury_into`, a lost branch's copies, a copy's unused keys), at or
+        // below `reaped_before`, and a prune by range would drop it undeleted.
         for attempt in 0..MAX_COMMIT_ATTEMPTS {
-            let at = head::read(&*self.store, self.tenant).await?;
-            // Everything dereferenced at an epoch this old is beyond the reach of any
-            // reader the window promises to protect.
-            let horizon = horizon_of(at.head.epoch.0).min(at.head.epoch.0);
-            let due: Vec<u64> = at
-                .head
-                .graveyard
-                .range(..=horizon)
-                .map(|(e, _)| *e)
-                .collect();
-            if due.is_empty() {
-                return Ok(0);
-            }
-            let live: std::collections::BTreeSet<&str> = at
-                .head
-                .indexes
-                .values()
-                .flatten()
-                .map(|r| r.key.as_str())
-                // And every delete vector HEAD names (M9c.2).
-                .chain(at.head.deletes.values().map(|(k, _)| k.as_str()))
-                // And every quarantine (M25): acknowledged rows, kept until discarded.
-                .chain(
-                    at.head
-                        .quarantine
-                        .values()
-                        .flatten()
-                        .map(|(k, _)| k.as_str()),
-                )
-                // And every listed outcome object (M129).
-                .chain(at.head.outcomes.iter().map(|(_, k)| k.as_str()))
-                .collect();
-            // M16: a marker -- a branch letting go of a borrowed segment -- names no object;
-            // it is a burial of the segment.
-            let object = |k: &String| -> String {
-                match head::unscoped(k) {
-                    Some((segment, _)) => segment.to_owned(),
-                    _ => k.clone(),
-                }
-            };
-            // ⚠️ **A key buried again inside the window waits for that burial** (M16, spec
-            // review B1): a segment shared by a branch is buried once by each index that lets
-            // it go, and reaping it at the first would take it from a reader of the second's
-            // past.
-            let later: std::collections::BTreeSet<String> = at
-                .head
-                .graveyard
-                .range(horizon.saturating_add(1)..)
-                .flat_map(|(_, keys)| keys.iter().map(object))
-                .collect();
-            let doomed: Vec<Key> = due
-                .iter()
-                .filter_map(|e| at.head.graveyard.get(e))
-                .flatten()
-                .map(object)
-                // ⚠️ Checked against what HEAD names *now*, not against what it named when
-                // the key was buried. Cheap, and the one thing standing between a bug
-                // anywhere in the commit path and deleting live data.
-                .filter(|k| !live.contains(k.as_str()) && !later.contains(k))
-                .collect::<std::collections::BTreeSet<String>>()
-                .into_iter()
-                .map(Key::new)
-                .collect();
-            // ⚠️ And the sidecars beside each SEGMENT. The graveyard records segments and
-            // bundles alike; a sidecar is reachable only by derivation from a segment, so one
-            // reaped without its dictionaries leaves objects nothing can ever name again. The
-            // deletes are unconditional for a segment because the alternative is a HEAD
-            // request per key to find out — but a bundle never has one, and deriving them for
-            // every key would triple the batch and inflate the reaped count with objects that
-            // never existed.
-            let mut batch = doomed.clone();
-            for k in &doomed {
-                if k.as_str().ends_with(".seg") {
-                    batch.push(pstore_format::sparse::dict_key(k));
-                    batch.push(pstore_format::text::dict_key(k));
-                    // And the centroid table (code review, M19): every segment above the
-                    // exact-scan threshold has one, and GC reaped none of them.
-                    batch.push(pstore_index::vec_index::centroid_key(k));
-                    // M71.2: the multi-vector encoding's clusters.
-                    batch.push(pstore_index::fde_clusters::key(k));
-                    batch.push(pstore_index::fde_clusters::vectors_key(k));
-                }
-            }
-
-            // ⚠️ Deleted BEFORE the manifest is pruned, and the order is not arbitrary.
-            // Pruning first and then failing to delete loses the only record that these
-            // objects exist, and they leak with nothing left to find them by. Deleting
-            // first and then failing to prune costs a repeated delete on the next pass,
-            // which is idempotent.
-            //
-            // ⚠️ **Chunked at the backend's cap, which is read and never assumed.**
-            // `BlobStore::delete_batch` is documented "capped at `max_batch_delete`" and both
-            // implementations enforce it, while this list is the graveyard's and has no bound
-            // at all — so a tenant with more dead objects than one batch holds could not be
-            // collected on any backend. S3 takes 1000 per request and Azure 256; a constant
-            // here would be wrong on one of them.
-            let cap = self.store.capabilities().max_batch_delete.max(1);
-            for chunk in batch.chunks(cap) {
-                self.store.delete_batch(chunk).await?;
-            }
-
             let mut next = at.head.clone();
             next.epoch = next.epoch.next();
             next.nonce = nonce_for(next.epoch, self.lane);
-            next.record_reap(horizon);
-            for e in &due {
-                next.graveyard.remove(e);
+            for (e, k) in &plan.pairs {
+                if let Some(keys) = next.graveyard.get_mut(e) {
+                    keys.retain(|x| x != k);
+                    if keys.is_empty() {
+                        next.graveyard.remove(e);
+                    }
+                }
             }
-            match self.commit_head(&at, &next).await {
-                Ok(epoch) => {
-                    self.record_commit(epoch);
+            match self.commit_head_at(&at, &next).await {
+                Ok(written) => {
+                    self.record_commit(written.head.epoch);
                     return Ok(doomed.len());
                 }
+                // A lost prune deletes nothing again: it removes the same pairs from a fresh
+                // HEAD.
                 Err(EngineError::Lost | EngineError::Contended)
                     if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
                 {
                     backoff(self.lane, attempt).await;
+                    at = head::read(&*self.store, self.tenant).await?;
                 }
                 Err(e) => return Err(e),
             }

@@ -1194,9 +1194,11 @@ impl<S: BlobStore> Engine<S> {
             if let Some(f) = interfere.take() {
                 f.await;
             }
-            // M196: GC deletes before it commits its horizon, so a copy of a past epoch checks
-            // it again before it publishes: in this attempt's own HEAD for a source in it, else
-            // in a fresh read of the source's. One that lapsed ends in the next attempt.
+            // M196: a copy of a past epoch checks GC's horizon again before it publishes: in
+            // this attempt's own HEAD for a source in it (the commit is conditional on that
+            // HEAD, so a later announcement makes it lose), else in a fresh read of the
+            // source's. GC announces its horizon before it deletes (M201), so a copy whose
+            // GETs met a delete sees it here. One that lapsed ends in the next attempt.
             let mut lapsed = false;
             for (d, _) in &included {
                 let (Some(epoch), Some(r)) = (st.as_of.get(d.as_str()), plan.get(d.as_str()))
