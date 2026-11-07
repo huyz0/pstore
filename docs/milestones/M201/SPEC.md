@@ -26,21 +26,35 @@ copied ... pending".
   commit wrote (`commit_head_at`, M200), so it reads no HEAD unless the commit loses.
   - A lost or contended announcement is retried from a fresh read, as today. Nothing has
     been deleted at that point.
-  - A lost prune is retried from a fresh read. It removes the graveyard entries at or below
-    that HEAD's `reaped_before`, and it deletes nothing again.
+  - **The prune removes exactly the (epoch, key) entries the pass decided on**: those it
+    deleted, and those it declined because HEAD still names them, as today's commit drops
+    them. A lost prune is retried from a fresh read and removes those same pairs where they
+    are still listed. It deletes nothing again. An entry another commit filed in the meantime
+    stays, even at an epoch at or below `reaped_before`: `bury_into`, a lost branch's copies
+    and a copy's unused keys all file a key under the epoch it was born at, which can be
+    that old, and a prune by range would drop them undeleted (spec review round 1).
   - Deletes stay before the prune, so a failed delete still loses no record. The comment in
     `gc_inner` explains why.
 - **The announced entries are reaped first.** A pass reaps the graveyard entries at or below
-  `max(horizon, reaped_before)`. Entries at or below `reaped_before` are already announced, so
-  deleting them is safe. A pass that died between its announcement and its prune (a crash, or
-  a failed delete) leaves them for the next pass, whatever retention that pass is given. When
-  every entry due is already announced, the pass skips the announcement and goes straight to
-  the deletes and the prune.
+  `floor = max(horizon, reaped_before)`, and its `later` set (a key buried again inside the
+  window waits for that burial, M16) starts above `floor`. Entries at or below
+  `reaped_before` are already announced, so deleting them is safe. A pass that died between
+  its announcement and its prune (a crash, or a failed delete) leaves them for the next pass,
+  whatever retention that pass is given.
+- **The announcement is skipped exactly when `horizon <= reaped_before`**: there is nothing
+  new to announce, and `record_reap` would not change `reaped_before`. Such a pass goes
+  straight to the deletes and the prune. Otherwise it announces, so `reaped_before` ends where
+  today's `record_reap(horizon)` leaves it.
+- Both commits call `record_commit` and neither calls `record_reapable`, as GC's commit does
+  today, so a reap never makes the next one due.
 - **What it closes.** Every GC delete now follows a HEAD in which the epochs it affects are
-  below `reaped_before`. A copy's re-read comes after its GETs, so either the re-read sees the
-  announcement and ends the copy `epoch_unavailable`, or every GET came before the first
-  delete. The same holds for a copy in another tenant or store, whose re-read reads the
-  source's HEAD (M196).
+  below `reaped_before`. For a source in another tenant or store, the copy's re-read is a
+  fresh read of the source's HEAD after its GETs (M196). For a same-tenant source the check
+  reads the attempt's base HEAD, which may be older than the GETs, but the copy's commit is
+  conditional on that same HEAD: an announcement after it makes the commit lose, and the
+  retry's check ends the copy. Either way the copy sees the announcement and ends
+  `epoch_unavailable`, or every GET came before the first delete. M196's comment in
+  `replica.rs` ("GC deletes before it commits") is updated.
 - **Not a hold.** GC does not wait for a copy. A copy whose epoch GC passes still ends
   `epoch_unavailable`, and the client asks again at a newer epoch. A query `as_of` an epoch
   GC is reaping is unchanged: retention is what protects it.
@@ -58,20 +72,27 @@ encoding (no new section), copies, queries.
    returns the count it returns today.
 2. **The window closes** (engine, for a same-tenant, a cross-tenant and a remote source): an
    `as_of E` copy is created, and a GC whose horizon is past `E` runs. At its first delete, a
-   hook runs the copy's whole sync. The copy ends `failed` with `epoch_unavailable`, `dest`
-   holds no segment, and the sync commits no copy. Against the parent the same test publishes
+   hook runs the copy's whole sync. The copy ends `failed` with `epoch_unavailable`, `dest`'s
+   HEAD names no segment, and the sync commits no copy. (The sync sees the announcement at its
+   first view, so this reaches M196's check at the sync's start, not its publish-time re-read;
+   M196's interference test covers that one.) Against the parent the same test publishes
    the copy, so the test is seen red.
 3. **A pass that dies is finished by the next** (engine): a store refuses a GC pass's first
    `delete_batch`, and the pass returns that error. HEAD's `reaped_before` is raised and its
    graveyard kept. A second pass, given a retention whose horizon is below `reaped_before`,
-   deletes those objects, prunes those entries, and returns their count. A third pass returns
-   0 and writes nothing.
-4. **Cost:** a pass with nothing due issues the requests it does today (one HEAD GET). A pass
+   deletes those objects, prunes those entries, returns their count, and issues exactly one
+   conditional PUT (no announcement). A third pass returns 0 and writes nothing.
+4. **A rival's burial survives the prune** (engine): at a GC pass's first `delete_batch`, a
+   hook writes an object and commits a graveyard entry for it at an epoch at or below the
+   announced `reaped_before` (`commit_head_for_test`), so the pass's prune loses. After the
+   pass the object is either deleted or still listed in the graveyard, never present and
+   unlisted. After one more pass it is deleted and unlisted.
+5. **Cost:** a pass with nothing due issues the requests it does today (one HEAD GET). A pass
    that reaps, none lost, issues 1 GET, its delete batches and 2 conditional PUTs (one more
    than today). `a_scheduled_reap_costs_what_gc_does` changes from `(1, 1, 1)` to `(1, 1, 2)`,
    which is this spec's cost and needs the owner's OK. Every other GC test stays green
    unchanged.
-5. **Gates:** fmt, clippy, suite, coverage 95/95, mutants.
+6. **Gates:** fmt, clippy, suite, coverage 95/95, mutants.
 
 ## Test plan
 | AC | Test | Mutation it catches |
@@ -79,7 +100,15 @@ encoding (no new section), copies, queries.
 | 1 | engine `gc_announces_its_horizon_before_it_deletes` | deletes before the announcement; the prune dropped |
 | 2 | engine `a_copy_inside_a_gc_pass_never_publishes` | the announcement dropped, or committed after the deletes |
 | 3 | engine `an_announced_reap_is_finished_by_the_next_pass` | the due range not raised to `reaped_before`; the announcement not skipped when nothing new is due |
-| 4 | engine `a_scheduled_reap_costs_what_gc_does` (amended), `gc_with_nothing_due_is_free` (unchanged) | a third PUT; the prune re-reading HEAD |
+| 4 | engine `a_rivals_burial_survives_the_prune` | the prune by range; the lost prune not retried |
+| 5 | engine `a_scheduled_reap_costs_what_gc_does` (amended), `gc_with_nothing_due_is_free` (unchanged) | a third PUT; the prune re-reading HEAD |
+
+## Review
+Round 1 (a read-only subagent given the spec and the code): FAIL, two majors, both taken. A
+lost prune that removed entries by range dropped a rival's burial at an old epoch, so the
+prune now removes its exact pairs (AC 4); and AC 3 now counts the second pass's PUT, with one
+announce condition. Minors taken: the `later` floor, the same-tenant check's ordering,
+AC 2's wording, `record_reapable`, and the stale M196 comment.
 
 ## RA budget
 One more conditional PUT of HEAD per GC pass that reaps something, and a GET only when a
