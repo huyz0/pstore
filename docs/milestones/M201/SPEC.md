@@ -128,5 +128,5 @@ elapsed time per index. Nothing changes on a write, a query, a fold or a copy.
   That is the conservative direction.
 
 ## Out of scope
-A hold that keeps GC off an epoch a copy reads. Measured RPO/RTO. Progress for other
+(The owner's choice, 2026-11-07: GC ends the copy rather than waiting for it.) A hold that keeps GC off an epoch a copy reads. Measured RPO/RTO. Progress for other
 operation kinds.

@@ -53,6 +53,8 @@ struct Hooked {
     lose_next: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many conditional writes fail as an outage would.
     fail_cas: Arc<std::sync::atomic::AtomicU32>,
+    /// Run once, before the next delete batch (M201).
+    on_delete: Arc<Mutex<Option<Hook>>>,
 }
 
 type Hook = Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, ()> + Send>;
@@ -185,6 +187,10 @@ impl BlobStore for Hooked {
         self.inner.put_conditional(key, body, pre).await
     }
     async fn delete_batch(&self, keys: &[Key]) -> Result<(), BlobError> {
+        let hook = self.on_delete.lock().unwrap().take();
+        if let Some(f) = hook {
+            f().await;
+        }
         self.inner.delete_batch(keys).await
     }
     async fn list_unrestricted(&self, prefix: &Key) -> Result<Vec<Key>, BlobError> {
@@ -346,6 +352,8 @@ enum Kind {
 
 struct Setup {
     here: World,
+    /// The remote source's world (M201: its GC's deletes are hooked there).
+    there: World,
     src: E,
     dst: E,
     source: ReplicaSource,
@@ -376,6 +384,7 @@ fn setup(kind: Kind) -> Setup {
     Setup {
         dst: here.engine(DST, 1),
         here,
+        there,
         src,
         source,
         remotes,
@@ -3756,5 +3765,56 @@ async fn a_cancel_ends_a_copys_progress() {
                 );
             }
         }
+    }
+}
+
+// M201: GC announces its horizon before it deletes, so a copy inside a GC pass never
+// publishes an epoch whose objects are going.
+
+#[tokio::test]
+async fn a_copy_inside_a_gc_pass_never_publishes() {
+    for kind in [Kind::SameTenant, Kind::CrossTenant, Kind::Remote] {
+        let s = setup(kind);
+        write(&s.src, "src", 0..30).await;
+        let at = epoch_of(&s.src).await;
+        write(&s.src, "src", 30..60).await;
+        s.src.compact("src").await.unwrap();
+        s.copy_as_of("dst", at).await;
+        // GC stops at its first delete until the copy's whole sync has run.
+        let (reached, wait_reached) = tokio::sync::oneshot::channel::<()>();
+        let (go, wait_go) = tokio::sync::oneshot::channel::<()>();
+        let world = match kind {
+            Kind::Remote => &s.there,
+            _ => &s.here,
+        };
+        *world.hooked.on_delete.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                reached.send(()).unwrap();
+                wait_go.await.unwrap();
+            })
+        }));
+        let mut st = SyncState::default();
+        let (reaped, out) = tokio::join!(s.src.gc(0), async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), wait_reached)
+                .await
+                .expect("GC never reached a delete")
+                .unwrap();
+            let out = s.sync(&mut st).await;
+            go.send(()).unwrap();
+            out
+        });
+        assert!(reaped.unwrap() > 0, "{kind:?}: the GC reaped nothing");
+        assert!(out.committed.is_empty(), "{kind:?}: {out:?}");
+        let f = s.dst.copy_status("dst").await.unwrap().unwrap();
+        assert_eq!(f.state, CopyState::Failed, "{kind:?}: {f:?}");
+        assert_eq!(
+            f.failure,
+            Some(CopyFailure::EpochUnavailable),
+            "{kind:?}: {f:?}"
+        );
+        assert!(
+            !s.dst.head_for_test().await.indexes.contains_key("dst"),
+            "{kind:?}: the copy published"
+        );
     }
 }

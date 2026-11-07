@@ -42,6 +42,7 @@ mod filters;
 mod fold_overtaken;
 mod fresh_query;
 mod gc;
+mod gc_announce;
 mod gc_batch;
 mod head;
 mod idempotency;

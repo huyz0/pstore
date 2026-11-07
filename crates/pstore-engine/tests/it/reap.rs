@@ -206,14 +206,15 @@ async fn a_scheduled_reap_costs_what_gc_does() {
         count(OpClass::Delete),
     );
     assert!(e.gc_through(horizon).await.unwrap() > 0);
-    // One read of HEAD, one delete batch, and one CAS.
+    // One read of HEAD, one delete batch, and two CASes (M201, the owner's OK): the
+    // announcement of the horizon before the deletes, and the prune after them.
     assert_eq!(
         (
             count(OpClass::Read) - r,
             count(OpClass::Delete) - d,
             count(OpClass::Write) - w
         ),
-        (1, 1, 1)
+        (1, 1, 2)
     );
 }
 
