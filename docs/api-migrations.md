@@ -1,5 +1,34 @@
 # Native API migration notes
 
+## M199: a document export at one epoch
+
+An order (`rank_by` an attribute) takes `as_of` with `include_vectors`, so a client can export
+an index's documents, every field, as one epoch held them:
+
+```json
+GET  /v1/indexes/src                      -> {"epoch": 41, "schema": {...}, ...}
+POST /v1/indexes/src/query  {"rank_by": ["id", "asc"], "as_of": 41, "top_k": 1000,
+                             "filters": ["id", "Gt", "<last id of the previous page>"],
+                             "include_vectors": ["vector", "emb", "sparse"]}
+```
+
+- Take `E` and the schema from one `GET /v1/indexes/{index}`: both come from one HEAD read. Page
+  by `id > last`, with no filter on the first page, until a page is empty. Every page answers
+  as of `E`, whatever is written, deleted or compacted in between.
+- `as_of E` holds only rows folded by `E`. A write acknowledged but not yet folded is not in it,
+  so fold first (`POST /v1/admin/fold`) or treat the export as covering what was folded at `E`.
+- Vectors come back in the client space of the metric the index had at `E`, even when it was
+  dropped and re-created under another since. They are what the index stores: cosine vectors
+  normalized (M179).
+- Restore by writing the pages, with their vectors and attributes, into a new index under the
+  summary's schema. It answers the exact-vector and filter queries and the row digest of the
+  source at `E`, not the client's original bytes.
+- A ranked or a scored query still refuses `include_vectors` with `as_of` (`400`). An epoch
+  after the present or below the reap horizon is `400 time_travel_horizon`, as for any `as_of`.
+  A long export can cross the horizon: its next page is refused, never answered from another
+  epoch. To export an index already dropped, copy the epoch first (M196). Evidence is in
+  [M199 verification](milestones/M199/VERIFIED.md).
+
 ## M196: a copy or export of a past epoch
 
 A copy or an export takes `as_of`, a past epoch of its source, and holds the source index as a

@@ -536,3 +536,55 @@ async fn a_projection_costs_no_round_on_a_ranking_and_one_on_an_order() {
 const PINNED_1: [(usize, usize); 4] = [(4, 4), (4, 5), (3, 3), (4, 4)];
 /// The same at four segments.
 const PINNED_4: [(usize, usize); 4] = [(4, 13), (4, 17), (3, 9), (4, 13)];
+
+/// M199: an order's page takes `as_of` with `include_vectors`, and answers that epoch's
+/// vectors; a ranked or a scored query still refuses the pair.
+#[tokio::test]
+async fn an_export_page_takes_as_of_and_vectors() {
+    let a = api();
+    write(&a, "x", json!({"documents": docs(&corpus(12, 7))})).await;
+    fold(&a).await;
+    let (s, summary) = send(&a, "GET", "/v1/indexes/x", &Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    let epoch = summary["epoch"].as_u64().unwrap();
+    let order = json!({"rank_by": ["id", "asc"], "top_k": 100, "include_vectors": ["vector"]});
+    let before = query(&a, "x", &order).await;
+    // After E: three rows replaced by other vectors.
+    write(&a, "x", json!({"documents": docs(&corpus(3, 99))})).await;
+    fold(&a).await;
+    let present = query(&a, "x", &order).await;
+    let mut at = order.clone();
+    at["as_of"] = json!(epoch);
+    let past = query(&a, "x", &at).await;
+    let vectors = |b: &Value| -> Vec<Option<Vec<u32>>> {
+        b["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(vector_of)
+            .collect()
+    };
+    assert_eq!(ids(&past), ids(&before), "the epoch's rows");
+    assert_eq!(vectors(&past), vectors(&before), "the epoch's vectors");
+    assert_ne!(
+        vectors(&present),
+        vectors(&before),
+        "the writes after E changed nothing"
+    );
+    for q in [
+        json!({"vector": vec![1.0_f32; 8], "top_k": 3}),
+        json!({"rank_by": ["Product", 2.0, ["n", "Eq", "r0001"]], "top_k": 3}),
+    ] {
+        let mut q = q;
+        q["include_vectors"] = json!(["vector"]);
+        q["as_of"] = json!(epoch);
+        let (s, b) = ask(&a, "x", &q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {b}");
+        let msg = b["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("cannot be combined with as_of"), "{q}: {b}");
+    }
+    at["as_of"] = json!(epoch + 1_000);
+    let (s, b) = ask(&a, "x", &at).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "time_travel_horizon", "{b}");
+}
