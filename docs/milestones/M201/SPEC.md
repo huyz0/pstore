@@ -27,8 +27,9 @@ copied ... pending".
   - A lost or contended announcement is retried from a fresh read, as today. Nothing has
     been deleted at that point.
   - **The prune removes exactly the (epoch, key) entries the pass decided on**: those it
-    deleted, and those it declined because HEAD still names them, as today's commit drops
-    them. A lost prune is retried from a fresh read and removes those same pairs where they
+    deleted, those it declined because HEAD still names them, and those it declined because
+    the key is buried again above `floor` (that later burial carries the key), as today's
+    commit drops them. A lost prune is retried from a fresh read and removes those same pairs where they
     are still listed. It deletes nothing again. An entry another commit filed in the meantime
     stays, even at an epoch at or below `reaped_before`: `bury_into`, a lost branch's copies
     and a copy's unused keys all file a key under the epoch it was born at, which can be
@@ -84,9 +85,10 @@ encoding (no new section), copies, queries.
    conditional PUT (no announcement). A third pass returns 0 and writes nothing.
 4. **A rival's burial survives the prune** (engine): at a GC pass's first `delete_batch`, a
    hook writes an object and commits a graveyard entry for it at an epoch at or below the
-   announced `reaped_before` (`commit_head_for_test`), so the pass's prune loses. After the
-   pass the object is either deleted or still listed in the graveyard, never present and
-   unlisted. After one more pass it is deleted and unlisted.
+   announced `reaped_before` (`commit_head_for_test`), so the pass's prune loses. The pass
+   returns `Ok` with the count of its own objects, and the graveyard holds none of its own
+   pairs. The rival's object is either deleted or still listed in the graveyard, never present
+   and unlisted. After one more pass it is deleted and unlisted.
 5. **Cost:** a pass with nothing due issues the requests it does today (one HEAD GET). A pass
    that reaps, none lost, issues 1 GET, its delete batches and 2 conditional PUTs (one more
    than today). `a_scheduled_reap_costs_what_gc_does` changes from `(1, 1, 1)` to `(1, 1, 2)`,
@@ -108,7 +110,10 @@ Round 1 (a read-only subagent given the spec and the code): FAIL, two majors, bo
 lost prune that removed entries by range dropped a rival's burial at an old epoch, so the
 prune now removes its exact pairs (AC 4); and AC 3 now counts the second pass's PUT, with one
 announce condition. Minors taken: the `later` floor, the same-tenant check's ordering,
-AC 2's wording, `record_reapable`, and the stale M196 comment.
+AC 2's wording, `record_reapable`, and the stale M196 comment. Round 2: FAIL, one major,
+taken: AC 4 now requires the pass to succeed with its own pairs pruned, so a prune not retried
+fails it. Minor taken: pairs declined because of a later burial are pruned, as today. Round 3
+was not run: the fix is the major's own wording.
 
 ## RA budget
 One more conditional PUT of HEAD per GC pass that reaps something, and a GET only when a
