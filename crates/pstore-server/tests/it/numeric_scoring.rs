@@ -241,6 +241,7 @@ async fn numeric_expressions_over_http() {
         ("2026-02-03T13:13:14+01:00", json!(21_600_000)),
         ("2026-02-03T12:13:14", json!("360m")),
         ("2026-02-03T12:13:14", json!("0.25d")),
+        ("2026-02-03T12:13:14", json!("21600s")),
     ] {
         assert_eq!(
             scores(&api, &recency(origin, midpoint.clone())).await,
@@ -248,6 +249,11 @@ async fn numeric_expressions_over_http() {
             "{origin} {midpoint}"
         );
     }
+    // A week is 604,800,000 ms.
+    assert_eq!(
+        scores(&api, &recency("2026-02-03T12:13:14Z", json!("1w"))).await,
+        scores(&api, &recency("2026-02-03T12:13:14Z", json!(604_800_000))).await
+    );
     // A unit is not ignored.
     assert_ne!(
         scores(&api, &recency("2026-02-03T12:13:14", json!("6d"))).await,
