@@ -13,7 +13,7 @@
 - `{"band": ["Bucket", attribute, width]}` keys a row by `floor(value / width) * width`, in
   integers when both are integers, else in floats; a negative value falls in the bucket
   below zero. A row whose value is not a number is in the `null` group. `width` is a
-  positive finite number. A bucket may sit beside plain entries and a `ForEachUnique` one.
+  positive finite number; `10.0` is a float width, so write `10` for exact integer buckets. A bucket may sit beside plain entries and a `ForEachUnique` one.
 - Nested groups and hits per group are not offered; `limit_per` (M146) bounds hits per
   group of a ranking. Evidence is in [M211 verification](milestones/M211/VERIFIED.md).
 

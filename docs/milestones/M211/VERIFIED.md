@@ -35,3 +35,8 @@ Mutations were applied one at a time by a script and reverted, against the unit 
 Gates, in a cloud container: `cargo fmt --all --check` and `cargo clippy -p pstore-query
 -p pstore-server -p pstore-engine --all-targets -- -D warnings` passed. Coverage and
 `scripts/mutants.sh`: NOT-RUN here; CI runs both on the pull request.
+
+Code review round 1 (pass, two minors, both taken): a number whose integer bucket bound
+falls below `i64::MIN` was put in the `null` group; it is now the float nearest its bound,
+asserted in `a_bucket_is_its_lower_bound_floored` (red with the old fallback, green after).
+The migration notes now say a width of `10.0` is a float width.

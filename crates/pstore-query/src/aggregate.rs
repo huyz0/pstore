@@ -90,7 +90,18 @@ fn bucket(v: Option<&Value>, width: Width) -> Key {
         let w = i128::from(w);
         let lower = i.div_euclid(w) * w;
         return i64::try_from(lower).map_or_else(
-            |_| u64::try_from(lower).map_or(Key::Absent, |u| Key::Num(Number::Uint(u))),
+            |_| {
+                u64::try_from(lower).map_or_else(
+                    // Below i64::MIN (code review): still a number's bucket, as the float
+                    // nearest its bound, never the null group.
+                    |_| {
+                        #[allow(clippy::cast_precision_loss, reason = "stated: nearest float")]
+                        let f = lower as f64;
+                        Key::Num(Number::Float(f))
+                    },
+                    |u| Key::Num(Number::Uint(u)),
+                )
+            },
             |n| Key::Num(Number::Int(n)),
         );
     }
@@ -830,6 +841,12 @@ mod tests {
                 Some(Value::Int((1_i64 << 60) + 2)),
                 Some(Value::Uint(u64::MAX - 1))
             ]
+        );
+        // Below i64::MIN, a number is still in a bucket, never the null group.
+        let low = buckets(&[Value::Int(i64::MIN)], Width::Int(3));
+        assert!(
+            matches!(low[..], [Some(Value::Float(f))] if f < -9.2e18),
+            "{low:?}"
         );
     }
 
