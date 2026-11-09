@@ -3264,15 +3264,19 @@ fn aggregation(req: &QueryRequest) -> Result<Option<pstore_query::AggregateSpec>
         let agg = match (kind, attr) {
             ("Count", pstore_query::ID_ATTRIBUTE) => Aggregate::Count(None),
             ("Count", a) => Aggregate::Count(Some(a.to_owned())),
-            ("Sum", pstore_query::ID_ATTRIBUTE) => {
+            (kind @ ("Sum" | "Min" | "Max" | "Avg"), pstore_query::ID_ATTRIBUTE) => {
                 return Err(ApiError::bad_request(format!(
-                    "aggregate {label}: Sum of id is not a number"
+                    "aggregate {label}: {kind} of id is not a number"
                 )));
             }
             ("Sum", a) => Aggregate::Sum(a.to_owned()),
+            // M211.
+            ("Min", a) => Aggregate::Min(a.to_owned()),
+            ("Max", a) => Aggregate::Max(a.to_owned()),
+            ("Avg", a) => Aggregate::Avg(a.to_owned()),
             (other, _) => {
                 return Err(ApiError::bad_request(format!(
-                    "aggregate {label}: {other} is not Count or Sum"
+                    "aggregate {label}: {other} is not Count, Sum, Min, Max or Avg"
                 )));
             }
         };
@@ -3348,28 +3352,64 @@ fn group_keys(v: &serde_json::Value) -> Result<Vec<pstore_query::GroupKey>, ApiE
             )));
         }
     }
+    // A named entry's name is no other entry's (M211: a Bucket's, as a ForEachUnique's).
+    let named_twice = keys.iter().enumerate().find(|(i, g)| {
+        g.grouping != Grouping::Value
+            && keys
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != *i && o.name == g.name)
+    });
+    if let Some((_, g)) = named_twice {
+        return Err(ApiError::bad_request(format!(
+            "group_by names {} twice: a group would carry it twice",
+            g.name
+        )));
+    }
     Ok(keys)
 }
 
-/// One named group: `{name: ["ForEachUnique", attribute]}` (M210).
+/// One named group: `{name: ["ForEachUnique", attribute]}` (M210) or
+/// `{name: ["Bucket", attribute, width]}` (M211).
 fn named_group(
     o: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<pstore_query::GroupKey, ApiError> {
+    use pstore_query::Grouping;
     let refuse = || {
         ApiError::bad_request(
-            "a named group_by entry is one name mapped to [\"ForEachUnique\", attribute]",
+            "a named group_by entry is one name mapped to [\"ForEachUnique\", attribute] or \
+             [\"Bucket\", attribute, width]",
         )
     };
     let mut it = o.iter();
     let (Some((name, v)), None) = (it.next(), it.next()) else {
         return Err(refuse());
     };
-    match v.as_array().map(Vec::as_slice) {
-        Some([f, a]) if f.as_str() == Some("ForEachUnique") => Ok(pstore_query::GroupKey {
-            name: name.clone(),
-            attribute: a.as_str().ok_or_else(refuse)?.to_owned(),
-            grouping: pstore_query::Grouping::EachUnique,
-        }),
+    let (grouping, attribute) = match v.as_array().map(Vec::as_slice) {
+        Some([f, a]) if f.as_str() == Some("ForEachUnique") => (Grouping::EachUnique, a),
+        Some([f, a, w]) if f.as_str() == Some("Bucket") => (Grouping::Bucket(width(w)?), a),
+        _ => return Err(refuse()),
+    };
+    Ok(pstore_query::GroupKey {
+        name: name.clone(),
+        attribute: attribute.as_str().ok_or_else(refuse)?.to_owned(),
+        grouping,
+    })
+}
+
+/// A bucket's width (M211): a positive integer, or a positive finite float.
+fn width(w: &serde_json::Value) -> Result<pstore_query::Width, ApiError> {
+    let refuse =
+        || ApiError::bad_request("a Bucket width is a positive finite number, as in 10 or 2.5");
+    if let Some(n) = w.as_i64() {
+        return if n > 0 {
+            Ok(pstore_query::Width::Int(n))
+        } else {
+            Err(refuse())
+        };
+    }
+    match w.as_f64() {
+        Some(f) if f > 0.0 && f.is_finite() => Ok(pstore_query::Width::Float(f)),
         _ => Err(refuse()),
     }
 }

@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M211: `Min`, `Max`, `Avg` and numeric buckets
+
+```json
+{"aggregate_by": {"lo": ["Min", "price"], "hi": ["Max", "price"], "avg": ["Avg", "price"]},
+ "group_by": [{"band": ["Bucket", "price", 10]}, "color"]}
+```
+
+- `Min`, `Max` and `Avg` read an attribute's numbers (int, uint64, float) and skip anything
+  else. `Min` and `Max` report the number as a group key reports it (`1.0` as `1`); `Avg` is
+  a float. Each is `null` for a group with no number. None of them is offered on `id`.
+- `{"band": ["Bucket", attribute, width]}` keys a row by `floor(value / width) * width`, in
+  integers when both are integers, else in floats; a negative value falls in the bucket
+  below zero. A row whose value is not a number is in the `null` group. `width` is a
+  positive finite number. A bucket may sit beside plain entries and a `ForEachUnique` one.
+- Nested groups and hits per group are not offered; `limit_per` (M146) bounds hits per
+  group of a ranking. Evidence is in [M211 verification](milestones/M211/VERIFIED.md).
+
 ## M210: named `ForEachUnique` groups and unary `Count`
 
 A `group_by` entry may be a named group, one name mapped to `["ForEachUnique", attribute]`:

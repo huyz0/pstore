@@ -534,7 +534,10 @@ async fn what_an_aggregation_cannot_mean_is_refused() {
             json!({"vector": [1.0, 0.5], "group_by": ["color"]}),
             "group_by",
         ),
-        (json!({"aggregate_by": {"n": ["Avg", "price"]}}), "Avg"),
+        (
+            json!({"aggregate_by": {"n": ["Median", "price"]}}),
+            "Median",
+        ),
         (json!({"aggregate_by": {"n": ["Sum", "id"]}}), "Sum"),
         (json!({"aggregate_by": {"n": "Count"}}), "aggregate"),
         (json!({"aggregate_by": {}}), "aggregate_by"),

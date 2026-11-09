@@ -22,6 +22,12 @@ pub enum Aggregate {
     Count(Option<String>),
     /// The numeric values of an attribute. Anything not a number adds nothing.
     Sum(String),
+    /// The smallest number an attribute holds (M211); `null` for none.
+    Min(String),
+    /// The largest number an attribute holds (M211); `null` for none.
+    Max(String),
+    /// The numbers' sum over their count, a float (M211); `null` for none.
+    Avg(String),
 }
 
 /// What to compute: labelled aggregates, the attributes to group by, and how many groups.
@@ -43,6 +49,77 @@ pub enum Grouping {
     /// One group per unique element of an array value (`ForEachUnique`); a scalar is its own
     /// element, and an absent value or an empty array is the absent group.
     EachUnique,
+    /// A number's bucket, keyed by its lower bound `floor(v / width) * width` (M211); any other
+    /// value, and none, is the absent group.
+    Bucket(Width),
+}
+
+/// A bucket's width (M211): positive, and finite when a float.
+#[derive(Debug, Clone, Copy)]
+pub enum Width {
+    /// An integer width: an integer's bucket is computed exactly.
+    Int(i64),
+    /// A float width: every bucket is computed in floats.
+    Float(f64),
+}
+
+impl PartialEq for Width {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Width {}
+
+/// A value's bucket key (M211): its lower bound for a number, else the absent key.
+fn bucket(v: Option<&Value>, width: Width) -> Key {
+    let Some(n) = v.and_then(Number::of) else {
+        return Key::Absent;
+    };
+    let exact = match (n, width) {
+        (Number::Int(i), Width::Int(w)) => Some((i128::from(i), w)),
+        (Number::Uint(u), Width::Int(w)) => Some((i128::from(u), w)),
+        _ => None,
+    };
+    if let Some((i, w)) = exact {
+        // In i128, so no bound can overflow: |i| < 2^64 and 0 < w < 2^63.
+        let w = i128::from(w);
+        let lower = i.div_euclid(w) * w;
+        return i64::try_from(lower).map_or_else(
+            |_| u64::try_from(lower).map_or(Key::Absent, |u| Key::Num(Number::Uint(u))),
+            |n| Key::Num(Number::Int(n)),
+        );
+    }
+    let (v, w) = (as_f64(n), as_f64(width_number(width)));
+    let lower = (v / w).floor() * w;
+    if lower.is_finite() {
+        Key::Num(normalized(lower))
+    } else {
+        Key::Absent
+    }
+}
+
+fn width_number(w: Width) -> Number {
+    match w {
+        Width::Int(n) => Number::Int(n),
+        Width::Float(f) => Number::Float(f),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "stated: a bucket with a float on either side is computed in floats"
+)]
+fn as_f64(n: Number) -> f64 {
+    match n {
+        Number::Int(i) => i as f64,
+        Number::Uint(u) => u as f64,
+        Number::Float(f) => f,
+    }
 }
 
 /// One `group_by` entry: the field a group reports it under, and what it reads.
@@ -224,10 +301,49 @@ struct Acc {
     any_float: bool,
     /// Whether a uint64 was summed (M172): only then may an integer sum answer above `i64`.
     any_uint: bool,
+    /// The numbers seen (M211): `Avg`'s divisor.
+    nums: u64,
+    /// The smallest number seen (M211).
+    min: Option<Number>,
+    /// The largest number seen (M211).
+    max: Option<Number>,
 }
 
 impl Acc {
+    /// One number for `Min`, `Max` and `Avg` (M211): summed as `Sum` sums, and compared.
+    fn number(&mut self, n: Number) {
+        self.nums += 1;
+        match n {
+            Number::Int(i) => self.ints += i128::from(i),
+            Number::Uint(u) => {
+                self.ints += i128::from(u);
+                self.any_uint = true;
+            }
+            Number::Float(f) => {
+                self.floats += f;
+                self.any_float = true;
+            }
+        }
+        self.extremes(Some(n), Some(n));
+    }
+
+    fn extremes(&mut self, lo: Option<Number>, hi: Option<Number>) {
+        let less = |a: Number, b: Number| cmp_numbers(a, b) == Some(Ordering::Less);
+        if let Some(n) = lo
+            && self.min.is_none_or(|m| less(n, m))
+        {
+            self.min = Some(n);
+        }
+        if let Some(n) = hi
+            && self.max.is_none_or(|m| less(m, n))
+        {
+            self.max = Some(n);
+        }
+    }
+
     fn add(&mut self, other: &Self) {
+        self.nums += other.nums;
+        self.extremes(other.min, other.max);
         self.count += other.count;
         self.ints += other.ints;
         self.floats += other.floats;
@@ -267,6 +383,11 @@ fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
                 }
                 _ => {}
             },
+            Aggregate::Min(a) | Aggregate::Max(a) | Aggregate::Avg(a) => {
+                if let Some(n) = doc.attrs.get(a).and_then(Number::of) {
+                    acc.number(n);
+                }
+            }
         }
     }
 }
@@ -346,6 +467,7 @@ impl Aggregator {
             let v = doc.attrs.get(&g.attribute);
             match g.grouping {
                 Grouping::Value => key.push(Key::of(v)),
+                Grouping::Bucket(w) => key.push(bucket(v, w)),
                 Grouping::EachUnique => {
                     exploded = Some((i, elements(v)));
                     key.push(Key::Absent);
@@ -449,8 +571,39 @@ fn integral(sum: i128, any_uint: bool) -> Option<Total> {
     }
 }
 
+/// A smallest or largest number, reported as a key reports it (M211): `1.0` as `1`.
+fn extreme(n: Number) -> Total {
+    match Key::of(Some(&match n {
+        Number::Int(i) => Value::Int(i),
+        Number::Uint(u) => Value::Uint(u),
+        Number::Float(f) => Value::Float(f),
+    })) {
+        Key::Num(Number::Int(i)) => Total::Int(i),
+        Key::Num(Number::Uint(u)) => Total::Uint(u),
+        Key::Num(Number::Float(f)) => Total::Float(f),
+        _ => Total::Null,
+    }
+}
+
 fn total(agg: &Aggregate, acc: Acc) -> Total {
     match agg {
+        Aggregate::Min(_) => acc.min.map_or(Total::Null, extreme),
+        Aggregate::Max(_) => acc.max.map_or(Total::Null, extreme),
+        Aggregate::Avg(_) => {
+            if acc.nums == 0 {
+                return Total::Null;
+            }
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "stated: an average is a float, exact up to 2^53 a term"
+            )]
+            let avg = (acc.floats + acc.ints as f64) / acc.nums as f64;
+            if avg.is_finite() {
+                Total::Float(avg)
+            } else {
+                Total::Null
+            }
+        }
         Aggregate::Count(_) => Total::Int(i64::try_from(acc.count).unwrap_or(i64::MAX)),
         Aggregate::Sum(_) => {
             #[allow(
@@ -564,6 +717,120 @@ mod tests {
             .into_iter()
             .map(|(k, t)| (k.iter().map(Key::value).collect(), t))
             .collect()
+    }
+
+    fn stats(vals: &[Value]) -> Vec<Total> {
+        let mut a = Aggregator::new(Spec {
+            labels: vec![
+                ("lo".to_owned(), Aggregate::Min("k".into())),
+                ("hi".to_owned(), Aggregate::Max("k".into())),
+                ("avg".to_owned(), Aggregate::Avg("k".into())),
+            ],
+            group_by: vec![],
+            top_k: 1,
+        });
+        // Halves merged, as two segments' partials are.
+        let mut other = a.empty_like();
+        for (i, v) in vals.iter().enumerate() {
+            let part = if i % 2 == 0 { &mut a } else { &mut other };
+            part.offer(&doc(&i.to_string(), v.clone()));
+        }
+        a.offer(&Document::new("none", vec![1.0]));
+        a.merge(other);
+        a.finish().remove(0).1
+    }
+
+    #[test]
+    fn min_max_and_avg_are_typed_as_stated() {
+        assert_eq!(stats(&[]), [Total::Null, Total::Null, Total::Null]);
+        assert_eq!(
+            stats(&[Value::Str("x".into()), Value::Bool(true)]),
+            [Total::Null, Total::Null, Total::Null]
+        );
+        assert_eq!(
+            stats(&[Value::Int(2), Value::Str("x".into()), Value::Int(1)]),
+            [Total::Int(1), Total::Int(2), Total::Float(1.5)]
+        );
+        // A float reports as a float unless integral, which reports as its integer.
+        assert_eq!(
+            stats(&[Value::Float(2.5), Value::Float(-1.0), Value::Int(7)]),
+            [Total::Int(-1), Total::Int(7), Total::Float(8.5 / 3.0)]
+        );
+        assert_eq!(
+            stats(&[Value::Float(0.25), Value::Float(9.75)]),
+            [Total::Float(0.25), Total::Float(9.75), Total::Float(5.0)]
+        );
+        // A uint64 above i64 is the largest, exactly; i64::MIN the smallest.
+        assert_eq!(
+            stats(&[
+                Value::Uint(u64::MAX),
+                Value::Int(i64::MIN),
+                Value::Uint(u64::MAX - 1)
+            ])[..2],
+            [Total::Int(i64::MIN), Total::Uint(u64::MAX)]
+        );
+    }
+
+    fn buckets(vals: &[Value], width: Width) -> Vec<Option<Value>> {
+        let mut a = Aggregator::new(Spec {
+            labels: vec![("n".to_owned(), Aggregate::Count(None))],
+            group_by: vec![GroupKey {
+                name: "b".to_owned(),
+                attribute: "k".to_owned(),
+                grouping: Grouping::Bucket(width),
+            }],
+            top_k: 100,
+        });
+        for (i, v) in vals.iter().enumerate() {
+            a.offer(&doc(&i.to_string(), v.clone()));
+        }
+        a.finish().into_iter().map(|(k, _)| k[0].value()).collect()
+    }
+
+    #[test]
+    fn a_bucket_is_its_lower_bound_floored() {
+        assert_eq!(
+            buckets(
+                &[
+                    Value::Int(-1),
+                    Value::Int(0),
+                    Value::Int(9),
+                    Value::Int(10),
+                    Value::Int(-10),
+                    Value::Int(-11),
+                    Value::Float(19.5),
+                    Value::Str("x".into()),
+                ],
+                Width::Int(10)
+            ),
+            [
+                Some(Value::Int(-20)),
+                Some(Value::Int(-10)),
+                Some(Value::Int(0)),
+                Some(Value::Int(10)),
+                None
+            ]
+        );
+        assert_eq!(
+            buckets(
+                &[Value::Float(0.1), Value::Float(2.6), Value::Int(-1)],
+                Width::Float(2.5)
+            ),
+            [
+                Some(Value::Float(-2.5)),
+                Some(Value::Int(0)),
+                Some(Value::Float(2.5))
+            ]
+        );
+        // Exact in integers: a uint64 above 2^53 keeps its own bucket, which a float would not.
+        let big = (1_u64 << 60) + 3;
+        assert_eq!(
+            buckets(&[Value::Uint(big), Value::Uint(u64::MAX)], Width::Int(2)),
+            [
+                Some(Value::Int((1_i64 << 60) + 2)),
+                Some(Value::Uint(u64::MAX - 1))
+            ]
+        );
     }
 
     #[test]

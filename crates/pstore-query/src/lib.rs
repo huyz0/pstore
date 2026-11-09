@@ -23,7 +23,7 @@ mod order;
 mod run;
 
 pub use aggregate::{
-    Aggregate, Aggregator, GroupKey, Grouping, Key, Spec as AggregateSpec, Total, aggregate,
+    Aggregate, Aggregator, GroupKey, Grouping, Key, Spec as AggregateSpec, Total, Width, aggregate,
 };
 pub use expr::{
     Expr, MAX_CLAUSES as MAX_EXPR_CLAUSES, MAX_DEPTH as MAX_EXPR_DEPTH,
