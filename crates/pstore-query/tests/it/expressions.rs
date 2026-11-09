@@ -907,6 +907,33 @@ fn signed_roots_are_refused() {
     ] {
         assert!(bad.check().is_err(), "{bad:?}");
     }
+    // Saturate and Decay nest as Product does: 8 deep, the leaf included, and not 9.
+    let mut deep = a();
+    for i in 0..7 {
+        let of = Box::new(deep);
+        deep = if i % 2 == 0 {
+            Expr::Saturate {
+                of,
+                midpoint: 1.0,
+                exponent: 1.0,
+            }
+        } else {
+            Expr::Decay {
+                of,
+                midpoint: 1.0,
+                exponent: 1.0,
+            }
+        };
+    }
+    assert!(deep.check().is_ok(), "depth 8");
+    let why = Expr::Saturate {
+        of: Box::new(deep),
+        midpoint: 1.0,
+        exponent: 1.0,
+    }
+    .check()
+    .unwrap_err();
+    assert!(why.contains("deep"), "depth 9: {why}");
     let at_limits = Expr::Decay {
         of: Box::new(a()),
         midpoint: 1e-9,
