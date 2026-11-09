@@ -1,5 +1,41 @@
 # Native API migration notes
 
+## M221: a generated Python client
+
+`clients/python/pstore_client` is generated from the contract by `scripts/gen-clients.py`, and
+never edited: one `Client` method per `operationId`, standard library only, Python 3.9 or later.
+
+```python
+from pstore_client import Client, PstoreError
+c = Client("http://localhost:8080", token=TOKEN)
+c.write_documents("docs", {"durability": "durable", "documents": [{"id": 1, "vector": [0.1, 0.2]}]})
+c.query("docs", {"vector": [0.1, 0.2], "consistency": "session"}, session=c.last_session)
+```
+
+- A status of 400 or more raises `PstoreError` with the envelope's `code`, `message`,
+  `retryable` and `Retry-After`. `last_status` is the latest success's status (a copy answers
+  202 when this request started it, 200 when an earlier one had), and `last_session` the latest
+  `x-pstore-session`. Evidence is in [M221 verification](milestones/M221/VERIFIED.md).
+
+## M220: the native API as an OpenAPI contract
+
+[`api/openapi.json`](../api/openapi.json) (OpenAPI 3.1, contract version `1.0.0`) describes
+every route, method and scope, each request body's fields with their defaults and limits, every
+success response, and the error envelope with its codes and their statuses. Nothing on the wire
+changed.
+
+- It is tested against the server, not trusted: the router's routes and scopes, the fields each
+  request body's parser accepts, the error codes the source constructs, and every response the
+  fixtures in [`api/fixtures/native.json`](../api/fixtures/native.json) draw, validated against
+  closed schemas (`crates/pstore-server/tests/it/openapi.rs`). A response field the contract
+  does not name fails that test, so the contract changes with the field.
+- Scores: `$dist` is the vector distance under the index's metric, lower nearer for all three
+  (`dot_product` answers the negated product). `score` is the fused score, higher first.
+- A row missing a projected attribute answers no key for it, never `null`, and sorts after every
+  row that has it in an ascending order.
+- Expression grammars (filters, `rank_by`, facets, boosts) are typed by name only and point at
+  the milestone that defines them. Evidence is in [M220 verification](milestones/M220/VERIFIED.md).
+
 ## M211: `Min`, `Max`, `Avg` and numeric buckets
 
 ```json

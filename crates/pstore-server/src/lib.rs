@@ -700,8 +700,15 @@ impl<S: BlobStore + 'static> Api<S> {
         tick
     }
 
-    /// The routes. `api-design.md`'s surface, minus everything M7c defers.
-    pub fn router(self: Arc<Self>) -> Router {
+    /// Every route this server serves, as `(path, scope)` in registration order: what the
+    /// published OpenAPI contract is checked against (M220). A path registered under two
+    /// scopes is listed twice, once under each.
+    pub fn route_table(&self) -> Vec<(String, &'static str)> {
+        self.routes().table()
+    }
+
+    /// The routes, each under the scope that authorizes it.
+    fn routes(&self) -> auth::ScopedRouter<Arc<Self>> {
         use auth::Scope::{Admin, List, Read, Write};
         auth::ScopedRouter::new(Arc::clone(&self.ingress))
             .route("/v1/indexes", List.on(get(list_indexes::<S>)))
@@ -788,6 +795,11 @@ impl<S: BlobStore + 'static> Api<S> {
             .route("/v1/admin/gc", Admin.on(post(gc_tenant::<S>)))
             .route("/v1/admin/duties", Admin.on(get(duties)))
             .route("/metrics", Admin.on(get(metrics::<S>)))
+    }
+
+    /// The routes. `api-design.md`'s surface, minus everything M7c defers.
+    pub fn router(self: Arc<Self>) -> Router {
+        self.routes()
             .finish()
             // M128: the ceiling axum's own extractors held implicitly, now the typed limit.
             .layer(axum::extract::DefaultBodyLimit::max(

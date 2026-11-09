@@ -296,9 +296,26 @@ jobs:
       # the `portable` job below is what catches what a grep cannot.
       - run: ./scripts/check-portable.sh
       - run: ./scripts/check-portable.sh --selftest
+      # M221: the clients are generated from api/openapi.json, never edited (rung 5).
+      - run: ./scripts/gen-clients.py --check
       # M103: a mutation sweep removes its tree copies and its diff file, killed or not. Here
       # and not in `gates.sh`, because `mutants.sh` is `portable: no`.
       - run: ./scripts/selftest-mutants.sh
+
+  # M221: the generated clients, each running api/fixtures/native.json's steps against a real
+  # server. Its own job because it builds the server binary and needs Python (and Node, M222).
+  clients:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.9" }
+      - run: ./scripts/clients.sh
 
   # The whole local gate, on the three operating systems a contributor might run it on.
   # ⚠️ For seven milestones it ran on one: on Windows every Python gate failed (`python3` is
