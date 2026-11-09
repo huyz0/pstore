@@ -2142,11 +2142,11 @@ fn patch_by_filter_attrs(
     })
 }
 
-/// What a write's operations will hold in its tenant's buffer (M141), by
-/// [`pstore_format::Document::footprint`]'s rules: documents, each patch's id and
-/// attributes, each delete's tombstone, each by-filter operation's encoded filter, and an
-/// applied request's `stamp` on every row. An estimate: the engine trues it up to the
-/// stored rows as they are buffered.
+/// What a write's operations will hold in its tenant's buffer (M141), as the engine encodes
+/// them (M213): each document's [`pstore_format::Document::footprint`], each patch's, each
+/// delete's tombstone's and each by-filter operation's row, and an applied request's `stamp`
+/// on every row. An estimate -- a condition or a type stamp is not counted -- that the engine
+/// trues up to the stored rows as they are buffered.
 fn write_footprint(
     docs: &[Document],
     patches: &[pstore_engine::Patch],
@@ -2155,27 +2155,39 @@ fn write_footprint(
     patch_by: Option<&(pstore_query::Predicate, pstore_engine::Patch)>,
     stamp: u64,
 ) -> u64 {
-    let patch = |p: &pstore_engine::Patch| {
-        p.id.len() as u64
-            + p.set
-                .iter()
-                .map(|(k, v)| k.len() as u64 + v.footprint())
-                .sum::<u64>()
-            + p.unset.iter().map(|k| k.len() as u64).sum::<u64>()
-    };
-    let filter = |f: &pstore_query::Predicate| pstore_query::condition::encode(f).len() as u64;
-    // A delete is stored as a tombstone: its id and an 8-byte mark under an empty name.
     let rows = docs.len()
         + patches.len()
         + deletes.len()
         + usize::from(delete_by.is_some())
         + usize::from(patch_by.is_some());
     docs.iter().map(Document::footprint).sum::<u64>()
-        + patches.iter().map(patch).sum::<u64>()
-        + deletes.iter().map(|d| d.len() as u64 + 8).sum::<u64>()
-        + delete_by.map_or(0, filter)
-        + patch_by.map_or(0, |(f, p)| filter(f) + patch(p))
+        + patches
+            .iter()
+            .map(pstore_engine::patch_footprint)
+            .sum::<u64>()
+        + deletes
+            .iter()
+            .map(|d| pstore_engine::delete_footprint(d))
+            .sum::<u64>()
+        + delete_by.map_or(0, |f| pstore_engine::by_filter_footprint(f, None))
+        + patch_by.map_or(0, |(f, p)| pstore_engine::by_filter_footprint(f, Some(p)))
         + rows as u64 * stamp
+}
+
+/// Drops spare capacity from a patch's id, names and values (M213), as
+/// [`Document::shrink_to_fit`] does a row's.
+fn shrink_patch(p: &mut pstore_engine::Patch) {
+    p.id.shrink_to_fit();
+    p.set = std::mem::take(&mut p.set)
+        .into_iter()
+        .map(|(mut k, mut v)| {
+            k.shrink_to_fit();
+            v.shrink_to_fit();
+            (k, v)
+        })
+        .collect();
+    p.unset.iter_mut().for_each(String::shrink_to_fit);
+    p.unset.shrink_to_fit();
 }
 
 /// Reserves `bytes` of `tenant`'s buffer for one write (M141), flushing first when a
@@ -2463,7 +2475,7 @@ async fn write_documents<S: BlobStore + 'static>(
                 && !types.contains_key(n)
         })
         .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
-    let (docs, patches, patch_by) = match (
+    let (mut docs, mut patches, mut patch_by) = match (
         typed_ops(
             std::mem::take(&mut req.documents),
             patches,
@@ -2503,6 +2515,12 @@ async fn write_documents<S: BlobStore + 'static>(
         .into_iter()
         .map(|id| id.0)
         .collect();
+    // M213: what a parser grew past the length would be held, and charged, for nothing.
+    docs.iter_mut().for_each(Document::shrink_to_fit);
+    patches
+        .iter_mut()
+        .chain(patch_by.as_mut().map(|(_, p)| p))
+        .for_each(shrink_patch);
     // M141: the whole request's share of the tenant's buffer, before anything is buffered.
     let need = write_footprint(
         &docs,
@@ -7985,22 +8003,27 @@ mod tests {
             pstore_query::Op::Eq,
             pstore_format::Value::Int(2),
         );
-        let (e1, e2) = (
-            pstore_query::condition::encode(&gone).len() as u64,
-            pstore_query::condition::encode(&even).len() as u64,
-        );
-        assert!(e1 > 0 && e2 > 0 && e1 != e2);
         let got = write_footprint(
             std::slice::from_ref(&doc),
             std::slice::from_ref(&patch),
             &["del".to_owned()],
             Some(&gone),
-            Some(&(even, by)),
+            Some(&(even.clone(), by.clone())),
             7,
         );
-        // The row, the patch (2 + 2 + 3 + 1), the tombstone (3 + 8), the two filters, the
-        // patch by filter's patch (2 + 8), and the stamp on each of five operations.
-        assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
+        // M213: each operation as the engine encodes it -- the row, the patch, the tombstone,
+        // the two by-filter rows -- and the stamp on each of five operations.
+        let parts = [
+            doc.footprint(),
+            pstore_engine::patch_footprint(&patch),
+            pstore_engine::delete_footprint("del"),
+            pstore_engine::by_filter_footprint(&gone, None),
+            pstore_engine::by_filter_footprint(&even, Some(&by)),
+        ];
+        for (i, a) in parts.iter().enumerate() {
+            assert!(*a > 0 && parts[..i].iter().all(|b| b != a), "{parts:?}");
+        }
+        assert_eq!(got, parts.iter().sum::<u64>() + 5 * 7);
         assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
     }
 

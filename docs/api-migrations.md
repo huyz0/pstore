@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M213: buffered rows are charged the memory they hold
+
+`tenant_buffered_bytes` and `tenant_flush_bytes` (M141) keep their names and defaults, but a
+buffered row is now charged its **held bytes**: its struct slot, every allocation's capacity
+(id, vectors, attribute keys and strings, arrays) with 16 bytes each for the allocator, and
+its maps' nodes. A small row is charged about 40 times more than before: a 2-component row
+with no attributes about 830 bytes, not 18; a 768-component row about 3.9 KB, not 3.1 KB.
+A tenant of tiny rows now reaches the 64 MiB default after about 80,000 of them, not 3.7
+million, so batched writes of small rows flush, and are refused with `429`, far sooner.
+Raise `tenant_buffered_bytes` (and the flush bound) to keep the old row counts.
+
+- A flushed, unfolded row is charged the same held bytes until a fold, not its bundle's
+  share, so a flush no longer frees cap.
+- A delete is charged its tombstone row (about 800 bytes), and a patch its encoded row.
+- Measured against the heap, the charge is 1.0 to 1.4 times it across nine row shapes
+  (`provisional`). Evidence is in [M213 verification](milestones/M213/VERIFIED.md).
+
 ## M212: a query reserves its plan's candidate rows
 
 Every public query reserves **candidate rows** for its whole plan before it reads anything,

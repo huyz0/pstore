@@ -1,0 +1,6 @@
+dims,attributes,rows,footprint_bytes,heap_net_bytes,heap_per_footprint
+2,false,4000,3328000,2804804,0.84
+2,true,4000,6222890,5443694,0.87
+128,false,4000,5344000,4820868,0.90
+128,true,4000,8238890,7459694,0.91
+768,false,1000,3896000,3765204,0.97

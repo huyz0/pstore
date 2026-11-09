@@ -325,9 +325,11 @@ async fn a_full_batched_write_is_refused_before_any_flush() {
 
 #[tokio::test]
 async fn deletes_reserve_their_tombstones() {
-    // Each delete is stored as a tombstone: its id and an 8-byte mark.
+    // Each delete is stored as a tombstone (M213: the row it is encoded as), every id here
+    // three characters.
     let ids = |n: usize| (0..n).map(|i| format!("x{i:02}")).collect::<Vec<_>>();
-    let cap = 10 * (3 + 8) - 1;
+    let t = pstore_engine::delete_footprint("x00");
+    let cap = 10 * t - 1;
     let (api, store) = serve(MemoryStore::new(), limits(cap, cap));
     let delete = |n| json!({"durability": "batched", "deletes": ids(n)});
     let path = "/v1/indexes/docs/documents";
@@ -336,7 +338,7 @@ async fn deletes_reserve_their_tombstones() {
     assert_eq!(totals(&store), [0; 4]);
     let (s, b, _) = send(&api, 1, "PUT", path, &delete(9)).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    assert_eq!(buffered(&api, 1).await.pending, 9 * (3 + 8));
+    assert_eq!(buffered(&api, 1).await.pending, 9 * t);
 }
 
 /// A store whose first bundle PUT after [`Held::arm`] waits until [`Held::release`].
