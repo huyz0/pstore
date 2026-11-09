@@ -2527,7 +2527,7 @@
             "default": false
           },
           "rank_by": {
-            "description": "An order (an attribute and asc or desc) or a scoring expression (M182)."
+            "description": "An order (an attribute and asc or desc) or a scoring expression (M182; numeric nodes M203)."
           },
           "aggregate_by": {
             "description": "Aggregations instead of rows (M140)."

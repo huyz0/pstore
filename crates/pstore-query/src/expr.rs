@@ -1,5 +1,6 @@
 //! Exact scoring expressions (M182): `BM25`, `Sum`, `Max`, `Product` and a filter as a score,
-//! as a typed tree evaluated over every admitted row.
+//! as a typed tree evaluated over every admitted row. M203 adds the numeric nodes:
+//! `Attribute`, literals, `Saturate`, `Decay` and `Dist`.
 //!
 //! ⚠️ **A whole-corpus scan, not a retriever.** A row's BM25 here is re-derived from its stored
 //! value -- re-analyzed with the function the segment builder posts it with -- against the
@@ -10,7 +11,7 @@ use crate::filter::Predicate;
 use crate::order::{open, visit_opened};
 use crate::run::{QueryError, Target, Texts, leg_terms};
 use pstore_blob::BlobStore;
-use pstore_format::Document;
+use pstore_format::{Document, Value};
 use pstore_index::text::{Stats, TextIndex, row_score};
 use std::collections::HashSet;
 
@@ -24,8 +25,26 @@ pub const MAX_CLAUSES: usize = 16;
 pub const MIN_WEIGHT: f32 = 1e-3;
 /// The greatest weight a `Product` may take.
 pub const MAX_WEIGHT: f32 = 1e3;
+/// The largest magnitude a literal, a `Dist` origin or a `Saturate`/`Decay` midpoint may
+/// have, and a float attribute reads as (M203). With M182's limits it keeps every
+/// intermediate below `1e63`: finite, never NaN.
+pub const MAX_MAGNITUDE: f64 = 1e30;
+/// The least midpoint a `Saturate` or `Decay` may take.
+pub const MIN_MIDPOINT: f64 = 1e-9;
+/// The greatest exponent a `Saturate` or `Decay` may take; the least is above 0.
+pub const MAX_EXPONENT: f64 = 16.0;
 
-/// A scoring expression (M182). Every score it produces is `>= 0`.
+/// What a `Dist` measures from (M203).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Origin {
+    /// A number: a numeric value's distance from it.
+    Number(f64),
+    /// An instant, in microseconds: a datetime value's distance from it, in milliseconds.
+    Instant(i64),
+}
+
+/// A scoring expression (M182). Every score an expression [`Expr::check`] accepts produces is
+/// `>= 0`; a clause under it may be signed (M203).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// The score a text leg `{field, query, last_as_prefix}` gives the row, `0` where it
@@ -46,6 +65,37 @@ pub enum Expr {
     Product(f32, Box<Expr>),
     /// `1` where the predicate admits the row, else `0`.
     Filter(Predicate),
+    /// The row's value when it is an int, a `uint64` or a float -- a float clamped to
+    /// [`MAX_MAGNITUDE`] -- else no value (M203). Signed.
+    Attribute(String),
+    /// A number. Signed when it is negative.
+    Literal(f64),
+    /// `x^p / (x^p + m^p)` of `x = max(of, 0)`; `0` where `of` has no value.
+    Saturate {
+        /// The clause saturated.
+        of: Box<Expr>,
+        /// `m`, where it reaches `0.5`.
+        midpoint: f64,
+        /// `p`.
+        exponent: f64,
+    },
+    /// `m^p / (x^p + m^p)` of `x = max(of, 0)`; `0` where `of` has no value.
+    Decay {
+        /// The clause decayed.
+        of: Box<Expr>,
+        /// `m`, where it reaches `0.5`.
+        midpoint: f64,
+        /// `p`.
+        exponent: f64,
+    },
+    /// `|v - origin|` of the attribute's value `v`: a number's from a number, a datetime's
+    /// from an instant in milliseconds, and no value otherwise.
+    Dist {
+        /// The attribute.
+        attr: String,
+        /// Where it is measured from.
+        origin: Origin,
+    },
 }
 
 impl Expr {
@@ -55,9 +105,41 @@ impl Expr {
     ///
     /// # Errors
     /// Why, in a sentence a caller can be shown.
+    ///
+    /// M203: also a literal, midpoint, exponent or origin out of range, and a root that is not
+    /// [non-negative](Expr::non_negative).
     pub fn check(&self) -> Result<(), String> {
         let mut nodes = 0;
-        self.check_at(1, &mut nodes)
+        self.check_at(1, &mut nodes)?;
+        if self.non_negative() {
+            Ok(())
+        } else {
+            Err(
+                "an expression's score must be non-negative by its form: wrap a signed clause \
+                 (an Attribute, a negative number) in Max with a non-negative clause, as \
+                 [\"Max\", [0, clause]], or in Saturate, Decay or Dist"
+                    .to_owned(),
+            )
+        }
+    }
+
+    /// Whether every score this node gives is `>= 0`, by its form alone (M203): `Attribute`
+    /// and a negative literal are signed; a `Sum` is non-negative when every clause is, a
+    /// `Product` when its clause is, a `Max` when **any** clause is; the rest always are.
+    #[must_use]
+    pub fn non_negative(&self) -> bool {
+        match self {
+            Self::Attribute(_) => false,
+            Self::Literal(v) => *v >= 0.0,
+            Self::Sum(all) => all.iter().all(Self::non_negative),
+            Self::Max(all) => all.iter().any(Self::non_negative),
+            Self::Product(_, e) => e.non_negative(),
+            Self::Bm25 { .. }
+            | Self::Filter(_)
+            | Self::Saturate { .. }
+            | Self::Decay { .. }
+            | Self::Dist { .. } => true,
+        }
     }
 
     fn check_at(&self, depth: usize, nodes: &mut usize) -> Result<(), String> {
@@ -69,7 +151,38 @@ impl Expr {
             return Err(format!("an expression nests at most {MAX_DEPTH} deep"));
         }
         match self {
-            Self::Bm25 { .. } | Self::Filter(_) => Ok(()),
+            Self::Bm25 { .. } | Self::Filter(_) | Self::Attribute(_) => Ok(()),
+            Self::Literal(v) => magnitude_ok(*v)
+                .then_some(())
+                .ok_or_else(|| format!("a number is finite and at most {MAX_MAGNITUDE}, not {v}")),
+            Self::Dist { origin, .. } => match origin {
+                Origin::Number(o) if !magnitude_ok(*o) => Err(format!(
+                    "a Dist's origin is finite and at most {MAX_MAGNITUDE}, not {o}"
+                )),
+                _ => Ok(()),
+            },
+            Self::Saturate {
+                of,
+                midpoint,
+                exponent,
+            }
+            | Self::Decay {
+                of,
+                midpoint,
+                exponent,
+            } => {
+                if !(MIN_MIDPOINT..=MAX_MAGNITUDE).contains(midpoint) {
+                    return Err(format!(
+                        "a midpoint is from {MIN_MIDPOINT} to {MAX_MAGNITUDE}, not {midpoint}"
+                    ));
+                }
+                if !(*exponent > 0.0 && *exponent <= MAX_EXPONENT) {
+                    return Err(format!(
+                        "an exponent is above 0 and at most {MAX_EXPONENT}, not {exponent}"
+                    ));
+                }
+                of.check_at(depth + 1, nodes)
+            }
             Self::Sum(all) | Self::Max(all) => {
                 if all.is_empty() || all.len() > MAX_CLAUSES {
                     return Err(format!(
@@ -107,7 +220,28 @@ impl Expr {
                 Self::Max(all.iter().map(|e| e.bound_texts(primary, texts)).collect())
             }
             Self::Product(w, e) => Self::Product(*w, Box::new(e.bound_texts(primary, texts))),
-            bm25 @ Self::Bm25 { .. } => bm25.clone(),
+            Self::Saturate {
+                of,
+                midpoint,
+                exponent,
+            } => Self::Saturate {
+                of: Box::new(of.bound_texts(primary, texts)),
+                midpoint: *midpoint,
+                exponent: *exponent,
+            },
+            Self::Decay {
+                of,
+                midpoint,
+                exponent,
+            } => Self::Decay {
+                of: Box::new(of.bound_texts(primary, texts)),
+                midpoint: *midpoint,
+                exponent: *exponent,
+            },
+            leaf @ (Self::Bm25 { .. }
+            | Self::Attribute(_)
+            | Self::Literal(_)
+            | Self::Dist { .. }) => leaf.clone(),
         }
     }
 
@@ -141,10 +275,33 @@ impl Expr {
         f(self);
         match self {
             Self::Sum(all) | Self::Max(all) => all.iter().for_each(|e| e.walk(f)),
-            Self::Product(_, e) => e.walk(f),
-            Self::Bm25 { .. } | Self::Filter(_) => {}
+            Self::Product(_, e) | Self::Saturate { of: e, .. } | Self::Decay { of: e, .. } => {
+                e.walk(f);
+            }
+            Self::Bm25 { .. }
+            | Self::Filter(_)
+            | Self::Attribute(_)
+            | Self::Literal(_)
+            | Self::Dist { .. } => {}
         }
     }
+}
+
+/// A kept score as the wire's `f32` carries it: narrowed, and clamped into the smallest
+/// positive `f32` to `f32::MAX` (M203), so a kept row never reports `0` nor infinity.
+#[must_use]
+pub fn wire_score(s: f64) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped into f32's positive range first"
+    )]
+    let narrowed = s.clamp(f64::from(f32::from_bits(1)), f64::from(f32::MAX)) as f32;
+    narrowed
+}
+
+/// Whether `v` is finite and within [`MAX_MAGNITUDE`].
+fn magnitude_ok(v: f64) -> bool {
+    v.abs() <= MAX_MAGNITUDE
 }
 
 /// Whether `w` is a weight [`Expr::check`] accepts.
@@ -331,6 +488,11 @@ enum Node<'a> {
     Max(Vec<Node<'a>>),
     Product(f64, Box<Node<'a>>),
     Filter(&'a Predicate),
+    Attribute(&'a str),
+    Literal(f64),
+    Saturate(Box<Node<'a>>, f64, f64),
+    Decay(Box<Node<'a>>, f64, f64),
+    Dist(&'a str, Origin),
 }
 
 impl<'a> Node<'a> {
@@ -354,12 +516,53 @@ impl<'a> Node<'a> {
             Expr::Max(all) => Self::Max(all.iter().map(|e| Self::of(e, fields)).collect()),
             Expr::Product(w, e) => Self::Product(f64::from(*w), Box::new(Self::of(e, fields))),
             Expr::Filter(p) => Self::Filter(p),
+            Expr::Attribute(a) => Self::Attribute(a),
+            Expr::Literal(v) => Self::Literal(*v),
+            Expr::Saturate {
+                of,
+                midpoint,
+                exponent,
+            } => Self::Saturate(Box::new(Self::of(of, fields)), *midpoint, *exponent),
+            Expr::Decay {
+                of,
+                midpoint,
+                exponent,
+            } => Self::Decay(Box::new(Self::of(of, fields)), *midpoint, *exponent),
+            Expr::Dist { attr, origin } => Self::Dist(attr, *origin),
         }
     }
 
-    /// The row's score, in `f64`. `rows` holds each field's terms of this row, made the first
-    /// time a clause reads them.
+    /// The row's score, in `f64`: its value, no value as `0`. `rows` holds each field's terms
+    /// of this row, made the first time a clause reads them.
     fn score(&self, fields: &Fields, d: &Document, rows: &mut [Option<Vec<String>>]) -> f64 {
+        self.value(fields, d, rows).unwrap_or(0.0)
+    }
+
+    /// The row's value, `None` for no value: only an `Attribute` or a `Dist` has none.
+    fn value(
+        &self,
+        fields: &Fields,
+        d: &Document,
+        rows: &mut [Option<Vec<String>>],
+    ) -> Option<f64> {
+        Some(match self {
+            Self::Attribute(a) => return number(d.attrs.get(*a)?),
+            Self::Literal(v) => *v,
+            Self::Dist(a, origin) => return distance(d.attrs.get(*a)?, *origin),
+            Self::Saturate(n, m, p) => n
+                .value(fields, d, rows)
+                .map_or(0.0, |x| saturate(x, *m, *p)),
+            Self::Decay(n, m, p) => n.value(fields, d, rows).map_or(0.0, |x| decay(x, *m, *p)),
+            Self::Bm25 { .. }
+            | Self::Sum(_)
+            | Self::Max(_)
+            | Self::Product(..)
+            | Self::Filter(_) => self.relevance(fields, d, rows),
+        })
+    }
+
+    /// M182's nodes, which always have a value.
+    fn relevance(&self, fields: &Fields, d: &Document, rows: &mut [Option<Vec<String>>]) -> f64 {
         match self {
             Self::Bm25 {
                 field,
@@ -375,14 +578,60 @@ impl<'a> Node<'a> {
                 ))
             }
             Self::Sum(all) => all.iter().map(|n| n.score(fields, d, rows)).sum(),
+            // From below every value, as a clause may be signed (M203).
             Self::Max(all) => all
                 .iter()
                 .map(|n| n.score(fields, d, rows))
-                .fold(0.0, f64::max),
+                .fold(f64::NEG_INFINITY, f64::max),
             Self::Product(w, n) => w * n.score(fields, d, rows),
             Self::Filter(p) => f64::from(u8::from(p.admits(&d.id, &d.attrs))),
+            Self::Attribute(_)
+            | Self::Literal(_)
+            | Self::Saturate(..)
+            | Self::Decay(..)
+            | Self::Dist(..) => self.score(fields, d, rows),
         }
     }
+}
+
+/// A numeric value as `Attribute` reads it: a float clamped to [`MAX_MAGNITUDE`], and no
+/// value for any other kind.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "an attribute is scored in f64, as a float attribute is stored"
+)]
+fn number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Uint(u) => Some(*u as f64),
+        Value::Float(f) => Some(f.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE)),
+        _ => None,
+    }
+}
+
+/// `|v - origin|`: a number's from a number, a datetime's from an instant in milliseconds.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a distance in milliseconds is scored in f64"
+)]
+fn distance(v: &Value, origin: Origin) -> Option<f64> {
+    match (origin, v) {
+        (Origin::Number(o), v) => number(v).map(|x| (x - o).abs()),
+        // Both within `datetime::MIN..=MAX`, so the difference fits an i64.
+        (Origin::Instant(o), Value::DateTime(t)) => Some((t.abs_diff(o) as f64) / 1_000.0),
+        (Origin::Instant(_), _) => None,
+    }
+}
+
+/// `x^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (m/x)^p)`: no power overflows. At `0`,
+/// `m/0` is infinite and the score `0`, so no branch is needed.
+fn saturate(x: f64, m: f64, p: f64) -> f64 {
+    1.0 / (1.0 + (m / x.max(0.0)).powf(p))
+}
+
+/// `m^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (x/m)^p)`: `1` at `0`.
+fn decay(x: f64, m: f64, p: f64) -> f64 {
+    1.0 / (1.0 + (x.max(0.0) / m).powf(p))
 }
 
 /// The first `cap` rows scoring above 0, by score descending then id ascending.
@@ -459,6 +708,16 @@ mod tests {
                 .map(|i| format!("d{i:03}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// M203 criterion 3: a kept score never narrows to `0` or to infinity.
+    #[test]
+    fn wire_scores_stay_positive() {
+        assert_eq!(wire_score(1e-50).to_bits(), 1, "the smallest positive f32");
+        assert!(wire_score(1e-40) > 0.0, "a subnormal f32");
+        assert_eq!(wire_score(1e60).to_bits(), f32::MAX.to_bits());
+        assert_eq!(wire_score(2.5).to_bits(), 2.5f32.to_bits());
+        assert!(wire_score(1e-30) > 0.0);
     }
 
     #[test]

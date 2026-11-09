@@ -4058,11 +4058,7 @@ async fn run<E: BlobStore>(
                         attributes: selected(req, &d.attrs),
                         id: d.id,
                         // The wire's f32, narrowed from the f64 the rows were ordered by.
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "M182 Delta 1 bounds a kept score inside f32's range"
-                        )]
-                        score: Some(score as f32),
+                        score: Some(pstore_query::wire_score(score)),
                         dist: None,
                         highlight: None,
                         highlights: None,
@@ -5131,9 +5127,144 @@ fn expression(v: &serde_json::Value) -> Result<pstore_query::Expr, String> {
                 last_as_prefix,
             })
         }
+        // M203: the numeric nodes. Saturate, Decay and Dist only with an array second, so a
+        // filter on an attribute of that name stays a filter.
+        // Only this shape: a filter on an attribute named `Attribute` stays a filter.
+        Some([serde_json::Value::String(op), serde_json::Value::String(a)])
+            if op == "Attribute" =>
+        {
+            Ok(Expr::Attribute(a.clone()))
+        }
+        Some(
+            [
+                serde_json::Value::String(op),
+                e @ serde_json::Value::Array(_),
+                rest @ ..,
+            ],
+        ) if op == "Saturate" || op == "Decay" => {
+            let [serde_json::Value::Object(params)] = rest else {
+                return Err(format!(
+                    "{op} takes a clause and its params: [\"{op}\", clause, {{\"midpoint\": m}}]"
+                ));
+            };
+            let (midpoint, exponent) = curve(op, params)?;
+            let of = Box::new(expression(e)?);
+            Ok(if op == "Saturate" {
+                Expr::Saturate {
+                    of,
+                    midpoint,
+                    exponent,
+                }
+            } else {
+                Expr::Decay {
+                    of,
+                    midpoint,
+                    exponent,
+                }
+            })
+        }
+        Some(
+            [
+                serde_json::Value::String(op),
+                a @ serde_json::Value::Array(_),
+                rest @ ..,
+            ],
+        ) if op == "Dist" => {
+            let attr = match a.as_array().map(Vec::as_slice) {
+                Some(
+                    [
+                        serde_json::Value::String(o),
+                        serde_json::Value::String(attr),
+                    ],
+                ) if o == "Attribute" => attr.clone(),
+                _ => {
+                    return Err(
+                        "Dist measures an attribute: [\"Dist\", [\"Attribute\", name], origin]"
+                            .to_owned(),
+                    );
+                }
+            };
+            let origin = match rest {
+                [serde_json::Value::Number(n)] => {
+                    pstore_query::DistOrigin::Number(n.as_f64().unwrap_or(f64::NAN))
+                }
+                [serde_json::Value::String(t)] => pstore_query::DistOrigin::Instant(
+                    origin_instant(t)
+                        .ok_or_else(|| format!("a Dist's origin {t:?} is no RFC 3339 datetime"))?,
+                ),
+                _ => {
+                    return Err(
+                        "Dist takes an attribute and an origin, a number or a datetime".to_owned(),
+                    );
+                }
+            };
+            Ok(Expr::Dist { attr, origin })
+        }
+        _ if v.is_number() => v
+            .as_f64()
+            .map(Expr::Literal)
+            .ok_or_else(|| format!("{v} is no number")),
         Some(_) => clause(v).map(Expr::Filter).map_err(|e| e.message),
         None => Err(format!("an expression is an array, not {v}")),
     }
+}
+
+/// A `Saturate`'s or `Decay`'s params (M203): `midpoint`, a number or a duration string in
+/// milliseconds, and `exponent`, by default 1. Ranges are [`pstore_query::Expr::check`]'s.
+fn curve(
+    op: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(f64, f64), String> {
+    if let Some(k) = params.keys().find(|k| *k != "midpoint" && *k != "exponent") {
+        return Err(format!(
+            "{op}'s params are midpoint and exponent, not {k:?}"
+        ));
+    }
+    let midpoint = match params.get("midpoint") {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(d)) => duration_ms(d),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        format!("{op}'s midpoint is a number, or a duration such as \"6h\" (s, m, h, d or w)")
+    })?;
+    let exponent = match params.get("exponent") {
+        None => 1.0,
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+        Some(_) => return Err(format!("{op}'s exponent is a number")),
+    };
+    Ok((midpoint, exponent))
+}
+
+/// A duration string `<n><unit>` as milliseconds (M203): `n` a decimal of up to 15 digits with
+/// an optional fraction, `unit` one of `s m h d w`. `None` for anything else.
+fn duration_ms(d: &str) -> Option<f64> {
+    let unit = match d.as_bytes().last()? {
+        b's' => 1_000.0,
+        b'm' => 60_000.0,
+        b'h' => 3_600_000.0,
+        b'd' => 86_400_000.0,
+        b'w' => 604_800_000.0,
+        _ => return None,
+    };
+    let n = d.get(..d.len() - 1)?;
+    let (whole, frac) = n.split_once('.').unwrap_or((n, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let ok = !whole.is_empty()
+        && digits(whole)
+        && digits(frac)
+        && frac.is_empty() != n.contains('.')
+        && whole.len() + frac.len() <= 15;
+    ok.then(|| n.parse::<f64>().ok())
+        .flatten()
+        .map(|v| v * unit)
+}
+
+/// A `Dist`'s datetime origin: RFC 3339, and UTC when it has no offset, as the vendor's
+/// example is written (M203).
+fn origin_instant(t: &str) -> Option<i64> {
+    // A `Z` appended parses only where the instant had no offset of its own.
+    pstore_format::datetime::parse(t).or_else(|| pstore_format::datetime::parse(&format!("{t}Z")))
 }
 
 /// One `[attribute, "asc" | "desc"]` pair of `rank_by`.

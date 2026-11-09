@@ -24,8 +24,9 @@ mod run;
 
 pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
 pub use expr::{
-    Expr, MAX_CLAUSES as MAX_EXPR_CLAUSES, MAX_DEPTH as MAX_EXPR_DEPTH,
-    MAX_NODES as MAX_EXPR_NODES, MAX_WEIGHT, MIN_WEIGHT, rank,
+    Expr, MAX_CLAUSES as MAX_EXPR_CLAUSES, MAX_DEPTH as MAX_EXPR_DEPTH, MAX_EXPONENT,
+    MAX_MAGNITUDE, MAX_NODES as MAX_EXPR_NODES, MAX_WEIGHT, MIN_MIDPOINT, MIN_WEIGHT,
+    Origin as DistOrigin, rank, wire_score,
 };
 pub use filter::{
     Bound, ID as ID_ATTRIBUTE, MAX_PATTERN, Needle, Op, Pattern, PatternKind, Predicate, TokenOp,
