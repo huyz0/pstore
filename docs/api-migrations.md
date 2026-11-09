@@ -1,5 +1,22 @@
 # Native API migration notes
 
+## M221: a generated Python client
+
+`clients/python/pstore_client` is generated from the contract by `scripts/gen-clients.py`, and
+never edited: one `Client` method per `operationId`, standard library only, Python 3.9 or later.
+
+```python
+from pstore_client import Client, PstoreError
+c = Client("http://localhost:8080", token=TOKEN)
+c.write_documents("docs", {"durability": "durable", "documents": [{"id": 1, "vector": [0.1, 0.2]}]})
+c.query("docs", {"vector": [0.1, 0.2], "consistency": "session"}, session=c.last_session)
+```
+
+- A status of 400 or more raises `PstoreError` with the envelope's `code`, `message`,
+  `retryable` and `Retry-After`. `last_status` is the latest success's status (a copy answers
+  202 when this request started it, 200 when an earlier one had), and `last_session` the latest
+  `x-pstore-session`. Evidence is in [M221 verification](milestones/M221/VERIFIED.md).
+
 ## M220: the native API as an OpenAPI contract
 
 [`api/openapi.json`](../api/openapi.json) (OpenAPI 3.1, contract version `1.0.0`) describes
