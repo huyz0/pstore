@@ -6,10 +6,11 @@
 # Builds the server, starts it unsecured on the in-memory store with every applied-write
 # level on (what `fixture_server` in crates/pstore-server/tests/it/openapi.rs
 # builds in process), then runs each client's suite with PSTORE_URL naming it. Every client
-# runs api/fixtures/native.json's steps through its generated methods.
+# runs api/fixtures/native.json's steps through its generated methods, each client in a tenant
+# of its own (PSTORE_FIXTURE_TENANT) so the server they share starts empty for each.
 #
-# ⚠️ Outside `cargo test` for depth.sh's reason, and because it needs Python (and, from M222,
-# Node): a mutant of the server rebuilding it once per mutant would buy nothing the in-process
+# ⚠️ Outside `cargo test` for depth.sh's reason, and because it needs Python, Node 22.6 or later
+# and `tsc`: a mutant of the server rebuilding it once per mutant would buy nothing the in-process
 # conformance test does not already check.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -43,4 +44,11 @@ if [ "$up" != 1 ]; then
 fi
 
 echo "python client"
-py -m unittest discover -s clients/python/tests -v
+PSTORE_FIXTURE_TENANT=101 py -m unittest discover -s clients/python/tests -v
+
+# M222: the TypeScript client, type-checked strict, then run by Node's own test runner with
+# its type stripping (Node 22.6 or later). Both are required: a client that does not compile
+# or did not run is not a passing client.
+echo "typescript client"
+tsc -p clients/typescript
+PSTORE_FIXTURE_TENANT=102 node --experimental-strip-types --no-warnings --test clients/typescript/test/fixtures.test.mjs

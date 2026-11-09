@@ -61,7 +61,7 @@ class Fixtures(unittest.TestCase):
         url = os.environ.get("PSTORE_URL")
         self.assertTrue(url, "PSTORE_URL names the server: run scripts/clients.sh")
         fixtures = json.loads((ROOT / "api" / "fixtures" / "native.json").read_text())
-        client = pstore_client.Client(url, tenant=fixtures["tenant"])
+        client = pstore_client.Client(url, tenant=os.environ.get("PSTORE_FIXTURE_TENANT", fixtures["tenant"]))
         failures = []
         called = set()
         for step in fixtures["steps"]:

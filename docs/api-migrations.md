@@ -1,5 +1,20 @@
 # Native API migration notes
 
+## M222: a generated TypeScript client
+
+`clients/typescript/src/index.ts` is generated beside the Python client, dependency-free, for
+Node 22.6 or later (type stripping) or any TypeScript build:
+
+```ts
+import { Client } from "./clients/typescript/src/index.ts";
+const c = new Client({ baseUrl: "http://localhost:8080", token: TOKEN });
+await c.writeDocuments("docs", { durability: "durable", documents: [{ id: 1, vector: [0.1, 0.2] }] });
+await c.query("docs", { vector: [0.1, 0.2], consistency: "session" }, { session: c.lastSession });
+```
+
+Methods are the operationIds in camelCase; a refusal rejects with `PstoreError`. Evidence is in
+[M222 verification](milestones/M222/VERIFIED.md).
+
 ## M221: a generated Python client
 
 `clients/python/pstore_client` is generated from the contract by `scripts/gen-clients.py`, and

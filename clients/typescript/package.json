@@ -1,0 +1,9 @@
+{
+  "name": "@pstore/client",
+  "version": "1.0.0",
+  "description": "pstore's native API, generated from api/openapi.json by scripts/gen-clients.py",
+  "type": "module",
+  "private": true,
+  "exports": "./src/index.ts",
+  "engines": { "node": ">=22.6" }
+}
