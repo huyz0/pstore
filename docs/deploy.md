@@ -357,9 +357,37 @@ always. The primary takes it by naming `"field": "text"`, since a string leg has
 - Not with `vector`, `multi`, `text`, `field`, `exact`, `fusion`, `boost`, `aggregate_by`
   or `highlight`. `top_k + offset` is at most 10,000. A query with an expression is
   answered by the server that received it.
-- `Attribute`, `Saturate`, `Decay` and `Dist` are not supported yet.
+- Numbers in a score ([M203](milestones/M203/SPEC.md)):
+  ```json
+  {"rank_by": ["Sum", [["title", "BM25", "quick fox"],
+                       ["Product", 1.7, ["Saturate", ["Attribute", "clicks"], {"midpoint": 100}]],
+                       ["Decay", ["Dist", ["Attribute", "published_at"], "2026-02-03T12:13:14"],
+                        {"midpoint": "6h"}]]]}
+  ```
+  - `["Attribute", name]` is the row's int, `uint64` or float value (a float beyond `±1e30`
+    reads as `±1e30`). A string, bool, datetime, array or a missing attribute is **no
+    value**. A JSON number is a clause too, at most `1e30` either way.
+  - `["Saturate", e, {"midpoint": m, "exponent": p}]` is `x^p / (x^p + m^p)` and `Decay` is
+    `m^p / (x^p + m^p)`, of `x = max(e, 0)`; `exponent` defaults to 1 and is above 0, at most
+    16. `midpoint` is from `1e-9` to `1e30`, or a duration (`"6h"`; `s`, `m`, `h`, `d`, `w`),
+    read as milliseconds. **No value scores 0 under both**: a row lacking the attribute gets
+    no boost. That is the clause's own property: `Decay(["Sum", [["Attribute", n]]])` scores
+    1 for a missing `n`, its `Sum` being 0.
+  - `["Dist", ["Attribute", name], origin]` is `|v - origin|`: from a number, of a numeric
+    value; from an RFC 3339 instant (UTC when it has no offset), of a datetime, in
+    milliseconds. Anything else is no value, which is 0 outside `Saturate` and `Decay`.
+  - ⚠️ **A score must be non-negative by its form.** `Attribute` and a negative number are
+    signed, and so is a `Sum` or `Product` over one; a `Max` with any non-negative clause is
+    not. So `["Attribute", "clicks"]` alone is refused, and `["Max", [0, ["Attribute",
+    "clicks"]]]` is accepted -- even for a `uint64` attribute, whose type is not read.
+  - A kept score is never reported as 0: one below `f32`'s range reports its smallest
+    positive value, and one above it `f32::MAX`. Rows are ordered by the exact `f64`.
+  - Geo origins, `Dist` of anything but an `Attribute`, and an `Attribute` of a datetime
+    outside `Dist` are not supported.
 - Inside `rank_by`, a filter on an attribute named `Sum`, `Max` or `Product` reads as that
-  operator; filter such an attribute in `filters`.
+  operator; filter such an attribute in `filters`. One named `Saturate`, `Decay`, `Dist` or
+  `Attribute` stays a filter (their operands are arrays, or one name), but a pair of strings
+  is always an order, so an expression cannot be `["Attribute", name]` at the top.
 
 ## Tokenizers and a token length limit
 

@@ -230,6 +230,12 @@ async fn an_expression_query_takes_three_rounds() {
                 Value::Int(2),
             ))),
         ),
+        // M203: an attribute's value comes from the blocks the scan reads anyway.
+        Expr::Saturate {
+            of: Box::new(Expr::Attribute("k".to_owned())),
+            midpoint: 2.0,
+            exponent: 1.0,
+        },
     ]);
     for segments in [1usize, 8] {
         let store = Arc::new(DepthCounting::new(MemoryStore::new()));

@@ -19,7 +19,8 @@ use pstore_format::{Document, Value};
 use pstore_index::cluster::Params;
 use pstore_index::vec_index;
 use pstore_query::{
-    Expr, Fusion, Op, Predicate, Prefetch, Target, Texts, Weights, query_with_texts, rank,
+    DistOrigin as Origin, Expr, Fusion, Op, Predicate, Prefetch, Target, Texts, Weights,
+    query_with_texts, rank,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -47,6 +48,12 @@ const KW_WORDS: [&str; 9] = [
     "alphabet",
 ];
 const TAGS: [&str; 3] = ["red", "green", "blue"];
+/// M203: a signed int, a signed float and a datetime.
+const N: &str = "n";
+const F: &str = "f";
+const AT: &str = "at";
+/// 2026-01-01T00:00:00Z, in microseconds.
+const T0: i64 = 1_767_225_600_000_000;
 
 fn texts() -> Texts {
     Texts {
@@ -115,7 +122,28 @@ fn row(i: usize, rng: &mut Rng) -> Document {
     }
     d.attrs
         .insert("tag".into(), Value::Str(TAGS[i % 3].to_owned()));
+    numeric_attrs(i, &mut d);
     d
+}
+
+/// M203's attributes, from `i` alone so M182's draws are unchanged: a signed int `n`, a
+/// string on a few rows; a signed float `f`; a datetime `at`, an hour apart. Each is missing
+/// on some rows.
+fn numeric_attrs(i: usize, d: &mut Document) {
+    if i % 11 == 3 {
+        d.attrs.insert(N.into(), Value::Str("seven".into()));
+    } else if i % 4 != 1 {
+        d.attrs
+            .insert(N.into(), Value::Int(((i * 7919) % 21) as i64 - 10));
+    }
+    if i % 6 != 2 {
+        d.attrs
+            .insert(F.into(), Value::Float(((i * 31) % 17) as f64 * 0.37 - 2.5));
+    }
+    if i % 9 != 4 {
+        d.attrs
+            .insert(AT.into(), Value::DateTime(T0 + i as i64 * 3_600_000_000));
+    }
 }
 
 /// The corpus: each segment's documents, and the rows of each its delete vector names.
@@ -360,9 +388,47 @@ fn ref_score(stats: &BTreeMap<&str, RefStats>, e: &Expr, d: &Document) -> f64 {
         Expr::Max(all) => all
             .iter()
             .map(|e| ref_score(stats, e, d))
-            .fold(0.0, f64::max),
+            .fold(f64::NEG_INFINITY, f64::max),
         Expr::Product(w, e) => f64::from(*w) * ref_score(stats, e, d),
         Expr::Filter(p) => f64::from(u8::from(p.admits(&d.id, &d.attrs))),
+        _ => ref_value(stats, e, d).unwrap_or(0.0),
+    }
+}
+
+/// M203's nodes, as the vendor writes them: `None` is no value.
+fn ref_value(stats: &BTreeMap<&str, RefStats>, e: &Expr, d: &Document) -> Option<f64> {
+    let number = |a: &str| match d.attrs.get(a)? {
+        Value::Int(v) => Some(*v as f64),
+        Value::Uint(v) => Some(*v as f64),
+        Value::Float(v) => Some(v.clamp(-1e30, 1e30)),
+        _ => None,
+    };
+    match e {
+        Expr::Attribute(a) => number(a),
+        Expr::Literal(v) => Some(*v),
+        // No value scores 0 under both; a value is clamped at 0, then the formula as written.
+        Expr::Saturate {
+            of,
+            midpoint,
+            exponent,
+        } => Some(ref_value(stats, of, d).map_or(0.0, |x| {
+            let x = x.max(0.0).powf(*exponent);
+            x / (x + midpoint.powf(*exponent))
+        })),
+        Expr::Decay {
+            of,
+            midpoint,
+            exponent,
+        } => Some(ref_value(stats, of, d).map_or(0.0, |x| {
+            let m = midpoint.powf(*exponent);
+            m / (x.max(0.0).powf(*exponent) + m)
+        })),
+        Expr::Dist { attr, origin } => match (origin, d.attrs.get(attr)?) {
+            (Origin::Number(o), _) => number(attr).map(|v| (v - o).abs()),
+            (Origin::Instant(o), Value::DateTime(t)) => Some(((t - o) as f64 / 1000.0).abs()),
+            (Origin::Instant(_), _) => None,
+        },
+        _ => Some(ref_score(stats, e, d)),
     }
 }
 
@@ -658,6 +724,318 @@ async fn zero_scores_are_dropped() {
     let ids: Vec<String> = got.iter().map(|(id, _)| id.clone()).collect();
     assert_eq!(ids, want, "exactly the filter's rows, by id");
     assert!(got.iter().all(|(_, s)| *s == 2.5), "{got:?}");
+}
+
+// --- M203: Attribute, literals, Saturate, Decay, Dist -------------------------------------
+
+const MIDPOINTS: [f64; 4] = [1e-3, 0.5, 3.0, 7_200_000.0];
+const EXPONENTS: [f64; 4] = [0.5, 1.0, 2.0, 3.5];
+const LITERALS: [f64; 5] = [-4.0, -0.5, 0.0, 1.0, 2.5];
+
+/// A leaf or node of M203's kinds, or M182's.
+fn numeric_tree(rng: &mut Rng, depth: usize) -> Expr {
+    let attribute = |rng: &mut Rng| Expr::Attribute([N, F, AT][rng.below(3)].to_owned());
+    let dist = |rng: &mut Rng| match rng.below(3) {
+        0 => Expr::Dist {
+            attr: AT.into(),
+            origin: Origin::Instant(T0 + 40 * 3_600_000_000),
+        },
+        1 => Expr::Dist {
+            attr: N.into(),
+            origin: Origin::Number(2.0),
+        },
+        _ => Expr::Dist {
+            attr: F.into(),
+            origin: Origin::Number(-1.0),
+        },
+    };
+    if depth >= 5 || rng.below(3) == 0 {
+        return match rng.below(6) {
+            0 => attribute(rng),
+            1 => Expr::Literal(LITERALS[rng.below(LITERALS.len())]),
+            2 => dist(rng),
+            3 => Expr::Filter(tag(rng)),
+            _ => bm25(rng),
+        };
+    }
+    let child = |rng: &mut Rng| Box::new(numeric_tree(rng, depth + 1));
+    // A Saturate's or Decay's argument stays within 1e-3..1e6, where the vendor's formula as
+    // written neither under- nor overflows.
+    let argument = |rng: &mut Rng| {
+        Box::new(match rng.below(4) {
+            0 => attribute(rng),
+            1 => dist(rng),
+            2 => Expr::Literal(LITERALS[rng.below(LITERALS.len())]),
+            _ => Expr::Sum(vec![
+                attribute(rng),
+                Expr::Literal(LITERALS[rng.below(LITERALS.len())]),
+            ]),
+        })
+    };
+    let midpoint = MIDPOINTS[rng.below(MIDPOINTS.len())];
+    let exponent = EXPONENTS[rng.below(EXPONENTS.len())];
+    match rng.below(6) {
+        0 => Expr::Sum((0..1 + rng.below(4)).map(|_| *child(rng)).collect()),
+        1 => Expr::Max((0..1 + rng.below(4)).map(|_| *child(rng)).collect()),
+        2 => Expr::Product(WEIGHTS[rng.below(WEIGHTS.len())], child(rng)),
+        3 => Expr::Saturate {
+            of: argument(rng),
+            midpoint,
+            exponent,
+        },
+        4 => Expr::Decay {
+            of: argument(rng),
+            midpoint,
+            exponent,
+        },
+        _ => Expr::Max(vec![Expr::Literal(0.0), *child(rng)]),
+    }
+}
+
+/// M203 criterion 1: 300 seeded trees over every node kind, up to depth 5, each root
+/// non-negative: a signed one is drawn again.
+#[tokio::test]
+async fn numeric_expressions_match_the_oracle() {
+    let c = corpus(false).await;
+    let mut rng = Rng(0x0203_0203);
+    let mut nonempty = 0;
+    let mut kinds = BTreeMap::<&str, usize>::new();
+    for i in 0..300 {
+        let e = std::iter::repeat_with(|| numeric_tree(&mut rng, 1))
+            .find(|e| e.check().is_ok())
+            .unwrap();
+        let s = format!("{e:?}");
+        for k in [
+            "Attribute",
+            "Literal(-",
+            "Saturate",
+            "Decay",
+            "Dist",
+            "Bm25",
+            "Max",
+        ] {
+            *kinds.entry(k).or_insert(0) += usize::from(s.contains(k));
+        }
+        let filter = (i % 3 == 0).then(|| tag(&mut rng));
+        let want = reference(&c, &e, filter.as_ref());
+        let got = ranked(&c, &e, filter.as_ref()).await;
+        assert_matches(&got, &want, 1e-4, &format!("tree {i}: {e:?}"));
+        nonempty += usize::from(!want.is_empty());
+    }
+    assert!(nonempty > 150, "{nonempty} of 300 trees kept a row");
+    // Every kind is drawn often, a negative literal among them.
+    assert!(kinds.values().all(|n| *n >= 30), "{kinds:?}");
+}
+
+/// M203 criterion 2: the root is non-negative by its form, or refused.
+#[test]
+fn signed_roots_are_refused() {
+    let a = || Expr::Attribute(N.into());
+    let bm = || Expr::Bm25 {
+        field: BODY.into(),
+        query: "fox".into(),
+        last_as_prefix: false,
+    };
+    let sat = || Expr::Saturate {
+        of: Box::new(a()),
+        midpoint: 1.0,
+        exponent: 1.0,
+    };
+    for signed in [
+        a(),
+        Expr::Literal(-1.0),
+        Expr::Sum(vec![bm(), a()]),
+        Expr::Product(2.0, Box::new(a())),
+        Expr::Max(vec![a(), Expr::Literal(-1.0)]),
+        Expr::Sum(vec![Expr::Max(vec![a()]), bm()]),
+    ] {
+        let why = signed.check().unwrap_err();
+        assert!(why.contains("negative"), "{signed:?}: {why}");
+    }
+    for ok in [
+        Expr::Max(vec![Expr::Literal(0.0), a()]),
+        Expr::Max(vec![a(), bm()]),
+        sat(),
+        Expr::Sum(vec![sat(), Expr::Literal(1.0), bm()]),
+        Expr::Product(
+            2.0,
+            Box::new(Expr::Max(vec![
+                Expr::Sum(vec![a(), Expr::Literal(-3.0)]),
+                Expr::Literal(0.0),
+            ])),
+        ),
+        Expr::Decay {
+            of: Box::new(Expr::Sum(vec![a(), Expr::Literal(-3.0)])),
+            midpoint: 1.0,
+            exponent: 1.0,
+        },
+        Expr::Dist {
+            attr: N.into(),
+            origin: Origin::Number(-5.0),
+        },
+    ] {
+        assert!(ok.check().is_ok(), "{ok:?}: {:?}", ok.check());
+    }
+    for bad in [
+        Expr::Literal(f64::NAN),
+        Expr::Literal(f64::INFINITY),
+        Expr::Literal(1.1e30),
+        Expr::Saturate {
+            of: Box::new(a()),
+            midpoint: 0.0,
+            exponent: 1.0,
+        },
+        Expr::Saturate {
+            of: Box::new(a()),
+            midpoint: 1.1e30,
+            exponent: 1.0,
+        },
+        Expr::Decay {
+            of: Box::new(a()),
+            midpoint: 1.0,
+            exponent: 0.0,
+        },
+        Expr::Decay {
+            of: Box::new(a()),
+            midpoint: 1.0,
+            exponent: 16.5,
+        },
+        Expr::Dist {
+            attr: N.into(),
+            origin: Origin::Number(f64::NAN),
+        },
+    ] {
+        assert!(bad.check().is_err(), "{bad:?}");
+    }
+    let at_limits = Expr::Decay {
+        of: Box::new(a()),
+        midpoint: 1e-9,
+        exponent: 16.0,
+    };
+    assert!(at_limits.check().is_ok());
+}
+
+/// M203 criterion 3: no value scores 0, and a value below 0 is clamped to 0.
+#[tokio::test]
+async fn missing_values_score_zero() {
+    let c = corpus(false).await;
+    let ids = |got: &[(String, f64)]| -> Vec<String> {
+        let mut v: Vec<String> = got.iter().map(|(id, _)| id.clone()).collect();
+        v.sort();
+        v
+    };
+    let n_of = |d: &Document| match d.attrs.get(N) {
+        Some(Value::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let positive = Expr::Max(vec![Expr::Literal(0.0), Expr::Attribute(N.into())]);
+    let got = ranked(&c, &positive, None).await;
+    let mut want: Vec<String> = c
+        .live()
+        .filter(|d| n_of(d).is_some_and(|v| v > 0))
+        .map(|d| d.id.clone())
+        .collect();
+    want.sort();
+    assert!(!want.is_empty());
+    assert_eq!(ids(&got), want, "exactly the rows whose n > 0");
+
+    let decay = Expr::Decay {
+        of: Box::new(Expr::Attribute(N.into())),
+        midpoint: 3.0,
+        exponent: 1.0,
+    };
+    let got = ranked(&c, &decay, None).await;
+    let mut want: Vec<String> = c
+        .live()
+        .filter(|d| n_of(d).is_some())
+        .map(|d| d.id.clone())
+        .collect();
+    want.sort();
+    assert_eq!(
+        ids(&got),
+        want,
+        "no row lacking n, nor one holding a string"
+    );
+    let by_id: BTreeMap<String, f64> = got.into_iter().collect();
+    let mut clamped = 0;
+    for d in c.live() {
+        if let Some(v) = n_of(d)
+            && v <= 0
+        {
+            assert_eq!(by_id[&d.id], 1.0, "{}: n = {v} decays from 0", d.id);
+            clamped += 1;
+        }
+    }
+    assert!(clamped > 5, "{clamped} rows at or below 0");
+
+    // A Max of signed clauses alone is their largest, not 0: inside a sum it moves the sum.
+    let shifted = Expr::Max(vec![
+        Expr::Literal(0.0),
+        Expr::Sum(vec![
+            Expr::Max(vec![Expr::Attribute(N.into())]),
+            Expr::Literal(5.0),
+        ]),
+    ]);
+    let got: BTreeMap<String, f64> = ranked(&c, &shifted, None).await.into_iter().collect();
+    let mut negative = 0;
+    for d in c.live() {
+        match n_of(d) {
+            Some(v) if v < 5 && v > -5 => {
+                assert_eq!(got[&d.id], (v + 5) as f64, "{}: n = {v}", d.id);
+                negative += usize::from(v < 0);
+            }
+            Some(v) if v <= -5 => assert!(!got.contains_key(&d.id), "{}: n = {v}", d.id),
+            _ => {}
+        }
+    }
+    assert!(negative > 3, "{negative} rows with -5 < n < 0");
+
+    // A number origin gives a datetime no distance, so no row is kept.
+    let dist = Expr::Saturate {
+        of: Box::new(Expr::Dist {
+            attr: AT.into(),
+            origin: Origin::Number(0.0),
+        }),
+        midpoint: 1.0,
+        exponent: 1.0,
+    };
+    assert!(ranked(&c, &dist, None).await.is_empty());
+    // And an instant origin gives it one, in milliseconds: an hour from row 40's.
+    let dist = Expr::Dist {
+        attr: AT.into(),
+        origin: Origin::Instant(T0 + 40 * 3_600_000_000),
+    };
+    let got: BTreeMap<String, f64> = ranked(&c, &dist, None).await.into_iter().collect();
+    let row41 = &c.segments[1][11];
+    assert!(
+        c.deleted[1].contains(&11),
+        "row 41 is deleted in this corpus"
+    );
+    let row42 = &c.segments[1][12];
+    assert_eq!(got[&row42.id], 7_200_000.0, "two hours, in milliseconds");
+    assert!(!got.contains_key(&row41.id));
+
+    // A float beyond 1e30 reads as 1e30, so two of them sum to a finite 2e30.
+    let mut huge = Document::new("huge", vec![0.5; DIM]);
+    huge.attrs.insert(F.into(), Value::Float(1e300));
+    let twice = Expr::Max(vec![
+        Expr::Literal(0.0),
+        Expr::Sum(vec![Expr::Attribute(F.into()), Expr::Attribute(F.into())]),
+    ]);
+    let got = rank(
+        &c.store,
+        &[],
+        None,
+        &HashSet::new(),
+        &twice,
+        &texts(),
+        &[huge],
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1, 2e30, "clamped to 1e30 each");
 }
 
 /// The limits [`Expr::check`] holds.

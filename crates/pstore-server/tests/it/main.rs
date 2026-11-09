@@ -55,6 +55,7 @@ mod multi_aggregate;
 mod multi_fde;
 mod named_dense;
 mod null_elements;
+mod numeric_scoring;
 mod order;
 mod order_keys;
 mod patch;
