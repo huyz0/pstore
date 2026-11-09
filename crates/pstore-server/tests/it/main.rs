@@ -39,6 +39,7 @@ mod external;
 mod facets;
 mod filters;
 mod geo;
+mod group_each;
 mod highlight;
 mod idempotency;
 mod idle;

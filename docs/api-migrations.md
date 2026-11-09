@@ -1,5 +1,25 @@
 # Native API migration notes
 
+## M210: named `ForEachUnique` groups and unary `Count`
+
+A `group_by` entry may be a named group, one name mapped to `["ForEachUnique", attribute]`:
+
+```json
+{"aggregate_by": {"n": ["Count"], "s": ["Sum", "price"]},
+ "group_by": [{"tag": ["ForEachUnique", "tags"]}, "status"]}
+```
+
+- A row is in one group for each unique element of its array, combined with its plain keys,
+  and reported under the name (`"tag": "electronics"`). An element twice in one row's array
+  counts the row once in that group; `1` and `1.0` are one element. A scalar is its own
+  element. An absent attribute or an empty array is the `null` group, as for a plain entry.
+- At most one `ForEachUnique` entry; its name and attribute may not be another entry's or an
+  aggregate's label. A plain entry still groups by the whole array.
+- `["Count"]` counts the rows admitted, as `["Count", "id"]` does.
+- Facets and the aggregations of a multi-query accept both. `meta.unfolded_hits` counts a row
+  once however many of its groups were kept. Evidence is in
+  [M210 verification](milestones/M210/VERIFIED.md).
+
 ## M201: GC announces its horizon before it deletes
 
 A copy or export `as_of` a past epoch either holds that epoch whole or ends `failed` with

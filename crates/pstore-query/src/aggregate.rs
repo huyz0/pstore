@@ -29,10 +29,43 @@ pub enum Aggregate {
 pub struct Spec {
     /// Each aggregate with the label it is reported under, in request order.
     pub labels: Vec<(String, Aggregate)>,
-    /// Attributes whose values key a group; empty for one group over everything.
-    pub group_by: Vec<String>,
+    /// What keys a group, in key order; empty for one group over everything.
+    pub group_by: Vec<GroupKey>,
     /// The most groups kept: the smallest keys.
     pub top_k: usize,
+}
+
+/// How one `group_by` entry keys a row (M210).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grouping {
+    /// By the attribute's whole value (M12).
+    Value,
+    /// One group per unique element of an array value (`ForEachUnique`); a scalar is its own
+    /// element, and an absent value or an empty array is the absent group.
+    EachUnique,
+}
+
+/// One `group_by` entry: the field a group reports it under, and what it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupKey {
+    /// The field of `aggregation_groups` it is reported under.
+    pub name: String,
+    /// The attribute it reads.
+    pub attribute: String,
+    /// How the value keys the row.
+    pub grouping: Grouping,
+}
+
+impl GroupKey {
+    /// A plain entry: the attribute's whole value, reported under its own name.
+    #[must_use]
+    pub fn value(attribute: &str) -> Self {
+        Self {
+            name: attribute.to_owned(),
+            attribute: attribute.to_owned(),
+            grouping: Grouping::Value,
+        }
+    }
 }
 
 impl Spec {
@@ -238,6 +271,21 @@ fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
     }
 }
 
+/// A value's unique elements as keys, ascending (M210): an array's, deduplicated as keys are
+/// equal; a scalar's own; the absent key for no value or an empty array.
+fn elements(v: Option<&Value>) -> Vec<Key> {
+    match v {
+        Some(Value::Array(a)) if !a.is_empty() => {
+            let mut keys: Vec<Key> = a.iter().map(|e| Key::of(Some(e))).collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        }
+        Some(Value::Array(_)) | None => vec![Key::Absent],
+        scalar => vec![Key::of(scalar)],
+    }
+}
+
 /// Counts and sums, per group, over rows offered one at a time.
 #[derive(Debug, Clone)]
 pub struct Aggregator {
@@ -292,12 +340,34 @@ impl Aggregator {
     /// Offers a row the filter admitted. Whether it was aggregated: `false` when its key is
     /// not among the `top_k` smallest.
     pub fn offer(&mut self, doc: &Document) -> bool {
-        let key: Vec<Key> = self
-            .spec
-            .group_by
-            .iter()
-            .map(|a| Key::of(doc.attrs.get(a)))
-            .collect();
+        let mut exploded = None;
+        let mut key: Vec<Key> = Vec::with_capacity(self.spec.group_by.len());
+        for (i, g) in self.spec.group_by.iter().enumerate() {
+            let v = doc.attrs.get(&g.attribute);
+            match g.grouping {
+                Grouping::Value => key.push(Key::of(v)),
+                Grouping::EachUnique => {
+                    exploded = Some((i, elements(v)));
+                    key.push(Key::Absent);
+                }
+            }
+        }
+        let Some((at, elements)) = exploded else {
+            return self.offer_keyed(key, doc);
+        };
+        // M210: one keyed row per unique element; the row was aggregated if any was kept.
+        let mut kept = false;
+        for e in elements {
+            let mut k = key.clone();
+            if let Some(slot) = k.get_mut(at) {
+                *slot = e;
+            }
+            kept |= self.offer_keyed(k, doc);
+        }
+        kept
+    }
+
+    fn offer_keyed(&mut self, key: Vec<Key>, doc: &Document) -> bool {
         // ⚠️ An existing group found in one search, and a new one's key moved in rather than
         // copied (M119): `admit` then `get_mut` searched twice, and the spec's `Arc` was
         // cloned, for every row.
@@ -451,9 +521,128 @@ mod tests {
     fn by_k(top_k: usize) -> Aggregator {
         Aggregator::new(Spec {
             labels: vec![("n".to_owned(), Aggregate::Count(None))],
-            group_by: vec!["k".to_owned()],
+            group_by: vec![GroupKey::value("k")],
             top_k,
         })
+    }
+
+    /// Counts and sums of `s`, one group per unique element of `k` (M210), then by `c`.
+    fn each_k(top_k: usize, plain: bool) -> Aggregator {
+        let mut group_by = vec![GroupKey {
+            name: "tag".to_owned(),
+            attribute: "k".to_owned(),
+            grouping: Grouping::EachUnique,
+        }];
+        if plain {
+            group_by.push(GroupKey::value("c"));
+        }
+        Aggregator::new(Spec {
+            labels: vec![
+                ("n".to_owned(), Aggregate::Count(None)),
+                ("s".to_owned(), Aggregate::Sum("s".to_owned())),
+            ],
+            group_by,
+            top_k,
+        })
+    }
+
+    fn tagged(id: &str, k: Option<Value>, s: i64) -> Document {
+        let mut d = Document::new(id, vec![1.0]);
+        if let Some(k) = k {
+            d.attrs.insert("k".to_owned(), k);
+        }
+        d.attrs.insert("s".to_owned(), Value::Int(s));
+        d
+    }
+
+    fn strs(v: &[&str]) -> Value {
+        Value::Array(v.iter().map(|s| Value::Str((*s).to_owned())).collect())
+    }
+
+    fn report(a: Aggregator) -> Vec<(Vec<Option<Value>>, Vec<Total>)> {
+        a.finish()
+            .into_iter()
+            .map(|(k, t)| (k.iter().map(Key::value).collect(), t))
+            .collect()
+    }
+
+    #[test]
+    fn an_element_twice_in_one_array_counts_the_row_once() {
+        let mut a = each_k(10, false);
+        assert!(a.offer(&tagged("x", Some(strs(&["a", "a", "b"])), 5)));
+        let s = |v: &str| Some(Value::Str(v.to_owned()));
+        assert_eq!(
+            report(a),
+            [
+                (vec![s("a")], vec![Total::Int(1), Total::Int(5)]),
+                (vec![s("b")], vec![Total::Int(1), Total::Int(5)]),
+            ]
+        );
+        // 1 and 1.0 are one element, as they are one key.
+        let mut a = each_k(10, false);
+        a.offer(&tagged(
+            "y",
+            Some(Value::Array(vec![Value::Int(1), Value::Float(1.0)])),
+            2,
+        ));
+        assert_eq!(
+            report(a),
+            [(
+                vec![Some(Value::Int(1))],
+                vec![Total::Int(1), Total::Int(2)]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_scalar_is_its_own_element_and_nothing_is_the_absent_group() {
+        let mut a = each_k(10, false);
+        a.offer(&tagged("s", Some(Value::Str("a".into())), 1));
+        a.offer(&tagged("e", Some(Value::Array(Vec::new())), 2));
+        a.offer(&tagged("n", None, 4));
+        a.offer(&tagged("z", Some(Value::Array(vec![Value::Null])), 8));
+        assert_eq!(
+            report(a),
+            [
+                (
+                    vec![Some(Value::Str("a".into()))],
+                    vec![Total::Int(1), Total::Int(1)]
+                ),
+                (vec![Some(Value::Null)], vec![Total::Int(1), Total::Int(8)]),
+                (vec![None], vec![Total::Int(2), Total::Int(6)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn exploded_groups_combine_with_plain_keys_and_keep_the_smallest_exactly() {
+        let row = |id: &str, k: &[&str], c: &str, s: i64| {
+            let mut d = tagged(id, Some(strs(k)), s);
+            d.attrs.insert("c".to_owned(), Value::Str(c.to_owned()));
+            d
+        };
+        // Two segments, merged at top_k 2: the two smallest (element, c) keys, complete.
+        let mut one = each_k(2, true);
+        assert!(one.offer(&row("1", &["z", "b"], "r", 1)));
+        one.offer(&row("2", &["b", "a"], "r", 2));
+        let mut two = each_k(2, true);
+        two.offer(&row("3", &["a", "a"], "g", 4));
+        two.offer(&row("4", &["a"], "r", 8));
+        // Every key of this row is larger than the two kept: nothing is aggregated.
+        assert!(!two.offer(&row("5", &["y", "x"], "r", 16)));
+        // Kept by its smaller element though its larger one is refused.
+        assert!(two.offer(&row("6", &["z", "a"], "g", 32)));
+        let mut all = each_k(2, true);
+        all.merge(one);
+        all.merge(two);
+        let s = |v: &str| Some(Value::Str(v.to_owned()));
+        assert_eq!(
+            report(all),
+            [
+                (vec![s("a"), s("g")], vec![Total::Int(2), Total::Int(36)]),
+                (vec![s("a"), s("r")], vec![Total::Int(2), Total::Int(10)]),
+            ]
+        );
     }
 
     #[test]
