@@ -45,3 +45,7 @@ CI's `mutants-shard (0)` on the pull request found four mutants of `Width`'s `Pa
 missed (each arm deleted, each `==` turned `!=`): nothing compared two widths. The unit test
 `widths_are_equal_only_of_one_kind_and_value` was added; it fails under each of the four and
 passes on the code, run one at a time by script here.
+`mutants-shard (3)` then timed out on `+=` turned `-=` and `*=` for a uint64 in
+`Acc::number`: no test averaged a uint64, so the surviving mutant ran the whole suite past
+the timeout. `min_max_and_avg_are_typed_as_stated` now averages uint64s beside an int; it
+fails under both mutants and passes on the code, run by script here.

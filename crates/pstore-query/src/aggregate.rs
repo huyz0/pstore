@@ -780,6 +780,11 @@ mod tests {
             ])[..2],
             [Total::Int(i64::MIN), Total::Uint(u64::MAX)]
         );
+        // A uint64 is averaged as summed: exactly, beside an int.
+        assert_eq!(
+            stats(&[Value::Uint(7), Value::Int(1), Value::Uint(4)])[2],
+            Total::Float(4.0)
+        );
     }
 
     fn buckets(vals: &[Value], width: Width) -> Vec<Option<Value>> {
