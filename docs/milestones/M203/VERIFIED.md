@@ -57,3 +57,12 @@ an attribute named `Attribute`, was refused; only `["Attribute", name]` is now t
 `numeric_expressions_over_http` asserts the filter (not seen red). Malformed and over-long
 durations (`"1.h"`, `".5h"`, 16 digits) added to the refusals. The third (M204's directory
 in the tree) was a separate worktree's, not this change's.
+
+CI's mutation shards on the PR's first head missed eight mutants, each now killed or gone:
+a `uint64` attribute's arm deleted (a test of one added); `origin_instant`'s guards' `&&`
+as `||` twice (the guards were redundant -- appending `Z` parses only where there was no
+offset -- and are removed; two malformed origins added to the refusals); `saturate`'s and
+`decay`'s `x > 0` as `>=` (equivalent at 0: the branches are replaced by `max(x, 0)`, and
+mutations M8, M13 re-run against the new form, killed); the `s` and `w` duration arms
+deleted (a test of each added, each arm's deletion seen red by hand); `Saturate`/`Decay`'s
+`depth + 1` as `* 1` or `- 1` (a depth test for them added, `* 1` seen red by hand).
