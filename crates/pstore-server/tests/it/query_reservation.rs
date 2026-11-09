@@ -341,3 +341,26 @@ async fn a_reservation_is_held_while_running_and_returned_on_every_path() {
     drop(held);
     assert_eq!(api.reserved_query_rows(), 0);
 }
+
+#[tokio::test]
+async fn an_external_query_reserves_its_window() {
+    // `docs` has no external source, so a query that fits is answered by the engine, whatever
+    // it says; one whose window is past the pool is refused before anything is read.
+    let (api, store, _) = serve(4 * R, R).await;
+    let uri = "/v1/indexes/docs/external/query";
+    let ask = |window: u64| json!({"vector": [1.0, 0.5], "k": 10, "window": window});
+    let got = send(&api, T, "POST", uri, &ask(R)).await;
+    assert_ne!(got.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", got.body);
+    let before = spent(&store, T);
+    let got = send(&api, T, "POST", uri, &ask(R + 1)).await;
+    assert_eq!(got.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", got.body);
+    assert!(
+        got.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tenant_query_rows"),
+        "{}",
+        got.body
+    );
+    assert_eq!(spent(&store, T), before, "a refusal costs no request");
+}

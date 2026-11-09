@@ -631,9 +631,12 @@ impl<S: BlobStore + 'static> Api<S> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&tenant);
+            // M213: or its flushed rows hold its flush bound. The cap counts their held bytes,
+            // which fill it while their bundles are far below `policy.bytes`.
+            let flush_at = self.ingress.limits().tenant_flush_bytes();
             let old_or_large = engine.unfolded().is_some_and(|u| {
                 now.duration_since(u.oldest) >= policy.age || u.bytes >= policy.bytes
-            });
+            }) || engine.buffered().unfolded >= flush_at;
             if !old_or_large && !requested {
                 continue;
             }

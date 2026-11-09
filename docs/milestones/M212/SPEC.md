@@ -18,7 +18,8 @@ query's facets:
 - a relevance ranking: each leg's `limit` (a `multi` FDE leg's `rerank` when larger), plus
   its window (`top_k + offset`, or the boost, `diversify` or `limit_per` window);
 - an order or a `rank_by` expression: `top_k + offset`;
-- an aggregation: its `top_k`.
+- an aggregation: its `top_k`;
+- an external-source query (`/external/query`, M65): its `window`.
 
 Two version-1 limits per `Api`, defaults and configuration as M128's (lower only, validated
 before store, cache or bind), new fields of `PSTORE_REQUEST_LIMITS_CONFIG`:
@@ -53,6 +54,8 @@ the peer. Writes are unchanged (M141 bounds them).
 5. Configuration: zero, above the default, and `tenant_query_rows` above `query_rows` are
    refused, by name, as M128's limits are; the fields read from the config JSON.
 6. Every existing test passes unedited.
+7. Review: an external-source query whose `window` is R gets past admission, and R + 1 is
+   413 naming `tenant_query_rows`, with no blob request.
 
 ## Test plan
 Server tests in a new `crates/pstore-server/tests/it/query_reservation.rs`; criterion 5 in

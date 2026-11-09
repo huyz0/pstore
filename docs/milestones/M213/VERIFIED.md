@@ -65,3 +65,14 @@ claimed.
    refused patch estimates 0. `a_write_exactly_the_bound_fits` covers a parsed row at the
    bound. Killed "tombstone as id and 8", "parsed rows not shrunk" and "patch-by-filter
    estimate dropped".
+7. `flushed_rows_at_the_flush_bound_make_their_tenant_due_for_a_fold`: added after code
+   review found held bytes could fill the cap while bundles stayed below the fold size.
+   Seen red first (two flushed rows at the bound, folded 0), green after; the mutation `>`
+   for `>=` at the bound was killed.
+
+Code review: one round, an independent agent given the specs and the diff without the
+author's reasoning. Pass, with two majors and two minors, all fixed: the migration note
+advised raising a bound that can only be lowered; held bytes could fill the cap below the
+fold trigger (criterion 7); `stamp_footprint` was documented as a bound and is not (now an
+estimate, and a risk in the spec); and the external-source query reserved nothing (M212's
+criterion 7).

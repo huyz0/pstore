@@ -217,7 +217,8 @@ impl Kind {
 
 /// The held bytes [`stamp`] adds to each row of a request stamped as `op`'s (M141; M213: as
 /// [`Document::footprint`] counts them): its two keys and the request id, each one allocation,
-/// and a map leaf for a row that had no attributes. A bound: a row that had some needs no leaf.
+/// and a map leaf for a row that had no attributes. An estimate, not a bound: a row whose map
+/// the two entries push past a leaf holds more, charged when buffered past the reservation.
 #[must_use]
 pub fn stamp_footprint(op: Option<OperationId>, ids: bool, key: Option<&IdempotencyKey>) -> u64 {
     use pstore_format::heap_bytes;

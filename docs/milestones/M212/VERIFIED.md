@@ -32,6 +32,10 @@ tests and `query_reservation::`. 9 of 9 were killed. No `cargo mutants` run is c
 6. `cargo test -p pstore-server --no-fail-fast` passed (the `it` suite: 662 passed, 1
    ignored), skipping the two IPv6 peer tests this container cannot run.
 
+7. `an_external_query_reserves_its_window`: added after code review found the
+   `/external/query` route reserved nothing. Seen red first (window R + 1 was answered by
+   the engine, 403 `external_sources_off`, not 413), green after.
+
 Gates, in a cloud container: `cargo fmt --all --check` and `cargo clippy -p pstore-server
 --all-targets -- -D warnings` passed. Coverage and `scripts/mutants.sh`: NOT-RUN here; CI
 runs both on the pull request.

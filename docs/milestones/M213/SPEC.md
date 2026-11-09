@@ -32,7 +32,10 @@ slot, computed from what it holds:
 A flushed row stays in memory until a fold, so it is charged the same held bytes, not its
 bundle's share: `Buffered::unfolded` and the cap check sum the held bytes of every flushed
 batch not yet folded. A row's charge no longer changes when it is flushed. The bundle size
-still drives scheduled folds (`Engine::unfolded`), unchanged.
+still drives scheduled folds (`Engine::unfolded`), and in addition (found in review) a
+tenant is due for a scheduled fold once its flushed rows' held bytes reach
+`tenant_flush_bytes`: held bytes can fill the cap while the bundles are far below
+`PSTORE_FOLD_BYTES`, leaving every batched write refused until the age trigger.
 
 A write is reserved before it is buffered, by an estimate (M141) that must now follow the
 same rule, or a write exactly at the bound is refused and a reservation is left over while
@@ -62,6 +65,9 @@ At the same 64 MiB, a tenant of tiny rows now buffers about 70,000 of them, not 
 6. Each operation's estimate is what buffering it charges: a delete, a patch, a delete by
    filter and a patch by filter, buffered alone, are charged exactly their
    `*_footprint`; and a write whose parsed rows are exactly the bound is admitted.
+7. Review: with the fold policy's age and size never reached, a tenant whose flushed rows
+   hold one row less than `tenant_flush_bytes` is not folded by a scheduled tick, and one
+   at exactly the bound is, which returns its charge to 0.
 5. `buffered_bench.rs` sums allocated less deallocated, and its release run is recorded,
    `provisional`.
 
@@ -84,6 +90,10 @@ Unchanged: memory arithmetic only.
 - `size_of` of std's B-tree nodes is not public; the bound is computed from the layout std
   has used since 1.0 (11 entries, a parent pointer, two `u16`s, 12 edges inside). If std
   changes it, criterion 1's measurement says so.
+- The applied stamp's estimate is not a bound: a row of 10 or 11 attributes grows past one
+  map leaf when stamped, about 1.4 KB more than estimated. The excess is charged as rows
+  past the reservation, unchecked (M141's rule), so one large applied write can pass the cap
+  by that much; it is then counted exactly and returns to 0.
 - Heap is not RSS: allocator fragmentation is still not counted; the 16 bytes an allocation
   stand in for glibc's header and size classes, measured nowhere here.
 

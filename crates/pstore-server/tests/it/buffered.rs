@@ -505,3 +505,26 @@ async fn concurrent_reservations_admit_one() {
     assert_eq!(ids(&api, 1).await, [winner]);
     assert_eq!(buffered(&api, 1).await.reserved, 0);
 }
+
+#[tokio::test]
+async fn flushed_rows_at_the_flush_bound_make_their_tenant_due_for_a_fold() {
+    // M213: the cap counts flushed rows' held bytes, which can fill it while their bundles are
+    // far below the policy's size, so held bytes at the flush bound make a tenant due too.
+    let (api, _) = serve(MemoryStore::new(), limits(2 * f(), 3 * f()));
+    let policy = FoldPolicy {
+        period: std::time::Duration::from_secs(3600),
+        age: std::time::Duration::from_secs(3600),
+        bytes: u64::MAX,
+    };
+    assert_eq!(write(&api, 1, "d01", "durable").await.0, StatusCode::OK);
+    assert_eq!(buffered(&api, 1).await.unfolded, f());
+    assert_eq!(
+        api.fold_due(&policy).await.folded,
+        0,
+        "one row is below the bound"
+    );
+    assert_eq!(write(&api, 1, "d02", "durable").await.0, StatusCode::OK);
+    assert_eq!(buffered(&api, 1).await.unfolded, 2 * f());
+    assert_eq!(api.fold_due(&policy).await.folded, 1, "two rows are at it");
+    assert_eq!(buffered(&api, 1).await, Buffered::default());
+}

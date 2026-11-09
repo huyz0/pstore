@@ -9,7 +9,10 @@ its maps' nodes. A small row is charged about 40 times more than before: a 2-com
 with no attributes about 830 bytes, not 18; a 768-component row about 3.9 KB, not 3.1 KB.
 A tenant of tiny rows now reaches the 64 MiB default after about 80,000 of them, not 3.7
 million, so batched writes of small rows flush, and are refused with `429`, far sooner.
-Raise `tenant_buffered_bytes` (and the flush bound) to keep the old row counts.
+The old row counts cannot be kept: both bounds can only be lowered (M128), and their
+defaults are unchanged. Smaller rows or more frequent durable writes are the remedy.
+- A tenant is also due for a scheduled fold once its flushed, unfolded rows hold its flush
+  bound, whatever their bundles' size, so the cap is not left full until the age trigger.
 
 - A flushed, unfolded row is charged the same held bytes until a fold, not its bundle's
   share, so a flush no longer frees cap.
@@ -25,7 +28,8 @@ and holds them until it answers:
 - a relevance ranking: each leg's limit plus its window (`top_k + offset`, or the boost,
   `diversify` or `limit_per` window). A hybrid dense and text query at `top_k` 100 is 300;
 - an order or a `rank_by` expression: `top_k + offset`; an aggregation: its `top_k`;
-- a multi-query: the sum over its queries, and over each query's `facets`.
+- a multi-query: the sum over its queries, and over each query's `facets`;
+- an external-source query (`/external/query`): its `window`.
 
 `PSTORE_REQUEST_LIMITS_CONFIG` takes `query_rows` (default 4,194,304, every query of the
 server at once) and `tenant_query_rows` (default 1,048,576, one tenant's, at most
