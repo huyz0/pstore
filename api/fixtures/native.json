@@ -1,0 +1,1304 @@
+{
+ "description": "The native API's semantic fixtures (M220): one tenant's steps, run in order against a fresh server with an empty in-memory store, no read cache, and PSTORE_APPLIED_WRITES=5. Each step names an operationId of api/openapi.json; its response must have the status, validate against the operation's schema for it, and contain `expect` (an object holds at least the keys given, an array exactly the items given, in order). A step's `absent` lists JSON pointers its answer must not hold. A step marked `invalid` sends a request (body or query) the contract must refuse.",
+ "tenant": "7",
+ "steps": [
+  {
+   "name": "a new tenant has no indexes",
+   "operation": "list_indexes",
+   "status": 200,
+   "expect": {
+    "indexes": [],
+    "next_cursor": null
+   }
+  },
+  {
+   "name": "an index is created empty",
+   "operation": "create_index",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "dims": 2,
+    "distance_metric": "euclidean_squared"
+   },
+   "status": 200
+  },
+  {
+   "name": "creating it again is refused",
+   "operation": "create_index",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "dims": 2
+   },
+   "status": 409,
+   "expect": {
+    "error": {
+     "code": "index_exists",
+     "retryable": false
+    }
+   }
+  },
+  {
+   "name": "a durable write",
+   "operation": "write_documents",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "durability": "durable",
+    "distance_metric": "euclidean_squared",
+    "documents": [
+     {
+      "id": "a",
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "attributes": {
+       "color": "red",
+       "n": 3
+      }
+     },
+     {
+      "id": "b",
+      "vector": [
+       1.0,
+       0.0
+      ],
+      "attributes": {
+       "color": "blue",
+       "n": 1
+      }
+     },
+     {
+      "id": "c",
+      "vector": [
+       3.0,
+       0.0
+      ],
+      "attributes": {
+       "color": "blue"
+      }
+     }
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "documents_written": 3,
+    "durable": true
+   }
+  },
+  {
+   "name": "a write's metric is dot_product when absent, and must be the index's",
+   "operation": "write_documents",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "documents": [
+     {
+      "id": "z",
+      "vector": [
+       0.0,
+       0.0
+      ]
+     }
+    ]
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "schema_conflict"
+    }
+   }
+  },
+  {
+   "name": "an unknown write field is refused",
+   "operation": "write_documents",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "documentz": []
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request",
+     "retryable": false
+    }
+   },
+   "invalid": true
+  },
+  {
+   "name": "the tenant is folded",
+   "operation": "fold_tenant",
+   "status": 200
+  },
+  {
+   "name": "the summary",
+   "operation": "get_index",
+   "path": {
+    "index": "fx"
+   },
+   "status": 200,
+   "expect": {
+    "index": "fx",
+    "documents": 3,
+    "unfolded": false,
+    "read_only": false,
+    "schema": {
+     "dims": 2,
+     "distance_metric": "euclidean_squared"
+    }
+   }
+  },
+  {
+   "name": "the summary with its indexing progress",
+   "operation": "get_index",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "progress": "true"
+   },
+   "status": 200,
+   "expect": {
+    "progress": {
+     "status": "up-to-date"
+    }
+   }
+  },
+  {
+   "name": "progress is true or false",
+   "operation": "get_index",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "progress": "maybe"
+   },
+   "status": 400,
+   "invalid": true
+  },
+  {
+   "name": "a page of one index",
+   "operation": "list_indexes",
+   "query": {
+    "page_size": "1"
+   },
+   "status": 200,
+   "expect": {
+    "indexes": [
+     "fx"
+    ]
+   }
+  },
+  {
+   "name": "a page size past 1000 is refused",
+   "operation": "list_indexes",
+   "query": {
+    "page_size": "1001"
+   },
+   "status": 400,
+   "invalid": true
+  },
+  {
+   "name": "a prefix",
+   "operation": "list_indexes",
+   "query": {
+    "prefix": "f"
+   },
+   "status": 200,
+   "expect": {
+    "indexes": [
+     "fx"
+    ]
+   }
+  },
+  {
+   "name": "a prefix nothing has",
+   "operation": "list_indexes",
+   "query": {
+    "prefix": "q"
+   },
+   "status": 200,
+   "expect": {
+    "indexes": []
+   }
+  },
+  {
+   "name": "a cursor past the last name",
+   "operation": "list_indexes",
+   "query": {
+    "cursor": "fx"
+   },
+   "status": 200,
+   "expect": {
+    "indexes": [],
+    "next_cursor": null
+   }
+  },
+  {
+   "name": "nearest first, $dist ascending",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "top_k": 3,
+    "include_attributes": [
+     "color"
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "results": [
+     {
+      "id": "a",
+      "$dist": 0.0,
+      "attributes": {
+       "color": "red"
+      }
+     },
+     {
+      "id": "b",
+      "$dist": 1.0,
+      "attributes": {
+       "color": "blue"
+      }
+     },
+     {
+      "id": "c",
+      "$dist": 9.0,
+      "attributes": {
+       "color": "blue"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "a filter",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "top_k": 10,
+    "filters": [
+     "color",
+     "Eq",
+     "blue"
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "results": [
+     {
+      "id": "b"
+     },
+     {
+      "id": "c"
+     }
+    ]
+   }
+  },
+  {
+   "name": "an order by an attribute: a row missing it sorts last ascending, and answers no key for it",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "rank_by": [
+     "n",
+     "asc"
+    ],
+    "top_k": 10,
+    "include_attributes": [
+     "n"
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "results": [
+     {
+      "id": "b",
+      "attributes": {
+       "n": 1
+      }
+     },
+     {
+      "id": "a",
+      "attributes": {
+       "n": 3
+      }
+     },
+     {
+      "id": "c",
+      "attributes": {}
+     }
+    ]
+   },
+   "absent": [
+    "/results/2/attributes/n"
+   ]
+  },
+  {
+   "name": "two queries in one request",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "queries": [
+     {
+      "vector": [
+       3.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     }
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "results": [
+     [
+      {
+       "id": "c"
+      }
+     ],
+     [
+      {
+       "id": "a"
+      }
+     ]
+    ]
+   }
+  },
+  {
+   "name": "an unknown query field is refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vectr": [
+     0.0,
+     0.0
+    ]
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   },
+   "invalid": true
+  },
+  {
+   "name": "top_k at its maximum",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "top_k": 10000
+   },
+   "status": 200
+  },
+  {
+   "name": "top_k past its maximum is refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "top_k": 10001
+   },
+   "invalid": true,
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   }
+  },
+  {
+   "name": "top_k 0 is refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "top_k": 0
+   },
+   "invalid": true,
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   }
+  },
+  {
+   "name": "sixteen queries in one request",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "queries": [
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     }
+    ]
+   },
+   "status": 200
+  },
+  {
+   "name": "seventeen are refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "queries": [
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     },
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 1
+     }
+    ]
+   },
+   "invalid": true,
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   }
+  },
+  {
+   "name": "an unknown multi-query root key is refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "queries": [
+     {
+      "vector": [
+       0.0,
+       0.0
+      ]
+     }
+    ],
+    "limt": 1
+   },
+   "invalid": true,
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   }
+  },
+  {
+   "name": "an outer fusion's limit and offset",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "queries": [
+     {
+      "vector": [
+       0.0,
+       0.0
+      ],
+      "top_k": 3
+     },
+     {
+      "vector": [
+       3.0,
+       0.0
+      ],
+      "top_k": 3
+     }
+    ],
+    "rerank_by": [
+     "RRF"
+    ],
+    "limit": 2,
+    "offset": 0
+   },
+   "status": 200
+  },
+  {
+   "name": "bounded staleness at its maximum",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "consistency": "bounded",
+    "max_staleness_ms": 3600000
+   },
+   "status": 200,
+   "expect": {
+    "meta": {
+     "consistency": "bounded"
+    }
+   }
+  },
+  {
+   "name": "bounded staleness past it is refused",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "consistency": "bounded",
+    "max_staleness_ms": 3600001
+   },
+   "invalid": true,
+   "status": 400
+  },
+  {
+   "name": "a strong query reads every acknowledged write",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "consistency": "strong",
+    "top_k": 1
+   },
+   "status": 200,
+   "expect": {
+    "meta": {
+     "consistency": "strong"
+    },
+    "results": [
+     {
+      "id": "a"
+     }
+    ]
+   }
+  },
+  {
+   "name": "a wrong width is a schema conflict",
+   "operation": "query",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "schema_conflict"
+    }
+   }
+  },
+  {
+   "name": "an applied write answers what it did",
+   "operation": "write_documents",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "durability": "applied",
+    "affected_ids": true,
+    "distance_metric": "euclidean_squared",
+    "deletes": [
+     "c"
+    ],
+    "patch_rows": [
+     {
+      "id": "a",
+      "attributes": {
+       "n": 4
+      }
+     }
+    ]
+   },
+   "status": 200,
+   "expect": {
+    "completion": "applied",
+    "applied": {
+     "deleted": 1,
+     "patched": 1
+    }
+   }
+  },
+  {
+   "name": "an idempotency key",
+   "operation": "issue_idempotency_key",
+   "path": {
+    "index": "fx"
+   },
+   "status": 200
+  },
+  {
+   "name": "recall at one snapshot",
+   "operation": "recall",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "num": 2,
+    "top_k": 1
+   },
+   "status": 200,
+   "expect": {
+    "num": 2
+   }
+  },
+  {
+   "name": "warming needs a read cache",
+   "operation": "warm_index",
+   "path": {
+    "index": "fx"
+   },
+   "status": 409,
+   "expect": {
+    "error": {
+     "code": "no_read_cache"
+    }
+   }
+  },
+  {
+   "name": "made read-only",
+   "operation": "patch_index",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "read_only": true
+   },
+   "status": 200,
+   "expect": {
+    "read_only": true
+   }
+  },
+  {
+   "name": "a read-only index refuses a write",
+   "operation": "write_documents",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "distance_metric": "euclidean_squared",
+    "documents": [
+     {
+      "id": "d",
+      "vector": [
+       0.0,
+       1.0
+      ]
+     }
+    ]
+   },
+   "status": 409,
+   "expect": {
+    "error": {
+     "code": "index_read_only"
+    }
+   }
+  },
+  {
+   "name": "made writable again",
+   "operation": "patch_index",
+   "path": {
+    "index": "fx"
+   },
+   "body": {
+    "read_only": false
+   },
+   "status": 200,
+   "expect": {
+    "read_only": false
+   }
+  },
+  {
+   "name": "the schema cannot be patched",
+   "operation": "patch_schema",
+   "path": {
+    "index": "fx"
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "schema_immutable"
+    }
+   }
+  },
+  {
+   "name": "an isolated copy starts",
+   "operation": "copy_index",
+   "path": {
+    "index": "fx_copy"
+   },
+   "body": {
+    "source": {
+     "index": "fx"
+    }
+   },
+   "status": 202,
+   "expect": {
+    "index": "fx_copy",
+    "source": {
+     "index": "fx"
+    }
+   }
+  },
+  {
+   "name": "the copy's status",
+   "operation": "get_copy",
+   "path": {
+    "index": "fx_copy"
+   },
+   "status": 200,
+   "expect": {
+    "index": "fx_copy"
+   }
+  },
+  {
+   "name": "read_only is a copy's",
+   "operation": "create_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "body": {
+    "source": {
+     "index": "fx"
+    },
+    "read_only": true
+   },
+   "invalid": true,
+   "status": 400
+  },
+  {
+   "name": "schema is a copy's",
+   "operation": "create_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "body": {
+    "source": {
+     "index": "fx"
+    },
+    "schema": {}
+   },
+   "invalid": true,
+   "status": 400
+  },
+  {
+   "name": "as_of is a copy's",
+   "operation": "create_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "body": {
+    "source": {
+     "index": "fx"
+    },
+    "as_of": 1
+   },
+   "invalid": true,
+   "status": 400
+  },
+  {
+   "name": "a replication",
+   "operation": "create_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "body": {
+    "source": {
+     "index": "fx"
+    }
+   },
+   "status": 201
+  },
+  {
+   "name": "the replication's status",
+   "operation": "get_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "status": 200,
+   "expect": {
+    "index": "fx_rep",
+    "state": "running"
+   }
+  },
+  {
+   "name": "paused",
+   "operation": "pause_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "status": 200,
+   "expect": {
+    "state": "paused"
+   }
+  },
+  {
+   "name": "resumed",
+   "operation": "resume_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "status": 200,
+   "expect": {
+    "state": "running"
+   }
+  },
+  {
+   "name": "synced now",
+   "operation": "sync_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "status": 200
+  },
+  {
+   "name": "the tenant's replications",
+   "operation": "list_replications",
+   "status": 200
+  },
+  {
+   "name": "cancelled",
+   "operation": "cancel_replication",
+   "path": {
+    "index": "fx_rep"
+   },
+   "status": 200,
+   "expect": {
+    "index": "fx_rep"
+   }
+  },
+  {
+   "name": "the quarantine export",
+   "operation": "export_quarantine",
+   "path": {
+    "index": "fx"
+   },
+   "status": 200
+  },
+  {
+   "name": "discarding the quarantine needs through",
+   "operation": "discard_quarantine",
+   "path": {
+    "index": "fx"
+   },
+   "status": 400,
+   "expect": {
+    "error": {
+     "code": "bad_request"
+    }
+   },
+   "invalid": true
+  },
+  {
+   "name": "discarding the quarantine through an epoch",
+   "operation": "discard_quarantine",
+   "path": {
+    "index": "fx"
+   },
+   "query": {
+    "through": "1"
+   },
+   "status": 200,
+   "expect": {
+    "discarded": 0
+   }
+  },
+  {
+   "name": "external sources are off here",
+   "operation": "register_external",
+   "path": {
+    "index": "ext"
+   },
+   "body": {
+    "kind": "parquet",
+    "source": "s3://nowhere/x",
+    "column": "v"
+   },
+   "status": 403,
+   "expect": {
+    "error": {
+     "code": "external_sources_off"
+    }
+   }
+  },
+  {
+   "name": "no external index",
+   "operation": "query_external",
+   "path": {
+    "index": "ext"
+   },
+   "body": {
+    "vector": [
+     0.0,
+     0.0
+    ],
+    "k": 1
+   },
+   "status": 403,
+   "expect": {
+    "error": {
+     "code": "external_sources_off"
+    }
+   }
+  },
+  {
+   "name": "no external index to drop",
+   "operation": "drop_external",
+   "path": {
+    "index": "ext"
+   },
+   "status": 404,
+   "expect": {
+    "error": {
+     "code": "external_index_not_found"
+    }
+   }
+  },
+  {
+   "name": "no external index to copy",
+   "operation": "copy_external",
+   "path": {
+    "index": "ext2"
+   },
+   "body": {
+    "index": "ext"
+   },
+   "status": 403,
+   "expect": {
+    "error": {
+     "code": "external_sources_off"
+    }
+   }
+  },
+  {
+   "name": "garbage collection",
+   "operation": "gc_tenant",
+   "status": 200
+  },
+  {
+   "name": "retention is a number",
+   "operation": "gc_tenant",
+   "query": {
+    "retention": "forever"
+   },
+   "status": 400,
+   "invalid": true
+  },
+  {
+   "name": "the operator's duties",
+   "operation": "list_duties",
+   "status": 200
+  },
+  {
+   "name": "metrics",
+   "operation": "metrics",
+   "status": 200
+  },
+  {
+   "name": "the index is dropped",
+   "operation": "delete_index",
+   "path": {
+    "index": "fx"
+   },
+   "status": 200
+  },
+  {
+   "name": "and is gone",
+   "operation": "get_index",
+   "path": {
+    "index": "fx"
+   },
+   "status": 404,
+   "expect": {
+    "error": {
+     "code": "index_not_found"
+    }
+   }
+  }
+ ]
+}

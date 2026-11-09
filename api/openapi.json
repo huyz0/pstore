@@ -1,0 +1,3799 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "pstore native API",
+    "version": "1.0.0",
+    "description": "The native HTTP API of pstore (M220). This document is the contract: the server is tested against it (crates/pstore-server/tests/it/openapi.rs) and the clients are generated from it. Every request body field set is the set the server accepts; every response object is closed, so a field the server answers and this document does not name fails the conformance test. Objects described only in prose (filters, rank_by, facets and the like) are typed here by name and documented in docs/api-migrations.md."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080"
+    }
+  ],
+  "security": [
+    {
+      "bearer": []
+    },
+    {
+      "tenantHeader": []
+    }
+  ],
+  "paths": {
+    "/v1/indexes": {
+      "get": {
+        "operationId": "list_indexes",
+        "summary": "List the tenant's indexes, a page at a time.",
+        "security": [
+          {
+            "bearer": [
+              "list"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only names beginning with this."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only names strictly after this: the last page's next_cursor."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            },
+            "description": "At most this many."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}": {
+      "get": {
+        "operationId": "get_index",
+        "summary": "An index's summary: schema, counts, epoch and times.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          },
+          {
+            "name": "progress",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Include indexing progress (M143)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexSummary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "create_index",
+        "summary": "Create an empty index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIndexRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Committed"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "patch_index",
+        "summary": "Make an index read-only or writable.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchIndexRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadOnlyResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_index",
+        "summary": "Drop an index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Committed"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/documents": {
+      "put": {
+        "operationId": "write_documents",
+        "summary": "Write documents: upserts, patches and deletes. The index is created by its first write.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          },
+          {
+            "$ref": "#/components/parameters/Session"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/query": {
+      "post": {
+        "operationId": "query",
+        "summary": "Query an index: one query, or several in one request.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          },
+          {
+            "$ref": "#/components/parameters/Session"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/QueryRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MultiQueryRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A query's results, or each query's in request order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/QueryResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MultiQueryResponse"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/warm": {
+      "post": {
+        "operationId": "warm_index",
+        "summary": "Fetch an index's segments into this server's read cache.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarmResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/recall": {
+      "post": {
+        "operationId": "recall",
+        "summary": "Measure the index's ANN recall at one snapshot.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/idempotency-keys": {
+      "post": {
+        "operationId": "issue_idempotency_key",
+        "summary": "Issue a key that makes an applied write's retry safe.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdempotencyKey"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/external": {
+      "put": {
+        "operationId": "register_external",
+        "summary": "Register an external index over an object the customer owns.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalRegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalCommitted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "drop_external",
+        "summary": "Drop an external index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalCommitted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/external/query": {
+      "post": {
+        "operationId": "query_external",
+        "summary": "Query an external index.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalQueryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/external/copy": {
+      "put": {
+        "operationId": "copy_external",
+        "summary": "Copy another external index, codes moved and nothing rebuilt.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalCopyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalCommitted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/quarantine": {
+      "get": {
+        "operationId": "export_quarantine",
+        "summary": "Export the rows a fold quarantined.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuarantineExport"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "discard_quarantine",
+        "summary": "Discard quarantined rows through an epoch an export reported.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          },
+          {
+            "name": "through",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "The epoch the export reported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuarantineDiscarded"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/replications": {
+      "get": {
+        "operationId": "list_replications",
+        "summary": "The tenant's replications.",
+        "security": [
+          {
+            "bearer": [
+              "list"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/replication": {
+      "put": {
+        "operationId": "create_replication",
+        "summary": "Start a running replication into the new index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "get_replication",
+        "summary": "A replication's status.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "cancel_replication",
+        "summary": "Cancel a replication; the index stays, as a normal index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationCancelled"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/copy": {
+      "post": {
+        "operationId": "copy_index",
+        "summary": "Start an isolated copy, export or reindex into the new index.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Started by this request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CopyStatus"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "The copy a repeated request started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CopyStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "get_copy",
+        "summary": "A copy's status.",
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CopyStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/replication/pause": {
+      "post": {
+        "operationId": "pause_replication",
+        "summary": "Pause a replication. Idempotent.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/replication/resume": {
+      "post": {
+        "operationId": "resume_replication",
+        "summary": "Resume a replication. Idempotent.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/replication/sync": {
+      "post": {
+        "operationId": "sync_replication",
+        "summary": "Fold the source and sync the tenant's replications now.",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationSynced"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/indexes/{index}/schema": {
+      "patch": {
+        "operationId": "patch_schema",
+        "summary": "Always refused: a schema is fixed by the first fold (schema_immutable).",
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "$ref": "#/components/parameters/Index"
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/fold": {
+      "post": {
+        "operationId": "fold_tenant",
+        "summary": "Fold the tenant's acknowledged writes into its indexes now.",
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Committed"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/gc": {
+      "post": {
+        "operationId": "gc_tenant",
+        "summary": "Reap what the tenant's commits buried.",
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "name": "retention",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Epochs to keep, for time travel."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GcResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/duties": {
+      "get": {
+        "operationId": "list_duties",
+        "summary": "What this deployment leaves to its operator.",
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Duties"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "summary": "Prometheus metrics.",
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          },
+          {
+            "tenantHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A refusal: its error.code says which.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "An HS256 token naming tenant and scopes (M127). Each operation's security lists the one scope it needs; no scope implies another."
+      },
+      "tenantHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-pstore-tenant",
+        "description": "An unsecured deployment only (no PSTORE_AUTH_CONFIG): the tenant, a decimal id. Under bearer auth the token's tenant decides."
+      }
+    },
+    "parameters": {
+      "Index": {
+        "name": "index",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The index's name."
+      },
+      "Tenant": {
+        "name": "x-pstore-tenant",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The tenant, on an unsecured deployment."
+      },
+      "Session": {
+        "name": "x-pstore-session",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "A session token an earlier answer returned: a session query reads at least what it names (M11.1)."
+      }
+    },
+    "schemas": {
+      "Cost": {
+        "type": "object",
+        "properties": {
+          "blob_reads": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blob_writes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blob_lists": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes_read": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes_written": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "blob_reads",
+          "blob_writes",
+          "blob_lists",
+          "bytes_read",
+          "bytes_written"
+        ],
+        "additionalProperties": false,
+        "description": "What the request cost in blob-store requests and bytes. Native: present on every answer that touches the store."
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Stable across releases: the field a client switches on. x-pstore-status gives each code's HTTP status.",
+        "enum": [
+          "bad_query",
+          "bad_request",
+          "bad_session",
+          "copy_not_found",
+          "external_index_not_found",
+          "external_source_changed",
+          "external_source_not_allowed",
+          "external_source_unreadable",
+          "external_sources_off",
+          "forbidden",
+          "idempotency_expired",
+          "idempotency_partial",
+          "index_exists",
+          "index_limit",
+          "index_not_folded",
+          "index_not_found",
+          "index_read_only",
+          "internal",
+          "lane_taken",
+          "no_read_cache",
+          "not_folded",
+          "overloaded",
+          "quarantine_unavailable",
+          "recall_needs_vectors",
+          "recall_too_large",
+          "replica_no_history",
+          "replica_read_only",
+          "replication_active",
+          "replication_exists",
+          "replication_not_found",
+          "replication_paused",
+          "request_timeout",
+          "request_too_large",
+          "schema_conflict",
+          "schema_immutable",
+          "source_not_found",
+          "storage_unavailable",
+          "tenant_required",
+          "time_travel_horizon",
+          "unauthenticated",
+          "unknown_field",
+          "unsupported_content_encoding",
+          "unsupported_durability",
+          "version_conflict"
+        ],
+        "x-pstore-status": {
+          "bad_query": 422,
+          "bad_request": 400,
+          "bad_session": 400,
+          "copy_not_found": 404,
+          "external_index_not_found": 404,
+          "external_source_changed": 409,
+          "external_source_not_allowed": 403,
+          "external_source_unreadable": 400,
+          "external_sources_off": 403,
+          "forbidden": 403,
+          "idempotency_expired": 409,
+          "idempotency_partial": 409,
+          "index_exists": 409,
+          "index_limit": 409,
+          "index_not_folded": 409,
+          "index_not_found": 404,
+          "index_read_only": 409,
+          "internal": 500,
+          "lane_taken": 500,
+          "no_read_cache": 409,
+          "not_folded": 503,
+          "overloaded": 429,
+          "quarantine_unavailable": 503,
+          "recall_needs_vectors": 400,
+          "recall_too_large": 400,
+          "replica_no_history": 409,
+          "replica_read_only": 409,
+          "replication_active": 409,
+          "replication_exists": 409,
+          "replication_not_found": 404,
+          "replication_paused": 409,
+          "request_timeout": 408,
+          "request_too_large": 413,
+          "schema_conflict": 400,
+          "schema_immutable": 400,
+          "source_not_found": 404,
+          "storage_unavailable": 503,
+          "tenant_required": 400,
+          "time_travel_horizon": 400,
+          "unauthenticated": 401,
+          "unknown_field": 400,
+          "unsupported_content_encoding": 415,
+          "unsupported_durability": 400,
+          "version_conflict": 409
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              "message": {
+                "type": "string",
+                "description": "For a human reading a log; not stable."
+              },
+              "retryable": {
+                "type": "boolean",
+                "description": "Derived from the status: true for 429 and 5xx only."
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false,
+        "description": "The body of every refusal."
+      },
+      "Id": {
+        "description": "A document id: a string, or an integer in 0..=2^64-1 for a uint64-keyed index. A uuid-keyed index answers ids as canonical uuid strings.",
+        "type": [
+          "string",
+          "integer"
+        ],
+        "minimum": 0,
+        "maximum": 18446744073709551615
+      },
+      "Epoch": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "A HEAD commit's number; increases with every commit."
+      },
+      "DistanceMetric": {
+        "type": "string",
+        "enum": [
+          "dot_product",
+          "cosine_distance",
+          "euclidean_squared"
+        ],
+        "description": "How $dist is computed. cosine_distance is 1 - cos(q, v) and euclidean_squared is |q - v|^2: lower is nearer. dot_product answers -(q . v): lower is nearer too."
+      },
+      "Vector": {
+        "description": "A dense vector: an array of numbers, or a base64 string of little-endian f32 (D-36).",
+        "type": [
+          "array",
+          "string"
+        ],
+        "items": {
+          "type": "number"
+        }
+      },
+      "Document": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "vector": {
+            "$ref": "#/components/schemas/Vector"
+          },
+          "vectors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/Vector"
+              }
+            },
+            "description": "Named dense fields (M190): each field one vector or several, spelled as vector is."
+          },
+          "text": {
+            "type": "string",
+            "description": "The primary text field's text."
+          },
+          "sparse": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "A sparse vector: string keys to weights (M178)."
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {},
+            "description": "Attribute values. A null value is the absent attribute (M174)."
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false,
+        "description": "One document to upsert."
+      },
+      "WriteRequest": {
+        "type": "object",
+        "properties": {
+          "durability": {
+            "type": "string",
+            "enum": [
+              "batched",
+              "durable",
+              "applied"
+            ],
+            "default": "batched",
+            "description": "batched: buffered in this process, visible to its queries, not yet in the blob store. durable: written as one bundle object before the answer. applied: durable, then answered once a fold applied it, with what it did (M129; refused unless the deployment enables it)."
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Document"
+            },
+            "description": "Documents to upsert."
+          },
+          "deletes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "description": "Ids to delete."
+          },
+          "distance_metric": {
+            "$ref": "#/components/schemas/DistanceMetric",
+            "description": "The metric this write assumes, dot_product when absent. It must be the index's: a write naming another is refused schema_conflict."
+          },
+          "schema": {
+            "description": "Attribute and field declarations (M171-M178)."
+          },
+          "patch_rows": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Rows to patch: id and attributes only (M134)."
+          },
+          "patch_columns": {
+            "description": "Column-oriented patches (M174)."
+          },
+          "upsert_columns": {
+            "description": "Column-oriented upserts (M174)."
+          },
+          "upsert_condition": {
+            "description": "A filter each upsert's old row must pass (M133)."
+          },
+          "patch_condition": {
+            "description": "A filter each patch's old row must pass (M133)."
+          },
+          "delete_condition": {
+            "description": "A filter each delete's old row must pass (M133)."
+          },
+          "delete_by_filter": {
+            "description": "Delete every row the filter matches (M136)."
+          },
+          "patch_by_filter": {
+            "description": "Patch every row the filter matches (M136)."
+          },
+          "delete_by_filter_allow_partial": {
+            "type": "boolean",
+            "description": "Apply a large delete_by_filter in pages (M137).",
+            "default": false
+          },
+          "patch_by_filter_allow_partial": {
+            "type": "boolean",
+            "description": "Apply a large patch_by_filter in pages (M137).",
+            "default": false
+          },
+          "branch_from_namespace": {
+            "type": "string",
+            "description": "Create this index as a copy-on-write branch of another (M16)."
+          },
+          "copy_from_namespace": {
+            "type": "string",
+            "description": "Create this index as a copy of another."
+          },
+          "affected_ids": {
+            "type": "boolean",
+            "description": "With durability applied, answer the ids each operation affected (M130).",
+            "default": false
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "A key from POST .../idempotency-keys: the write is applied at most once (M132)."
+          }
+        },
+        "additionalProperties": false,
+        "description": "A write: upserts, patches, deletes and conditions, applied in a fixed order (M130)."
+      },
+      "AffectedIds": {
+        "type": "object",
+        "properties": {
+          "upserted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "deleted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "patched": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          }
+        },
+        "required": [
+          "upserted",
+          "deleted",
+          "patched"
+        ],
+        "additionalProperties": false
+      },
+      "Applied": {
+        "type": "object",
+        "properties": {
+          "upserted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "deleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "patched": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows_remaining": {
+            "type": "boolean",
+            "description": "A partial by-filter operation left rows: send it again (M137)."
+          },
+          "ids": {
+            "$ref": "#/components/schemas/AffectedIds"
+          }
+        },
+        "required": [
+          "upserted",
+          "deleted",
+          "patched",
+          "skipped",
+          "rejected"
+        ],
+        "additionalProperties": false,
+        "description": "What an applied write did (M129)."
+      },
+      "WriteResponse": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "documents_written": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "documents_deleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "documents_patched": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "durable": {
+            "type": "boolean",
+            "description": "In the blob store before this answer."
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          },
+          "session": {
+            "type": "string",
+            "description": "A session token: send it as x-pstore-session to read this write (M11.1)."
+          },
+          "completion": {
+            "type": "string",
+            "enum": [
+              "applied"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "description": "The applied operation's id (M129)."
+          },
+          "applied": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Applied"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome_unavailable": {
+            "type": "boolean",
+            "description": "The write was applied but its outcome was reaped before it was read (M132)."
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "An idempotency key's retry: the first request's answer (M132)."
+          }
+        },
+        "required": [
+          "epoch",
+          "documents_written",
+          "documents_deleted",
+          "documents_patched",
+          "durable",
+          "cost",
+          "session"
+        ],
+        "additionalProperties": false
+      },
+      "IdempotencyKey": {
+        "type": "object",
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "idempotency_key"
+        ],
+        "additionalProperties": false
+      },
+      "CreateIndexRequest": {
+        "type": "object",
+        "properties": {
+          "dims": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The vector width; 0 for a text-only index (M170)."
+          },
+          "distance_metric": {
+            "$ref": "#/components/schemas/DistanceMetric",
+            "description": "dot_product when absent."
+          }
+        },
+        "required": [
+          "dims"
+        ],
+        "additionalProperties": false,
+        "description": "Create an empty index (M147)."
+      },
+      "PatchIndexRequest": {
+        "type": "object",
+        "properties": {
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "read_only"
+        ],
+        "additionalProperties": false,
+        "description": "Make an index read-only or writable (M149)."
+      },
+      "Committed": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "epoch",
+          "cost"
+        ],
+        "additionalProperties": false,
+        "description": "The commit a request made, or the epoch it found."
+      },
+      "ReadOnlyResponse": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "epoch",
+          "read_only",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "IndexList": {
+        "type": "object",
+        "properties": {
+          "indexes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as cursor for the next page; null on the last."
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "indexes",
+          "next_cursor",
+          "epoch",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "IndexSchema": {
+        "type": "object",
+        "properties": {
+          "dims": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "distance_metric": {
+            "$ref": "#/components/schemas/DistanceMetric"
+          },
+          "text_field": {
+            "type": "string"
+          },
+          "full_text_search": {
+            "type": "object",
+            "description": "The primary text field's analyzer."
+          },
+          "text_fields": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object"
+            },
+            "description": "Further text fields and their analyzers (M152)."
+          },
+          "regex": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "vectors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Named dense fields and their widths."
+          },
+          "id": {
+            "type": "string",
+            "enum": [
+              "string",
+              "uint64",
+              "uuid"
+            ]
+          },
+          "vector_types": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Declared element types per dense field (M195)."
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Recorded attribute types (M173)."
+          }
+        },
+        "required": [
+          "dims",
+          "distance_metric",
+          "text_field",
+          "full_text_search",
+          "regex",
+          "id",
+          "attributes"
+        ],
+        "additionalProperties": false
+      },
+      "VectorSearch": {
+        "type": "object",
+        "properties": {
+          "approximate_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "exact_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unknown_rows": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "approximate_rows",
+          "exact_rows",
+          "unknown_rows"
+        ],
+        "additionalProperties": false
+      },
+      "IndexProgress": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "updating",
+              "up-to-date"
+            ]
+          },
+          "unindexed_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unindexed_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "exact": {
+            "type": "boolean"
+          },
+          "as_of_epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          }
+        },
+        "required": [
+          "status",
+          "unindexed_rows",
+          "unindexed_bytes",
+          "exact",
+          "as_of_epoch"
+        ],
+        "additionalProperties": false
+      },
+      "IndexSummary": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "segments": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "documents": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "unfolded": {
+            "type": "boolean",
+            "description": "A write is acknowledged and not yet folded."
+          },
+          "schema": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IndexSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vector_search": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/VectorSearch"
+            },
+            "description": "Per dense field: rows ANN searches, rows scanned exactly (M198)."
+          },
+          "rejected_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "quarantined_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "updated_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "approx_row_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "approx_logical_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/IndexProgress"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "index",
+          "segments",
+          "documents",
+          "epoch",
+          "unfolded",
+          "schema",
+          "rejected_rows",
+          "quarantined_rows",
+          "updated_epoch",
+          "approx_row_count",
+          "created_at",
+          "updated_at",
+          "approx_logical_bytes",
+          "read_only",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "MultiVectorQuery": {
+        "type": "object",
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "vectors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Vector"
+            }
+          },
+          "mode": {
+            "description": "exact (the default) or fde (M67)."
+          },
+          "rerank": {
+            "description": "With mode fde, exact re-scores the candidates."
+          },
+          "rerank_window": {
+            "description": "Candidates a rerank re-scores a segment."
+          },
+          "probes": {
+            "description": "Clustered lists read a segment (M72)."
+          }
+        },
+        "required": [
+          "field",
+          "vectors"
+        ],
+        "additionalProperties": false,
+        "description": "A MaxSim query over a field of several vectors a row (M61)."
+      },
+      "QueryRequest": {
+        "type": "object",
+        "properties": {
+          "vector": {
+            "$ref": "#/components/schemas/Vector"
+          },
+          "field": {
+            "type": "string",
+            "description": "The dense field vector searches; the primary when absent."
+          },
+          "diversify": {
+            "description": "MMR diversification (M144)."
+          },
+          "include_vectors": {
+            "description": "Project stored vectors: true or field names (M179)."
+          },
+          "vector_encoding": {
+            "type": "string",
+            "enum": [
+              "float",
+              "base64"
+            ]
+          },
+          "limit_per": {
+            "description": "At most n results per attribute value (M146)."
+          },
+          "facets": {
+            "description": "Facet counts beside the results (M65)."
+          },
+          "highlight": {
+            "description": "Highlight matched text (M159)."
+          },
+          "boost": {
+            "description": "Attribute boosts (M154)."
+          },
+          "multi": {
+            "$ref": "#/components/schemas/MultiVectorQuery"
+          },
+          "sparse": {
+            "description": "A sparse query vector (M178)."
+          },
+          "text": {
+            "description": "BM25 legs: a string, or an array of strings and {field, query, last_as_prefix} objects (M155, M180).",
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "fusion": {
+            "description": "How legs combine: rrf (the default), sum or max (M9g)."
+          },
+          "as_of": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Read the index as this past epoch held it (M114)."
+          },
+          "top_k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "default": 10
+          },
+          "include_attributes": {
+            "description": "true for every attribute, false for none, or names.",
+            "type": [
+              "boolean",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "exclude_attributes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "filters": {
+            "description": "A filter expression, e.g. [\"color\", \"Eq\", \"blue\"] or [\"And\", [...]]."
+          },
+          "exact": {
+            "type": "boolean",
+            "description": "Scan exactly rather than through ANN.",
+            "default": false
+          },
+          "rank_by": {
+            "description": "An order (an attribute and asc or desc) or a scoring expression (M182)."
+          },
+          "aggregate_by": {
+            "description": "Aggregations instead of rows (M140)."
+          },
+          "group_by": {
+            "description": "Group aggregations by attributes (M140)."
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Rows to skip (M157)."
+          },
+          "consistency": {
+            "description": "eventual (the default), strong, session or bounded (M11).",
+            "type": [
+              "string",
+              "object"
+            ]
+          },
+          "max_staleness_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600000,
+            "description": "With consistency bounded."
+          },
+          "explain": {
+            "type": "boolean",
+            "description": "Answer the plan the query ran (M165).",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "description": "One query. Ranked by vector, text or sparse legs, ordered by rank_by, or aggregated."
+      },
+      "MultiQueryRequest": {
+        "type": "object",
+        "properties": {
+          "queries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryRequest"
+            },
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "rerank_by": {
+            "description": "An outer fusion of the queries' results (M142)."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "queries"
+        ],
+        "additionalProperties": false,
+        "description": "Several queries in one request, one snapshot (M9g, M131). A sub-query carries neither queries, explain nor include_vectors, and limit and offset apply only beside rerank_by: each is refused (400)."
+      },
+      "VectorOut": {
+        "type": [
+          "array",
+          "string"
+        ],
+        "items": {
+          "type": "number"
+        },
+        "description": "As vector_encoding asked: floats or base64."
+      },
+      "HighlightMatch": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "fragment_range": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "match_ranges": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "array_index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ResultRow": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "score": {
+            "type": "number",
+            "description": "The fused score: higher ranks first. Under RRF it is the sum of 1/(60 + rank) over the legs."
+          },
+          "$dist": {
+            "type": "number",
+            "description": "The vector distance under the index's metric: lower is nearer. Absent on an order or a text-only query."
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {},
+            "description": "The projected attributes. An attribute the row does not have is absent, never null."
+          },
+          "$highlight": {
+            "type": "string"
+          },
+          "$highlights": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HighlightMatch"
+            }
+          },
+          "vector": {
+            "$ref": "#/components/schemas/VectorOut"
+          },
+          "vectors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/VectorOut"
+              }
+            }
+          },
+          "sparse": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            }
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false,
+        "description": "One result. Rows come in rank order: score descending, or the order rank_by names."
+      },
+      "QueryMeta": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "unfolded_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Results served from writes not yet folded."
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          },
+          "consistency": {
+            "type": "string",
+            "enum": [
+              "eventual",
+              "strong",
+              "session",
+              "bounded"
+            ]
+          },
+          "session": {
+            "type": "string"
+          },
+          "staleness_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "facets_epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "explain": {
+            "description": "The plan, with explain: true."
+          }
+        },
+        "required": [
+          "epoch",
+          "unfolded_hits",
+          "cost",
+          "consistency",
+          "session",
+          "staleness_ms"
+        ],
+        "additionalProperties": false
+      },
+      "QueryResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResultRow"
+            }
+          },
+          "aggregations": {
+            "type": "object"
+          },
+          "aggregation_groups": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "facets": {
+            "description": "Facet counts (M65)."
+          },
+          "meta": {
+            "$ref": "#/components/schemas/QueryMeta"
+          }
+        },
+        "required": [
+          "results",
+          "meta"
+        ],
+        "additionalProperties": false
+      },
+      "MultiQueryMeta": {
+        "type": "object",
+        "properties": {
+          "epochs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Epoch"
+            }
+          },
+          "unfolded_hits": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          },
+          "consistencies": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "eventual",
+                "strong",
+                "session",
+                "bounded"
+              ]
+            }
+          },
+          "session": {
+            "type": "string"
+          },
+          "staleness_ms": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "facets_epochs": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        "required": [
+          "epochs",
+          "unfolded_hits",
+          "cost",
+          "consistencies",
+          "session",
+          "staleness_ms"
+        ],
+        "additionalProperties": false
+      },
+      "MultiQueryResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ResultRow"
+              }
+            }
+          },
+          "aggregations": {
+            "type": "array",
+            "items": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "aggregation_groups": {
+            "type": "array",
+            "items": {
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "facets": {
+            "type": "array",
+            "items": {}
+          },
+          "meta": {
+            "$ref": "#/components/schemas/MultiQueryMeta"
+          }
+        },
+        "required": [
+          "results",
+          "meta"
+        ],
+        "additionalProperties": false,
+        "description": "Each query's answer in request order, and one cost."
+      },
+      "RecallRequest": {
+        "type": "object",
+        "properties": {
+          "num": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "default": 10,
+            "description": "Queries to sample."
+          },
+          "top_k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 10
+          },
+          "filters": {
+            "description": "Applied to every sampled query."
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "include_ground_truth": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RecallNeighbor": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "dist": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "dist"
+        ],
+        "additionalProperties": false
+      },
+      "RecallGroundTruth": {
+        "type": "object",
+        "properties": {
+          "query_vector": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "nearest_neighbors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallNeighbor"
+            }
+          }
+        },
+        "required": [
+          "query_vector",
+          "nearest_neighbors"
+        ],
+        "additionalProperties": false
+      },
+      "RecallResponse": {
+        "type": "object",
+        "properties": {
+          "avg_recall": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "avg_ann_count": {
+            "type": "number"
+          },
+          "avg_exhaustive_count": {
+            "type": "number"
+          },
+          "num": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "ground_truth": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallGroundTruth"
+            }
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "avg_recall",
+          "avg_ann_count",
+          "avg_exhaustive_count",
+          "num",
+          "epoch",
+          "cost"
+        ],
+        "additionalProperties": false,
+        "description": "The index's recall at one snapshot (M162)."
+      },
+      "WarmResponse": {
+        "type": "object",
+        "properties": {
+          "segments": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fetched": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "meta": {
+            "type": "object",
+            "properties": {
+              "cost": {
+                "$ref": "#/components/schemas/Cost"
+              }
+            },
+            "required": [
+              "cost"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "segments",
+          "fetched",
+          "meta"
+        ],
+        "additionalProperties": false
+      },
+      "GcResponse": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "reaped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reaped_before": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "epoch",
+          "reaped",
+          "reaped_before",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "Duties": {
+        "type": "object",
+        "properties": {
+          "duties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "instead": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "instead"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "duties"
+        ],
+        "additionalProperties": false,
+        "description": "What this deployment leaves to its operator."
+      },
+      "QuarantineExport": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "document": {
+                  "type": "object"
+                },
+                "reserved": {},
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "document",
+                "reserved",
+                "reason"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "epoch",
+          "rows",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "QuarantineDiscarded": {
+        "type": "object",
+        "properties": {
+          "discarded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "discarded",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "ReplicaSource": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string",
+            "description": "A tenant id, decimal; this request's tenant when absent."
+          },
+          "store": {
+            "type": "string",
+            "description": "A source store PSTORE_SOURCES names; this store when absent or empty."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReplicaSourceOut": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "tenant",
+          "store"
+        ],
+        "additionalProperties": false
+      },
+      "CopyRequest": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSource"
+          },
+          "read_only": {
+            "type": "boolean",
+            "description": "Finish read-only: an export (M167)."
+          },
+          "schema": {
+            "description": "Rebuild under this schema: a reindex (M168)."
+          },
+          "as_of": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Copy the source as this past epoch held it (M196)."
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "additionalProperties": false
+      },
+      "CopyStatus": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "paused",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSourceOut"
+          },
+          "epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "source_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "source_not_found",
+              "rebuild_refused",
+              "epoch_unavailable",
+              null
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "as_of": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "progress": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "segments_done": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "segments_total": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytes_done": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "attempt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "updated_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "segments_done",
+                  "segments_total",
+                  "bytes_done",
+                  "attempt",
+                  "updated_at"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "state",
+          "run",
+          "source",
+          "epoch",
+          "source_epoch",
+          "code",
+          "last_error",
+          "read_only",
+          "created_at",
+          "ended_at",
+          "as_of",
+          "progress"
+        ],
+        "additionalProperties": false,
+        "description": "An isolated copy, export or reindex, as an operation with a status (M166)."
+      },
+      "ReplicationRequest": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSource"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "additionalProperties": false,
+        "description": "A replication follows its source's present and schema, always read-only: read_only, schema and as_of are a copy's, and refused here."
+      },
+      "ReplicationSummary": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "paused"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSourceOut"
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "index",
+          "state",
+          "source",
+          "run",
+          "applied_epoch",
+          "rejected"
+        ],
+        "additionalProperties": false
+      },
+      "ReplicationStatus": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "paused"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSourceOut"
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "segments": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "boolean"
+          },
+          "claim": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "expires_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "owner",
+                  "expires_ms"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_commit_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_lag_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "fresh_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "lag_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "lag_exceeded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "index",
+          "state",
+          "source",
+          "run",
+          "applied_epoch",
+          "rejected",
+          "segments",
+          "rows",
+          "queued",
+          "claim",
+          "last_commit_ms",
+          "last_error",
+          "max_lag_ms",
+          "fresh_ms",
+          "lag_ms",
+          "lag_exceeded"
+        ],
+        "additionalProperties": false
+      },
+      "ReplicationSynced": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "paused"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ReplicaSourceOut"
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "segments": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "boolean"
+          },
+          "claim": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "expires_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "owner",
+                  "expires_ms"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_commit_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_lag_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "fresh_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "lag_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "lag_exceeded": {
+            "type": "boolean"
+          },
+          "source_folded": {
+            "type": "boolean",
+            "description": "The source was folded in this store before the sync."
+          }
+        },
+        "required": [
+          "index",
+          "state",
+          "source",
+          "run",
+          "applied_epoch",
+          "rejected",
+          "segments",
+          "rows",
+          "queued",
+          "claim",
+          "last_commit_ms",
+          "last_error",
+          "max_lag_ms",
+          "fresh_ms",
+          "lag_ms",
+          "lag_exceeded"
+        ],
+        "additionalProperties": false
+      },
+      "ReplicationList": {
+        "type": "object",
+        "properties": {
+          "replications": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicationSummary"
+            }
+          }
+        },
+        "required": [
+          "replications"
+        ],
+        "additionalProperties": false
+      },
+      "ReplicationCancelled": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          }
+        },
+        "required": [
+          "index",
+          "epoch"
+        ],
+        "additionalProperties": false
+      },
+      "ExternalRegisterRequest": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "parquet",
+              "lance"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "description": "The object's URL; its prefix must be allowed."
+          },
+          "column": {
+            "type": "string",
+            "description": "The vector column."
+          }
+        },
+        "required": [
+          "kind",
+          "source",
+          "column"
+        ],
+        "additionalProperties": false,
+        "description": "An external index over the customer's own object (M86)."
+      },
+      "ExternalQueryRequest": {
+        "type": "object",
+        "properties": {
+          "vector": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 10
+          },
+          "window": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Candidates re-scored, at least k: 4 x k when absent."
+          }
+        },
+        "required": [
+          "vector"
+        ],
+        "additionalProperties": false
+      },
+      "ExternalCopyRequest": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "additionalProperties": false
+      },
+      "ExternalCommitted": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Cost"
+          }
+        },
+        "required": [
+          "epoch",
+          "cost"
+        ],
+        "additionalProperties": false
+      },
+      "ExternalAnswer": {
+        "type": "object",
+        "properties": {
+          "hits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "row": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "score": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "row",
+                "score"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "meta": {
+            "type": "object",
+            "properties": {
+              "cost": {
+                "$ref": "#/components/schemas/Cost"
+              }
+            },
+            "required": [
+              "cost"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "hits",
+          "meta"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
