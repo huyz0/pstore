@@ -1,5 +1,24 @@
 # Native API migration notes
 
+## M220: the native API as an OpenAPI contract
+
+[`api/openapi.json`](../api/openapi.json) (OpenAPI 3.1, contract version `1.0.0`) describes
+every route, method and scope, each request body's fields with their defaults and limits, every
+success response, and the error envelope with its codes and their statuses. Nothing on the wire
+changed.
+
+- It is tested against the server, not trusted: the router's routes and scopes, the fields each
+  request body's parser accepts, the error codes the source constructs, and every response the
+  fixtures in [`api/fixtures/native.json`](../api/fixtures/native.json) draw, validated against
+  closed schemas (`crates/pstore-server/tests/it/openapi.rs`). A response field the contract
+  does not name fails that test, so the contract changes with the field.
+- Scores: `$dist` is the vector distance under the index's metric, lower nearer for all three
+  (`dot_product` answers the negated product). `score` is the fused score, higher first.
+- A row missing a projected attribute answers no key for it, never `null`, and sorts after every
+  row that has it in an ascending order.
+- Expression grammars (filters, `rank_by`, facets, boosts) are typed by name only and point at
+  the milestone that defines them. Evidence is in [M220 verification](milestones/M220/VERIFIED.md).
+
 ## M201: GC announces its horizon before it deletes
 
 A copy or export `as_of` a past epoch either holds that epoch whole or ends `failed` with
