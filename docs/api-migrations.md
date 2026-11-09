@@ -1,5 +1,26 @@
 # Native API migration notes
 
+## M212: a query reserves its plan's candidate rows
+
+Every public query reserves **candidate rows** for its whole plan before it reads anything,
+and holds them until it answers:
+
+- a relevance ranking: each leg's limit plus its window (`top_k + offset`, or the boost,
+  `diversify` or `limit_per` window). A hybrid dense and text query at `top_k` 100 is 300;
+- an order or a `rank_by` expression: `top_k + offset`; an aggregation: its `top_k`;
+- a multi-query: the sum over its queries, and over each query's `facets`.
+
+`PSTORE_REQUEST_LIMITS_CONFIG` takes `query_rows` (default 4,194,304, every query of the
+server at once) and `tenant_query_rows` (default 1,048,576, one tenant's, at most
+`query_rows`), lowered only, as M128's limits are.
+
+- A query whose plan is above `tenant_query_rows` is `413 request_too_large`, naming it.
+  Split it: a multi-query of 16 queries with 8 dense legs each at `top_k` 10,000 is about
+  1.4 million rows.
+- One that fits but finds its tenant's or the server's pool short is `429 overloaded` with
+  `Retry-After: 1`. Neither waits or reads a blob. Rows are counted, not bytes. Evidence is
+  in [M212 verification](milestones/M212/VERIFIED.md).
+
 ## M222: a generated TypeScript client
 
 `clients/typescript/src/index.ts` is generated beside the Python client, dependency-free, for

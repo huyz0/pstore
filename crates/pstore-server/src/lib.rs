@@ -430,6 +430,26 @@ impl<S: BlobStore + 'static> Api<S> {
         self.ingress.counts()
     }
 
+    /// Candidate rows reserved by running queries now (M212).
+    #[doc(hidden)]
+    pub fn reserved_query_rows(&self) -> u64 {
+        self.ingress.reserved_rows()
+    }
+
+    /// Holds `rows` of `tenant`'s query reservation until the returned value is dropped, as a
+    /// running query would (M212's contention tests).
+    ///
+    /// # Errors
+    /// As a query's reservation would be refused.
+    #[doc(hidden)]
+    pub fn hold_query_rows_for_test(
+        &self,
+        tenant: TenantId,
+        rows: u64,
+    ) -> Result<QueryRowsHeld, ApiError> {
+        self.ingress.reserve_rows(tenant, rows).map(QueryRowsHeld)
+    }
+
     fn build(
         store: Accounted<S>,
         lane: LaneId,
@@ -2940,6 +2960,12 @@ async fn query_index<S: BlobStore + 'static>(
         // M65: checked first, so every refusal names `facets`.
         let facet = facets::derive(&req)?;
         let plan = plan(&req)?;
+        // M212: the whole plan's candidates reserved, before any blob request, until answered.
+        let mut rows = plan_rows(&plan, &req);
+        if let Some((freq, _)) = &facet {
+            rows = rows.saturating_add(plan_rows(&crate::plan(freq)?, freq));
+        }
+        let _reserved = api.ingress.reserve_rows(tenant, rows)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
@@ -3001,7 +3027,12 @@ async fn query_index<S: BlobStore + 'static>(
         .iter()
         .map(|r| Ok(facets::derive(r)?.map(|(f, _)| f)))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
+    // M212: every query's and facet's plan reserved together, before any blob request.
+    let mut rows = 0_u64;
+    for r in reqs.iter().chain(facet_reqs.iter().flatten()) {
+        rows = rows.saturating_add(plan_rows(&plan(r)?, r));
+    }
+    let _reserved = api.ingress.reserve_rows(tenant, rows)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
@@ -3440,6 +3471,44 @@ fn total_json(t: pstore_query::Total) -> serde_json::Value {
         pstore_query::Total::Null => serde_json::Value::Null,
     }
 }
+
+/// The candidate rows a plan holds (M212): an aggregation its groups, an order or expression
+/// its page, a ranking each leg's limit (a FDE leg's rerank when larger) and its window.
+fn plan_rows(plan: &Plan, req: &QueryRequest) -> u64 {
+    let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    match plan {
+        Plan::Aggregate(spec, _) => wide(spec.top_k),
+        Plan::Ordered(..) | Plan::Scored(..) => wide(page_end(req)),
+        Plan::Ranked(legs, _, _, boost, _, diversify, limit_per) => {
+            let window = boost
+                .as_ref()
+                .map(|b| b.window)
+                .or(diversify.map(|d| d.window))
+                .or(limit_per.as_ref().map(|p| p.window))
+                .unwrap_or(page_end(req));
+            legs.iter()
+                .map(|l| wide(leg_rows(l)))
+                .fold(wide(window), u64::saturating_add)
+        }
+    }
+}
+
+fn leg_rows(leg: &pstore_query::Prefetch) -> usize {
+    use pstore_query::Prefetch;
+    match leg {
+        Prefetch::MultiFde { limit, rerank, .. } => rerank.map_or(*limit, |r| r.max(*limit)),
+        Prefetch::Dense { limit, .. }
+        | Prefetch::Sparse { limit, .. }
+        | Prefetch::Multi { limit, .. }
+        | Prefetch::Text { limit, .. }
+        | Prefetch::Trigram { limit, .. } => *limit,
+    }
+}
+
+/// A test's hold on query rows (M212): returned when dropped.
+#[doc(hidden)]
+#[must_use = "dropping it returns the rows at once"]
+pub struct QueryRowsHeld(#[allow(dead_code, reason = "held for its drop")] ingress::Rows);
 
 /// What a query will run, decided -- and refused -- before it runs.
 enum Plan {
