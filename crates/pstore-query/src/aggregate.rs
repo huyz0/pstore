@@ -799,6 +799,18 @@ mod tests {
     }
 
     #[test]
+    fn widths_are_equal_only_of_one_kind_and_value() {
+        // Specs compare by value, so a width must too: an integer width is never a float's,
+        // and a float compares by its bits.
+        assert_eq!(Width::Int(10), Width::Int(10));
+        assert_ne!(Width::Int(10), Width::Int(20));
+        assert_eq!(Width::Float(2.5), Width::Float(2.5));
+        assert_ne!(Width::Float(2.5), Width::Float(0.5));
+        assert_ne!(Width::Int(1), Width::Float(1.0));
+        assert_ne!(Width::Float(1.0), Width::Int(1));
+    }
+
+    #[test]
     fn a_bucket_is_its_lower_bound_floored() {
         assert_eq!(
             buckets(

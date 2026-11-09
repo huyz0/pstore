@@ -40,3 +40,8 @@ Code review round 1 (pass, two minors, both taken): a number whose integer bucke
 falls below `i64::MIN` was put in the `null` group; it is now the float nearest its bound,
 asserted in `a_bucket_is_its_lower_bound_floored` (red with the old fallback, green after).
 The migration notes now say a width of `10.0` is a float width.
+
+CI's `mutants-shard (0)` on the pull request found four mutants of `Width`'s `PartialEq`
+missed (each arm deleted, each `==` turned `!=`): nothing compared two widths. The unit test
+`widths_are_equal_only_of_one_kind_and_value` was added; it fails under each of the four and
+passes on the code, run one at a time by script here.
