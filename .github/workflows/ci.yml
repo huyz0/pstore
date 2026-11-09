@@ -303,7 +303,7 @@ jobs:
       - run: ./scripts/selftest-mutants.sh
 
   # M221: the generated clients, each running api/fixtures/native.json's steps against a real
-  # server. Its own job because it builds the server binary and needs Python (and Node, M222).
+  # server. Its own job because it builds the server binary and needs Python, Node and tsc.
   clients:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -315,6 +315,10 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.9" }
+      # M222: Node 22, the first with type stripping, and a pinned tsc.
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: npm install --global typescript@5.9.3
       - run: ./scripts/clients.sh
 
   # The whole local gate, on the three operating systems a contributor might run it on.
