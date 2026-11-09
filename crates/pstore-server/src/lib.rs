@@ -5805,8 +5805,18 @@ fn full_text_options(v: &serde_json::Value) -> Result<pstore_format::text::FullT
                     _ => return Err(format!("full_text_search: unknown option {k:?}")),
                 }
             }
-            if fts.analyzer.remove_stopwords && fts.analyzer.language != Language::English {
-                return Err("full_text_search: remove_stopwords is English only".to_owned());
+            // M204: every language with a stopword list.
+            if fts.analyzer.remove_stopwords && fts.analyzer.language.stopwords().is_none() {
+                return Err(format!(
+                    "full_text_search: remove_stopwords has no list for {}; it has one for {}",
+                    fts.analyzer.language.name(),
+                    Language::ALL
+                        .into_iter()
+                        .filter(|l| l.stopwords().is_some())
+                        .map(Language::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             // M158: a pre-tokenized token is kept byte for byte, so nothing may change it --
             // and it is matched case-sensitively, whatever was declared.
