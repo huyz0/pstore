@@ -1018,6 +1018,23 @@ async fn missing_values_score_zero() {
     // A float beyond 1e30 reads as 1e30, so two of them sum to a finite 2e30.
     let mut huge = Document::new("huge", vec![0.5; DIM]);
     huge.attrs.insert(F.into(), Value::Float(1e300));
+    // And a `uint64` is a number, read exactly as its value.
+    let mut unsigned = Document::new("unsigned", vec![0.5; DIM]);
+    unsigned.attrs.insert(N.into(), Value::Uint(7));
+    let got = rank(
+        &c.store,
+        &[],
+        None,
+        &HashSet::new(),
+        &positive,
+        &texts(),
+        std::slice::from_ref(&unsigned),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1, 7.0, "a uint64 of 7");
     let twice = Expr::Max(vec![
         Expr::Literal(0.0),
         Expr::Sum(vec![Expr::Attribute(F.into()), Expr::Attribute(F.into())]),

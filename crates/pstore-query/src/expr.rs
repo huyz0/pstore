@@ -623,22 +623,15 @@ fn distance(v: &Value, origin: Origin) -> Option<f64> {
     }
 }
 
-/// `x^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (m/x)^p)`: no power overflows.
+/// `x^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (m/x)^p)`: no power overflows. At `0`,
+/// `m/0` is infinite and the score `0`, so no branch is needed.
 fn saturate(x: f64, m: f64, p: f64) -> f64 {
-    if x > 0.0 {
-        1.0 / (1.0 + (m / x).powf(p))
-    } else {
-        0.0
-    }
+    1.0 / (1.0 + (m / x.max(0.0)).powf(p))
 }
 
-/// `m^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (x/m)^p)`.
+/// `m^p / (x^p + m^p)` of `max(x, 0)`, as `1 / (1 + (x/m)^p)`: `1` at `0`.
 fn decay(x: f64, m: f64, p: f64) -> f64 {
-    if x > 0.0 {
-        1.0 / (1.0 + (x / m).powf(p))
-    } else {
-        1.0
-    }
+    1.0 / (1.0 + (x.max(0.0) / m).powf(p))
 }
 
 /// The first `cap` rows scoring above 0, by score descending then id ascending.

@@ -5251,13 +5251,8 @@ fn duration_ms(d: &str) -> Option<f64> {
 /// A `Dist`'s datetime origin: RFC 3339, and UTC when it has no offset, as the vendor's
 /// example is written (M203).
 fn origin_instant(t: &str) -> Option<i64> {
-    pstore_format::datetime::parse(t).or_else(|| {
-        let bare = t.len() >= 19
-            && !t.ends_with('Z')
-            && t.get(19..).is_some_and(|tail| !tail.contains(['+', '-']));
-        bare.then(|| pstore_format::datetime::parse(&format!("{t}Z")))
-            .flatten()
-    })
+    // A `Z` appended parses only where the instant had no offset of its own.
+    pstore_format::datetime::parse(t).or_else(|| pstore_format::datetime::parse(&format!("{t}Z")))
 }
 
 /// One `[attribute, "asc" | "desc"]` pair of `rank_by`.

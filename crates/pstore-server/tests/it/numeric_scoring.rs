@@ -320,6 +320,8 @@ async fn numeric_expressions_out_of_bounds_are_refused() {
         json!(["Dist", ["Sum", [1]], 3]),
         json!(["Dist", attr(), true]),
         json!(["Dist", attr(), "yesterday"]),
+        json!(["Dist", attr(), "2026-02-03T12:13:14ZZ"]),
+        json!(["Dist", attr(), "2026-02-03T12:13:14+01:00Z"]),
         json!(["Dist", attr()]),
         // Attribute's.
         json!(["Max", [0, ["Attribute"]]]),
