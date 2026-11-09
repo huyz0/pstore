@@ -385,25 +385,51 @@ impl Scope {
     }
 }
 
-/// Routes that are authorized, then admitted (M128), before their handler runs.
-pub(crate) struct ScopedRouter<S>(axum::Router<S>, Arc<crate::ingress::Ingress>);
+/// Routes that are authorized, then admitted (M128), before their handler runs -- and each
+/// path with the scope it was registered under, which the published contract is checked
+/// against (M220).
+pub(crate) struct ScopedRouter<S>(
+    axum::Router<S>,
+    Arc<crate::ingress::Ingress>,
+    Vec<(String, Scope)>,
+);
+
+impl Scope {
+    /// The scope as a token's `scopes` claim spells it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::List => "list",
+            Self::Admin => "admin",
+            Self::Internal => "internal",
+        }
+    }
+}
 
 impl<S: Clone + Send + Sync + 'static> ScopedRouter<S> {
     pub(crate) fn new(ingress: Arc<crate::ingress::Ingress>) -> Self {
-        Self(axum::Router::new(), ingress)
+        Self(axum::Router::new(), ingress, Vec::new())
+    }
+
+    /// Every `(path, scope)` registered, in registration order.
+    pub(crate) fn table(&self) -> Vec<(String, &'static str)> {
+        self.2.iter().map(|(p, s)| (p.clone(), s.name())).collect()
     }
 
     /// ⚠️ **The scope layer is outermost**, so a request is refused for its authority before
     /// it holds any admission capacity or has its body polled.
     pub(crate) fn route(self, path: &str, route: ScopedRoute<S>) -> Self {
         let ScopedRoute(method, scope) = route;
+        let mut table = self.2;
+        table.push((path.to_owned(), scope));
         let method = method
             .route_layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&self.1),
                 crate::ingress::admit,
             ))
             .route_layer(axum::middleware::from_fn_with_state(scope, require_scope));
-        Self(self.0.route(path, method), self.1)
+        Self(self.0.route(path, method), self.1, table)
     }
 
     pub(crate) fn finish(self) -> axum::Router<S> {
