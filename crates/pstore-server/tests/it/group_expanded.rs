@@ -344,6 +344,17 @@ async fn what_expanded_grouping_cannot_mean_is_refused_before_any_blob_request()
             Some(json!([{"b": ["Bucket", "price", -1]}])),
             "Bucket",
         ),
+        // A float width, too, must be positive.
+        (
+            count.clone(),
+            Some(json!([{"b": ["Bucket", "price", -2.5]}])),
+            "Bucket",
+        ),
+        (
+            count.clone(),
+            Some(json!([{"b": ["Bucket", "price", 0.0]}])),
+            "Bucket",
+        ),
         (
             count.clone(),
             Some(json!([{"b": ["Bucket", "price", "10"]}])),

@@ -49,3 +49,7 @@ passes on the code, run one at a time by script here.
 `Acc::number`: no test averaged a uint64, so the surviving mutant ran the whole suite past
 the timeout. `min_max_and_avg_are_typed_as_stated` now averages uint64s beside an int; it
 fails under both mutants and passes on the code, run by script here.
+`mutants-shard (11)` missed the float width's guard made `true` and its `&&` made `||`: no
+test sent a non-positive float width. The refusal cases in `group_expanded.rs` now send
+-2.5 and 0.0; both mutants fail them, run by script here. A non-finite width cannot be
+written in JSON, so `is_finite` guards only a value no client can send.
