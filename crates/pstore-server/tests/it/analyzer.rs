@@ -427,6 +427,26 @@ async fn a_past_epoch_answers_with_its_own_analyzer() {
     assert_eq!(b["results"][0]["id"], "r", "{b}");
 }
 
+/// M204 criterion 6: French stopwords, declared, dropped on both sides, and read back.
+#[tokio::test]
+async fn french_stopwords_over_http() {
+    let (_, w) = apis(&[1]);
+    let a = &w[0];
+    ok_put(
+        a,
+        &[("c", "le chat dort sur la table"), ("d", "un chien")],
+        Some(json!({"language": "french", "remove_stopwords": true})),
+    )
+    .await;
+    fold(a).await;
+    assert!(ids(a, "le").await.is_empty(), "le is a stopword");
+    assert_eq!(ids(a, "chat").await, ["c"]);
+    assert_eq!(bm25(a, "le chat").await, bm25(a, "chat").await);
+    let f = &stats(a).await["schema"]["full_text_search"];
+    assert_eq!(f["remove_stopwords"], true, "{f}");
+    assert_eq!(f["language"], "french", "{f}");
+}
+
 #[tokio::test]
 async fn what_an_analyzer_cannot_mean_is_refused() {
     let (_, w) = apis(&[1]);
@@ -435,7 +455,8 @@ async fn what_an_analyzer_cannot_mean_is_refused() {
         (json!({"stemmer": true}), "stemmer"),
         (json!({"language": "klingon"}), "language"),
         (
-            json!({"language": "french", "remove_stopwords": true}),
+            // M204: French has a list now; Arabic has none.
+            json!({"language": "arabic", "remove_stopwords": true}),
             "stopwords",
         ),
         (json!({"k1": 3.5}), "k1"),
