@@ -793,12 +793,6 @@ fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
     }
 }
 
-/// Whether a row holding `name` could satisfy `name op s` for a string literal (M9h.3).
-///
-/// ⚠️ Only a datetime entry can rule the block out, and only when it says the name holds no
-/// string here: a string row compares bytewise, and nothing describes those. With no entry,
-/// no datetime row exists but a string row may, so the block is kept. The caller keeps `id`
-/// out: no zone describes it.
 /// Whether the block's equality section (M230) leaves room for a row of `name` equal to
 /// `want`: `true` without one.
 fn may_equal(zones: &Zones, name: &str, want: &Value) -> bool {
@@ -808,6 +802,12 @@ fn may_equal(zones: &Zones, name: &str, want: &Value) -> bool {
         .is_none_or(|(e, b)| e.may_equal(name, *b, want))
 }
 
+/// Whether a row holding `name` could satisfy `name op s` for a string literal (M9h.3).
+///
+/// ⚠️ Only a datetime entry can rule the block out, and only when it says the name holds no
+/// string here: a string row compares bytewise, and nothing describes those. With no entry,
+/// no datetime row exists but a string row may, so the block is kept. The caller keeps `id`
+/// out: no zone describes it.
 fn could_hold_string(zones: &Zones, name: &str, op: Op, s: &str) -> bool {
     let Some(&(lo, hi, strings)) = zones.datetimes.get(name) else {
         return true;
