@@ -22,7 +22,9 @@ mod fuse;
 mod order;
 mod run;
 
-pub use aggregate::{Aggregate, Aggregator, Key, Spec as AggregateSpec, Total, aggregate};
+pub use aggregate::{
+    Aggregate, Aggregator, GroupKey, Grouping, Key, Spec as AggregateSpec, Total, Width, aggregate,
+};
 pub use expr::{
     Expr, MAX_CLAUSES as MAX_EXPR_CLAUSES, MAX_DEPTH as MAX_EXPR_DEPTH, MAX_EXPONENT,
     MAX_MAGNITUDE, MAX_NODES as MAX_EXPR_NODES, MAX_WEIGHT, MIN_MIDPOINT, MIN_WEIGHT,

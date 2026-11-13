@@ -51,6 +51,43 @@ changed.
 - Expression grammars (filters, `rank_by`, facets, boosts) are typed by name only and point at
   the milestone that defines them. Evidence is in [M220 verification](milestones/M220/VERIFIED.md).
 
+## M211: `Min`, `Max`, `Avg` and numeric buckets
+
+```json
+{"aggregate_by": {"lo": ["Min", "price"], "hi": ["Max", "price"], "avg": ["Avg", "price"]},
+ "group_by": [{"band": ["Bucket", "price", 10]}, "color"]}
+```
+
+- `Min`, `Max` and `Avg` read an attribute's numbers (int, uint64, float) and skip anything
+  else. `Min` and `Max` report the number as a group key reports it (`1.0` as `1`); `Avg` is
+  a float. Each is `null` for a group with no number. None of them is offered on `id`.
+- `{"band": ["Bucket", attribute, width]}` keys a row by `floor(value / width) * width`, in
+  integers when both are integers, else in floats; a negative value falls in the bucket
+  below zero. A row whose value is not a number is in the `null` group. `width` is a
+  positive finite number; `10.0` is a float width, so write `10` for exact integer buckets. A bucket may sit beside plain entries and a `ForEachUnique` one.
+- Nested groups and hits per group are not offered; `limit_per` (M146) bounds hits per
+  group of a ranking. Evidence is in [M211 verification](milestones/M211/VERIFIED.md).
+
+## M210: named `ForEachUnique` groups and unary `Count`
+
+A `group_by` entry may be a named group, one name mapped to `["ForEachUnique", attribute]`:
+
+```json
+{"aggregate_by": {"n": ["Count"], "s": ["Sum", "price"]},
+ "group_by": [{"tag": ["ForEachUnique", "tags"]}, "status"]}
+```
+
+- A row is in one group for each unique element of its array, combined with its plain keys,
+  and reported under the name (`"tag": "electronics"`). An element twice in one row's array
+  counts the row once in that group; `1` and `1.0` are one element. A scalar is its own
+  element. An absent attribute or an empty array is the `null` group, as for a plain entry.
+- At most one `ForEachUnique` entry; its name and attribute may not be another entry's or an
+  aggregate's label. A plain entry still groups by the whole array.
+- `["Count"]` counts the rows admitted, as `["Count", "id"]` does.
+- Facets and the aggregations of a multi-query accept both. `meta.unfolded_hits` counts a row
+  once however many of its groups were kept. Evidence is in
+  [M210 verification](milestones/M210/VERIFIED.md).
+
 ## M201: GC announces its horizon before it deletes
 
 A copy or export `as_of` a past epoch either holds that epoch whole or ends `failed` with
