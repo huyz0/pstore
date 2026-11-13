@@ -65,6 +65,12 @@ loaded only when a skill says to read one — never wholesale.
    a predicate over files in the tree, an agent must not be asked to check it.**
 7. **Numbers measured on WSL2 or against an emulator are `provisional`** and say so.
    They are relative, never absolute.
+8. **A feature with a measured downside is a setting: a cluster default, overridable per
+   index.** Only a change that wins everywhere, or whose downside is negligible and
+   measured, ships without one. The default is on only when the measurements show it wins
+   in most cases. Existing tests pin the old behaviour unchanged; new tests cover the new
+   one; both run in CI. → [`spec`](.agents/skills/spec/SKILL.md), "Settings, defaults and
+   both modes"
 
 ## Gates
 

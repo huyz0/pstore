@@ -78,6 +78,34 @@ every named test resolves, and a line that names no test must say `NOT-RUN` or
 `OBSERVED-NOT`. It **cannot** check that the evidence is true, and it cannot see
 macro-generated tests — name the enclosing `#[test]` fn, or abstain with a reason.
 
+## Settings, defaults and both modes
+
+A change to an on-disk format or to behaviour a user can observe (bytes read, latency, CPU,
+memory, rounding, compatibility) is benchmarked and profiled **before** it is adopted, and
+its downsides are measured, not argued. Then:
+
+1. **Every downside measured as negligible, every workload no worse** → ship it with no
+   setting. VERIFIED.md names the numbers that show it.
+2. **Any real downside, or any workload that gets worse** → it is a **setting**:
+   - a **cluster default**, set the same way on every server (configuration, documented in
+     `docs/deploy.md`'s Environment table). There is no control plane, so servers may
+     disagree during a rollout: a reader must accept both modes, and a mixed cluster is a
+     correct cluster;
+   - an **index-level override**, kept with the index (its HEAD or schema), which wins over
+     the cluster default and survives a restart of every server.
+3. **The default** is chosen from the benchmark: on only when the new mode wins for most of
+   the measured workloads. VERIFIED.md says which workloads lose, by how much, and when an
+   operator should turn it off.
+4. **Tests cover both modes.** Existing tests and byte fixtures **pin the old mode
+   explicitly** and keep every assertion as it was: never weaken one to fit the new default
+   (the "never weaken a test" non-negotiable). New tests show the new mode answers what the
+   old one does, plus whatever it adds. A test that only passes in one mode says so.
+5. **Rollback** is part of the downside: if an older binary cannot read what the new mode
+   writes, the spec says so and the setting is the switch back.
+
+⚠️ "Default on" is a measurement, not a preference. A spec that adds a mode states, as an
+acceptance criterion, the workloads and the bound that decide the default.
+
 ## Only the current milestone
 
 Decompose in detail only what is next. Tasks written three milestones ahead are wrong by
