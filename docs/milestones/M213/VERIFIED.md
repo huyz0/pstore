@@ -76,3 +76,11 @@ advised raising a bound that can only be lowered; held bytes could fill the cap 
 fold trigger (criterion 7); `stamp_footprint` was documented as a bound and is not (now an
 estimate, and a risk in the spec); and the external-source query reserved nothing (M212's
 criterion 7).
+
+CI's mutation shards on the pull request found two more misses, both now killed by script
+here: `Value::shrink_to_fit` made a no-op (nothing checked an attribute's spare capacity),
+and `held`'s prune kept `<` the watermark rather than `>=` (which drops unfolded batches'
+charge, unlike the equivalent "not pruned"). Added
+`shrinking_a_row_drops_the_capacity_it_was_parsed_with` (a parsed-shaped row's footprint
+equals its clone's after shrinking; it also kills an unshrunk id or vector), and
+`a_prune_drops_exactly_the_batches_a_watermark_folded` now asserts the `held` entries left.

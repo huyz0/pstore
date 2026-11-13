@@ -103,3 +103,23 @@ fn a_document_is_charged_the_memory_it_holds() {
     let leaves = 32_u64.div_ceil(5);
     assert!(d.footprint() > with_attrs + multi + sparse + (leaves - 1) * attrs);
 }
+
+#[test]
+fn shrinking_a_row_drops_the_capacity_it_was_parsed_with() {
+    // M213: the server shrinks a parsed row before charging it, so its footprint is what its
+    // contents need -- as a clone's, which allocates exactly -- in every part a parser grows.
+    let mut tags = Vec::with_capacity(16);
+    tags.push(Value::Str(String::with_capacity(64) + "red"));
+    let mut vector = Vec::with_capacity(8);
+    vector.extend([1.0_f32, 0.5]);
+    let mut id = String::with_capacity(32);
+    id.push_str("d01");
+    let mut key = String::with_capacity(32);
+    key.push_str("tags");
+    let mut doc = Document::new(id, vector);
+    doc.attrs.insert(key, Value::Array(tags));
+    let exact = doc.clone().footprint();
+    assert!(doc.footprint() > exact);
+    doc.shrink_to_fit();
+    assert_eq!(doc.footprint(), exact);
+}

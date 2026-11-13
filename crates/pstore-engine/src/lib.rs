@@ -2168,12 +2168,15 @@ mod memtable_tests {
     fn a_prune_drops_exactly_the_batches_a_watermark_folded() {
         let mut m = Memtable {
             durable: vec![(0, batch("a")), (1, batch("b")), (2, batch("c"))],
+            held: BTreeMap::from([(0, 10), (1, 11), (2, 12)]),
             ..Memtable::default()
         };
         // Watermark 2: sequences 0 and 1 are folded, 2 is not.
         assert!(m.prune(2));
         let left: Vec<&str> = m.durable_rows("i").map(|d| d.id.as_str()).collect();
         assert_eq!(left, ["c"]);
+        // M213: and the held charge of exactly the batches dropped.
+        assert_eq!(m.held, BTreeMap::from([(2, 12)]));
         assert_eq!(
             m.generation, 1,
             "dropping rows must invalidate a cached fresh segment"
