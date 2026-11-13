@@ -197,6 +197,23 @@ impl Segment {
                 b.zones.sketch = Some((std::sync::Arc::clone(&sketch), i));
             }
         }
+        // M230: and the equality section, the same way.
+        if let Some(span) = seg.section(Section::Equality) {
+            let lo = span.start.checked_sub(meta_offset).unwrap_or(u64::MAX) as usize;
+            let raw = idx_bytes
+                .get(lo..lo.saturating_add((span.end - span.start) as usize))
+                .ok_or(FormatError::Truncated)?;
+            let eq = crate::equality::Equality::decode(raw)?;
+            if eq.block_count() != seg.blocks.len() {
+                return Err(FormatError::Corrupt(
+                    "an equality section for another block count",
+                ));
+            }
+            let eq = std::sync::Arc::new(eq);
+            for (i, b) in seg.blocks.iter_mut().enumerate() {
+                b.zones.equality = Some((std::sync::Arc::clone(&eq), i));
+            }
+        }
         Ok(seg)
     }
 
@@ -855,6 +872,12 @@ impl Segment {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.rows as usize
+    }
+
+    /// Each block's zones, in block order: what a filter's pruning sees (M230's bench and
+    /// tests count the blocks a predicate keeps through it).
+    pub fn block_zones(&self) -> impl Iterator<Item = &Zones> {
+        self.blocks.iter().map(|b| &b.zones)
     }
 
     /// Blocks in the segment.

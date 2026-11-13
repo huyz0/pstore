@@ -706,8 +706,13 @@ impl Predicate {
                         Op::Gte => hi.is_some_and(Ordering::is_ge),
                     }
                 }),
+                // M230: an equality of a string or a bool, through the equality section.
                 None => match want {
-                    Value::Str(s) => could_hold_string(zones, name, *op, s),
+                    Value::Str(s) => {
+                        could_hold_string(zones, name, *op, s)
+                            && (*op != Op::Eq || may_equal(zones, name, want))
+                    }
+                    Value::Bool(_) if *op == Op::Eq => may_equal(zones, name, want),
                     _ => true,
                 },
             },
@@ -794,6 +799,15 @@ fn tokens_match(op: TokenOp, b: &Bound, elems: &[&str]) -> bool {
 /// string here: a string row compares bytewise, and nothing describes those. With no entry,
 /// no datetime row exists but a string row may, so the block is kept. The caller keeps `id`
 /// out: no zone describes it.
+/// Whether the block's equality section (M230) leaves room for a row of `name` equal to
+/// `want`: `true` without one.
+fn may_equal(zones: &Zones, name: &str, want: &Value) -> bool {
+    zones
+        .equality
+        .as_ref()
+        .is_none_or(|(e, b)| e.may_equal(name, *b, want))
+}
+
 fn could_hold_string(zones: &Zones, name: &str, op: Op, s: &str) -> bool {
     let Some(&(lo, hi, strings)) = zones.datetimes.get(name) else {
         return true;
