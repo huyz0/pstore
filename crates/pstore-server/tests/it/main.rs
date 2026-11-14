@@ -94,6 +94,7 @@ mod sketch;
 mod snapshot;
 mod socket;
 mod sparse;
+mod storage;
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,

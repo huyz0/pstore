@@ -680,6 +680,55 @@ impl Predicate {
         }
     }
 
+    /// Whether every one of a block's `rows` rows is provably admitted (M232): its aggregate
+    /// statistics say every row holds the attribute, as one numeric kind, and its zone puts
+    /// every value on the admitted side. `false` whenever that is not proven, which only costs
+    /// reading the block.
+    #[must_use]
+    pub fn must_admit(&self, zones: &Zones, rows: usize) -> bool {
+        match self {
+            Self::Cmp(name, ..) if name == ID => false,
+            Self::Cmp(name, op, want) => {
+                let Some(x) = Number::of(want) else {
+                    return false;
+                };
+                let Some((stats, b)) = zones.aggregates.as_ref() else {
+                    return false;
+                };
+                let Some(stat) = stats.get(name, *b) else {
+                    return false;
+                };
+                if stat.count() as usize != rows {
+                    return false;
+                }
+                let bounds = match stat {
+                    pstore_format::aggregates::Stat::Int { .. } => zones
+                        .ints
+                        .get(name)
+                        .map(|&(lo, hi)| (Number::Int(lo), Number::Int(hi))),
+                    pstore_format::aggregates::Stat::Float { .. } => zones
+                        .floats
+                        .get(name)
+                        .map(|&(lo, hi)| (Number::Float(lo), Number::Float(hi))),
+                };
+                let Some((lo, hi)) = bounds else {
+                    return false;
+                };
+                let (lo, hi) = (cmp_numbers(lo, x), cmp_numbers(hi, x));
+                match op {
+                    Op::Eq => lo.is_some_and(Ordering::is_eq) && hi.is_some_and(Ordering::is_eq),
+                    Op::Lt => hi.is_some_and(Ordering::is_lt),
+                    Op::Lte => hi.is_some_and(Ordering::is_le),
+                    Op::Gt => lo.is_some_and(Ordering::is_gt),
+                    Op::Gte => lo.is_some_and(Ordering::is_ge),
+                }
+            }
+            Self::And(all) => all.iter().all(|p| p.must_admit(zones, rows)),
+            Self::Or(any) => any.iter().any(|p| p.must_admit(zones, rows)),
+            _ => false,
+        }
+    }
+
     /// Whether a block with these zone maps **could** hold an admitted row. `false` only
     /// when it provably cannot: a wrongly dropped block silently loses rows.
     ///

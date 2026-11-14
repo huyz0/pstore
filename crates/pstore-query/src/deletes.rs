@@ -45,6 +45,13 @@ impl Rows {
         self.0.binary_search(row).is_ok()
     }
 
+    /// Whether any row in `rows` is deleted (M232): a block answered from its statistics
+    /// must have none.
+    pub(crate) fn any_in(&self, rows: std::ops::Range<usize>) -> bool {
+        let at = self.0.partition_point(|r| *r < rows.start);
+        self.0.get(at).is_some_and(|r| *r < rows.end)
+    }
+
     /// How many distinct rows are deleted: [`decode`]'s set's size.
     pub(crate) fn len(&self) -> usize {
         self.0.len()

@@ -20,7 +20,7 @@ pub use external::ExternalRefusal;
 pub use head::{
     COPIES_RETAINED, CopyEnd, CopyFailure, CopyOutcome, CopyProgress, Dicts, ExternalKind,
     ExternalRef, Head, HeadAt, IndexSchema, MAX_TEXTS, Metric, Reindex, ReplicaSource, Replication,
-    SegmentRef, TimeTravel,
+    SegmentRef, Storage, TimeTravel,
 };
 pub use pstore_format::typed::Kind;
 pub use recall::{GroundTruth, RECALL_ROW_BUDGET, Recall, RecallRequest, recall_probe};
@@ -1149,6 +1149,7 @@ pub(crate) fn stats_of(h: &Head, index: &str) -> Option<IndexStats> {
         written_ms: h.times.get(index).map(|t| t.1),
         bytes: refs.iter().map(|r| r.len).sum(),
         read_only: h.read_only.contains(index) || h.replications.contains_key(index),
+        storage: h.storage.get(index).copied().unwrap_or_default(),
     })
 }
 
@@ -2471,6 +2472,8 @@ pub struct IndexStats {
     /// Each dense field the schema records, to how a query on it searches the live rows
     /// (M198); empty before the schema is.
     pub vector_search: BTreeMap<String, VectorSearch>,
+    /// Its storage overrides (M231); unset ones take the cluster's default.
+    pub storage: head::Storage,
 }
 
 /// How a query on one dense field searches an index's folded live rows (M198), by segment:
@@ -2843,6 +2846,25 @@ impl<S: BlobStore> Engine<S> {
             .checkpoint_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// Seals blocks as `options` says for every index that overrides nothing (M231): the
+    /// cluster's default, set alike on every server. ⚠️ Servers that disagree, mid-rollout,
+    /// write segments a reader reads either way.
+    #[must_use]
+    pub fn with_block_options(mut self, options: pstore_format::BlockOptions) -> Self {
+        self.params.blocks = options;
+        self
+    }
+
+    /// What `index`'s next sealed segment's blocks are, by `head` (M231): its overrides over
+    /// this engine's default.
+    fn blocks_of(&self, head: &Head, index: &str) -> pstore_format::BlockOptions {
+        head.storage
+            .get(index)
+            .copied()
+            .unwrap_or_default()
+            .over(self.params.blocks)
     }
 
     /// Folds without each row's sparse pairs when `write` is false, as a build before M193
@@ -3725,6 +3747,7 @@ impl<S: BlobStore> Engine<S> {
         fts: &FullText,
         texts: &BTreeMap<String, FullText>,
         trigram: &[String],
+        blocks: pstore_format::BlockOptions,
     ) -> Result<(Key, Dicts, u64, BTreeSet<String>), EngineError> {
         let sparse = sparse_field_of(docs);
         // `None` indexes no text (M30): a merge with no field to keep must not choose one.
@@ -3743,7 +3766,10 @@ impl<S: BlobStore> Engine<S> {
         // MB at p=2 — and lowering `p` is a decision with its own measurement.
         let built = pstore_index::vec_index::try_build_all_fields(
             docs,
-            self.params,
+            pstore_index::cluster::Params {
+                blocks,
+                ..self.params
+            },
             pstore_format::DEFAULT_FIELD,
             sparse.as_deref(),
             &fields,
@@ -5871,6 +5897,59 @@ impl<S: BlobStore> Engine<S> {
         Err(EngineError::Lost)
     }
 
+    /// Changes `index`'s storage overrides (M231) by `change`, applied to what HEAD holds
+    /// inside the CAS loop, so two owners changing different settings both land: one HEAD
+    /// read and, when the overrides change, one CAS commit. Answers the overrides HEAD then
+    /// holds, at its epoch; `None` when HEAD does not hold the index. The next fold or
+    /// compaction writes by them; segments already written stay as they are.
+    pub async fn set_storage(
+        &self,
+        index: &str,
+        change: impl Fn(head::Storage) -> head::Storage,
+    ) -> Result<Option<(Epoch, head::Storage)>, EngineError> {
+        require_fencing(&*self.store)?;
+        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let at = head::read(&*self.store, self.tenant).await?;
+            self.remember_schemas(&at.head);
+            if !quarantine_exists(&at.head, index) {
+                return Ok(None);
+            }
+            let was = at.head.storage.get(index).copied().unwrap_or_default();
+            let now = change(was);
+            if now == was {
+                return Ok(Some((at.head.epoch, was)));
+            }
+            let mut next = at.head.clone();
+            next.epoch = next.epoch.next();
+            next.nonce = nonce_for(next.epoch, self.lane);
+            if now.is_default() {
+                next.storage.remove(index);
+            } else {
+                next.storage.insert(index.to_owned(), now);
+            }
+            match self.commit_head(&at, &next).await {
+                Ok(epoch) => {
+                    self.record_commit(epoch);
+                    self.remember_schemas(&next);
+                    return Ok(Some((epoch, now)));
+                }
+                Err(EngineError::Lost | EngineError::Contended)
+                    if attempt < MAX_COMMIT_ATTEMPTS - 1 =>
+                {
+                    backoff(self.lane, attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(EngineError::Lost)
+    }
+
+    /// This engine's default for indexes that override nothing (M231).
+    #[must_use]
+    pub fn block_options(&self) -> pstore_format::BlockOptions {
+        self.params.blocks
+    }
+
     /// [`Self::delete_index`], with `interfere` awaited between the first attempt's reads and
     /// its commit, so a test can make another delete land first and force the retry.
     #[doc(hidden)]
@@ -6404,6 +6483,7 @@ impl<S: BlobStore> Engine<S> {
                         &schema.fts,
                         &schema.texts,
                         &schema.trigram,
+                        self.blocks_of(&next, idx),
                     )
                     .await?;
                 next.indexes
@@ -7307,6 +7387,8 @@ impl<S: BlobStore> Engine<S> {
         // M14: a merge re-analyzes, so under the index's analyzer -- never the default.
         let schema = at.head.schemas.get(index).cloned().unwrap_or_default();
         let (fts, trigram, texts) = (schema.fts, schema.trigram, schema.texts);
+        // M231: as the index's storage settings stand at the HEAD the merge read.
+        let blocks = self.blocks_of(&at.head, index);
         let mut sealed_at = at.head.epoch.next();
         let mut out_key = self.compacted_key(sealed_at, index);
         // The single W (two, for an index with a sparse field). Written BEFORE the commit.
@@ -7320,7 +7402,9 @@ impl<S: BlobStore> Engine<S> {
         if !empty {
             let len;
             (out_key, out_dicts, len, out_ann) = self
-                .seal(names, &out_key, &rows, text_field, &fts, &texts, &trigram)
+                .seal(
+                    names, &out_key, &rows, text_field, &fts, &texts, &trigram, blocks,
+                )
                 .await?;
             out_len = Some(len);
         }
@@ -7349,6 +7433,7 @@ impl<S: BlobStore> Engine<S> {
                         &fts,
                         &texts,
                         &trigram,
+                        blocks,
                     )
                     .await?;
                 out_key = key;

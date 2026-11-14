@@ -9,6 +9,7 @@
 mod abandon;
 mod accessors;
 mod aggregate;
+mod aggregate_stats;
 mod analyzer;
 mod ann_fields;
 mod applied;
@@ -82,6 +83,7 @@ mod sketch;
 mod snapshot;
 mod sparse;
 mod split;
+mod storage;
 mod text_field;
 mod time_travel;
 mod times;

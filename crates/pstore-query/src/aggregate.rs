@@ -7,7 +7,6 @@
 //! a key among the global `top_k` smallest is among every segment's own, so the merge is exact.
 
 use crate::filter::Predicate;
-use crate::order::visit;
 use crate::run::{QueryError, Target};
 use pstore_blob::BlobStore;
 use pstore_format::{Document, Number, Value, cmp_numbers};
@@ -376,6 +375,24 @@ pub enum Total {
     Null,
 }
 
+/// A block's smallest and largest value of `attr`, from the zone of its statistics' kind.
+fn extremes_of(
+    zones: &pstore_format::Zones,
+    attr: &str,
+    stat: pstore_format::aggregates::Stat,
+) -> Option<(Number, Number)> {
+    match stat {
+        pstore_format::aggregates::Stat::Int { .. } => zones
+            .ints
+            .get(attr)
+            .map(|&(lo, hi)| (Number::Int(lo), Number::Int(hi))),
+        pstore_format::aggregates::Stat::Float { .. } => zones
+            .floats
+            .get(attr)
+            .map(|&(lo, hi)| (Number::Float(lo), Number::Float(hi))),
+    }
+}
+
 /// Adds one row to its group's accumulators.
 fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
     for ((_, agg), acc) in labels.iter().zip(accs.iter_mut()) {
@@ -517,6 +534,75 @@ impl Aggregator {
         true
     }
 
+    /// Whether [`Self::offer_block`] can stand for offering a block's rows (M232): the spec is
+    /// ungrouped, and every aggregate's attribute has statistics in the block, with a zone
+    /// for `Min`, `Max` and `Avg` when any row holds it.
+    #[must_use]
+    pub fn answers_block(&self, zones: &pstore_format::Zones) -> bool {
+        let Some((stats, b)) = zones.aggregates.as_ref() else {
+            return false;
+        };
+        self.spec.group_by.is_empty()
+            && self.spec.labels.iter().all(|(_, agg)| match agg {
+                Aggregate::Count(None) => true,
+                Aggregate::Count(Some(a)) | Aggregate::Sum(a) => stats.get(a, *b).is_some(),
+                Aggregate::Min(a) | Aggregate::Max(a) | Aggregate::Avg(a) => stats
+                    .get(a, *b)
+                    .is_some_and(|s| s.count() == 0 || extremes_of(zones, a, s).is_some()),
+            })
+    }
+
+    /// Folds a block of `rows` rows, every one admitted, from its statistics and zones (M232).
+    /// The caller has checked [`Self::answers_block`].
+    pub fn offer_block(&mut self, zones: &pstore_format::Zones, rows: u64) {
+        let Some((stats, b)) = zones.aggregates.as_ref() else {
+            return;
+        };
+        if !self.admit(&[]) {
+            return;
+        }
+        let Some(accs) = self.groups.get_mut(&Vec::new()) else {
+            return;
+        };
+        for ((_, agg), acc) in self.spec.labels.iter().zip(accs.iter_mut()) {
+            let attr = match agg {
+                Aggregate::Count(None) => {
+                    acc.count += rows;
+                    continue;
+                }
+                Aggregate::Count(Some(a))
+                | Aggregate::Sum(a)
+                | Aggregate::Min(a)
+                | Aggregate::Max(a)
+                | Aggregate::Avg(a) => a,
+            };
+            let Some(stat) = stats.get(attr, *b) else {
+                continue;
+            };
+            let count = u64::from(stat.count());
+            if matches!(agg, Aggregate::Count(_)) {
+                acc.count += count;
+                continue;
+            }
+            if count == 0 {
+                continue;
+            }
+            match stat {
+                pstore_format::aggregates::Stat::Int { sum, .. } => acc.ints += i128::from(sum),
+                pstore_format::aggregates::Stat::Float { sum, .. } => {
+                    acc.floats += sum;
+                    acc.any_float = true;
+                }
+            }
+            if !matches!(agg, Aggregate::Sum(_)) {
+                acc.nums += count;
+                if let Some((lo, hi)) = extremes_of(zones, attr, stat) {
+                    acc.extremes(Some(lo), Some(hi));
+                }
+            }
+        }
+    }
+
     /// Counts `rows` rows without offering them: HEAD's arithmetic, for the fast path. Only
     /// meaningful for [`Spec::counts_rows_only`].
     pub fn count_rows(&mut self, rows: u64) {
@@ -649,17 +735,46 @@ pub async fn aggregate<S: BlobStore>(
     aggregator: &mut Aggregator,
 ) -> Result<(), QueryError> {
     let blank = aggregator.empty_like();
-    let parts = visit(
-        store,
-        targets,
-        filter,
-        shadow,
-        || blank.empty_like(),
-        |a: &mut Aggregator, doc: Document| {
-            a.offer(&doc);
-        },
-    )
-    .await?;
+    let opened = crate::order::open(store, targets, false).await?;
+    let blank = &blank;
+    let parts =
+        futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
+            let mut local = blank.empty_like();
+            // M232: a block the filter admits whole, with no deleted or shadowed row, is
+            // folded from its statistics and never fetched.
+            let mut answered: Vec<usize> = Vec::new();
+            if !t.shadowed || shadow.is_empty() {
+                for (i, (start, rows, zones)) in o.segment.block_spans().enumerate() {
+                    if local.answers_block(zones)
+                        && filter.is_none_or(|f| f.must_admit(zones, rows))
+                        && !o.deleted.any_in(start..start + rows)
+                    {
+                        local.offer_block(zones, rows as u64);
+                        answered.push(i);
+                    }
+                }
+            }
+            o.segment
+                .visit_blocks_projected(
+                    store,
+                    &t.segment,
+                    |i, zones| {
+                        answered.binary_search(&i).is_err()
+                            && filter.is_none_or(|f| f.could_admit(zones))
+                    },
+                    &pstore_format::Projection::ALL,
+                    |row, doc| {
+                        let hidden =
+                            o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
+                        if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
+                            local.offer(&doc);
+                        }
+                    },
+                )
+                .await?;
+            Ok::<_, QueryError>(local)
+        }))
+        .await?;
     for part in parts {
         aggregator.merge(part);
     }

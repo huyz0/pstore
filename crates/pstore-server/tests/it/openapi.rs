@@ -380,6 +380,7 @@ fn probes() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         ("create_index", "CreateIndexRequest", json!({})),
         ("patch_index", "PatchIndexRequest", json!({})),
+        ("patch_index", "StoragePatch", json!({"storage": {}})),
         ("write_documents", "WriteRequest", json!({})),
         (
             "write_documents",

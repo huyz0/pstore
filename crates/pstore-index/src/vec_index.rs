@@ -553,7 +553,7 @@ fn assemble(
     let dictionary = sparse.as_ref().map(|p| p.dictionary.clone());
     let text_dictionary = text.as_ref().map(|t| t.dictionary.clone());
     // Moved in, never cloned again: `rows` is the blocks' documents, in their order.
-    let mut w = SegmentWriter::new(64);
+    let mut w = SegmentWriter::new(64).with_block_options(params.blocks);
     for d in rows {
         w.push(d);
     }

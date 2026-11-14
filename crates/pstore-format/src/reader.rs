@@ -19,6 +19,8 @@ pub struct Segment {
     /// The vector fields this segment carries.
     fields: Vec<crate::FieldLayout>,
     text_fields: Vec<String>,
+    /// Its blocks are columnar (M231).
+    columnar: bool,
 }
 
 /// A dense field's stored bytes as its vectors of `dims` components each, little-endian f32s
@@ -96,7 +98,10 @@ impl Segment {
             return Err(FormatError::Corrupt("bad magic"));
         }
         let version = d.u16()?;
-        if version != VERSION && version != crate::VERSION_TYPED {
+        if version != VERSION
+            && version != crate::VERSION_TYPED
+            && version != crate::VERSION_COLUMNAR
+        {
             return Err(FormatError::UnsupportedVersion(version));
         }
         let meta_offset = d.u64()?;
@@ -177,6 +182,7 @@ impl Segment {
             sections,
             fields: Vec::new(),
             text_fields: Vec::new(),
+            columnar: version == crate::VERSION_COLUMNAR,
         };
         seg.fields = seg.decode_fields(&idx_bytes, meta_offset)?;
         seg.text_fields = seg.decode_text_fields(&idx_bytes, meta_offset)?;
@@ -212,6 +218,23 @@ impl Segment {
             let eq = std::sync::Arc::new(eq);
             for (i, b) in seg.blocks.iter_mut().enumerate() {
                 b.zones.equality = Some((std::sync::Arc::clone(&eq), i));
+            }
+        }
+        // M232: and the aggregate statistics.
+        if let Some(span) = seg.section(Section::Aggregates) {
+            let lo = span.start.checked_sub(meta_offset).unwrap_or(u64::MAX) as usize;
+            let raw = idx_bytes
+                .get(lo..lo.saturating_add((span.end - span.start) as usize))
+                .ok_or(FormatError::Truncated)?;
+            let agg = crate::aggregates::Aggregates::decode(raw)?;
+            if agg.block_count() != seg.blocks.len() {
+                return Err(FormatError::Corrupt(
+                    "aggregate statistics for another block count",
+                ));
+            }
+            let agg = std::sync::Arc::new(agg);
+            for (i, b) in seg.blocks.iter_mut().enumerate() {
+                b.zones.aggregates = Some((std::sync::Arc::clone(&agg), i));
             }
         }
         Ok(seg)
@@ -818,7 +841,7 @@ impl Segment {
         }
         // M9h.1: a typed segment says whether its zone maps are on; if they are, a float table
         // per block follows, and every block's zones are complete.
-        if version == crate::VERSION_TYPED {
+        if version == crate::VERSION_TYPED || version == crate::VERSION_COLUMNAR {
             let flag = d.u8()?;
             if flag > 3 {
                 return Err(FormatError::Corrupt(
@@ -1035,7 +1058,7 @@ impl Segment {
         let mut out = Vec::new();
         for (n, block) in wanted.iter().enumerate() {
             let Some(buf) = bufs.get(n) else { continue };
-            let rows = Self::decode_block(buf)?;
+            let rows = self.decode_block(buf)?;
             let vecs = bufs.get(block_count + n);
             // The absolute row index this block starts at, so a per-row lookup into a
             // whole-field vector lands on the right row.
@@ -1156,12 +1179,38 @@ impl Segment {
         key: &Key,
         keep: impl Fn(&Zones) -> bool,
         project: &crate::Projection<'_>,
+        visit: impl FnMut(usize, Document),
+    ) -> Result<(), FormatError> {
+        self.visit_blocks_projected(store, key, |_, z| keep(z), project, visit)
+            .await
+    }
+
+    /// Each block's first row, row count and zones, in block order (M232): what a caller that
+    /// answers some blocks without reading them decides from.
+    pub fn block_spans(&self) -> impl Iterator<Item = (usize, usize, &Zones)> {
+        self.blocks.iter().scan(0usize, |start, b| {
+            let at = *start;
+            *start += b.rows as usize;
+            Some((at, b.rows as usize, &b.zones))
+        })
+    }
+
+    /// [`Self::visit_rows_projected`], `keep` told each block's index too (M232).
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    pub async fn visit_blocks_projected<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(usize, &Zones) -> bool,
+        project: &crate::Projection<'_>,
         mut visit: impl FnMut(usize, Document),
     ) -> Result<(), FormatError> {
         let mut base = 0usize;
         let mut wanted: Vec<(usize, &BlockMeta)> = Vec::new();
-        for b in &self.blocks {
-            if keep(&b.zones) {
+        for (i, b) in self.blocks.iter().enumerate() {
+            if keep(i, &b.zones) {
                 wanted.push((base, b));
             }
             base += b.rows as usize;
@@ -1175,11 +1224,17 @@ impl Segment {
             .collect();
         let bufs = store.get_ranges(key, &ranges).await?;
         for ((start, _), buf) in wanted.iter().zip(&bufs) {
-            for (r, doc) in crate::decode_rows_where(buf, project)?
-                .into_iter()
-                .enumerate()
-            {
-                visit(start + r, doc);
+            if self.columnar {
+                for (r, doc) in crate::columnar::decode_block(buf, project, None)? {
+                    visit(start + r, doc);
+                }
+            } else {
+                for (r, doc) in crate::decode_rows_where(buf, project)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    visit(start + r, doc);
+                }
             }
         }
         Ok(())
@@ -1241,7 +1296,12 @@ impl Segment {
             let Some(buf) = bufs.get(n) else { continue };
             let start = base.get(*block).copied().unwrap_or(0);
             let pick = |r: usize| asked.contains(&(start + r));
-            for (r, doc) in crate::decode_rows_picked(buf, &pick)? {
+            let picked = if self.columnar {
+                crate::columnar::decode_block(buf, &crate::Projection::ALL, Some(&pick))?
+            } else {
+                crate::decode_rows_picked(buf, &pick)?
+            };
+            for (r, doc) in picked {
                 found.insert(start + r, doc);
             }
         }
@@ -1310,7 +1370,15 @@ impl Segment {
     }
 
     /// Decodes one block's rows. Vectors arrive separately, from their own section.
-    fn decode_block(buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+    fn decode_block(&self, buf: &[u8]) -> Result<Vec<Document>, FormatError> {
+        if self.columnar {
+            return Ok(
+                crate::columnar::decode_block(buf, &crate::Projection::ALL, None)?
+                    .into_iter()
+                    .map(|(_, d)| d)
+                    .collect(),
+            );
+        }
         crate::decode_rows(buf)
     }
 }
@@ -1490,7 +1558,8 @@ mod tests {
 
     /// M45: a segment of `n` rows, each carrying 200 bytes of attribute.
     fn segment(n: usize) -> Bytes {
-        let mut w = crate::SegmentWriter::new(4);
+        // Row blocks (M231): a columnar block compresses the padding below the suffix read.
+        let mut w = crate::SegmentWriter::new(4).with_row_blocks();
         for i in 0..n {
             let mut d = crate::Document::new(format!("d{i}"), vec![i as f32]);
             d.attrs

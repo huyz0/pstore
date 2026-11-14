@@ -922,6 +922,9 @@ pub struct IndexSummary {
     pub approx_logical_bytes: Option<u64>,
     /// Whether it takes no writes (M149): its owner made it read-only, or it is a replica.
     pub read_only: bool,
+    /// What its next sealed segments' blocks are (M231): its overrides over this server's
+    /// defaults.
+    pub storage: StorageSettings,
     /// Its indexing progress across every writer (M160), only when asked for with
     /// `progress=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -946,16 +949,61 @@ pub struct IndexProgress {
     pub as_of_epoch: u64,
 }
 
-/// What `PATCH /v1/indexes/{index}` answers (M149).
+/// What `PATCH /v1/indexes/{index}` answers (M149, M231).
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadOnlyResponse {
-    /// The HEAD that holds the flag: the commit that set it, or the HEAD read when it
-    /// already had that value.
+    /// The HEAD that holds what was asked: the last commit that set it, or the HEAD read when
+    /// it already had that value.
     pub epoch: u64,
-    /// The flag as it now is.
-    pub read_only: bool,
+    /// The flag as it now is, when the patch named it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// The storage settings as they now are, when the patch named them (M231).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageSettings>,
     /// What it cost.
     pub cost: Cost,
+}
+
+/// An index's storage settings (M231): what its next fold or compaction writes. Segments
+/// already written stay as they are; every combination reads the same rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageSettings {
+    /// `columnar` or `rows`.
+    pub block_layout: &'static str,
+    /// Whether segments carry the equality section, which prunes blocks for string and bool
+    /// equality (M230).
+    pub equality_filters: bool,
+    /// Whether segments carry per-block counts and sums an aggregation reads (M232).
+    pub block_aggregates: bool,
+    /// The settings the index overrides; any other takes this server's default
+    /// (`PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS`, `PSTORE_BLOCK_AGGREGATES`).
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
+
+impl StorageSettings {
+    /// `overrides` over the server's `default`.
+    #[must_use]
+    pub fn of(overrides: pstore_engine::Storage, default: pstore_format::BlockOptions) -> Self {
+        let b = overrides.over(default);
+        let layout = |columnar: bool| if columnar { "columnar" } else { "rows" };
+        let mut o = serde_json::Map::new();
+        if let Some(c) = overrides.columnar {
+            o.insert("block_layout".to_owned(), layout(c).into());
+        }
+        if let Some(e) = overrides.equality {
+            o.insert("equality_filters".to_owned(), e.into());
+        }
+        if let Some(a) = overrides.aggregates {
+            o.insert("block_aggregates".to_owned(), a.into());
+        }
+        Self {
+            block_layout: layout(b.columnar),
+            equality_filters: b.equality,
+            block_aggregates: b.aggregates,
+            overrides: o,
+        }
+    }
 }
 
 /// What `POST /v1/indexes/{index}/recall` answers (M162).

@@ -7,6 +7,7 @@
 //! separate binaries beside this directory.
 
 mod analyzer;
+mod columnar;
 mod corrupt;
 mod equality;
 mod external;

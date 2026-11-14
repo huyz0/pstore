@@ -514,31 +514,8 @@ pub async fn vectors_at<S: BlobStore>(
     Ok(out)
 }
 
-/// The visiting [`select`] and [`crate::aggregate`] share (M12): every admitted row of every
-/// target, less deleted and shadowed rows, offered to a sink of its segment's own -- `new`
-/// makes one per segment -- in the two rounds `select` states. Returns the sinks, in target
-/// order, for the caller to merge.
-pub(crate) async fn visit<S, T, N, O>(
-    store: &S,
-    targets: &[Target],
-    filter: Option<&Predicate>,
-    shadow: &HashSet<String>,
-    new: N,
-    offer: O,
-) -> Result<Vec<T>, QueryError>
-where
-    S: BlobStore,
-    N: Fn() -> T,
-    O: Fn(&mut T, Document),
-{
-    visit_held(store, targets, filter, shadow, new, |t: &mut T, _, doc| {
-        offer(t, doc);
-    })
-    .await
-    .map(|(sinks, _)| sinks)
-}
-
-/// [`visit`], offering each row with where it was read, and returning the segments it opened.
+/// Every admitted row of every target, less deleted and shadowed rows, offered with where it
+/// was read to a sink of its segment's own, and the segments it opened (M12).
 async fn visit_held<S, T, N, O>(
     store: &S,
     targets: &[Target],
@@ -561,7 +538,7 @@ where
 /// HEAD says it has one -- its term-dictionary sidecar (M182).
 pub(crate) struct Opened {
     pub(crate) segment: Segment,
-    deleted: crate::deletes::Rows,
+    pub(crate) deleted: crate::deletes::Rows,
     pub(crate) dictionary: Option<bytes::Bytes>,
 }
 
