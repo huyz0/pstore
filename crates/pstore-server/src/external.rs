@@ -131,6 +131,8 @@ pub(crate) async fn query<S: BlobStore + 'static>(
             "window must be between k and {MAX_WINDOW}"
         )));
     }
+    // M212: a public query reserves its candidate rows, here its window, before it reads.
+    let _reserved = api.ingress.reserve_rows(tenant, window as u64)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     let hits = engine

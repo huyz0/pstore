@@ -1,4 +1,4 @@
-//! M141: provisional heap held by buffered rows, against their `footprint()` estimate.
+//! M141, M213: provisional heap held by buffered rows, against their `footprint()` charge.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -95,8 +95,10 @@ async fn buffered_footprint_against_heap() {
             "no flush inside the region"
         );
         let footprint = after.pending - before.pending;
-        let net = stats.bytes_allocated as i64 + stats.bytes_reallocated as i64
-            - stats.bytes_deallocated as i64;
+        // M213: allocated less deallocated. ⚠️ M141 also added `bytes_reallocated`, but
+        // `stats_alloc` already counts a reallocation's growth in `bytes_allocated`, so every
+        // grown vector was counted twice.
+        let net = stats.bytes_allocated as i64 - stats.bytes_deallocated as i64;
         assert!(footprint > 0);
         println!(
             "{dims},{attrs},{},{footprint},{net},{:.2}",

@@ -16,8 +16,15 @@ Mutations were applied one at a time by a script and reverted, against both test
 closed; bool bits swapped at build; string probes ignored; the saturation cut removed; the
 selectivity cut removed; a string order comparison pruned by the section; a bool order
 comparison pruned; string equality never consulting the section; the writer's spare ignoring
-the sketch and the section's own directory entry; the fit check loosened by 64 bytes. No
-`cargo mutants` run is claimed here; CI runs it on the pull request.
+the sketch and the section's own directory entry; the fit check loosened by 64 bytes.
+
+`cargo mutants` on the pull request then found survivors, each fixed with a test seen red
+against it: the budget loop's `>` (no exact fit; the loop, whose inverted condition hung, is
+now a count), the selectivity bound's `* 2`, the hash finaliser (its values are on disk in
+every filter, so they are now pinned), and, in a local sweep of `equality.rs` (172 mutants,
+`pstore-format`'s tests: 164 caught, 4 unviable, 4 missed), the filter slice's end offset,
+which only matters past eight blocks. With those tests, the filter and hash mutants are all
+caught.
 
 1. `equality_prunes_blocks_without_the_literal`: green after. `Eq` and `In` on strings and
    `Eq` on bools keep exactly the blocks holding the literal; `And`, `Or`, `Not` compose.

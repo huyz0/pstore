@@ -168,9 +168,15 @@ impl Equality {
                 .copied()
                 .filter(|(_, most)| most * 4 <= bits as usize)
                 .collect();
-            while !chosen.is_empty() && 16 + bools_len + string_len(bits, &chosen) > spare {
-                chosen.pop();
-            }
+            // The most of them that fit, fewest values first. A count, not a popping loop: a
+            // loop's condition inverted never ends, and a mutant that hangs is not measured.
+            let fit = (0..=chosen.len())
+                .rev()
+                .find(|&k| {
+                    16 + bools_len + string_len(bits, chosen.get(..k).unwrap_or_default()) <= spare
+                })
+                .unwrap_or(0);
+            chosen.truncate(fit);
             if !chosen.is_empty() {
                 let mut out = Self {
                     bits,
@@ -355,5 +361,91 @@ impl<'a> Cursor<'a> {
     fn u32(&mut self) -> Result<u32, FormatError> {
         let s = self.take(4)?;
         s.try_into().map(u32::from_le_bytes).map_err(|_| corrupt())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "assertions in tests are the reporting mechanism"
+)]
+mod tests {
+    use super::*;
+
+    /// The hash is on disk in every filter a segment holds: a change to it, however small,
+    /// makes every segment already written answer wrongly, so its values are pinned.
+    #[test]
+    fn the_hash_is_the_one_segments_were_written_with() {
+        let all: Vec<u8> = (0..=255).collect();
+        for (bytes, want) in [
+            (&b""[..], 0xf52a_15e9_a9b5_e89b),
+            (b"a", 0x02c0_bdbf_4814_20f8),
+            (b"category-17", 0xe638_d145_8904_15d2),
+            (&all, 0xef26_87f0_d437_1fe2),
+        ] {
+            assert_eq!(hash(bytes), want, "{bytes:?}");
+        }
+    }
+
+    /// A filter's false positive rate is near its design: 3 probes at 8 bits a value is about
+    /// 3.1%. Probes that collapse to neighbouring bits (an `h2` of 1) or lose the odd step
+    /// that keeps them apart cost several times that, and soundness alone would not notice.
+    #[test]
+    fn a_filter_s_false_positive_rate_is_near_its_design() {
+        for bits in [512u32, 2048] {
+            let n = bits / 8;
+            let mut f = vec![0u8; bits as usize / 8];
+            for i in 0..n {
+                for at in probes(hash(format!("in-{i}").as_bytes()), bits) {
+                    set(&mut f, at as usize);
+                }
+            }
+            for i in 0..n {
+                assert!(
+                    probes(hash(format!("in-{i}").as_bytes()), bits).all(|at| bit(&f, at as usize))
+                );
+            }
+            let asked = 50_000;
+            let fp = (0..asked)
+                .filter(|i| {
+                    probes(hash(format!("out-{i}").as_bytes()), bits).all(|at| bit(&f, at as usize))
+                })
+                .count();
+            assert!(
+                fp * 100 < asked * 5,
+                "{bits} bits: {fp} of {asked} false positives"
+            );
+        }
+    }
+
+    /// The probes of one value are distinct bits, so each adds evidence.
+    #[test]
+    fn a_value_s_probes_are_distinct_bits() {
+        for i in 0..2_000 {
+            let mut p: Vec<u32> = probes(hash(format!("v{i}").as_bytes()), 2048).collect();
+            p.sort_unstable();
+            p.dedup();
+            assert_eq!(p.len(), PROBES as usize, "value {i}");
+        }
+    }
+
+    /// A width out of range, or in range and not a power of two, is refused.
+    #[test]
+    fn a_width_must_be_a_power_of_two_in_range() {
+        let ok = Equality {
+            bits: 64,
+            blocks: 1,
+            strings: BTreeMap::new(),
+            bools: BTreeMap::from([("b".to_owned(), vec![0])]),
+        };
+        let bytes = ok.encode();
+        assert_eq!(Equality::decode(&bytes).unwrap(), ok);
+        for bits in [96u32, 32, 4096, 0, MAX_BITS - 1] {
+            let mut b = bytes.clone();
+            b[..4].copy_from_slice(&bits.to_le_bytes());
+            assert!(Equality::decode(&b).is_err(), "{bits} bits");
+        }
     }
 }
