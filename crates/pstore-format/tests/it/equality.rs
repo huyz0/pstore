@@ -283,3 +283,33 @@ fn a_section_that_fits_its_budget_exactly_is_kept() {
     );
     assert_ne!(build(len - 1), Some(widest), "one byte less cannot");
 }
+
+#[test]
+fn an_attribute_whose_blocks_hold_most_of_its_values_is_not_filtered() {
+    // Four values; each of four blocks holds `per` of them, and a bool so a section exists.
+    let section = |per: usize| {
+        let blocks: Vec<Vec<(String, Value)>> = (0..4)
+            .map(|b| {
+                let mut v: Vec<(String, Value)> = (0..per)
+                    .map(|k| ("s".into(), Value::Str(format!("v{}", (b + k) % 4))))
+                    .collect();
+                v.push(("b".into(), Value::Bool(true)));
+                v
+            })
+            .collect();
+        Equality::build(blocks.len(), usize::MAX, |b| {
+            blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+        })
+        .unwrap()
+    };
+    // Block 0 holds v0 and v1 of two, v0, v1 and v2 of three: v3 is absent from it either way.
+    let absent = Value::Str("v3".into());
+    assert!(
+        !section(2).may_equal("s", 0, &absent),
+        "half its values: filtered"
+    );
+    assert!(
+        section(3).may_equal("s", 0, &absent),
+        "three quarters: not filtered"
+    );
+}
