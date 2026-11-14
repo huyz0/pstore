@@ -1,5 +1,47 @@
 # Native API migration notes
 
+## M213: buffered rows are charged the memory they hold
+
+`tenant_buffered_bytes` and `tenant_flush_bytes` (M141) keep their names and defaults, but a
+buffered row is now charged its **held bytes**: its struct slot, every allocation's capacity
+(id, vectors, attribute keys and strings, arrays) with 16 bytes each for the allocator, and
+its maps' nodes. A small row is charged about 40 times more than before: a 2-component row
+with no attributes about 830 bytes, not 18; a 768-component row about 3.9 KB, not 3.1 KB.
+A tenant of tiny rows now reaches the 64 MiB default after about 80,000 of them, not 3.7
+million, so batched writes of small rows flush, and are refused with `429`, far sooner.
+The old row counts cannot be kept: both bounds can only be lowered (M128), and their
+defaults are unchanged. Smaller rows or more frequent durable writes are the remedy.
+- A tenant is also due for a scheduled fold once its flushed, unfolded rows hold its flush
+  bound, whatever their bundles' size, so the cap is not left full until the age trigger.
+
+- A flushed, unfolded row is charged the same held bytes until a fold, not its bundle's
+  share, so a flush no longer frees cap.
+- A delete is charged its tombstone row (about 800 bytes), and a patch its encoded row.
+- Measured against the heap, the charge is 1.0 to 1.4 times it across nine row shapes
+  (`provisional`). Evidence is in [M213 verification](milestones/M213/VERIFIED.md).
+
+## M212: a query reserves its plan's candidate rows
+
+Every public query reserves **candidate rows** for its whole plan before it reads anything,
+and holds them until it answers:
+
+- a relevance ranking: each leg's limit plus its window (`top_k + offset`, or the boost,
+  `diversify` or `limit_per` window). A hybrid dense and text query at `top_k` 100 is 300;
+- an order or a `rank_by` expression: `top_k + offset`; an aggregation: its `top_k`;
+- a multi-query: the sum over its queries, and over each query's `facets`;
+- an external-source query (`/external/query`): its `window`.
+
+`PSTORE_REQUEST_LIMITS_CONFIG` takes `query_rows` (default 4,194,304, every query of the
+server at once) and `tenant_query_rows` (default 1,048,576, one tenant's, at most
+`query_rows`), lowered only, as M128's limits are.
+
+- A query whose plan is above `tenant_query_rows` is `413 request_too_large`, naming it.
+  Split it: a multi-query of 16 queries with 8 dense legs each at `top_k` 10,000 is about
+  1.4 million rows.
+- One that fits but finds its tenant's or the server's pool short is `429 overloaded` with
+  `Retry-After: 1`. Neither waits or reads a blob. Rows are counted, not bytes. Evidence is
+  in [M212 verification](milestones/M212/VERIFIED.md).
+
 ## M222: a generated TypeScript client
 
 `clients/typescript/src/index.ts` is generated beside the Python client, dependency-free, for

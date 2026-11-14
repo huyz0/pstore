@@ -33,19 +33,57 @@ fn every_value_kind_is_counted() {
     }
 }
 
+/// The 16 bytes M213 charges each heap allocation beyond its own.
+const A: u64 = 16;
+
+fn heap(cap: usize, each: usize) -> u64 {
+    if cap == 0 { 0 } else { (cap * each) as u64 + A }
+}
+
+/// One B-tree leaf of 11 entries, its parent pointer and two `u16`s padded to 16 bytes.
+fn leaf<K, V>() -> u64 {
+    (16 + 11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())) as u64 + A
+}
+
+/// M213: a document is charged the heap it holds and its slot, from capacities and sizes.
 #[test]
-fn a_document_counts_its_id_vectors_and_attributes() {
-    let mut d = Document::new("abc", vec![0.0; 5]);
-    // A vector field's name is not counted, whatever it is.
-    assert_eq!(d.footprint(), 3 + 20);
-    d.attrs
-        .insert("k".to_owned(), Value::Str("vvvv".to_owned()));
-    assert_eq!(d.footprint(), 3 + 20 + 1 + 4);
+fn a_document_is_charged_the_memory_it_holds() {
+    use std::mem::size_of;
+    let slot = 2 * size_of::<Document>() as u64;
+    let mut v = Vec::with_capacity(8);
+    v.extend([0.0_f32; 5]);
+    let mut d = Document::new(String::from("abc"), v);
+    let field = |name: &str| 16 + name.len() as u64 + A;
+    let dense = |caps: &[usize]| {
+        heap(caps.len(), size_of::<Vec<f32>>()) + caps.iter().map(|c| heap(*c, 4)).sum::<u64>()
+    };
+    let vectors = leaf::<Field, VectorField>();
+    let base = slot + heap(3, 1) + vectors + field("vector") + dense(&[8]);
+    // Capacity, not length: a vector grown to 8 holds 8.
+    assert_eq!(d.footprint(), base);
+    d.attrs.insert(
+        "k".to_owned(),
+        Value::Str(String::with_capacity(10) + "vvvv"),
+    );
+    let attrs = leaf::<String, Value>();
+    assert_eq!(d.footprint(), base + attrs + heap(1, 1) + heap(10, 1));
+    d.attrs.insert(
+        "arr".to_owned(),
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Array(vec![Value::Null]),
+        ]),
+    );
+    let arr = heap(3, 1) + heap(3, size_of::<Value>()) + heap(3, 1) + heap(1, size_of::<Value>());
+    let with_attrs = base + attrs + heap(1, 1) + heap(10, 1) + arr;
+    assert_eq!(d.footprint(), with_attrs);
     d.vectors.insert(
         Field::from("multi"),
         VectorField::Dense(vec![vec![0.0; 2], vec![0.0; 3]]),
     );
-    assert_eq!(d.footprint(), 3 + 20 + 5 + 20);
+    let multi = field("multi") + dense(&[2, 3]);
+    assert_eq!(d.footprint(), with_attrs + multi);
     d.vectors.insert(
         Field::from("sp"),
         VectorField::Sparse(vec![
@@ -53,6 +91,56 @@ fn a_document_counts_its_id_vectors_and_attributes() {
             ("abc".to_owned(), pstore_format::Impact::new(2.0)),
         ]),
     );
-    // M177: a pair is its key's bytes plus its impact's 4.
-    assert_eq!(d.footprint(), 3 + 20 + 5 + 20 + (1 + 4) + (3 + 4));
+    let sparse = field("sp")
+        + heap(2, size_of::<(String, pstore_format::Impact)>())
+        + heap(1, 1)
+        + heap(3, 1);
+    assert_eq!(d.footprint(), with_attrs + multi + sparse);
+    // Past 11 entries a map holds more than one node: never less than one leaf a 5 entries.
+    for k in 0..30 {
+        d.attrs.insert(format!("n{k:02}"), Value::Int(k));
+    }
+    let leaves = 32_u64.div_ceil(5);
+    assert!(d.footprint() > with_attrs + multi + sparse + (leaves - 1) * attrs);
+}
+
+#[test]
+fn shrinking_a_row_drops_the_capacity_it_was_parsed_with() {
+    // M213: the server shrinks a parsed row before charging it, so its footprint is what its
+    // contents need -- as a clone's, which allocates exactly -- in every part a parser grows.
+    let mut tags = Vec::with_capacity(16);
+    tags.push(Value::Str(String::with_capacity(64) + "red"));
+    let mut vector = Vec::with_capacity(8);
+    vector.extend([1.0_f32, 0.5]);
+    let mut id = String::with_capacity(32);
+    id.push_str("d01");
+    let mut key = String::with_capacity(32);
+    key.push_str("tags");
+    let mut doc = Document::new(id, vector);
+    doc.attrs.insert(key, Value::Array(tags));
+    let exact = doc.clone().footprint();
+    assert!(doc.footprint() > exact);
+    doc.shrink_to_fit();
+    assert_eq!(doc.footprint(), exact);
+}
+
+#[test]
+fn a_maps_nodes_are_its_leaves_and_internal_nodes_exactly() {
+    // M213: a leaf of 11 (u64, u64) entries is 16 + 11 * 16 bytes and the allocation's 16; an
+    // internal node adds 12 edges. Past 11 entries, len / 5 leaves (rounded up) and a fifth
+    // as many internal nodes (rounded up).
+    let leaf = 16 + 11 * 16 + 16;
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(0), 0);
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(1), leaf);
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(11), leaf);
+    // 12 entries: 3 leaves, 1 internal node.
+    assert_eq!(
+        pstore_format::map_bytes::<u64, u64>(12),
+        3 * leaf + (leaf + 96)
+    );
+    // 60 entries: 12 leaves, 3 internal nodes.
+    assert_eq!(
+        pstore_format::map_bytes::<u64, u64>(60),
+        12 * leaf + 3 * (leaf + 96)
+    );
 }

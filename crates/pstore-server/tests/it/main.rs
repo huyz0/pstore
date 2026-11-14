@@ -72,6 +72,7 @@ mod persistent_types;
 mod pre_tokenized;
 mod progress;
 mod quarantine;
+mod query_reservation;
 mod read_cache;
 mod read_only;
 mod recall;

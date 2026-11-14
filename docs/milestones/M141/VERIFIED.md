@@ -75,6 +75,12 @@ bound below the flush bound accepted, and an oversized write answered 429. No
    `scripts/ndcg.sh` and `scripts/depth.sh` passed (.harness/m141-quality.log). The
    measurement below is `buffered_footprint_against_heap`.
 
+> ⚠️ **Corrected by [M213](../M213/VERIFIED.md).** The measurement below summed
+> `bytes_allocated` and `bytes_reallocated`, but `stats_alloc` counts a reallocation's growth
+> in both, so each grown vector was counted twice and the larger ratios are overstated (the
+> 768-dimension 4.3x was about 1.2x). The conclusion stands for small rows: the footprint
+> bounded rows, not memory. M213 charges held bytes instead.
+
 Measurement (the spec's risk: `footprint()` is not RSS). `buffered_footprint_against_heap`
 (release, rustc 1.90.0, [measurements/buffered-heap.csv](measurements/buffered-heap.csv))
 buffers batched rows below the flush bound and compares the heap the process gained with

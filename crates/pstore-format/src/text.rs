@@ -102,6 +102,30 @@ impl Language {
         Self::ALL.into_iter().find(|l| l.name() == name)
     }
 
+    /// The words `remove_stopwords` drops (M204): Lucene's 33 for English, Snowball's list for
+    /// twelve more, and `None` for the five Snowball ships none for, where the option is
+    /// refused.
+    #[must_use]
+    pub fn stopwords(self) -> Option<&'static [&'static str]> {
+        use crate::stopwords as s;
+        match self {
+            Self::English => Some(&STOPWORDS),
+            Self::Danish => Some(s::DANISH),
+            Self::Dutch => Some(s::DUTCH),
+            Self::Finnish => Some(s::FINNISH),
+            Self::French => Some(s::FRENCH),
+            Self::German => Some(s::GERMAN),
+            Self::Hungarian => Some(s::HUNGARIAN),
+            Self::Italian => Some(s::ITALIAN),
+            Self::Norwegian => Some(s::NORWEGIAN),
+            Self::Portuguese => Some(s::PORTUGUESE),
+            Self::Russian => Some(s::RUSSIAN),
+            Self::Spanish => Some(s::SPANISH),
+            Self::Swedish => Some(s::SWEDISH),
+            Self::Arabic | Self::Greek | Self::Romanian | Self::Tamil | Self::Turkish => None,
+        }
+    }
+
     fn algorithm(self) -> rust_stemmers::Algorithm {
         use rust_stemmers::Algorithm as A;
         match self {
@@ -139,11 +163,11 @@ impl Language {
     reason = "each is an independent option of the wire's `full_text_search`"
 )]
 pub struct Analyzer {
-    /// The stemmer's language, and what `remove_stopwords` needs to be English.
+    /// The stemmer's language, and which list `remove_stopwords` drops.
     pub language: Language,
     /// Reduce each token to its Snowball stem.
     pub stemming: bool,
-    /// Drop the Lucene English stopwords.
+    /// Drop the language's stopwords: Lucene's English list, or Snowball's (M204).
     pub remove_stopwords: bool,
     /// Keep case rather than lowercasing.
     pub case_sensitive: bool,
@@ -278,16 +302,38 @@ impl FullText {
         let rest = line.get(2..).unwrap_or_default();
         // M181: a `v2` line names any tokenizer but `word_v1`; a `v3` line adds the limit.
         // A build before M181 refuses both.
-        match (a.tokenizer, a.max_token_length) {
+        let line = match (a.tokenizer, a.max_token_length) {
             (Tokenizer::WordV1, None) => line,
             (t, None) => format!("v2{rest};{}", t.name()),
             (t, Some(max)) => format!("v3{rest};{};{max}", t.name()),
+        };
+        // M204: stopwords beyond English, behind a prefix no earlier grammar reads -- a build
+        // before would drop English's list from the text instead.
+        if Self::new_stopwords(a) {
+            format!("v4:{line}")
+        } else {
+            line
         }
+    }
+
+    /// Whether `a` drops a list a build before M204 did not have.
+    fn new_stopwords(a: &Analyzer) -> bool {
+        a.remove_stopwords && a.language != Language::English
     }
 
     /// The full-text schema [`Self::encode`] wrote, or `None` for anything else.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
+        // M204: one spelling each -- the prefix exactly when there is a new list.
+        let (prefixed, line) = s.strip_prefix("v4:").map_or((false, s), |l| (true, l));
+        Self::decode_line(line).filter(|f| {
+            Self::new_stopwords(&f.analyzer) == prefixed
+                && (!f.analyzer.remove_stopwords || f.analyzer.language.stopwords().is_some())
+        })
+    }
+
+    /// A `v1` to `v3` line.
+    fn decode_line(s: &str) -> Option<Self> {
         let mut parts = s.split(';');
         let version = parts.next()?;
         let language = Language::parse(parts.next()?)?;
@@ -434,7 +480,7 @@ pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
             } else {
                 t
             };
-            let term = if a.remove_stopwords && STOPWORDS.contains(&t.as_str()) {
+            let term = if a.remove_stopwords && is_stopword(a, &t) {
                 None
             } else {
                 Some(match &stemmer {
@@ -445,6 +491,37 @@ pub fn tokens(a: &Analyzer, s: &str) -> Vec<Token> {
             Token { span, term }
         })
         .collect()
+}
+
+/// Whether `t`, cased and folded as `a` does, is one of `a`'s language's stopwords (M204),
+/// each list word folded the same way when `a` folds.
+fn is_stopword(a: &Analyzer, t: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    /// Each language's list as written, then folded, in [`Language::ALL`]'s order.
+    static SETS: OnceLock<Vec<[HashSet<String>; 2]>> = OnceLock::new();
+    let sets = SETS.get_or_init(|| {
+        Language::ALL
+            .iter()
+            .map(|l| {
+                let words = l.stopwords().unwrap_or_default();
+                [
+                    words.iter().map(|w| (*w).to_owned()).collect(),
+                    words
+                        .iter()
+                        .map(|w| w.nfkd().filter(|c| !is_combining_mark(*c)).collect())
+                        .collect(),
+                ]
+            })
+            .collect()
+    });
+    Language::ALL
+        .iter()
+        .position(|l| *l == a.language)
+        .and_then(|i| sets.get(i))
+        .and_then(|both| both.get(usize::from(a.ascii_folding)))
+        .is_some_and(|set| set.contains(t))
 }
 
 /// Whether the raw token `raw` holds more characters than `a`'s `max_token_length` (M181):

@@ -222,8 +222,14 @@ impl World {
     ) -> T {
         *self.sa.knobs.hold.lock().unwrap() = Some(kind);
         let knobs = Arc::clone(&self.sa.knobs);
+        // A that ends without reaching its hold (it failed early) fails the test rather than
+        // leaving `meanwhile` waiting forever: a hang reads as a timeout, not a failure.
+        let mut a = std::pin::pin!(a);
+        tokio::select! {
+            _ = &mut a => panic!("A finished before reaching its {kind} write"),
+            () = knobs.reached.notified() => {}
+        }
         let (got, ()) = tokio::join!(a, async {
-            knobs.reached.notified().await;
             meanwhile.await;
             knobs.release.notify_one();
         });
