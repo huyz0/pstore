@@ -26,7 +26,7 @@ fn encode_attrs(e: &mut Enc, attrs: &BTreeMap<String, Value>) {
     }
 }
 
-fn encode_value(e: &mut Enc, v: &Value) {
+pub(crate) fn encode_value(e: &mut Enc, v: &Value) {
     match v {
         Value::Int(n) => {
             e.u8(0);
@@ -140,7 +140,7 @@ fn skip_value(d: &mut Dec<'_>, array: bool) -> Result<(), FormatError> {
 }
 
 /// One tagged value; an array only where `array` allows it, so never nested.
-fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
+pub(crate) fn decode_value(d: &mut Dec<'_>, array: bool) -> Result<Value, FormatError> {
     Ok(match d.u8()? {
         0 => Value::Int(d.i64()?),
         1 => Value::Str(d.string()?),

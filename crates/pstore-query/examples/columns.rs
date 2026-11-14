@@ -30,8 +30,10 @@
 //!   scripts/columns.sh 100000       another scale
 
 use pstore_blob::{Accounted, BlobStore, Key, MemoryStore, OpClass};
-use pstore_format::{Document, Projection, Segment, SegmentWriter, Value};
-use pstore_query::{Op, Predicate};
+use pstore_format::{BlockOptions, Document, Projection, Segment, SegmentWriter, Value};
+use pstore_query::{
+    Aggregate, AggregateSpec, Aggregator, Op, Order, OrderBy, Predicate, Selector, Target,
+};
 use pstore_types::TenantId;
 use std::time::Instant;
 
@@ -198,11 +200,98 @@ type Arm = (&'static str, fn(SegmentWriter) -> SegmentWriter);
 
 /// The arms, oldest layout first, so a milestone's gain is the step between two rows.
 const ARMS: &[Arm] = &[
-    ("M229 (no equality section)", |w| {
-        w.without_equality_section_for_test()
+    ("M229 (row blocks, no equality section)", |w| {
+        w.with_block_options(BlockOptions {
+            columnar: false,
+            equality: false,
+            aggregates: false,
+        })
     }),
-    ("M230 (equality section)", |w| w),
+    ("M230 (row blocks, equality section)", |w| {
+        w.with_block_options(BlockOptions {
+            columnar: false,
+            equality: true,
+            aggregates: false,
+        })
+    }),
+    ("M231 (columnar blocks)", |w| {
+        w.with_block_options(BlockOptions {
+            aggregates: false,
+            ..BlockOptions::default()
+        })
+    }),
+    ("M232 (columnar blocks, aggregate statistics)", |w| w),
 ];
+
+/// The aggregations M232 measures: what each costs with and without block statistics.
+fn aggregations() -> Vec<(&'static str, AggregateSpec, Option<Predicate>)> {
+    let spec = |label: &str, agg: Aggregate| AggregateSpec {
+        labels: vec![(label.to_owned(), agg)],
+        group_by: vec![],
+        top_k: 10,
+    };
+    vec![
+        (
+            "sum(price)",
+            spec("s", Aggregate::Sum("price".into())),
+            None,
+        ),
+        (
+            "avg(rating) where price >= 1 (all)",
+            spec("a", Aggregate::Avg("rating".into())),
+            Some(Predicate::Cmp("price".into(), Op::Gte, Value::Int(1))),
+        ),
+        (
+            "max(price) where price >= 5001 (half)",
+            spec("m", Aggregate::Max("price".into())),
+            Some(Predicate::Cmp("price".into(), Op::Gte, Value::Int(5001))),
+        ),
+        (
+            "count where category = (no stats)",
+            spec("c", Aggregate::Count(None)),
+            Some(eq("category", Value::Str("cat-07".into()))),
+        ),
+        // M233: shapes statistics never answer, so every block is decoded.
+        (
+            "sum(price) where customer = (one batch)",
+            spec("s", Aggregate::Sum("price".into())),
+            Some(eq("customer", Value::Str("cust-00100".into()))),
+        ),
+        (
+            "sum(price) by category (grouped)",
+            AggregateSpec {
+                labels: vec![("s".to_owned(), Aggregate::Sum("price".into()))],
+                group_by: vec![pstore_query::GroupKey::value("category")],
+                top_k: 50,
+            },
+            None,
+        ),
+    ]
+}
+
+/// The order-bys M233 measures: a top 10 by one key, unfiltered, under a selective filter and
+/// under one admitting every row.
+fn orders() -> Vec<(&'static str, Order, Option<Predicate>)> {
+    let by = |attr: &str, desc: bool| {
+        Order::from(OrderBy {
+            attr: attr.to_owned(),
+            desc,
+        })
+    };
+    vec![
+        ("top 10 by price desc", by("price", true), None),
+        (
+            "top 10 by price where category =",
+            by("price", false),
+            Some(eq("category", Value::Str("cat-07".into()))),
+        ),
+        (
+            "top 10 by rating where price >= 1 (all)",
+            by("rating", true),
+            Some(Predicate::Cmp("price".into(), Op::Gte, Value::Int(1))),
+        ),
+    ]
+}
 
 async fn run(rows: usize) {
     let docs = corpus(rows);
@@ -246,6 +335,31 @@ async fn run(rows: usize) {
             }
             None => println!("equality section: none"),
         }
+        // Whole-segment decode, and resolving 10 hits spread over the segment (`rows_at`).
+        let mut full = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let n = seg
+                .rows_where(&view, &key, |_| true)
+                .await
+                .expect("scan")
+                .len();
+            full.push(t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(n, rows);
+        }
+        let hits: Vec<usize> = (0..10).map(|k| k * rows / 10 + 3).collect();
+        let mut resolve = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let got = seg.rows_at(&view, &key, &hits).await.expect("resolve");
+            resolve.push(t.elapsed().as_secs_f64() * 1e3);
+            assert!(got.iter().all(Option::is_some));
+        }
+        println!(
+            "decode every row {:.2} ms, resolve 10 hits {:.3} ms",
+            median(full),
+            median(resolve)
+        );
         println!(
             "{:<40} {:>9} {:>5} {:>11} {:>8} {:>10}",
             "predicate", "blocks", "GETs", "bytes", "rows", "mask ms"
@@ -269,6 +383,89 @@ async fn run(rows: usize) {
             println!(
                 "{label:<40} {kept:>4}/{blocks:<4} {gets:>5} {moved:>11} {admitted:>8} {:>10.3}",
                 median(times)
+            );
+        }
+        // M232: aggregations, through the query path every server runs.
+        let target = Target {
+            segment: key.clone(),
+            segment_len: Some(seg_len as u64),
+            centroids: None,
+            deleted: None,
+            sparse_dict: false,
+            text_dict: false,
+            fde_clusters: false,
+            shadowed: false,
+        };
+        let none = std::collections::HashSet::new();
+        println!(
+            "{:<40} {:>5} {:>11} {:>10}  answer",
+            "aggregation", "GETs", "bytes", "ms"
+        );
+        for (label, spec, filter) in aggregations() {
+            let run = || async {
+                let mut a = Aggregator::new(spec.clone());
+                pstore_query::aggregate(
+                    &view,
+                    std::slice::from_ref(&target),
+                    filter.as_ref(),
+                    &none,
+                    &mut a,
+                )
+                .await
+                .expect("aggregate");
+                a.finish()
+            };
+            let gets0 = acct.count(tenant, OpClass::Read);
+            let bytes0 = acct.bytes(tenant, OpClass::Read);
+            let answer = run().await;
+            let gets = acct.count(tenant, OpClass::Read) - gets0;
+            let moved = acct.bytes(tenant, OpClass::Read) - bytes0;
+            let mut times = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                assert_eq!(run().await, answer, "a run answered otherwise");
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "{label:<40} {gets:>5} {moved:>11} {:>10.3}  {:?}",
+                median(times),
+                answer[0].1
+            );
+        }
+        // M233: order-bys, through the same path.
+        println!(
+            "{:<40} {:>5} {:>11} {:>10}  first",
+            "order-by", "GETs", "bytes", "ms"
+        );
+        for (label, by, filter) in orders() {
+            let run = || async {
+                let mut s = Selector::new(by.clone(), 10);
+                pstore_query::select(
+                    &view,
+                    std::slice::from_ref(&target),
+                    filter.as_ref(),
+                    &none,
+                    &mut s,
+                )
+                .await
+                .expect("select");
+                s.into_sorted()
+            };
+            let gets0 = acct.count(tenant, OpClass::Read);
+            let bytes0 = acct.bytes(tenant, OpClass::Read);
+            let answer = run().await;
+            let gets = acct.count(tenant, OpClass::Read) - gets0;
+            let moved = acct.bytes(tenant, OpClass::Read) - bytes0;
+            let mut times = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                assert_eq!(run().await, answer, "a run answered otherwise");
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "{label:<40} {gets:>5} {moved:>11} {:>10.3}  {}",
+                median(times),
+                answer.first().map_or("", |d| d.id.as_str())
             );
         }
     }

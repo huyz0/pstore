@@ -633,6 +633,13 @@ async fn a_bounded_hit_on_a_reaped_segment_falls_back() {
 async fn a_refused_strong_aggregation_is_not_run_twice() {
     let w = world(&[1, 2]);
     let (a, b) = (&w.apis[0], &w.apis[1]);
+    // M231: pinned to the blocks this was measured on: with aggregate statistics the block
+    // read is answered from the open (M232), held by its own test.
+    a.set_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     upsert(a, &mut Model::new(), &rows(0..20), true).await;
     fold(a).await;
     upsert(a, &mut Model::new(), &rows(20..21), true).await;

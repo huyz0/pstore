@@ -313,6 +313,69 @@ pub struct Head {
     /// and its replication has the entry's run, so a cancel, a resume, a drop or an outcome
     /// ends it.
     pub copy_progress: BTreeMap<String, CopyProgress>,
+    /// Each index's storage overrides (M231), by name: what its next sealed segments' blocks
+    /// are, over the cluster's default. ⚠️ The last trailing section, after the copies'
+    /// progress; `encode` writes only the overrides of indexes that exist and set something.
+    pub storage: BTreeMap<String, Storage>,
+}
+
+/// An index's storage overrides (M231): each `None` takes the cluster's default, set on the
+/// server. Changing one changes what the next fold or compaction writes, never a segment
+/// already written: a reader reads every combination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Storage {
+    /// Columnar blocks (M231), or row-major ones.
+    pub columnar: Option<bool>,
+    /// The equality section (M230).
+    pub equality: Option<bool>,
+    /// The per-block aggregate statistics (M232).
+    pub aggregates: Option<bool>,
+}
+
+impl Storage {
+    /// Whether it overrides nothing.
+    #[must_use]
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+
+    /// The blocks it writes, over the cluster's `default`.
+    #[must_use]
+    pub fn over(self, default: pstore_format::BlockOptions) -> pstore_format::BlockOptions {
+        pstore_format::BlockOptions {
+            columnar: self.columnar.unwrap_or(default.columnar),
+            equality: self.equality.unwrap_or(default.equality),
+            aggregates: self.aggregates.unwrap_or(default.aggregates),
+        }
+    }
+
+    /// Its byte in HEAD: two bits a setting, 0 unset, 1 off, 2 on.
+    fn byte(self) -> u8 {
+        let code = |v: Option<bool>| match v {
+            None => 0u8,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        code(self.columnar) | code(self.equality) << 2 | code(self.aggregates) << 4
+    }
+
+    /// The overrides a byte names; a code of 3 or a high bit set is corrupt.
+    fn from_byte(b: u8) -> Result<Self, EngineError> {
+        let get = |shift: u8| match (b >> shift) & 3 {
+            0 => Ok(None),
+            1 => Ok(Some(false)),
+            2 => Ok(Some(true)),
+            _ => Err(EngineError::CorruptHead),
+        };
+        if b >> 6 != 0 {
+            return Err(EngineError::CorruptHead);
+        }
+        Ok(Self {
+            columnar: get(0)?,
+            equality: get(2)?,
+            aggregates: get(4)?,
+        })
+    }
 }
 
 /// One sync attempt's progress through a copy, an export or a reindex (M200), as its last
@@ -758,9 +821,23 @@ impl Head {
                 once.contains(n) && self.replications.get(*n).is_some_and(|r| r.run == p.run)
             })
             .collect();
+        // M231: the storage overrides last, only those of indexes that exist, forcing the
+        // progress count (0 when none) and so everything before it.
+        let stored: Vec<(&String, u8)> = self
+            .storage
+            .iter()
+            .filter(|(n, s)| {
+                !s.is_default()
+                    && (self.indexes.contains_key(*n)
+                        || self.schema_rejects.contains_key(*n)
+                        || self.quarantine.contains_key(*n))
+            })
+            .map(|(n, s)| (n, s.byte()))
+            .collect();
+        let progressed = !progress.is_empty() || !stored.is_empty();
         // M198: the ANN sets before it, written whenever any ref's is known, forcing every
         // count before them.
-        let ann = self.indexes.values().flatten().any(|r| r.ann.is_some()) || !progress.is_empty();
+        let ann = self.indexes.values().flatten().any(|r| r.ann.is_some()) || progressed;
         let as_of = !copy_as_of.is_empty() || ann;
         let copy_timed = !copy_times.is_empty() || as_of;
         let reindexed = !reindexes.is_empty() || copy_timed;
@@ -996,11 +1073,18 @@ impl Head {
         if ann {
             put_ann(&mut out, &self.indexes);
         }
-        if !progress.is_empty() {
+        if progressed {
             out.extend_from_slice(&(progress.len() as u32).to_le_bytes());
             for (name, p) in progress {
                 put_str(&mut out, name);
                 put_progress(&mut out, p);
+            }
+        }
+        if !stored.is_empty() {
+            out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+            for (name, b) in stored {
+                put_str(&mut out, name);
+                out.push(b);
             }
         }
         out
@@ -1545,6 +1629,17 @@ impl Head {
             let name = c.string()?;
             let p = get_progress(&mut c)?;
             if h.copy_progress.insert(name, p).is_some() {
+                return Err(EngineError::CorruptHead);
+            }
+        }
+        // M231: and here, no storage override.
+        if c.at_end() {
+            return Ok(h);
+        }
+        for _ in 0..c.u32()? {
+            let name = c.string()?;
+            let s = Storage::from_byte(c.u8()?)?;
+            if s.is_default() || h.storage.insert(name, s).is_some() {
                 return Err(EngineError::CorruptHead);
             }
         }
@@ -3521,6 +3616,132 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// M231: an index's storage overrides round-trip after every other section, alone and
+    /// beside a copy's progress; an override of nothing, or of an index that does not exist,
+    /// is not written, so a HEAD without one keeps its bytes; a malformed one is refused.
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "offsets computed from the encoding above"
+    )]
+    fn storage_overrides_round_trip_last() -> Result<(), EngineError> {
+        let one = SegmentRef {
+            key: "k".to_owned(),
+            rows: 3,
+            dicts: None,
+            len: None,
+            ann: None,
+        };
+        let rows = Storage {
+            columnar: Some(false),
+            ..Storage::default()
+        };
+        let every = Storage {
+            columnar: Some(true),
+            equality: Some(false),
+            aggregates: Some(true),
+        };
+        for base in [Head::default(), sample(), every_section()] {
+            let mut plain = base.clone();
+            plain.indexes.insert("idx".to_owned(), vec![one.clone()]);
+            plain.indexes.insert("other".to_owned(), vec![one.clone()]);
+            for s in [rows, every] {
+                let mut with = plain.clone();
+                with.storage.insert("idx".to_owned(), s);
+                assert_eq!(Head::decode(&with.encode())?, with);
+                with.storage.insert("other".to_owned(), rows);
+                assert_eq!(Head::decode(&with.encode())?, with);
+            }
+            // Not written: nothing overridden, or an index HEAD does not hold.
+            let mut none = plain.clone();
+            none.storage.insert("idx".to_owned(), Storage::default());
+            assert_eq!(hex(&none.encode()), hex(&plain.encode()));
+            let mut ghost = plain.clone();
+            ghost.storage.insert("gone".to_owned(), rows);
+            assert_eq!(hex(&ghost.encode()), hex(&plain.encode()));
+            // An index HEAD holds only as rejects, or only as quarantine, keeps its override
+            // (CI's mutation review of #58: the last `||` as `&&` missed).
+            for (name, rejects) in [("rejected", true), ("quarantined", false)] {
+                let mut held = plain.clone();
+                if rejects {
+                    held.schema_rejects.insert(name.to_owned(), 2);
+                } else {
+                    held.quarantine
+                        .insert(name.to_owned(), vec![("q/0".to_owned(), 2)]);
+                }
+                let mut with = held.clone();
+                with.storage.insert(name.to_owned(), rows);
+                assert_ne!(hex(&with.encode()), hex(&held.encode()), "{name}");
+                assert_eq!(Head::decode(&with.encode())?, with, "{name}");
+            }
+            // Malformed: a code of 3, a high bit, an all-unset byte, a name twice, a trailing
+            // byte.
+            let mut with = plain.clone();
+            with.storage.insert("idx".to_owned(), rows);
+            let bytes = with.encode();
+            let at = bytes.len() - 1;
+            for bad in [3u8, 0x40, 0x80, 0] {
+                let mut b = bytes.clone();
+                b[at] = bad;
+                assert!(Head::decode(&b).is_err(), "byte {bad:#x}");
+            }
+            let entry = {
+                let mut e = Vec::new();
+                put_str(&mut e, "idx");
+                e.push(rows.byte());
+                e
+            };
+            let count_at = bytes.len() - entry.len() - 4;
+            let mut twice = bytes[..count_at].to_vec();
+            twice.extend_from_slice(&2_u32.to_le_bytes());
+            twice.extend_from_slice(&entry);
+            twice.extend_from_slice(&entry);
+            assert!(Head::decode(&twice).is_err(), "a name twice");
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Head::decode(&longer).is_err());
+            for cut in plain.encode().len()..bytes.len() {
+                if let Ok(h) = Head::decode(&bytes[..cut]) {
+                    assert!(h.storage.is_empty(), "a cut at {cut} decoded an override");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M231: an override takes the cluster's default for what it leaves unset.
+    #[test]
+    fn an_override_wins_over_the_default_only_where_set() {
+        let d = pstore_format::BlockOptions::default();
+        assert_eq!(Storage::default().over(d), d);
+        let off = pstore_format::BlockOptions {
+            columnar: false,
+            equality: false,
+            aggregates: false,
+        };
+        let s = Storage {
+            columnar: Some(true),
+            equality: None,
+            aggregates: Some(false),
+        };
+        assert_eq!(
+            s.over(off),
+            pstore_format::BlockOptions {
+                columnar: true,
+                equality: false,
+                aggregates: false,
+            }
+        );
+        assert_eq!(
+            s.over(d),
+            pstore_format::BlockOptions {
+                columnar: true,
+                equality: true,
+                aggregates: false,
+            }
+        );
     }
 
     /// M194 criterion 3: a copy `record_copy` evicts takes its times with it.

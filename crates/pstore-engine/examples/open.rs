@@ -221,6 +221,7 @@ async fn by_deployment_size(sizes: &[u32]) {
                 copy_times: Default::default(),
                 copy_as_of: Default::default(),
                 copy_progress: Default::default(),
+                storage: Default::default(),
             };
             store
                 .put(

@@ -7,7 +7,6 @@
 //! a key among the global `top_k` smallest is among every segment's own, so the merge is exact.
 
 use crate::filter::Predicate;
-use crate::order::visit;
 use crate::run::{QueryError, Target};
 use pstore_blob::BlobStore;
 use pstore_format::{Document, Number, Value, cmp_numbers};
@@ -166,6 +165,28 @@ impl Spec {
                 .labels
                 .iter()
                 .all(|(_, a)| matches!(a, Aggregate::Count(None)))
+    }
+
+    /// Every attribute an aggregate or a group key reads, sorted (M233): all an admitted row
+    /// is built with.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .labels
+            .iter()
+            .filter_map(|(_, a)| match a {
+                Aggregate::Count(None) => None,
+                Aggregate::Count(Some(a))
+                | Aggregate::Sum(a)
+                | Aggregate::Min(a)
+                | Aggregate::Max(a)
+                | Aggregate::Avg(a) => Some(a.as_str()),
+            })
+            .chain(self.group_by.iter().map(|g| g.attribute.as_str()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -376,6 +397,24 @@ pub enum Total {
     Null,
 }
 
+/// A block's smallest and largest value of `attr`, from the zone of its statistics' kind.
+fn extremes_of(
+    zones: &pstore_format::Zones,
+    attr: &str,
+    stat: pstore_format::aggregates::Stat,
+) -> Option<(Number, Number)> {
+    match stat {
+        pstore_format::aggregates::Stat::Int { .. } => zones
+            .ints
+            .get(attr)
+            .map(|&(lo, hi)| (Number::Int(lo), Number::Int(hi))),
+        pstore_format::aggregates::Stat::Float { .. } => zones
+            .floats
+            .get(attr)
+            .map(|&(lo, hi)| (Number::Float(lo), Number::Float(hi))),
+    }
+}
+
 /// Adds one row to its group's accumulators.
 fn fold(labels: &[(String, Aggregate)], accs: &mut [Acc], doc: &Document) {
     for ((_, agg), acc) in labels.iter().zip(accs.iter_mut()) {
@@ -433,6 +472,11 @@ impl Aggregator {
             spec: Arc::new(spec),
             groups: BTreeMap::new(),
         }
+    }
+
+    /// [`Spec::names`], owned.
+    fn spec_names(&self) -> Vec<String> {
+        self.spec.names().into_iter().map(str::to_owned).collect()
     }
 
     fn empty_like(&self) -> Self {
@@ -515,6 +559,75 @@ impl Aggregator {
         fold(&self.spec.labels, &mut accs, doc);
         self.groups.insert(key, accs);
         true
+    }
+
+    /// Whether [`Self::offer_block`] can stand for offering a block's rows (M232): the spec is
+    /// ungrouped, and every aggregate's attribute has statistics in the block, with a zone
+    /// for `Min`, `Max` and `Avg` when any row holds it.
+    #[must_use]
+    pub fn answers_block(&self, zones: &pstore_format::Zones) -> bool {
+        let Some((stats, b)) = zones.aggregates.as_ref() else {
+            return false;
+        };
+        self.spec.group_by.is_empty()
+            && self.spec.labels.iter().all(|(_, agg)| match agg {
+                Aggregate::Count(None) => true,
+                Aggregate::Count(Some(a)) | Aggregate::Sum(a) => stats.get(a, *b).is_some(),
+                Aggregate::Min(a) | Aggregate::Max(a) | Aggregate::Avg(a) => stats
+                    .get(a, *b)
+                    .is_some_and(|s| s.count() == 0 || extremes_of(zones, a, s).is_some()),
+            })
+    }
+
+    /// Folds a block of `rows` rows, every one admitted, from its statistics and zones (M232).
+    /// The caller has checked [`Self::answers_block`].
+    pub fn offer_block(&mut self, zones: &pstore_format::Zones, rows: u64) {
+        let Some((stats, b)) = zones.aggregates.as_ref() else {
+            return;
+        };
+        if !self.admit(&[]) {
+            return;
+        }
+        let Some(accs) = self.groups.get_mut(&Vec::new()) else {
+            return;
+        };
+        for ((_, agg), acc) in self.spec.labels.iter().zip(accs.iter_mut()) {
+            let attr = match agg {
+                Aggregate::Count(None) => {
+                    acc.count += rows;
+                    continue;
+                }
+                Aggregate::Count(Some(a))
+                | Aggregate::Sum(a)
+                | Aggregate::Min(a)
+                | Aggregate::Max(a)
+                | Aggregate::Avg(a) => a,
+            };
+            let Some(stat) = stats.get(attr, *b) else {
+                continue;
+            };
+            let count = u64::from(stat.count());
+            if matches!(agg, Aggregate::Count(_)) {
+                acc.count += count;
+                continue;
+            }
+            if count == 0 {
+                continue;
+            }
+            match stat {
+                pstore_format::aggregates::Stat::Int { sum, .. } => acc.ints += i128::from(sum),
+                pstore_format::aggregates::Stat::Float { sum, .. } => {
+                    acc.floats += sum;
+                    acc.any_float = true;
+                }
+            }
+            if !matches!(agg, Aggregate::Sum(_)) {
+                acc.nums += count;
+                if let Some((lo, hi)) = extremes_of(zones, attr, stat) {
+                    acc.extremes(Some(lo), Some(hi));
+                }
+            }
+        }
     }
 
     /// Counts `rows` rows without offering them: HEAD's arithmetic, for the fast path. Only
@@ -649,17 +762,67 @@ pub async fn aggregate<S: BlobStore>(
     aggregator: &mut Aggregator,
 ) -> Result<(), QueryError> {
     let blank = aggregator.empty_like();
-    let parts = visit(
-        store,
-        targets,
-        filter,
-        shadow,
-        || blank.empty_like(),
-        |a: &mut Aggregator, doc: Document| {
-            a.offer(&doc);
-        },
-    )
-    .await?;
+    let names = aggregator.spec_names();
+    let spec_names = &names;
+    let opened = crate::order::open(store, targets, false).await?;
+    let blank = &blank;
+    let parts =
+        futures_util::future::try_join_all(opened.iter().zip(targets).map(|(o, t)| async move {
+            let mut local = blank.empty_like();
+            // M232: a block the filter admits whole, with no deleted or shadowed row, is
+            // folded from its statistics and never fetched.
+            let mut answered: Vec<usize> = Vec::new();
+            if !t.shadowed || shadow.is_empty() {
+                for (i, (start, rows, zones)) in o.segment.block_spans().enumerate() {
+                    if local.answers_block(zones)
+                        && filter.is_none_or(|f| f.must_admit(zones, rows))
+                        && !o.deleted.any_in(start..start + rows)
+                    {
+                        local.offer_block(zones, rows as u64);
+                        answered.push(i);
+                    }
+                }
+            }
+            // M233: a row is built first as far as deciding it needs, and an admitted one then
+            // only with what the aggregates and group keys read.
+            let hiding = t.shadowed && !shadow.is_empty();
+            let (id, deciding) = crate::order::deciding(filter, hiding, &[]);
+            let decides = |name: &str| deciding.binary_search(&name).is_ok();
+            let wanted = |name: &str| {
+                spec_names
+                    .binary_search_by(|r| r.as_str().cmp(name))
+                    .is_ok()
+            };
+            o.segment
+                .visit_blocks_late(
+                    store,
+                    &t.segment,
+                    |i, zones| {
+                        answered.binary_search(&i).is_err()
+                            && filter.is_none_or(|f| f.could_admit(zones))
+                    },
+                    &mut local,
+                    &pstore_format::Projection {
+                        id,
+                        attrs: &decides,
+                    },
+                    |_, row, doc| {
+                        let hidden =
+                            o.deleted.contains(&row) || (hiding && shadow.contains(&doc.id));
+                        !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs))
+                    },
+                    &pstore_format::Projection {
+                        id: false,
+                        attrs: &wanted,
+                    },
+                    |local, _, doc| {
+                        local.offer(&doc);
+                    },
+                )
+                .await?;
+            Ok::<_, QueryError>(local)
+        }))
+        .await?;
     for part in parts {
         aggregator.merge(part);
     }
@@ -1162,5 +1325,36 @@ mod tests {
         g.count_rows(7);
         g.offer(&doc("z", Value::Int(1)));
         assert_eq!(g.finish()[0].1[0], Total::Int(8));
+    }
+
+    /// A block whose rows never hold the attribute answers `Min` from its statistics, since
+    /// there is nothing to add; one holding it with no zone does not (M232, CI mutation
+    /// review: `count() == 0` as `!=` only fetched the empty block, and the suite timed out).
+    #[test]
+    fn a_block_without_the_attribute_is_answered_and_one_without_its_zone_is_not() {
+        let mut with = Document::new("a", vec![1.0]);
+        with.attrs.insert("p".to_owned(), Value::Int(3));
+        let without = Document::new("b", vec![1.0]);
+        let stats = std::sync::Arc::new(
+            pstore_format::aggregates::Aggregates::build(&[&[with][..], &[without][..]], 1 << 16)
+                .unwrap(),
+        );
+        let a = Aggregator::new(Spec {
+            labels: vec![("lo".to_owned(), Aggregate::Min("p".to_owned()))],
+            group_by: vec![],
+            top_k: 10,
+        });
+        let empty = pstore_format::Zones {
+            aggregates: Some((stats.clone(), 1)),
+            ..pstore_format::Zones::default()
+        };
+        assert!(a.answers_block(&empty));
+        let mut zoned = pstore_format::Zones {
+            aggregates: Some((stats, 0)),
+            ..pstore_format::Zones::default()
+        };
+        assert!(!a.answers_block(&zoned));
+        zoned.ints.insert("p".to_owned(), (3, 3));
+        assert!(a.answers_block(&zoned));
     }
 }
