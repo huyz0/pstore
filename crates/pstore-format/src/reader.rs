@@ -1287,7 +1287,7 @@ impl Segment {
             }
             return Ok(());
         }
-        let either = |name: &str| (first.attrs)(name) || (then.attrs)(name);
+        let either = |name: &str| (then.attrs)(name) || (first.attrs)(name);
         let both = crate::Projection {
             id: first.id || then.id,
             attrs: &either,
