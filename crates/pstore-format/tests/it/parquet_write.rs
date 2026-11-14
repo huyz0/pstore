@@ -42,8 +42,15 @@ fn rows(n: usize, seed: u64) -> Vec<Document> {
     (0..n)
         .map(|i| {
             let mut d = Document::new(format!("d{i:05}"), vec![i as f32, -0.5, 1e-3]);
-            if r.below(5) == 0 {
-                d.vectors.remove(DEFAULT_FIELD);
+            match r.below(10) {
+                0 | 1 => {
+                    d.vectors.remove(DEFAULT_FIELD);
+                }
+                2 => {
+                    d.vectors
+                        .insert(DEFAULT_FIELD.into(), VectorField::Dense(vec![Vec::new()]));
+                }
+                _ => {}
             }
             if r.below(3) == 0 {
                 d.vectors.insert(
@@ -139,9 +146,27 @@ fn floats(l: &List) -> Vec<f32> {
         .collect()
 }
 
+/// `f` on a thread, failed if it takes longer than a sound file ever does: a broken file can
+/// send the reader into a loop, and a hang is a failure, not a test that never ends.
+fn within(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the reader failed or hung on the file");
+}
+
 #[test]
 fn a_page_reads_back_through_the_parquet_crate() {
     for (n, seed) in [(1, 1), (37, 2), (1_000, 3)] {
+        within(move || reads_back(n, seed));
+    }
+}
+
+fn reads_back(n: usize, seed: u64) {
+    {
         let docs = rows(n, seed);
         let fields = vec![DEFAULT_FIELD.to_owned(), "named".to_owned()];
         let meta = vec![("pstore.index".to_owned(), "idx".to_owned())];
@@ -177,10 +202,23 @@ fn a_page_reads_back_through_the_parquet_crate() {
                 )
             })
             .collect();
+        // Each attribute's kind, stated rather than derived: past one row, every attribute
+        // holds several values, so a kind kept only for a lone value is caught.
         if n >= 37 {
-            assert_eq!(kinds["mixed"], Kind::Json);
-            assert_eq!(kinds["nums"], Kind::Double);
-            assert_eq!(kinds["arr"], Kind::Json);
+            let stated = [
+                ("arr", Kind::Json),
+                ("bool", Kind::Bool),
+                ("bytes", Kind::Bytes),
+                ("float", Kind::Double),
+                ("int", Kind::Int),
+                ("mixed", Kind::Json),
+                ("nums", Kind::Double),
+                ("str", Kind::Str),
+                ("time", Kind::Time),
+                ("uint", Kind::Uint),
+                ("uuid", Kind::Uuid),
+            ];
+            assert_eq!(kinds.clone().into_iter().collect::<Vec<_>>(), stated);
         }
         let mut seen = 0;
         for (d, row) in docs.iter().zip(reader.get_row_iter(None).unwrap()) {
@@ -226,6 +264,10 @@ fn a_page_reads_back_through_the_parquet_crate() {
 
 #[test]
 fn a_field_of_several_vectors_a_row_is_left_out_by_name() {
+    within(a_field_of_several_vectors_a_row_is_left_out_by_name_body);
+}
+
+fn a_field_of_several_vectors_a_row_is_left_out_by_name_body() {
     let mut docs = rows(5, 9);
     docs[2].vectors.insert(
         "multi".to_owned().into(),
@@ -242,6 +284,10 @@ fn a_field_of_several_vectors_a_row_is_left_out_by_name() {
 
 #[test]
 fn a_field_named_as_an_attribute_is_left_out_by_name() {
+    within(a_field_named_as_an_attribute_is_left_out_by_name_body);
+}
+
+fn a_field_named_as_an_attribute_is_left_out_by_name_body() {
     let mut docs = rows(5, 11);
     docs[1]
         .attrs
@@ -266,6 +312,10 @@ fn a_field_named_as_an_attribute_is_left_out_by_name() {
 
 #[test]
 fn an_empty_page_is_a_file_of_no_rows() {
+    within(an_empty_page_is_a_file_of_no_rows_body);
+}
+
+fn an_empty_page_is_a_file_of_no_rows_body() {
     let (file, _) = write(&[], &[DEFAULT_FIELD.to_owned()], &[], &json);
     let reader = SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();
     assert_eq!(reader.metadata().file_metadata().num_rows(), 0);

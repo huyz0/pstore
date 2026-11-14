@@ -114,7 +114,7 @@ impl Thrift {
         let last = self.last.last().copied().unwrap_or(0);
         let delta = id - last;
         if (1..=15).contains(&delta) {
-            self.out.push(((delta as u8) << 4) | ty);
+            self.out.push(((delta as u8) << 4) + ty);
         } else {
             self.out.push(ty);
             self.zigzag(i64::from(id));
@@ -160,9 +160,9 @@ impl Thrift {
     fn list(&mut self, id: i16, ty: u8, n: usize) {
         self.field(id, T_LIST);
         if n < 15 {
-            self.out.push(((n as u8) << 4) | ty);
+            self.out.push(((n as u8) << 4) + ty);
         } else {
-            self.out.push(0xf0 | ty);
+            self.out.push(0xf0 + ty);
             self.varint(n as u64);
         }
     }
@@ -176,9 +176,9 @@ impl Thrift {
 /// Writes a column's logical type into its schema element.
 type Logical = Box<dyn Fn(&mut Thrift)>;
 
-/// Levels as the RLE/bit-packing hybrid, runs only, behind their 4-byte length.
-fn levels(out: &mut Vec<u8>, values: &[u8], max: u8) {
-    let width = 8 - max.leading_zeros() as usize;
+/// Levels as the RLE/bit-packing hybrid, runs only, behind their 4-byte length. Only a column
+/// whose maximum level is 1 to 255 writes them, so each run's value is one byte wide.
+fn levels(out: &mut Vec<u8>, values: &[u8]) {
     let mut body = Vec::new();
     for run in values.chunk_by(|a, b| a == b) {
         let Some(&v) = run.first() else { continue };
@@ -188,10 +188,7 @@ fn levels(out: &mut Vec<u8>, values: &[u8], max: u8) {
             header >>= 7;
         }
         body.push(header as u8);
-        // A level is at most 8 bits wide: its run's value is one byte, or none at width 0.
-        if width > 0 {
-            body.push(v);
-        }
+        body.push(v);
     }
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
@@ -207,30 +204,22 @@ struct Column {
     max_rep: u8,
     max_def: u8,
     values: Vec<u8>,
-    /// Values written: non-null leaves.
-    count: usize,
+    /// Levels written: one a leaf slot, nulls and empty lists included -- a row each but in
+    /// a list, which holds one per element and one per null or empty list.
+    slots: usize,
 }
 
 impl Column {
     fn page(&self) -> Vec<u8> {
         let mut data = Vec::new();
         if self.max_rep > 0 {
-            levels(&mut data, &self.rep, self.max_rep);
+            levels(&mut data, &self.rep);
         }
         if self.max_def > 0 {
-            levels(&mut data, &self.def, self.max_def);
+            levels(&mut data, &self.def);
         }
         data.extend_from_slice(&self.values);
         data
-    }
-
-    /// Levels written: one a leaf slot, nulls and empty lists included.
-    fn slots(&self) -> usize {
-        if self.max_def > 0 {
-            self.def.len()
-        } else {
-            self.count
-        }
     }
 }
 
@@ -326,14 +315,13 @@ pub fn write(
         max_rep: 0,
         max_def: 0,
         values: ids,
-        count: rows.len(),
+        slots: rows.len(),
     });
 
     for &name in &names {
         let kind = Kind::of(rows.iter().filter_map(|d| d.attrs.get(name)));
         let mut def = Vec::with_capacity(rows.len());
         let mut values = Vec::new();
-        let mut count = 0;
         let mut bools: Vec<bool> = Vec::new();
         for d in rows {
             let Some(v) = d.attrs.get(name) else {
@@ -341,7 +329,6 @@ pub fn write(
                 continue;
             };
             def.push(1);
-            count += 1;
             match (kind, v) {
                 (Kind::Int, Value::Int(n)) | (Kind::Time, Value::DateTime(n)) => {
                     values.extend_from_slice(&n.to_le_bytes());
@@ -438,7 +425,7 @@ pub fn write(
             max_rep: 0,
             max_def: 1,
             values,
-            count,
+            slots: rows.len(),
         });
     }
 
@@ -454,7 +441,7 @@ pub fn write(
             skipped.push(field.clone());
             continue;
         }
-        let (mut rep, mut def, mut values, mut count) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        let (mut rep, mut def, mut values) = (Vec::new(), Vec::new(), Vec::new());
         for d in rows {
             match dense(d).and_then(|v| v.into_iter().next()) {
                 None => {
@@ -470,7 +457,6 @@ pub fn write(
                         rep.push(u8::from(i > 0));
                         def.push(2);
                         values.extend_from_slice(&x.to_le_bytes());
-                        count += 1;
                     }
                 }
             }
@@ -511,12 +497,12 @@ pub fn write(
         columns.push(Column {
             path: vec![field.clone(), "list".to_owned(), "element".to_owned()],
             physical: FLOAT,
+            slots: def.len(),
             rep,
             def,
             max_rep: 1,
             max_def: 2,
             values,
-            count,
         });
     }
 
@@ -531,7 +517,7 @@ pub fn write(
         h.i32(2, data.len() as i32);
         h.i32(3, data.len() as i32);
         h.struct_(5);
-        h.i32(1, c.slots() as i32);
+        h.i32(1, c.slots as i32);
         h.i32(2, PLAIN);
         h.i32(3, RLE);
         h.i32(4, RLE);
@@ -540,7 +526,7 @@ pub fn write(
         let offset = file.len() as i64;
         file.extend_from_slice(&h.out);
         file.extend_from_slice(&data);
-        chunks.push((offset, (h.out.len() + data.len()) as i64, c.slots() as i64));
+        chunks.push((offset, (h.out.len() + data.len()) as i64, c.slots as i64));
     }
 
     // The footer.
@@ -614,4 +600,51 @@ fn schema_tops(schema: &[Vec<u8>], fields: &[String], skipped: &[String]) -> usi
     // Each written field is three elements, every other top-level column one.
     let written = fields.len() - skipped.len();
     schema.len() - 2 * written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{T_I32, T_LIST, T_STRUCT, Thrift};
+
+    fn bytes(f: impl FnOnce(&mut Thrift)) -> Vec<u8> {
+        let mut t = Thrift::default();
+        t.begin();
+        f(&mut t);
+        t.out
+    }
+
+    #[test]
+    fn integers_are_zigzag_varints() {
+        for (v, want) in [
+            (0, vec![0]),
+            (-1, vec![1]),
+            (1, vec![2]),
+            (-64, vec![127]),
+            (64, vec![0x80, 1]),
+            (
+                i64::MIN,
+                vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
+            ),
+        ] {
+            assert_eq!(bytes(|t| t.zigzag(v)), want, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_field_header_is_its_delta_and_type_or_its_id_in_full() {
+        assert_eq!(bytes(|t| t.i32(1, -2)), [0x15, 3]);
+        assert_eq!(bytes(|t| t.i32(15, 0)), [0xf5, 0]);
+        assert_eq!(bytes(|t| t.i32(16, 0)), [T_I32, 32, 0]);
+        assert_eq!(bytes(|t| t.i32(-1, 0)), [T_I32, 1, 0]);
+    }
+
+    #[test]
+    fn a_list_header_is_short_below_fifteen_items() {
+        assert_eq!(bytes(|t| t.list(1, T_STRUCT, 14)), [0x10 + T_LIST, 0xec]);
+        assert_eq!(
+            bytes(|t| t.list(1, T_STRUCT, 15)),
+            [0x10 + T_LIST, 0xfc, 15]
+        );
+        assert_eq!(bytes(|t| t.list(1, T_I32, 0)), [0x10 + T_LIST, 0x05]);
+    }
 }
