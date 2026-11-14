@@ -97,8 +97,8 @@ exclude_re = [
     # `floats_with_few_decimals_are_written_as_integers` (9e15 itself is below 2^53, so accepting it
     # is exact too), and `malformed_codec_headers_are_refused` (an LZ4 length at exactly the bound
     # cannot decompress from bytes that few, so both refuse). Named by line and column. (M231)
-    'pstore-format/src/columnar\.rs:(224:24|258:21|309:22|317:23|436:21): replace < with <= in (encode_ints|encode_blob|encode_bytes|decimal_exponent)$',
-    'pstore-format/src/columnar\.rs:276:20: replace > with >= in decode_blob$',
+    'pstore-format/src/columnar\.rs:(233:24|267:21|318:22|326:23|445:21): replace < with <= in (encode_ints|encode_blob|encode_bytes|decimal_exponent)$',
+    'pstore-format/src/columnar\.rs:285:20: replace > with >= in decode_blob$',
     # `Storage::byte` joins three two-bit codes shifted to disjoint bits, so `|` and `^` give
     # the same byte for every input. Premise: `storage_overrides_round_trip_last` pins the
     # byte both ways. Named by line and column. (M231)

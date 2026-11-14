@@ -66,6 +66,11 @@ accepted; LZ4 never used; the reader ignoring the version. No `cargo mutants` ru
    quarantine-only cases in `storage_overrides_round_trip_last` now catch them. For each of these,
    the test was seen red under the mutant. The third gap is `Storage::byte`'s `|` mutated to `^`,
    which is equivalent because the bits are disjoint. It is excluded in `.cargo/mutants.toml`.
+   CI's shard 2 never reported: its runner was killed both times. The cause was that `put_var`'s
+   `while v >= 0x80` mutated to `<`, and `pack`'s `bits -= 8` mutated to `+=`, push bytes until
+   memory runs out. Both loops are now bounded counts: ten bytes at most for a varint, and
+   `bits / 8` bytes a value. A scoped `cargo mutants` over `put_var` and `pack` caught 19 of 19.
+   The columnar exclusions' line numbers moved with these edits.
 7. Pinned to rows with assertions unchanged: `typed_values::a_float_column_prunes_its_blocks`,
    `typed_values::an_int_column_still_prunes_for_either_literal`,
    `datetime::a_datetime_column_prunes_its_blocks`, `patch::a_plain_fold_reads_what_it_did_before_m13`,
