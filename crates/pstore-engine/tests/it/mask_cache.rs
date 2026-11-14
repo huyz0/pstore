@@ -169,7 +169,10 @@ async fn a_cached_mask_answers_as_a_computed_one() {
     assert_eq!((&a1, &a2), (&b1, &b1));
     // Its HEAD now holds the override, a few bytes more than the plain one's: compared with
     // its own first query, the same query again reads every block again.
-    assert_eq!(again, first, "an index that opts out still read from the cache");
+    assert_eq!(
+        again, first,
+        "an index that opts out still read from the cache"
+    );
     assert_eq!(
         cache.len(),
         held,
