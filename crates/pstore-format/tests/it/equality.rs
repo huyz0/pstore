@@ -313,3 +313,26 @@ fn an_attribute_whose_blocks_hold_most_of_its_values_is_not_filtered() {
         "three quarters: not filtered"
     );
 }
+
+#[test]
+fn every_block_of_a_long_section_finds_its_own_values() {
+    // 20 blocks: the open bitmap takes three bytes, so each filter's place depends on it.
+    let blocks: Vec<Vec<(String, Value)>> = (0..20)
+        .map(|b| vec![("s".into(), Value::Str(format!("v{b}")))])
+        .collect();
+    let built = Equality::build(blocks.len(), usize::MAX, |b| {
+        blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+    })
+    .unwrap();
+    let mut ruled_out = 0;
+    for b in 0..20 {
+        assert!(
+            built.may_equal("s", b, &Value::Str(format!("v{b}"))),
+            "block {b}"
+        );
+        ruled_out += (0..20)
+            .filter(|o| !built.may_equal("s", b, &Value::Str(format!("v{o}"))))
+            .count();
+    }
+    assert!(ruled_out > 300, "{ruled_out} of 380 other values ruled out");
+}
