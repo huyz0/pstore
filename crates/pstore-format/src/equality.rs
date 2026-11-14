@@ -361,6 +361,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::indexing_slicing,
     clippy::cast_possible_truncation,
     reason = "assertions in tests are the reporting mechanism"
 )]
