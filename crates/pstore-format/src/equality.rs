@@ -374,6 +374,21 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    /// The hash is on disk in every filter a segment holds: a change to it, however small,
+    /// makes every segment already written answer wrongly, so its values are pinned.
+    #[test]
+    fn the_hash_is_the_one_segments_were_written_with() {
+        let all: Vec<u8> = (0..=255).collect();
+        for (bytes, want) in [
+            (&b""[..], 0xf52a_15e9_a9b5_e89b),
+            (b"a", 0x02c0_bdbf_4814_20f8),
+            (b"category-17", 0xe638_d145_8904_15d2),
+            (&all, 0xef26_87f0_d437_1fe2),
+        ] {
+            assert_eq!(hash(bytes), want, "{bytes:?}");
+        }
+    }
+
     /// A filter's false positive rate is near its design: 3 probes at 8 bits a value is about
     /// 3.1%. Probes that collapse to neighbouring bits (an `h2` of 1) or lose the odd step
     /// that keeps them apart cost several times that, and soundness alone would not notice.
