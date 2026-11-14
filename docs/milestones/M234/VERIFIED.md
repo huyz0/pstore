@@ -63,4 +63,6 @@ aggregations filter rows inline and gain nothing. (d) **Remote parts** are not c
 reads no HEAD, so cannot see the override). (e) **Rollback** below M234 with a `filter_cache`
 override set is refused by the older binary's HEAD decoder (docs/deploy.md). Nothing durable.
 
-Gates, in a cloud container: GATES-PENDING
+Gates, in a cloud container: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast` (the two IPv6 peer tests this container cannot run skipped; nothing else failed), `scripts/depth.sh`, `check-links.sh`, `check-verified.py`, `gen-clients.py --check`, `check-slos.py`, `build-index.py --check` and `check-poison.sh` passed. The coverage floor is CI's full run.
+
+The first gates run found `read_cache::the_uncached_api_repeats_its_reads` and `consistency::the_own_lane_is_probed_past_what_this_process_holds` red: both count a plain `Api`'s reads, and the cache made a repeated filter read less. Those tests pin the old behaviour, so they stay as they are: an `Api` keeps no cache until `set_filter_cache_bytes`, and the server binary sets the cluster default (64 MiB, `PSTORE_FILTER_CACHE_BYTES`) from its `Config`.

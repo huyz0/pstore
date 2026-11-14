@@ -164,6 +164,9 @@ async fn columnar(store: &Accounted<MemoryStore>) -> Vec<bool> {
 async fn an_index_overrides_the_cluster_default_and_says_so() {
     let store = Accounted::new(MemoryStore::new());
     let api = Api::unsecured(store.clone(), LaneId(1)).unwrap();
+    // The server binary's default cache (M234): an `Api` keeps none until it is set.
+    assert!(api.mask_cache().is_none());
+    api.set_filter_cache_bytes(pstore_server::DEFAULT_FILTER_CACHE_BYTES);
     // The cluster default is rows, as an operator mid-rollout sets it.
     api.set_block_options(BlockOptions {
         columnar: false,
