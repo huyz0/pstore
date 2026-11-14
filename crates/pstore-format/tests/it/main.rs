@@ -28,6 +28,7 @@ mod sketch;
 mod sparse;
 mod sparse_keys;
 mod sparse_rows;
+mod stopwords;
 mod text;
 mod text_fields;
 mod tokenizers;
