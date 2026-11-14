@@ -434,6 +434,26 @@ impl<S: BlobStore + 'static> Api<S> {
         self.ingress.counts()
     }
 
+    /// Candidate rows reserved by running queries now (M212).
+    #[doc(hidden)]
+    pub fn reserved_query_rows(&self) -> u64 {
+        self.ingress.reserved_rows()
+    }
+
+    /// Holds `rows` of `tenant`'s query reservation until the returned value is dropped, as a
+    /// running query would (M212's contention tests).
+    ///
+    /// # Errors
+    /// As a query's reservation would be refused.
+    #[doc(hidden)]
+    pub fn hold_query_rows_for_test(
+        &self,
+        tenant: TenantId,
+        rows: u64,
+    ) -> Result<QueryRowsHeld, ApiError> {
+        self.ingress.reserve_rows(tenant, rows).map(QueryRowsHeld)
+    }
+
     fn build(
         store: Accounted<S>,
         lane: LaneId,
@@ -616,9 +636,12 @@ impl<S: BlobStore + 'static> Api<S> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&tenant);
+            // M213: or its flushed rows hold its flush bound. The cap counts their held bytes,
+            // which fill it while their bundles are far below `policy.bytes`.
+            let flush_at = self.ingress.limits().tenant_flush_bytes();
             let old_or_large = engine.unfolded().is_some_and(|u| {
                 now.duration_since(u.oldest) >= policy.age || u.bytes >= policy.bytes
-            });
+            }) || engine.buffered().unfolded >= flush_at;
             if !old_or_large && !requested {
                 continue;
             }
@@ -2147,11 +2170,11 @@ fn patch_by_filter_attrs(
     })
 }
 
-/// What a write's operations will hold in its tenant's buffer (M141), by
-/// [`pstore_format::Document::footprint`]'s rules: documents, each patch's id and
-/// attributes, each delete's tombstone, each by-filter operation's encoded filter, and an
-/// applied request's `stamp` on every row. An estimate: the engine trues it up to the
-/// stored rows as they are buffered.
+/// What a write's operations will hold in its tenant's buffer (M141), as the engine encodes
+/// them (M213): each document's [`pstore_format::Document::footprint`], each patch's, each
+/// delete's tombstone's and each by-filter operation's row, and an applied request's `stamp`
+/// on every row. An estimate -- a condition or a type stamp is not counted -- that the engine
+/// trues up to the stored rows as they are buffered.
 fn write_footprint(
     docs: &[Document],
     patches: &[pstore_engine::Patch],
@@ -2160,27 +2183,39 @@ fn write_footprint(
     patch_by: Option<&(pstore_query::Predicate, pstore_engine::Patch)>,
     stamp: u64,
 ) -> u64 {
-    let patch = |p: &pstore_engine::Patch| {
-        p.id.len() as u64
-            + p.set
-                .iter()
-                .map(|(k, v)| k.len() as u64 + v.footprint())
-                .sum::<u64>()
-            + p.unset.iter().map(|k| k.len() as u64).sum::<u64>()
-    };
-    let filter = |f: &pstore_query::Predicate| pstore_query::condition::encode(f).len() as u64;
-    // A delete is stored as a tombstone: its id and an 8-byte mark under an empty name.
     let rows = docs.len()
         + patches.len()
         + deletes.len()
         + usize::from(delete_by.is_some())
         + usize::from(patch_by.is_some());
     docs.iter().map(Document::footprint).sum::<u64>()
-        + patches.iter().map(patch).sum::<u64>()
-        + deletes.iter().map(|d| d.len() as u64 + 8).sum::<u64>()
-        + delete_by.map_or(0, filter)
-        + patch_by.map_or(0, |(f, p)| filter(f) + patch(p))
+        + patches
+            .iter()
+            .map(pstore_engine::patch_footprint)
+            .sum::<u64>()
+        + deletes
+            .iter()
+            .map(|d| pstore_engine::delete_footprint(d))
+            .sum::<u64>()
+        + delete_by.map_or(0, |f| pstore_engine::by_filter_footprint(f, None))
+        + patch_by.map_or(0, |(f, p)| pstore_engine::by_filter_footprint(f, Some(p)))
         + rows as u64 * stamp
+}
+
+/// Drops spare capacity from a patch's id, names and values (M213), as
+/// [`Document::shrink_to_fit`] does a row's.
+fn shrink_patch(p: &mut pstore_engine::Patch) {
+    p.id.shrink_to_fit();
+    p.set = std::mem::take(&mut p.set)
+        .into_iter()
+        .map(|(mut k, mut v)| {
+            k.shrink_to_fit();
+            v.shrink_to_fit();
+            (k, v)
+        })
+        .collect();
+    p.unset.iter_mut().for_each(String::shrink_to_fit);
+    p.unset.shrink_to_fit();
 }
 
 /// Reserves `bytes` of `tenant`'s buffer for one write (M141), flushing first when a
@@ -2468,7 +2503,7 @@ async fn write_documents<S: BlobStore + 'static>(
                 && !types.contains_key(n)
         })
         .then(|| (req.documents.clone(), patches.clone(), patch_by.clone()));
-    let (docs, patches, patch_by) = match (
+    let (mut docs, mut patches, mut patch_by) = match (
         typed_ops(
             std::mem::take(&mut req.documents),
             patches,
@@ -2508,6 +2543,12 @@ async fn write_documents<S: BlobStore + 'static>(
         .into_iter()
         .map(|id| id.0)
         .collect();
+    // M213: what a parser grew past the length would be held, and charged, for nothing.
+    docs.iter_mut().for_each(Document::shrink_to_fit);
+    patches
+        .iter_mut()
+        .chain(patch_by.as_mut().map(|(_, p)| p))
+        .for_each(shrink_patch);
     // M141: the whole request's share of the tenant's buffer, before anything is buffered.
     let need = write_footprint(
         &docs,
@@ -2965,6 +3006,12 @@ async fn query_index<S: BlobStore + 'static>(
         // M65: checked first, so every refusal names `facets`.
         let facet = facets::derive(&req)?;
         let plan = plan(&req)?;
+        // M212: the whole plan's candidates reserved, before any blob request, until answered.
+        let mut rows = plan_rows(&plan, &req);
+        if let Some((freq, _)) = &facet {
+            rows = rows.saturating_add(plan_rows(&crate::plan(freq)?, freq));
+        }
+        let _reserved = api.ingress.reserve_rows(tenant, rows)?;
         let engine = api.engine(tenant).await;
         let before = api.spend(tenant);
         let peers = api.query_peers(tenant, &req);
@@ -3026,7 +3073,12 @@ async fn query_index<S: BlobStore + 'static>(
         .iter()
         .map(|r| Ok(facets::derive(r)?.map(|(f, _)| f)))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    reqs.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
+    // M212: every query's and facet's plan reserved together, before any blob request.
+    let mut rows = 0_u64;
+    for r in reqs.iter().chain(facet_reqs.iter().flatten()) {
+        rows = rows.saturating_add(plan_rows(&plan(r)?, r));
+    }
+    let _reserved = api.ingress.reserve_rows(tenant, rows)?;
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
     // Concurrently: a multi-query costs its queries' requests at the deepest one's depth.
@@ -3465,6 +3517,44 @@ fn total_json(t: pstore_query::Total) -> serde_json::Value {
         pstore_query::Total::Null => serde_json::Value::Null,
     }
 }
+
+/// The candidate rows a plan holds (M212): an aggregation its groups, an order or expression
+/// its page, a ranking each leg's limit (a FDE leg's rerank when larger) and its window.
+fn plan_rows(plan: &Plan, req: &QueryRequest) -> u64 {
+    let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    match plan {
+        Plan::Aggregate(spec, _) => wide(spec.top_k),
+        Plan::Ordered(..) | Plan::Scored(..) => wide(page_end(req)),
+        Plan::Ranked(legs, _, _, boost, _, diversify, limit_per) => {
+            let window = boost
+                .as_ref()
+                .map(|b| b.window)
+                .or(diversify.map(|d| d.window))
+                .or(limit_per.as_ref().map(|p| p.window))
+                .unwrap_or(page_end(req));
+            legs.iter()
+                .map(|l| wide(leg_rows(l)))
+                .fold(wide(window), u64::saturating_add)
+        }
+    }
+}
+
+fn leg_rows(leg: &pstore_query::Prefetch) -> usize {
+    use pstore_query::Prefetch;
+    match leg {
+        Prefetch::MultiFde { limit, rerank, .. } => rerank.map_or(*limit, |r| r.max(*limit)),
+        Prefetch::Dense { limit, .. }
+        | Prefetch::Sparse { limit, .. }
+        | Prefetch::Multi { limit, .. }
+        | Prefetch::Text { limit, .. }
+        | Prefetch::Trigram { limit, .. } => *limit,
+    }
+}
+
+/// A test's hold on query rows (M212): returned when dropped.
+#[doc(hidden)]
+#[must_use = "dropping it returns the rows at once"]
+pub struct QueryRowsHeld(#[allow(dead_code, reason = "held for its drop")] ingress::Rows);
 
 /// What a query will run, decided -- and refused -- before it runs.
 enum Plan {
@@ -8082,22 +8172,27 @@ mod tests {
             pstore_query::Op::Eq,
             pstore_format::Value::Int(2),
         );
-        let (e1, e2) = (
-            pstore_query::condition::encode(&gone).len() as u64,
-            pstore_query::condition::encode(&even).len() as u64,
-        );
-        assert!(e1 > 0 && e2 > 0 && e1 != e2);
         let got = write_footprint(
             std::slice::from_ref(&doc),
             std::slice::from_ref(&patch),
             &["del".to_owned()],
             Some(&gone),
-            Some(&(even, by)),
+            Some(&(even.clone(), by.clone())),
             7,
         );
-        // The row, the patch (2 + 2 + 3 + 1), the tombstone (3 + 8), the two filters, the
-        // patch by filter's patch (2 + 8), and the stamp on each of five operations.
-        assert_eq!(got, doc.footprint() + 8 + 11 + e1 + e2 + 10 + 5 * 7);
+        // M213: each operation as the engine encodes it -- the row, the patch, the tombstone,
+        // the two by-filter rows -- and the stamp on each of five operations.
+        let parts = [
+            doc.footprint(),
+            pstore_engine::patch_footprint(&patch),
+            pstore_engine::delete_footprint("del"),
+            pstore_engine::by_filter_footprint(&gone, None),
+            pstore_engine::by_filter_footprint(&even, Some(&by)),
+        ];
+        for (i, a) in parts.iter().enumerate() {
+            assert!(*a > 0 && parts[..i].iter().all(|b| b != a), "{parts:?}");
+        }
+        assert_eq!(got, parts.iter().sum::<u64>() + 5 * 7);
         assert_eq!(write_footprint(&[], &[], &[], None, None, 7), 0);
     }
 

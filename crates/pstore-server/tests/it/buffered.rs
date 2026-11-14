@@ -325,9 +325,11 @@ async fn a_full_batched_write_is_refused_before_any_flush() {
 
 #[tokio::test]
 async fn deletes_reserve_their_tombstones() {
-    // Each delete is stored as a tombstone: its id and an 8-byte mark.
+    // Each delete is stored as a tombstone (M213: the row it is encoded as), every id here
+    // three characters.
     let ids = |n: usize| (0..n).map(|i| format!("x{i:02}")).collect::<Vec<_>>();
-    let cap = 10 * (3 + 8) - 1;
+    let t = pstore_engine::delete_footprint("x00");
+    let cap = 10 * t - 1;
     let (api, store) = serve(MemoryStore::new(), limits(cap, cap));
     let delete = |n| json!({"durability": "batched", "deletes": ids(n)});
     let path = "/v1/indexes/docs/documents";
@@ -336,7 +338,7 @@ async fn deletes_reserve_their_tombstones() {
     assert_eq!(totals(&store), [0; 4]);
     let (s, b, _) = send(&api, 1, "PUT", path, &delete(9)).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    assert_eq!(buffered(&api, 1).await.pending, 9 * (3 + 8));
+    assert_eq!(buffered(&api, 1).await.pending, 9 * t);
 }
 
 /// A store whose first bundle PUT after [`Held::arm`] waits until [`Held::release`].
@@ -502,4 +504,27 @@ async fn concurrent_reservations_admit_one() {
     assert_eq!(s, StatusCode::OK, "{winner}: {b}");
     assert_eq!(ids(&api, 1).await, [winner]);
     assert_eq!(buffered(&api, 1).await.reserved, 0);
+}
+
+#[tokio::test]
+async fn flushed_rows_at_the_flush_bound_make_their_tenant_due_for_a_fold() {
+    // M213: the cap counts flushed rows' held bytes, which can fill it while their bundles are
+    // far below the policy's size, so held bytes at the flush bound make a tenant due too.
+    let (api, _) = serve(MemoryStore::new(), limits(2 * f(), 3 * f()));
+    let policy = FoldPolicy {
+        period: std::time::Duration::from_secs(3600),
+        age: std::time::Duration::from_secs(3600),
+        bytes: u64::MAX,
+    };
+    assert_eq!(write(&api, 1, "d01", "durable").await.0, StatusCode::OK);
+    assert_eq!(buffered(&api, 1).await.unfolded, f());
+    assert_eq!(
+        api.fold_due(&policy).await.folded,
+        0,
+        "one row is below the bound"
+    );
+    assert_eq!(write(&api, 1, "d02", "durable").await.0, StatusCode::OK);
+    assert_eq!(buffered(&api, 1).await.unfolded, 2 * f());
+    assert_eq!(api.fold_due(&policy).await.folded, 1, "two rows are at it");
+    assert_eq!(buffered(&api, 1).await, Buffered::default());
 }

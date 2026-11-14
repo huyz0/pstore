@@ -276,8 +276,81 @@ pub enum Value {
     Null,
 }
 
+/// What [`Document::footprint`] charges each heap allocation beyond its own bytes (M213): the
+/// allocator's header and size-class rounding, which no `Layout` shows.
+pub const ALLOCATION_OVERHEAD: u64 = 16;
+
+/// One allocation of `cap` elements of `T`, or nothing for none (M213).
+#[must_use]
+pub fn heap_bytes<T>(cap: usize) -> u64 {
+    if cap == 0 {
+        0
+    } else {
+        (cap * std::mem::size_of::<T>()) as u64 + ALLOCATION_OVERHEAD
+    }
+}
+
+/// A bound on the nodes of a `BTreeMap<K, V>` of `len` entries (M213). A leaf holds 11 entries,
+/// a parent pointer and two `u16`s (16 bytes, padded); an internal node also 12 edges. Up to
+/// 11 entries are one leaf; past that every node but the root holds at least 5, so there are at
+/// most `len / 5` leaves (rounded up) and as many internal nodes again, a fifth of them.
+#[must_use]
+pub fn map_bytes<K, V>(len: usize) -> u64 {
+    let leaf = (16 + 11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())) as u64
+        + ALLOCATION_OVERHEAD;
+    match len {
+        1..=11 => leaf,
+        // An empty map has no node: no leaves, so no internal nodes either.
+        _ => {
+            let leaves = len.div_ceil(5) as u64;
+            let internal = leaves.div_ceil(5);
+            leaves * leaf + internal * (leaf + 12 * 8)
+        }
+    }
+}
+
 impl Value {
-    /// The bytes [`Document::footprint`] counts for this value: 8 for a number, bool or
+    /// The heap this value holds (M213): a string's or bytes' capacity, an array's elements
+    /// at their size and their own heap, each with [`ALLOCATION_OVERHEAD`]; nothing inline.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        match self {
+            Self::Str(s) => heap_bytes::<u8>(s.capacity()),
+            Self::Bytes(b) => heap_bytes::<u8>(b.capacity()),
+            Self::Array(vs) => {
+                heap_bytes::<Self>(vs.capacity()) + vs.iter().map(Self::held).sum::<u64>()
+            }
+            Self::Int(_)
+            | Self::Uint(_)
+            | Self::Float(_)
+            | Self::Bool(_)
+            | Self::DateTime(_)
+            | Self::Uuid(_)
+            | Self::Null => 0,
+        }
+    }
+
+    /// Drops spare capacity from this value's string, bytes or array, and its elements'
+    /// (M213): what a parser grew past the length is held for nothing.
+    pub fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Str(s) => s.shrink_to_fit(),
+            Self::Bytes(b) => b.shrink_to_fit(),
+            Self::Array(vs) => {
+                vs.iter_mut().for_each(Self::shrink_to_fit);
+                vs.shrink_to_fit();
+            }
+            Self::Int(_)
+            | Self::Uint(_)
+            | Self::Float(_)
+            | Self::Bool(_)
+            | Self::DateTime(_)
+            | Self::Uuid(_)
+            | Self::Null => {}
+        }
+    }
+
+    /// The bytes a patch's estimate counts for this value: 8 for a number, bool or
     /// instant, 16 for a UUID, a string's or byte string's bytes, 1 for a null element (M175),
     /// and an array's elements summed.
     #[must_use]
@@ -742,27 +815,77 @@ impl Document {
         self.vectors.get(name).map_or(&[], VectorField::as_dense)
     }
 
-    /// A deterministic estimate of the bytes this row holds in memory (M141): the id's
-    /// bytes, 4 per dense component, a sparse pair's key bytes plus 4 (M177), and per
-    /// attribute its key's bytes
-    /// plus its value's. Not RSS: allocator and map overhead are
-    /// not counted.
+    /// The row's **held bytes** (M213): an upper bound on the heap it holds and its slot in
+    /// a buffer's `Vec`, what a tenant's buffered rows are bounded by (M141). Twice the
+    /// struct's size for the slot; the capacity of its id, field names, vectors, attribute
+    /// keys, strings, bytes and arrays; each non-empty map's B-tree nodes; and
+    /// [`ALLOCATION_OVERHEAD`] for each of those allocations. Not RSS: fragmentation is not
+    /// counted.
     #[must_use]
     pub fn footprint(&self) -> u64 {
-        let vectors: usize = self
+        let slot = 2 * std::mem::size_of::<Self>() as u64;
+        let vectors: u64 = self
             .vectors
-            .values()
-            .map(|field| match field {
-                VectorField::Dense(vs) => vs.iter().map(|v| 4 * v.len()).sum::<usize>(),
-                VectorField::Sparse(pairs) => pairs.iter().map(|(k, _)| k.len() + 4).sum(),
+            .iter()
+            .map(|(name, field)| {
+                // An `Arc<str>`: its two counts and its bytes.
+                let name = 16 + name.as_str().len() as u64 + ALLOCATION_OVERHEAD;
+                name + match field {
+                    VectorField::Dense(vs) => {
+                        heap_bytes::<Vec<f32>>(vs.capacity())
+                            + vs.iter()
+                                .map(|v| heap_bytes::<f32>(v.capacity()))
+                                .sum::<u64>()
+                    }
+                    VectorField::Sparse(pairs) => {
+                        heap_bytes::<(String, Impact)>(pairs.capacity())
+                            + pairs
+                                .iter()
+                                .map(|(k, _)| heap_bytes::<u8>(k.capacity()))
+                                .sum::<u64>()
+                    }
+                }
             })
             .sum();
         let attrs: u64 = self
             .attrs
             .iter()
-            .map(|(k, v)| k.len() as u64 + v.footprint())
+            .map(|(k, v)| heap_bytes::<u8>(k.capacity()) + v.held())
             .sum();
-        self.id.len() as u64 + vectors as u64 + attrs
+        slot + heap_bytes::<u8>(self.id.capacity())
+            + map_bytes::<Field, VectorField>(self.vectors.len())
+            + vectors
+            + map_bytes::<String, Value>(self.attrs.len())
+            + attrs
+    }
+
+    /// Drops spare capacity from the row's id, vectors, attribute keys and values (M213), so
+    /// its [`Self::footprint`] is what its contents need: a JSON parser grows a vector of two
+    /// to a capacity of four.
+    pub fn shrink_to_fit(&mut self) {
+        self.id.shrink_to_fit();
+        for field in self.vectors.values_mut() {
+            match field {
+                VectorField::Dense(vs) => {
+                    vs.iter_mut().for_each(Vec::shrink_to_fit);
+                    vs.shrink_to_fit();
+                }
+                VectorField::Sparse(pairs) => {
+                    pairs.iter_mut().for_each(|(k, _)| k.shrink_to_fit());
+                    pairs.shrink_to_fit();
+                }
+            }
+        }
+        // A key cannot be changed in place: one with spare capacity is moved out and back.
+        let attrs = std::mem::take(&mut self.attrs);
+        self.attrs = attrs
+            .into_iter()
+            .map(|(mut k, mut v)| {
+                k.shrink_to_fit();
+                v.shrink_to_fit();
+                (k, v)
+            })
+            .collect();
     }
 
     /// The single dense vector in [`DEFAULT_FIELD`], or empty.

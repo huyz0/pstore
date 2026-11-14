@@ -125,9 +125,10 @@ async fn unfolded_bundles_count_against_the_cap_until_folded() {
 async fn a_reservation_converts_into_the_rows_its_scope_buffers() {
     let e = engine();
     let f = doc("d01").footprint();
+    // M213: the cap scaled to the row's held bytes; it was 1,000 when a row was charged 15.
     let bounds = BufferBounds {
         flush_at: None,
-        cap: 1000,
+        cap: 10 * f,
     };
     let r = e.reserve_buffer(f + 10, bounds).unwrap();
     r.scope(e.write("x", vec![doc("d01")])).await.unwrap();
@@ -178,6 +179,89 @@ async fn an_applied_rows_stamp_is_what_stamp_footprint_says() {
         .await
         .unwrap();
     assert_eq!(e.buffered().pending, f + stamp);
-    // `$op` (3 + 8) and `$req` (4 + 32 hex digits + `:ids`).
-    assert_eq!(stamp, 11 + 4 + 32 + 4);
+    // M213: a map leaf for a row that had no attributes, then `$op` (3), `$req` (4) and its
+    // 32 hex digits and `:ids`, each one allocation.
+    let a = pstore_format::ALLOCATION_OVERHEAD;
+    let leaf = pstore_format::map_bytes::<String, pstore_format::Value>(1);
+    assert_eq!(stamp, leaf + (3 + a) + (4 + a) + (32 + 4 + a));
+}
+
+/// M213: a flushed row stays in memory until a fold, and is charged what it was pending.
+#[tokio::test]
+async fn a_flushed_row_keeps_its_held_charge_until_folded() {
+    let e = engine();
+    let rows = vec![doc("d01"), doc("d02"), doc("d03")];
+    e.write("x", rows).await.unwrap();
+    let pending = e.buffered().pending;
+    assert_eq!(pending, 3 * doc("d01").footprint());
+    e.flush().await.unwrap();
+    assert_eq!(
+        e.buffered(),
+        Buffered {
+            pending: 0,
+            reserved: 0,
+            unfolded: pending
+        }
+    );
+    e.fold().await.unwrap();
+    assert_eq!(e.buffered(), Buffered::default());
+}
+
+#[tokio::test]
+async fn each_operations_estimate_is_the_row_the_engine_buffers() {
+    // M213: the server reserves a write by these before anything is buffered, so each must be
+    // what buffering it charges -- or the reservation is left over, or the row unchecked.
+    let patch = pstore_engine::Patch {
+        id: "p01".to_owned(),
+        set: [(
+            "colour".to_owned(),
+            pstore_format::Value::Str("blue".to_owned()),
+        )]
+        .into(),
+        unset: vec!["size".to_owned()],
+    };
+    let by = pstore_engine::Patch {
+        id: String::new(),
+        set: [("n".to_owned(), pstore_format::Value::Int(1))].into(),
+        unset: Vec::new(),
+    };
+    let filter = pstore_query::Predicate::Absent("owner".to_owned());
+    let charged = |e: &Engine<MemoryStore>| e.buffered().pending;
+
+    let e = engine();
+    e.delete("x", vec!["gone1".to_owned()]).await.unwrap();
+    assert_eq!(charged(&e), pstore_engine::delete_footprint("gone1"));
+    let e = engine();
+    e.patch("x", vec![patch.clone()], None).await.unwrap();
+    assert_eq!(charged(&e), pstore_engine::patch_footprint(&patch));
+    let e = engine();
+    e.delete_by_filter("x", &filter).await.unwrap();
+    assert_eq!(
+        charged(&e),
+        pstore_engine::by_filter_footprint(&filter, None)
+    );
+    let e = engine();
+    e.patch_by_filter("x", &filter, by.clone()).await.unwrap();
+    assert_eq!(
+        charged(&e),
+        pstore_engine::by_filter_footprint(&filter, Some(&by))
+    );
+    // Each a different row, so an estimate standing in for another is caught.
+    let all = [
+        pstore_engine::delete_footprint("gone1"),
+        pstore_engine::patch_footprint(&patch),
+        pstore_engine::by_filter_footprint(&filter, None),
+        pstore_engine::by_filter_footprint(&filter, Some(&by)),
+    ];
+    for (i, a) in all.iter().enumerate() {
+        assert!(all[..i].iter().all(|b| b != a), "{all:?}");
+    }
+    // A patch the engine refuses holds nothing.
+    let bad = pstore_engine::Patch {
+        id: "p02".to_owned(),
+        set: [("$op".to_owned(), pstore_format::Value::Int(1))].into(),
+        unset: Vec::new(),
+    };
+    assert_eq!(pstore_engine::patch_footprint(&bad), 0);
+    assert_eq!(pstore_engine::by_filter_footprint(&filter, Some(&bad)), 0);
 }
