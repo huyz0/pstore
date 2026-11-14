@@ -97,8 +97,13 @@ fn get_bytes<'a>(d: &mut Dec<'a>) -> Result<&'a [u8], FormatError> {
     d.raw(n)
 }
 
+/// Euclid's, in at most 128 steps: two 64-bit numbers take at most 93 (consecutive Fibonacci
+/// numbers are the worst case), and a bound keeps a broken step from looping forever.
 fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
+    for _ in 0..128 {
+        if b == 0 {
+            break;
+        }
         (a, b) = (b, a % b);
     }
     a
@@ -197,13 +202,14 @@ fn decode_for(d: &mut Dec<'_>, n: usize) -> Result<Vec<u64>, FormatError> {
         .collect()
 }
 
-/// An integer column: the smaller of frame-of-reference over the values and over their
-/// successive (wrapping) deltas.
+/// An integer column: frame-of-reference over the values, or over their successive (wrapping)
+/// deltas when that is strictly smaller -- a tie keeps frame-of-reference, which decodes
+/// without a running sum.
 pub(crate) fn encode_ints(e: &mut Enc, values: &[u64]) {
     let mut plain = Enc::default();
     plain.u8(INT_FOR);
     encode_for(&mut plain, values);
-    if values.len() > 2 {
+    {
         let deltas: Vec<u64> = values
             .windows(2)
             .filter_map(|w| match *w {
@@ -819,6 +825,33 @@ mod tests {
     }
 
     #[test]
+    fn a_late_row_holds_only_what_either_pass_asked_for() {
+        let mut d = Document::new("a", vec![]);
+        for (n, v) in [("k", 1), ("s", 2), ("x", 3)] {
+            d.attrs.insert(n.to_owned(), Value::Int(v));
+        }
+        let buf = encode_block(&[d]);
+        let k = |n: &str| n == "k";
+        let s = |n: &str| n == "s";
+        let got = decode_block_late(
+            &buf,
+            &Projection {
+                id: false,
+                attrs: &k,
+            },
+            &mut |_, _| true,
+            &Projection {
+                id: false,
+                attrs: &s,
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = got[0].1.attrs.keys().map(String::as_str).collect();
+        assert_eq!(names, ["k", "s"]);
+        assert_eq!(got[0].1.id, "", "no id was asked for");
+    }
+
+    #[test]
     fn malformed_codec_headers_are_refused() {
         let refused = |r: Result<(), FormatError>, what: &str| match r {
             Err(FormatError::Corrupt(m)) => assert!(m.contains(what), "{m}"),
@@ -873,6 +906,147 @@ mod tests {
             decode_block(&e.0, &Projection::ALL, None).map(|_| ()),
             "trailing bytes in the id column",
         );
+    }
+
+    #[test]
+    fn a_varint_s_tenth_byte_holds_one_bit() {
+        let var = |last: u8, low: u8| {
+            let mut b = vec![low | 0x80; 9];
+            b.push(last);
+            get_var(&mut Dec::new(&b))
+        };
+        assert_eq!(var(0, 0).unwrap(), 0, "a padded zero");
+        assert_eq!(var(1, 0x7f).unwrap(), u64::MAX);
+        assert!(var(2, 0).is_err());
+    }
+
+    #[test]
+    fn euclid_finishes_on_its_worst_case() {
+        // F(93) and F(92): the largest consecutive Fibonacci numbers in 64 bits.
+        let (mut a, mut b) = (0u64, 1u64);
+        for _ in 0..92 {
+            (a, b) = (b, a + b);
+        }
+        assert_eq!(gcd(b, a), 1);
+        assert_eq!(gcd(12_000, 18_000), 6_000);
+        assert_eq!(gcd(1_000, 0), 1_000);
+    }
+
+    #[test]
+    fn a_common_divisor_is_factored_out() {
+        // 256 multiples of 1,000 in no order: eight bits a value with the divisor (or nine a
+        // delta), 18 without.
+        let values: Vec<u64> = (0..256u64).map(|i| 7 + (i * 97 % 256) * 1_000).collect();
+        let buf = ints(&values);
+        assert!(buf.len() < 270, "{}", buf.len());
+        assert_eq!(decode_ints(&mut Dec::new(&buf), 256).unwrap(), values);
+    }
+
+    #[test]
+    fn a_short_column_keeps_frame_of_reference() {
+        // Deltas cost their first value and a frame of their own: on two values, about nine
+        // bytes more than frame-of-reference.
+        let buf = ints(&[0, 1 << 40]);
+        assert_eq!((buf[0], buf.len()), (INT_FOR, 10));
+    }
+
+    #[test]
+    fn a_delta_column_of_no_values_is_empty() {
+        let mut e = Enc::default();
+        e.u8(INT_DELTA);
+        put_var(&mut e, 5);
+        encode_for(&mut e, &[]);
+        assert_eq!(
+            decode_ints(&mut Dec::new(&e.0), 0).unwrap(),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn bytes_that_save_less_than_an_eighth_are_stored_raw() {
+        let mut x = 0x2545_f491_u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let random = noise(1_000);
+        // 920 random bytes and 80 zeros: LZ4 saves something, but under an eighth.
+        let mut some = noise(920);
+        some.extend([0u8; 80]);
+        let packed = lz4_flex::block::compress(&some).len();
+        assert!(
+            packed < some.len() && packed >= some.len() - some.len() / 8,
+            "{packed}"
+        );
+        for raw in [random, some] {
+            let mut e = Enc::default();
+            encode_blob(&mut e, &raw);
+            assert_eq!(e.0[0], 0, "stored raw");
+            assert_eq!(&*decode_blob(&mut Dec::new(&e.0)).unwrap(), &raw[..]);
+        }
+    }
+
+    #[test]
+    fn a_column_of_repeats_takes_the_dictionary() {
+        let items: Vec<&[u8]> = (0..100)
+            .map(|i| {
+                if i % 2 == 0 {
+                    &b"alpha"[..]
+                } else {
+                    &b"beta"[..]
+                }
+            })
+            .collect();
+        let mut e = Enc::default();
+        encode_bytes(&mut e, &items);
+        assert_eq!(e.0[0], BYTES_DICT);
+        let col = decode_bytes(&mut Dec::new(&e.0), items.len()).unwrap();
+        for (i, b) in items.iter().enumerate() {
+            assert_eq!(col.get(i).unwrap(), *b);
+        }
+    }
+
+    #[test]
+    fn floats_with_few_decimals_are_written_as_integers() {
+        let column = |fs: &[f64]| {
+            let values: Vec<Value> = fs.iter().map(|f| Value::Float(*f)).collect();
+            let refs: Vec<&Value> = values.iter().collect();
+            let mut e = Enc::default();
+            encode_values(&mut e, KIND_FLOAT, &refs);
+            let col = decode_values(&mut Dec::new(&e.0), KIND_FLOAT, fs.len()).unwrap();
+            for (i, v) in values.iter().enumerate() {
+                assert_eq!(&col.value(i).unwrap(), v, "{fs:?}");
+            }
+            e.0
+        };
+        let prices: Vec<f64> = (0..200).map(|i| f64::from(i) * 0.25 - 10.0).collect();
+        let buf = column(&prices);
+        assert_eq!(&buf[..2], &[FLOAT_DECIMAL, 2]);
+        assert!(buf.len() < 220, "{}", buf.len());
+        assert_eq!(&column(&[1.5, -2.5, 3.0])[..2], &[FLOAT_DECIMAL, 1]);
+        assert_eq!(&column(&[4.0, 1e15])[..2], &[FLOAT_DECIMAL, 0]);
+        assert_eq!(column(&[0.1 + 0.2, 1e300])[0], FLOAT_RAW);
+    }
+
+    #[test]
+    fn every_row_of_a_uuid_column_keeps_its_own() {
+        let docs: Vec<Document> = (0..20u8)
+            .map(|i| {
+                let mut d = Document::new(format!("d{i}"), vec![]);
+                d.attrs.insert("u".to_owned(), Value::Uuid([i; 16]));
+                d
+            })
+            .collect();
+        let got = decode_block(&encode_block(&docs), &Projection::ALL, None).unwrap();
+        for ((_, g), d) in got.iter().zip(&docs) {
+            assert_eq!(g.attrs, d.attrs);
+        }
     }
 
     #[test]
@@ -945,6 +1119,10 @@ mod tests {
     #[test]
     fn a_dictionary_ordinal_past_its_entries_is_refused() {
         assert!(decode_bytes(&mut Dec::new(&dict(3, &[0, 1, 2, 2])), 4).is_ok());
+        assert!(
+            decode_bytes(&mut Dec::new(&dict(3, &[2, 1, 0])), 3).is_ok(),
+            "n entries of n"
+        );
         assert!(decode_bytes(&mut Dec::new(&dict(3, &[0, 1, 3, 2])), 4).is_err());
     }
 
