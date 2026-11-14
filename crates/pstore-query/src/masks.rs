@@ -217,6 +217,8 @@ mod tests {
             c.insert(key(n), mask(999));
         }
         assert_eq!(c.len(), 8);
+        // Held entries are not empty (CI's mutation review of #59: `is_empty` as `true` missed).
+        assert!(!c.is_empty());
         for n in [0, 2, 3, 4, 5, 6, 7] {
             assert!(c.get(&key(n)).is_none(), "{n} held");
         }
