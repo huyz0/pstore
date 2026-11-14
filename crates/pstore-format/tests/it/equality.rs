@@ -255,6 +255,27 @@ fn a_section_round_trips_and_a_truncated_one_is_refused() {
     assert!(built.may_equal("s", 2, &Value::Int(1)));
 }
 
+/// M232's statistics take what the sketch and the equality section leave, not less (mutation
+/// review: the two sections' reservation multiplied rather than added left no room at all).
+#[tokio::test]
+async fn beside_a_sketch_and_filters_the_statistics_still_fit() {
+    // At 2,000 rows the zone maps, sketch and filters leave no room for statistics.
+    for n in [200, 500] {
+        let bytes = writer(&docs(n), false)
+            .with_trigram_attrs(&["s".to_owned()])
+            .try_finish()
+            .unwrap();
+        assert!(pstore_format::index_section_len(&bytes).unwrap() <= pstore_format::INDEX_BUDGET);
+        let (_, _, seg) = open(bytes).await;
+        assert!(seg.section(Section::TrigramSketch).is_some(), "{n} rows");
+        assert!(seg.section(Section::Equality).is_some(), "{n} rows");
+        assert!(
+            seg.section(Section::Aggregates).is_some(),
+            "{n} rows: no statistics"
+        );
+    }
+}
+
 #[test]
 fn a_section_that_fits_its_budget_exactly_is_kept() {
     let blocks: Vec<Vec<(String, Value)>> = (0..6)

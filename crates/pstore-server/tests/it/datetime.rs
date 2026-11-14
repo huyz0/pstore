@@ -226,6 +226,13 @@ async fn a_string_literal_meets_a_datetime_by_instant_and_a_string_by_bytes() {
 #[tokio::test]
 async fn a_datetime_column_prunes_its_blocks() {
     let api = api();
+    // M231: pinned to the blocks this was measured on, row-major with no aggregate
+    // statistics; the columnar layout is held by its own test below.
+    api.set_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     let base = 1_704_067_200_i64; // 2024-01-01T00:00:00Z
     let documents: Vec<Value> = (0..2000)
         .map(|i| {
@@ -252,6 +259,46 @@ async fn a_datetime_column_prunes_its_blocks() {
     assert!(
         pruned * 4 <= unpruned,
         "{pruned} bytes against {unpruned} unpruned"
+    );
+}
+
+/// M231: under the default, columnar blocks, a datetime filter still keeps out the blocks it
+/// rules out: the kept blocks cost a quarter or less of every block, beyond a filter that
+/// keeps none (the open costs the same either way).
+#[tokio::test]
+async fn a_datetime_column_prunes_its_columnar_blocks() {
+    let api = api();
+    assert!(api.block_options().columnar);
+    let base = 1_704_067_200_i64; // 2024-01-01T00:00:00Z
+    let documents: Vec<Value> = (0..2000)
+        .map(|i| {
+            let secs = base + i64::from(i) * 3600;
+            doc(&format!("d{i:05}"), json!({"t": rfc3339(secs)}))
+        })
+        .collect();
+    let (s, b) = put(&api, &declared(json!(documents))).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    fold(&api).await;
+    let bytes = |f: Value, first: Option<&'static str>| {
+        let api = Arc::clone(&api);
+        async move {
+            let q = json!({"rank_by": ["t", "asc"], "top_k": 10, "filters": f});
+            let (s, b) = query(&api, &q).await;
+            assert_eq!(s, StatusCode::OK, "{q} -> {b}");
+            match first {
+                Some(id) => assert_eq!(b["results"][0]["id"], id),
+                None => assert_eq!(b["results"], json!([])),
+            }
+            b["meta"]["cost"]["bytes_read"].as_u64().unwrap()
+        }
+    };
+    let cut = "2024-01-03T16:00:00Z";
+    let none = bytes(json!(["t", "Lt", "2023-12-31T00:00:00Z"]), None).await;
+    let unpruned = bytes(json!(["Not", ["t", "Gte", cut]]), Some("d00000")).await;
+    let pruned = bytes(json!(["t", "Lt", cut]), Some("d00000")).await;
+    assert!(
+        (pruned - none) * 4 <= unpruned - none,
+        "{pruned} bytes against {unpruned} unpruned, {none} for no block"
     );
 }
 

@@ -21,8 +21,13 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn a_segment_without_floats_keeps_its_bytes() {
     // Recorded on f17fdd7, the commit before M9h.1: a segment holding no float or bool must not move
-    // by a byte, or every reader before M9h.1 loses segments it could read.
-    let mut w = SegmentWriter::new(4);
+    // by a byte, or every reader before M9h.1 loses segments it could read. M231, M232: in
+    // the blocks it was recorded with, row-major and without aggregate statistics.
+    let mut w = SegmentWriter::new(4).with_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     for i in 0..10i64 {
         let mut d = Document::new(format!("d{i}"), vec![i as f32, 1.0, -0.5]);
         d.attrs.insert("n".to_owned(), Value::Int(i * 7 - 20));
@@ -40,7 +45,7 @@ fn a_segment_without_floats_keeps_its_bytes() {
 }
 
 fn typed_segment() -> bytes::Bytes {
-    typed_segment_with(SegmentWriter::new(2))
+    typed_segment_with(SegmentWriter::new(2).with_row_blocks())
 }
 
 fn typed_segment_with(mut w: SegmentWriter) -> bytes::Bytes {
@@ -98,7 +103,7 @@ async fn floats_and_bools_round_trip_in_a_version_2_segment() {
 
 #[test]
 fn an_untyped_segment_stays_version_1() {
-    let mut w = SegmentWriter::new(2);
+    let mut w = SegmentWriter::new(2).with_row_blocks();
     let mut d = Document::new("a", vec![1.0]);
     d.attrs.insert("n".to_owned(), Value::Int(1));
     w.push(d);
@@ -195,7 +200,7 @@ fn numbers_compare_exactly_across_int_and_float() {
 async fn uint64s_round_trip_and_make_a_segment_typed() {
     // M172: a segment of ints and uint64s alone is version 2, so it carries a flag and zones.
     use pstore_blob::{BlobStore, Key, MemoryStore};
-    let mut w = SegmentWriter::new(2);
+    let mut w = SegmentWriter::new(2).with_row_blocks();
     let want = [Value::Uint(u64::MAX), Value::Int(-1), Value::Uint(0)];
     for (i, v) in want.iter().enumerate() {
         let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
@@ -231,7 +236,7 @@ async fn uint64s_round_trip_and_make_a_segment_typed() {
 fn a_segment_holding_only_arrays_is_version_2() {
     // Spec review of M9h.2, m1: typed by the array itself, not by what is inside it.
     for items in [vec![], vec![Value::Int(1), Value::Str("a".to_owned())]] {
-        let mut w = SegmentWriter::new(2);
+        let mut w = SegmentWriter::new(2).with_row_blocks();
         let mut d = Document::new("a", vec![1.0]);
         d.attrs.insert("n".to_owned(), Value::Array(items.clone()));
         w.push(d);
@@ -296,7 +301,11 @@ fn a_typed_segment_without_datetimes_keeps_its_bytes() {
     // Recorded on 25e43b5, the commit before M9h.3: flag 1 and M9h.1's float tables, byte for
     // byte, so a datetime table is never written for a segment that holds no datetime. Written
     // without M230's equality section, which these bools would otherwise earn.
-    let b = typed_segment_with(SegmentWriter::new(2).without_equality_section_for_test());
+    let b = typed_segment_with(
+        SegmentWriter::new(2)
+            .with_row_blocks()
+            .without_equality_section_for_test(),
+    );
     assert_eq!(fnv(&b), 3_636_883_691_723_148_763, "len {}", b.len());
 }
 
@@ -305,7 +314,9 @@ fn a_dated_segment_without_uint64s_keeps_its_bytes() {
     // Recorded on 95b292f, the commit before M172: flag 2 and its float and datetime tables,
     // byte for byte, so a uint64 table is never written for a segment that holds none. Written
     // without M230's equality section, which the string row would otherwise earn.
-    let mut w = SegmentWriter::new(2).without_equality_section_for_test();
+    let mut w = SegmentWriter::new(2)
+        .with_row_blocks()
+        .without_equality_section_for_test();
     for (i, v) in [
         Value::DateTime(-5),
         Value::Float(2.5),
@@ -328,7 +339,7 @@ fn a_dated_segment_without_uint64s_keeps_its_bytes() {
 async fn a_datetime_round_trips_and_its_range_is_enforced() {
     use pstore_blob::{BlobStore, Key, MemoryStore};
     use pstore_format::datetime;
-    let mut w = SegmentWriter::new(2);
+    let mut w = SegmentWriter::new(2).with_row_blocks();
     for (i, t) in [datetime::MIN, 0, datetime::MAX].into_iter().enumerate() {
         let mut d = Document::new(format!("d{i}"), vec![1.0, 0.0]);
         d.attrs.insert("t".to_owned(), Value::DateTime(t));

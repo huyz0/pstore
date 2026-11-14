@@ -616,7 +616,8 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// One field, and `vector` with a second field named after it.
 fn pinned() -> [u64; 2] {
     let seal = |fields: usize| {
-        let mut w = SegmentWriter::new(8);
+        // The M60 writer's blocks were rows (M231).
+        let mut w = SegmentWriter::new(8).with_row_blocks();
         for i in 0..20 {
             let x = i as f32;
             let mut f: Vec<(&str, Vec<Vec<f32>>)> = vec![(DEFAULT_FIELD, vec![vec![x, 1.0, -x]])];

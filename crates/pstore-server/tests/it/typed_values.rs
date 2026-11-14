@@ -212,8 +212,67 @@ async fn an_int_column_still_prunes_for_either_literal() {
     prunes(|i| json!(i)).await;
 }
 
+/// M231: under the default, columnar blocks, a filter still keeps out the blocks it rules
+/// out. Measured against a filter that keeps none, since what pruning saves is block bytes and
+/// the open costs the same either way: the kept blocks cost a quarter or less of every block.
+#[tokio::test]
+async fn columnar_blocks_prune_for_float_and_int_columns() {
+    for float in [true, false] {
+        let api = api();
+        assert!(api.block_options().columnar);
+        let documents: Vec<Value> = (0..2000)
+            .map(|i| {
+                let x = if float {
+                    json!(f64::from(i) + 0.5)
+                } else {
+                    json!(i)
+                };
+                doc(&format!("d{i:05}"), json!({ "x": x }))
+            })
+            .collect();
+        let (s, b) = put(
+            &api,
+            &json!({"durability": "durable", "documents": documents}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        fold(&api).await;
+        let bytes = |f: Value, first: Option<&'static str>| {
+            let api = Arc::clone(&api);
+            async move {
+                let q = json!({"rank_by": ["x", "asc"], "top_k": 10, "filters": f});
+                let (s, b) = query(&api, &q).await;
+                assert_eq!(s, StatusCode::OK, "{q} -> {b}");
+                match first {
+                    Some(id) => assert_eq!(b["results"][0]["id"], id),
+                    None => assert_eq!(b["results"], json!([])),
+                }
+                b["meta"]["cost"]["bytes_read"].as_u64().unwrap()
+            }
+        };
+        let none = bytes(json!(["x", "Lt", -1.0]), None).await;
+        let unpruned = bytes(json!(["Not", ["x", "Gte", 64.0]]), Some("d00000")).await;
+        assert!(unpruned > none, "{unpruned} against {none} for no block");
+        for f in [json!(["x", "Lt", 64.0]), json!(["x", "Lt", 64])] {
+            let pruned = bytes(f.clone(), Some("d00000")).await;
+            assert!(
+                (pruned - none) * 4 <= unpruned - none,
+                "float {float}: {f} read {pruned} bytes against {unpruned} unpruned, {none} \
+                 for no block"
+            );
+        }
+    }
+}
+
 async fn prunes(x: impl Fn(i32) -> Value) {
     let api = api();
+    // M231: pinned to the blocks this was measured on, row-major with no aggregate
+    // statistics; the columnar layout is held by its own test below.
+    api.set_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     let documents: Vec<Value> = (0..2000)
         .map(|i| doc(&format!("d{i:05}"), json!({"x": x(i)})))
         .collect();

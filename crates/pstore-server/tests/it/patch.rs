@@ -364,6 +364,13 @@ async fn a_patch_is_never_a_reject_and_a_conditional_upsert_is_checked() {
 async fn a_plain_fold_reads_what_it_did_before_m13() {
     let w = apis(&[1]);
     let a = &w[0];
+    // M231: pinned to the blocks this was measured on, row-major with no aggregate
+    // statistics.
+    a.set_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     seeded(a).await;
     write(
         a,

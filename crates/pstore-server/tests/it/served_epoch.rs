@@ -91,6 +91,13 @@ fn two() -> (Arc<Api<MemoryStore>>, Arc<Api<MemoryStore>>) {
 #[tokio::test]
 async fn a_read_only_process_reports_the_epoch_it_served() {
     let (a, b) = two();
+    // M231: pinned to the blocks this was measured on, row-major with no aggregate
+    // statistics.
+    a.set_block_options(pstore_format::BlockOptions {
+        columnar: false,
+        aggregates: false,
+        ..pstore_format::BlockOptions::default()
+    });
     put(&a, "x", 1).await;
     let e = fold(&a).await;
     assert!(e >= 1);

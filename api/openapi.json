@@ -203,7 +203,7 @@
       },
       "patch": {
         "operationId": "patch_index",
-        "summary": "Make an index read-only or writable.",
+        "summary": "Make an index read-only or writable, or change its storage settings.",
         "security": [
           {
             "bearer": [
@@ -2096,13 +2096,13 @@
         "properties": {
           "read_only": {
             "type": "boolean"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/StoragePatch"
           }
         },
-        "required": [
-          "read_only"
-        ],
         "additionalProperties": false,
-        "description": "Make an index read-only or writable (M149)."
+        "description": "Make an index read-only or writable (M149), or change its storage settings (M231). Names one or both."
       },
       "Committed": {
         "type": "object",
@@ -2130,13 +2130,15 @@
           "read_only": {
             "type": "boolean"
           },
+          "storage": {
+            "$ref": "#/components/schemas/StorageSettings"
+          },
           "cost": {
             "$ref": "#/components/schemas/Cost"
           }
         },
         "required": [
           "epoch",
-          "read_only",
           "cost"
         ],
         "additionalProperties": false
@@ -2382,6 +2384,9 @@
           "read_only": {
             "type": "boolean"
           },
+          "storage": {
+            "$ref": "#/components/schemas/StorageSettings"
+          },
           "progress": {
             "$ref": "#/components/schemas/IndexProgress"
           },
@@ -2404,6 +2409,7 @@
           "updated_at",
           "approx_logical_bytes",
           "read_only",
+          "storage",
           "cost"
         ],
         "additionalProperties": false
@@ -3793,6 +3799,85 @@
           "meta"
         ],
         "additionalProperties": false
+      },
+      "StorageSettings": {
+        "type": "object",
+        "properties": {
+          "block_layout": {
+            "type": "string",
+            "enum": [
+              "columnar",
+              "rows"
+            ]
+          },
+          "equality_filters": {
+            "type": "boolean"
+          },
+          "block_aggregates": {
+            "type": "boolean"
+          },
+          "overrides": {
+            "$ref": "#/components/schemas/StorageOverrides"
+          }
+        },
+        "required": [
+          "block_layout",
+          "equality_filters",
+          "block_aggregates",
+          "overrides"
+        ],
+        "additionalProperties": false,
+        "description": "What an index's next fold or compaction writes (M231): its overrides over the server's defaults. Segments already written stay as they are."
+      },
+      "StorageOverrides": {
+        "type": "object",
+        "properties": {
+          "block_layout": {
+            "type": "string",
+            "enum": [
+              "columnar",
+              "rows"
+            ]
+          },
+          "equality_filters": {
+            "type": "boolean"
+          },
+          "block_aggregates": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "description": "The settings an index overrides (M231); any other takes the server's default."
+      },
+      "StoragePatch": {
+        "type": "object",
+        "properties": {
+          "block_layout": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "columnar",
+              "rows",
+              null
+            ]
+          },
+          "equality_filters": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_aggregates": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Storage settings to change (M231): absent leaves a setting, null clears its override, a value sets it."
       }
     }
   }

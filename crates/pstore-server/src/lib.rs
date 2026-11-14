@@ -60,7 +60,8 @@ pub use types::{
     Cost, Duties, Duty, ErrorBody, FoldResponse, GcResponse, IdempotencyKeyResponse, IndexList,
     IndexProgress, IndexSummary, ListParams, MultiQueryMeta, MultiQueryResponse, QueryMeta,
     QueryRequest, QueryResponse, ReadOnlyResponse, RecallGroundTruth, RecallNeighbor,
-    RecallResponse, ResultRow, Schema, TextIn, WarmMeta, WarmResponse, WriteRequest, WriteResponse,
+    RecallResponse, ResultRow, Schema, StorageSettings, TextIn, WarmMeta, WarmResponse,
+    WriteRequest, WriteResponse,
 };
 
 /// Everything a running server leaves to whoever deploys it.
@@ -174,6 +175,9 @@ pub struct Api<S> {
     /// Whether a fold writes each row's sparse pairs (M193): always, but for a test that
     /// folds a segment as a build before M193 did.
     sparse_rows: std::sync::atomic::AtomicBool,
+    /// What an index that overrides nothing seals (M231): the cluster's default, from
+    /// `PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES`.
+    blocks: Mutex<pstore_format::BlockOptions>,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -492,6 +496,7 @@ impl<S: BlobStore + 'static> Api<S> {
             index_params: Mutex::new(None),
             projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             sparse_rows: std::sync::atomic::AtomicBool::new(true),
+            blocks: Mutex::new(pstore_format::BlockOptions::default()),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -878,6 +883,7 @@ impl<S: BlobStore + 'static> Api<S> {
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
             .with_sparse_rows(self.sparse_rows.load(std::sync::atomic::Ordering::Relaxed))
+            .with_block_options(self.block_options())
             .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
@@ -960,6 +966,25 @@ impl<S: BlobStore + 'static> Api<S> {
                 })?;
         *pool = Some(created.clone());
         Ok(created)
+    }
+
+    /// Seals blocks as `options` says for every index that overrides nothing (M231): the
+    /// cluster's default, [`Config::blocks`], for the engines built after it -- set it before
+    /// a tenant's first request. A test pins the row layout with it.
+    pub fn set_block_options(&self, options: pstore_format::BlockOptions) {
+        *self
+            .blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = options;
+    }
+
+    /// The cluster's default this server seals by (M231).
+    #[must_use]
+    pub fn block_options(&self) -> pstore_format::BlockOptions {
+        *self
+            .blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Folds sparse fields without each row's pairs, as a build before M193 did (M193's
@@ -4603,6 +4628,7 @@ async fn index_summary<S: BlobStore + 'static>(
         bytes: Some(0),
         read_only: false,
         vector_search: std::collections::BTreeMap::new(),
+        storage: pstore_engine::Storage::default(),
     });
     Ok(axum::Json(IndexSummary {
         index,
@@ -4684,6 +4710,7 @@ async fn index_summary<S: BlobStore + 'static>(
         updated_at: s.written_ms.map(rfc3339_ms),
         approx_logical_bytes: s.bytes,
         read_only: s.read_only,
+        storage: StorageSettings::of(s.storage, engine.block_options()),
         progress: progress.map(|p| IndexProgress {
             status: if p.rows > 0 { "updating" } else { "up-to-date" },
             unindexed_rows: p.rows,
@@ -5021,25 +5048,114 @@ async fn patch_index<S: BlobStore + 'static>(
     let tenant = tenant_of(&headers)?;
     let req: PatchIndexRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("malformed index patch: {e}")))?;
+    let change = req
+        .storage
+        .as_ref()
+        .map(storage_change)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+    if req.read_only.is_none() && change.is_none() {
+        return Err(ApiError::bad_request(
+            "an index patch names read_only, storage, or both".to_owned(),
+        ));
+    }
     let engine = api.engine(tenant).await;
     let before = api.spend(tenant);
-    let Some(epoch) = engine.set_read_only(&index, req.read_only).await? else {
-        // HEAD does not hold it. One this process holds unfolded, which its summary
-        // reports, is not absent: it can be flagged once folded.
+    // HEAD does not hold it. One this process holds unfolded, which its summary reports, is
+    // not absent: it can be changed once folded.
+    let absent = async |engine: &Tenant<S>| {
         if engine.pending_indexes().await.iter().any(|i| i == &index) {
-            return Err(ApiError::new(
+            return ApiError::new(
                 StatusCode::CONFLICT,
                 "index_not_folded",
                 format!("the index {index} has rows not yet folded; retry after the fold"),
-            ));
+            );
         }
-        return Err(no_index(&index));
+        no_index(&index)
     };
+    let mut epoch = None;
+    if let Some(on) = req.read_only {
+        match engine.set_read_only(&index, on).await? {
+            Some(e) => epoch = Some(e),
+            None => return Err(absent(&engine).await),
+        }
+    }
+    let mut storage = None;
+    if let Some(change) = change {
+        match engine.set_storage(&index, |s| change.apply(s)).await? {
+            Some((e, now)) => {
+                epoch = Some(epoch.map_or(e, |was| was.max(e)));
+                storage = Some(StorageSettings::of(now, engine.block_options()));
+            }
+            None => return Err(absent(&engine).await),
+        }
+    }
     Ok(axum::Json(ReadOnlyResponse {
-        epoch: epoch.0,
+        epoch: epoch.map_or(0, |e| e.0),
         read_only: req.read_only,
+        storage,
         cost: api.spend(tenant).since(before),
     }))
+}
+
+/// A patch's `storage` (M231): per setting, absent leaves it, `null` clears the override, and
+/// a value sets it. An unknown setting is refused with the ones it takes named.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoragePatch {
+    #[serde(default, deserialize_with = "present")]
+    block_layout: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    equality_filters: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "present")]
+    block_aggregates: Option<Option<bool>>,
+}
+
+/// A member that is present, `null` or not: absent is the `default`, `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(d).map(Some)
+}
+
+/// A patch's `storage`, its layout read: what to apply to the index's overrides.
+#[derive(Debug, Clone, Copy, Default)]
+struct StorageChange {
+    columnar: Option<Option<bool>>,
+    equality: Option<Option<bool>>,
+    aggregates: Option<Option<bool>>,
+}
+
+impl StorageChange {
+    fn apply(self, s: pstore_engine::Storage) -> pstore_engine::Storage {
+        pstore_engine::Storage {
+            columnar: self.columnar.unwrap_or(s.columnar),
+            equality: self.equality.unwrap_or(s.equality),
+            aggregates: self.aggregates.unwrap_or(s.aggregates),
+        }
+    }
+}
+
+/// Reads a patch's `storage`, refusing a layout it does not know by name.
+fn storage_change(p: &StoragePatch) -> Result<StorageChange, String> {
+    let columnar = match p.block_layout.as_ref() {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(l)) if l == "columnar" => Some(Some(true)),
+        Some(Some(l)) if l == "rows" => Some(Some(false)),
+        Some(Some(l)) => {
+            return Err(format!(
+                "storage.block_layout is \"columnar\", \"rows\" or null, not {l:?}"
+            ));
+        }
+    };
+    Ok(StorageChange {
+        columnar,
+        equality: p.equality_filters,
+        aggregates: p.block_aggregates,
+    })
 }
 
 /// `POST /v1/indexes/{index}/recall` (M162): ANN against exhaustive search, for queries
@@ -5117,7 +5233,8 @@ struct RecallBody {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchIndexRequest {
-    read_only: bool,
+    read_only: Option<bool>,
+    storage: Option<StoragePatch>,
 }
 
 /// What `PUT /v1/indexes/{index}` carries (M147). Anything else is refused.
@@ -6947,6 +7064,41 @@ pub struct Config {
     /// or `None` -- the default -- for no external index at all. From
     /// `PSTORE_EXTERNAL_SOURCES=allow` and `PSTORE_EXTERNAL_PREFIXES`.
     pub external_sources: Option<Vec<String>>,
+    /// What an index that overrides nothing seals (M231), from `PSTORE_BLOCK_LAYOUT`
+    /// (`columnar` unset, or `rows`), `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES`
+    /// (`on` unset, or `off`). ⚠️ The cluster's default: set alike on every server. Servers
+    /// that disagree, mid-rollout, write segments every reader reads.
+    pub blocks: pstore_format::BlockOptions,
+}
+
+/// The cluster's storage defaults (M231), each refused by name when not one of its values.
+fn block_options(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<pstore_format::BlockOptions, ConfigError> {
+    let flag = |var: &'static str| match get(var).as_deref() {
+        None | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(other) => Err(ConfigError::Storage(
+            var,
+            other.to_owned(),
+            "unset, on or off",
+        )),
+    };
+    Ok(pstore_format::BlockOptions {
+        columnar: match get("PSTORE_BLOCK_LAYOUT").as_deref() {
+            None | Some("columnar") => true,
+            Some("rows") => false,
+            Some(other) => {
+                return Err(ConfigError::Storage(
+                    "PSTORE_BLOCK_LAYOUT",
+                    other.to_owned(),
+                    "unset, columnar or rows",
+                ));
+            }
+        },
+        equality: flag("PSTORE_EQUALITY_FILTERS")?,
+        aggregates: flag("PSTORE_BLOCK_AGGREGATES")?,
+    })
 }
 
 /// `PSTORE_INDEXES_PER_TENANT` unset (M169): below M7b's ~29,700, where a whole-HEAD read
@@ -7148,6 +7300,9 @@ pub enum ConfigError {
     /// `PSTORE_ENGINES` that is not a count (M26).
     #[error("PSTORE_ENGINES={0} is refused: a count of engines, 0 for unbounded")]
     Engines(String),
+    /// A storage default that is not one of its values (M231).
+    #[error("{0}={1} is refused: {2}")]
+    Storage(&'static str, String, &'static str),
     /// `PSTORE_INDEXES_PER_TENANT` that is not a count (M169).
     #[error("PSTORE_INDEXES_PER_TENANT={0} is refused: a count of indexes, 0 for unbounded")]
     IndexesPerTenant(String),
@@ -7229,6 +7384,7 @@ impl Config {
                 None => DEFAULT_INDEXES_PER_TENANT,
                 Some(v) => v.parse().map_err(|_| ConfigError::IndexesPerTenant(v))?,
             },
+            blocks: block_options(&get)?,
         })
     }
 }

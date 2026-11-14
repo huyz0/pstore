@@ -15,7 +15,9 @@
 //! common case. Nothing about a segment is discovered by listing, and nothing needs a side
 //! table: the key is enough.
 
+pub mod aggregates;
 mod codec;
+pub mod columnar;
 pub mod datetime;
 mod docs;
 pub mod equality;
@@ -39,7 +41,7 @@ pub use docs::{
     encode_rows,
 };
 pub use reader::{Segment, decode_vectors};
-pub use writer::{INDEX_BUDGET, SegmentWriter};
+pub use writer::{BlockOptions, INDEX_BUDGET, SegmentWriter};
 
 /// A footer-addressed region of a segment.
 ///
@@ -140,6 +142,12 @@ pub enum Section {
     /// ⚠️ **Absent means nothing is filtered**: every segment before M230, and every one whose
     /// block index and trigram sketch left no room. It prunes nothing.
     Equality = 18,
+    /// Per-block aggregate statistics (M232): per numeric attribute of one kind, a count and a
+    /// sum a block, in the meta region. See [`aggregates::Aggregates`].
+    ///
+    /// ⚠️ **Absent means nothing is summarised**: every segment before M232, and every one
+    /// whose other meta sections left no room. Every aggregation then reads rows, as before.
+    Aggregates = 19,
 }
 
 /// Where the third and later dense fields' vector sections are numbered from (M61): field `k`
@@ -225,6 +233,11 @@ pub(crate) const VERSION: u16 = 1;
 /// silently. Under version 2 it refuses at `open`. A segment holding neither stays version 1,
 /// byte for byte.
 pub(crate) const VERSION_TYPED: u16 = 2;
+/// A segment whose blocks are columnar (M231), with a typed index (M9h.1's tables).
+///
+/// ⚠️ **A version, for VERSION_TYPED's reason**: a reader before M231 must refuse it at
+/// `open`, since it would read a columnar block as rows and fail or, worse, misread one.
+pub(crate) const VERSION_COLUMNAR: u16 = 3;
 
 /// An attribute value.
 ///
@@ -1032,6 +1045,8 @@ pub struct Zones {
     pub sketch: Option<(std::sync::Arc<trigram::Sketch>, usize)>,
     /// The segment's equality section and this block's place in it (M230), when it has one.
     pub equality: Option<(std::sync::Arc<equality::Equality>, usize)>,
+    /// The segment's aggregate statistics and this block's place in them (M232).
+    pub aggregates: Option<(std::sync::Arc<aggregates::Aggregates>, usize)>,
 }
 
 impl Zones {

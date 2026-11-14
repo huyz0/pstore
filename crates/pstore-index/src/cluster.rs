@@ -66,6 +66,9 @@ pub struct Params {
     /// Always, but for a test that stands in for a build before M193.
     #[doc(hidden)]
     pub sparse_rows: bool,
+    /// What a sealed segment's blocks are (M230-M232): the index's storage settings, its
+    /// override over the cluster's default.
+    pub blocks: pstore_format::BlockOptions,
 }
 
 impl Default for Params {
@@ -95,6 +98,7 @@ impl Default for Params {
             boundary: 0.05,
             exact_scan_threshold: crate::vec_index::EXACT_SCAN_THRESHOLD,
             sparse_rows: true,
+            blocks: pstore_format::BlockOptions::default(),
         }
     }
 }

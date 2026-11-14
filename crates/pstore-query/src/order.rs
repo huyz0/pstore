@@ -291,40 +291,59 @@ impl Selector {
 
     /// [`Self::offer`], with where the row was read (M179): kept beside it, never compared.
     pub fn offer_at(&mut self, doc: Document, at: Option<Located>) {
-        if self.cap == 0 {
+        if !self.would_keep(&doc) {
             return;
+        }
+        if self.kept.len() == self.cap {
+            self.kept.pop();
+        }
+        let rank = Rank::of(&self.by, &doc);
+        self.kept.push(Ranked(rank, doc, at));
+    }
+
+    /// Whether [`Self::offer`] would keep `doc` now (M233): it reads only the id and the
+    /// order's keys, so a late decode builds the rest of a row only when this holds. A row it
+    /// refuses is refused for good: the worst row kept only ever gets better.
+    #[must_use]
+    pub fn would_keep(&self, doc: &Document) -> bool {
+        if self.cap == 0 {
+            return false;
+        }
+        if self.kept.len() < self.cap {
+            return true;
         }
         // ⚠️ Compared borrowed, and owned only once kept (M119): a full selector rejects almost
         // every row it is offered, and building the rank first cloned the id and the value of
         // each. Key by key (M140), reading a later key's value only when the earlier ones tie.
-        if self.kept.len() == self.cap {
-            match self.kept.peek() {
-                Some(worst)
-                    if self
-                        .by
-                        .keys()
-                        .iter()
-                        .zip(&worst.0.keys)
-                        .map(|(by, k)| {
-                            let value = value_of(by, &doc);
-                            key_order(
-                                by.desc,
-                                (group_of(by, value.as_deref()), value.as_deref()),
-                                (k.group, k.value.as_ref()),
-                            )
-                        })
-                        .find(|o| o.is_ne())
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| doc.id.as_bytes().cmp(worst.0.id.as_bytes()))
-                        .is_lt() =>
-                {
-                    self.kept.pop();
-                }
-                _ => return,
-            }
-        }
-        let rank = Rank::of(&self.by, &doc);
-        self.kept.push(Ranked(rank, doc, at));
+        self.kept.peek().is_some_and(|worst| {
+            self.by
+                .keys()
+                .iter()
+                .zip(&worst.0.keys)
+                .map(|(by, k)| {
+                    let value = value_of(by, doc);
+                    key_order(
+                        by.desc,
+                        (group_of(by, value.as_deref()), value.as_deref()),
+                        (k.group, k.value.as_ref()),
+                    )
+                })
+                .find(|o| o.is_ne())
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| doc.id.as_bytes().cmp(worst.0.id.as_bytes()))
+                .is_lt()
+        })
+    }
+
+    /// The attributes its order reads (M233), the id among them as [`crate::filter::ID`].
+    #[must_use]
+    pub fn key_names(&self) -> Vec<&str> {
+        self.by
+            .keys()
+            .iter()
+            .map(|k| k.attr.as_str())
+            .chain(std::iter::once(crate::filter::ID))
+            .collect()
     }
 
     /// How many rows it holds: what the bound is asserted on.
@@ -385,6 +404,7 @@ pub async fn select_held<S: BlobStore>(
     selector: &mut Selector,
 ) -> Result<Vec<Segment>, QueryError> {
     let (by, cap) = (selector.by.clone(), selector.cap);
+    let keys = selector.key_names();
     // ⚠️ **A selector per segment**, merged after: collecting a segment's admitted rows and
     // selecting afterwards would hold the whole segment decoded, which is the sort this exists
     // not to do.
@@ -394,6 +414,9 @@ pub async fn select_held<S: BlobStore>(
         filter,
         shadow,
         || Selector::new(by.clone(), cap),
+        &keys,
+        // M233: a row the segment's selector would refuse is never built whole.
+        |s: &Selector, doc: &Document| s.would_keep(doc),
         |s: &mut Selector, at, doc| s.offer_at(doc, Some(at)),
     )
     .await?;
@@ -514,46 +537,33 @@ pub async fn vectors_at<S: BlobStore>(
     Ok(out)
 }
 
-/// The visiting [`select`] and [`crate::aggregate`] share (M12): every admitted row of every
-/// target, less deleted and shadowed rows, offered to a sink of its segment's own -- `new`
-/// makes one per segment -- in the two rounds `select` states. Returns the sinks, in target
-/// order, for the caller to merge.
-pub(crate) async fn visit<S, T, N, O>(
+/// Every admitted row of every target, less deleted and shadowed rows, offered with where it
+/// was read to a sink of its segment's own, and the segments it opened (M12).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the visit's parameters, and the early refusal's own"
+)]
+async fn visit_held<S, T, N, W, O>(
     store: &S,
     targets: &[Target],
     filter: Option<&Predicate>,
     shadow: &HashSet<String>,
     new: N,
-    offer: O,
-) -> Result<Vec<T>, QueryError>
-where
-    S: BlobStore,
-    N: Fn() -> T,
-    O: Fn(&mut T, Document),
-{
-    visit_held(store, targets, filter, shadow, new, |t: &mut T, _, doc| {
-        offer(t, doc);
-    })
-    .await
-    .map(|(sinks, _)| sinks)
-}
-
-/// [`visit`], offering each row with where it was read, and returning the segments it opened.
-async fn visit_held<S, T, N, O>(
-    store: &S,
-    targets: &[Target],
-    filter: Option<&Predicate>,
-    shadow: &HashSet<String>,
-    new: N,
+    keys: &[&str],
+    wanted: W,
     offer: O,
 ) -> Result<(Vec<T>, Vec<Segment>), QueryError>
 where
     S: BlobStore,
     N: Fn() -> T,
+    W: Fn(&T, &Document) -> bool,
     O: Fn(&mut T, Located, Document),
 {
     let opened = open(store, targets, false).await?;
-    let sinks = visit_opened_at(store, targets, &opened, filter, shadow, new, offer).await?;
+    let sinks = visit_opened_at(
+        store, targets, &opened, filter, shadow, new, keys, wanted, offer,
+    )
+    .await?;
     Ok((sinks, opened.into_iter().map(|o| o.segment).collect()))
 }
 
@@ -561,7 +571,7 @@ where
 /// HEAD says it has one -- its term-dictionary sidecar (M182).
 pub(crate) struct Opened {
     pub(crate) segment: Segment,
-    deleted: crate::deletes::Rows,
+    pub(crate) deleted: crate::deletes::Rows,
     pub(crate) dictionary: Option<bytes::Bytes>,
 }
 
@@ -635,42 +645,82 @@ where
         filter,
         shadow,
         new,
+        &[],
+        |_: &T, _: &Document| true,
         |t: &mut T, _, doc| offer(t, doc),
     )
     .await
 }
 
+/// What deciding a row reads (M233), the first of a late decode's two passes: whether the id,
+/// and the attributes, sorted. The id when `filter` reads it, when `hiding` (a shadowed
+/// segment checks each id) or when `keys` name it; every attribute `filter` and `keys` read.
+pub(crate) fn deciding<'a>(
+    filter: Option<&'a Predicate>,
+    hiding: bool,
+    keys: &'a [&'a str],
+) -> (bool, Vec<&'a str>) {
+    let mut names: Vec<&str> = filter.map(Predicate::names).unwrap_or_default();
+    names.extend(keys.iter().copied());
+    names.sort_unstable();
+    names.dedup();
+    let id = hiding || names.binary_search(&crate::filter::ID).is_ok();
+    (id, names)
+}
+
 /// [`visit_opened`], offering each row with where it was read.
-async fn visit_opened_at<S, T, N, O>(
+///
+/// ⚠️ **Decoded late (M233):** a row is built first only as far as deciding it reads -- the
+/// filter's attributes, `keys` and the id where needed -- and only a row the filter admits,
+/// no delete or shadow hides, and `wanted` still takes is built whole and offered. Building
+/// every row whole first was most of a selective scan's time.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the visit's parameters, and the early refusal's own"
+)]
+async fn visit_opened_at<S, T, N, W, O>(
     store: &S,
     targets: &[Target],
     opened: &[Opened],
     filter: Option<&Predicate>,
     shadow: &HashSet<String>,
     new: N,
+    keys: &[&str],
+    wanted: W,
     offer: O,
 ) -> Result<Vec<T>, QueryError>
 where
     S: BlobStore,
     N: Fn() -> T,
+    W: Fn(&T, &Document) -> bool,
     O: Fn(&mut T, Located, Document),
 {
-    let (new, offer) = (&new, &offer);
+    let (new, wanted, offer) = (&new, &wanted, &offer);
     futures_util::future::try_join_all(opened.iter().zip(targets).enumerate().map(
         |(i, (o, t))| async move {
             let mut local = new();
+            let hiding = t.shadowed && !shadow.is_empty();
+            let (id, deciding) = deciding(filter, hiding, keys);
+            let decides = |name: &str| deciding.binary_search(&name).is_ok();
             o.segment
-                .visit_rows_where(
+                .visit_blocks_late(
                     store,
                     &t.segment,
-                    |zones| filter.is_none_or(|f| f.could_admit(zones)),
-                    |row, doc| {
-                        let hidden =
-                            o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
-                        if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
-                            offer(&mut local, (i, row), doc);
-                        }
+                    |_, zones| filter.is_none_or(|f| f.could_admit(zones)),
+                    &mut local,
+                    &pstore_format::Projection {
+                        id,
+                        attrs: &decides,
                     },
+                    |local, row, doc| {
+                        let hidden =
+                            o.deleted.contains(&row) || (hiding && shadow.contains(&doc.id));
+                        !hidden
+                            && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs))
+                            && wanted(local, doc)
+                    },
+                    &pstore_format::Projection::ALL,
+                    |local, row, doc| offer(local, (i, row), doc),
                 )
                 .await?;
             Ok::<_, QueryError>(local)

@@ -27,8 +27,8 @@ pub struct SegmentWriter {
     write_text_fields: bool,
     text_fields: Vec<String>,
     trigram_attrs: Vec<String>,
-    /// Whether the equality section (M230) is written; cleared only by a test.
-    write_equality: bool,
+    /// What the blocks are and which per-block sections ride with them (M230-M232).
+    options: BlockOptions,
     rows_per_block: usize,
     /// Whether sealed blocks carry zone maps. Cleared only by [`Self::seal_segment`]'s
     /// fallback, for a segment whose integer attribute names cannot fit the index.
@@ -47,6 +47,29 @@ pub struct SegmentWriter {
     blocks: Vec<BlockMeta>,
     body: Enc,
     rows: u32,
+}
+
+/// What a segment's blocks are, and which per-block sections ride with them: an index's
+/// storage settings (M230-M232). ⚠️ A reader reads every combination, so writers that
+/// disagree -- servers mid-rollout, an index whose override changed -- write a correct index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockOptions {
+    /// Columnar blocks at `VERSION_COLUMNAR` (M231), else row-major ones at version 1 or 2.
+    pub columnar: bool,
+    /// The `Equality` section: string and bool equality prunes blocks (M230).
+    pub equality: bool,
+    /// The `Aggregates` section: an aggregation reads a whole block's count and sum (M232).
+    pub aggregates: bool,
+}
+
+impl Default for BlockOptions {
+    fn default() -> Self {
+        Self {
+            columnar: true,
+            equality: true,
+            aggregates: true,
+        }
+    }
 }
 
 /// Bytes the index section may occupy, so it arrives with the footer.
@@ -68,7 +91,7 @@ impl SegmentWriter {
             write_fields: true,
             write_text_fields: true,
             trigram_attrs: Vec::new(),
-            write_equality: true,
+            options: BlockOptions::default(),
             text_fields: Vec::new(),
             rows_per_block: rows_per_block.max(1),
             zone_maps: true,
@@ -157,11 +180,27 @@ impl SegmentWriter {
         self
     }
 
+    /// Writes its blocks and their sections as `options` says (M230-M232): an index's
+    /// storage settings, its override over the cluster's default.
+    #[must_use]
+    pub fn with_block_options(mut self, options: BlockOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Writes row-major blocks at version 1 or 2, as every writer before M231 did (M231): for
+    /// a rollout an older binary must still read, and for fixtures that pin old bytes.
+    #[must_use]
+    pub fn with_row_blocks(mut self) -> Self {
+        self.options.columnar = false;
+        self
+    }
+
     /// Emits a segment with **no** `Equality` section, as one written before M230.
     #[doc(hidden)]
     #[must_use]
     pub fn without_equality_section_for_test(mut self) -> Self {
-        self.write_equality = false;
+        self.options.equality = false;
         self
     }
 
@@ -202,7 +241,11 @@ impl SegmentWriter {
         }
         let offset = self.body.len() as u64;
         let zones = self.zones_of(rows);
-        let blk = crate::encode_rows(rows);
+        let blk = if self.options.columnar {
+            crate::columnar::encode_block(rows)
+        } else {
+            crate::encode_rows(rows)
+        };
         let len = blk.len() as u32;
         self.body.raw(&blk);
         self.blocks.push(BlockMeta {
@@ -434,6 +477,8 @@ impl SegmentWriter {
                 )
             })
         });
+        // M231: a columnar segment's index is always the typed one, so a v3 reader has one shape.
+        self.typed |= self.options.columnar;
         // ⚠️ One set of sections per named field. Fields are taken in name order so the
         // layout is deterministic, and **field 0 keeps the legacy section ids** so a reader
         // that predates the Fields table sees exactly the single-dense view it expects
@@ -715,7 +760,7 @@ impl SegmentWriter {
         };
         // M230: the equality section takes what the index and the sketch left, less its own
         // directory entry, so it never coarsens a block nor narrows the sketch.
-        let equality = if self.write_equality {
+        let equality = if self.options.equality {
             let used = idx.len()
                 + if sketch.is_empty() {
                     0
@@ -733,6 +778,22 @@ impl SegmentWriter {
             })
             .map(|e| e.encode())
             .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // M232: the aggregate statistics take what everything above left, last of all.
+        let aggregates = if self.options.aggregates {
+            let used = idx.len()
+                + [&sketch, &equality]
+                    .iter()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| ENTRY + b.len())
+                    .sum::<usize>();
+            let spare = target.saturating_sub(used).saturating_sub(ENTRY);
+            let chunks: Vec<&[Document]> = docs.chunks(self.rows_per_block).collect();
+            crate::aggregates::Aggregates::build(&chunks, spare)
+                .map(|a| a.encode())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -781,6 +842,9 @@ impl SegmentWriter {
         }
         if !equality.is_empty() {
             inline.push((Section::Equality, &equality));
+        }
+        if !aggregates.is_empty() {
+            inline.push((Section::Aggregates, &aggregates));
         }
         inline.push((Section::Blocks, &idx.0));
         for (section, bytes) in &inline {
@@ -835,6 +899,11 @@ impl SegmentWriter {
                     0
                 } else {
                     ENTRY + equality.len()
+                }
+                + if aggregates.is_empty() {
+                    0
+                } else {
+                    ENTRY + aggregates.len()
                 },
             "the overhead above is wrong"
         );
@@ -847,7 +916,9 @@ impl SegmentWriter {
         // The footer is last and fixed-width, so `Range: -N` finds it without knowing the
         // object's length -- which is what makes an open possible from the key alone.
         out.raw(MAGIC);
-        out.u16(if self.typed {
+        out.u16(if self.options.columnar {
+            crate::VERSION_COLUMNAR
+        } else if self.typed {
             crate::VERSION_TYPED
         } else {
             VERSION

@@ -1792,6 +1792,8 @@ impl<S: BlobStore> Engine<S> {
                 &schema.fts,
                 &schema.texts,
                 &schema.trigram,
+                // M231: a reindex writes a new index, which overrides nothing yet.
+                self.params.blocks,
             )
             .await;
         written
