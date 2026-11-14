@@ -319,3 +319,83 @@ fn an_ingress_keeps_its_limits_and_overload_says_when_to_retry() {
     assert_eq!(e.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(e.retry_after, Some(1));
 }
+
+#[test]
+fn query_row_limits_follow_m128s_rules() {
+    let d = RequestLimits::default();
+    assert_eq!(d.query_rows(), 4_194_304);
+    assert_eq!(d.tenant_query_rows(), 1_048_576);
+    let got = read(Some(
+        r#"{"version":1,"query_rows":900,"tenant_query_rows":300}"#,
+    ))
+    .unwrap();
+    assert_eq!((got.query_rows(), got.tenant_query_rows()), (900, 300));
+    // A tenant may hold the whole pool.
+    let edge = read(Some(
+        r#"{"version":1,"query_rows":5,"tenant_query_rows":5}"#,
+    ))
+    .unwrap();
+    assert_eq!(edge.tenant_query_rows(), 5);
+    for (raw, want) in [
+        (
+            r#"{"version":1,"query_rows":0}"#,
+            LimitsError::Zero("query_rows"),
+        ),
+        (
+            r#"{"version":1,"tenant_query_rows":0}"#,
+            LimitsError::Zero("tenant_query_rows"),
+        ),
+        (
+            r#"{"version":1,"query_rows":4194305}"#,
+            LimitsError::AboveDefault("query_rows"),
+        ),
+        (
+            r#"{"version":1,"tenant_query_rows":1048577}"#,
+            LimitsError::AboveDefault("tenant_query_rows"),
+        ),
+        (
+            r#"{"version":1,"query_rows":10,"tenant_query_rows":11}"#,
+            LimitsError::TenantRowsAboveGlobal,
+        ),
+    ] {
+        assert_eq!(read(Some(raw)), Err(want), "{raw}");
+    }
+}
+
+#[test]
+fn a_query_reservation_is_bounded_per_tenant_and_in_all_and_returned_on_drop() {
+    let limits = RequestLimits::builder()
+        .query_rows(10)
+        .tenant_query_rows(6)
+        .build()
+        .unwrap();
+    let ingress = Arc::new(Ingress::new(limits));
+    let (a, b) = (TenantId(1), TenantId(2));
+    // Never fits: too large, whatever is held.
+    assert_eq!(
+        ingress.reserve_rows(a, 7).err().unwrap().status,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let r1 = ingress.reserve_rows(a, 6).unwrap();
+    assert_eq!(ingress.reserved_rows(), 6);
+    // The tenant's own pool is full: overloaded, with when to retry.
+    let refused = ingress.reserve_rows(a, 1).err().unwrap();
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.retry_after, Some(1));
+    // Another tenant fits until the server's pool is full.
+    let r2 = ingress.reserve_rows(b, 4).unwrap();
+    assert_eq!(
+        ingress.reserve_rows(b, 1).err().unwrap().status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(r1);
+    assert_eq!(ingress.reserved_rows(), 4);
+    let r3 = ingress.reserve_rows(b, 2).unwrap();
+    assert_eq!(ingress.reserved_rows(), 6);
+    drop((r2, r3));
+    assert_eq!(ingress.reserved_rows(), 0);
+    assert!(
+        ingress.lock().tenant_rows.is_empty(),
+        "an idle tenant leaves no entry"
+    );
+}

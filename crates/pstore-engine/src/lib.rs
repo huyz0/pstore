@@ -646,6 +646,10 @@ struct Memtable {
     /// Beside each durable batch, by sequence: when it became durable and its bundle's size
     /// (M9i.1). What a scheduled fold decides from, without a request.
     stamps: BTreeMap<u64, (tokio::time::Instant, u64)>,
+    /// M213: beside each durable batch, by sequence, its rows' held bytes
+    /// ([`Document::footprint`]): a flushed row stays in memory until a fold, and is charged
+    /// what it was pending.
+    held: BTreeMap<u64, u64>,
     /// Every batch below this sequence is known folded and has been dropped. A query holding a
     /// HEAD whose watermark is below it would be missing rows its HEAD does not have yet, and
     /// re-reads HEAD instead.
@@ -689,11 +693,12 @@ pub struct BufferBounds {
 /// What the buffered-bytes accounting holds now (M141's tests and measurements).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Buffered {
-    /// The footprint of the rows buffered and not yet in a bundle.
+    /// The held bytes ([`Document::footprint`]) of the rows buffered and not yet in a bundle.
     pub pending: u64,
     /// Bytes reserved by requests still running.
     pub reserved: u64,
-    /// The encoded size of flushed bundles not yet known folded.
+    /// The held bytes of flushed rows not yet known folded (M213: before, their bundles'
+    /// encoded size).
     pub unfolded: u64,
 }
 
@@ -774,6 +779,7 @@ impl Memtable {
         let before = self.durable.len();
         self.durable.retain(|(seq, _)| *seq >= watermark);
         self.stamps.retain(|seq, _| *seq >= watermark);
+        self.held.retain(|seq, _| *seq >= watermark);
         if self.durable.len() != before {
             self.generation += 1;
         }
@@ -953,6 +959,48 @@ fn tombstone(id: String) -> Document {
         vectors: BTreeMap::new(),
         attrs: BTreeMap::from([(TOMBSTONE.to_owned(), pstore_format::Value::Int(0))]),
     }
+}
+
+/// What a delete of `id` holds in its tenant's buffer (M213): its tombstone's
+/// [`Document::footprint`].
+#[must_use]
+pub fn delete_footprint(id: &str) -> u64 {
+    tombstone(id.to_owned()).footprint()
+}
+
+/// What `p` holds in its tenant's buffer as a patch (M213): the row it is encoded as, before
+/// a condition or a stamp is added. Nothing for a patch the engine will refuse.
+#[must_use]
+pub fn patch_footprint(p: &Patch) -> u64 {
+    patch_attrs(p.clone()).map_or(0, |attrs| {
+        Document {
+            id: p.id.clone(),
+            vectors: BTreeMap::new(),
+            attrs,
+        }
+        .footprint()
+    })
+}
+
+/// What a by-filter operation over `filter` holds in its tenant's buffer (M213): a delete
+/// with no `patch`, else a patch, encoded as one row, unbounded and unstamped. Nothing for
+/// one the engine will refuse.
+#[must_use]
+pub fn by_filter_footprint(filter: &pstore_query::Predicate, patch: Option<&Patch>) -> u64 {
+    let Ok(mark) = encoded(filter) else {
+        return 0;
+    };
+    let op = match patch {
+        None => by_filter_op(OP_DELETE_BY_FILTER, mark, BTreeMap::new()),
+        Some(p) => {
+            // Its `$op` is overwritten with the by-filter kind, as `patch_by_filter_bounded`'s is.
+            let Ok(attrs) = patch_attrs(p.clone()) else {
+                return 0;
+            };
+            by_filter_op(OP_PATCH_BY_FILTER, mark, attrs)
+        }
+    };
+    op.footprint()
 }
 
 /// Whether an operation is a delete.
@@ -2120,12 +2168,15 @@ mod memtable_tests {
     fn a_prune_drops_exactly_the_batches_a_watermark_folded() {
         let mut m = Memtable {
             durable: vec![(0, batch("a")), (1, batch("b")), (2, batch("c"))],
+            held: BTreeMap::from([(0, 10), (1, 11), (2, 12)]),
             ..Memtable::default()
         };
         // Watermark 2: sequences 0 and 1 are folded, 2 is not.
         assert!(m.prune(2));
         let left: Vec<&str> = m.durable_rows("i").map(|d| d.id.as_str()).collect();
         assert_eq!(left, ["c"]);
+        // M213: and the held charge of exactly the batches dropped.
+        assert_eq!(m.held, BTreeMap::from([(2, 12)]));
         assert_eq!(
             m.generation, 1,
             "dropping rows must invalidate a cached fresh segment"
@@ -4782,7 +4833,7 @@ impl<S: BlobStore> Engine<S> {
         let after = held.saturating_add(bytes);
         // The cap first: a flush moves rows from pending to unfolded and cannot make room,
         // so a write that cannot fit is refused before it spends one.
-        let unfolded: u64 = m.stamps.range(m.pruned..).map(|(_, (_, b))| *b).sum();
+        let unfolded: u64 = m.held.range(m.pruned..).map(|(_, b)| *b).sum();
         if after.saturating_add(unfolded) > bounds.cap {
             return Err(BufferRefusal::Full);
         }
@@ -4804,7 +4855,7 @@ impl<S: BlobStore> Engine<S> {
         Buffered {
             pending: m.pending_bytes,
             reserved: m.reserved,
-            unfolded: m.stamps.range(m.pruned..).map(|(_, (_, b))| *b).sum(),
+            unfolded: m.held.range(m.pruned..).map(|(_, b)| *b).sum(),
         }
     }
 
@@ -5233,13 +5284,16 @@ impl<S: BlobStore> Engine<S> {
         // the same order, so a cached fresh segment built before the move is still exact.
         let mut m = self.mem();
         let mut batch: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+        let mut held = 0;
         for (idx, n) in counts {
             if let Some(rows) = m.pending.get_mut(idx) {
                 let moved: Vec<Document> = rows.drain(..(*n).min(rows.len())).collect();
                 let empty = rows.is_empty();
                 // M141: exactly the rows that moved stop being pending; rows buffered during
                 // the PUT stay behind, and stay charged.
-                m.pending_bytes = m.pending_bytes.saturating_sub(footprint(&moved));
+                let charge = footprint(&moved);
+                m.pending_bytes = m.pending_bytes.saturating_sub(charge);
+                held += charge;
                 batch.insert(idx.clone(), moved);
                 if empty {
                     m.pending.remove(idx);
@@ -5254,6 +5308,7 @@ impl<S: BlobStore> Engine<S> {
         // where the rows are in `pending` AND a segment -- a query returns them twice. Residual.
         m.durable.push((seq.0, batch));
         m.stamps.insert(seq.0, (tokio::time::Instant::now(), size));
+        m.held.insert(seq.0, held);
     }
 
     /// Replays **every lane's** unfolded WAL bundles into segments and commits them.

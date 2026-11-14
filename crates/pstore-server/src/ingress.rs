@@ -43,6 +43,8 @@ pub struct RequestLimits {
     body_read_timeout: Duration,
     tenant_flush_bytes: u64,
     tenant_buffered_bytes: u64,
+    query_rows: u64,
+    tenant_query_rows: u64,
     shape: shape::Shape,
 }
 
@@ -51,7 +53,8 @@ impl Default for RequestLimits {
     /// 30 s body-read deadline; and (M141) a tenant's batched rows flushed past 8 MiB and its
     /// buffered rows bounded at 64 MiB; and (M143) a body's JSON nested at most 128 deep, with
     /// at most 16,384 elements in one array, 1,024 members in one object and 256 KiB in one
-    /// string.
+    /// string; and (M212) 4,194,304 candidate rows reserved by every query at once, 1,048,576
+    /// by one tenant's.
     fn default() -> Self {
         Self {
             body_bytes: 2 << 20,
@@ -61,6 +64,8 @@ impl Default for RequestLimits {
             body_read_timeout: Duration::from_secs(30),
             tenant_flush_bytes: 8 << 20,
             tenant_buffered_bytes: 64 << 20,
+            query_rows: 4 << 20,
+            tenant_query_rows: 1 << 20,
             shape: shape::Shape {
                 depth: shape::DEPTH,
                 elements: 16_384,
@@ -92,6 +97,9 @@ pub enum LimitsError {
     /// A tenant's buffer bound is below its flush bound (M141).
     #[error("request limits: tenant_buffered_bytes is smaller than tenant_flush_bytes")]
     BufferBelowFlush,
+    /// A tenant may reserve more query rows than the server (M212).
+    #[error("request limits: tenant_query_rows exceeds query_rows")]
+    TenantRowsAboveGlobal,
 }
 
 /// A checked way to lower [`RequestLimits`]; it starts at the defaults.
@@ -145,6 +153,20 @@ impl RequestLimitsBuilder {
     #[must_use]
     pub fn tenant_buffered_bytes(mut self, n: u64) -> Self {
         self.0.tenant_buffered_bytes = n;
+        self
+    }
+
+    /// Candidate rows every query of this server may reserve at once (M212).
+    #[must_use]
+    pub fn query_rows(mut self, n: u64) -> Self {
+        self.0.query_rows = n;
+        self
+    }
+
+    /// Candidate rows one tenant's queries may reserve at once (M212).
+    #[must_use]
+    pub fn tenant_query_rows(mut self, n: u64) -> Self {
+        self.0.tenant_query_rows = n;
         self
     }
 
@@ -216,6 +238,12 @@ impl RequestLimitsBuilder {
                 l.tenant_buffered_bytes,
                 d.tenant_buffered_bytes,
             ),
+            ("query_rows", l.query_rows, d.query_rows),
+            (
+                "tenant_query_rows",
+                l.tenant_query_rows,
+                d.tenant_query_rows,
+            ),
         ] {
             if got == 0 {
                 return Err(LimitsError::Zero(name));
@@ -236,6 +264,9 @@ impl RequestLimitsBuilder {
         if l.tenant_active > l.active {
             return Err(LimitsError::TenantAboveGlobal);
         }
+        if l.tenant_query_rows > l.query_rows {
+            return Err(LimitsError::TenantRowsAboveGlobal);
+        }
         if l.reserved_body_bytes < l.body_bytes {
             return Err(LimitsError::PoolBelowBody);
         }
@@ -255,6 +286,8 @@ struct Config {
     body_read_timeout_ms: Option<u64>,
     tenant_flush_bytes: Option<u64>,
     tenant_buffered_bytes: Option<u64>,
+    query_rows: Option<u64>,
+    tenant_query_rows: Option<u64>,
     json_depth: Option<u64>,
     array_elements: Option<u64>,
     object_members: Option<u64>,
@@ -309,6 +342,8 @@ impl RequestLimits {
             .body_read_timeout(timeout)
             .tenant_flush_bytes(c.tenant_flush_bytes.unwrap_or(d.tenant_flush_bytes))
             .tenant_buffered_bytes(c.tenant_buffered_bytes.unwrap_or(d.tenant_buffered_bytes))
+            .query_rows(c.query_rows.unwrap_or(d.query_rows))
+            .tenant_query_rows(c.tenant_query_rows.unwrap_or(d.tenant_query_rows))
             .json_depth(size("json_depth", c.json_depth, d.shape.depth)?)
             .array_elements(size("array_elements", c.array_elements, d.shape.elements)?)
             .object_members(size("object_members", c.object_members, d.shape.members)?)
@@ -381,6 +416,18 @@ impl RequestLimits {
     pub fn tenant_buffered_bytes(&self) -> u64 {
         self.tenant_buffered_bytes
     }
+
+    /// Candidate rows every query of this server may reserve at once (M212).
+    #[must_use]
+    pub fn query_rows(&self) -> u64 {
+        self.query_rows
+    }
+
+    /// Candidate rows one tenant's queries may reserve at once (M212).
+    #[must_use]
+    pub fn tenant_query_rows(&self) -> u64 {
+        self.tenant_query_rows
+    }
 }
 
 /// Who a request is counted against.
@@ -400,6 +447,9 @@ struct Counts {
     active: usize,
     bytes: usize,
     tenants: HashMap<Key, usize>,
+    /// Candidate rows reserved by running queries (M212), in all and per tenant.
+    rows: u64,
+    tenant_rows: HashMap<TenantId, u64>,
 }
 
 /// One `Api`'s admission state, shared by every router it builds.
@@ -441,7 +491,64 @@ impl Drop for Permit {
     }
 }
 
+/// One query's reserved candidate rows (M212). Dropping it, on any path, returns them.
+pub(crate) struct Rows {
+    ingress: Arc<Ingress>,
+    tenant: TenantId,
+    rows: u64,
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) {
+        let mut c = self.ingress.lock();
+        c.rows = c.rows.saturating_sub(self.rows);
+        if let Some(n) = c.tenant_rows.get_mut(&self.tenant) {
+            *n = n.saturating_sub(self.rows);
+            if *n == 0 {
+                c.tenant_rows.remove(&self.tenant);
+            }
+        }
+    }
+}
+
 impl Ingress {
+    /// Reserves `rows` candidate rows for one of `tenant`'s queries (M212), never waiting: 413
+    /// when no pool could ever hold them, 429 when the tenant's or the server's is short now.
+    pub(crate) fn reserve_rows(
+        self: &Arc<Self>,
+        tenant: TenantId,
+        rows: u64,
+    ) -> Result<Rows, ApiError> {
+        let (all, each) = (self.limits.query_rows, self.limits.tenant_query_rows);
+        if rows > each {
+            return Err(ApiError {
+                message: format!(
+                    "the query plan reserves {rows} candidate rows, above tenant_query_rows \
+                     ({each}); split it into smaller queries"
+                ),
+                ..too_large()
+            });
+        }
+        let mut c = self.lock();
+        let mine = c.tenant_rows.get(&tenant).copied().unwrap_or(0);
+        if mine + rows > each || c.rows + rows > all {
+            return Err(overloaded());
+        }
+        c.rows += rows;
+        *c.tenant_rows.entry(tenant).or_default() += rows;
+        drop(c);
+        Ok(Rows {
+            ingress: Arc::clone(self),
+            tenant,
+            rows,
+        })
+    }
+
+    /// Candidate rows reserved by running queries now (M212).
+    pub(crate) fn reserved_rows(&self) -> u64 {
+        self.lock().rows
+    }
+
     pub(crate) fn new(limits: RequestLimits) -> Self {
         Self {
             limits,
