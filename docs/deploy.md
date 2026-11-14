@@ -423,6 +423,26 @@ How this differs from the vendor's options of the same names:
   every server runs M181: an older build refuses such a schema in a HEAD, but may read a
   row's stamp as no declaration and record the index as `word_v1`, as M158 states for its own.
 
+## Stopwords
+
+`full_text_search.remove_stopwords` drops the language's stopwords
+([M204](milestones/M204/SPEC.md)). It is off by default in every language.
+
+| Language | List |
+|---|---|
+| `english` | Lucene's 33 words, unchanged since M14 |
+| `danish`, `dutch`, `finnish`, `french`, `german`, `hungarian`, `italian`, `norwegian`, `portuguese`, `russian`, `spanish`, `swedish` | The Snowball project's `stop.txt` for the language, as tantivy 0.22 ships it |
+| `arabic`, `greek`, `romanian`, `tamil`, `turkish` | None: `remove_stopwords` is refused |
+
+- A word is dropped after case and folding, before stemming, as English's always were: with
+  `ascii_folding` the list is folded too, so French `où` ("where") folds to the list's `ou`
+  ("or") and is dropped. With `case_sensitive`, `Le` is kept.
+- Documents and queries drop the same words.
+- ⚠️ Declare a non-English language with stopwords only once every server runs M204: its
+  schema line is new (`v4:`). An older build refuses such a schema in a HEAD rather than
+  reading it with English's list, but may read a row's stamp as no declaration and record
+  the index with the default analyzer, as M181 states for its own lines.
+
 ## Replication
 
 An index can follow another index, in the same tenant, another tenant, or another bucket

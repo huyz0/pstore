@@ -27,6 +27,7 @@ pub mod parquet;
 mod reader;
 mod shared;
 pub mod sparse;
+mod stopwords;
 pub mod text;
 pub mod trigram;
 pub mod typed;
