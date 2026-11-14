@@ -94,6 +94,45 @@ async fn the_equality_section_never_narrows_the_trigram_sketch() {
     }
 }
 
+/// The section takes the space the sketch leaves, not less: beside a sketch, a selective
+/// attribute still gets its filters, as wide as the budget then allows (mutation review: the
+/// sketch's reservation multiplied rather than added left no room at all, and nothing failed).
+#[tokio::test]
+async fn beside_a_sketch_the_section_keeps_its_filters() {
+    // At 20,000 rows the blocks' zone maps leave no room for a sketch at all.
+    for n in [500, 2000, 5000] {
+        let rows: Vec<Document> = docs(n)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs
+                    .insert("batch".to_owned(), Value::Str(format!("b{}", i / 40)));
+                d
+            })
+            .collect();
+        let bytes = writer(&rows, false)
+            .with_trigram_attrs(&["s".to_owned()])
+            .try_finish()
+            .unwrap();
+        let meta = pstore_format::index_section_len(&bytes).unwrap();
+        assert!(meta <= pstore_format::INDEX_BUDGET, "{n} rows");
+        let (_, _, seg) = open(bytes).await;
+        assert!(seg.section(Section::TrigramSketch).is_some(), "{n} rows");
+        let (bits, strings, bools) = seg
+            .block_zones()
+            .next()
+            .unwrap()
+            .equality
+            .as_ref()
+            .unwrap_or_else(|| panic!("{n} rows: no equality section beside the sketch"))
+            .0
+            .shape();
+        assert!(strings.contains(&"batch"), "{n} rows: {strings:?}");
+        assert_eq!(bools, ["on"], "{n} rows");
+        assert!(bits >= 64, "{n} rows");
+    }
+}
+
 #[tokio::test]
 async fn many_string_attributes_never_change_the_blocks() {
     // 200 attributes, each a value no other row repeats: the section keeps the attributes that

@@ -32,7 +32,9 @@ the sketch and the section's own directory entry; the fit check loosened by 64 b
    `a_dated_segment_without_uint64s_keeps_its_bytes` pin bytes recorded before M9h.3 and M172;
    their segments now earn an equality section, so both write with
    `without_equality_section_for_test()` and keep their recorded hashes unchanged.
-4. `many_string_attributes_never_change_the_blocks`,
+4. `beside_a_sketch_the_section_keeps_its_filters` (added when CI's mutation shard found the
+   sketch's reservation multiplied rather than added survived: it left the section no room;
+   killed by this test, checked by hand), `many_string_attributes_never_change_the_blocks`,
    `a_filter_that_would_be_mostly_ones_is_not_written` and
    `the_section_never_costs_the_open_a_second_read` (every budget 100 to 1,500 bytes): green.
    `scripts/depth.sh`: see the gates line.
