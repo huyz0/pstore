@@ -58,4 +58,4 @@ with both passes' names, and an order-by needs every attribute; the cost is with
 refusal starts once it holds `offset + limit` rows. Nothing changes on disk, so there is
 nothing to roll back.
 
-Gates, in a cloud container: GATES-PENDING
+Gates, in a cloud container: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` (the two IPv6 peer tests this container cannot run skipped; nothing else failed), `scripts/depth.sh`, `check-links.sh`, `check-verified.py`, `gen-clients.py --check`, `check-slos.py`, `build-index.py --check` and `check-poison.sh` passed. The coverage floor is CI's full run.
