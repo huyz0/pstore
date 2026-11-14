@@ -178,8 +178,8 @@ pub struct Api<S> {
     /// What an index that overrides nothing seals (M231): the cluster's default, from
     /// `PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES`.
     blocks: Mutex<pstore_format::BlockOptions>,
-    /// The filter-mask cache every tenant's queries share (M234), `None` when
-    /// `PSTORE_FILTER_CACHE_BYTES` is 0.
+    /// The filter-mask cache every tenant's queries share (M234): `None` until
+    /// [`Api::set_filter_cache_bytes`] (the server binary's `PSTORE_FILTER_CACHE_BYTES`), or 0.
     masks: Mutex<Option<Arc<pstore_query::masks::MaskCache>>>,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
@@ -480,9 +480,9 @@ impl<S: BlobStore + 'static> Api<S> {
             projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             sparse_rows: std::sync::atomic::AtomicBool::new(true),
             blocks: Mutex::new(pstore_format::BlockOptions::default()),
-            masks: Mutex::new(Some(Arc::new(pstore_query::masks::MaskCache::new(
-                DEFAULT_FILTER_CACHE_BYTES,
-            )))),
+            // None until configured: an embedder's reads stay as before M234; the server
+            // binary sets `Config::filter_cache_bytes`, the cluster default.
+            masks: Mutex::new(None),
             external_prefixes: Mutex::new(None),
         }))
     }
