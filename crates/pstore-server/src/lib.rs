@@ -4516,12 +4516,9 @@ fn fusion(req: &QueryRequest, legs: usize) -> Result<pstore_query::Fusion, ApiEr
     }
 }
 
-/// The most rows one Parquet export page holds (M235).
-pub const MAX_EXPORT_ROWS: usize = 100_000;
-
 /// `GET /v1/indexes/{index}/export.parquet` (M235): one page of M199's export loop -- the rows
 /// folded by `as_of` (the present HEAD's epoch by default), in id order after `after`, at most
-/// `limit` -- as a Parquet file. `x-pstore-epoch` names the epoch and `x-pstore-next-after`
+/// `limit` (10,000, or 1,000 with vectors: the JSON export's bounds) -- as a Parquet file. `x-pstore-epoch` names the epoch and `x-pstore-next-after`
 /// the next page's `after`, absent on the last page.
 async fn export_parquet<S: BlobStore + 'static>(
     State(api): State<Arc<Api<S>>>,
@@ -4530,18 +4527,6 @@ async fn export_parquet<S: BlobStore + 'static>(
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
     let tenant = tenant_of(&headers)?;
-    let limit = match params.get("limit") {
-        None => 10_000,
-        Some(v) => v
-            .parse::<usize>()
-            .ok()
-            .filter(|n| (1..=MAX_EXPORT_ROWS).contains(n))
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "limit is a count of rows from 1 to {MAX_EXPORT_ROWS}, not {v:?}"
-                ))
-            })?,
-    };
     let vectors = match params.get("include_vectors").map(String::as_str) {
         None | Some("false") => false,
         Some("true") => true,
@@ -4550,6 +4535,25 @@ async fn export_parquet<S: BlobStore + 'static>(
                 "include_vectors must be true or false, not {other:?}"
             )));
         }
+    };
+    // The JSON export's bounds, so a page holds no more in memory than one of its pages.
+    let most = if vectors {
+        MAX_VECTOR_ROWS
+    } else {
+        MAX_ORDERED
+    };
+    let limit = match params.get("limit") {
+        None => most,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=most).contains(n))
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "limit is a count of rows from 1 to {most}{}, not {v:?}",
+                    if vectors { " with vectors" } else { "" }
+                ))
+            })?,
     };
     let engine = api.engine(tenant).await;
     let epoch = match params.get("as_of") {

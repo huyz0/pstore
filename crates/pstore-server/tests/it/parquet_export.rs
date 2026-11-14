@@ -185,13 +185,14 @@ async fn the_parquet_export_pages_one_epoch() {
     );
 
     // An exact last page says no next page.
-    let exact = page(&api, &format!("limit=25&as_of={first}")).await;
+    let exact = page(&api, &format!("as_of={first}")).await;
     assert_eq!((exact.rows.len(), exact.next), (25, None));
     assert!(!exact.meta.contains_key("pstore.next_after"));
 
     for (q, want) in [
         ("limit=0", StatusCode::BAD_REQUEST),
-        ("limit=100001", StatusCode::BAD_REQUEST),
+        ("limit=10001", StatusCode::BAD_REQUEST),
+        ("limit=1001&include_vectors=true", StatusCode::BAD_REQUEST),
         ("include_vectors=yes", StatusCode::BAD_REQUEST),
         ("as_of=soon", StatusCode::BAD_REQUEST),
         ("as_of=1000000", StatusCode::BAD_REQUEST),
@@ -207,4 +208,67 @@ async fn the_parquet_export_pages_one_epoch() {
     }
     let (s, _, _) = send(&api, "GET", "/v1/indexes/nope/export.parquet", &Value::Null).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// M235 criterion 4: a 10,000-row page at 20,000 rows, as Parquet and as M199's JSON export,
+/// bytes and time. A measurement, not an assertion: `cargo test -- --ignored export_cost`.
+#[tokio::test]
+#[ignore = "a measurement, run by hand"]
+async fn export_cost() {
+    let api: A = Api::unsecured(Accounted::new(MemoryStore::new()), LaneId(1)).unwrap();
+    ok(
+        &api,
+        "PUT",
+        "/v1/indexes/x",
+        &json!({"dims": 64, "distance_metric": "euclidean_squared"}),
+    )
+    .await;
+    for k in 0..20 {
+        let documents: Vec<Value> = (k * 1_000..(k + 1) * 1_000)
+            .map(|i| {
+                let v: Vec<f32> = (0..64).map(|d| ((i * 31 + d) % 97) as f32 / 97.0).collect();
+                json!({"id": format!("d{i:05}"), "vector": v, "attributes": {
+                    "n": i, "price": i as f64 * 0.25, "s": format!("cat{}", i % 50),
+                    "flag": i % 3 == 0, "title": format!("title {i} of the set"),
+                }})
+            })
+            .collect();
+        let body = json!({"durability": "durable", "distance_metric": "euclidean_squared",
+                          "documents": documents});
+        ok(&api, "PUT", "/v1/indexes/x/documents", &body).await;
+    }
+    let epoch = ok(&api, "POST", "/v1/admin/fold", &json!({})).await["epoch"]
+        .as_u64()
+        .unwrap();
+    for (vectors, rows) in [(false, 10_000), (true, 1_000)] {
+        let mut best = (u128::MAX, u128::MAX, 0, 0);
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let (s, _, b) = send(
+                &api,
+                "GET",
+                &format!("/v1/indexes/x/export.parquet?limit={rows}&as_of={epoch}&include_vectors={vectors}"),
+                &Value::Null,
+            )
+            .await;
+            let parquet = t.elapsed().as_micros();
+            assert_eq!(s, StatusCode::OK);
+            let q = if vectors {
+                json!({"rank_by": ["id", "asc"], "top_k": rows, "include_attributes": true,
+                       "include_vectors": ["vector"]})
+            } else {
+                json!({"rank_by": ["id", "asc"], "top_k": rows, "as_of": epoch,
+                       "include_attributes": true})
+            };
+            let t = std::time::Instant::now();
+            let (s, _, j) = send(&api, "POST", "/v1/indexes/x/query", &q).await;
+            let json_us = t.elapsed().as_micros();
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&j));
+            best = (best.0.min(parquet), best.1.min(json_us), b.len(), j.len());
+        }
+        println!(
+            "vectors={vectors}, {rows} rows: parquet {} B in {} us, json {} B in {} us",
+            best.2, best.0, best.3, best.1
+        );
+    }
 }

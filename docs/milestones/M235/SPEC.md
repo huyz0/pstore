@@ -11,8 +11,9 @@ analytics engine needs a client to turn the pages into a table.
 
 After, **`GET /v1/indexes/{index}/export.parquet`** answers one page of the same loop as a
 Parquet file (`application/vnd.apache.parquet`): `as_of` (default the present HEAD's epoch,
-which the response names), `after` (the last id of the previous page), `limit` (rows, at most
-100,000, default 10,000) and `include_vectors`. A page is a whole Parquet file with one row
+which the response names), `after` (the last id of the previous page), `limit` (rows: at most and by default 10,000, or
+1,000 with vectors -- the JSON export's own bounds, `MAX_ORDERED` and `MAX_VECTOR_ROWS`, so a
+page holds no more in memory than a JSON page) and `include_vectors`. A page is a whole Parquet file with one row
 group, so a client saves each and reads them as one dataset. The response's
 `x-pstore-epoch` and `x-pstore-next-after` (absent on the last page) drive the loop; the file's
 metadata carries both too (`pstore.epoch`, `pstore.next_after`), so a generated client, which
@@ -46,17 +47,17 @@ No setting: it is a request, and costs nothing when not asked.
 2. The loop: paging an index with deletes, a replacement and unfolded rows written after `E`
    by `after` and `limit` returns, across all pages, exactly the rows the index held at `E`,
    each once, in id order, with their attributes; the last page names no next.
-3. Refusals by name: a `limit` of 0 or over 100,000, an `as_of` past the present or below the
-   reap horizon, an absent index (`404`).
+3. Refusals by name: a `limit` of 0, over 10,000, or over 1,000 with vectors; an `as_of` that
+   is not an epoch or is past the present; an absent index (`404`).
 4. Cost recorded in `VERIFIED.md` (`provisional`): bytes and time of a 10,000-row page at
-   20,000 rows, against the same page as JSON.
+   20,000 rows, and of a 1,000-row page with vectors, against the same page as JSON.
 
 ## Test plan
 - 1: `a_page_reads_back_through_the_parquet_crate` (pstore-format `tests/it/parquet_write.rs`)
   and unit tests of the Thrift writer. Kills: a definition level inverted; a column's type
   chosen from the first value only; a page header's size off by one.
 - 2, 3: `the_parquet_export_pages_one_epoch` (server `tests/it/parquet_export.rs`).
-- 4: `scripts/columns.sh` or the server test's measurement.
+- 4: `export_cost` (server `tests/it/parquet_export.rs`, ignored: run by hand).
 
 ## RA budget
 A page is M199's ordered read: three rounds, the same requests as a JSON page.
