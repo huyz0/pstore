@@ -278,8 +278,8 @@ pub fn map_bytes<K, V>(len: usize) -> u64 {
     let leaf = (16 + 11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())) as u64
         + ALLOCATION_OVERHEAD;
     match len {
-        0 => 0,
         1..=11 => leaf,
+        // An empty map has no node: no leaves, so no internal nodes either.
         _ => {
             let leaves = len.div_ceil(5) as u64;
             let internal = leaves.div_ceil(5);

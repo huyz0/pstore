@@ -84,3 +84,8 @@ charge, unlike the equivalent "not pruned"). Added
 `shrinking_a_row_drops_the_capacity_it_was_parsed_with` (a parsed-shaped row's footprint
 equals its clone's after shrinking; it also kills an unshrunk id or vector), and
 `a_prune_drops_exactly_the_batches_a_watermark_folded` now asserts the `held` entries left.
+A later shard missed `map_bytes`'s internal-node term (`*` turned `+` or `/`) and timed out
+on four other `map_bytes` mutants, which no fast test caught before the suite's 600 s
+limit. `a_maps_nodes_are_its_leaves_and_internal_nodes_exactly` asserts the bound exactly at
+0, 1, 11, 12 and 60 entries; all six mutants were killed by script. The redundant `0 => 0`
+arm, an equivalent mutant, was removed: the general arm gives 0 for an empty map.

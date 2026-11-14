@@ -123,3 +123,24 @@ fn shrinking_a_row_drops_the_capacity_it_was_parsed_with() {
     doc.shrink_to_fit();
     assert_eq!(doc.footprint(), exact);
 }
+
+#[test]
+fn a_maps_nodes_are_its_leaves_and_internal_nodes_exactly() {
+    // M213: a leaf of 11 (u64, u64) entries is 16 + 11 * 16 bytes and the allocation's 16; an
+    // internal node adds 12 edges. Past 11 entries, len / 5 leaves (rounded up) and a fifth
+    // as many internal nodes (rounded up).
+    let leaf = 16 + 11 * 16 + 16;
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(0), 0);
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(1), leaf);
+    assert_eq!(pstore_format::map_bytes::<u64, u64>(11), leaf);
+    // 12 entries: 3 leaves, 1 internal node.
+    assert_eq!(
+        pstore_format::map_bytes::<u64, u64>(12),
+        3 * leaf + (leaf + 96)
+    );
+    // 60 entries: 12 leaves, 3 internal nodes.
+    assert_eq!(
+        pstore_format::map_bytes::<u64, u64>(60),
+        12 * leaf + 3 * (leaf + 96)
+    );
+}
