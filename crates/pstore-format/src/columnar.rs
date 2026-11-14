@@ -56,14 +56,21 @@ fn unordered(v: u64) -> i64 {
 }
 
 /// A LEB128 varint: small counts, lengths and frames cost a byte, not four or eight.
+///
+/// ⚠️ **Bounded at ten bytes**, which 64 bits never exceed, rather than `while v >= 0x80`: CI's
+/// mutation shard ran `while v < 0x80`, which pushes bytes forever, and the runner was killed
+/// before the timeout could report it (#58, twice).
 fn put_var(e: &mut Enc, mut v: u64) {
-    while v >= 0x80 {
+    for _ in 0..10 {
+        if v < 0x80 {
+            #[allow(clippy::cast_possible_truncation, reason = "below 0x80")]
+            e.u8(v as u8);
+            return;
+        }
         #[allow(clippy::cast_possible_truncation, reason = "the low seven bits")]
         e.u8((v as u8) | 0x80);
         v >>= 7;
     }
-    #[allow(clippy::cast_possible_truncation, reason = "below 0x80")]
-    e.u8(v as u8);
 }
 
 fn get_var(d: &mut Dec<'_>) -> Result<u64, FormatError> {
@@ -125,12 +132,14 @@ fn pack(e: &mut Enc, values: impl Iterator<Item = u64>, width: u8) {
     for v in values {
         acc |= u128::from(v) << bits;
         bits += u32::from(width);
-        while bits >= 8 {
+        // ⚠️ A count, not `while bits >= 8 { .. bits -= 8 }`: that loop's `-=` mutated to `+=`
+        // pushes bytes forever and kills a CI runner rather than timing out (#58).
+        for _ in 0..bits / 8 {
             #[allow(clippy::cast_possible_truncation, reason = "the low byte")]
             e.u8(acc as u8);
             acc >>= 8;
-            bits -= 8;
         }
+        bits %= 8;
     }
     if bits > 0 {
         #[allow(clippy::cast_possible_truncation, reason = "the low byte")]

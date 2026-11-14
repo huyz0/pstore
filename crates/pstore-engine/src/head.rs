@@ -365,10 +365,12 @@ impl Storage {
             Some(false) => 1,
             Some(true) => 2,
         };
+        // A sum, not `|`, as `Dicts::byte` does: the codes sit in disjoint bits, so `|` and `^`
+        // agree and a sweep cannot tell them apart (#58's sweep found it).
         code(self.columnar)
-            | code(self.equality) << 2
-            | code(self.aggregates) << 4
-            | code(self.filter_cache) << 6
+            + 4 * code(self.equality)
+            + 16 * code(self.aggregates)
+            + 64 * code(self.filter_cache)
     }
 
     /// The overrides a byte names; a code of 3 in any setting is corrupt. The top two bits
@@ -3680,6 +3682,21 @@ mod tests {
             let mut ghost = plain.clone();
             ghost.storage.insert("gone".to_owned(), rows);
             assert_eq!(hex(&ghost.encode()), hex(&plain.encode()));
+            // An index HEAD holds only as rejects, or only as quarantine, keeps its override
+            // (CI's mutation review of #58: the last `||` as `&&` missed).
+            for (name, rejects) in [("rejected", true), ("quarantined", false)] {
+                let mut held = plain.clone();
+                if rejects {
+                    held.schema_rejects.insert(name.to_owned(), 2);
+                } else {
+                    held.quarantine
+                        .insert(name.to_owned(), vec![("q/0".to_owned(), 2)]);
+                }
+                let mut with = held.clone();
+                with.storage.insert(name.to_owned(), rows);
+                assert_ne!(hex(&with.encode()), hex(&held.encode()), "{name}");
+                assert_eq!(Head::decode(&with.encode())?, with, "{name}");
+            }
             // Malformed: a code of 3 in the first or the last setting, an all-unset byte, a name
             // twice, a trailing byte. (M231 refused 0x40 and 0x80 as high bits; M234 gives them
             // to `filter_cache`, and decodes them above.)
