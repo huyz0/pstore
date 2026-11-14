@@ -1207,29 +1207,13 @@ impl Segment {
         project: &crate::Projection<'_>,
         mut visit: impl FnMut(usize, Document),
     ) -> Result<(), FormatError> {
-        let mut base = 0usize;
-        let mut wanted: Vec<(usize, &BlockMeta)> = Vec::new();
-        for (i, b) in self.blocks.iter().enumerate() {
-            if keep(i, &b.zones) {
-                wanted.push((base, b));
-            }
-            base += b.rows as usize;
-        }
-        if wanted.is_empty() {
-            return Ok(());
-        }
-        let ranges: Vec<std::ops::Range<u64>> = wanted
-            .iter()
-            .map(|(_, b)| b.offset..b.offset + u64::from(b.len))
-            .collect();
-        let bufs = store.get_ranges(key, &ranges).await?;
-        for ((start, _), buf) in wanted.iter().zip(&bufs) {
+        for (start, buf) in self.kept_blocks(store, key, keep).await? {
             if self.columnar {
-                for (r, doc) in crate::columnar::decode_block(buf, project, None)? {
+                for (r, doc) in crate::columnar::decode_block(&buf, project, None)? {
                     visit(start + r, doc);
                 }
             } else {
-                for (r, doc) in crate::decode_rows_where(buf, project)?
+                for (r, doc) in crate::decode_rows_where(&buf, project)?
                     .into_iter()
                     .enumerate()
                 {
@@ -1238,6 +1222,82 @@ impl Segment {
             }
         }
         Ok(())
+    }
+
+    /// The blocks `keep` keeps, each with its first row, fetched in **one** coalesced
+    /// `get_ranges`; none fetched when none is kept.
+    async fn kept_blocks<S: BlobStore>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(usize, &Zones) -> bool,
+    ) -> Result<Vec<(usize, bytes::Bytes)>, FormatError> {
+        let mut base = 0usize;
+        let mut starts = Vec::new();
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            if keep(i, &b.zones) {
+                starts.push(base);
+                ranges.push(b.offset..b.offset + u64::from(b.len));
+            }
+            base += b.rows as usize;
+        }
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bufs = store.get_ranges(key, &ranges).await?;
+        Ok(starts.into_iter().zip(bufs).collect())
+    }
+
+    /// [`Self::visit_blocks_projected`] decoded **late** (M233): each kept block's rows built
+    /// as far as `first` asks, offered to `admit` with their row, and only the admitted ones
+    /// built as far as `then` asks too, then handed to `visit`. A columnar block builds no value
+    /// of a column only `then` names for a refused row; a row block is decoded once, as far as
+    /// either asks. `admit` must read only what `first` names. Both are given `state`, `admit`
+    /// to read and `visit` to change: a block's rows are all admitted before any is visited.
+    ///
+    /// # Errors
+    /// If a block cannot be read or decoded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fetch's parameters, and each pass's own"
+    )]
+    pub async fn visit_blocks_late<S: BlobStore, St>(
+        &self,
+        store: &S,
+        key: &Key,
+        keep: impl Fn(usize, &Zones) -> bool,
+        state: &mut St,
+        first: &crate::Projection<'_>,
+        admit: impl Fn(&St, usize, &Document) -> bool,
+        then: &crate::Projection<'_>,
+        mut visit: impl FnMut(&mut St, usize, Document),
+    ) -> Result<(), FormatError> {
+        if self.columnar {
+            for (start, buf) in self.kept_blocks(store, key, keep).await? {
+                let rows = crate::columnar::decode_block_late(
+                    &buf,
+                    first,
+                    &mut |r, d| admit(state, start + r, d),
+                    then,
+                )?;
+                for (r, doc) in rows {
+                    visit(state, start + r, doc);
+                }
+            }
+            return Ok(());
+        }
+        let either = |name: &str| (first.attrs)(name) || (then.attrs)(name);
+        let both = crate::Projection {
+            id: first.id || then.id,
+            attrs: &either,
+        };
+        self.visit_blocks_projected(store, key, keep, &both, |row, doc| {
+            if admit(state, row, &doc) {
+                visit(state, row, doc);
+            }
+        })
+        .await
     }
 
     /// Specific rows' ids **and attributes**, from the same blocks [`Self::ids_at`] reads.

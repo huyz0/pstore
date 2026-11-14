@@ -52,6 +52,7 @@ mod index_limit;
 mod invariants;
 mod lane_taken;
 mod lanes;
+mod late;
 mod lengths;
 mod linearizability;
 mod memtable_races;

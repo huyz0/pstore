@@ -716,6 +716,38 @@ pub fn decode_block(
     Ok(rows)
 }
 
+/// A columnar block decoded **late** (M233): each row built as far as `first` asks, offered to
+/// `admit` with its position, and only the admitted rows built further, as far as `then`
+/// asks. A column `first` decoded is not decoded again; a column only `then` names has no
+/// value built for a row `admit` refused.
+///
+/// # Errors
+/// As [`decode_block`], for either pass.
+pub fn decode_block_late(
+    buf: &[u8],
+    first: &Projection<'_>,
+    admit: &mut dyn FnMut(usize, &Document) -> bool,
+    then: &Projection<'_>,
+) -> Result<Vec<(usize, Document)>, FormatError> {
+    let mut rows = decode_block(buf, first, None)?;
+    rows.retain(|(i, d)| admit(*i, d));
+    let rest = |name: &str| (then.attrs)(name) && !(first.attrs)(name);
+    let more = Projection {
+        id: then.id && !first.id,
+        attrs: &rest,
+    };
+    let wanted: Vec<usize> = rows.iter().map(|(i, _)| *i).collect();
+    let pick = |i: usize| wanted.binary_search(&i).is_ok();
+    let later = decode_block(buf, &more, Some(&pick))?;
+    for ((_, doc), (_, add)) in rows.iter_mut().zip(later) {
+        if more.id {
+            doc.id = add.id;
+        }
+        doc.attrs.extend(add.attrs);
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -735,6 +767,57 @@ mod tests {
     /// Each malformed codec header is refused by name: a varint past 64 bits, a zero divisor,
     /// an LZ4 length its bytes cannot hold, a dictionary larger than its column, an unknown
     /// float codec, and bytes left in the id column.
+    #[test]
+    fn an_unadmitted_row_is_never_built() {
+        let row = |id: &str, s: &str, k: i64| {
+            let mut d = Document::new(id, vec![]);
+            d.attrs.insert("k".to_owned(), Value::Int(k));
+            d.attrs.insert("s".to_owned(), Value::Str(s.to_owned()));
+            d
+        };
+        let mut buf = encode_block(&[row("a", "ab", 1), row("b", "cd", 2)]);
+        // Row 1's string is made bytes that are not UTF-8.
+        let at = buf.windows(2).position(|w| w == b"cd").unwrap();
+        buf[at] = 0xff;
+        buf[at + 1] = 0xfe;
+        let k = |n: &str| n == "k";
+        let first = Projection {
+            id: false,
+            attrs: &k,
+        };
+        let late = |want: i64| {
+            decode_block_late(
+                &buf,
+                &first,
+                &mut |_, d: &Document| d.attrs.get("k") == Some(&Value::Int(want)),
+                &Projection::ALL,
+            )
+        };
+        let got = late(1).unwrap();
+        assert_eq!(got.len(), 1);
+        let (i, d) = &got[0];
+        assert_eq!((*i, d.id.as_str()), (0, "a"));
+        assert_eq!(d.attrs, row("a", "ab", 1).attrs);
+        assert!(late(2).is_err());
+        assert!(decode_block(&buf, &Projection::ALL, None).is_err());
+        // What the first pass decoded is kept when the second does not ask for it.
+        let s = |n: &str| n == "s";
+        let got = decode_block_late(
+            &encode_block(&[row("a", "ab", 1), row("b", "cd", 2)]),
+            &first,
+            &mut |i, _| i == 1,
+            &Projection {
+                id: true,
+                attrs: &s,
+            },
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[0].1.id, "b");
+        assert_eq!(got[0].1.attrs, row("b", "cd", 2).attrs);
+    }
+
     #[test]
     fn malformed_codec_headers_are_refused() {
         let refused = |r: Result<(), FormatError>, what: &str| match r {

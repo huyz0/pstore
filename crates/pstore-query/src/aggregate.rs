@@ -166,6 +166,28 @@ impl Spec {
                 .iter()
                 .all(|(_, a)| matches!(a, Aggregate::Count(None)))
     }
+
+    /// Every attribute an aggregate or a group key reads, sorted (M233): all an admitted row
+    /// is built with.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .labels
+            .iter()
+            .filter_map(|(_, a)| match a {
+                Aggregate::Count(None) => None,
+                Aggregate::Count(Some(a))
+                | Aggregate::Sum(a)
+                | Aggregate::Min(a)
+                | Aggregate::Max(a)
+                | Aggregate::Avg(a) => Some(a.as_str()),
+            })
+            .chain(self.group_by.iter().map(|g| g.attribute.as_str()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 /// A group key component: a stored value, normalized so that the filters' equality is the
@@ -452,6 +474,11 @@ impl Aggregator {
         }
     }
 
+    /// [`Spec::names`], owned.
+    fn spec_names(&self) -> Vec<String> {
+        self.spec.names().into_iter().map(str::to_owned).collect()
+    }
+
     fn empty_like(&self) -> Self {
         Self {
             spec: Arc::clone(&self.spec),
@@ -735,6 +762,8 @@ pub async fn aggregate<S: BlobStore>(
     aggregator: &mut Aggregator,
 ) -> Result<(), QueryError> {
     let blank = aggregator.empty_like();
+    let names = aggregator.spec_names();
+    let spec_names = &names;
     let opened = crate::order::open(store, targets, false).await?;
     let blank = &blank;
     let parts =
@@ -754,21 +783,40 @@ pub async fn aggregate<S: BlobStore>(
                     }
                 }
             }
+            // M233: a row is built first as far as deciding it needs, and an admitted one then
+            // only with what the aggregates and group keys read.
+            let hiding = t.shadowed && !shadow.is_empty();
+            let (id, deciding) = crate::order::deciding(filter, hiding, &[]);
+            let decides = |name: &str| deciding.binary_search(&name).is_ok();
+            let wanted = |name: &str| {
+                spec_names
+                    .binary_search_by(|r| r.as_str().cmp(name))
+                    .is_ok()
+            };
             o.segment
-                .visit_blocks_projected(
+                .visit_blocks_late(
                     store,
                     &t.segment,
                     |i, zones| {
                         answered.binary_search(&i).is_err()
                             && filter.is_none_or(|f| f.could_admit(zones))
                     },
-                    &pstore_format::Projection::ALL,
-                    |row, doc| {
+                    &mut local,
+                    &pstore_format::Projection {
+                        id,
+                        attrs: &decides,
+                    },
+                    |_, row, doc| {
                         let hidden =
-                            o.deleted.contains(&row) || (t.shadowed && shadow.contains(&doc.id));
-                        if !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs)) {
-                            local.offer(&doc);
-                        }
+                            o.deleted.contains(&row) || (hiding && shadow.contains(&doc.id));
+                        !hidden && filter.is_none_or(|f| f.admits(&doc.id, &doc.attrs))
+                    },
+                    &pstore_format::Projection {
+                        id: false,
+                        attrs: &wanted,
+                    },
+                    |local, _, doc| {
+                        local.offer(&doc);
                     },
                 )
                 .await?;
