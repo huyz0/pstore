@@ -3818,12 +3818,17 @@
           },
           "overrides": {
             "$ref": "#/components/schemas/StorageOverrides"
+          },
+          "filter_cache": {
+            "type": "boolean",
+            "description": "Whether its filtered queries use the server's filter-mask cache (M234)."
           }
         },
         "required": [
           "block_layout",
           "equality_filters",
           "block_aggregates",
+          "filter_cache",
           "overrides"
         ],
         "additionalProperties": false,
@@ -3843,6 +3848,9 @@
             "type": "boolean"
           },
           "block_aggregates": {
+            "type": "boolean"
+          },
+          "filter_cache": {
             "type": "boolean"
           }
         },
@@ -3870,6 +3878,12 @@
             ]
           },
           "block_aggregates": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "filter_cache": {
             "type": [
               "boolean",
               "null"

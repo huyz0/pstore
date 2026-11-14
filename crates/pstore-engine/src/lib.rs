@@ -2494,6 +2494,9 @@ pub struct Engine<S> {
     store: Arc<S>,
     tenant: TenantId,
     lane: LaneId,
+    /// The server's filter-mask cache (M234), shared by its tenants' engines; `None` when
+    /// the server keeps none.
+    masks: Option<Arc<pstore_query::masks::MaskCache>>,
     mem: Mutex<Memtable>,
     /// Where this lane stands: `None` until the first flush resumes it (M9j). Lanes are
     /// single-writer, so this needs no coordination with anyone — which is the entire point
@@ -2748,6 +2751,7 @@ impl<S: BlobStore> Engine<S> {
             abandoned: Mutex::new(Vec::new()),
             copy_checkpoint: replica::COPY_CHECKPOINT,
             checkpoint_hook: Mutex::new(None),
+            masks: None,
             reapable: Mutex::new(std::collections::VecDeque::new()),
             committed: Mutex::new(Epoch::ZERO),
             fold_gate: tokio::sync::Mutex::new(()),
@@ -2855,6 +2859,40 @@ impl<S: BlobStore> Engine<S> {
     pub fn with_block_options(mut self, options: pstore_format::BlockOptions) -> Self {
         self.params.blocks = options;
         self
+    }
+
+    /// Uses `cache` for the filter masks of its queries (M234): the server's one cache, shared
+    /// by every tenant's engine. An index's `filter_cache` override of `false` keeps its
+    /// queries out of it.
+    #[must_use]
+    pub fn with_mask_cache(mut self, cache: Option<Arc<pstore_query::masks::MaskCache>>) -> Self {
+        self.masks = cache;
+        self
+    }
+
+    /// The cache `index`'s queries use, by `head` (M234): the server's, unless the index
+    /// overrides `filter_cache` off.
+    fn masks_of(&self, head: &Head, index: &str) -> Option<pstore_query::masks::Scope> {
+        let on = head
+            .storage
+            .get(index)
+            .copied()
+            .unwrap_or_default()
+            .filter_cache_over(true);
+        self.masks
+            .as_ref()
+            .filter(|_| on)
+            .map(|cache| pstore_query::masks::Scope {
+                cache: Arc::clone(cache),
+                tenant: self.tenant.0.to_string(),
+            })
+    }
+
+    /// Whether this engine has a filter-mask cache (M234): the cluster default an index's
+    /// `filter_cache` overrides.
+    #[must_use]
+    pub fn has_mask_cache(&self) -> bool {
+        self.masks.is_some()
     }
 
     /// What `index`'s next sealed segment's blocks are, by `head` (M231): its overrides over
@@ -8258,9 +8296,13 @@ impl<S: BlobStore> Engine<S> {
             folded: unfolded_at,
             ..vectors
         };
-        let resolved = pstore_query::query_rows_split_texts(
-            &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere,
-            projection,
+        // M234: the segments' filter masks from the server's cache, unless the index opts out.
+        let resolved = pstore_query::masks::scope(
+            self.masks_of(&at.head, index),
+            pstore_query::query_rows_split_texts(
+                &store, &targets, prefetch, &scored, filter, &shadow, fusion, top_k, elsewhere,
+                projection,
+            ),
         )
         .await
         .map_err(|e| query_error(metric, prefetch, e))?;

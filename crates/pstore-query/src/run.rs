@@ -813,25 +813,47 @@ async fn candidates<S: BlobStore + Clone>(
     let legs_fut = tasks.join();
     // ⚠️ A mask only for a segment some leg runs over here (M54): a segment whose vector legs
     // run elsewhere is masked there.
-    let mut mask_tasks: Tasks<(usize, Mask)> = Tasks(Vec::new());
+    let mut mask_tasks: Tasks<(usize, Arc<Mask>)> = Tasks(Vec::new());
+    // M234: a segment's mask held by the server's cache is not built again. Looked up here,
+    // on the query's own task, where the cache's scope is.
+    let mut cached: Vec<(usize, Arc<Mask>)> = Vec::new();
     if let Some(f) = filter {
+        let scope = crate::masks::current();
+        let canonical = scope.as_ref().map(|_| format!("{f:?}"));
         for &(i, t, o) in items {
             if legs.iter().any(|(j, _)| runs(i, *j)) {
-                let (store, key, segment, f) = (
+                let key = scope.as_ref().zip(canonical.as_ref()).map(|(s, c)| {
+                    (
+                        s.tenant.clone(),
+                        t.segment.as_str().to_owned(),
+                        c.clone(),
+                    )
+                });
+                if let Some(hit) = scope.as_ref().zip(key.as_ref()).and_then(|(s, k)| s.cache.get(k)) {
+                    cached.push((i, hit));
+                    continue;
+                }
+                let (store, seg_key, segment, f) = (
                     store.clone(),
                     t.segment.clone(),
                     Arc::clone(&o.segment),
                     f.clone(),
                 );
+                let cache = scope.as_ref().map(|s| Arc::clone(&s.cache));
                 mask_tasks.0.push(tokio::spawn(async move {
-                    mask(&store, &key, &segment, &f).await.map(|m| (i, m))
+                    let m = Arc::new(mask(&store, &seg_key, &segment, &f).await?);
+                    if let Some((c, k)) = cache.zip(key) {
+                        c.insert(k, Arc::clone(&m));
+                    }
+                    Ok((i, m))
                 }));
             }
         }
     }
     let masks_fut = mask_tasks.join();
     let (per_segment, masks) = futures_util::future::try_join(legs_fut, masks_fut).await?;
-    let masks: std::collections::BTreeMap<usize, Mask> = masks.into_iter().collect();
+    let masks: std::collections::BTreeMap<usize, Arc<Mask>> =
+        masks.into_iter().chain(cached).collect();
     let by_ordinal: std::collections::BTreeMap<usize, (&Target, &Opened)> =
         items.iter().map(|&(i, t, o)| (i, (t, o))).collect();
     Ok(per_segment

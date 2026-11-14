@@ -19,6 +19,7 @@ pub mod explain;
 mod expr;
 mod filter;
 mod fuse;
+pub mod masks;
 mod order;
 mod run;
 

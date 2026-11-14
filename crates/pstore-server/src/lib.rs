@@ -178,6 +178,9 @@ pub struct Api<S> {
     /// What an index that overrides nothing seals (M231): the cluster's default, from
     /// `PSTORE_BLOCK_LAYOUT`, `PSTORE_EQUALITY_FILTERS` and `PSTORE_BLOCK_AGGREGATES`.
     blocks: Mutex<pstore_format::BlockOptions>,
+    /// The filter-mask cache every tenant's queries share (M234), `None` when
+    /// `PSTORE_FILTER_CACHE_BYTES` is 0.
+    masks: Mutex<Option<Arc<pstore_query::masks::MaskCache>>>,
     /// The prefixes of customers' objects tenants may register as external indexes (M86), or
     /// `None` for off, the default. Read when a tenant's engine is built.
     external_prefixes: Mutex<Option<Vec<String>>>,
@@ -477,6 +480,9 @@ impl<S: BlobStore + 'static> Api<S> {
             projection_bytes: std::sync::atomic::AtomicU64::new(MAX_PROJECTED_BYTES),
             sparse_rows: std::sync::atomic::AtomicBool::new(true),
             blocks: Mutex::new(pstore_format::BlockOptions::default()),
+            masks: Mutex::new(Some(Arc::new(pstore_query::masks::MaskCache::new(
+                DEFAULT_FILTER_CACHE_BYTES,
+            )))),
             external_prefixes: Mutex::new(None),
         }))
     }
@@ -861,6 +867,7 @@ impl<S: BlobStore + 'static> Api<S> {
             )
             .with_sparse_rows(self.sparse_rows.load(std::sync::atomic::Ordering::Relaxed))
             .with_block_options(self.block_options())
+            .with_mask_cache(self.mask_cache())
             .with_index_limit(index_limit);
             engine.set_idempotency(keys);
             let engine = match &external {
@@ -953,6 +960,25 @@ impl<S: BlobStore + 'static> Api<S> {
             .blocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = options;
+    }
+
+    /// Keeps at most `bytes` of filter masks for its tenants' queries (M234), `0` for none:
+    /// [`Config::filter_cache_bytes`], for the engines built after it.
+    pub fn set_filter_cache_bytes(&self, bytes: usize) {
+        *self
+            .masks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (bytes > 0)
+            .then(|| Arc::new(pstore_query::masks::MaskCache::new(bytes)));
+    }
+
+    /// The filter-mask cache its engines share (M234), if it keeps one.
+    #[must_use]
+    pub fn mask_cache(&self) -> Option<Arc<pstore_query::masks::MaskCache>> {
+        self.masks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The cluster's default this server seals by (M231).
@@ -4620,7 +4646,11 @@ async fn index_summary<S: BlobStore + 'static>(
         updated_at: s.written_ms.map(rfc3339_ms),
         approx_logical_bytes: s.bytes,
         read_only: s.read_only,
-        storage: StorageSettings::of(s.storage, engine.block_options()),
+        storage: StorageSettings::of(
+            s.storage,
+            engine.block_options(),
+            engine.has_mask_cache(),
+        ),
         progress: progress.map(|p| IndexProgress {
             status: if p.rows > 0 { "updating" } else { "up-to-date" },
             unindexed_rows: p.rows,
@@ -4995,7 +5025,11 @@ async fn patch_index<S: BlobStore + 'static>(
         match engine.set_storage(&index, |s| change.apply(s)).await? {
             Some((e, now)) => {
                 epoch = Some(epoch.map_or(e, |was| was.max(e)));
-                storage = Some(StorageSettings::of(now, engine.block_options()));
+                storage = Some(StorageSettings::of(
+                    now,
+                    engine.block_options(),
+                    engine.has_mask_cache(),
+                ));
             }
             None => return Err(absent(&engine).await),
         }
@@ -5019,6 +5053,8 @@ struct StoragePatch {
     equality_filters: Option<Option<bool>>,
     #[serde(default, deserialize_with = "present")]
     block_aggregates: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "present")]
+    filter_cache: Option<Option<bool>>,
 }
 
 /// A member that is present, `null` or not: absent is the `default`, `None`.
@@ -5036,6 +5072,7 @@ struct StorageChange {
     columnar: Option<Option<bool>>,
     equality: Option<Option<bool>>,
     aggregates: Option<Option<bool>>,
+    filter_cache: Option<Option<bool>>,
 }
 
 impl StorageChange {
@@ -5044,6 +5081,7 @@ impl StorageChange {
             columnar: self.columnar.unwrap_or(s.columnar),
             equality: self.equality.unwrap_or(s.equality),
             aggregates: self.aggregates.unwrap_or(s.aggregates),
+            filter_cache: self.filter_cache.unwrap_or(s.filter_cache),
         }
     }
 }
@@ -5065,6 +5103,7 @@ fn storage_change(p: &StoragePatch) -> Result<StorageChange, String> {
         columnar,
         equality: p.equality_filters,
         aggregates: p.block_aggregates,
+        filter_cache: p.filter_cache,
     })
 }
 
@@ -6969,6 +7008,26 @@ pub struct Config {
     /// (`on` unset, or `off`). ⚠️ The cluster's default: set alike on every server. Servers
     /// that disagree, mid-rollout, write segments every reader reads.
     pub blocks: pstore_format::BlockOptions,
+    /// The bytes of filter masks the server keeps for its queries (M234), from
+    /// `PSTORE_FILTER_CACHE_BYTES`: [`DEFAULT_FILTER_CACHE_BYTES`] unset, `0` for none. An
+    /// index's `filter_cache` override of `false` keeps its queries out of the cache.
+    pub filter_cache_bytes: usize,
+}
+
+/// `PSTORE_FILTER_CACHE_BYTES` unset (M234): 64 MiB.
+pub const DEFAULT_FILTER_CACHE_BYTES: usize = 64 << 20;
+
+/// `PSTORE_FILTER_CACHE_BYTES` (M234), refused by name when not a count of bytes.
+fn filter_cache_bytes(get: &impl Fn(&str) -> Option<String>) -> Result<usize, ConfigError> {
+    get("PSTORE_FILTER_CACHE_BYTES").map_or(Ok(DEFAULT_FILTER_CACHE_BYTES), |v| {
+        v.parse::<usize>().map_err(|_| {
+            ConfigError::Storage(
+                "PSTORE_FILTER_CACHE_BYTES",
+                v,
+                "a count of bytes, 0 for no cache",
+            )
+        })
+    })
 }
 
 /// The cluster's storage defaults (M231), each refused by name when not one of its values.
@@ -7285,6 +7344,7 @@ impl Config {
                 Some(v) => v.parse().map_err(|_| ConfigError::IndexesPerTenant(v))?,
             },
             blocks: block_options(&get)?,
+            filter_cache_bytes: filter_cache_bytes(&get)?,
         })
     }
 }
