@@ -246,3 +246,34 @@ async fn a_branch_that_keeps_contending_reports_contention_not_a_lost_race() {
         store.refused()
     );
 }
+
+#[tokio::test]
+async fn a_storage_change_that_keeps_contending_reports_contention_not_a_lost_race() {
+    // M231's storage overrides commit through the same guard (CI's mutation review of #58:
+    // six mutations of it in `set_storage` missed).
+    let store = Arc::new(ArmedContention::default());
+    let t = TenantId(644);
+    let e = Engine::new(Arc::clone(&store), t, LaneId(1));
+    e.write("idx", (0..6).map(doc).collect()).await.unwrap();
+    e.flush().await.unwrap();
+    e.fold().await.unwrap();
+
+    store.arm();
+    let err = e
+        .set_storage("idx", |s| pstore_engine::Storage {
+            columnar: Some(false),
+            ..s
+        })
+        .await
+        .expect_err("a storage change committed against a backend refusing every CAS");
+    assert!(
+        matches!(err, EngineError::Contended),
+        "the storage loop reported {err:?} rather than what it saw"
+    );
+    assert_eq!(
+        store.refused(),
+        24,
+        "the storage change gave up after {} refusal(s)",
+        store.refused()
+    );
+}

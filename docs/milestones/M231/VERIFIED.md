@@ -59,6 +59,13 @@ accepted; LZ4 never used; the reader ignoring the version. No `cargo mutants` ru
    default replaced by `true`; the byte's on/off codes swapped; an unset override written; a
    patch replacing rather than merging; the server's default not passed to engines;
    `PSTORE_BLOCK_LAYOUT=rows` read as columnar.
+   CI's `cargo mutants` on #58 then found three more gaps. `set_storage`'s retry guard missed six
+   mutations, and now `a_storage_change_that_keeps_contending_reports_contention_not_a_lost_race`
+   (`retry_ceiling.rs`) catches them: it checks the error kind and the 24 refusals. `Head::encode`
+   missed both `||` mutated to `&&` in its filter of held indexes, and the rejects-only and
+   quarantine-only cases in `storage_overrides_round_trip_last` now catch them. For each of these,
+   the test was seen red under the mutant. The third gap is `Storage::byte`'s `|` mutated to `^`,
+   which is equivalent because the bits are disjoint. It is excluded in `.cargo/mutants.toml`.
 7. Pinned to rows with assertions unchanged: `typed_values::a_float_column_prunes_its_blocks`,
    `typed_values::an_int_column_still_prunes_for_either_literal`,
    `datetime::a_datetime_column_prunes_its_blocks`, `patch::a_plain_fold_reads_what_it_did_before_m13`,

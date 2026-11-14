@@ -3661,6 +3661,21 @@ mod tests {
             let mut ghost = plain.clone();
             ghost.storage.insert("gone".to_owned(), rows);
             assert_eq!(hex(&ghost.encode()), hex(&plain.encode()));
+            // An index HEAD holds only as rejects, or only as quarantine, keeps its override
+            // (CI's mutation review of #58: the last `||` as `&&` missed).
+            for (name, rejects) in [("rejected", true), ("quarantined", false)] {
+                let mut held = plain.clone();
+                if rejects {
+                    held.schema_rejects.insert(name.to_owned(), 2);
+                } else {
+                    held.quarantine
+                        .insert(name.to_owned(), vec![("q/0".to_owned(), 2)]);
+                }
+                let mut with = held.clone();
+                with.storage.insert(name.to_owned(), rows);
+                assert_ne!(hex(&with.encode()), hex(&held.encode()), "{name}");
+                assert_eq!(Head::decode(&with.encode())?, with, "{name}");
+            }
             // Malformed: a code of 3, a high bit, an all-unset byte, a name twice, a trailing
             // byte.
             let mut with = plain.clone();

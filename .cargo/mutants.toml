@@ -99,4 +99,8 @@ exclude_re = [
     # cannot decompress from bytes that few, so both refuse). Named by line and column. (M231)
     'pstore-format/src/columnar\.rs:(224:24|258:21|309:22|317:23|436:21): replace < with <= in (encode_ints|encode_blob|encode_bytes|decimal_exponent)$',
     'pstore-format/src/columnar\.rs:276:20: replace > with >= in decode_blob$',
+    # `Storage::byte` joins three two-bit codes shifted to disjoint bits, so `|` and `^` give
+    # the same byte for every input. Premise: `storage_overrides_round_trip_last` pins the
+    # byte both ways. Named by line and column. (M231)
+    'pstore-engine/src/head\.rs:359:(29|56): replace \| with \^ in Storage::byte$',
 ]
