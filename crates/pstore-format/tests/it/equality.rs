@@ -275,3 +275,85 @@ async fn beside_a_sketch_and_filters_the_statistics_still_fit() {
         );
     }
 }
+
+#[test]
+fn a_section_that_fits_its_budget_exactly_is_kept() {
+    let blocks: Vec<Vec<(String, Value)>> = (0..6)
+        .map(|b| {
+            vec![
+                ("s".into(), Value::Str(format!("v{b}"))),
+                ("b".into(), Value::Bool(b % 2 == 0)),
+            ]
+        })
+        .collect();
+    let build = |spare: usize| {
+        Equality::build(blocks.len(), spare, |b| {
+            blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+        })
+    };
+    let widest = build(usize::MAX).unwrap();
+    assert!(
+        !widest.may_equal("s", 0, &Value::Str("v1".into())),
+        "s is filtered"
+    );
+    let len = widest.encoded_len();
+    assert_eq!(
+        build(len),
+        Some(widest.clone()),
+        "a budget of exactly its length keeps it"
+    );
+    assert_ne!(build(len - 1), Some(widest), "one byte less cannot");
+}
+
+#[test]
+fn an_attribute_whose_blocks_hold_most_of_its_values_is_not_filtered() {
+    // Four values; each of four blocks holds `per` of them, and a bool so a section exists.
+    let section = |per: usize| {
+        let blocks: Vec<Vec<(String, Value)>> = (0..4)
+            .map(|b| {
+                let mut v: Vec<(String, Value)> = (0..per)
+                    .map(|k| ("s".into(), Value::Str(format!("v{}", (b + k) % 4))))
+                    .collect();
+                v.push(("b".into(), Value::Bool(true)));
+                v
+            })
+            .collect();
+        Equality::build(blocks.len(), usize::MAX, |b| {
+            blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+        })
+        .unwrap()
+    };
+    // Block 0 holds v0 and v1 of two, v0, v1 and v2 of three: v3 is absent from it either way.
+    let absent = Value::Str("v3".into());
+    assert!(
+        !section(2).may_equal("s", 0, &absent),
+        "half its values: filtered"
+    );
+    assert!(
+        section(3).may_equal("s", 0, &absent),
+        "three quarters: not filtered"
+    );
+}
+
+#[test]
+fn every_block_of_a_long_section_finds_its_own_values() {
+    // 20 blocks: the open bitmap takes three bytes, so each filter's place depends on it.
+    let blocks: Vec<Vec<(String, Value)>> = (0..20)
+        .map(|b| vec![("s".into(), Value::Str(format!("v{b}")))])
+        .collect();
+    let built = Equality::build(blocks.len(), usize::MAX, |b| {
+        blocks[b].iter().map(|(k, v)| (k.as_str(), v))
+    })
+    .unwrap();
+    let mut ruled_out = 0;
+    for b in 0..20 {
+        assert!(
+            built.may_equal("s", b, &Value::Str(format!("v{b}"))),
+            "block {b}"
+        );
+        ruled_out += (0..20)
+            .filter(|o| !built.may_equal("s", b, &Value::Str(format!("v{o}"))))
+            .count();
+    }
+    assert!(ruled_out > 300, "{ruled_out} of 380 other values ruled out");
+}
